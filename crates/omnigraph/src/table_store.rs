@@ -53,7 +53,7 @@ use lance_datafusion::exec::{
     ExecutionStatsCallback, ExecutionSummaryCounts, HardCapBatchSizeExec, LanceExecutionOptions,
     collect_execution_metrics,
 };
-use lance_file::version::LanceFileVersion;
+use lance_file::{version::LanceFileVersion, writer::FileWriterOptions};
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
 use lance_index::{IndexType, is_system_index};
 use lance_linalg::distance::MetricType;
@@ -107,6 +107,19 @@ pub(crate) const INSERT_ABSENCE_V1: &str = "v1";
 const EXTERNAL_BLOB_PROBE_CONCURRENCY: usize = 8;
 const EXTERNAL_BLOB_REFERENCE_RESOURCE: &str = "external Blob reference cells";
 const EXTERNAL_BLOB_URI_METADATA_RESOURCE: &str = "external Blob URI metadata bytes";
+
+// Lance divides this per-writer accumulation allowance among top-level fields.
+// A complete input array can overshoot a column's threshold; nested leaves and
+// concurrent writers have independent queues. This is not an operation-wide
+// memory reservation. Keep copying slices so a small column cannot retain its
+// whole source batch. V2_2 does not enforce max_page_bytes in its encoder.
+fn budgeted_file_writer_options(write_budget: WriteBudget) -> FileWriterOptions {
+    FileWriterOptions {
+        data_cache_bytes: Some(write_budget.bytes()),
+        keep_original_array: Some(false),
+        max_page_bytes: None,
+    }
+}
 
 // Lance's ordinary Scanner stream executes SortExec with an unbounded memory
 // pool and spilling disabled. Every OmniGraph-ordered scan instead uses an
@@ -325,11 +338,6 @@ impl ScanTuning<'_> {
     /// scanner and drops the callback.
     pub(crate) fn scan_stats_callback(&mut self, callback: ExecutionStatsCallback) -> &mut Self {
         self.scanner.scan_stats_callback(callback);
-        self
-    }
-
-    pub(crate) fn target_parallelism(&mut self, target_parallelism: usize) -> &mut Self {
-        self.scanner.target_parallelism(target_parallelism);
         self
     }
 
@@ -702,7 +710,7 @@ pub struct TableState {
 /// `scan_with_staged` (and `count_rows_with_staged`) compose
 /// `committed - removed + new` so subsequent reads see the staged result
 /// without double-counting fragments that `Operation::Update` rewrote.
-/// Without `removed_fragment_ids`, a `stage_merge_insert` that rewrites
+/// Without `removed_fragment_ids`, a keyed write that rewrites
 /// existing fragments would yield duplicate rows (the original fragment
 /// stays in the committed manifest while its rewrite shows up in `new_fragments`).
 // Sealed storage surface: `new_fragments`/`removed_fragment_ids` record the
@@ -792,7 +800,7 @@ pub struct StagedWrite {
     /// `new_fragments` for read-your-writes scans, otherwise rewrites
     /// yield duplicate rows. Empty for `stage_append` (`Operation::Append`
     /// adds without removing anything); populated from
-    /// `Operation::Update.removed_fragment_ids` for `stage_merge_insert`.
+    /// `Operation::Update.removed_fragment_ids` for keyed writes.
     removed_fragment_ids: Vec<u64>,
 }
 
@@ -826,10 +834,12 @@ async fn commit_detached(
     if let Some(affected_rows) = affected_rows {
         builder = builder.with_affected_rows(affected_rows);
     }
+    // A detached commit is unreachable until a manifest names it, so its
+    // failure is definite for the graph whatever its storage cause.
     builder
         .execute(transaction)
         .await
-        .map_err(OmniError::storage)
+        .map_err(|error| OmniError::storage(error).unpublished())
 }
 
 /// The columns of `columns` that hold no full-text segment once `effect`
@@ -1505,6 +1515,10 @@ decide_seam! {
 }
 
 impl TableStore {
+    pub(crate) fn session(&self) -> Arc<lance::session::Session> {
+        self.session.clone()
+    }
+
     pub fn new(root_uri: &str, session: Arc<lance::session::Session>) -> Self {
         Self {
             root_uri: root_uri.trim_end_matches('/').to_string(),
@@ -1525,9 +1539,9 @@ impl TableStore {
     /// Authorize, normalize, deduplicate, and probe every URI before any
     /// external payload read, target ref creation, table commit, or
     /// graph-visible effect. Scalar-only preparation may already have produced
-    /// temporary in-memory or staged inputs. The graph session supplies the
-    /// process-wide shared registry, so one operation does not create cold
-    /// clients per row.
+    /// temporary in-memory or staged inputs. External sources retain their
+    /// independent provider registry; a selected graph destination never
+    /// overrides the source address or creates a cold client per row.
     pub(crate) async fn preflight_external_blob_uris(
         &self,
         uris: &[String],
@@ -1587,7 +1601,7 @@ impl TableStore {
         }
 
         crate::instrumentation::record_external_blob_preflight_inputs(uri_count);
-        let registry = self.session.store_registry();
+        let registry = crate::lance_access::external_source_registry(&self.session);
         let entries = futures::stream::iter(pending.into_values().map(|(normalized, aliases)| {
             let registry = Arc::clone(&registry);
             async move {
@@ -1738,7 +1752,8 @@ impl TableStore {
         if entry.native_dataset_branch.is_none() {
             return self.open_at_entry(entry).await;
         }
-        let dataset = match open_dataset_entry(entry, &self.root_uri, None).await {
+        let fresh = crate::lance_access::statement_session(self.session.store_registry(), 0, 0);
+        let dataset = match open_dataset_entry(entry, &self.root_uri, Some(&fresh)).await {
             Ok(dataset) => dataset,
             Err(error @ OmniError::HistoricalVersionReclaimed { .. }) => {
                 // Cleanup can reclaim a pinned version of a live fork (a
@@ -2941,24 +2956,24 @@ impl TableStore {
         }
     }
 
-    /// Stage a delete without advancing Lance HEAD — the two-phase analogue of
-    /// `stage_merge_insert`. `DeleteBuilder::execute_uncommitted` writes the
+    /// Stage a delete without advancing Lance HEAD.
+    /// `DeleteBuilder::execute_uncommitted` writes the
     /// per-fragment deletion files to object storage and returns an
     /// uncommitted `Operation::Delete` transaction; HEAD does NOT advance until
     /// `commit_staged`. A 0-row delete is a TRUE no-op: `None` (no transaction,
     /// no fragments, no version). For a non-empty delete the returned
     /// `StagedWrite` carries the deletion-vector-bearing `updated_fragments` as
     /// `new_fragments` and the superseded originals (+ any fully-removed
-    /// fragments) as `removed_fragment_ids`, so `combine_committed_with_staged`
+    /// fragments) as `removed_fragment_ids`, so `scan_with_staged`
     /// (`committed - removed + new`) makes an in-query read see the deletion.
-    /// Like `stage_merge_insert`, this must carry Lance's `affected_rows`
+    /// Like `stage_keyed_write`, this must carry Lance's `affected_rows`
     /// metadata through to `commit_staged`; otherwise a staged transaction loses
     /// the row-level conflict information Lance's rebase path needs.
     pub async fn stage_delete(&self, ds: &Dataset, filter: Expr) -> Result<Option<StagedWrite>> {
         let uncommitted = DeleteBuilder::from_expr(Arc::new(ds.clone()), filter)
             .execute_uncommitted()
             .await
-            .map_err(OmniError::storage)?;
+            .map_err(|error| OmniError::storage(error).unpublished())?;
 
         if uncommitted.num_deleted_rows == 0 {
             return Ok(None);
@@ -3038,11 +3053,9 @@ impl TableStore {
     ///
     /// **Contract: `prior_stages` must contain only previous
     /// `stage_append` results against the same dataset.** Mixing
-    /// stage_merge_insert into `prior_stages` would over-count because
-    /// merge_insert's `new_fragments` include rewrites that don't add
-    /// rows. The engine's parse-time D₂′ check (per touched table: all
-    /// stage_append OR exactly one stage_merge_insert) guarantees this
-    /// upstream; on the primitive layer it's the caller's responsibility.
+    /// keyed writes into `prior_stages` would over-count because their
+    /// `new_fragments` can include rewrites that do not add rows. This
+    /// test-only primitive leaves that restriction to its caller.
     #[cfg(test)]
     pub async fn stage_append(
         &self,
@@ -3067,7 +3080,7 @@ impl TableStore {
             .with_params(&params)
             .execute_uncommitted(vec![batch])
             .await
-            .map_err(OmniError::storage)?;
+            .map_err(|error| OmniError::storage(error).unpublished())?;
         // After the write succeeds, so a failed write never inflates the probe.
         crate::instrumentation::record_stage_append(appended_rows);
         let mut new_fragments = match &transaction.operation {
@@ -3112,12 +3125,16 @@ impl TableStore {
 
     /// Stage one RFC-023 keyed write from an in-memory batch.
     ///
-    /// Unlike the legacy generic merge primitive below, this adapter fixes the
-    /// join key to `id` and derives Lance actions from a closed logical enum.
+    /// This adapter fixes the join key to the graph's system id column and
+    /// derives Lance actions from a closed logical enum.
     /// StrictInsert exact-probes its pinned parent, then stages the shared
     /// join-free filter-bearing insertion-only `Update`; Upsert keeps Lance's
     /// forced-v2 MergeInsert route. These are the only production
     /// insertion-bearing routes for keyed graph tables.
+    ///
+    /// Each call stages against the supplied committed view and cannot see
+    /// another call's uncommitted fragments. `MutationStaging` combines pending
+    /// upserts by key before invoking this once per touched table.
     pub async fn stage_keyed_write(
         &self,
         ds: Dataset,
@@ -3361,6 +3378,7 @@ impl TableStore {
         let ds = Arc::new(ds);
         let params = WriteParams {
             mode: WriteMode::Append,
+            file_writer_options: Some(budgeted_file_writer_options(write_budget)),
             allow_external_blob_outside_bases: false,
             auto_cleanup: None,
             skip_auto_cleanup: true,
@@ -3370,7 +3388,7 @@ impl TableStore {
             .with_params(&params)
             .execute_uncommitted(vec![batch])
             .await
-            .map_err(OmniError::storage)?;
+            .map_err(|error| OmniError::storage(error).unpublished())?;
         if transaction.read_version != expected_read_version {
             return Err(OmniError::manifest_internal(format!(
                 "{context} wrote against version {}, expected {expected_read_version}",
@@ -3612,11 +3630,7 @@ impl TableStore {
             builder.use_index(false);
         }
         builder.conflict_retries(0);
-        // FirstSeen works around Lance #6877.  The batch entry point proves
-        // source-id uniqueness; the streaming entry point accepts only a
-        // trusted exact-id-PK graph dataset and also rejects duplicates within
-        // each physical record batch.
-        builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
+        builder.source_dedupe_behavior(SourceDedupeBehavior::Fail);
         let uncommitted = builder
             .try_build()
             .map_err(OmniError::lance_internal)?
@@ -3877,126 +3891,6 @@ impl TableStore {
         Ok(observe_proven_insert_raw_stream(raw))
     }
 
-    /// Stage a merge_insert (upsert): write fragment files describing the
-    /// merge result, return the uncommitted transaction plus the new
-    /// fragments. The transaction's `Operation::Update` carries the
-    /// fragments-to-remove and fragments-to-add; for read-your-writes we
-    /// expose `new_fragments` (rows that will be visible after commit).
-    ///
-    /// **Contract: do not chain `stage_merge_insert` calls on the same
-    /// table within one query.** Each call's `MergeInsertBuilder` runs
-    /// against the supplied dataset's committed view — it does not see
-    /// fragments produced by a previous staged merge on the same table.
-    /// Two chained `stage_merge_insert`s whose source rows share keys will
-    /// each independently produce `Operation::Update` transactions whose
-    /// `new_fragments` contain a row for the shared key. `scan_with_staged`
-    /// (and `count_rows_with_staged`) will then return both — i.e.
-    /// **duplicates by key**.
-    ///
-    /// This is intrinsic to the underlying Lance API: there is no public
-    /// way to make `MergeInsertBuilder` see uncommitted fragments. The
-    /// engine's `MutationStaging` accumulator works around this by
-    /// concatenating per-table batches in memory and issuing exactly
-    /// one `stage_merge_insert` per touched table at end-of-query (with
-    /// last-write-wins dedupe by id) — see `exec/staging.rs`. Direct
-    /// callers of this primitive must respect the contract themselves.
-    ///
-    /// Lift path: either a Lance API extension that lets
-    /// `MergeInsertBuilder` accept additional staged fragments, or an
-    /// in-memory pre-merge here that folds prior staged batches into the
-    /// input stream. See `docs/dev/writes.md`.
-    #[cfg(test)]
-    pub async fn stage_merge_insert(
-        &self,
-        ds: Dataset,
-        batch: RecordBatch,
-        key_columns: Vec<String>,
-        when_matched: WhenMatched,
-        when_not_matched: WhenNotMatched,
-    ) -> Result<StagedWrite> {
-        if batch.num_rows() == 0 {
-            return Err(OmniError::manifest_internal(
-                "stage_merge_insert called with empty batch".to_string(),
-            ));
-        }
-        let merged_rows = batch.num_rows() as u64;
-
-        // Precondition for the FirstSeen workaround below: every call path that
-        // reaches stage_merge_insert (load, MutationStaging::finalize,
-        // branch_merge::publish_rewritten_merge_table) must hand in a source
-        // batch that is unique by `key_columns`. Without this check,
-        // `SourceDedupeBehavior::FirstSeen` would silently collapse genuine
-        // duplicates instead of erroring.
-        check_batch_unique_by_keys(&batch, &key_columns, "stage_merge_insert")?;
-
-        let ds = Arc::new(ds);
-        let mut builder =
-            MergeInsertBuilder::try_new(ds, key_columns).map_err(OmniError::lance_internal)?;
-        builder.when_matched(when_matched);
-        builder.when_not_matched(when_not_matched);
-        // Workaround for a Lance bug class where sequential merge_insert calls
-        // against rows previously rewritten by merge_insert produce a spurious
-        // "Ambiguous merge inserts: multiple source rows match the same target
-        // row on (id = ...)" error. Lance's `processed_row_ids:
-        // Mutex<HashSet<u64>>` (lance-6.0.1 `src/dataset/write/merge_insert.rs`)
-        // double-processes the same source/target match against datasets
-        // previously rewritten by merge_insert, and the default
-        // `SourceDedupeBehavior::Fail` errors on the second insertion; FirstSeen
-        // makes Lance skip the duplicate match instead. Correctness-preserving
-        // because every call path pre-dedupes the source batch by id or surfaces
-        // a real source dup via `check_batch_unique_by_keys` above (load:
-        // `enforce_unique_constraints_intra_batch`; mutate:
-        // `MutationStaging::finalize`; branch-merge: the `OrderedTableCursor`
-        // walk in `exec/merge.rs`). Retire when upstream Lance fixes the bug
-        // class. Tracked at MR-957; upstream: lance-format/lance#6877.
-        builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
-        let job = builder.try_build().map_err(OmniError::lance_internal)?;
-        let schema = batch.schema();
-        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
-        let stream = lance_datafusion::utils::reader_to_stream(Box::new(reader));
-        let uncommitted = job
-            .execute_uncommitted(stream)
-            .await
-            .map_err(OmniError::lance_stream)?;
-        // After the write succeeds, so a failed write never inflates the probe.
-        crate::instrumentation::record_stage_merge_insert(merged_rows);
-        // Operation::Update { removed_fragment_ids, updated_fragments, new_fragments, .. } —
-        // `new_fragments` are the freshly inserted rows; `updated_fragments`
-        // are rewrites of existing fragments that include both retained and
-        // updated rows; `removed_fragment_ids` lists the committed-manifest
-        // fragments that those rewrites supersede. For read-your-writes we
-        // expose `updated_fragments + new_fragments` and the
-        // `removed_fragment_ids` so `scan_with_staged` can filter the
-        // superseded committed fragments before combining — otherwise a
-        // single merge_insert appears as duplicate rows (original committed
-        // version + rewritten staged version).
-        let (new_fragments, removed_fragment_ids) = match &uncommitted.transaction.operation {
-            Operation::Update {
-                new_fragments,
-                updated_fragments,
-                removed_fragment_ids,
-                ..
-            } => {
-                let mut all = updated_fragments.clone();
-                all.extend(new_fragments.iter().cloned());
-                (all, removed_fragment_ids.clone())
-            }
-            Operation::Append { fragments } => (fragments.clone(), Vec::new()),
-            other => {
-                return Err(OmniError::manifest_internal(format!(
-                    "stage_merge_insert: unexpected Lance operation {:?}",
-                    std::mem::discriminant(other)
-                )));
-            }
-        };
-        Ok(StagedWrite::with_commit_metadata(
-            uncommitted.transaction,
-            StagedCommitMetadata::affected_rows(uncommitted.affected_rows),
-            new_fragments,
-            removed_fragment_ids,
-        ))
-    }
-
     /// Commit a previously-staged write onto `ds`, returning the new dataset
     /// (with HEAD advanced). The staged packet owns the Lance transaction plus
     /// any commit metadata (`affected_rows` for delete/merge rebase). Used by
@@ -4177,7 +4071,8 @@ impl TableStore {
             ));
         }
 
-        let store_params = crate::storage::lance_store_params_for_uri(dataset_uri)?;
+        let store_params =
+            crate::storage::lance_store_params_for_session(dataset_uri, &self.session)?;
         let handler = crate::storage_layer::lance_clone::configured_commit_handler(
             dataset_uri,
             &Some(store_params.clone()),
@@ -4460,7 +4355,10 @@ impl TableStore {
     pub async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedWrite> {
         let params = WriteParams {
             mode: WriteMode::Create,
-            store_params: Some(crate::storage::lance_store_params_for_uri(dataset_uri)?),
+            store_params: Some(crate::storage::lance_store_params_for_session(
+                dataset_uri,
+                &self.session,
+            )?),
             enable_stable_row_ids: true,
             data_storage_version: Some(LanceFileVersion::V2_2),
             allow_external_blob_outside_bases: true,
@@ -4473,7 +4371,7 @@ impl TableStore {
             .with_params(&params)
             .execute_uncommitted(vec![batch])
             .await
-            .map_err(OmniError::storage)?;
+            .map_err(|error| OmniError::storage(error).unpublished())?;
         if transaction.read_version != 0 {
             return Err(OmniError::manifest_internal(format!(
                 "stage_create resolved '{}' at existing version {}; expected an absent dataset",
@@ -4761,36 +4659,68 @@ impl TableStore {
 
     /// Stage an overwrite from one batch; see [`Self::stage_overwrite_batches`].
     pub async fn stage_overwrite(&self, ds: &Dataset, batch: RecordBatch) -> Result<StagedWrite> {
-        self.stage_overwrite_batches(ds, vec![batch]).await
+        self.stage_overwrite_batches(ds, vec![batch], WriteBudget::default(), 1)
+            .await
     }
 
     /// Stage an overwrite (write_fragments + Operation::Overwrite { schema, fragments })
-    /// from the batches as they were produced, never concatenated. Returns a
-    /// StagedWrite carrying the replacement fragments. HEAD does NOT advance.
+    /// from the batches as they were produced, never concatenated, through
+    /// up to `writers` Lance writers at once. Returns a StagedWrite carrying
+    /// the replacement fragments. HEAD does NOT advance.
     ///
     /// Lance shape: `InsertBuilder::with_params(WriteParams { mode: Overwrite, .. })
     /// .execute_uncommitted(batches)` produces a `Transaction` whose
     /// `Operation::Overwrite` carries the new schema + fragments, sized by
-    /// Lance's own fragment target. Zero-row batches contribute nothing; with
-    /// no row at all the transaction carries no fragment and the first batch's
-    /// schema, or the dataset's own schema when no batch was given. The
-    /// transaction is committed via `commit_staged` (same call as
-    /// `stage_append`).
+    /// Lance's own fragment target, and writes those files one after another.
+    /// So the batches are cut at that target into contiguous chunks, one call
+    /// per chunk with `writers` calls in flight, and the chunks' fragments
+    /// are joined in chunk order into one `Operation::Overwrite`: the files
+    /// one call would write, in the order it would write them, numbered by
+    /// Lance at commit (the staged scan view numbers them `1..=n` itself,
+    /// whatever each call numbered). A chunk that fails leaves the finished
+    /// chunks' files unreferenced, like every staged-but-unpublished write.
+    /// Zero-row batches contribute nothing; with no row at all the
+    /// transaction carries no fragment and the first batch's schema, or the
+    /// dataset's own schema when no batch was given. The transaction is
+    /// committed via `commit_staged` (same call as `stage_append`).
     pub async fn stage_overwrite_batches(
         &self,
         ds: &Dataset,
         batches: Vec<RecordBatch>,
+        write_budget: WriteBudget,
+        writers: usize,
+    ) -> Result<StagedWrite> {
+        self.stage_overwrite_chunks(ds, batches, write_budget, writers, overwrite_chunk_rows())
+            .await
+    }
+
+    /// [`Self::stage_overwrite_batches`] with the chunk target spelled out; refuses
+    /// mixed schemas among the non-empty batches before any writer starts, as one
+    /// Lance call would, since an overwrite takes whatever schema each call brings.
+    async fn stage_overwrite_chunks(
+        &self,
+        ds: &Dataset,
+        batches: Vec<RecordBatch>,
+        write_budget: WriteBudget,
+        writers: usize,
+        chunk_rows: usize,
     ) -> Result<StagedWrite> {
         // Existing graph datasets retain stable row IDs through Overwrite;
         // keep the flag explicit at this write site too. This is not the
         // separate Lance migration API for legacy datasets without stable IDs.
         // See `stage_overwrite_preserves_stable_row_ids` and docs/dev/lance.md.
         let schema = batches.first().map(RecordBatch::schema);
-        let batches: Vec<RecordBatch> = batches
-            .into_iter()
-            .filter(|batch| batch.num_rows() > 0)
-            .collect();
-        let (transaction, mut new_fragments) = if batches.is_empty() {
+        let mut filled = batches.iter().filter(|batch| batch.num_rows() > 0);
+        if let Some(first) = filled.next()
+            && let Some(other) = filled.find(|batch| batch.schema() != first.schema())
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "stage_overwrite_batches: all batches must share one schema, {}",
+                first_schema_difference(&first.schema(), &other.schema())
+            )));
+        }
+        let chunks = overwrite_chunks(batches, chunk_rows);
+        let (transaction, mut new_fragments) = if chunks.is_empty() {
             let schema = match schema {
                 Some(schema) => {
                     LanceSchema::try_from(schema.as_ref()).map_err(OmniError::lance_internal)?
@@ -4811,19 +4741,36 @@ impl TableStore {
         } else {
             let params = WriteParams {
                 mode: WriteMode::Overwrite,
+                file_writer_options: Some(budgeted_file_writer_options(write_budget)),
                 enable_stable_row_ids: true,
                 allow_external_blob_outside_bases: true,
                 auto_cleanup: None,
                 skip_auto_cleanup: true,
                 ..Default::default()
             };
-            let transaction = InsertBuilder::new(Arc::new(ds.clone()))
-                .with_params(&params)
-                .execute_uncommitted(batches)
-                .await
-                .map_err(OmniError::storage)?;
-            let new_fragments = match &transaction.operation {
-                Operation::Overwrite { fragments, .. } => fragments.clone(),
+            let writers = writers.clamp(1, chunks.len());
+            let ds = Arc::new(ds.clone());
+            let transactions = futures::stream::iter(chunks)
+                .map(|chunk| {
+                    let ds = Arc::clone(&ds);
+                    let params = &params;
+                    async move {
+                        InsertBuilder::new(ds)
+                            .with_params(params)
+                            .execute_uncommitted(chunk)
+                            .await
+                            .map_err(|error| OmniError::storage(error).unpublished())
+                    }
+                })
+                .buffered(writers)
+                .try_collect::<Vec<Transaction>>()
+                .await?;
+            let mut transactions = transactions.into_iter();
+            let mut transaction = transactions.next().ok_or_else(|| {
+                OmniError::manifest_internal("stage_overwrite_batches: no chunk was written")
+            })?;
+            let fragments = match &mut transaction.operation {
+                Operation::Overwrite { fragments, .. } => fragments,
                 other => {
                     return Err(OmniError::manifest_internal(format!(
                         "stage_overwrite_batches: unexpected Lance operation {:?}",
@@ -4831,6 +4778,24 @@ impl TableStore {
                     )));
                 }
             };
+            for later in transactions {
+                match later.operation {
+                    Operation::Overwrite {
+                        fragments: chunk_fragments,
+                        ..
+                    } => fragments.extend(chunk_fragments),
+                    other => {
+                        return Err(OmniError::manifest_internal(format!(
+                            "stage_overwrite_batches: unexpected Lance operation {:?}",
+                            std::mem::discriminant(&other)
+                        )));
+                    }
+                }
+            }
+            let mut new_fragments = fragments.clone();
+            new_fragments
+                .iter_mut()
+                .for_each(|fragment| fragment.id = 0);
             (transaction, new_fragments)
         };
         // These IDs belong only to the pre-commit scan view. All committed
@@ -5014,6 +4979,10 @@ impl TableStore {
     /// not bypass it. Lance 9.0.0 closed that gap: matching staged rows are
     /// now returned. `staged_tests::scan_with_staged_with_filter_returns_
     /// matching_staged_rows` pins the current behavior.
+    ///
+    /// Combining independently staged keyed writes does not resolve their
+    /// overlapping keys: each write saw only the committed snapshot. The
+    /// keyed-write staging tests pin that limitation.
     ///
     /// Production never depended on either side of this. The engine's
     /// `MutationStaging` accumulator unions in-memory pending batches with
@@ -5537,46 +5506,78 @@ fn map_lance_exact_commit_error(error: lance::Error) -> OmniError {
     }
 }
 
-/// Build the `Scanner::with_fragments` argument for read-your-writes:
-/// committed manifest fragments minus any fragment IDs superseded by the
-/// staged writes, plus the staged `new_fragments`. Order is:
-///   1. committed fragments whose IDs are NOT in any staged
-///      `removed_fragment_ids` (preserves committed order),
-///   2. all staged `new_fragments` in stage order.
-///
-/// Lance's `Scanner` does not require any particular ordering between
-/// committed and staged fragments — `with_fragments` scopes the scan to
-/// exactly the supplied list. The dedup matters because merge_insert
-/// rewrites a fragment in place at the Lance layer: the rewritten
-/// fragment is in `new_fragments`, the original (which it supersedes) is
-/// in `committed` until manifest commit, and including both would yield
-/// duplicate rows.
-///
-/// **Inter-stage supersession is not handled here.** Each StagedWrite's
-/// `removed_fragment_ids` lists committed-manifest fragment IDs only; a
-/// later staged merge cannot know about an earlier staged merge's
-/// fragments (Lance's `MergeInsertBuilder` runs against the committed
-/// view). If two `stage_merge_insert`s on the same table produce rows
-/// with the same key, the combined view returns duplicates by key. The
-/// engine's mutation path enforces "per touched table: all stage_append
-/// OR exactly one stage_merge_insert" at parse time (D₂′ in
-/// `exec/mutation.rs`) so this primitive's caller never chains merges.
-/// See `stage_merge_insert` for the full contract.
-/// Sum `physical_rows` across all fragments in the supplied stages.
-/// Used by `stage_append` to compute the row-ID offset for chained
-/// `stage_append` calls against the same dataset.
-///
-/// Assumes `prior_stages` contains only `stage_append` results — see
-/// `stage_append`'s D₂′ contract. For `stage_merge_insert` results the
-/// `new_fragments` include rewrites that don't add new rows, so this
-/// would over-count.
-// Staged-write helper retained alongside the sealed storage surface; no
+/// Count fragments from earlier `stage_append` calls against the same dataset.
+/// Keyed writes are not append history: their fragments can include rewrites.
 #[allow(dead_code)]
 fn prior_stages_fragment_count(prior_stages: &[StagedWrite]) -> u64 {
     prior_stages
         .iter()
         .map(|s| s.new_fragments.len() as u64)
         .sum()
+}
+
+/// The rows one overwrite chunk holds: Lance's file target, so a chunk is
+/// the file one call would cut there.
+fn overwrite_chunk_rows() -> usize {
+    WriteParams::default().max_rows_per_file
+}
+
+/// Cut `batches` into contiguous runs of exactly `chunk_rows` rows, the last
+/// run shorter, a batch straddling the target sliced without a copy,
+/// zero-row batches dropped.
+fn overwrite_chunks(batches: Vec<RecordBatch>, chunk_rows: usize) -> Vec<Vec<RecordBatch>> {
+    let chunk_rows = chunk_rows.max(1);
+    let mut chunks = Vec::new();
+    let mut current: Vec<RecordBatch> = Vec::new();
+    let mut rows = 0;
+    for mut batch in batches.into_iter().filter(|batch| batch.num_rows() > 0) {
+        while rows + batch.num_rows() >= chunk_rows {
+            let fill = chunk_rows - rows;
+            current.push(batch.slice(0, fill));
+            chunks.push(std::mem::take(&mut current));
+            rows = 0;
+            batch = batch.slice(fill, batch.num_rows() - fill);
+        }
+        if batch.num_rows() > 0 {
+            rows += batch.num_rows();
+            current.push(batch);
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+/// The first field on which two overwrite batches' schemas differ, both
+/// types named, for the one-schema refusal.
+fn first_schema_difference(
+    expected: &arrow_schema::Schema,
+    found: &arrow_schema::Schema,
+) -> String {
+    let (expected, found) = (expected.fields(), found.fields());
+    if let Some((a, b)) = expected.iter().zip(found.iter()).find(|(a, b)| a != b) {
+        return format!(
+            "field `{}` {} in one batch and `{}` {} in another",
+            a.name(),
+            a.data_type(),
+            b.name(),
+            b.data_type()
+        );
+    }
+    match expected.len().cmp(&found.len()) {
+        std::cmp::Ordering::Less => format!(
+            "field `{}` {} in one batch only",
+            found[expected.len()].name(),
+            found[expected.len()].data_type()
+        ),
+        std::cmp::Ordering::Greater => format!(
+            "field `{}` {} in one batch only",
+            expected[found.len()].name(),
+            expected[found.len()].data_type()
+        ),
+        std::cmp::Ordering::Equal => "the schemas differ in metadata only".to_string(),
+    }
 }
 
 /// Assign sequential fragment IDs starting at `start_id`. Mirrors Lance's
@@ -5594,7 +5595,7 @@ fn assign_fragment_ids(fragments: &mut [Fragment], start_id: u64) {
     }
 }
 
-// Staged-write helper retained alongside the sealed storage surface; no
+/// Sum the physical rows from earlier `stage_append` calls against one dataset.
 #[allow(dead_code)]
 fn prior_stages_row_count(prior_stages: &[StagedWrite]) -> Result<u64> {
     let mut total: u64 = 0;
@@ -5617,9 +5618,9 @@ fn prior_stages_row_count(prior_stages: &[StagedWrite]) -> Result<u64> {
 /// for the `row_id_meta = None` case — fragments produced by
 /// `InsertBuilder::execute_uncommitted` against a stable-row-id dataset.
 ///
-/// Used only by `stage_append` for read-your-writes — see its docstring
-/// for why pre-commit assignment is needed and why diverging from Lance's
-/// commit-time IDs is safe.
+/// Used by staged appends, strict inserts and overwrites for read-your-writes.
+/// These provisional IDs never become committed identity; Lance assigns the
+/// transaction's IDs at commit.
 fn assign_row_id_meta(fragments: &mut [Fragment], start_row_id: u64) -> Result<()> {
     let mut next_row_id = start_row_id;
     for fragment in fragments {
@@ -7111,59 +7112,6 @@ fn staged_keyed_merge_result(
     ))
 }
 
-/// Precondition guard for `stage_merge_insert`, whose `FirstSeen` dedupe (Lance
-/// `processed_row_ids` bug MR-957) would also silently collapse genuine
-/// duplicate source keys. Single-column string keys only; anything else errors.
-// Staged-write helper retained alongside the sealed storage surface; no
-#[allow(dead_code)]
-fn check_batch_unique_by_keys(
-    batch: &RecordBatch,
-    key_columns: &[String],
-    context: &'static str,
-) -> Result<()> {
-    if key_columns.len() != 1 {
-        return Err(OmniError::manifest_internal(format!(
-            "{}: check_batch_unique_by_keys currently supports single-column keys only, got {:?}",
-            context, key_columns
-        )));
-    }
-    let key_col_name = &key_columns[0];
-    let column = batch.column_by_name(key_col_name).ok_or_else(|| {
-        OmniError::manifest_internal(format!(
-            "{}: source batch missing key column '{}'",
-            context, key_col_name
-        ))
-    })?;
-    let strs = column
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            OmniError::manifest_internal(format!(
-                "{}: key column '{}' is not a StringArray (got {:?})",
-                context,
-                key_col_name,
-                column.data_type()
-            ))
-        })?;
-
-    let mut seen: std::collections::HashSet<&str> =
-        std::collections::HashSet::with_capacity(batch.num_rows());
-    for i in 0..strs.len() {
-        if !strs.is_valid(i) {
-            continue;
-        }
-        let v = strs.value(i);
-        if !seen.insert(v) {
-            return Err(OmniError::manifest(format!(
-                "{}: duplicate source row for key '{}' (column '{}'); \
-                 callers must hand in a batch unique by `key_columns`",
-                context, v, key_col_name
-            )));
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7922,36 +7870,6 @@ mod tests {
             2055,
             "a persisted range must not be charged as its whole backing object"
         );
-    }
-
-    #[test]
-    fn check_batch_unique_by_keys_passes_when_all_unique() {
-        let batch = batch_with_ids(&["a", "b", "c"]);
-        check_batch_unique_by_keys(&batch, &["id".to_string()], "test").unwrap();
-    }
-
-    #[test]
-    fn check_batch_unique_by_keys_errors_on_duplicate_id() {
-        let batch = batch_with_ids(&["a", "b", "a"]);
-        let err = check_batch_unique_by_keys(&batch, &["id".to_string()], "test").unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("duplicate source row for key 'a'"),
-            "unexpected error: {msg}"
-        );
-        assert!(
-            msg.contains("unique by `key_columns`"),
-            "error should state the unique-batch precondition: {msg}"
-        );
-    }
-
-    #[test]
-    fn check_batch_unique_by_keys_rejects_multi_column_keys() {
-        let batch = batch_with_ids(&["a"]);
-        let err =
-            check_batch_unique_by_keys(&batch, &["id".to_string(), "other".to_string()], "test")
-                .unwrap_err();
-        assert!(err.to_string().contains("single-column keys only"));
     }
 }
 

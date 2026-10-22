@@ -12,19 +12,20 @@ They do not run through the HTTP server. Address a standalone graph directly,
 or select a graph from a cluster root:
 
 ```bash
-omnigraph optimize ./graph.omni
-omnigraph optimize --cluster s3://company/omnigraph --graph knowledge
+omnigraph optimize --target ./graph.omni
+omnigraph optimize --target ./cluster-root --graph knowledge
 ```
 
-Follow the command-specific concurrency requirements below. Azure writers
-must also run through `omnigraph-azure-admission`; Azure support remains a
-qualification preview pending the adversarial live-Azure matrix.
+Follow the command-specific concurrency requirements below. Operator version 1
+accepts local-file direct targets only; cloud-direct maintenance is not exposed
+by this CLI. Engine/server cloud support does not change that client boundary.
+See [operator configuration](../cli/targets.md#transport-and-capability-boundaries).
 
 ## Optimize
 
 ```bash
-omnigraph optimize ./graph.omni
-omnigraph optimize ./graph.omni --json
+omnigraph optimize --target ./graph.omni
+omnigraph optimize --target ./graph.omni --json
 ```
 
 Optimize rewrites small fragments into fewer larger fragments, rewrites every
@@ -99,8 +100,8 @@ failing the run. Run optimize again after loading or generating vectors.
 ## Rebuild full-text indexes
 
 ```bash
-omnigraph rebuild-full-text-indexes ./graph.omni --branch main
-omnigraph rebuild-full-text-indexes --cluster s3://company/omnigraph \
+omnigraph rebuild-full-text-indexes --target ./graph.omni --branch main
+omnigraph rebuild-full-text-indexes --target ./cluster-root \
   --graph knowledge --branch review --json
 ```
 
@@ -118,7 +119,7 @@ no-op with an empty index list, null commit, and empty `warnings` array. The def
 branch is `main`.
 
 `--as` supplies actor attribution for this command. Direct CLI access, including
-`--cluster`, does not load the server's Cedar policy; storage permissions are its
+`--target`, does not load the server's Cedar policy; storage permissions are its
 trust boundary. An embedded host that installs a policy checker also enforces
 the Change permission before rebuilding.
 
@@ -136,7 +137,7 @@ Repair reports, per node or edge type, how the backing dataset's Lance linear
 history stands against the graph's registration. Preview:
 
 ```bash
-omnigraph repair ./graph.omni --json
+omnigraph repair --target ./graph.omni --json
 ```
 
 Every OmniGraph table write is a detached Lance commit that a graph commit
@@ -174,6 +175,19 @@ in addition to the versions selected by the policy.
 Historical table lifetimes participate even after a type is dropped or its
 name is re-added under a new identity. Blob sidecars follow their parent data
 file's reachability.
+
+`omnigraph cleanup` is the only cleanup to run against a graph root. Lance's
+own cleanup (`cleanup_old_versions`, and every vacuum or retention tool built
+on it) does not trace OmniGraph's detached table versions. On Lance 13 it can
+delete files used only by detached versions once those files are older than
+seven days, leaving the manifests present but affected snapshots unreadable.
+This can affect the current graph or a recent commit that inherits an old file;
+files shared with retained attached versions remain protected. The same risk
+applies to the graph's catalog dataset, whose unpublished proposals and
+unattached snapshots are detached versions. If an external cleanup has run,
+stop writes and check for missing files; restore the whole root from a verified
+backup if data was deleted.
+
 A table version no graph commit ever named is unpublished staging: a write
 in flight, or one that failed before its publication. Unless a native tag
 protects it, it is deleted when the branch incarnation and graph head its
@@ -189,13 +203,13 @@ CLI only echoes the requested retention policy and exits before opening the
 graph; it does not enumerate candidates:
 
 ```bash
-omnigraph cleanup --keep 10 --older-than 7d ./graph.omni
+omnigraph cleanup --keep 10 --older-than 7d --target ./graph.omni
 ```
 
 Run the reviewed policy with `--confirm`:
 
 ```bash
-omnigraph cleanup --keep 10 --older-than 7d --confirm ./graph.omni
+omnigraph cleanup --keep 10 --older-than 7d --confirm --target ./graph.omni
 ```
 
 At least one retention option is required:
@@ -208,7 +222,10 @@ At least one retention option is required:
 A graph commit survives when either option retains it. The current HEAD of
 every live branch is always retained, and a named branch also keeps its
 oldest commit, the copy of the parent's commit it was created from, while
-the branch lives. Cleanup also retains the selected merge bases between
+the branch lives; for a branch started at a past commit, that is the commit
+it names. A commit cleanup no longer retains starts no branch
+([start a branch at a commit](../branching/index.md#start-a-branch-at-a-commit)).
+Cleanup also retains the selected merge bases between
 current branch heads and accepted merge inputs. Native tags protect the exact
 snapshots they name. A tagged graph snapshot retains all its table versions; a
 tagged table snapshot retains that version, including a detached version or a
@@ -221,10 +238,6 @@ its name is gone: immediately with `--keep` alone, and with `--older-than`
 only after every object of the fork is older than the cutoff. Native tags,
 readable graph snapshots and required native ancestors also protect forks. Choose a policy that matches
 your rollback and audit needs.
-
-For `s3://` and `az://` targets, destructive execution also requires an
-interactive confirmation or `--yes`. Non-interactive and JSON runs refuse
-without `--yes`.
 
 Before cleanup:
 

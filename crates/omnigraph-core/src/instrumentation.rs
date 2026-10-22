@@ -396,6 +396,26 @@ pub fn query_memory_limit() -> Option<u64> {
     QUERY_MEMORY_LIMIT.try_with(|bytes| *bytes).ok()
 }
 
+tokio::task_local! {
+    static CSV_SLICE_BYTES: usize;
+}
+
+/// Run `fut` with every `load csv` source it parses cut into slices of
+/// `bytes` instead of the planner's partition size. Test-only entry point;
+/// nothing in production sets it.
+pub async fn with_csv_slice_bytes<F>(bytes: usize, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    CSV_SLICE_BYTES.scope(bytes, fut).await
+}
+
+/// The slice size a test installed for this task, if any; `None` in
+/// production.
+pub fn csv_slice_bytes() -> Option<usize> {
+    CSV_SLICE_BYTES.try_with(|bytes| *bytes).ok()
+}
+
 /// Reservations and execution metrics observed by v2 acceptance tests.
 /// Holding a pool here keeps the observer alive without retaining reservations.
 #[derive(Clone, Debug, Default)]
@@ -1609,7 +1629,7 @@ pub fn record_stage_append(rows: u64) {
     });
 }
 
-/// Record one `stage_merge_insert` of `rows` rows against the active probes.
+/// Record one merge-insert keyed stage of `rows` rows against the active probes.
 /// No-op in production (no probes installed).
 pub fn record_stage_merge_insert(rows: u64) {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
@@ -2058,8 +2078,8 @@ async fn dataset_builder(
     let session = session
         .cloned()
         .unwrap_or_else(crate::lance_access::control_session);
+    let mut store_params = crate::storage::lance_store_params_for_session(uri, &session)?;
     builder = builder.with_session(session);
-    let mut store_params = crate::storage::lance_store_params_for_uri(uri)?;
     if let Some(wrapper) = wrapper {
         store_params.object_store_wrapper = Some(wrapper.clone());
     }
@@ -2149,6 +2169,12 @@ impl CountingStorageAdapter {
 
 #[async_trait]
 impl StorageAdapter for CountingStorageAdapter {
+    fn binding(&self) -> Option<crate::storage::CapturedStorageBinding> {
+        self.inner.binding()
+    }
+    fn io_scope(&self) -> Option<crate::storage::StorageIoScope> {
+        self.inner.io_scope()
+    }
     async fn read_text(&self, uri: &str) -> Result<String> {
         self.counts.read_text.fetch_add(1, Ordering::Relaxed);
         self.inner.read_text(uri).await

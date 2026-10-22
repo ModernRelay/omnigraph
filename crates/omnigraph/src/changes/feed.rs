@@ -486,7 +486,8 @@ impl<'a> PollSnapshots<'a> {
                 .cut
                 .buffer
                 .record_of(buffered, &self.cut.head_record.tables);
-            let snapshot = Snapshot::wrap(record.snapshot(self.root_uri)?);
+            let snapshot =
+                Snapshot::wrap(record.snapshot(self.root_uri, &self.cut.control_session)?);
             (record.commit, snapshot)
         } else {
             let record = self.settled.remove(commit_id).ok_or_else(|| {
@@ -495,7 +496,8 @@ impl<'a> PollSnapshots<'a> {
                      `__history` does not hold its record"
                 ))
             })?;
-            let snapshot = Snapshot::wrap(record.snapshot(self.root_uri)?);
+            let snapshot =
+                Snapshot::wrap(record.snapshot(self.root_uri, &self.cut.control_session)?);
             (record.commit, snapshot)
         };
         if let Some(native) = &commit.native_branch

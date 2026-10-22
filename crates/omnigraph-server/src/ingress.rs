@@ -4,8 +4,8 @@
 
 use axum::body::{Body, Bytes};
 use axum::extract::{FromRequestParts, MatchedPath, Path, Request};
+use axum::http::Method;
 use axum::http::request::Parts;
-use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
 use futures::Stream;
@@ -30,10 +30,10 @@ pub(crate) struct BodyDeadline(pub(crate) Instant);
 pub(crate) type McpGraphRequest = Arc<OnceLock<GraphRequest>>;
 
 pub(crate) fn body_timeout() -> ApiError {
-    let mut error =
-        ApiError::bad_request("request body deadline exceeded before operation admission");
-    error.status = StatusCode::REQUEST_TIMEOUT;
-    error
+    ApiError::new(
+        crate::api::ErrorCode::RequestTimeout,
+        "request body deadline exceeded before operation admission",
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -44,7 +44,10 @@ enum AdmissionClass {
 
 async fn classify(parts: &mut Parts, route: &str) -> Result<AdmissionClass, ApiError> {
     if parts.method == Method::POST
-        && matches!(route, "/queries/{name}" | "/queries/{name}/if-graph-commit")
+        && matches!(
+            route,
+            "/queries/{query_name}" | "/queries/{query_name}/if-graph-commit"
+        )
     {
         let handle = parts
             .extensions
@@ -68,11 +71,12 @@ async fn classify(parts: &mut Parts, route: &str) -> Result<AdmissionClass, ApiE
                 return Err(ApiError::not_found("stored query not found"));
             }
         }
-        let Path(crate::handlers::QueryNamePath { name }) = Path::from_request_parts(parts, &())
-            .await
-            .map_err(|error| {
-                ApiError::bad_request(format!("invalid stored query path: {error}"))
-            })?;
+        let Path(crate::handlers::QueryNamePath { query_name: name }) =
+            Path::from_request_parts(parts, &())
+                .await
+                .map_err(|error| {
+                    ApiError::bad_request(format!("invalid stored query path: {error}"))
+                })?;
         return Ok(
             if handle
                 .queries
@@ -174,17 +178,18 @@ pub(crate) async fn admit(
             .await
             .map_err(|_| body_timeout())?
             .map_err(|error| {
-                let mut failure = ApiError::bad_request(format!("request body refused: {error}"));
                 // The existing extractor limits use 413 for this same bound.
                 // Other body transport failures remain a malformed request.
                 use std::error::Error;
-                if error
+                let code = if error
                     .source()
                     .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
                 {
-                    failure.status = StatusCode::PAYLOAD_TOO_LARGE;
-                }
-                failure
+                    crate::api::ErrorCode::PayloadTooLarge
+                } else {
+                    crate::api::ErrorCode::BadRequest
+                };
+                ApiError::new(code, format!("request body refused: {error}"))
             })?;
         lease
             .shrink(bytes.len() as u64)
@@ -201,6 +206,7 @@ pub(crate) async fn admit(
         AdmissionClass::Read => {
             // Wrap before offering the owned result: even an unpolled oneshot
             // response must retain its graph through the stream's destruction.
+            // Its task also keeps the request's record of submitted writes.
             let response_observer = observer.clone();
             let response_input = lease.clone();
             let response_graph = graph.clone();
@@ -221,7 +227,7 @@ pub(crate) async fn admit(
         // Effectful handlers register through the owned-write boundary once
         // their typed input, actor and operation reservations are captured.
         AdmissionClass::Write => Ok(observe_response(
-            next.run(request).await,
+            crate::operations::scope_request(next.run(request)).await,
             observer,
             lease,
             graph,
@@ -300,6 +306,7 @@ mod tests {
     use super::*;
     use axum::Router;
     use axum::extract::State;
+    use axum::http::StatusCode;
     use axum::middleware;
     use axum::routing::{MethodRouter, get, post};
     use futures::StreamExt;
@@ -598,6 +605,14 @@ mod tests {
         assert_eq!(state.workload.snapshot(), WorkloadSnapshot::default());
     }
 
+    async fn error_code(response: Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        body["code"].as_str().unwrap().to_string()
+    }
+
     #[tokio::test]
     async fn ordinary_body_deadline_refuses_without_dispatch_or_retained_capacity() {
         let (app, state, entered) = router(WorkloadLimits {
@@ -610,6 +625,7 @@ mod tests {
             .expect("the input deadline must bound an incomplete body")
             .unwrap();
         assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(error_code(response).await, "request_timeout");
         assert_eq!(entered.load(Ordering::SeqCst), 0);
         assert_eq!(state.operations.snapshot().active_reads, 0);
         assert_eq!(state.workload.snapshot(), WorkloadSnapshot::default());
@@ -627,6 +643,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(error_code(response).await, "payload_too_large");
         assert_eq!(entered.load(Ordering::SeqCst), 0);
         assert_eq!(state.operations.snapshot().active_reads, 0);
         assert_eq!(state.workload.snapshot(), WorkloadSnapshot::default());

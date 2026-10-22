@@ -1,7 +1,6 @@
 //! Graph data transfer through the existing client and streaming boundaries.
 use crate::client::GraphClient;
 use crate::helpers::resolve_branch;
-use crate::planes::Capability;
 use color_eyre::eyre::Result;
 use std::io::Write;
 
@@ -17,14 +16,10 @@ pub(crate) use load::run_load;
 #[derive(Clone, Copy)]
 pub(crate) struct TransferScope<'a> {
     pub(crate) operator: &'a crate::operator::InvocationConfig,
-    pub capability: Capability,
-    pub server: Option<&'a str>,
+    pub target: &'a crate::targets::ResolvedTarget,
     pub graph: Option<&'a str>,
     pub actor: Option<&'a str>,
-    pub profile: Option<&'a str>,
-    pub store: Option<&'a str>,
     pub yes: bool,
-    pub quiet: bool,
 }
 
 pub(crate) async fn run_export(
@@ -33,22 +28,9 @@ pub(crate) async fn run_export(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
-    let ExportArgs {
-        uri,
-        branch,
-        type_names,
-    } = args;
-    let client = GraphClient::resolve(
-        scope.operator,
-        scope.capability,
-        scope.server,
-        scope.graph,
-        uri,
-        scope.profile,
-        scope.store,
-        stderr,
-    )
-    .await?;
+    let ExportArgs { branch, type_names } = args;
+    let client =
+        GraphClient::from_target(scope.operator, scope.target, scope.graph, None, stderr).await?;
     let branch = resolve_branch(branch, None, "main");
     execute_export(&client, &branch, &type_names, stdout).await
 }

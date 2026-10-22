@@ -1,11 +1,11 @@
 //! The clap surface: every command, subcommand, and argument struct
-//! (moved verbatim from main.rs in the modularization).
-
-use std::path::PathBuf;
+//! Profiles select control operations; targets select resources.
 
 pub(crate) use crate::commands::cluster::{ClusterCommand, ClusterMembersCommand, ClusterRunArgs};
 pub(crate) use crate::commands::control::{GraphsCommand, PolicyCommand, QueriesCommand};
-pub(crate) use crate::commands::local::{ProfileCommand, SkillCommand};
+pub(crate) use crate::commands::local::SkillCommand;
+pub(crate) use crate::commands::mcp::McpArgs;
+pub(crate) use crate::commands::targets::{AccessArgs, CredentialCommand, TargetCommand};
 pub(crate) use crate::managed::args::{
     OrganizationArgs, OrganizationCommand, OrganizationInvitationsCommand,
     OrganizationMembersCommand,
@@ -17,7 +17,7 @@ use crate::commands::history::{DiffArgs, SnapshotArgs};
 use crate::commands::maintenance::{
     CleanupArgs, OptimizeArgs, RebuildFullTextIndexesArgs, RepairArgs, UpgradeArgs,
 };
-use crate::commands::query::{AliasArgs, MutateArgs, QueryArgs};
+use crate::commands::query::{AliasArgs, CatalogueArgs, MutateArgs, QueryArgs};
 pub(crate) use crate::commands::schema::SchemaCommand;
 use crate::commands::schema::{InitArgs, LintArgs};
 pub(crate) use crate::commands::transfer::{BlobCommand, CliLoadMode};
@@ -28,78 +28,32 @@ use crate::embed::EmbedArgs;
 #[command(name = "omnigraph")]
 #[command(about = "Omnigraph graph database CLI")]
 #[command(version = crate::commands::local::output::PACKAGE_VERSION.as_str(), disable_version_flag = true)]
-// Subcommands render in declaration order (clap can't print labeled headings
-// between groups), so this legend names the capability each command needs —
-// the user-facing vocabulary (RFC-011). `Plane` stays the internal classifier.
-#[command(after_help = "\
-COMMANDS BY CAPABILITY:\n  \
-any — run against a graph, served (--server / --profile) or embedded (--store / a \
-URI): query, mutate, load, blob, branch, snapshot, export, commit, changes, schema show.\n  \
-served — require a server: graphs (registry scope).\n  \
-direct — direct storage access; reject --server (init, upgrade, optimize, rebuild-full-text-indexes, \
-repair, cleanup, schema plan/apply, lint).\n  \
-control — manage or inspect a cluster (--config for bundles; explicit --cluster roots for \
-self-hosted deployment/recovery; --managed for the managed service; policy & queries via --cluster).\n  \
-local — no explicit graph scope; local config & tooling: alias, embed, login, logout, profile, skill, version.\n\
-MANAGED FOLDERS: cluster --managed uses .omnigraph/context; data commands acquire identity credentials automatically.\n\
-Implicit query, mutate, load and commit list/show use folder context and require --graph.\n\
-Explicit target selectors retain ordinary addressing; competing ambient targets refuse.\n\
---direct selects ordinary addressing, including operator profiles and defaults.\n\
-See the 'Command capabilities' section of the CLI reference for which flags apply where.")]
+#[command(
+    after_help = "Select resources with --target and account operations with --profile.
+--operator-config selects one operator file.
+--config supplies deployment sources. Use config validate and target inspect for offline checks."
+)]
 pub(crate) struct Cli {
-    /// Use ordinary addressing and operator credentials, ignoring folder context.
-    #[arg(long, global = true)]
-    pub(crate) direct: bool,
+    #[arg(long, global = true, help = "Named profile for control-plane operations; otherwise defaults.profile", conflicts_with = "target", value_parser = crate::invocation::single_selector("--profile"))]
+    pub(crate) profile: Option<String>,
+    #[arg(long, global = true, help = "Use this operator configuration file instead of the default, without merging", value_parser = crate::invocation::single_selector("--operator-config"))]
+    pub(crate) operator_config: Option<String>,
+    /// Named resource target or inline local storage address; otherwise defaults.target.
+    #[arg(long, global = true, value_name = "NAME|ADDRESS", value_parser = crate::invocation::single_selector("--target"))]
+    pub(crate) target: Option<String>,
 
     /// Actor id for direct-engine writes and actor-bound cluster operations;
-    /// overrides `operator.actor`. No effect on remote writes (the server
-    /// resolves the actor from the bearer token). With a policy configured
-    /// but no actor set, the operation is denied — see
-    /// docs/user/operations/policy.md.
-    #[arg(long = "as", global = true, value_name = "ACTOR")]
+    /// On a served write, and on every request `mcp` relays, it is an assertion:
+    /// the request carries `omnigraph-if-actor`, and the server refuses it
+    /// before anything runs when the bearer token resolves to another actor.
+    /// With a policy configured but no actor set, a direct operation is
+    /// denied — see docs/user/operations/policy.md.
+    #[arg(long = "as", global = true, value_name = "ACTOR", value_parser = crate::invocation::single_selector("--as"))]
     pub(crate) as_actor: Option<String>,
 
-    /// Address a server by name (resolves to its `url` from `servers:` in
-    /// ~/.omnigraph/config.yaml) or by a literal `http(s)://` URL or
-    /// `unix:///absolute/path.sock` socket. Exclusive with a positional URI.
-    #[arg(long, global = true, value_name = "NAME|URL")]
-    pub(crate) server: Option<String>,
-
-    /// Select a graph within a multi-graph scope: on a `--server` it appends
-    /// `/graphs/<id>` to the server url; on `--cluster` it picks which cluster
-    /// graph to maintain. Rejected on a single-graph address (a positional URI /
-    /// `--store`). Required for managed queries, mutations, loads, and commit reads.
-    #[arg(long, global = true, value_name = "GRAPH_ID")]
+    /// Graph within a server or direct-root target; overrides default_graph.
+    #[arg(long, global = true, value_name = "GRAPH_ID", value_parser = crate::invocation::single_selector("--graph"))]
     pub(crate) graph: Option<String>,
-
-    /// Select a named scope bundle from `profiles:` in
-    /// ~/.omnigraph/config.yaml: fills in this command's omitted addressing
-    /// (server/cluster/store + default graph). Falls back to
-    /// $OMNIGRAPH_PROFILE. Config data, not state — every command resolves
-    /// scope fresh.
-    #[arg(long, global = true, value_name = "NAME")]
-    pub(crate) profile: Option<String>,
-
-    /// Address a single graph's storage directly: a `file://`, `s3://`, or
-    /// `az://` store URI. Azure is a qualification preview: code, Azurite,
-    /// and a safe live managed-identity smoke are complete; adversarial
-    /// qualification remains pending.
-    /// Explicit, ad-hoc direct access — bypasses any server. Azure write
-    /// commands still require the root-scoped external admission wrapper.
-    /// Exclusive with a positional URI / `--server`.
-    #[arg(long, global = true, value_name = "URI")]
-    pub(crate) store: Option<String>,
-
-    /// Address a cluster. Cluster apply/status/force-unlock/upgrade-ledger accept
-    /// a literal file://, s3:// or az:// storage root independently of local
-    /// bundle files. Root-addressed apply reconciles an exact --deployment-id.
-    /// Maintenance also accepts a cluster directory or a `clusters:` name from
-    /// ~/.omnigraph/config.yaml; pair it with --graph to select the graph.
-    /// Azure writes still require the cluster-root external admission wrapper
-    /// and remain a qualification preview. Exclusive with a positional URI,
-    /// --store or --server; root-addressed cluster commands also reject explicit --config.
-    #[arg(long, global = true, value_name = "DIR|URI")]
-    pub(crate) cluster: Option<String>,
 
     /// Skip the confirmation prompt for a destructive write (`cleanup`,
     /// overwrite `load`, `branch delete`) against a non-local scope.
@@ -107,11 +61,6 @@ pub(crate) struct Cli {
     /// and refuses (errors) when there is no TTY or `--json` is set.
     #[arg(long, global = true)]
     pub(crate) yes: bool,
-
-    /// Suppress the one-line resolved-write-target diagnostic that write
-    /// commands echo to stderr.
-    #[arg(long, global = true)]
-    pub(crate) quiet: bool,
 
     #[command(subcommand)]
     pub(crate) command: Command,
@@ -122,19 +71,18 @@ pub(crate) enum Command {
     /// Manage people and invitations in the selected organization.
     #[command(visible_alias = "org")]
     Organization {
-        /// Use the managed service and your cached organization identity.
-        #[arg(long, global = true)]
-        managed: bool,
         #[command(flatten)]
-        target: OrganizationArgs,
+        args: OrganizationArgs,
         #[command(subcommand)]
         command: OrganizationCommand,
     },
-    // ── Data plane ── run against a graph (embedded or via --server).
+    // Graph operations.
     /// Execute a read query, a branch read (`branch list`, `branch diff`, `branch merge-base`, `branch merge … dry run`), or an `explain` statement against a branch or snapshot.
     ///
     /// Run a read query.
     Query(QueryArgs),
+    /// Query this binary's engine catalogue without storage, configuration or credentials.
+    Catalogue(CatalogueArgs),
     /// Execute a mutation, or one `branch create`/`delete`/`merge` statement.
     ///
     /// Run a mutation.
@@ -142,8 +90,8 @@ pub(crate) enum Command {
     /// Invoke an operator alias.
     ///
     /// An alias is a personal binding under `aliases:` in
-    /// ~/.omnigraph/config.yaml — name → (server, graph, stored-query name,
-    /// default params). `omnigraph alias <name> [args]` invokes the bound
+    /// ~/.omnigraph/config.yaml — name → (target, graph, stored-query name,
+    /// default params). `omnigraph alias <name> --params '{"key":"value"}'` invokes the bound
     /// stored query on its server. Living in its own namespace, an alias can
     /// never shadow or be shadowed by a built-in verb. Replaces the removed
     /// `--alias` flag on `query`/`mutate`.
@@ -190,7 +138,7 @@ pub(crate) enum Command {
         command: GraphsCommand,
     },
 
-    // ── Storage / local graph ops ── direct storage or local files; reject --server.
+    // ── Storage / local graph ops ── direct storage or local files.
     /// Initialize a new graph from a schema
     Init(InitArgs),
     /// Convert a standalone graph's storage offline from format v8, v9 or v13 to
@@ -215,12 +163,8 @@ pub(crate) enum Command {
     },
 
     // ── Control plane ── manage a cluster directory (--config <dir>).
-    /// Deploy and inspect a cluster; --managed selects its managed service API.
+    /// Deploy and inspect the selected cluster target.
     Cluster {
-        /// Use the managed service and the selected folder's .omnigraph/context.
-        /// Never inferred from context; incompatible with other target selectors.
-        #[arg(long, global = true)]
-        managed: bool,
         #[command(subcommand)]
         command: ClusterCommand,
     },
@@ -232,56 +176,56 @@ pub(crate) enum Command {
     },
     /// Generate, clean, or refresh explicit seed embeddings
     Embed(EmbedArgs),
-    /// Store a bearer token for a named server (0600 credentials file). Token
-    /// via --token or piped on stdin; see the CLI reference for token resolution.
+    /// Sign in to an existing managed profile, or explicitly create one.
     Login {
-        /// Server name (keys the credential; declare its url under
-        /// `servers:` in ~/.omnigraph/config.yaml)
-        #[arg(required_unless_present = "api", conflicts_with = "api")]
-        name: Option<String>,
-        /// Reuse or renew a managed session; use browser device authorization when needed.
-        #[arg(long, conflicts_with = "token")]
+        #[arg(long, conflicts_with_all = ["create_profile", "api", "organization"])]
+        replace_principal: Option<String>,
+        /// Create a new local profile after verifying login and organization selection.
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["profile", "target"], value_parser = crate::invocation::single_selector("--create-profile"))]
+        create_profile: Option<String>,
+        /// Control-plane endpoint for the new profile; defaults to https://platform.omnigraph.dev.
+        #[arg(long, requires = "create_profile", conflicts_with_all = ["profile", "target"])]
         api: Option<String>,
-        /// Select the managed organization; never changes an existing session account.
-        #[arg(long, requires = "api", conflicts_with = "name")]
+        /// Organization to verify when creating the profile; otherwise discover it during login.
+        #[arg(long, requires = "create_profile", conflicts_with_all = ["profile", "target"])]
         organization: Option<String>,
-        /// The token. Prefer piping via stdin over this flag (shell
-        /// history).
-        #[arg(long)]
-        token: Option<String>,
         #[arg(long)]
         json: bool,
     },
-    /// Remove a named server's stored credential. Idempotent.
+    /// Remove the selected managed session and attempt remote revocation.
     Logout {
-        #[arg(required_unless_present = "api", conflicts_with = "api")]
-        name: Option<String>,
-        /// Revoke the managed session and remove its OS keychain entry.
-        #[arg(long)]
-        api: Option<String>,
-        /// Select the managed organization; never changes an existing session account.
-        #[arg(long, requires = "api", conflicts_with = "name")]
-        organization: Option<String>,
         #[arg(long)]
         json: bool,
     },
-    /// Select a managed cluster for this config directory.
-    Use {
-        cluster_id: String,
-        #[arg(long)]
-        api: String,
-        /// Select the managed organization.
-        #[arg(long)]
-        organization: Option<String>,
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Inspect the scope profiles in ~/.omnigraph/config.yaml (read-only).
-    Profile {
+    /// Inspect or edit complete target entries in operator configuration.
+    Target {
         #[command(subcommand)]
-        command: ProfileCommand,
+        command: TargetCommand,
+    },
+    /// Say who you are at a target and what you may do there: the actions
+    /// the graph's policy grants, graph-wide and on a branch.
+    Access(AccessArgs),
+    /// Manage an explicitly selected owner/profile credential or export access through a pipe.
+    #[command(name = "credentials")]
+    Credential {
+        #[command(subcommand)]
+        command: CredentialCommand,
+    },
+    /// Relay an agent's MCP over stdio to an existing server target's `/mcp`.
+    ///
+    /// For agents that start their tools as child processes. The bridge sends
+    /// the target's stored credential, which the agent never sees, and is
+    /// bound to one graph: `--graph`, else the target's `default_graph`.
+    /// It only connects: a direct target refuses, and it never starts,
+    /// discovers or hosts a server. stdout carries only MCP messages and
+    /// diagnostics go to stderr.
+    Mcp(McpArgs),
+    #[command(
+        about = "Validate operator configuration, rename bindings, or recover interrupted edits"
+    )]
+    Config {
+        #[command(subcommand)]
+        command: crate::commands::targets::ConfigCommand,
     },
     /// Export or print the agent skill built into this binary, which matches
     /// this CLI's commands and HTTP contract.

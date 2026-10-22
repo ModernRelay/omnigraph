@@ -46,6 +46,14 @@ impl LanceAccessContext {
         }
     }
 
+    /// Carry the same immutable destination through native data and control IO.
+    pub fn with_storage(storage: &dyn crate::storage::StorageAdapter) -> Self {
+        match storage.binding() {
+            Some(binding) => Self::with_registry(bound::registry(binding, storage.io_scope())),
+            None => Self::with_io_scope(storage.io_scope()),
+        }
+    }
+
     fn with_registry(registry: Arc<ObjectStoreRegistry>) -> Self {
         Self {
             data_session: Arc::new(Session::new(
@@ -66,7 +74,15 @@ impl LanceAccessContext {
     }
 }
 
+mod bound;
 mod scoped;
+
+pub(crate) fn has_captured_provider(session: &Arc<Session>) -> bool {
+    session
+        .store_registry()
+        .get_provider(bound::MARKER)
+        .is_some()
+}
 
 /// Control-plane session for `__manifest` and other mutable-tip metadata.
 ///
@@ -91,6 +107,17 @@ pub fn statement_session(
         metadata_cache_bytes,
         registry,
     ))
+}
+
+/// Source-side store registry after external Blob policy authorization.
+/// A captured graph destination must not override an external input's provider.
+/// Ordinary embedded and scoped sessions retain their existing registry.
+pub fn external_source_registry(session: &Arc<Session>) -> Arc<ObjectStoreRegistry> {
+    if has_captured_provider(session) {
+        Arc::clone(&STORE_REGISTRY)
+    } else {
+        session.store_registry()
+    }
 }
 
 /// DST seam (Lance-realm listing): the process-wide Lance object-store

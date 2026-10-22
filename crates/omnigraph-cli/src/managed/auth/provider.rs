@@ -136,6 +136,9 @@ impl Provider {
     pub fn new(config: &Config) -> Result<Self> {
         config.validate()?;
         let http = reqwest::Client::builder()
+            .no_proxy()
+            .tls_built_in_webpki_certs(false)
+            .tls_built_in_native_certs(true)
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(10))
@@ -213,7 +216,7 @@ pub(super) fn failure(error: &workos::Error) -> Failure {
         Some("access_denied") => Failure::refused("device_denied", "device sign-in was denied"),
         Some("expired_token") => Failure::refused(
             "device_expired",
-            "device sign-in expired; run login --api again",
+            "device sign-in expired; run login --target NAME again",
         ),
         _ => Failure::new(
             "identity_provider_unavailable",

@@ -161,6 +161,114 @@ async fn failed_mutation_leaves_target_unchanged() {
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
 }
 
+/// A storage failure while a mutation stages its files is a definite
+/// failure: the error keeps its storage cause and carries `Unpublished`, the
+/// graph is unchanged, and the next write on the same handle publishes. The
+/// fault is real backend I/O, a file planted where the table's `data/`
+/// directory goes.
+#[tokio::test]
+async fn storage_failure_while_staging_is_definite_issue_1067() {
+    use omnigraph::error::CompletionEvidence;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = session(Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap());
+    let person = snapshot_main(&db)
+        .await
+        .unwrap()
+        .dataset("node:Person")
+        .unwrap()
+        .dataset_path
+        .clone();
+    let data_blocker = dir.path().join(person.trim_start_matches('/')).join("data");
+    if data_blocker.is_dir() {
+        std::fs::remove_dir(&data_blocker).expect("an empty table has no data files yet");
+    }
+    std::fs::write(&data_blocker, b"not a directory").unwrap();
+
+    let error = mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "stranded")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.storage_failure().is_some(),
+        "the staged data-file write fails in storage: {error:?}"
+    );
+    assert_eq!(
+        error.completion_evidence(),
+        Some(CompletionEvidence::Unpublished),
+        "a storage failure before publication is definite: {error:?}"
+    );
+    assert_eq!(count_rows(&db, "node:Person").await, 0);
+
+    std::fs::remove_file(&data_blocker).unwrap();
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "after")], &[("$age", 31)]),
+    )
+    .await
+    .expect("the next write on the same handle publishes");
+    assert_eq!(count_rows(&db, "node:Person").await, 1);
+}
+
+/// A storage failure while the publisher writes the `__manifest`
+/// transaction file, before Lance sends the manifest, is definite: the error
+/// carries `Unpublished` and is not a publication in doubt, the graph is
+/// unchanged, and the next write on the same handle publishes. This is the
+/// shape of the 2026-10-19 containment, where one throttled transaction-file
+/// PUT was answered in doubt. The fault is real backend I/O: a file planted
+/// where `__manifest/_transactions/` goes.
+#[tokio::test]
+async fn publisher_failure_before_the_manifest_put_is_definite_issue_1067() {
+    use omnigraph::error::CompletionEvidence;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = session(Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap());
+    let transactions = dir.path().join("__manifest/_transactions");
+    let parked = dir.path().join("__manifest/_transactions.parked");
+    assert!(transactions.is_dir(), "init wrote the genesis transaction");
+    std::fs::rename(&transactions, &parked).unwrap();
+    std::fs::write(&transactions, b"not a directory").unwrap();
+
+    let error = mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "stranded")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        !error.is_manifest_publish_in_doubt(),
+        "no manifest request was sent: {error:?}"
+    );
+    assert_eq!(
+        error.completion_evidence(),
+        Some(CompletionEvidence::Unpublished),
+        "a publisher failure before the manifest put is definite: {error:?}"
+    );
+
+    std::fs::remove_file(&transactions).unwrap();
+    std::fs::rename(&parked, &transactions).unwrap();
+    assert_eq!(count_rows(&db, "node:Person").await, 0);
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "after")], &[("$age", 31)]),
+    )
+    .await
+    .expect("the next write on the same handle publishes");
+    assert_eq!(count_rows(&db, "node:Person").await, 1);
+}
+
 /// Mutation text the parser refuses keeps its diagnostic through the engine
 /// door, as read text does: the code and the position survive, and nothing
 /// is published.
@@ -1409,6 +1517,99 @@ async fn load_csv_overwrite_admits_compact_keys_under_default_memory() {
         helpers::count_rows_branch(&db, "main", "node:Person").await,
         ROWS
     );
+}
+
+/// A source cut into many slices loads the same rows in the same order as one
+/// slice, and the receipt records every slice; GQT cannot shrink the 8 MiB
+/// slice without an 8 MiB fixture.
+#[tokio::test]
+async fn load_csv_overwrite_from_many_slices_keeps_source_order() {
+    use omnigraph::instrumentation::with_csv_slice_bytes;
+    use omnigraph::loader::CsvLoadRequest;
+    use omnigraph_compiler::query::ast::LoadTarget;
+    use std::io::Write;
+
+    const ROWS: usize = 2_000;
+    let source_dir = tempfile::tempdir().unwrap();
+    let csv_path = source_dir.path().join("people.csv");
+    let mut csv = std::io::BufWriter::new(std::fs::File::create(&csv_path).unwrap());
+    writeln!(csv, "key,name").unwrap();
+    for row in 0..ROWS {
+        writeln!(csv, "{row},p{row:04}").unwrap();
+    }
+    csv.flush().unwrap();
+    drop(csv);
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(source_dir.path()).unwrap(),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let graph_dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(
+            graph_dir.path().to_str().unwrap(),
+            "node Person { key: I64 @key name: String }",
+        )
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy)
+        .unwrap(),
+    );
+    let request = CsvLoadRequest {
+        source: format!("file://{}", csv_path.display()),
+        target: LoadTarget::Node("Person".to_string()),
+        mode: LoadMode::Overwrite,
+        delimiter: b',',
+        header: true,
+        columns: None,
+    };
+    let receipt = with_csv_slice_bytes(64, db.load_csv_as_with_receipt("main", &request, None))
+        .await
+        .unwrap();
+    assert_eq!(receipt.result.nodes_loaded.values().sum::<usize>(), ROWS);
+    let executed = receipt.executed_plan().expect("an overwrite runs the plan");
+    assert_eq!(
+        executed.partitions, 1,
+        "a source under 8 MiB plans one partition"
+    );
+    let source = &executed.operators[0];
+    assert_eq!((source.node.as_str(), source.partitions), ("CsvSource", 1));
+    assert!(source.slices.len() > 1, "{} slices", source.slices.len());
+    assert_eq!(
+        source
+            .slices
+            .iter()
+            .map(|slice| slice.slice)
+            .collect::<Vec<_>>(),
+        (0..source.slices.len() as u32).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        source.slices.iter().map(|slice| slice.rows).sum::<u64>(),
+        ROWS as u64
+    );
+    assert!(
+        executed.operators[1..]
+            .iter()
+            .all(|operator| operator.partitions == 1 && operator.slices.is_empty())
+    );
+    let batches = helpers::read_table(db.db(), "node:Person").await;
+    let keys: Vec<i64> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("key")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(keys, (0..ROWS as i64).collect::<Vec<_>>());
 }
 
 /// Update predicate matching is itself a bounded allocation. The committed
@@ -2665,8 +2866,8 @@ query del_age_then_name($threshold: I32, $name: String) {
 
 /// `insert Person 'X'; update Person where name='X' set age=...` — both
 /// ops produce content on `node:Person` and coalesce into one
-/// `stage_merge_insert` at end-of-query. The accumulator's last-write-wins
-/// dedupe (during `MutationStaging::stage_all`) ensures the update's value
+/// `stage_keyed_write` at end-of-query. The accumulator's last-write-wins
+/// dedupe (during `prepare_pending_table`) ensures the update's value
 /// wins. Single Lance commit per table per query.
 #[tokio::test]
 async fn mixed_insert_and_update_on_same_person_coalesces_to_one_merge() {
@@ -3645,21 +3846,9 @@ query scalars() {
     assert_eq!(scalars().await, unchanged_scalars);
 }
 
-/// MR-920 regression: two sequential `update T set {f:v} where x=y`
-/// invocations against the same row must both succeed. Pre-fix, the
-/// second one failed with `Ambiguous merge inserts are prohibited:
-/// multiple source rows match the same target row on (id = "Alice")`
-/// even though the scan returned exactly one row.
-///
-/// Root cause hypothesis (per MR-920): Lance's
-/// `processed_row_ids: Mutex<HashSet<u64>>`
-/// (`src/dataset/write/merge_insert.rs:2099`) double-processes the
-/// same target row_id against datasets previously rewritten by
-/// merge_insert. `SourceDedupeBehavior::FirstSeen` makes Lance skip
-/// rather than error.
-///
-/// Companion to `consistency.rs::load_merge_repeated_against_overlapping_keys_succeeds`
-/// (PR #98 / Window 1 of the bug class via the load surface).
+/// Two sequential updates to one row must both succeed and retain the second
+/// value. This preserves the mutation regression for lance-format/lance#6877
+/// alongside the repeated merge-load owner in `consistency.rs`.
 #[tokio::test]
 async fn second_sequential_update_on_same_row_succeeds() {
     let dir = tempfile::tempdir().unwrap();

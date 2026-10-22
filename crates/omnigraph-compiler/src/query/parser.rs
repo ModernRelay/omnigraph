@@ -323,6 +323,18 @@ fn parse_branch_stmt(
     let dry_run = has(Rule::dry_run_clause);
     let between = has(Rule::kw_to);
     let page = parse_diff_page_clause(&form)?;
+    let from_commit = form
+        .clone()
+        .into_inner()
+        .find(|inner| inner.as_rule() == Rule::create_from_commit)
+        .map(|pair| {
+            let literal = pair
+                .into_inner()
+                .find(|inner| inner.as_rule() == Rule::string_lit)
+                .expect("grammar: create_from_commit names one string literal");
+            decode_graph_commit_id(&literal)
+        })
+        .transpose()?;
     let names = form
         .into_inner()
         .filter(|inner| inner.as_rule() == Rule::branch_name)
@@ -330,9 +342,12 @@ fn parse_branch_stmt(
         .collect::<std::result::Result<Vec<_>, QueryDiagnostic>>()?;
     let mut names = names.into_iter();
     match (rule, names.next(), names.next()) {
-        (Rule::branch_create, Some(name), from) => {
-            Ok(BranchStmt::Write(BranchWrite::Create { name, from }))
-        }
+        (Rule::branch_create, Some(name), from) => Ok(BranchStmt::Write(BranchWrite::Create {
+            name,
+            from: from_commit
+                .map(BranchCreateFrom::Commit)
+                .or(from.map(BranchCreateFrom::Branch)),
+        })),
         (Rule::branch_delete, Some(name), None) => {
             Ok(BranchStmt::Write(BranchWrite::Delete { name }))
         }

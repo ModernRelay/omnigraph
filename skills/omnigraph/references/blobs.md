@@ -60,13 +60,13 @@ OmniGraph never deletes the external source object.
 ## CLI reads
 
 Select one cell as `<node|edge> <TYPE> <ID> <PROPERTY>` and address the graph
-with `--store`, `--server`, or a profile. A keyed edge's `<ID>` is its derived
+with `--target NAME|ADDRESS`. A keyed edge's `<ID>` is its derived
 JSON-array id (for example `'["alice","bob"]'`):
 
 ```bash
-omnigraph blob stat node Document manual content --store graph.omni --json
+omnigraph blob stat node Document manual content --target ./graph.omni --json
 omnigraph blob get node Document manual content \
-  --store graph.omni --out manual.bin
+  --target ./graph.omni --out manual.bin
 ```
 
 Use `--branch` or the mutually exclusive `--snapshot`. `get` supports
@@ -83,8 +83,8 @@ CLI never follows an external URI: `get` refuses it and directs the caller to
 
 ## HTTP reads
 
-`GET` and `HEAD /graphs/{id}/blob` take `entity`, `type`, `id`, `property`, and
-either `branch` or `snapshot`, plus the `Omnigraph-Http-Api: 0.13` header every
+`GET` and `HEAD /graphs/{graph_id}/blob` take `entity`, `type`, `id`, `property`, and
+either `branch` or `snapshot`, plus the `Omnigraph-Http-Api: 0.14` header every
 protected graph route requires (`api_contract_mismatch` without it). Managed
 values support one standard `Range`,
 `ETag`, `If-Match`, and `If-None-Match`. Treat an ETag as an opaque validator of

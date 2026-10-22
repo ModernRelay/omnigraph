@@ -24,9 +24,9 @@ The upgrade is offline, and it cannot verify that itself:
 3. Check, then convert, then verify with the new binary:
 
 ```bash
-omnigraph upgrade ./graph.omni --check --json
-omnigraph upgrade ./graph.omni --json
-omnigraph commit list ./graph.omni --json
+omnigraph upgrade --target ./graph.omni --check --json
+omnigraph upgrade --target ./graph.omni --json
+omnigraph commit list --target ./graph.omni --json
 ```
 
 `--check` writes nothing. A run without `--check` first marks the graph as
@@ -109,18 +109,18 @@ Server and cluster selectors, cluster profiles and cluster-layout roots are
 refused: a cluster-managed graph is exported with the build that wrote it and
 [rebuilt](#rebuild). Paths, file URIs and symlinks resolve before that check.
 
-## v0.9 to v0.10
+## Lance substrate upgrades (v0.10, v0.14)
 
-Released v0.9.0 uses Lance 9; v0.10.0 uses Lance 11. Both use graph storage
-format v6, so existing entities, branches, and retained history do not need an
-export/import migration. Development builds using Lance 10 follow the same
-full-text upgrade procedure below.
+v0.10.0 moved from Lance 9 to Lance 11 on graph storage format v6: no export/import
+migration, but the full-text upgrade below. v0.14 moves to Lance 13 with graph
+format 16 and V2_2 data files unchanged: no `omnigraph upgrade` for a format-16
+graph, and full-text indexes stay searchable, the analyzer being unchanged.
 
-The CLI/API vocabulary changes are not rolling-compatible. Update the CLI,
-server, and client integrations together, with application traffic stopped.
-Even without full-text indexes, do not run an old and new fleet against the
-same graph. Keep the old executables and a verified whole-root backup until the
-upgrade is proven. See the [v0.10 compatibility notes](../../releases/v0.10.0.md#compatibility).
+Neither transition is rolling-compatible. Update the CLI, server, and client
+integrations together with application traffic stopped, never run an old and new
+fleet against the same graph, and keep the old executables and a verified whole-root
+backup until the upgrade is proven: a graph the new fleet has written is not qualified
+for the old reader ([Lance contract](../../dev/versioning.md#lance-contract), [v0.10 compatibility notes](../../releases/v0.10.0.md#compatibility)).
 
 ## Full-text index upgrade
 
@@ -148,8 +148,8 @@ full-text queries until the selected indexes have been rebuilt.
 4. Use the new operator CLI to rebuild each branch on the inventory checklist:
 
    ```bash
-   omnigraph rebuild-full-text-indexes ./graph.omni --branch main --as operator --json
-   omnigraph rebuild-full-text-indexes ./graph.omni --branch review --as operator --json
+   omnigraph rebuild-full-text-indexes --target ./graph.omni --branch main --as operator --json
+   omnigraph rebuild-full-text-indexes --target ./graph.omni --branch review --as operator --json
    ```
 
    `--as` is optional actor attribution, not server-policy authorization. Inspect
@@ -246,7 +246,7 @@ If the graph's generation is newer than the binary, upgrade the binary instead.
 
 ## System-column upgrade (legacy spellings)
 
-`omnigraph schema upgrade-system-columns <graph>` respells a served graph's
+`omnigraph schema upgrade-system-columns --target <graph>` respells a standalone graph's
 legacy system columns in place (`id`/`src`/`dst` to `__id`/`__src`/`__dst`).
 It needs a graph that normal open accepts. The respelling
 changes no storage layout and publishes the replacement contract with the
@@ -282,13 +282,13 @@ jq -c 'if has("id") then . else .id = .data.id | del(.data.id) end' \
   graph.jsonl > graph-current.jsonl
 
 # New binary (schema.pg endpoint constraints use @src and @dst)
-omnigraph init --schema schema.pg s3://bucket/graph-new.omni
+omnigraph init --schema schema.pg ./graph-new.omni
 omnigraph load --mode overwrite --data graph-current.jsonl \
-  s3://bucket/graph-new.omni
+  --target ./graph-new.omni
 
 # Verify with the new binary
-omnigraph snapshot s3://bucket/graph-new.omni --json
-omnigraph schema show s3://bucket/graph-new.omni
+omnigraph snapshot --target ./graph-new.omni --json
+omnigraph schema show --target ./graph-new.omni
 ```
 
 For another branch:
@@ -297,9 +297,9 @@ old-omnigraph export --branch review s3://bucket/graph.omni \
   > review.jsonl
 jq -c 'if has("id") then . else .id = .data.id | del(.data.id) end' \
   review.jsonl > review-current.jsonl
-omnigraph init --schema schema.pg s3://bucket/graph-review-new.omni
+omnigraph init --schema schema.pg ./graph-review-new.omni
 omnigraph load --mode overwrite --data review-current.jsonl \
-  s3://bucket/graph-review-new.omni
+  --target ./graph-review-new.omni
 ```
 
 ## Verify before cutover
@@ -331,7 +331,7 @@ these cutovers:
 
 - **New graph ID in the same cluster.** Add (for example)
   `knowledge_next` with the desired schema, query, provider, and policy
-  bindings. Validate, plan, and submit `cluster apply --server` so the running
+  bindings. Validate, plan, and submit `cluster apply --target` so the running
   owner creates and activates its derived root. Load through that server, verify
   the new ID, back up what you need, and move clients. Removing the old declaration
   and applying deletes its managed storage and all retained history.

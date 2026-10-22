@@ -4,8 +4,6 @@ use clap::{Args, Subcommand, ValueEnum};
 
 #[derive(Debug, Args)]
 pub(crate) struct SnapshotArgs {
-    /// Graph URI
-    pub(crate) uri: Option<String>,
     #[arg(long)]
     pub(crate) branch: Option<String>,
     #[arg(long)]
@@ -14,8 +12,6 @@ pub(crate) struct SnapshotArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct DiffArgs {
-    /// Graph URI
-    pub(crate) uri: Option<String>,
     /// Read target the diff starts from
     #[arg(long)]
     pub(crate) from: String,
@@ -47,37 +43,31 @@ pub(crate) struct DiffArgs {
 pub(crate) enum BranchCommand {
     /// Create a new branch
     Create {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
+        /// Branch to fork; the new branch starts at its head. Defaults to
+        /// `main`.
         #[arg(long)]
         from: Option<String>,
+        /// A published graph commit id to start the branch at, with that
+        /// commit's data and history, instead of a branch head.
+        #[arg(long, conflicts_with = "from")]
+        from_commit: Option<String>,
         name: String,
         #[arg(long)]
         json: bool,
     },
     /// List branches
     List {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
         #[arg(long)]
         json: bool,
     },
     /// Delete a branch
     Delete {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
         name: String,
         #[arg(long)]
         json: bool,
     },
     /// Merge a source branch into a target branch
     Merge {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
         source: String,
         #[arg(long)]
         into: Option<String>,
@@ -107,9 +97,6 @@ pub(crate) enum BranchCommand {
     /// What a branch changed since its merge base with a target branch: the
     /// net entity changes from the base to the branch head. Auto-paginates.
     Diff {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
         source: String,
         /// Branch the source is compared against (default main)
         #[arg(long)]
@@ -137,9 +124,6 @@ pub(crate) enum BranchCommand {
     /// The commit a merge of a source branch into a target branch would
     /// classify against
     MergeBase {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
         source: String,
         /// Branch the source would merge into (default main)
         #[arg(long)]
@@ -154,8 +138,6 @@ pub(crate) enum BranchCommand {
 pub(crate) enum CommitCommand {
     /// List graph commits
     List {
-        /// Graph URI
-        uri: Option<String>,
         #[arg(long)]
         branch: Option<String>,
         /// List the unpublished commits whose recorded target is the branch
@@ -179,9 +161,6 @@ pub(crate) enum CommitCommand {
     },
     /// Publish an unpublished commit onto its recorded target branch
     Publish {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
         commit_id: String,
         #[arg(long)]
         json: bool,
@@ -189,27 +168,18 @@ pub(crate) enum CommitCommand {
     /// Drop an unpublished commit or an unattached snapshot: the id and every
     /// unattached descendant stop resolving and held merge inputs are released
     Drop {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
         commit_id: String,
         #[arg(long)]
         json: bool,
     },
     /// Show a graph commit
     Show {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
         commit_id: String,
         #[arg(long)]
         json: bool,
     },
     /// List the entity changes one commit made relative to its first parent
     Changes {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
         commit_id: String,
         /// Changes per page, at most 8192: 8192 when the CLI follows every
         /// page, 1000 for one `--page-token` fetch
@@ -244,7 +214,7 @@ pub(crate) enum ChangeKindArg {
     Edge,
 }
 
-impl From<ChangeKindArg> for omnigraph_api_types::EntityKindOutput {
+impl From<ChangeKindArg> for omnigraph_api_types::EntityKind {
     fn from(kind: ChangeKindArg) -> Self {
         match kind {
             ChangeKindArg::Node => Self::Node,
@@ -260,7 +230,7 @@ pub(crate) enum ChangeOpArg {
     Delete,
 }
 
-impl From<ChangeOpArg> for omnigraph_api_types::ChangeOpOutput {
+impl From<ChangeOpArg> for omnigraph_api_types::ChangeOp {
     fn from(op: ChangeOpArg) -> Self {
         match op {
             ChangeOpArg::Insert => Self::Insert,
@@ -275,9 +245,6 @@ pub(crate) enum ChangesCommand {
     /// Poll the change feed of a branch. Auto-consumes page tokens and prints
     /// the durable cursor from the terminal page.
     Poll {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
         #[arg(long)]
         branch: Option<String>,
         /// Durable cursor from a previous poll or baseline
@@ -311,9 +278,6 @@ pub(crate) enum ChangesCommand {
     /// Non-POSIX platforms fail before capture until a durable write-through
     /// namespace replacement is available.
     Baseline {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
         #[arg(long)]
         branch: Option<String>,
         /// Snapshot scope by entity kind (repeatable): node | edge

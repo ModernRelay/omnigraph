@@ -1639,12 +1639,12 @@ async fn a_write_to_an_unread_table_leaves_the_replay_accepted() {
     assert_eq!(rows_of(&replay.result), rows_of(&run.result));
 }
 
-/// The planner's refusal of a search order on a traversal destination is the
-/// caller's error, a bad request carrying a plan diagnostic, on the ordinary
-/// door and the inspected one alike; the HTTP door maps the kind, which no
-/// `.gqt` case observes.
+/// A planner refusal is the caller's error, a bad request carrying a plan
+/// diagnostic, on the ordinary door and the inspected one alike; the HTTP door
+/// maps the kind, which no `.gqt` case observes. A search order on a traversal
+/// destination is no longer one: the ranked binding roots its component.
 #[tokio::test]
-async fn a_search_order_on_a_traversal_destination_is_a_typed_bad_request_issue_786() {
+async fn a_plan_refusal_is_a_typed_bad_request_and_a_ranked_destination_replays_issue_786() {
     let dir = tempfile::tempdir().unwrap();
     let db = docs(&dir).await;
     let source = r#"
@@ -1664,8 +1664,7 @@ query nearest_destination($q: Vector(4)) {
             &params,
         )
         .await
-        .err()
-        .expect("the shape is refused on the inspected door");
+        .expect("the ranked destination roots its component on the inspected door");
     let ordinary = db
         .query(
             ReadTarget::branch("main"),
@@ -1674,35 +1673,23 @@ query nearest_destination($q: Vector(4)) {
             &params,
         )
         .await
-        .expect_err("the shape is refused on the ordinary door");
-    for refused in [&inspected, &ordinary] {
-        let diagnostic = refused
-            .diagnostic()
-            .unwrap_or_else(|| panic!("a plan refusal carries its diagnostic: {refused:?}"));
-        assert_eq!(diagnostic.code.as_str(), "P001");
-        let stage = diagnostic
-            .stage
-            .as_deref()
-            .expect("a plan refusal names its stage");
-        assert_eq!(stage.name, "plan");
-        assert_eq!(
-            stage.expression.as_deref(),
-            Some("nearest($t.embedding, $q)")
-        );
-        assert_eq!(
-            diagnostic.fix.as_deref(),
-            Some("declare `$t` first in `match`, so the ranking starts the traversal")
-        );
-        assert!(
-            refused.to_string().contains("a traversal destination"),
-            "{refused}"
-        );
-    }
+        .expect("the ranked destination roots its component on the ordinary door");
+    // `d00` is the nearest document but no traversal reaches it.
+    let expected = vec![serde_json::json!({"t.slug": "d01"})];
+    assert_eq!(rows_of(&inspected.result), expected);
+    assert_eq!(rows_of(&ordinary), expected);
+    let replay = db
+        .replay_bound_plan(
+            ReadTarget::branch("main"),
+            &inspected.replay_envelope(source, "nearest_destination"),
+        )
+        .await
+        .expect("the ranked-root plan replays");
+    assert_eq!(rows_of(&replay.result), expected);
 
     // An `rrf()` whose arms rank two bindings one traversal connects is
-    // refused whichever binding is declared first, with no reorder fix to
-    // follow: the binding declared first starts the traversal and the other
-    // is reached, so a reorder hint would only send the caller back and forth.
+    // refused at type checking whichever binding is declared first, with no
+    // fix to follow: each arm would root the traversal at its own binding.
     for (name, first, second) in [("d_first", "$d", "$t"), ("t_first", "$t", "$d")] {
         let source = format!(
             "query {name}() {{\n    match {{ {first}: Doc {second}: Doc $d knows $t }}\n    return {{ $d.slug, $t.slug }}\n    order {{ rrf(bm25($d.text, \"needle\"), bm25($t.text, \"needle\")) }}\n    limit 1\n}}\n"
@@ -1712,9 +1699,9 @@ query nearest_destination($q: Vector(4)) {
             .await
             .expect_err("both declaration orders refuse the fused shape");
         let diagnostic = refused.diagnostic().unwrap_or_else(|| {
-            panic!("{name}: a plan refusal carries its diagnostic: {refused:?}")
+            panic!("{name}: a type refusal carries its diagnostic: {refused:?}")
         });
-        assert_eq!(diagnostic.code.as_str(), "P005", "{name}: {refused}");
+        assert_eq!(diagnostic.code.as_str(), "T59", "{name}: {refused}");
         assert_eq!(
             diagnostic.fix, None,
             "{name}: no declaration order serves both arms"
@@ -1730,9 +1717,9 @@ query nearest_destination($q: Vector(4)) {
     }
 
     // A refusal raised while the query is resolved, before lowering, keeps
-    // its diagnostic too: the statistics pass that resolves the query first
-    // must not turn it into a planner defect. An edge wildcard refuses CSR
-    // traversal mode, which only a session pin selects.
+    // its diagnostic on both doors: the statistics pass that resolves the
+    // query first must not turn it into a planner defect. An edge wildcard
+    // refuses CSR traversal mode, which only a session pin selects.
     let csr = with_traversal(&db, omnigraph_compiler::settings::Traversal::Csr);
     let wildcard = r#"
 query wildcard() {
@@ -1740,7 +1727,17 @@ query wildcard() {
     return { $b.slug }
 }
 "#;
-    let refused = csr
+    let inspected = csr
+        .query_inspected(
+            ReadTarget::branch("main"),
+            wildcard,
+            "wildcard",
+            &ParamMap::new(),
+        )
+        .await
+        .err()
+        .expect("an edge wildcard refuses CSR traversal mode on the inspected door");
+    let ordinary = csr
         .query(
             ReadTarget::branch("main"),
             wildcard,
@@ -1748,14 +1745,18 @@ query wildcard() {
             &ParamMap::new(),
         )
         .await
-        .expect_err("an edge wildcard refuses CSR traversal mode");
-    assert_eq!(
-        refused
+        .expect_err("an edge wildcard refuses CSR traversal mode on the ordinary door");
+    for refused in [&inspected, &ordinary] {
+        let diagnostic = refused
             .diagnostic()
-            .map(|diagnostic| diagnostic.code.as_str()),
-        Some("P004"),
-        "{refused:?}"
-    );
+            .unwrap_or_else(|| panic!("a plan refusal carries its diagnostic: {refused:?}"));
+        assert_eq!(diagnostic.code.as_str(), "P004", "{refused}");
+        assert_eq!(
+            diagnostic.stage.as_deref().map(|stage| stage.name),
+            Some("plan"),
+            "{refused}"
+        );
+    }
 }
 
 /// `now()` is bound at gather and rides in the value table, so the replay

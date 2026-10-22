@@ -279,7 +279,8 @@ async fn parked_stored_invocation_requires_a_serving_transition_barrier() {
                 .await
                 .unwrap();
             assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert!(!refused.headers().contains_key("retry-after"));
+            // An unavailable graph asks for a retry, and says when.
+            assert_eq!(refused.headers()["retry-after"], "60");
             drop(refused);
             let (status, ready) = json_response(&app, get_request("/readyz", "")).await;
             assert_eq!(status, StatusCode::OK);

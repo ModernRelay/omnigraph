@@ -110,15 +110,9 @@ fn human(directory: &Directory) -> String {
     output
 }
 
-pub(super) async fn list(config: &Path, json: bool) -> Output {
+pub(super) async fn list(context: &Context, json: bool) -> Output {
     let result = async {
-        let context = read_context(config)?.ok_or_else(|| {
-            Failure::refused(
-                "managed_context_required",
-                "cluster members list --managed requires the selected folder's .omnigraph/context",
-            )
-        })?;
-        let api = Api::authenticated(context.api.clone(), Some(&context.organization_id)).await?;
+        let api = context.client().await?;
         let body = api
             .request(
                 Method::GET,
@@ -127,6 +121,7 @@ pub(super) async fn list(config: &Path, json: bool) -> Output {
                 None,
             )
             .await?;
+        context.verify(&body)?;
         let directory = directory(&body, &context.cluster)?;
         Ok((body, human(&directory)))
     }

@@ -140,6 +140,10 @@ pub(crate) struct MutationStaging {
     /// `RetryableCommitConflict` as a 500. See
     /// [`MutationOpKind::strict_pre_stage_version_check`].
     pub(crate) op_kinds: HashMap<String, MutationOpKind>,
+    /// The Lance writers one table's overwrite runs at once; `Default` leaves
+    /// 0 and the store treats 0 as one writer, [`Self::with_overwrite_writers`]
+    /// widens it.
+    overwrite_writers: usize,
 }
 
 decide_seam! {
@@ -156,8 +160,16 @@ impl MutationStaging {
         Self {
             write_budget,
             deleted_id_budget: DeletedIdBudget::new(write_budget),
+            overwrite_writers: 1,
             ..Self::default()
         }
+    }
+
+    /// Run each table's overwrite through up to `writers` Lance writers at
+    /// once; see `TableStore::stage_overwrite_batches`.
+    pub(crate) fn with_overwrite_writers(mut self, writers: usize) -> Self {
+        self.overwrite_writers = writers.max(1);
+        self
     }
 
     pub(crate) fn write_budget(&self) -> WriteBudget {
@@ -483,6 +495,7 @@ impl MutationStaging {
             deleted_ids,
             deleted_id_budget: _,
             op_kinds: _,
+            overwrite_writers,
         } = self;
 
         let mut stage_inputs: Vec<(String, PreparedPendingTable, StagedTablePath, u64)> =
@@ -613,7 +626,16 @@ impl MutationStaging {
                     if stage_idx > 0 {
                         fail(&LOAD_BETWEEN_TABLE_STAGES)?;
                     }
-                    stage_pending_table(db, table_key, table, path, expected, write_budget).await
+                    stage_pending_table(
+                        db,
+                        table_key,
+                        table,
+                        path,
+                        expected,
+                        write_budget,
+                        overwrite_writers,
+                    )
+                    .await
                 },
             ))
             .buffered(concurrency)
@@ -785,6 +807,7 @@ async fn stage_pending_table(
     path: StagedTablePath,
     expected: u64,
     write_budget: WriteBudget,
+    overwrite_writers: usize,
 ) -> Result<Option<StagedTableEntry>> {
     let ds = db
         .open_pinned_for_write(&path.full_path, &path.entry)
@@ -811,7 +834,9 @@ async fn stage_pending_table(
                 .await?
         }
         PreparedPendingTable::Overwrite { batches } => {
-            db.storage().stage_overwrite_batches(&ds, batches).await?
+            db.storage()
+                .stage_overwrite_batches(&ds, batches, write_budget, overwrite_writers)
+                .await?
         }
     };
     Ok(Some(StagedTableEntry {
@@ -1097,16 +1122,6 @@ impl StagedMutation {
     }
 }
 
-/// Walk `batches` in reverse, tracking seen `id` values; for each row
-/// whose id we have NOT seen yet, mark it as a keeper. After the walk,
-/// take the kept rows in forward (input) order and concat into one batch.
-///
-/// Result: a deduped batch where each `id` appears at most once, with
-/// the LAST occurrence's column values. Required by `stage_merge_insert`,
-/// which needs unique source keys (Lance's `MergeInsertBuilder` produces
-/// arbitrary results on duplicates).
-///
-/// `batches` must be non-empty and all share `schema` (caller enforces).
 /// Compare two schemas for the purposes of `MutationStaging::append_batch`'s
 /// accumulator-compatibility check. We treat schemas as compatible if
 /// they have the same field names and data types in the same order.
@@ -1125,6 +1140,11 @@ fn schemas_compatible(a: &SchemaRef, b: &SchemaRef) -> bool {
     true
 }
 
+/// Fold pending upserts to unique ids before `stage_keyed_write`, which
+/// rejects duplicate source ids. Walking backwards keeps the last occurrence's
+/// values; the result retains input order among the surviving rows.
+///
+/// `batches` must be non-empty and all share `schema` (caller enforces).
 fn dedupe_merge_batches_by_id(
     schema: &SchemaRef,
     batches: Vec<RecordBatch>,

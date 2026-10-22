@@ -378,6 +378,7 @@ pub(super) async fn execute_node_scan(
         _ => true,
     };
     scan_report.probes.clear();
+    scan_report.ann_metrics.clear();
     let mut last_rung: Option<(usize, u64)> = None;
     let mut final_summary: Option<(Option<u64>, Option<u64>)> = None;
     let (batches, attempt_memory) = loop {
@@ -409,7 +410,6 @@ pub(super) async fn execute_node_scan(
                                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                                 Some(summary.clone());
                         }));
-                        scanner.target_parallelism(1);
                     }
                     Ok(())
                 })
@@ -440,6 +440,11 @@ pub(super) async fn execute_node_scan(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map(|summary| {
+                if let Some(metrics) =
+                    AnnAttemptMetrics::from_summary(scan_report.probes.len(), summary)
+                {
+                    scan_report.ann_metrics.push(metrics);
+                }
                 let counter = |name: &str| summary.all_counts.get(name).map(|count| *count as u64);
                 (
                     counter(lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC),

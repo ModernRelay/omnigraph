@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - OmniGraph maintainers
 created: 2026-06-11
-updated: 2026-10-16
+updated: 2026-10-20
 discussion: null
 supersedes: []
 superseded_by: []
@@ -16,13 +16,23 @@ blocked_on: []
 
 # RFC 0007: Per-operator configuration
 
+> **RFC 0059 disposition:** [RFC 0059](0059-config-cli-coherency.md) replaces
+> routing with complete targets in the existing operator file. Historical: D2's
+> server/alias routing schema and warn-only unknown keys; D3's routing precedence
+> and field merging; D4's server-name login spelling; and D6's additive-only and
+> old-config compatibility promises. The legacy exceptions in D4/D5 remain
+> retired. Current: actor/output preferences, keyed environment/file credentials,
+> D5's endpoint ownership boundary, atomic edits and the single-owner rules.
+> This is the accepted replacement design; implementation cutover remains tracked
+> by RFC 0059, not implied by this disposition.
+
 > **RFC 0008 disposition:** [RFC 0008](0008-retire-omnigraph-yaml.md) retired
 > `./omnigraph.yaml` and [RFC 0011](0011-cli-addressing-and-config.md) completed
 > its removal. Historical: the legacy file in D1, the alias collision rule in
 > D2, the legacy hops in the D3 cascades, the legacy pair in D4 step 3, and the
-> `omnigraph.yaml` cases in D5 rules 1 and 2. Current: the operator surface,
-> including `--server` targeting, operator aliases, keyed credentials, and D5
-> rule 3.
+> `omnigraph.yaml` cases in D5 rules 1 and 2. At that cutover, the operator
+> surface, `--server` targeting, operator aliases, keyed credentials and D5 rule 3
+> remained; the RFC 0059 disposition above records the later targeting change.
 
 **Builds on:** [RFC 0002](0002-config-cli-architecture.md) (superseded umbrella;
 PRs #139/#162 closed over review findings),

@@ -15,6 +15,7 @@
 //! scan Doc as $d: ranked bm25
 //! scan Doc as $d: ranked nearest fetch 10
 //! scan Doc as $d: ranked nearest fetch 10 nprobes 20
+//! scan Doc as $d: ranked nearest diagnostics present
 //! scan Doc as $d: ranked bm25 eligibility after_scoring
 //! expand $d Knows $e: mode indexed_scan
 //! expand $d Knows $e: mode indexed_scan ran csr
@@ -38,9 +39,10 @@ use omnigraph_planner::ValidationScope;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::report::Row;
+use crate::load_plan::PipelineClaim;
+use crate::report::Report;
 
-const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `scan <Type>[ as $var]: access sequential`, `scan <Type>[ as $var]: access index_probe <column>`, `hash join $var[ ran <hash_join|id_lookup>]`, `anti join $var: <correlated|key_set>`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `rank fuse row tiebreak [$e.@type, $e.@id]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `aggregate <column>: <func>([distinct ]<Type>) <accumulator> <overflow> -> <Type>`, `block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `result columns [<name>: <Type>, ...]`, `type <gq>: <Type>`, `cast <gq>: <Type> -> <Type>`, `no cast <gq>`, `hydrate $var: columns [a, b]`, `pass <name>`, `not pass <name>`, `validation scope <exact_subset|invariants_only>`";
+const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `scan <Type>[ as $var]: access sequential`, `scan <Type>[ as $var]: access index_probe <column>`, `hash join $var[ ran <hash_join|id_lookup>]`, `anti join $var: <correlated|key_set>`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>][ diagnostics present]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `rank fuse row tiebreak [$e.@type, $e.@id]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `aggregate <column>: <func>([distinct ]<Type>) <accumulator> <overflow> -> <Type>`, `block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `result columns [<name>: <Type>, ...]`, `type <gq>: <Type>`, `cast <gq>: <Type> -> <Type>`, `no cast <gq>`, `hydrate $var: columns [a, b]`, `pass <name>`, `not pass <name>`, `validation scope <exact_subset|invariants_only>`, `pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]`";
 
 const ID_LOOKUP: &str = "id_lookup";
 const JOIN_SIDES: [&str; 2] = ["hash_join", "id_lookup"];
@@ -137,6 +139,8 @@ pub(crate) enum PlanLine {
         nprobes: Option<u64>,
         /// Where the scan applies its eligibility, when claimed.
         eligibility: Option<String>,
+        /// Every selected nearest scan must have a measured attempt.
+        diagnostics: bool,
     },
     /// Every selected physical scan is marked with a runtime filter on
     /// `column`, or with none when `column` is `None`.
@@ -203,6 +207,11 @@ pub(crate) enum PlanLine {
     ValidationScope {
         scope: String,
     },
+    /// The document's `pipelines` hold `claim` at its position: the physical
+    /// plan cut at the operators that hold their whole input.
+    Pipeline {
+        claim: PipelineClaim,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -252,6 +261,15 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
             lines.push(PlanLine::ValidationScope {
                 scope: scope.to_string(),
             });
+            continue;
+        }
+        if let Some(pipeline) = line.strip_prefix("pipeline ") {
+            let Some(claim) = PipelineClaim::parse(pipeline) else {
+                return Err(refused(
+                    "is `pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]`",
+                ));
+            };
+            lines.push(PlanLine::Pipeline { claim });
             continue;
         }
         if let Some(gq) = line.strip_prefix("no cast ") {
@@ -619,27 +637,37 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
             let mut fetch = None;
             let mut nprobes = None;
             let mut eligibility = None;
+            let mut diagnostics = false;
             while let Some(key) = words.next() {
                 let value = words.next();
                 let count = value.and_then(|count| count.parse::<u64>().ok());
                 match (key, count, value) {
                     ("fetch", Some(count), _)
-                        if fetch.is_none() && nprobes.is_none() && eligibility.is_none() =>
+                        if fetch.is_none()
+                            && nprobes.is_none()
+                            && eligibility.is_none()
+                            && !diagnostics =>
                     {
                         fetch = Some(count);
                     }
-                    ("nprobes", Some(count), _) if nprobes.is_none() && eligibility.is_none() => {
+                    ("nprobes", Some(count), _)
+                        if nprobes.is_none() && eligibility.is_none() && !diagnostics =>
+                    {
                         nprobes = Some(count);
                     }
                     ("eligibility", _, Some(placement))
                         if eligibility.is_none()
+                            && !diagnostics
                             && ["before_scoring", "after_scoring"].contains(&placement) =>
                     {
                         eligibility = Some(placement.to_string());
                     }
+                    ("diagnostics", _, Some("present")) if kind == "nearest" && !diagnostics => {
+                        diagnostics = true;
+                    }
                     _ => {
                         return Err(refused(
-                            "claims `ranked <kind>[ fetch <n>][ nprobes <n>][ eligibility <before_scoring|after_scoring>]`: each key optional, at most once, in that order",
+                            "claims `ranked <kind>[ fetch <n>][ nprobes <n>][ eligibility <before_scoring|after_scoring>][ diagnostics present]`: each key optional, at most once, in that order; diagnostics requires nearest",
                         ));
                     }
                 }
@@ -651,6 +679,7 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
                 fetch,
                 nprobes,
                 eligibility,
+                diagnostics,
             });
             continue;
         } else if let Some(access) = claim.strip_prefix("access ") {
@@ -879,6 +908,7 @@ struct PlannedExpandMode {
 /// the column of the runtime filter it is marked with (`None` unmarked).
 #[derive(Debug)]
 struct PlannedAccess {
+    id: Option<u64>,
     type_key: String,
     binding: Option<String>,
     access: Option<String>,
@@ -928,12 +958,13 @@ fn choice_and_ran(rest: &str, allowed: &[&str]) -> Option<(String, Option<String
 
 /// The side of node `id`'s declared switch the run took: the last attempt of
 /// the row that recorded one. `Err` names why there is no such side.
-fn ran_side(report: Option<&[Row]>, id: Option<u64>, what: &str) -> Result<String, String> {
+fn ran_side(report: Option<&Report>, id: Option<u64>, what: &str) -> Result<String, String> {
     let report = report.ok_or_else(|| {
         format!("expect plan: `ran` on {what} needs the execution report of the run")
     })?;
     let id = id.ok_or_else(|| format!("expect plan: the {what} row carries no `id`"))?;
     let sides: Vec<&str> = report
+        .rows
         .iter()
         .filter(|row| row.id as u64 == id)
         .filter_map(|row| row.attempts.last()?.ran.side())
@@ -1282,6 +1313,7 @@ fn planned_physical(node: &Value, out: &mut PlannedNodes) {
             });
         }
         Some("Scan") => out.accesses.push(PlannedAccess {
+            id,
             type_key: text("table"),
             binding: node
                 .get("binding")
@@ -1463,7 +1495,7 @@ fn result_columns(node: &Value) -> Option<&Vec<Value>> {
 pub(crate) fn plan_mismatch(
     lines: &[PlanLine],
     explain: &Value,
-    report: Option<&[Row]>,
+    report: Option<&Report>,
 ) -> Option<String> {
     let mut nodes = PlannedNodes::default();
     if let Some(plan) = explain.get("logical_plan") {
@@ -1481,6 +1513,16 @@ pub(crate) fn plan_mismatch(
         .unwrap_or_default();
     for line in lines {
         match line {
+            PlanLine::Pipeline { claim } => {
+                let printed = PipelineClaim::of_document(explain);
+                if !printed.contains(claim) {
+                    let printed: Vec<String> = printed.iter().map(PipelineClaim::spell).collect();
+                    return Some(format!(
+                        "expect plan: pipeline {}; the document prints {printed:?}",
+                        claim.spell()
+                    ));
+                }
+            }
             PlanLine::ValidationScope { scope } => {
                 let reported = explain
                     .get("validation")
@@ -1708,13 +1750,14 @@ pub(crate) fn plan_mismatch(
                 fetch,
                 nprobes,
                 eligibility,
+                diagnostics,
             } => {
                 let selected = match physical_scans(&nodes, type_name, binding.as_deref()) {
                     Ok(selected) => selected,
                     Err(mismatch) => return Some(mismatch),
                 };
                 let mut rankings = Vec::with_capacity(selected.len());
-                for scan in selected {
+                for scan in &selected {
                     let Some(ranked) = &scan.ranked else {
                         return Some(format!(
                             "expect plan: the scan of `{type_name}` is not ranked, expected `ranked {kind}`"
@@ -1731,6 +1774,29 @@ pub(crate) fn plan_mismatch(
                     return Some(format!(
                         "expect plan: the scan of `{type_name}` is ranked by {kinds:?}, expected `{kind}`"
                     ));
+                }
+                if *diagnostics {
+                    let Some(report) = report else {
+                        return Some("expect plan: `diagnostics present` needs the execution report of the run".into());
+                    };
+                    for scan in &selected {
+                        if scan
+                            .ranked
+                            .as_ref()
+                            .is_some_and(|ranked| ranked.kind == *kind)
+                        {
+                            let Some(id) = scan.id else {
+                                return Some(format!(
+                                    "expect plan: the nearest scan of `{type_name}` carries no `id`"
+                                ));
+                            };
+                            if !report.has_ann(id) {
+                                return Some(format!(
+                                    "expect plan: the nearest scan of `{type_name}` (node {id}) recorded no ANN diagnostics"
+                                ));
+                            }
+                        }
+                    }
                 }
                 if let Some(fetch) = fetch {
                     let fetches: Vec<Option<u64>> = of_kind.iter().map(|r| r.fetch).collect();
@@ -2755,7 +2821,7 @@ mod tests {
                 ]}
             ]},
         });
-        let report: Vec<Row> = serde_json::from_value(json!([
+        let report: Report = serde_json::from_value(json!({"rows": [
             {"id": 3, "operator": "HashJoinExec", "status": "executed",
              "attempts": [{"rung": 0, "ran": "hash_join", "actual_rows": 3}, {"rung": 1, "ran": "id_lookup", "actual_rows": 3}]},
             {"id": 2, "operator": "ScanExec", "status": "executed",
@@ -2764,7 +2830,7 @@ mod tests {
              "attempts": [{"rung": 0, "ran": "csr", "actual_rows": 3}]},
             {"id": 0, "operator": "ScanExec", "status": "executed",
              "attempts": [{"rung": 0, "ran": true, "actual_rows": 1}]}
-        ]))
+        ]}))
         .unwrap();
         let lines = parse_plan_body(&[
             (0, "hash join $d ran id_lookup"),
@@ -2799,7 +2865,8 @@ mod tests {
                 .unwrap()
                 .contains("needs the execution report")
         );
-        let no_switch: Vec<Row> = report.iter().filter(|row| row.id != 3).cloned().collect();
+        let mut no_switch = report;
+        no_switch.rows.retain(|row| row.id != 3);
         assert!(
             plan_mismatch(&lines, &explain, Some(&no_switch))
                 .unwrap()
@@ -3143,6 +3210,7 @@ mod tests {
                 fetch: Some(10),
                 nprobes: None,
                 eligibility: None,
+                diagnostics: false,
             }
         );
         assert_eq!(lines[2].clone(), {
@@ -3217,6 +3285,7 @@ mod tests {
                 fetch: None,
                 nprobes: Some(20),
                 eligibility: None,
+                diagnostics: false,
             }
         );
         assert_eq!(
@@ -3224,7 +3293,87 @@ mod tests {
             None,
             "`fetch` is optional beside `nprobes`"
         );
+        // Each nearest arm needs its own measured attempt. A BM25 sibling
+        // needs none, and the diagnostic can belong to a later probe position.
+        let measured = json!({"physical_plan": {"node": "RankFuse", "inputs": [
+            {"node": "Scan", "id": 2, "table": "node:Doc", "binding": "d",
+             "ranked": {"kind": "nearest", "fetch": 3}},
+            {"node": "Scan", "id": 5, "table": "node:Doc", "binding": "d",
+             "ranked": {"kind": "nearest", "fetch": 3}},
+            {"node": "Scan", "id": 7, "table": "node:Doc", "binding": "d",
+             "ranked": {"kind": "bm25"}}
+        ]}});
+        let mut value = json!({"rows": [], "search": [
+            {"id": 2, "rung": 0, "decision": "probes", "attempts": [{"maximum_nprobes": 1, "flat": false, "rows": 0}, {"maximum_nprobes": 2, "flat": false, "rows": 3}]},
+            {"id": 5, "rung": 3, "decision": "probes", "attempts": [{"maximum_nprobes": null, "flat": true, "rows": 3}]}
+        ], "ann_metrics": [
+            {"id": 2, "rung": 0, "attempt": 1, "counts": {"partitions_searched": 1},
+             "cumulative_times_ns": {"index_search_time": 0}},
+            {"id": 5, "rung": 3, "attempt": 0, "counts": {"partitions_searched": 1},
+             "cumulative_times_ns": {}}
+        ]});
+        let claims = parse_plan_body(&[(
+            0,
+            "scan Doc as $d: ranked nearest fetch 3 nprobes 0 diagnostics present",
+        )])
+        .unwrap();
+        assert!(matches!(
+            &claims[0],
+            PlanLine::ScanRanked {
+                diagnostics: true,
+                ..
+            }
+        ));
+        let presence =
+            parse_plan_body(&[(0, "scan Doc as $d: ranked nearest diagnostics present")]).unwrap();
+        let report = crate::report::read_report(&value).unwrap();
+        assert_eq!(plan_mismatch(&presence, &measured, Some(&report)), None);
+        assert!(
+            plan_mismatch(&presence, &measured, None)
+                .unwrap()
+                .contains("needs the execution report")
+        );
+        value["ann_metrics"].as_array_mut().unwrap().pop();
+        let missing_arm = crate::report::read_report(&value).unwrap();
+        assert!(
+            plan_mismatch(&presence, &measured, Some(&missing_arm))
+                .unwrap()
+                .contains("node 5")
+        );
+        value["ann_metrics"] = json!([]);
+        let dropped = crate::report::read_report(&value).unwrap();
+        assert!(
+            plan_mismatch(&presence, &measured, Some(&dropped))
+                .unwrap()
+                .contains("no ANN diagnostics")
+        );
+        let mut missing_id = measured.clone();
+        missing_id["physical_plan"]["inputs"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("id");
+        assert!(
+            plan_mismatch(&presence, &missing_id, Some(&report))
+                .unwrap()
+                .contains("carries no `id`")
+        );
+        let absent_binding =
+            parse_plan_body(&[(0, "scan Doc as $absent: ranked nearest diagnostics present")])
+                .unwrap();
+        assert!(
+            plan_mismatch(&absent_binding, &measured, Some(&report))
+                .unwrap()
+                .contains("no scan")
+        );
+
         for refused in [
+            "scan Doc as $d: ranked nearest diagnostics",
+            "scan Doc as $d: ranked nearest diagnostics absent",
+            "scan Doc as $d: ranked nearest diagnostics present diagnostics present",
+            "scan Doc as $d: ranked nearest diagnostics present fetch 3",
+            "scan Doc as $d: ranked nearest diagnostics present nprobes 3",
+            "scan Doc as $d: ranked nearest diagnostics present eligibility before_scoring",
+            "scan Doc as $d: ranked bm25 diagnostics present",
             "scan Doc as $d: ranked",
             "scan Doc as $d: ranked fuzzy",
             "scan Doc as $d: ranked bm25 fetch",

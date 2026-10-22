@@ -10,6 +10,7 @@ use crate::app::Completion;
 use crate::client::GraphClient;
 use crate::helpers::graph_resource_id_for_selection;
 use crate::operator;
+use crate::targets::TargetBinding;
 
 mod args;
 mod output;
@@ -19,14 +20,12 @@ use output::{
     QueriesIssue, QueriesListItem, QueriesListOutput, QueriesParam, QueriesValidateOutput,
 };
 
-/// Only the existing global arguments consumed by these control tools.
+/// Captured target and explicit graph filter for applied control tools.
 #[derive(Clone, Copy)]
 pub(crate) struct ControlScope<'a> {
-    pub operator: &'a operator::InvocationConfig,
-    pub cluster: Option<&'a str>,
-    pub profile: Option<&'a str>,
-    pub graph: Option<&'a str>,
-    pub server: Option<&'a str>,
+    pub(crate) operator: &'a operator::InvocationConfig,
+    pub(crate) target: &'a crate::targets::ResolvedTarget,
+    pub(crate) graph: Option<&'a str>,
 }
 
 pub(crate) async fn run_queries(
@@ -35,19 +34,25 @@ pub(crate) async fn run_queries(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
-    let cluster = require_cluster_scope(
-        scope.operator,
-        scope.cluster,
-        scope.profile,
-        "queries",
-        stderr,
-    )?;
+    // A server answers for one graph: `--json` prints the route's body.
+    if let (QueriesCommand::List { json }, TargetBinding::Server { .. }) =
+        (&command, &scope.target.binding)
+    {
+        let client =
+            GraphClient::from_target(scope.operator, scope.target, scope.graph, None, stderr)
+                .await?;
+        let catalog = client.list_queries().await?;
+        output::write_queries_catalog(&catalog, *json, stdout)?;
+        return Ok(Completion::success());
+    }
+    crate::scope::direct_root_uri(scope.target)?;
+    let binding = crate::scope::capture_storage_binding(scope.target)?;
     match command {
         QueriesCommand::Validate { json } => {
-            return execute_queries_validate(&cluster, scope.graph, json, stdout).await;
+            return execute_queries_validate(&binding, scope.graph, json, stdout).await;
         }
         QueriesCommand::List { json } => {
-            execute_queries_list(&cluster, scope.graph, json, stdout).await?;
+            execute_queries_list(&binding, scope.graph, json, stdout).await?;
         }
     }
     Ok(Completion::success())
@@ -57,27 +62,19 @@ pub(crate) async fn run_policy(
     command: PolicyCommand,
     scope: ControlScope<'_>,
     stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
+    _stderr: &mut dyn Write,
 ) -> Result<Completion> {
-    // Policy tooling sources the Cedar bundle(s) from the cluster's
-    // applied policies (RFC-011): --cluster <dir>, + the global --graph
-    // to pick a graph's bundle when several apply.
-    let cluster = require_cluster_scope(
-        scope.operator,
-        scope.cluster,
-        scope.profile,
-        "policy",
-        stderr,
-    )?;
+    let cluster = crate::scope::direct_root_uri(scope.target)?;
+    let binding = crate::scope::capture_storage_binding(scope.target)?;
     let graph = scope.graph;
     let graph_id = match graph {
         Some(id) => graph_resource_id_for_selection(Some(id), ""),
         None => graph_resource_id_for_selection(None, "default"),
     };
-    let policies = read_cluster_policies(&cluster).await?;
+    let policies = read_cluster_policies(&binding).await?;
     match command {
         PolicyCommand::Validate {} => {
-            let bundle = select_cluster_policy(&cluster, &policies, graph)?;
+            let bundle = select_cluster_policy(cluster, &policies, graph)?;
             let engine = PolicyEngine::load_graph_from_source(&bundle.source, &graph_id)?;
             writeln!(
                 stdout,
@@ -87,7 +84,7 @@ pub(crate) async fn run_policy(
             )?;
         }
         PolicyCommand::Test { tests } => {
-            let bundle = select_cluster_policy(&cluster, &policies, graph)?;
+            let bundle = select_cluster_policy(cluster, &policies, graph)?;
             let engine = PolicyEngine::load_graph_from_source(&bundle.source, &graph_id)?;
             let tests = PolicyTestConfig::load(&tests)?;
             engine.run_tests(&tests)?;
@@ -99,7 +96,7 @@ pub(crate) async fn run_policy(
             branch,
             target_branch,
         } => {
-            let bundle = select_cluster_policy(&cluster, &policies, graph)?;
+            let bundle = select_cluster_policy(cluster, &policies, graph)?;
             let engine = PolicyEngine::load_graph_from_source(&bundle.source, &graph_id)?;
             let request = PolicyRequest {
                 action,
@@ -116,28 +113,14 @@ pub(crate) async fn run_policy(
 pub(crate) async fn run_graphs(
     command: GraphsCommand,
     scope: ControlScope<'_>,
-    managed_data: Option<GraphClient>,
+
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
     match command {
         GraphsCommand::List { json, discovery } => {
-            let (client, discovery) = if let Some(client) = managed_data {
-                (client, true)
-            } else {
-                // Explicit operator addressing retains the legacy catalog
-                // unless discovery is explicitly requested. Token bytes do
-                // not choose configuration or change static-token behavior.
-                (
-                    GraphClient::resolve_registry(
-                        scope.operator,
-                        scope.server,
-                        scope.profile,
-                        stderr,
-                    )?,
-                    discovery,
-                )
-            };
+            let client =
+                GraphClient::registry_from_target(scope.operator, scope.target, stderr).await?;
             if discovery {
                 let payload = client.discover_graphs().await?;
                 output::write_graphs_discovery(&payload, json, stdout)?;
@@ -150,75 +133,44 @@ pub(crate) async fn run_graphs(
     Ok(Completion::success())
 }
 
-/// Resolve the cluster for a control-plane tooling command (`policy`,
-/// `queries`) from `--cluster`. A configured name (`clusters:` in operator
-/// config) is rewritten to its root; a literal dir / `s3://`/`az://`/`file://` root is
-/// passed through. A `--profile`/`OMNIGRAPH_PROFILE` cluster binding also
-/// resolves here when `--cluster` is absent. No omnigraph.yaml.
-fn require_cluster_scope(
-    input: &operator::InvocationConfig,
-    cluster: Option<&str>,
-    profile: Option<&str>,
-    command: &str,
-    stderr: &mut dyn Write,
-) -> Result<String> {
-    let op = input.get(stderr)?;
-    let resolve_name = |name: &str| {
-        op.cluster_root(name)
-            .map(str::to_string)
-            .unwrap_or_else(|| name.to_string())
-    };
-    if let Some(cluster) = cluster {
-        return Ok(resolve_name(cluster));
-    }
-    // A cluster profile (flag, else OMNIGRAPH_PROFILE) binds the cluster too.
-    let profile_name = profile.or_else(|| input.profile().filter(|name| !name.is_empty()));
-    if let Some(name) = profile_name {
-        let profile = op.profile(name).ok_or_else(|| {
-            color_eyre::eyre::eyre!("unknown profile '{name}' (not defined under `profiles:`)")
-        })?;
-        if let crate::operator::ScopeBinding::Cluster(cluster) = profile.binding(name)? {
-            return Ok(resolve_name(&cluster));
-        }
-    }
-    bail!(
-        "`{command}` needs a cluster — pass --cluster <dir|uri> (or a name from `clusters:` \
-         in ~/.omnigraph/config.yaml), or select a cluster profile"
-    )
-}
-
 /// Read a cluster's serving snapshot for a control-plane tooling command,
 /// flattening the readiness `Diagnostic` list into one loud error. The single
 /// snapshot entry point for `policy`/`queries` so the not-servable message stays
 /// identical across them.
 async fn read_serving_snapshot_or_report(
-    cluster: &str,
+    binding: &omnigraph::storage::CapturedStorageBinding,
 ) -> Result<omnigraph_cluster::ServingSnapshot> {
-    let diagnostic_cluster = omnigraph::storage::redacted_storage_uri(cluster);
-    let snapshot = if cluster.contains("://") {
-        omnigraph_cluster::read_serving_snapshot_from_storage(cluster).await
-    } else {
-        omnigraph_cluster::read_serving_snapshot(cluster).await
-    };
-    snapshot.map_err(|diagnostics| {
-        color_eyre::eyre::eyre!(
-            "cluster `{diagnostic_cluster}` is not servable:\n  {}",
-            diagnostics
-                .iter()
-                .map(|d| d.message.clone())
-                .collect::<Vec<_>>()
-                .join("\n  ")
-        )
-    })
+    omnigraph_cluster::read_serving_snapshot_with_binding(binding)
+        .await
+        .map_err(|diagnostics| not_servable(binding, &diagnostics))
 }
 
-/// Resolve the Cedar policy bundle(s) for a `--cluster` policy-tooling command
+/// The one loud error for a cluster the serving snapshot reader refused:
+/// every readiness diagnostic, under the redacted root.
+pub(crate) fn not_servable(
+    binding: &omnigraph::storage::CapturedStorageBinding,
+    diagnostics: &[omnigraph_cluster::Diagnostic],
+) -> color_eyre::Report {
+    color_eyre::eyre::eyre!(
+        "cluster `{}` is not servable:\n  {}",
+        omnigraph::storage::redacted_storage_uri(binding.uri()),
+        diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    )
+}
+
+/// Resolve the Cedar policy bundle(s) for a direct-root policy target
 /// (RFC-011). Sources the applied policies from the cluster's serving snapshot;
 /// each `ServingPolicy` carries its `source` (digest-verified content) and the
 /// scopes it `applies_to` (`cluster` | `graph.<id>`). The optional `graph`
 /// selects a graph's bundle when several apply.
-async fn read_cluster_policies(cluster: &str) -> Result<Vec<omnigraph_cluster::ServingPolicy>> {
-    Ok(read_serving_snapshot_or_report(cluster).await?.policies)
+async fn read_cluster_policies(
+    binding: &omnigraph::storage::CapturedStorageBinding,
+) -> Result<Vec<omnigraph_cluster::ServingPolicy>> {
+    Ok(read_serving_snapshot_or_report(binding).await?.policies)
 }
 
 /// Pick the single policy bundle that applies to the selection. With `--graph`,
@@ -304,18 +256,19 @@ fn registry_load_issues(errors: Vec<omnigraph_server::queries::LoadError>) -> Ve
         .collect()
 }
 
-/// `queries validate --cluster <dir>` (RFC-011): type-check every stored query
+/// `queries validate --target NAME`: type-check every stored query
 /// in the cluster catalog against its graph's applied schema. Both the registry
 /// and the schemas come from the cluster serving snapshot — no omnigraph.yaml.
 /// With `--graph`, scope to a single graph.
 pub(crate) async fn execute_queries_validate(
-    cluster: &str,
+    binding: &omnigraph::storage::CapturedStorageBinding,
     graph: Option<&str>,
     json: bool,
     stdout: &mut dyn Write,
 ) -> Result<Completion> {
-    let snapshot = read_serving_snapshot_or_report(cluster).await?;
+    let snapshot = read_serving_snapshot_or_report(binding).await?;
 
+    let cluster = binding.uri();
     // Type-check per graph: each graph's stored queries against its own schema
     // (read from the graph's applied storage root). A `--graph` filter scopes to
     // exactly one graph; an unknown id is a loud error.
@@ -336,8 +289,9 @@ pub(crate) async fn execute_queries_validate(
                     continue;
                 }
             };
-        let db = crate::admission::open_read_only(
-            &serving_graph.root.to_string_lossy(),
+        let graph_binding = binding.for_uri(&serving_graph.root.to_string_lossy())?;
+        let db = crate::admission::open_read_only_with_binding(
+            &graph_binding,
             snapshot.state_cas.as_deref(),
         )
         .await?;
@@ -383,15 +337,15 @@ pub(crate) async fn execute_queries_validate(
     Ok(Completion::success())
 }
 
-/// `queries list --cluster <dir>` (RFC-011): list the catalog's stored queries.
-/// With `--graph`, scope to one graph.
+/// `queries list --target ROOT`: list the catalog's stored queries.
+/// With `--graph`, scope to one graph. A server target never reaches this.
 pub(crate) async fn execute_queries_list(
-    cluster: &str,
+    binding: &omnigraph::storage::CapturedStorageBinding,
     graph: Option<&str>,
     json: bool,
     stdout: &mut dyn Write,
 ) -> Result<()> {
-    let snapshot = read_serving_snapshot_or_report(cluster).await?;
+    let snapshot = read_serving_snapshot_or_report(binding).await?;
     let registry = registry_from_serving_queries(&snapshot.queries, graph).map_err(|errors| {
         color_eyre::eyre::eyre!(
             "stored-query registry failed to load:\n  {}",
@@ -468,10 +422,16 @@ mod tests {
     async fn cluster_storage_errors_redact_uri_credentials() {
         let secret = "TOPSECRET-CLI-SAS";
         let cluster = format!("az://omnigraph/clusters/company-brain?sv=2026-01-01&sig={secret}");
-        let error = read_serving_snapshot_or_report(&cluster)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = omnigraph::storage::CapturedStorageBinding::capture(
+            &cluster,
+            &omnigraph::storage::StorageDestination::Azure {
+                account_name: "testaccount".into(),
+                endpoint: None,
+                emulator: false,
+            },
+        )
+        .unwrap_err()
+        .to_string();
         assert!(!error.contains(secret));
         assert!(error.contains("az://omnigraph/clusters/company-brain"));
         assert!(error.contains("query redacted"));

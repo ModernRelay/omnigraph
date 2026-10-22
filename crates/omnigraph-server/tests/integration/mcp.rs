@@ -6,59 +6,14 @@ use std::task::Poll;
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Request, StatusCode};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::StreamExt as _;
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use omnigraph_server::AppState;
 use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
-use omnigraph_server::oidc_identity::OidcIdentityTrust;
-use rsa::{RsaPrivateKey, pkcs8::DecodePrivateKey as _, traits::PublicKeyParts as _};
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
+use crate::support::oidc::{RESOURCE, token, trust};
 use crate::support::*;
-
-const KEY: &str = include_str!("../fixtures/oidc-test-key.pem");
-const RESOURCE: &str = "https://data.example/clusters/A/incarnations/one";
-const ISSUER: &str = "https://identity.example";
-
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-}
-
-fn token(subject: &str, audience: &str) -> String {
-    let now = now();
-    let claims = json!({"iss":ISSUER,"aud":audience,"org_id":"org_example",
-        "client_id":"oauth-client","sub":subject,"iat":now,"exp":now+300,
-        "roles":["admin"],"permissions":["everything"]});
-    let mut header = Header::new(Algorithm::RS256);
-    header.kid = Some("key-1".into());
-    encode(
-        &header,
-        &claims,
-        &EncodingKey::from_rsa_pem(KEY.as_bytes()).unwrap(),
-    )
-    .unwrap()
-}
-
-fn trust(root: &std::path::Path) -> Arc<OidcIdentityTrust> {
-    let now = now();
-    let key = RsaPrivateKey::from_pkcs8_pem(KEY).unwrap();
-    let canonical_root = format!("file://{}", root.display());
-    let document = json!({"version":1,"revision":1,"generated_at":now,"expires_at":now+300,
-        "issuer":ISSUER,"audience":RESOURCE,"organization_id":"org_example","account_id":"account_1",
-        "cluster_id":"A","cluster_incarnation":"one","canonical_root":canonical_root,
-        "keys":[{"kid":"key-1","kty":"RSA","alg":"RS256","use":"sig",
-            "n":URL_SAFE_NO_PAD.encode(key.n().to_bytes_be()),"e":URL_SAFE_NO_PAD.encode(key.e().to_bytes_be())}],
-        "principals":[{"subject":"alice","principal_id":"stable_alice"},{"subject":"bob","principal_id":"stable_bob"},
-            {"subject":"read_only","principal_id":"stable_reader"},{"subject":"change_only","principal_id":"stable_changer"}]});
-    let path = root.join("oidc-public.json");
-    std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
-    OidcIdentityTrust::read(&path, &canonical_root).unwrap()
-}
 
 async fn fixture_app() -> (tempfile::TempDir, Router, AppState) {
     fixture_app_with(omnigraph_server::McpSettings::default()).await
@@ -247,6 +202,7 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
             "queries",
             "query",
             "snapshot",
+            "access",
             "branches_list",
             "commits_list",
             "commits_get",
@@ -676,6 +632,7 @@ async fn instructions(app: &Router, token: &str) -> String {
 /// server enables it.
 #[tokio::test]
 async fn mcp_tool_list_follows_the_adhoc_setting_and_describes_every_tool() {
+    let mut advertised = std::collections::BTreeSet::new();
     let alice = token("alice", RESOURCE);
     for (settings, expected) in [
         (
@@ -687,6 +644,7 @@ async fn mcp_tool_list_follows_the_adhoc_setting_and_describes_every_tool() {
                 "queries [graph] read_only output",
                 "query [graph,name] read_only",
                 "snapshot [graph] read_only",
+                "access [graph] read_only output",
                 "branches_list [graph] read_only output",
                 "commits_list [graph] read_only",
                 "commits_get [graph,commit_id] read_only",
@@ -704,6 +662,7 @@ async fn mcp_tool_list_follows_the_adhoc_setting_and_describes_every_tool() {
                 "query [graph,name] read_only",
                 "read [graph,query] read_only",
                 "snapshot [graph] read_only",
+                "access [graph] read_only output",
                 "branches_list [graph] read_only output",
                 "commits_list [graph] read_only",
                 "commits_get [graph,commit_id] read_only",
@@ -720,6 +679,7 @@ async fn mcp_tool_list_follows_the_adhoc_setting_and_describes_every_tool() {
                 "queries [graph] read_only output",
                 "query [graph,name] read_only",
                 "snapshot [graph] read_only",
+                "access [graph] read_only output",
                 "branches_list [graph] read_only output",
                 "commits_list [graph] read_only",
                 "commits_get [graph,commit_id] read_only",
@@ -736,6 +696,11 @@ async fn mcp_tool_list_follows_the_adhoc_setting_and_describes_every_tool() {
         let enabled = settings.allow_adhoc;
         let (_temp, app, _state) = fixture_app_with(settings).await;
         let tools = tool_list(&app, &alice).await;
+        advertised.extend(
+            tools
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap().to_owned()),
+        );
         let lines: Vec<String> = tools
             .iter()
             .map(|tool| {
@@ -760,6 +725,22 @@ async fn mcp_tool_list_follows_the_adhoc_setting_and_describes_every_tool() {
                 if let Some(output) = tool.get("outputSchema") {
                     assert_eq!(output["type"], "object");
                     assert_eq!(output["anyOf"].as_array().unwrap().len(), 2);
+                    if tool["name"] == "access" {
+                        let success = output["anyOf"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|schema| schema["properties"].get("graph_id").is_some())
+                            .expect("access advertises its successful result");
+                        assert!(
+                            success["required"]
+                                .as_array()
+                                .unwrap()
+                                .contains(&json!("actor_id"))
+                        );
+                        assert!(success["properties"].get("actor_id").is_some());
+                        assert!(success["properties"].get("actor").is_none());
+                    }
                     line.push_str(" output");
                 }
                 line
@@ -774,6 +755,13 @@ async fn mcp_tool_list_follows_the_adhoc_setting_and_describes_every_tool() {
             assert!(refused.get("error").is_some(), "{refused}");
         }
     }
+    // Compare real tools/list responses across the boot gates with the shared
+    // inventory, without adding an engine dependency to the MCP crate.
+    let inventoried = omnigraph_server::api::operations::HTTP_OPERATIONS
+        .iter()
+        .flat_map(|operation| operation.mcp.names.iter().map(|name| (*name).to_owned()))
+        .collect();
+    assert_eq!(advertised, inventoried);
 }
 
 #[tokio::test]
@@ -965,15 +953,19 @@ async fn static_token_server_serves_mcp_without_oauth_discovery() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    for credential in [None, Some("wrong")] {
+    for (credential, challenge) in [
+        (None, "Bearer"),
+        (Some("wrong"), "Bearer error=\"invalid_token\""),
+    ] {
         let response = app
             .clone()
             .oneshot(rpc(credential, "tools/list", json!({})))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        // No OIDC resource: nothing to discover, so no OAuth challenge.
-        assert!(!response.headers().contains_key("www-authenticate"));
+        // No OIDC resource: nothing to discover, so the challenge names no
+        // metadata, as on every other route.
+        assert_eq!(response.headers()["www-authenticate"], challenge);
     }
     assert_eq!(
         app.clone()
@@ -1072,6 +1064,16 @@ async fn mcp_read_parity_tools_equal_their_routes() {
             "/graphs/default/branches".to_string(),
         ),
         (
+            "access",
+            json!({"graph":"default"}),
+            "/graphs/default/access".to_string(),
+        ),
+        (
+            "access",
+            json!({"graph":"default","branch":"main","target_branch":"feature"}),
+            "/graphs/default/access?branch=main&target_branch=feature".to_string(),
+        ),
+        (
             "commits_list",
             json!({"graph":"default"}),
             "/graphs/default/commits".to_string(),
@@ -1099,6 +1101,11 @@ async fn mcp_read_parity_tools_equal_their_routes() {
     ] {
         let result = call(&app, "secret", tool, arguments).await;
         assert_eq!(result["result"]["isError"], false, "{tool}: {result}");
+        if tool == "access" {
+            let access = &result["result"]["structuredContent"];
+            assert_eq!(access["actor_id"], "default", "{access}");
+            assert!(access.get("actor").is_none(), "{access}");
+        }
         assert_eq!(
             result["result"]["structuredContent"],
             http_get(&app, &uri, "secret").await,
@@ -1324,10 +1331,19 @@ async fn mcp_write_tools_are_opt_in_conditional_and_policy_gated() {
         stale["result"]["structuredContent"]["status"], 412,
         "{stale}"
     );
-    assert!(
-        stale["result"]["structuredContent"]
-            .get("outcome_unknown")
-            .is_none()
+    // The refusal is the route's own error body: its code and a
+    // disposition that says nothing was written.
+    let refusal = &stale["result"]["structuredContent"];
+    assert_eq!(refusal["error"]["code"], "precondition_failed", "{stale}");
+    assert_eq!(
+        refusal["error"]["disposition"],
+        json!({"effects": "none", "action": "refresh"}),
+        "{stale}"
+    );
+    assert_eq!(
+        refusal.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["error", "status"],
+        "{stale}"
     );
     assert_eq!(
         manifest_dataset_version(&graph_path(temp.path())).await,
@@ -1389,6 +1405,31 @@ async fn mcp_write_tools_are_opt_in_conditional_and_policy_gated() {
     )
     .await;
     assert_eq!(missing["result"]["structuredContent"]["status"], 404);
+
+    // A load that forks its branch publishes the fork before its rows, so a
+    // typed refusal of the rows follows effects. The tool's task boundary
+    // must not lose that: the body says so, and the branch is there.
+    let refused = call(
+        &app,
+        "secret",
+        "load",
+        json!({"graph":"default","branch":"forked","from":"main","mode":"append","data":"{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":31}}"}),
+    )
+    .await;
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    let refusal = &refused["result"]["structuredContent"];
+    assert_eq!(refusal["status"], 409, "{refused}");
+    assert!(refusal["error"]["key_conflict"].is_object(), "{refused}");
+    assert_eq!(
+        refusal["error"]["disposition"],
+        json!({"effects": "partial", "action": "refresh"}),
+        "{refused}"
+    );
+    let branches = call(&app, "secret", "branches_list", json!({"graph":"default"})).await;
+    assert_eq!(
+        branches["result"]["structuredContent"]["branches"],
+        json!(["forked", "main"])
+    );
 
     // Each write keeps its route's policy action: `change` without
     // `branch_create` refuses branch creation.

@@ -165,10 +165,13 @@ Changing the key field is effectively a replace — it invalidates every externa
 ### Constraints: only `@index` is added in place
 
 Adding a constraint other than `@index` (`@key`, `@unique`, `@range`, `@check`)
-to an existing type, removing any constraint, and changing edge cardinality or
-endpoints are refused as unsupported. In-place migrations are additions of
-nullable properties and types, `@index` additions, enum widening, renames, and
-drops; tightening a constraint means a rebuild.
+to an existing type, removing a constraint from a property that stays, and
+changing edge cardinality or endpoints are refused as unsupported. Dropping a
+property drops every constraint that names only dropped properties (its own
+`@index`, `@unique`, `@range` or `@check`); a drop that would remove a `@key`,
+or a constraint that also names a field that stays, is refused. In-place
+migrations are additions of nullable properties and types, `@index` additions,
+enum widening, renames, and drops; tightening a constraint means a rebuild.
 
 ### `schema apply` blocks writes while running
 
@@ -204,8 +207,13 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 - `@key(@src, @dst, prop)` — edge identity tuple including both endpoints and optional scalar members
 - `@unique(prop1, prop2)` — composite uniqueness, enforced as a true tuple key at intake and merge (works on edges too: `@unique(@src, @dst)`). Members must reduce to scalar keys. Blob is rejected at schema admission; list/vector declarations may parse but writes fail scalar-key validation.
 - `@index(prop1, prop2)` — composite index intent. Composite and edge intents are accepted but are not currently materialized as property indexes.
-- `@range(prop, min..max)` — node-only numeric bounds; either bound may be omitted
+- `@range(prop, min..max)` — node-only inclusive numeric bounds, compared exactly; a list property bounds each element; either bound may be omitted
 - `@check(prop, "regex")` — node-only String regular-expression constraint
+
+Integer bounds must fit `I64`; `..max` is upper-only and `min..` is lower-only.
+Decimal bounds use `F64`. Existing accepted schemas retain their bounds: before
+restating a historical schema, write an old upper-only bound as `min..` and an
+oversized integer bound as a decimal with its stored value.
 
 ## Interfaces
 
@@ -238,13 +246,12 @@ schema is declared (`graphs.<id>.schema:` in `cluster.yaml`) and converged:
 
 ```bash
 $EDITOR schema.pg
-omnigraph cluster plan  --config . --observe   # migration steps; takes no cluster lock
-omnigraph cluster apply --server <name|url> --config .
+omnigraph cluster plan --target ./cluster --config . --observe   # migration steps; takes no cluster lock
+omnigraph cluster apply --target <name|url> --config .
 # the running server publishes and activates the new shape; no restart
 ```
 
-Without `--server`, `cluster apply --config . --as <you>` writes the storage
-root itself: stop the server and transfer its cluster lock first (see
+With a direct-root target, `cluster apply --target ./cluster --config . --as <you>` writes storage directly: stop the server and transfer its cluster lock first (see
 [`cluster.md`](cluster.md)), then start the server to serve the new shape.
 
 Differences from direct `schema apply` (on a non-cluster store): out-of-band

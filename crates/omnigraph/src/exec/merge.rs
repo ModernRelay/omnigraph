@@ -4982,6 +4982,12 @@ impl Session {
         } else {
             MergeMode::Publish
         };
+        // Every failure the merge returns before its one publisher call is
+        // definite: the chains it committed are detached versions no manifest
+        // names. The publisher marks its own in-doubt outcomes, which this
+        // wrapper never overwrites, and no fallible step follows the publish
+        // inside `branch_merge_impl`; a step added there must mark its own
+        // evidence.
         let result = Box::pin(self.branch_merge_impl(
             source,
             target,
@@ -4991,7 +4997,8 @@ impl Session {
             WriteBudget::from_settings(self.settings()),
             mode,
         ))
-        .await;
+        .await
+        .map_err(OmniError::unpublished);
         if let Err(error) = fail(&BRANCH_MERGE_PRE_RETURN) {
             // This boundary is after the result is fixed. A simulated lost
             // receipt cannot turn an acknowledged publication into a normal
@@ -5175,8 +5182,12 @@ impl Omnigraph {
             let base_snapshot = if head_is_base {
                 target_txn.base.clone()
             } else {
-                let base =
-                    ManifestCoordinator::pinned_graph_commit(self.uri(), &base_commit).await?;
+                let base = ManifestCoordinator::pinned_graph_commit_with_session(
+                    self.uri(),
+                    &base_commit,
+                    &self.control_session(),
+                )
+                .await?;
                 if !dry_run {
                     input_guard.pin(&base.dataset).await?;
                 }

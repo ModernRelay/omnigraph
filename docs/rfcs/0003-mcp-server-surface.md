@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-06-01
-updated: 2026-10-14
+updated: 2026-10-20
 discussion: https://github.com/ModernRelay/omnigraph/issues/991
 supersedes: []
 superseded_by: []
@@ -110,18 +110,18 @@ route with its own 64 KiB body bound) and authenticated per HTTP request by
 One endpoint, `POST /mcp`, server-scoped. Graph-scoped tools take a `graph`
 argument; there are no per-graph MCP endpoints.
 
-| Server credential sources | `/mcp` | Protected-resource metadata and OAuth challenge |
-|---|---|---|
-| none (`--unauthenticated` or policy-only) | not mounted | not served |
-| static bearer tokens and/or signed data tokens | mounted | not served; 401 carries no challenge |
-| OIDC identity trust (alone or with the above) | mounted | served; 401 carries the challenge |
+| Server credential sources | `/mcp` | Protected-resource metadata | Challenge on a 401 |
+|---|---|---|---|
+| none (`--unauthenticated` or policy-only) | not mounted | not served | `Bearer` |
+| static bearer tokens and/or signed data tokens | mounted | not served | `Bearer` |
+| OIDC identity trust (alone or with the above) | mounted | served | `Bearer resource_metadata="<url>"` |
 
 Authentication is the server's existing middleware: static tokens, then signed
 data tokens, then OIDC. A 401 happens before the request body is collected.
-Without OIDC, a 401 from `/mcp`, like every other 401 the server returns today,
-carries no `WWW-Authenticate` header. RFC 9110 §15.5.2 asks for one; a plain
-`WWW-Authenticate: Bearer`, which advertises no OAuth flow, belongs to a
-server-wide follow-up rather than to `/mcp` alone.
+Every 401 the server returns, from `/mcp` and from every REST route alike,
+carries `WWW-Authenticate` as RFC 9110 §15.5.2 requires; a refused bearer
+credential adds `error="invalid_token"` (see [Challenge](#challenge)). A plain
+`Bearer` challenge advertises no OAuth flow.
 
 ### Discovery (OIDC only)
 
@@ -131,10 +131,17 @@ server-wide follow-up rather than to `/mcp` alone.
   same body. The path is computed once from the fixed boot binding and compared
   with the request path byte for byte; any other suffix is 404. This is the URL
   the challenge advertises and the first URL MCP clients probe.
-- A 401 from `/mcp` with no credential carries
+- A 401 from any route with no credential carries
   `WWW-Authenticate: Bearer resource_metadata="<url>"`. A 401 after a presented
   bearer credential was refused carries
   `WWW-Authenticate: Bearer error="invalid_token", resource_metadata="<url>"`.
+- The server has one resource identifier, so every route's challenge names the
+  same metadata. RFC 9728 §3.3 has a client that followed a challenge require
+  the metadata's `resource` to equal the URL it requested, so a strict client
+  uses it only on the URL the identifier names. A client that accepts a path
+  prefix, as the MCP TypeScript SDK does (`checkResourceAllowed`), can use an
+  identifier naming the service root (`https://graphs.example.com`) on every
+  route; one naming `/mcp` matches only that endpoint.
 
 ### Host and Origin
 
@@ -325,9 +332,21 @@ its default cannot remove the refusal silently.
 
 ### Challenge
 
-The challenge layer records whether the request carried a `Bearer` credential
-before authentication runs, and adds `error="invalid_token"` only to a 401 for a
-request that did. It never reflects the credential or a refusal reason.
+The challenge belongs to the authentication decision, not to a router.
+Authentication reads the request's one `Authorization` header once: the scheme
+is case-insensitive (RFC 9110 §11.1) and one or more spaces precede the token
+(RFC 6750 §2.1). Another scheme, a missing header, several `Authorization`
+headers or a `Bearer` without a token presents no single credential, so the
+challenge asks for one rather than telling the client to refresh; a bearer token
+that does not authenticate is a refused one. The 401
+records which. One layer outside every router renders the server's challenge on
+every 401 response, including one a handler returns: `Bearer`, plus
+`error="invalid_token"` when a presented bearer credential was refused (RFC 6750
+§3.1, with or without OIDC), plus `resource_metadata` with OIDC. Both forms are
+built once from the boot binding, never from a request's `Host`, `Origin` or
+path, and never reflect the credential or a refusal reason. `/mcp` keeps only
+its own `Cache-Control: no-store`. The OpenAPI document records the header on
+every protected operation's 401.
 
 ## Invariants
 
@@ -352,6 +371,10 @@ request that did. It never reflects the credential or a refusal reason.
 - OpenAPI gains one documented route,
   `/.well-known/oauth-protected-resource/{resource_path}`. `/mcp` stays out of the
   REST document.
+- Every 401 gains a `WWW-Authenticate` header and the scheme in `Authorization`
+  is read case-insensitively; a response body and status are unchanged. A
+  client that read a missing challenge as "no OAuth" now reads the
+  `resource_metadata` parameter's presence instead.
 - Turning the opt-ins off removes tools without affecting HTTP.
 - The npm package's users move by pointing their client at `https://<server>/mcp`
   with the same token. Tool names differ where noted above. Reverting this RFC means
@@ -396,6 +419,15 @@ than duplicated:
 `openapi.json` and its drift test cover the new route. In-source `mcp.rs` tests keep
 owning `run_read` ownership through cancellation and the result bound.
 
+The server-wide challenge is owned by
+`integration/auth_policy.rs::issue_1020_every_401_carries_the_one_bearer_challenge`:
+it takes every protected operation from the served OpenAPI document, adds `/mcp`
+and the engine catalogue, and requires each to answer an absent, refused,
+foreign-scheme and duplicated credential with 401 and the exact challenge on a
+static-token, a signed-data-token and an OIDC server, and the document to
+record the header on that 401. In-source `challenge.rs` tests own the header
+reading.
+
 ## Rollout
 
 1. **Phases 1 and 2, shipped together** in
@@ -411,10 +443,13 @@ owning `run_read` ownership through cancellation and the result bound.
    write wait and the `graph_list` instruction from this review in
    [#999](https://github.com/ModernRelay/omnigraph/pull/999).
    `implementation` stays `partial` until these and the package retirement land.
-3. **Package retirement**, after a release contains phases 1 and 2: a final
+3. **Server-wide challenge**, issue
+   [#1020](https://github.com/ModernRelay/omnigraph/issues/1020): every 401
+   carries the challenge `/mcp` sent alone, and the scheme is case-insensitive.
+4. **Package retirement**, after a release contains phases 1 and 2: a final
    `@modernrelay/omnigraph-mcp` version whose README and binary print a
    deprecation pointing at the server's `/mcp`, then npm deprecation.
-4. **Deferred, separate decisions:** per-stored-query `invoke_query` scope (a query
+5. **Deferred, separate decisions:** per-stored-query `invoke_query` scope (a query
    name in `PolicyRequest` and the Cedar schema); one MCP tool per stored query
    filtered by that scope; a Rust stdio bridge only if local desktop clients need
    it; a token-lifetime cap separate from the 300 second admission-snapshot bound
@@ -429,6 +464,21 @@ a deferred item or the existing allowed-origin rule.
 
 ## Decision log
 
+- 2026-10-20: Amended for the server-wide challenge (issue
+  [#1020](https://github.com/ModernRelay/omnigraph/issues/1020)). Every 401
+  carries `WWW-Authenticate`, `error="invalid_token"` follows a refused bearer
+  credential with or without OIDC, and the `Authorization` scheme is read once,
+  case-insensitively, by authentication. Superseded sentences: the mounting
+  table's "not served; 401 carries no challenge"; "Without OIDC, a 401 from
+  `/mcp`, like every other 401 the server returns today, carries no
+  `WWW-Authenticate` header", "RFC 9110 §15.5.2 asks for one; a plain
+  `WWW-Authenticate: Bearer`, which advertises no OAuth flow, belongs to a
+  server-wide follow-up rather than to `/mcp` alone"; "A 401 from `/mcp` with no
+  credential carries"; and the Challenge section's "The challenge layer records
+  whether the request carried a `Bearer` credential before authentication runs,
+  and adds `error="invalid_token"` only to a 401 for a request that did" (a
+  second reading of the header that accepted `bearer` while authentication
+  refused it).
 - 2026-10-02: The `schema_apply` tool loses its `allow_data_loss` argument,
   following the removal of that field from the schema-apply route: a drop
   reclaims nothing at apply, so there is no destructive mode to select.

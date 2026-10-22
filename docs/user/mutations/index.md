@@ -135,7 +135,7 @@ reports `key_conflict` on an already-committed pair, `merge` upserts it, and
 a supplied top-level `id` must equal the derivation exactly.
 
 ```bash
-omnigraph load --data batch.jsonl --mode merge graph.omni
+omnigraph load --data batch.jsonl --mode merge --target ./graph.omni
 ```
 
 One load request is one graph commit. Use `--branch <name> --from <base>` to
@@ -210,24 +210,27 @@ document a query's explain prints: the source, the one validation with each
 check and its access path, and the write.
 An overwrite runs that plan; append and merge run the keyed adapters.
 It reads the source's metadata and no payload byte.
-See [Explaining a load statement](../queries/explain.md#explaining-a-load-statement).
+See [Explaining a load statement](../queries/explain-load.md).
 
 #### CLI and HTTP requests
 
 ```bash
-omnigraph mutate --store graph.omni -e 'load csv "file:///data/person_0_0.csv" into node:Person mode append delimiter "|" header'
-omnigraph mutate --server dev -e 'load csv "s3://imports/knows.csv" into edge:Knows mode append delimiter "|" header'
+omnigraph mutate --target ./graph.omni -e 'load csv "file:///data/person_0_0.csv" into node:Person mode append delimiter "|" header'
+omnigraph mutate --target dev -e 'load csv "s3://imports/knows.csv" into edge:Knows mode append delimiter "|" header'
 ```
 
 The CLI uses `--branch`; HTTP uses the request `branch`, with `main` as the
 omitted default. The statement accepts no `name`, `params` or commit
 precondition (`--if-commit` or `Omnigraph-If-Graph-Commit`). It requires
-`change` on the branch. The response is a mutation's `ChangeOutput`: the
-branch, `load csv` as `query_name`, loaded node and edge counts, and the commit.
+`change` on the branch. A source that holds no records is refused. The
+response is a mutation's `ChangeOutput`: the
+branch, `load csv` as `query_name`, loaded node and edge counts, the commit,
+and for `mode overwrite` an `executed` object, what the load's plan measured
+as it ran ([explaining a load statement](../queries/explain-load.md)).
 
 ```bash
 curl -sS http://localhost:8080/graphs/knowledge/mutate \
-  -H 'Omnigraph-Http-Api: 0.13' \
+  -H 'Omnigraph-Http-Api: 0.14' \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -d '{"query":"load csv \"s3://imports/person.csv\" into node:Person mode append delimiter \"|\" header","branch":"main"}'
@@ -301,8 +304,15 @@ range `1..=64`); it is `process` scope, so the server takes it from
 `OMNIGRAPH_LOAD_CONCURRENCY` and a direct CLI run from that variable or from
 `--set` on `load`, `ingest` or `mutate` (a JSONL input carries no `set` line),
 and an invalid or `0` value refuses startup instead of running the default.
-Delete staging remains serial. This affects preparation only—one
-request still publishes exactly one graph commit.
+The same width is the number of Lance writers a `load csv` overwrite runs at
+once: its batches are cut into runs of at most one Lance file (1 M rows), each
+run written by its own writer, and the files are published in input order, so
+the table's files are the ones a single writer would have produced. It is also
+the most streams that parse the overwrite's source: the source is cut on
+record ends into 8 MiB slices, a stream claims the next slice as it finishes
+one, and the validation puts the slices back in source order, so the rows and
+their order are those of a single parser. Delete staging remains serial. This affects preparation only—one request still
+publishes exactly one graph commit.
 
 A stale strict update, delete, or overwrite can return `read_set_conflict`.
 Refresh the branch and retry deliberately. A `key_conflict` means an append or
@@ -320,28 +330,5 @@ loading them, and its [limits](../blobs.md#limits) for the bounds that apply.
 
 ## Conditional mutations
 
-Use `--if-commit` when a mutation should apply only to the graph state that
-the caller read:
-
-```bash
-# The JSON response includes the commit pinned for these rows.
-omnigraph query find_person --query queries.gq --store graph.omni --json
-
-omnigraph mutate update_person --query queries.gq --store graph.omni \
-  --params '{"name":"Ada"}' \
-  --if-commit <graph_commit_id> --json
-```
-
-The condition compares the effective head of the target branch. Any
-intervening commit invalidates it, including a commit that changed an unrelated
-entity or type. On mismatch, nothing is written: the CLI exits with code 4
-against a server and with code 1 on an embedded graph such as this `--store`
-run, and JSON output contains `precondition_failure` with `expected` and
-optional `actual` commit ids. Re-read the branch and decide again; do not blindly retry
-the old mutation. The precondition is still checked when the mutation would
-match no entities.
-
-Use the `graph_commit_id` returned with the original query rows. Fetching a
-head id afterward creates a race between the read and the precondition. For the
-HTTP header and dedicated conditional routes, see the
-[HTTP server guide](../operations/server.md#conditional-mutations).
+A mutation can be made to apply only to the graph state the caller read, with
+`--if-commit`; see [conditional mutations](conditional.md).

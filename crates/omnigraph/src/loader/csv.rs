@@ -226,6 +226,58 @@ pub(crate) fn prepare_csv_batches(
     capture: &CapturedSource,
     admit: &mut dyn FnMut(u64) -> Result<()>,
 ) -> Result<PreparedCsvBatch> {
+    let bytes = capture.bytes.as_ref();
+    let resolved = resolve_csv_columns(catalog, request, bytes)?;
+    let table_key = resolved.table_key;
+    let shape = CsvShape::count(bytes, request);
+    admit(shape.reader_bytes(bytes.len()))?;
+    let read = parse_records(bytes, request, resolved.read_schema, &table_key)?;
+    let rows: usize = read.iter().map(RecordBatch::num_rows).sum();
+    if rows == 0 {
+        return Err(OmniError::manifest(format!(
+            "load csv into {table_key}: the source holds no records"
+        )));
+    }
+
+    let typing = CsvTyping {
+        catalog,
+        target: &request.target,
+        table_key: &table_key,
+        properties: resolved.properties,
+        arrow_schema: &resolved.arrow_schema,
+        roles: &resolved.roles,
+        is_edge: resolved.is_edge,
+    };
+    admit(typing.normalization_bytes(&read)?)?;
+    let batches = typing.normalize_batches(&read)?;
+    Ok(PreparedCsvBatch {
+        type_name: request.target.type_name().to_string(),
+        table_key,
+        is_edge: resolved.is_edge,
+        batches,
+        rows,
+    })
+}
+
+/// The columns of one CSV statement resolved against the catalog: the
+/// target's properties and strict schema, each column's role and the read
+/// schema the typed reader parses into.
+struct ResolvedCsvColumns<'a> {
+    table_key: String,
+    properties: &'a HashMap<String, PropType>,
+    arrow_schema: SchemaRef,
+    is_edge: bool,
+    roles: Vec<ColumnRole>,
+    read_schema: SchemaRef,
+}
+
+/// Resolve the target, the mapping and the supported kinds against the
+/// catalog from the header alone: every refusal names what it refuses.
+fn resolve_csv_columns<'a>(
+    catalog: &'a Catalog,
+    request: &CsvLoadRequest,
+    bytes: &[u8],
+) -> Result<ResolvedCsvColumns<'a>> {
     let table_key = request.target.table_key();
     let (properties, arrow_schema, is_edge) = match &request.target {
         LoadTarget::Node(name) => {
@@ -253,9 +305,6 @@ pub(crate) fn prepare_csv_batches(
         resolve_roles(columns, properties, is_edge, &table_key)?;
     }
 
-    let bytes = capture.bytes.as_ref();
-    let shape = CsvShape::count(bytes, request);
-    admit(shape.reader_bytes(bytes.len()))?;
     let format = Format::default()
         .with_header(request.header)
         .with_delimiter(request.delimiter);
@@ -292,32 +341,198 @@ pub(crate) fn prepare_csv_batches(
             .map(|(role, name)| Field::new(name, read_data_type(role), true))
             .collect::<Vec<_>>(),
     ));
-    let read = parse_records(bytes, request, read_schema, &table_key)?;
-    let rows: usize = read.iter().map(RecordBatch::num_rows).sum();
-    if rows == 0 {
-        return Err(OmniError::manifest(format!(
-            "load csv into {table_key}: the source holds no records"
-        )));
+    Ok(ResolvedCsvColumns {
+        table_key,
+        properties,
+        arrow_schema,
+        is_edge,
+        roles,
+        read_schema,
+    })
+}
+
+/// One slice of a capture's records: the byte range after the header, cut on
+/// record ends by the counting pass so a quoted newline never splits a slice,
+/// the 1-based record it starts at, and its record count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CsvSlice {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) first_record: usize,
+    pub(crate) rows: usize,
+}
+
+/// Where whole-source normalization refuses a record, in the order
+/// [`CsvTyping::normalize_batches_from`] meets failures: `step` counts the
+/// from endpoints, the to endpoints, then each property's conversion and its
+/// non-null check, then the ids; `record` is the 1-based source record. The
+/// lowest step over every slice, then the lowest record, is the refusal the
+/// whole-capture path raises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct NormalizeStep {
+    pub(crate) step: usize,
+    pub(crate) record: usize,
+}
+
+impl NormalizeStep {
+    /// The step of property `index`'s conversion, or of its non-null check.
+    fn property(index: usize, non_null: bool) -> usize {
+        2 + 2 * index + usize::from(non_null)
+    }
+}
+
+/// A record [`CsvTyping::normalize_batches_from`] refused: where it ranks
+/// and the refusal, boxed to keep the `Err` variant small.
+#[derive(Debug)]
+pub(crate) struct NormalizeFailure {
+    pub(crate) at: NormalizeStep,
+    pub(crate) error: Box<OmniError>,
+}
+
+/// Why [`ResolvedCsv::parse_slice`] refused a slice.
+#[derive(Debug)]
+pub(crate) enum SliceRefusal {
+    /// The reader, an admission or the slice itself: the load ends on it,
+    /// the lowest refused slice named, as the whole-capture path reads the
+    /// source to its end before any record is normalized.
+    Parse(Box<OmniError>),
+    /// A record failed normalization: the other slices are still normalized
+    /// and the earliest [`NormalizeStep`] over all of them is named.
+    Normalize(NormalizeFailure),
+}
+
+impl SliceRefusal {
+    #[cfg(test)]
+    pub(crate) fn into_error(self) -> OmniError {
+        match self {
+            Self::Parse(error) => *error,
+            Self::Normalize(failure) => *failure.error,
+        }
+    }
+}
+
+impl From<OmniError> for SliceRefusal {
+    fn from(error: OmniError) -> Self {
+        Self::Parse(Box::new(error))
+    }
+}
+
+impl From<NormalizeFailure> for SliceRefusal {
+    fn from(failure: NormalizeFailure) -> Self {
+        Self::Normalize(failure)
+    }
+}
+
+/// A capture resolved once for the engine's source operator: the columns,
+/// the record count and the slices its partitions parse; every refusal the
+/// counting pass can raise is raised here, before any slice is parsed.
+pub(crate) struct ResolvedCsv {
+    table_key: String,
+    arrow_schema: SchemaRef,
+    is_edge: bool,
+    roles: Vec<ColumnRole>,
+    read_schema: SchemaRef,
+    columns: usize,
+    slices: Vec<CsvSlice>,
+}
+
+impl ResolvedCsv {
+    /// `slice_bytes` is the size a slice is cut at: the planner's source
+    /// partition size in production, smaller in a test.
+    pub(crate) fn resolve(
+        catalog: &Catalog,
+        request: &CsvLoadRequest,
+        bytes: &[u8],
+        slice_bytes: usize,
+    ) -> Result<Self> {
+        let resolved = resolve_csv_columns(catalog, request, bytes)?;
+        let scan = CsvScan::scan(bytes, request, slice_bytes);
+        if scan.rows == 0 {
+            return Err(OmniError::manifest(format!(
+                "load csv into {}: the source holds no records",
+                resolved.table_key
+            )));
+        }
+        Ok(Self {
+            table_key: resolved.table_key,
+            arrow_schema: resolved.arrow_schema,
+            is_edge: resolved.is_edge,
+            roles: resolved.roles,
+            read_schema: resolved.read_schema,
+            columns: scan.columns,
+            slices: scan.slices,
+        })
     }
 
-    let typing = CsvTyping {
-        catalog,
-        target: &request.target,
-        table_key: &table_key,
-        properties,
-        arrow_schema: &arrow_schema,
-        roles: &roles,
-        is_edge,
-    };
-    admit(typing.normalization_bytes(&read)?)?;
-    let batches = typing.normalize_batches(&read)?;
-    Ok(PreparedCsvBatch {
-        type_name: request.target.type_name().to_string(),
-        table_key,
-        is_edge,
-        batches,
-        rows,
-    })
+    pub(crate) fn slices(&self) -> &[CsvSlice] {
+        &self.slices
+    }
+
+    /// Parse and normalize slice `index` of `bytes`, the capture `resolve`
+    /// read, admitting the read and the normalization as the whole-capture
+    /// path does, every record numbered from the slice's first.
+    pub(crate) fn parse_slice(
+        &self,
+        catalog: &Catalog,
+        request: &CsvLoadRequest,
+        bytes: &[u8],
+        index: usize,
+        admit: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> std::result::Result<Vec<RecordBatch>, SliceRefusal> {
+        let slice = self.slices.get(index).copied().ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "load csv into {}: slice {index} of {} requested",
+                self.table_key,
+                self.slices.len()
+            ))
+        })?;
+        let body = &bytes[slice.start..slice.end];
+        let shape = CsvShape {
+            rows: slice.rows,
+            columns: self.columns,
+        };
+        admit(shape.reader_bytes(body.len()))?;
+        let line_offset = slice.first_record - 1 + usize::from(request.header);
+        let parse_error = |error| {
+            csv_parse_error(
+                &request.source,
+                &self.table_key,
+                offset_arrow_lines(error, line_offset),
+            )
+        };
+        let reader = ReaderBuilder::new(Arc::clone(&self.read_schema))
+            .with_header(false)
+            .with_delimiter(request.delimiter)
+            .with_batch_size(CSV_READ_BATCH_ROWS.min(slice.rows.max(1)))
+            .build(Cursor::new(body))
+            .map_err(parse_error)?;
+        let read = reader
+            .map(|batch| batch.map_err(parse_error))
+            .collect::<Result<Vec<RecordBatch>>>()?;
+        let rows: usize = read.iter().map(RecordBatch::num_rows).sum();
+        if rows != slice.rows {
+            return Err(OmniError::manifest_internal(format!(
+                "load csv into {}: slice {index} counted {} records and read {rows}",
+                self.table_key, slice.rows
+            ))
+            .into());
+        }
+        let properties = match &request.target {
+            LoadTarget::Node(name) => &catalog.node_types[name].properties,
+            LoadTarget::Edge(name) => &catalog.edge_types[name].properties,
+        };
+        let typing = CsvTyping {
+            catalog,
+            target: &request.target,
+            table_key: &self.table_key,
+            properties,
+            arrow_schema: &self.arrow_schema,
+            roles: &self.roles,
+            is_edge: self.is_edge,
+        };
+        admit(typing.normalization_bytes(&read)?)?;
+        Ok(typing.normalize_batches_from(&read, slice.first_record)?)
+    }
 }
 
 /// The resolved typing one CSV load applies to every reader batch.
@@ -336,8 +551,20 @@ struct CsvShape {
     columns: usize,
 }
 
-impl CsvShape {
-    fn count(mut bytes: &[u8], request: &CsvLoadRequest) -> Self {
+/// What one quote-aware pass over a capture counts: its records and columns,
+/// and the slices it cut on record ends.
+struct CsvScan {
+    rows: usize,
+    columns: usize,
+    slices: Vec<CsvSlice>,
+}
+
+impl CsvScan {
+    /// A slice closes on the first record end at or past `slice_bytes` from
+    /// its start, a CRLF end after its line feed; the header, when read, is
+    /// no slice's. A capture with no record is one empty slice.
+    fn scan(mut bytes: &[u8], request: &CsvLoadRequest, slice_bytes: usize) -> Self {
+        let total = bytes.len();
         let mut reader = csv_core::ReaderBuilder::new()
             .delimiter(request.delimiter)
             .build();
@@ -346,9 +573,22 @@ impl CsvShape {
         let mut records = 0_usize;
         let mut columns = 0_usize;
         let mut fields = 0_usize;
+        let mut consumed_total = 0_usize;
+        let mut slice_start = 0_usize;
+        let mut slice_first_record = 1_usize;
+        let mut data_records = 0_usize;
+        let mut slices = Vec::new();
         loop {
-            let (result, consumed, _, count) = reader.read_record(bytes, &mut output, &mut ends);
+            let (result, mut consumed, _, count) =
+                reader.read_record(bytes, &mut output, &mut ends);
+            if matches!(result, csv_core::ReadRecordResult::Record)
+                && bytes[..consumed].ends_with(b"\r")
+                && bytes.get(consumed) == Some(&b'\n')
+            {
+                consumed += 1;
+            }
             bytes = &bytes[consumed..];
+            consumed_total = consumed_total.saturating_add(consumed);
             fields = fields.saturating_add(count);
             match result {
                 csv_core::ReadRecordResult::Record => {
@@ -357,14 +597,49 @@ impl CsvShape {
                     }
                     records = records.saturating_add(1);
                     fields = 0;
+                    if request.header && records == 1 {
+                        slice_start = consumed_total;
+                        continue;
+                    }
+                    data_records = data_records.saturating_add(1);
+                    if consumed_total.saturating_sub(slice_start) >= slice_bytes {
+                        slices.push(CsvSlice {
+                            start: slice_start,
+                            end: consumed_total,
+                            first_record: slice_first_record,
+                            rows: data_records + 1 - slice_first_record,
+                        });
+                        slice_start = consumed_total;
+                        slice_first_record = data_records + 1;
+                    }
                 }
                 csv_core::ReadRecordResult::End => break,
                 _ => {}
             }
         }
+        let tail_rows = data_records + 1 - slice_first_record;
+        if tail_rows > 0 || slices.is_empty() {
+            slices.push(CsvSlice {
+                start: slice_start,
+                end: total,
+                first_record: slice_first_record,
+                rows: tail_rows,
+            });
+        }
         Self {
-            rows: records.saturating_sub(usize::from(request.header)),
+            rows: data_records,
             columns,
+            slices,
+        }
+    }
+}
+
+impl CsvShape {
+    fn count(bytes: &[u8], request: &CsvLoadRequest) -> Self {
+        let scan = CsvScan::scan(bytes, request, usize::MAX);
+        Self {
+            rows: scan.rows,
+            columns: scan.columns,
         }
     }
 
@@ -472,7 +747,23 @@ impl CsvTyping<'_> {
     }
 
     fn normalize_batches(&self, read: &[RecordBatch]) -> Result<Vec<RecordBatch>> {
+        self.normalize_batches_from(read, 1)
+            .map_err(|failure| *failure.error)
+    }
+
+    /// [`Self::normalize_batches`] with the records numbered from
+    /// `first_record`, a slice's first record in the source; the steps run in
+    /// [`NormalizeStep`] order, so the first failure met is the lowest-ranked.
+    fn normalize_batches_from(
+        &self,
+        read: &[RecordBatch],
+        first_record: usize,
+    ) -> std::result::Result<Vec<RecordBatch>, NormalizeFailure> {
         let table_key = self.table_key;
+        let failed = |step: usize, record: usize, error: OmniError| NormalizeFailure {
+            at: NormalizeStep { step, record },
+            error: Box::new(error),
+        };
         let by_role: HashMap<&ColumnRole, usize> = self
             .roles
             .iter()
@@ -480,45 +771,62 @@ impl CsvTyping<'_> {
             .map(|(index, role)| (role, index))
             .collect();
         let leading = if self.is_edge { 3 } else { 1 };
-        let mut first_record = 1;
+        let mut next_record = first_record;
         let mut normalized: Vec<NormalizedCsvBatch> = read
             .iter()
             .map(|batch| {
                 let normalized = NormalizedCsvBatch {
-                    first_record,
+                    first_record: next_record,
                     rows: batch.num_rows(),
                     endpoints: Vec::with_capacity(leading - 1),
                     properties: Vec::with_capacity(
                         self.arrow_schema.fields().len().saturating_sub(leading),
                     ),
                 };
-                first_record += batch.num_rows();
+                next_record += batch.num_rows();
                 normalized
             })
             .collect();
         if self.is_edge {
-            for (role, label) in [(ColumnRole::Src, FROM_COLUMN), (ColumnRole::Dst, TO_COLUMN)] {
+            for (step, (role, label)) in
+                [(ColumnRole::Src, FROM_COLUMN), (ColumnRole::Dst, TO_COLUMN)]
+                    .into_iter()
+                    .enumerate()
+            {
                 let index = *by_role.get(&role).ok_or_else(|| {
-                    OmniError::manifest_internal(format!("{label} column resolved twice"))
+                    failed(
+                        step,
+                        first_record,
+                        OmniError::manifest_internal(format!("{label} column resolved twice")),
+                    )
                 })?;
                 for (read, normalized) in read.iter().zip(&mut normalized) {
                     let strings = utf8_without_empty(read.column(index));
                     if let Some(row) = first_null(&strings) {
-                        return Err(OmniError::manifest(format!(
-                            "load csv into {table_key}: record {} has an empty `{label}` endpoint",
-                            normalized.first_record + row
-                        )));
+                        let record = normalized.first_record + row;
+                        return Err(failed(
+                            step,
+                            record,
+                            OmniError::manifest(format!(
+                                "load csv into {table_key}: record {record} has an empty `{label}` endpoint"
+                            )),
+                        ));
                     }
                     normalized.endpoints.push(Arc::new(strings));
                 }
             }
         }
-        for field in self.arrow_schema.fields().iter().skip(leading) {
+        for (property, field) in self.arrow_schema.fields().iter().skip(leading).enumerate() {
+            let convert = NormalizeStep::property(property, false);
             let prop = self.properties.get(field.name()).ok_or_else(|| {
-                OmniError::manifest_internal(format!(
-                    "property '{}' of {table_key} is missing from its catalog entry",
-                    field.name()
-                ))
+                failed(
+                    convert,
+                    first_record,
+                    OmniError::manifest_internal(format!(
+                        "property '{}' of {table_key} is missing from its catalog entry",
+                        field.name()
+                    )),
+                )
             })?;
             let role = ColumnRole::Property {
                 name: field.name().to_string(),
@@ -526,10 +834,14 @@ impl CsvTyping<'_> {
             };
             let index = by_role.get(&role).copied();
             if index.is_none() && !field.is_nullable() {
-                return Err(OmniError::manifest(format!(
-                    "load csv into {table_key}: property '{}' is not nullable and the source has no column for it",
-                    field.name()
-                )));
+                return Err(failed(
+                    convert,
+                    first_record,
+                    OmniError::manifest(format!(
+                        "load csv into {table_key}: property '{}' is not nullable and the source has no column for it",
+                        field.name()
+                    )),
+                ));
             }
             for (read, normalized) in read.iter().zip(&mut normalized) {
                 let column = match index {
@@ -539,7 +851,10 @@ impl CsvTyping<'_> {
                         prop,
                         table_key,
                         normalized.first_record,
-                    )?,
+                    )
+                    .map_err(|(row, error)| {
+                        failed(convert, normalized.first_record + row, *error)
+                    })?,
                     None => new_null_array(field.data_type(), normalized.rows),
                 };
                 normalized.properties.push(column);
@@ -551,15 +866,20 @@ impl CsvTyping<'_> {
                         .last()
                         .expect("every batch has the current property");
                     if let Some(row) = first_null(column.as_ref()) {
-                        return Err(OmniError::manifest(format!(
-                            "load csv into {table_key}: record {} has an empty field for non-nullable property '{}'",
-                            normalized.first_record + row,
-                            field.name()
-                        )));
+                        let record = normalized.first_record + row;
+                        return Err(failed(
+                            NormalizeStep::property(property, true),
+                            record,
+                            OmniError::manifest(format!(
+                                "load csv into {table_key}: record {record} has an empty field for non-nullable property '{}'",
+                                field.name()
+                            )),
+                        ));
                     }
                 }
             }
         }
+        let ids_step = NormalizeStep::property(self.arrow_schema.fields().len() - leading, false);
         normalized
             .into_iter()
             .map(|normalized| {
@@ -570,7 +890,7 @@ impl CsvTyping<'_> {
                         &normalized.properties,
                         normalized.rows,
                         normalized.first_record,
-                    )?,
+                    ),
                     LoadTarget::Edge(name) => edge_ids(
                         &self.catalog.edge_types[name],
                         self.arrow_schema,
@@ -580,15 +900,21 @@ impl CsvTyping<'_> {
                         self.catalog.system_columns,
                         normalized.rows,
                         normalized.first_record,
-                    )?,
-                };
+                    ),
+                }
+                .map_err(|(row, error)| failed(ids_step, normalized.first_record + row, *error))?;
                 let mut columns: Vec<ArrayRef> =
                     Vec::with_capacity(self.arrow_schema.fields().len());
                 columns.push(Arc::new(StringArray::from(ids)));
                 columns.extend(normalized.endpoints);
                 columns.extend(normalized.properties);
-                RecordBatch::try_new(Arc::clone(self.arrow_schema), columns)
-                    .map_err(OmniError::arrow_internal)
+                RecordBatch::try_new(Arc::clone(self.arrow_schema), columns).map_err(|error| {
+                    failed(
+                        ids_step,
+                        normalized.first_record,
+                        OmniError::arrow_internal(error),
+                    )
+                })
             })
             .collect()
     }
@@ -759,6 +1085,39 @@ fn csv_parse_error(source: &str, table_key: &str, error: arrow_schema::ArrowErro
     ))
 }
 
+/// Arrow numbers a parse error's `at line` from its reader's first line; a
+/// slice's reader starts `offset` lines into the capture, so the number the
+/// whole capture's reader would print is restored.
+fn offset_arrow_lines(error: arrow_schema::ArrowError, offset: usize) -> arrow_schema::ArrowError {
+    let renumber = |text: String| -> String {
+        let Some(at) = text.find(" at line ") else {
+            return text;
+        };
+        let digits = at + " at line ".len();
+        let end = text[digits..]
+            .find(|c: char| !c.is_ascii_digit())
+            .map_or(text.len(), |n| digits + n);
+        match text[digits..end].parse::<usize>() {
+            Ok(line) => format!(
+                "{}{}{}",
+                &text[..digits],
+                line.saturating_add(offset),
+                &text[end..]
+            ),
+            Err(_) => text,
+        }
+    };
+    match error {
+        arrow_schema::ArrowError::ParseError(text) => {
+            arrow_schema::ArrowError::ParseError(renumber(text))
+        }
+        arrow_schema::ArrowError::CsvError(text) => {
+            arrow_schema::ArrowError::CsvError(renumber(text))
+        }
+        other => other,
+    }
+}
+
 /// A read text column with every empty field as null: the CSV spelling of
 /// null, since the format has no other.
 fn utf8_without_empty(column: &ArrayRef) -> StringArray {
@@ -779,19 +1138,22 @@ fn first_null(column: &dyn Array) -> Option<usize> {
 
 /// One read column to its declared Arrow type: numbers as read, text with
 /// empty fields as null, `Bool` from exactly `true` or `false`, `Date` and
-/// `DateTime` literal-checked cell by cell; `first_record` numbers row 0.
+/// `DateTime` literal-checked cell by cell; a refusal names its 0-based row.
 fn convert_property(
     column: &ArrayRef,
     name: &str,
     prop: &PropType,
     table_key: &str,
     first_record: usize,
-) -> Result<ArrayRef> {
+) -> std::result::Result<ArrayRef, (usize, Box<OmniError>)> {
     let cell_error = |row: usize, message: String| {
-        OmniError::manifest(format!(
-            "load csv into {table_key}: record {}, property '{name}': {message}",
-            first_record + row
-        ))
+        (
+            row,
+            Box::new(OmniError::manifest(format!(
+                "load csv into {table_key}: record {}, property '{name}': {message}",
+                first_record + row
+            ))),
+        )
     };
     Ok(match prop.scalar {
         ScalarType::I32 | ScalarType::I64 | ScalarType::U32 | ScalarType::U64 => Arc::clone(column),
@@ -873,9 +1235,12 @@ fn convert_property(
             Arc::new(Date64Array::from(values))
         }
         ScalarType::Vector(_) | ScalarType::Blob => {
-            return Err(OmniError::manifest_internal(format!(
-                "property '{name}' of {table_key} passed the kind check with an unsupported kind"
-            )));
+            return Err((
+                0,
+                Box::new(OmniError::manifest_internal(format!(
+                    "property '{name}' of {table_key} passed the kind check with an unsupported kind"
+                ))),
+            ));
         }
     })
 }
@@ -888,7 +1253,7 @@ fn node_ids(
     property_columns: &[ArrayRef],
     rows: usize,
     first_record: usize,
-) -> Result<Vec<String>> {
+) -> std::result::Result<Vec<String>, (usize, Box<OmniError>)> {
     let key_columns = node_type
         .key
         .as_ref()
@@ -913,9 +1278,10 @@ fn node_ids(
                 })
                 .collect::<Result<Vec<_>>>()
         })
-        .transpose()?;
-    (0..rows)
-        .map(|row| match &key_columns {
+        .transpose()
+        .map_err(|error| (0, Box::new(error)))?;
+    let id = |row: usize| -> Result<String> {
+        match &key_columns {
             Some(key_columns) => canonical_key_id(key_columns, row)?.ok_or_else(|| {
                 OmniError::manifest(format!(
                     "load csv into node:{}: record {} is missing a non-null @key value",
@@ -924,7 +1290,10 @@ fn node_ids(
                 ))
             }),
             None => Ok(generate_id()),
-        })
+        }
+    };
+    (0..rows)
+        .map(|row| id(row).map_err(|error| (row, Box::new(error))))
         .collect()
 }
 
@@ -939,7 +1308,7 @@ fn edge_ids(
     system_columns: SystemColumns,
     rows: usize,
     first_record: usize,
-) -> Result<Vec<String>> {
+) -> std::result::Result<Vec<String>, (usize, Box<OmniError>)> {
     let key_columns = edge_key_columns(
         edge_type,
         schema,
@@ -947,9 +1316,10 @@ fn edge_ids(
         dst_column,
         property_columns,
         system_columns,
-    )?;
-    (0..rows)
-        .map(|row| match &key_columns {
+    )
+    .map_err(|error| (0, Box::new(error)))?;
+    let id = |row: usize| -> Result<String> {
+        match &key_columns {
             Some(key_columns) => canonical_key_id(key_columns, row)?.ok_or_else(|| {
                 OmniError::manifest(format!(
                     "load csv into edge:{}: record {} is missing a non-null @key value",
@@ -958,7 +1328,10 @@ fn edge_ids(
                 ))
             }),
             None => Ok(generate_id()),
-        })
+        }
+    };
+    (0..rows)
+        .map(|row| id(row).map_err(|error| (row, Box::new(error))))
         .collect()
 }
 
@@ -1091,6 +1464,182 @@ mod tests {
         assert_eq!(batch_rows(&prepared.batches), vec![CSV_READ_BATCH_ROWS, 1]);
         assert_eq!(prepared.table_key, "node:Person");
         assert!(!prepared.is_edge);
+    }
+
+    fn slice_bodies<'a>(bytes: &'a [u8], scan: &CsvScan) -> Vec<&'a [u8]> {
+        scan.slices
+            .iter()
+            .map(|slice| &bytes[slice.start..slice.end])
+            .collect()
+    }
+
+    /// A slice closes on the first record end at or past the slice size,
+    /// the header belongs to none, and each slice numbers its first record
+    /// from the source; a case sees one slice under 8 MiB.
+    #[test]
+    fn scan_cuts_slices_on_record_ends_and_numbers_them_from_the_source() {
+        let mut source = String::from("key,score\n");
+        for row in 0..10 {
+            writeln!(&mut source, "{row},1.5").unwrap();
+        }
+        let bytes = source.as_bytes();
+        let scan = CsvScan::scan(bytes, &request(LoadMode::Overwrite), 8);
+        assert_eq!((scan.rows, scan.columns), (10, 2));
+        assert_eq!(
+            scan.slices,
+            (0..5)
+                .map(|slice| CsvSlice {
+                    start: 10 + slice * 12,
+                    end: 10 + (slice + 1) * 12,
+                    first_record: 1 + slice * 2,
+                    rows: 2,
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(slice_bodies(bytes, &scan)[2], b"4,1.5\n5,1.5\n");
+
+        let whole = CsvScan::scan(bytes, &request(LoadMode::Overwrite), usize::MAX);
+        assert_eq!(
+            whole.slices,
+            vec![CsvSlice {
+                start: 10,
+                end: bytes.len(),
+                first_record: 1,
+                rows: 10,
+            }]
+        );
+    }
+
+    #[test]
+    fn scan_without_a_header_counts_the_first_line_as_a_record() {
+        let bytes = b"0,1.5\n1,1.5\n2,1.5\n";
+        let request = CsvLoadRequest {
+            header: false,
+            ..request(LoadMode::Overwrite)
+        };
+        let scan = CsvScan::scan(bytes, &request, 7);
+        assert_eq!(scan.rows, 3);
+        assert_eq!(
+            scan.slices,
+            vec![
+                CsvSlice {
+                    start: 0,
+                    end: 12,
+                    first_record: 1,
+                    rows: 2,
+                },
+                CsvSlice {
+                    start: 12,
+                    end: 18,
+                    first_record: 3,
+                    rows: 1,
+                },
+            ]
+        );
+    }
+
+    /// `csv_core` reports a CRLF record once it has read the `\r`; the cut
+    /// takes the `\n` with it so no slice starts on a bare line feed.
+    #[test]
+    fn scan_cuts_a_crlf_source_after_the_line_feed() {
+        let bytes = b"key,score\r\n0,1.5\r\n1,1.5\r\n2,1.5\r\n";
+        let scan = CsvScan::scan(bytes, &request(LoadMode::Overwrite), 1);
+        assert_eq!(scan.rows, 3);
+        assert_eq!(
+            slice_bodies(bytes, &scan),
+            [&b"0,1.5\r\n"[..], b"1,1.5\r\n", b"2,1.5\r\n"]
+        );
+        assert_eq!(
+            scan.slices[0],
+            CsvSlice {
+                start: 11,
+                end: 18,
+                first_record: 1,
+                rows: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn scan_never_cuts_inside_a_quoted_field() {
+        let bytes = b"key,name\n1,\"a\nb\"\n2,c\n";
+        let scan = CsvScan::scan(bytes, &request(LoadMode::Overwrite), 1);
+        assert_eq!((scan.rows, scan.columns), (2, 2));
+        assert_eq!(slice_bodies(bytes, &scan), [&b"1,\"a\nb\"\n"[..], b"2,c\n"]);
+        assert_eq!(
+            scan.slices
+                .iter()
+                .map(|slice| slice.first_record)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+    }
+
+    /// Arrow numbers a parse error's line from its reader's start; a slice's
+    /// refusal carries the whole capture's number, so one slice and many
+    /// refuse the same record in the same words.
+    #[test]
+    fn a_slice_parse_error_names_the_source_line() {
+        let catalog = build_catalog(
+            &parse_schema("node Person {\n  key: I64 @key\n  score: F64\n}\n").unwrap(),
+        )
+        .unwrap();
+        let mut source = String::from("key,score\n");
+        for row in 0..40 {
+            if row == 27 {
+                writeln!(&mut source, "{row},x").unwrap();
+            } else {
+                writeln!(&mut source, "{row},1.5").unwrap();
+            }
+        }
+        let capture = CapturedSource {
+            bytes: Arc::from(source.as_bytes()),
+            admission: None,
+            size: source.len() as u64,
+            e_tag: None,
+            version: None,
+        };
+        let request = request(LoadMode::Overwrite);
+        let whole = prepare_csv_batches(&catalog, &request, &capture, &mut |_| Ok(()))
+            .unwrap_err()
+            .to_string();
+        assert!(whole.contains("at line 28"), "{whole}");
+
+        let resolved = ResolvedCsv::resolve(&catalog, &request, source.as_bytes(), 64).unwrap();
+        let slice = resolved
+            .slices()
+            .iter()
+            .position(|slice| (slice.first_record..slice.first_record + slice.rows).contains(&28))
+            .unwrap();
+        assert!(slice > 0, "record 28 is past the first slice");
+        let sliced = resolved
+            .parse_slice(
+                &catalog,
+                &request,
+                source.as_bytes(),
+                slice,
+                &mut |_| Ok(()),
+            )
+            .unwrap_err()
+            .into_error()
+            .to_string();
+        assert_eq!(sliced, whole);
+    }
+
+    #[test]
+    fn scan_of_a_header_alone_is_one_empty_slice() {
+        let bytes = b"key,score\n";
+        let scan = CsvScan::scan(bytes, &request(LoadMode::Overwrite), 8);
+        assert_eq!(scan.rows, 0);
+        assert_eq!(
+            scan.slices,
+            vec![CsvSlice {
+                start: 10,
+                end: 10,
+                first_record: 1,
+                rows: 0,
+            }]
+        );
     }
 
     /// Counts through fixed scratch-buffer boundaries and covers Arrow's

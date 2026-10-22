@@ -16,7 +16,7 @@ fix names the decision instead.
 | `suggestion` | Optional source edits with `applicability`, plus `start`, `end` and `replacement` for each edit. |
 
 The one-line `error` text is the code and the expectation in the legacy form
-(`parse error: …`, `type error: T33: …`, `plan error: P001: …`); the other
+(`parse error: …`, `type error: T33: …`, `plan error: P002: …`); the other
 fields travel beside it.
 
 ## The measured case
@@ -72,10 +72,11 @@ do not mean there is no possible fix.
 ## Where the fields appear
 
 - **CLI, human formats** (`table`, `kv`, `csv`): the form above on stderr,
-  exit status 1, with no colour codes and no backtrace footer.
+  then `HTTP 400` when served and the `disposition` line, exit status 1, with no
+  colour codes and no backtrace footer.
 - **CLI, machine formats**: `--json` and `--format json` print the API's error
-  body pretty, `--format jsonl` prints it as one line, both on stdout with
-  exit status 1. A served refusal keeps the server's `code` field
+  body pretty with its `disposition`, `--format jsonl` prints it as one line, both
+  on stdout with exit status 1. A served refusal keeps the server's `code` field
   (`bad_request`); an embedded one has none.
 - **HTTP**: a `400` that refuses a query carries the additive `diagnostic`
   object in its error body. See
@@ -124,8 +125,12 @@ an internal error.
 
 | Code | Meaning |
 |---|---|
-| `P001` | A ranking (`nearest`, `bm25`) orders a binding that a traversal reaches from another binding. The fix declares that binding first in `match`, so the ranking starts the traversal. |
 | `P002` | An edge alternation or wildcard traversal has no finite traversal work limit. The fix sets `traversal_work_limit` before the query. |
 | `P003` | The traversal work limit is outside `1..=9223372036854775807`, or a plan records it twice. |
 | `P004` | An edge alternation or wildcard traversal was asked to run in CSR traversal mode; it runs in `auto` or `indexed` mode. |
-| `P005` | An `rrf()` ranks two bindings that one traversal connects. One of them always starts the traversal and the other is reached, and engine v2 ranks only the binding a traversal starts from, so no declaration order serves both arms; the refusal offers no fix. |
+
+`P001` and `P005` are withdrawn. A search order ranks the binding it names
+whatever the `match` block declares first, so a ranking on a binding a
+traversal reaches is no longer refused, and an `rrf()` whose arms rank two
+bindings one traversal connects is the type error `T59`
+([Search](../search/index.md#ranking-a-traversal-reached-binding)).

@@ -11,8 +11,9 @@ and as the rolling `edge` release.
   build against data (the commit, the storage format it writes and serves next
   to the latest stable release's, the HTTP contract, how to pin the build) and
   the release notes recorded since the last stable release, which
-  `release_notes.py preview` renders. A marker line records the build's commit
-  and storage format for `prune`.
+  `release_notes.py preview` renders. A stable release before 0.14 does not
+  report its HTTP contract, so it is read from that release's source. A marker
+  line records the build's commit and storage format for `prune`.
 - `prune` lists the edge builds to delete: everything beyond the newest
   retained count, except the newest build of every storage format, which is
   the build that can still export a graph at that format.
@@ -24,7 +25,7 @@ import argparse
 import json
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 # GitHub refuses a release body above 125,000 characters; stay clear of it.
@@ -35,6 +36,7 @@ MARKER = re.compile(r"^<!-- edge-build: (\{.*\}) -->$", re.MULTILINE)
 COMMIT = re.compile(r"[0-9a-f]{40}")
 SCHEMA_LINE = re.compile(r"internal-schema ([0-9]+) \(serves v([0-9]+) to v([0-9]+)\)")
 PREVIEW_HEADING = re.compile(r"# OmniGraph (v[0-9]+\.[0-9]+\.[0-9]+)")
+SOURCE_CONTRACT = re.compile(r'^pub const HTTP_API_CONTRACT: &str = "([^"\n]+)";$', re.MULTILINE)
 
 
 class BodyError(Exception):
@@ -81,6 +83,26 @@ def parse_facts(raw: str) -> Facts:
         serves=(int(schema.group(2)), int(schema.group(3))),
         http_contract=contract,
     )
+
+
+def with_source_contract(facts: Facts, source: str) -> Facts:
+    """Complete `facts` with the `HTTP_API_CONTRACT` that the release's
+    `crates/omnigraph-api-types/src/lib.rs` defines. A release before 0.14
+    sends that value but does not report it; a release that reports it must
+    agree with its source."""
+    found = SOURCE_CONTRACT.findall(source)
+    if len(found) > 1:
+        raise BodyError("the stable release's source defines HTTP_API_CONTRACT more than once")
+    if not found:
+        return facts
+    if facts.http_contract is None:
+        return replace(facts, http_contract=found[0])
+    if facts.http_contract != found[0]:
+        raise BodyError(
+            f"the stable binary reports HTTP contract {facts.http_contract} but its source "
+            f"defines {found[0]}"
+        )
+    return facts
 
 
 def core_version(version: str) -> tuple[int, int, int]:
@@ -288,6 +310,11 @@ def main(argv: list[str] | None = None) -> int:
     body.add_argument("--build-version", required=True, type=Path, help="`omnigraph version --json` of this build")
     body.add_argument("--stable-tag", default="", help="latest stable release tag, empty when none exists")
     body.add_argument("--stable-version", type=Path, help="`omnigraph version` output of that release")
+    body.add_argument(
+        "--stable-source",
+        type=Path,
+        help="that release's crates/omnigraph-api-types/src/lib.rs, for a release that does not report its HTTP contract",
+    )
     body.add_argument("--notes", required=True, type=Path, help="`release_notes.py preview` output")
     body.add_argument("--rolling", action="store_true", help="compose the rolling `edge` release text")
     check = commands.add_parser("check-version", help="refuse a package version not above the latest stable")
@@ -311,13 +338,18 @@ def main(argv: list[str] | None = None) -> int:
         stable_tag = args.stable_tag or None
         if bool(stable_tag) != bool(args.stable_version):
             raise BodyError("--stable-tag and --stable-version go together")
+        if args.stable_source and not stable_tag:
+            raise BodyError("--stable-source needs --stable-tag")
+        stable = parse_facts(args.stable_version.read_text(encoding="utf-8")) if args.stable_version else None
+        if stable and args.stable_source:
+            stable = with_source_contract(stable, args.stable_source.read_text(encoding="utf-8"))
         text = compose(
             repository=args.repository,
             commit=args.commit,
             build_tag=args.build_tag,
             build=parse_facts(args.build_version.read_text(encoding="utf-8")),
             stable_tag=stable_tag,
-            stable=parse_facts(args.stable_version.read_text(encoding="utf-8")) if args.stable_version else None,
+            stable=stable,
             preview=args.notes.read_text(encoding="utf-8"),
             rolling=args.rolling,
         )

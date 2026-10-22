@@ -476,6 +476,19 @@ mod tests {
         paths
     }
 
+    #[test]
+    fn operation_inventory_covers_every_public_command() {
+        use omnigraph_api_types::operations::{CLI_ONLY_OPERATIONS, HTTP_OPERATIONS};
+
+        let inventoried: BTreeSet<String> = HTTP_OPERATIONS
+            .iter()
+            .flat_map(|operation| operation.cli.names.iter().copied())
+            .chain(CLI_ONLY_OPERATIONS.iter().map(|operation| operation.name))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(cli_command_paths(), inventoried);
+    }
+
     fn top_level_commands() -> BTreeSet<String> {
         cli_command_paths()
             .into_iter()

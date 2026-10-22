@@ -1,9 +1,14 @@
 //! A load's leaf: the captured CSV object parsed into the target table's
-//! typed delta, in source order, by one reader.
+//! typed delta by up to `partitions` readers, each claiming the next slice
+//! the resolve pass cut, the slices reordered by the breaker above.
 
+use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
+use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::common::Result as DfResult;
 use datafusion::execution::TaskContext;
@@ -13,47 +18,151 @@ use datafusion::physical_plan::{
 };
 use omnigraph_compiler::catalog::Catalog;
 
-use super::memory::WorkMemory;
-use super::producer::producer_stream;
-use super::{external, polled, streaming_properties};
-use crate::loader::csv::{CsvLoadRequest, prepare_csv_batches};
+use super::external;
+use super::shape::{Source, work};
+use crate::error::OmniError;
+use crate::loader::LoadSliceExecuted;
+use crate::loader::csv::{
+    CsvLoadRequest, NormalizeFailure, NormalizeStep, ResolvedCsv, SliceRefusal,
+};
 use crate::table_store::CapturedSource;
 
 /// The `csv_source_rows` metric: the records the source held, counted once
 /// the parse finished.
 pub(crate) const CSV_SOURCE_ROWS: &str = "csv_source_rows";
 
+/// The schema metadata key every produced batch carries its slice index
+/// under, so the breaker restores source order whatever partition parsed it.
+pub(crate) const CSV_SLICE_METADATA: &str = "omnigraph.load.slice";
+
 pub(crate) struct CsvSourceExec {
     parse: Arc<Parse>,
-    properties: Arc<PlanProperties>,
+    shape: Source,
+    partitions: usize,
     metrics: ExecutionPlanMetricsSet,
 }
 
-/// What one execution parses, shared with its producer.
+/// What every partition of one execution parses from, shared with its
+/// producers: the statement, the capture, the resolve pass once it ran, the
+/// slice claim counter and what each slice measured.
 struct Parse {
     request: CsvLoadRequest,
     capture: Arc<CapturedSource>,
     catalog: Arc<Catalog>,
+    slice_bytes: usize,
+    resolved: Mutex<Option<Arc<ResolvedCsv>>>,
+    next_slice: AtomicUsize,
+    stop: AtomicBool,
+    started: OnceLock<Instant>,
+    slices: Mutex<Vec<LoadSliceExecuted>>,
+    failed: Mutex<Vec<FailedSlice>>,
+}
+
+/// A slice a partition refused and, for a normalization refusal, where it
+/// ranks; the breaker names the best-ranked one's refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FailedSlice {
+    pub(crate) slice: usize,
+    pub(crate) partition: usize,
+    pub(crate) normalize: Option<NormalizeStep>,
+}
+
+impl FailedSlice {
+    /// The order the breaker names refusals in: a parse refusal first, the
+    /// lowest slice's, then a normalization refusal by its step and record;
+    /// the order the whole-capture path meets them in.
+    pub(crate) fn rank(&self) -> (bool, usize, usize) {
+        match self.normalize {
+            None => (false, self.slice, 0),
+            Some(at) => (true, at.step, at.record),
+        }
+    }
+}
+
+impl Parse {
+    fn record_failure(&self, failed: FailedSlice) {
+        self.failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(failed);
+    }
+
+    fn resolved(&self) -> crate::error::Result<Arc<ResolvedCsv>> {
+        let mut resolved = self
+            .resolved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(resolved) = resolved.as_ref() {
+            return Ok(Arc::clone(resolved));
+        }
+        let fresh = Arc::new(ResolvedCsv::resolve(
+            &self.catalog,
+            &self.request,
+            &self.capture.bytes,
+            self.slice_bytes,
+        )?);
+        *resolved = Some(Arc::clone(&fresh));
+        Ok(fresh)
+    }
 }
 
 impl CsvSourceExec {
     /// `schema` is the target type's Arrow schema, the shape every normalized
-    /// batch carries.
+    /// batch carries; `partitions` the output streams, the plan's
+    /// `max_partitions`; `slice_bytes` the size a slice is cut at.
     pub(crate) fn new(
         request: CsvLoadRequest,
         capture: Arc<CapturedSource>,
         catalog: Arc<Catalog>,
         schema: SchemaRef,
+        partitions: usize,
+        slice_bytes: usize,
     ) -> Self {
+        let partitions = partitions.max(1);
         Self {
             parse: Arc::new(Parse {
                 request,
                 capture,
                 catalog,
+                slice_bytes: slice_bytes.max(1),
+                resolved: Mutex::new(None),
+                next_slice: AtomicUsize::new(0),
+                stop: AtomicBool::new(false),
+                started: OnceLock::new(),
+                slices: Mutex::new(Vec::new()),
+                failed: Mutex::new(Vec::new()),
             }),
-            properties: streaming_properties(schema),
+            shape: Source::with_partitions(schema, partitions),
+            partitions,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    pub(crate) fn partitions(&self) -> usize {
+        self.partitions
+    }
+
+    /// What each slice measured, in slice order, once the plan ran.
+    pub(crate) fn executed_slices(&self) -> Vec<LoadSliceExecuted> {
+        let mut slices = self
+            .parse
+            .slices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        slices.sort_by_key(|slice| slice.slice);
+        slices
+    }
+
+    /// Every refused slice with the partition that met it, one per failed
+    /// partition (its best-ranked), so the breaker answers the best-ranked
+    /// refusal whatever partition met it.
+    pub(crate) fn failed_slices(&self) -> Vec<FailedSlice> {
+        self.parse
+            .failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -62,6 +171,7 @@ impl fmt::Debug for CsvSourceExec {
         f.debug_struct("CsvSourceExec")
             .field("source", &self.parse.request.source)
             .field("table", &self.parse.request.target.table_key())
+            .field("partitions", &self.partitions)
             .finish_non_exhaustive()
     }
 }
@@ -87,7 +197,7 @@ impl ExecutionPlan for CsvSourceExec {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
+        self.shape.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -107,43 +217,135 @@ impl ExecutionPlan for CsvSourceExec {
         partition: usize,
         ctx: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
-        assert_eq!(partition, 0, "CsvSourceExec has one partition");
-        let schema = self.schema();
-        let mut work = WorkMemory::new(ctx, "CsvSourceExec")?;
-        work.set_metrics(self.metrics.clone());
-        work.metric(CSV_SOURCE_ROWS, 0);
+        assert!(
+            partition < self.partitions,
+            "CsvSourceExec has {} partitions, partition {partition} executed",
+            self.partitions
+        );
+        let memory = work(ctx, "CsvSourceExec", &self.metrics)?;
+        memory.metric(CSV_SOURCE_ROWS, 0);
         let parse = Arc::clone(&self.parse);
-        let stream = producer_stream(
-            schema,
-            Arc::new(work),
-            Some(&self.metrics),
+        Ok(self.shape.partition_stream(
+            partition,
+            memory,
+            &self.metrics,
             move |memory, sender| async move {
-                let decoding = memory.child("CSV decoding")?;
-                decoding.checkpoint()?;
-                let prepared = prepare_csv_batches(
-                    &parse.catalog,
-                    &parse.request,
-                    &parse.capture,
-                    &mut |bytes| {
-                        decoding
-                            .grow(usize::try_from(bytes).unwrap_or(usize::MAX))
-                            .map_err(|error| decoding.error(error))
-                    },
-                )
-                .map_err(external)?;
-                for batch in &prepared.batches {
-                    memory.hold(batch)?;
+                let started = *parse.started.get_or_init(Instant::now);
+                if parse.stop.load(Ordering::Acquire) {
+                    return Ok(());
                 }
-                drop(decoding);
-                memory.metric(CSV_SOURCE_ROWS, prepared.rows);
-                for batch in prepared.batches {
-                    sender.send(batch, Arc::clone(&memory)).await?;
+                let resolved = match parse.resolved() {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        parse.stop.store(true, Ordering::Release);
+                        return Err(external(error));
+                    }
+                };
+                let mut failed: Option<(usize, NormalizeFailure)> = None;
+                loop {
+                    if parse.stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let slice = parse.next_slice.fetch_add(1, Ordering::AcqRel);
+                    if slice >= resolved.slices().len() {
+                        break;
+                    }
+                    let start_ns = elapsed_ns(started);
+                    let decoding = memory.child("CSV decoding")?;
+                    decoding.checkpoint()?;
+                    let computing = Instant::now();
+                    let parsed = resolved.parse_slice(
+                        &parse.catalog,
+                        &parse.request,
+                        &parse.capture.bytes,
+                        slice,
+                        &mut |bytes| {
+                            decoding
+                                .grow(usize::try_from(bytes).unwrap_or(usize::MAX))
+                                .map_err(|error| decoding.error(error))
+                        },
+                    );
+                    let batches = match parsed {
+                        Ok(batches) => batches,
+                        Err(SliceRefusal::Normalize(failure)) => {
+                            if failed.as_ref().is_none_or(|(_, held)| failure.at < held.at) {
+                                failed = Some((slice, failure));
+                            }
+                            continue;
+                        }
+                        Err(SliceRefusal::Parse(error)) => {
+                            parse.stop.store(true, Ordering::Release);
+                            parse.record_failure(FailedSlice {
+                                slice,
+                                partition,
+                                normalize: None,
+                            });
+                            return Err(external(*error));
+                        }
+                    };
+                    if failed.is_some() {
+                        continue;
+                    }
+                    let elapsed_compute_ns = elapsed_ns(computing);
+                    for batch in &batches {
+                        memory.hold(batch)?;
+                    }
+                    drop(decoding);
+                    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                    memory.metric(CSV_SOURCE_ROWS, rows);
+                    for batch in batches {
+                        sender
+                            .send(tag_slice(batch, slice)?, Arc::clone(&memory))
+                            .await?;
+                    }
+                    parse
+                        .slices
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(LoadSliceExecuted {
+                            slice: u32::try_from(slice).unwrap_or(u32::MAX),
+                            partition: u32::try_from(partition).unwrap_or(u32::MAX),
+                            rows: rows as u64,
+                            elapsed_compute_ns,
+                            start_ns,
+                            end_ns: elapsed_ns(started),
+                        });
+                }
+                if let Some((slice, failure)) = failed {
+                    parse.record_failure(FailedSlice {
+                        slice,
+                        partition,
+                        normalize: Some(failure.at),
+                    });
+                    return Err(external(*failure.error));
                 }
                 Ok(())
             },
-        );
-        Ok(polled(&self.metrics, stream))
+        ))
     }
+}
+
+fn elapsed_ns(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// `batch` with its slice index in the schema metadata, the columns shared.
+fn tag_slice(batch: RecordBatch, slice: usize) -> DfResult<RecordBatch> {
+    let mut metadata: HashMap<String, String> = batch.schema().metadata().clone();
+    metadata.insert(CSV_SLICE_METADATA.to_string(), slice.to_string());
+    let schema = Arc::new(batch.schema().as_ref().clone().with_metadata(metadata));
+    RecordBatch::try_new(schema, batch.columns().to_vec())
+        .map_err(|error| external(OmniError::arrow_internal(error)))
+}
+
+/// The slice index a produced batch carries, 0 for a batch with none.
+pub(crate) fn slice_of(batch: &RecordBatch) -> usize {
+    batch
+        .schema()
+        .metadata()
+        .get(CSV_SLICE_METADATA)
+        .and_then(|slice| slice.parse().ok())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -159,7 +361,7 @@ mod tests {
     use super::super::fixtures;
     use super::*;
     use crate::loader::LoadMode;
-    use crate::loader::csv::{CSV_READ_BATCH_ROWS, target_arrow_schema};
+    use crate::loader::csv::{CSV_READ_BATCH_ROWS, prepare_csv_batches, target_arrow_schema};
 
     fn request() -> CsvLoadRequest {
         CsvLoadRequest {
@@ -196,6 +398,17 @@ mod tests {
         exec.execute(0, ctx).unwrap().collect().await
     }
 
+    fn keys(batch: &RecordBatch) -> Vec<i64> {
+        batch
+            .column_by_name("key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    }
+
     /// The operator's stream against the loader's own parse of the same
     /// capture, across a reader-batch boundary; a case sees only the rows
     /// a load leaves, never the batches an operator hands on.
@@ -210,13 +423,17 @@ mod tests {
         let expected =
             prepare_csv_batches(&catalog, &request(), &capture, &mut |_| Ok(())).unwrap();
         let schema = target_arrow_schema(&catalog, &request().target).unwrap();
-        let exec = CsvSourceExec::new(request(), capture, catalog, schema);
+        let exec = CsvSourceExec::new(request(), capture, catalog, schema, 1, usize::MAX);
         let batches: Vec<RecordBatch> = run(&exec)
             .await
             .into_iter()
             .map(|batch| batch.unwrap())
             .collect();
-        assert_eq!(batches, expected.batches);
+        assert_eq!(
+            batches.iter().map(keys).collect::<Vec<_>>(),
+            expected.batches.iter().map(keys).collect::<Vec<_>>()
+        );
+        assert!(batches.iter().all(|batch| slice_of(batch) == 0));
         assert_eq!(
             batches
                 .iter()
@@ -229,6 +446,62 @@ mod tests {
             .and_then(|metrics| metrics.sum_by_name(CSV_SOURCE_ROWS))
             .map(|metric| metric.as_usize());
         assert_eq!(rows, Some(expected.rows));
+        assert_eq!(exec.executed_slices().len(), 1);
+    }
+
+    /// Three partitions over a capture cut into small slices: every slice is
+    /// claimed once, its batches carry its index, and all partitions' rows
+    /// sorted by slice are the loader's; a case never sees the claim.
+    #[tokio::test]
+    async fn partitions_claim_every_slice_once_and_tag_their_batches() {
+        let mut source = String::from("key,score\n");
+        for row in 0..1000 {
+            writeln!(&mut source, "{row},1.5").unwrap();
+        }
+        let catalog = catalog();
+        let capture = capture(&source);
+        let expected =
+            prepare_csv_batches(&catalog, &request(), &capture, &mut |_| Ok(())).unwrap();
+        let schema = target_arrow_schema(&catalog, &request().target).unwrap();
+        let exec = CsvSourceExec::new(request(), capture, catalog, schema, 3, 512);
+        let (_pool, ctx) = fixtures::context(64 << 20, CSV_READ_BATCH_ROWS);
+        let streams: Vec<_> = (0..3)
+            .map(|partition| exec.execute(partition, Arc::clone(&ctx)).unwrap())
+            .collect();
+        let outputs = futures::future::join_all(
+            streams
+                .into_iter()
+                .map(|stream| stream.collect::<Vec<DfResult<RecordBatch>>>()),
+        )
+        .await;
+        let mut tagged: Vec<(usize, RecordBatch)> = outputs
+            .into_iter()
+            .flatten()
+            .map(|batch| batch.unwrap())
+            .map(|batch| (slice_of(&batch), batch))
+            .collect();
+        tagged.sort_by_key(|(slice, _)| *slice);
+        let keys_in_order: Vec<i64> = tagged.iter().flat_map(|(_, batch)| keys(batch)).collect();
+        let expected_keys: Vec<i64> = expected.batches.iter().flat_map(keys).collect();
+        assert_eq!(keys_in_order, expected_keys);
+
+        let slices = exec.executed_slices();
+        assert!(slices.len() > 3, "{} slices", slices.len());
+        assert_eq!(
+            slices.iter().map(|slice| slice.slice).collect::<Vec<_>>(),
+            (0..slices.len() as u32).collect::<Vec<_>>()
+        );
+        assert!(slices.iter().all(|slice| slice.partition < 3));
+        assert_eq!(
+            slices.iter().map(|slice| slice.rows).sum::<u64>(),
+            expected.rows as u64
+        );
+        assert!(
+            slices
+                .iter()
+                .all(|slice| slice.start_ns <= slice.end_ns && slice.rows > 0)
+        );
+        assert!(exec.failed_slices().is_empty());
     }
 
     /// A refusal the parse raises reaches the consumer as the loader's own
@@ -237,7 +510,14 @@ mod tests {
     async fn parse_refusals_reach_the_stream_unchanged() {
         let catalog = catalog();
         let schema = target_arrow_schema(&catalog, &request().target).unwrap();
-        let exec = CsvSourceExec::new(request(), capture("key,score\n1,\n"), catalog, schema);
+        let exec = CsvSourceExec::new(
+            request(),
+            capture("key,score\n1,\n"),
+            catalog,
+            schema,
+            1,
+            usize::MAX,
+        );
         let outputs = run(&exec).await;
         let [Err(error)] = &outputs[..] else {
             panic!("one error and no batch, found {outputs:?}");
@@ -248,7 +528,52 @@ mod tests {
             ),
             "{error}"
         );
+        assert_eq!(
+            exec.failed_slices(),
+            vec![FailedSlice {
+                slice: 0,
+                partition: 0,
+                normalize: Some(NormalizeStep { step: 5, record: 1 }),
+            }]
+        );
     }
+
+    /// A normalization refusal holds nothing after it: the partition keeps
+    /// normalizing the later slices for an earlier-ranked refusal, but
+    /// records and sends none of them.
+    #[tokio::test]
+    async fn a_refused_slice_records_nothing_after_it() {
+        let mut source = String::from("key,score\n");
+        for row in 0..200 {
+            if row == 20 {
+                writeln!(&mut source, "{row},").unwrap();
+            } else {
+                writeln!(&mut source, "{row},1.5").unwrap();
+            }
+        }
+        let catalog = catalog();
+        let schema = target_arrow_schema(&catalog, &request().target).unwrap();
+        let exec = CsvSourceExec::new(request(), capture(&source), catalog, schema, 1, 64);
+        let outputs = run(&exec).await;
+        let error = outputs
+            .iter()
+            .find_map(|output| output.as_ref().err())
+            .expect("the bad record refuses the load");
+        assert!(
+            error.to_string().contains("record 21 has an empty field"),
+            "{error}"
+        );
+        let failed = exec.failed_slices();
+        assert_eq!(failed.len(), 1);
+        let parsed = exec.executed_slices();
+        assert!(
+            parsed
+                .iter()
+                .all(|slice| (slice.slice as usize) < failed[0].slice)
+        );
+        assert_eq!(outputs.len(), parsed.len() + 1, "{outputs:?}");
+    }
+
     /// Drops the load caller while its blocking CSV producer owns captured bytes;
     /// GQT cannot pause a worker or observe the lifetime of a reservation.
     #[tokio::test(flavor = "current_thread")]
@@ -276,7 +601,7 @@ mod tests {
             });
             let catalog = catalog();
             let schema = target_arrow_schema(&catalog, &request().target).unwrap();
-            let exec = CsvSourceExec::new(request(), captured, catalog, schema);
+            let exec = CsvSourceExec::new(request(), captured, catalog, schema, 1, usize::MAX);
             let stream = exec.execute(0, memory.context().task_ctx()).unwrap();
             tokio::time::timeout(Duration::from_secs(3), async {
                 while !pause.entered() {

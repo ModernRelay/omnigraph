@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 pub mod data_tokens;
+pub mod oidc;
 
 use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use std::env;
@@ -645,6 +646,7 @@ pub mod matrix {
         pub async fn create_branch(&self, from: &str, name: &str) {
             let body = serde_json::to_vec(&BranchCreateRequest {
                 from: Some(from.to_string()),
+                from_commit: None,
                 name: name.to_string(),
             })
             .unwrap();
@@ -950,6 +952,7 @@ pub mod matrix {
                 barrier.wait().await;
                 let body = serde_json::to_vec(&BranchCreateRequest {
                     from: Some(from),
+                    from_commit: None,
                     name,
                 })
                 .unwrap();

@@ -7,29 +7,31 @@ review a multi-step change without exposing intermediate results on `main`.
 
 ```bash
 # Create an isolated branch from main.
-omnigraph branch create review/add-benchmark --from main --store graph.omni
+omnigraph branch create review/add-benchmark --from main --target ./graph.omni
 
 # Write and inspect it.
 omnigraph load --data benchmark.jsonl --mode append \
-  --branch review/add-benchmark graph.omni
+  --branch review/add-benchmark --target ./graph.omni
 omnigraph query sources_for_claim --query queries.gq \
   --params '{"claim":"lower-latency"}' \
-  --branch review/add-benchmark --store graph.omni
+  --branch review/add-benchmark --target ./graph.omni
 
 # Publish its result to main, then remove the source branch.
 omnigraph branch merge review/add-benchmark --into main --delete-branch \
-  --store graph.omni
+  --target ./graph.omni
 ```
 
 List and delete branches with:
 
 ```bash
-omnigraph branch list --store graph.omni
-omnigraph branch delete review/abandoned --store graph.omni
+omnigraph branch list --target ./graph.omni
+omnigraph branch delete review/abandoned --target ./graph.omni
 ```
 
-Creating a branch defaults to `main` when `--from` is omitted. A load can create
-a missing target branch by combining `--branch <name>` with `--from <base>`.
+Creating a branch defaults to `main` when `--from` is omitted. To start a
+branch at a past commit instead of a branch head, use `--from-commit`; see
+[start a branch at a commit](#start-a-branch-at-a-commit). A load can create a
+missing target branch by combining `--branch <name>` with `--from <base>`.
 
 Each branch operation is also a GQ statement, so a client that already sends
 `.gq` source needs no second transport. The three control writes go to
@@ -38,6 +40,7 @@ with no request target, name, or parameters:
 
 ```text
 branch create "review/add-benchmark" from main
+branch create "fix/import" from commit "<commit-id>"
 branch merge "review/add-benchmark" into main
 branch delete "review/abandoned"
 branch list
@@ -54,7 +57,7 @@ and `_x` are bare. A control write answers a
 (`outcome.merge` holds the merge result), with zero affected counts; a merge
 that publishes a commit reports it in `commit`. `branch list` answers one row
 per branch in column `name`, sorted by name. Each statement runs under the same
-policy check as its HTTP route (`POST /branches`, `DELETE /branches/{branch}`,
+policy check as its HTTP route (`POST /branches`, `DELETE /branches/{branch_name}`,
 `POST /branches/merge`, `GET /branches`), and `branch list` is a read, so it is
 refused on `POST /mutate` as a control write is refused on `POST /query`. The
 branch reads `branch diff`, `branch merge-base` and `branch merge … dry run`
@@ -118,8 +121,8 @@ id, parent, branch, actor when known, and timestamp. Merge commits have two
 parents.
 
 ```bash
-omnigraph commit list graph.omni --branch main
-omnigraph commit show <commit-id> --uri graph.omni
+omnigraph commit list --target ./graph.omni --branch main
+omnigraph commit show <commit-id> --target ./graph.omni
 ```
 
 `commit list` is newest first. Omitting `--branch` shows history reachable from
@@ -129,8 +132,8 @@ own commits.
 A long history can be read a page at a time:
 
 ```bash
-omnigraph commit list graph.omni --branch main --limit 50 --json
-omnigraph commit list graph.omni --branch main --page-token <token> --json
+omnigraph commit list --target ./graph.omni --branch main --limit 50 --json
+omnigraph commit list --target ./graph.omni --branch main --page-token <token> --json
 ```
 
 `--limit` (1 to 1,000) returns one page with `head_commit_id`, the head the
@@ -145,9 +148,49 @@ and is refused with `400` otherwise: a commit the branch still holds, or one a
 branch the caller may read published, costs nothing more, and any other is
 looked for down the branch's history, which costs what the whole listing
 costs. Served, the same listing is
-`GET /commits?branch=<name>&limit=<n>` continued with `page_token=<token>`.
-Paging applies to a branch's history, not to `--unpublished` or
-`--unattached`.
+`GET /commits?listing=history&branch=<name>&limit=<n>` continued with
+`page_token=<token>`; omitting `listing` also selects history. Paging applies
+to a branch's history, not to `--unpublished` or `--unattached`.
+
+HTTP `listing` accepts `history`, `unpublished` or `unattached`; non-history
+listings refuse `limit` and `page_token`. The retired query keys `unpublished`
+and `unattached` return `400 bad_request` even when false or combined with
+`listing`; omit them or use `listing=history` for ordinary history.
+
+### Start a branch at a commit
+
+A branch can start at a published graph commit instead of a branch's head. It
+holds that commit's rows and history, as if it had been created while the
+commit was the head. Use it to try a fix or a revert where a change was made,
+then merge the branch as usual; the commit is its merge base.
+
+```bash
+omnigraph commit list --target ./graph.omni --branch main --json
+omnigraph branch create fix/import --from-commit <commit-id> --target ./graph.omni
+```
+
+The statement is `branch create "fix/import" from commit "<commit-id>"`, and
+`POST /branches` takes the id in `from_commit`, which excludes `from` (a
+request with both answers `400`). An id no commit has answers `404`. The
+receipt names the branch the new
+branch was forked off in `from`, for a commit start the branch that wrote the
+commit, and the commit it starts at in `from_commit_id`. Every receipt carries
+`from_commit_id`: for a start from a branch it is that branch's head when the
+branch was created. A branch starts only at a commit whose whole snapshot is
+still there under the graph's current schema; otherwise nothing is created,
+and the error's `code` is `branch_start_refusal`, with `action: fix`:
+
+| `from_commit` names | Answer | `branch_start_refusal.reason` |
+|---|---|---|
+| A commit whose table versions `cleanup` reclaimed, wholly or in a run that stopped part way | `410` | `not_retained`, with the type in `type_name` |
+| A commit written under an earlier schema than the graph's | `409` | `schema_changed` |
+| A commit written before the storage upgrade | `409` | `earlier_storage_format` |
+| A commit of a branch that was deleted, even if a branch has since been created under its name | `409` | `branch_deleted`, with the branch in `branch` |
+| An [unpublished commit](#unpublished-commits) | `409` | `unpublished_commit`; publish it, then start at the published commit |
+| An [unattached snapshot](#unattached-branches) | `409` | `unattached_snapshot`; it never becomes branch history |
+
+While the new branch lives, `cleanup` keeps the commit's table versions, so a
+later start at the same commit succeeds too.
 
 ### Unpublished commits
 
@@ -177,15 +220,15 @@ its id (`--snapshot`, `commit show`, `commit changes`) answer `not found`, and
 it leaves the `--unpublished` listing.
 
 ```bash
-omnigraph branch merge feature --into main --as-commit --uri graph.omni
-omnigraph commit list graph.omni --branch main --unpublished
-omnigraph commit publish <commit-id> --uri graph.omni
-omnigraph commit drop <commit-id> --uri graph.omni
+omnigraph branch merge feature --into main --as-commit --target ./graph.omni
+omnigraph commit list --target ./graph.omni --branch main --unpublished
+omnigraph commit publish <commit-id> --target ./graph.omni
+omnigraph commit drop <commit-id> --target ./graph.omni
 ```
 
 Served, the same control writes are `POST /commits/{commit_id}/publish`
 (the published commit), `DELETE /commits/{commit_id}` (204), and
-`GET /commits?unpublished=true&branch=<name>`; `POST /branches/merge` takes
+`GET /commits?listing=unpublished&branch=<name>`; `POST /branches/merge` takes
 `as_commit`, which excludes `delete_branch`. Publishing and dropping run under
 the `commit_publish` and `commit_drop` policy actions on the recorded target
 branch ([Policy](../operations/policy.md)).
@@ -221,9 +264,9 @@ be a live unattached snapshot: a published commit or an unpublished commit is
 refused.
 
 ```bash
-omnigraph commit list graph.omni --branch main --unattached
-omnigraph query people --query queries.gq --snapshot <snapshot-id> --store graph.omni
-omnigraph commit drop <snapshot-id> --uri graph.omni
+omnigraph commit list --target ./graph.omni --branch main --unattached
+omnigraph query people --query queries.gq --snapshot <snapshot-id> --target ./graph.omni
+omnigraph commit drop <snapshot-id> --target ./graph.omni
 ```
 
 `commit list --unattached` shows the branch's live snapshots, newest first,
@@ -237,10 +280,9 @@ first write captured, or when the branch is deleted or recreated: expired
 snapshots answer `not found` to reads and writes and leave the listing. Dropping or expiring
 a snapshot promises no storage reclamation; `cleanup` reports what it retains.
 
-Served, the listing is `GET /commits?unattached=true&branch=<name>`
-(`unattached` and `unpublished` together are refused) and the drop is the same
-`DELETE /commits/{commit_id}` (204). Writing needs `change` on the recorded
-branch; listing and reading a snapshot need `read` on it
+Served, the listing is `GET /commits?listing=unattached&branch=<name>`
+and the drop is the same `DELETE /commits/{commit_id}` (204). Writing needs
+`change` on the recorded branch; listing and reading a snapshot need `read` on it
 ([Policy](../operations/policy.md)).
 
 ## Historical reads
@@ -251,7 +293,7 @@ Every read targets either a live branch or an immutable graph commit. Take a
 ```bash
 omnigraph query sources_for_claim --query queries.gq \
   --params '{"claim":"lower-latency"}' \
-  --snapshot <graph-commit-id> --store graph.omni
+  --snapshot <graph-commit-id> --target ./graph.omni
 ```
 
 A query stays on one snapshot for its entire lifetime. Wildcard traversal is
@@ -279,9 +321,9 @@ Inspect the logical changes made by one commit, compare two points, or review
 what a branch changed since it left `main`:
 
 ```bash
-omnigraph commit changes <commit-id> --store graph.omni --json
-omnigraph diff --from <commit-id> --to main --store graph.omni --json
-omnigraph branch diff feature --store graph.omni --json
+omnigraph commit changes <commit-id> --target ./graph.omni --json
+omnigraph diff --from <commit-id> --to main --target ./graph.omni --json
+omnigraph branch diff feature --target ./graph.omni --json
 ```
 
 For continuous consumption, `omnigraph changes poll` follows complete commits

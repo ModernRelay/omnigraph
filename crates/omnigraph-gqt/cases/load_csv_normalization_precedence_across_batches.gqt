@@ -1,5 +1,5 @@
 # issue: none
-# notes: CSV overwrite preserves whole-source normalization precedence across reader batches:
+# notes: CSV overwrite preserves whole-source normalization precedence across reader batches and across slices:
 # notes: every from endpoint precedes every to endpoint, then properties follow schema order,
 # notes: and a property's conversion failures precede its non-null checks.
 

@@ -4,21 +4,28 @@ This guide covers data credentials for an existing managed cluster. Complete
 [managed login and cluster selection](reference.md#managed-cluster-commands)
 first; data authority is separate from that control-plane session.
 
-After login and selecting a managed cluster with `use`, run graph commands:
+After configuring a complete managed target and supplying its selected profile's
+credential (login for an `omnigraph` profile), run:
 
 ```bash
-omnigraph graphs list
-omnigraph query find_person --graph knowledge --params '{"name":"Alice"}' --json
-omnigraph mutate add_person --graph knowledge --params '{"name":"Alice"}' --json
+omnigraph graphs list --target production --discovery
+omnigraph query find_person --target production --graph knowledge --params '{"name":"Alice"}' --json
+omnigraph mutate add_person --target production --graph knowledge --params '{"name":"Alice"}' --json
 ```
 
-The CLI acquires a missing or expired identity credential before submitting
-the operation and caches it in the OS keychain. No separate token command is
-needed. A valid cached graph credential for your cached sign-in avoids an
-unrelated API session check; an explicit automation token verifies its own
-principal before reusing that cache. Authentication refresh never replays a
-submitted mutation. Explicit
-`cluster token --managed --ttl 1h` remains available for credential administration.
+The target references a profile for API, organization and one auth provider, and
+pins cluster ID, incarnation and data endpoint. See [operator configuration](targets.md). A graph operation requires `--graph` or that target's
+`default_graph`. Discovery lists graph IDs; it never selects one.
+
+The CLI acquires a missing or expired data credential before submitting the
+operation. Human profiles and stored-token profiles use the OS secure store.
+Explicit env/file/exec profiles instead keep exchanged credentials only in the
+current invocation's memory; they do not probe the OS store or select this path
+after a store failure. Managed-target credential export follows the same rule.
+External sources still require control-plane identity verification and exchange.
+Authentication refresh never replays a submitted mutation.
+`cluster token --target production --ttl 1h` is explicit persistent credential
+administration and requires the OS secure store, even with an external source.
 
 The issuer must support identity credentials and admit your principal to the
 selected cluster. The credential proves who you are and which cluster you
@@ -43,106 +50,103 @@ The service can shorten the requested lifetime. Issuer clock tolerance is
 
 ## Discover graphs
 
-With a cached identity credential, `graphs list` from the managed folder
+With a cached identity credential, `graphs list --target production`
 shows every graph ID and display name in the server's applied inventory,
 including graphs that failed to open. It does not reveal availability,
 storage locations, schema, stored queries, or graph contents. A display name
 currently equals its graph ID. Listing a graph does not grant access to it;
 an absent policy or unknown policy actor still denies protected operations.
 
-For an explicitly addressed server whose configured credential is an identity
-credential, select this minimal inventory with `--discovery`:
-
-```bash
-omnigraph graphs list --server prod --discovery --json
-```
-
-Without `--discovery`, an explicit server keeps the existing graph-metadata
-listing and requires `graph_list` policy permission. The CLI does not guess
-the credential type from a token's appearance. A server that lacks discovery
-support, or a static credential, refuses this route without falling
-back to another inventory.
+Use `--discovery` for this minimal inventory on either managed or standalone
+server targets. Without it, `graphs list` requests graph metadata and requires
+`graph_list` policy permission. The CLI does not guess the credential type from
+its appearance. A server without discovery support, or an incompatible static
+credential, refuses without falling back to another inventory.
 
 ## Cached access and routing
 
-The CLI saves one data credential per API origin and cluster in a separate
-OS-keychain entry, replacing that cluster's previous entry. The versioned
-cache binds the fixed data endpoint, cluster incarnation, expiry, key ID, and
-actor to the identity credential. There is no plaintext cache and no fallback
-to a control-plane session or a named-server token. Automation can use an
-origin-bound control credential to acquire identity credentials with an available
-keychain; unattended clients needing a raw token use the issuance API directly.
+Data credentials belong to the selected profile and resource binding,
+including endpoint and incarnation. They remain separate from control sessions;
+there is no plaintext cache or control-token fallback at the graph endpoint.
+Use [credential export](targets.md#manage-credentials) to explicitly release a
+cluster-bound data token to another process through a pipe.
 
-Managed `query`, `mutate`, `load`, `commit list`/`show`, and `graphs list`
-read `.omnigraph/context` only in the current directory; graph-specific
-commands require `--graph`. After
-`cluster token --managed --config DIR`, run these commands from `DIR`; no parent
-directory is searched. Ordinary data requests go directly to the cached
-endpoint without contacting the control
-API. They keep working during an API outage until the token expires or its
-signing trust is retired. Each request refuses redirects and accepts at most
-8 MiB of response data. Queries, commit reads, and mutations, including
-stored mutations and branch create/delete/merge statements, have a
-30-second deadline with at most 10 seconds to connect. A lost write response
-never triggers an automatic retry. Managed loads have the bounds described below.
+Managed and standalone access use the shared served graph client: query/mutation,
+load, schema reads, branches, snapshots, history, export, Blob operations and
+change feeds remain subject to server capabilities and policy. Direct-only
+maintenance, schema changes and root administration do not acquire storage
+access. `--as` remains refused on managed targets.
 
-Use `commit list --branch main --graph GRAPH --json` and
-`commit show COMMIT_ID --graph GRAPH --json` with your cached identity and
-`read` permission in applied policy to inspect native graph lineage after an
-uncertain write. Commit identity,
-parents and actor attribution are evidence to reconcile; a timeout alone
-never proves that a mutation failed to commit.
+A valid data cache must match the captured endpoint, incarnation and identity.
+A cached human sign-in or unchanged stored-token profile can support data access
+during a control outage until expiry or signing-trust retirement. Replacing or
+removing a stored token invalidates its cache generation. External env/file/exec
+profiles require control verification and invocation-only exchange; do not assume
+universal control-plane independence. Missing or expired access uses only the
+selected provider; auth never falls back or replays an uncertain write.
 
-Missing or expired identity credentials are acquired before a graph request;
-malformed or unsupported caches refuse without fallback.
-The server decides policy permissions. An explicit `--server`, `--profile`,
-`--store`, or `--cluster` selects ordinary addressing and follows that
-command's existing support
-rules, even in a managed folder or beside malformed context. A positional
-load/commit-list URI or `commit show --uri` also selects ordinary addressing.
-Other data commands, aliases, and storage maintenance keep their ordinary behavior;
-this does not give them managed credentials. Explicit `--as` alone is not a
-target and remains prohibited on managed requests.
+Managed JSON requests refuse redirects and accept at most 8 MiB of response data,
+with a 30-second deadline and at most 10 seconds to connect.
+A lost write response never triggers an automatic retry. Managed loads
+have the bounds below; Blob and streaming operations keep their own bounds.
 
-These implicit data commands refuse with `managed_target_ambiguous` when valid
-folder context competes with `OMNIGRAPH_PROFILE` or an operator default server
-or store. No credential is read and neither destination is contacted. Choose
-the ordinary target explicitly, or use `--direct` to select ordinary ambient
-resolution. To use the managed folder, unset the environment profile and
-remove the competing default target, using a separate operator home if needed.
-Presentation defaults and profiles that are merely defined do not conflict.
+Use `commit list --target production --branch main --graph knowledge --json`
+and `commit show COMMIT_ID --target production --graph knowledge --json` to
+inspect native lineage after an uncertain write. Commit identity, parents and
+actor attribution are evidence; a timeout alone never proves that a mutation
+failed to commit.
 
-For example, this keeps using staging from a folder bound to production:
+An explicit `--target staging` selects staging independently of source directories.
+Configuration and cached credentials cannot silently reroute an invocation.
+Preserve original recovery evidence when changing targets or credentials.
+
+## macOS Keychain access failures
+
+An upgrade can change the executable identity trusted by a Keychain item.
+Ad-hoc signing does not provide a stable identity across builds. Stable release
+trust requires consistent Developer ID signing and a fixed signing identifier;
+an existing item approved for an ad-hoc build can still require authorization
+when moving to a signed release. Several items can share the same service label,
+so approving one item does not approve every session and data-cache entry.
+
+Inspect the installed executable without reading credentials:
 
 ```bash
-omnigraph query find_person --profile staging --graph knowledge --json
+codesign -dv --verbose=4 "$(command -v omnigraph)"
+codesign -d -r- "$(command -v omnigraph)"
 ```
 
-Ordinary token settings never supply managed authority. Global `--direct`
-continues to select ordinary addressing and credentials, including when the
-context is malformed. `cluster` commands without `--managed` never read managed
-context. Without managed context, existing data commands retain their behavior.
+On a secure-store failure, retain the operation, classified reason and numeric
+OSStatus when present, together with `omnigraph version`. Do not export secrets
+to diagnose it. An authorization failure alone does not prove that a password
+is wrong, a keychain is locked, or a credential is missing. Do not repeatedly
+approve prompts, delete or reset the keychain, allow all applications, or disable
+signature checks as a workaround. Report repeated prompts to the maintainer.
+See Apple's [code identity requirements](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements).
 
 ## Clear a credential
 
-`cluster token --managed --clear [--config DIR]` forgets that cluster's local data
-entry, independently of the control-plane session. Do not combine `--clear`
-with `--graph` or `--ttl`. Clearing is not server revocation:
-copies remain usable until expiry or signing-key retirement. `logout --api`
-clears local login credentials and requests provider-session revocation;
-`provider_revocation_confirmed` reports whether that request succeeded.
-Already issued data credentials remain valid independently until expiry or
-signing-key retirement.
+`cluster token --target production --clear` forgets that cluster's persistent local data
+entry independently of its control session. Do not combine `--clear` with
+`--graph` or `--ttl`. Clearing is not server revocation: copies remain usable
+until expiry or signing-key retirement. `logout --profile work` clears the
+selected local session and its derived data cache, then requests provider-session revocation;
+`provider_revocation_confirmed` reports its outcome. Copies of issued data
+credentials can remain valid remotely until expiry or signing-key retirement.
+
+Local clearing does not require network transport. Logout also removes local
+custody when the configured CA is unavailable or proxy selection fails, reporting
+remote revocation as unconfirmed rather than retaining the session.
 
 ## Bulk loading
 
-Use the ordinary `load` syntax from the selected folder, with an explicit
+Use the ordinary `load` syntax with the selected target, an explicit
 graph and mode. The native CLI sends the exact UTF-8 NDJSON body to the
 authenticated data endpoint; it does not write storage directly.
 
 ```bash
-omnigraph load --graph knowledge --data batch-01.jsonl --mode append --branch review --from main --json
-omnigraph load --graph knowledge --data batch-02.jsonl --mode append --branch review --json
+omnigraph load --target production --graph knowledge --data batch-01.jsonl --mode append --branch review --from main --json
+omnigraph load --target production --graph knowledge --data batch-02.jsonl --mode append --branch review --json
 ```
 
 Every load requires `change` for that graph. `--from` additionally requires
@@ -181,6 +185,5 @@ target and any response, then inspect that branch before deciding whether to
 retry. `--from` is not an idempotency key. A success receipt's
 `commit.actor_id` records the authenticated actor.
 
-These managed bounds do not change ordinary direct, named-server or profile
-loading. Explicit addressing and `--direct` continue to use their existing
-credentials and transport.
+These managed bounds apply only to managed targets. Direct and server targets
+use their own credential and transport contracts.

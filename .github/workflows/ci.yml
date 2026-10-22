@@ -816,14 +816,14 @@ jobs:
   storage_upgrade_compatibility:
     name: Storage Upgrade Compatibility
     runs-on: ubuntu-latest
-    # Two builds use one target directory here: the genuine stamp-13
-    # predecessor CLI (one package, one bin, no test features), then the
-    # current tree's test targets. Their dependency feature sets differ (the
+    # Three builds use one target directory here: genuine stamp-13 and
+    # Lance 11 predecessor CLIs (one package, one bin, no test features),
+    # then the current tree's test targets. Their dependency feature sets differ (the
     # test builds enable dev-dependency features such as lance-io's defaults
     # and test-util), so the second build reuses only the dependency artifacts
     # whose features match. The v5 fence measured a cold predecessor CLI at
     # 25m40s.
-    timeout-minutes: 90
+    timeout-minutes: 120
     permissions:
       contents: read
     env:
@@ -930,6 +930,33 @@ jobs:
           cargo clean --workspace --locked \
             --target-dir "$GITHUB_WORKSPACE/target"
           echo "OMNIGRAPH_V13_BIN=$v13_bin" >> "$GITHUB_ENV"
+
+      # Same graph format, genuinely older substrate. A version label alone
+      # cannot distinguish this writer from the candidate, so pin its source.
+      - name: Build genuine Lance 11 CLI
+        env:
+          LANCE11_SOURCE_COMMIT: 0a62bb7b2aa5b99b012f413807c216277f7f9596
+        run: |
+          set -euo pipefail
+          lance11_source="$RUNNER_TEMP/omnigraph-lance-11"
+          lance11_bin="$RUNNER_TEMP/omnigraph-lance-11-bin"
+          git fetch --no-tags --depth=1 origin "$LANCE11_SOURCE_COMMIT"
+          git worktree add --detach "$lance11_source" "$LANCE11_SOURCE_COMMIT"
+          test "$(git -C "$lance11_source" rev-parse HEAD)" = "$LANCE11_SOURCE_COMMIT"
+          # Run inside the predecessor checkout so its workspace configuration applies.
+          (cd "$lance11_source" && cargo build --locked \
+            --package omnigraph-cli \
+            --bin omnigraph \
+            --target-dir "$GITHUB_WORKSPACE/target")
+          cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$lance11_bin"
+          test -x "$lance11_bin"
+          # Remove both path-package identities before linking the candidate tests.
+          cargo clean --workspace --locked \
+            --manifest-path "$lance11_source/Cargo.toml" \
+            --target-dir "$GITHUB_WORKSPACE/target"
+          cargo clean --workspace --locked \
+            --target-dir "$GITHUB_WORKSPACE/target"
+          echo "OMNIGRAPH_LANCE11_BIN=$lance11_bin" >> "$GITHUB_ENV"
 
       # The owner is the `crossversion_upgrade` module of the CLI's
       # `integration` binary. The exact case names come from the compiled
@@ -1297,6 +1324,7 @@ jobs:
             -p omnigraph-cli \
             --test lance_surface_guards \
             --test s3_cluster \
+            --test bound_storage \
             -- --nocapture --test-threads=1 2>&1 | tee -a "$test_log"
 
           # Keep the same package feature graph for this admitted-startup unit
@@ -1330,6 +1358,7 @@ jobs:
             s3::server_boots_cluster_from_bare_storage_uri_and_serves_query \
             settings::tests::s3_bootstrap_handoff_serves_empty_then_deploys_first_graph \
             s3_cluster_full_lifecycle_import_apply_serve_evolve_delete \
+            bound_handle_never_reaches_the_ambient_endpoint \
             cli_cluster_e2e::cluster_e2e_s3_live_apply_without_restart \
             system_local::local_cli_s3_end_to_end_init_load_read_flow
           do
@@ -1347,8 +1376,9 @@ jobs:
       - name: Run RustFS detached publication retention
         if: matrix.shard == 'failpoints'
         # Exercise detached write and compaction pins through S3 after a lost
-        # publication acknowledgement, then prove another write succeeds.
-        # Require both owners and reject unconfigured early returns.
+        # publication acknowledgement, then prove another write succeeds, and
+        # retry cleanup after a pass stopped in each window of its sweep.
+        # Require every owner and reject unconfigured early returns.
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/rustfs-failpoints.log"
@@ -1360,7 +1390,8 @@ jobs:
           fi
           for test_name in \
             s3_write_detached_pin_survives_next_write \
-            s3_optimize_detached_pin_survives_next_write
+            s3_optimize_detached_pin_survives_next_write \
+            s3_collector_retry_converges_after_every_sweep_window
           do
             grep -Fq "test ${test_name} ... ok" "$test_log" \
               || { echo "::error::required RustFS failpoint cell did not pass: $test_name"; exit 1; }
@@ -1561,6 +1592,7 @@ jobs:
           run_cell azure_write_detached_pin_survives_next_write --test failpoints
           run_cell azure_optimize_detached_pin_survives_next_write --test failpoints
           run_cell azure_schema_apply_post_commit_failure_leaves_readable_contract --test failpoints
+          run_cell azure_collector_retry_converges_after_every_sweep_window --test failpoints
           run_cell azure_cluster_full_lifecycle_import_apply_serve_evolve_delete --test s3_cluster
           run_cell s3::server_opens_azure_graph_directly_and_serves_snapshot_and_read --test integration
           run_cell s3::server_boots_azure_cluster_from_bare_storage_uri_and_serves_query --test integration

@@ -6,7 +6,9 @@
 //! rule (which row is reported, in which order, under which exemption) lives
 //! here, so the two routes cannot judge the same rows differently.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 use arrow_array::{Array, RecordBatch};
 use datafusion::scalar::ScalarValue;
@@ -67,20 +69,6 @@ pub(super) struct UniqueImageBuilder {
 }
 
 impl UniqueImageBuilder {
-    pub(super) fn for_input() -> Self {
-        Self {
-            input_keys: Some(HashMap::new()),
-            ..Self::default()
-        }
-    }
-
-    pub(super) fn for_replacement() -> Self {
-        Self {
-            input_only: true,
-            ..Self::for_input()
-        }
-    }
-
     pub(super) fn observe<F>(
         &mut self,
         table_key: &str,
@@ -131,6 +119,176 @@ impl UniqueImageBuilder {
             entries,
             within_batch_violation: self.within_batch_violation,
         }
+    }
+}
+
+/// A row's place in the delta, `slice << 32 | row in slice`, so facts the
+/// partitions extracted from different slices compare in source order.
+pub(crate) type Position = u64;
+
+/// The first holder of each key by position, `(id, position)`.
+pub(super) type FirstHolders = HashMap<Vec<String>, (String, Position)>;
+
+/// Each id's last key by position; `None` is a null key, which removes the
+/// id from the image.
+pub(super) type FinalKeys = HashMap<String, (Position, Option<(Vec<String>, Vec<ScalarValue>)>)>;
+
+fn shard_of(key: &[String], shards: usize) -> usize {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    usize::try_from(hasher.finish() % shards as u64).unwrap_or(0)
+}
+
+/// Pass 1 of uniqueness over the rows one partition saw, mergeable with the
+/// other partitions' ([`merge_unique_shard`], [`merge_unique_image`]): the
+/// first holder of each key by position, sharded by the key's hash so the
+/// partitions' shards merge side by side; each id's last key by position;
+/// and the first repeat the partition saw among its own rows.
+#[derive(Debug)]
+pub(super) struct UniquePartial {
+    input_only: bool,
+    first_by_key: Vec<FirstHolders>,
+    final_by_id: FinalKeys,
+    repeat: Option<(Position, Violation)>,
+}
+
+impl UniquePartial {
+    /// `input_only` is the replacement's pass: a repeat inside the input is
+    /// the only judgment and no image is kept.
+    pub(super) fn new(input_only: bool, shards: usize) -> Self {
+        Self {
+            input_only,
+            first_by_key: (0..shards.max(1)).map(|_| HashMap::new()).collect(),
+            final_by_id: HashMap::new(),
+            repeat: None,
+        }
+    }
+
+    /// `base` is the position of the batch's first row.
+    pub(super) fn observe(
+        &mut self,
+        table_key: &str,
+        columns: &[String],
+        batch: &RecordBatch,
+        system_columns: SystemColumns,
+        base: Position,
+    ) -> Result<()> {
+        let group_columns = group_columns(batch, table_key, columns)?;
+        let ids = string_col(batch, system_columns.id)?;
+        let shards = self.first_by_key.len();
+        for row in 0..batch.num_rows() {
+            let position = base.saturating_add(row as Position);
+            let id = ids.value(row).to_string();
+            let Some(key) = composite_unique_key(&group_columns, row)? else {
+                if !self.input_only {
+                    self.final_by_id.insert(id, (position, None));
+                }
+                continue;
+            };
+            if !self.input_only {
+                let values = group_columns
+                    .iter()
+                    .map(|arr| ScalarValue::try_from_array(arr, row))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|e| OmniError::manifest(e.to_string()))?;
+                self.final_by_id
+                    .insert(id.clone(), (position, Some((key.clone(), values))));
+            }
+            match self.first_by_key[shard_of(&key, shards)].entry(key) {
+                Entry::Occupied(first) => {
+                    if self.repeat.is_none() {
+                        let (prior, _) = first.get();
+                        self.repeat = Some((
+                            position,
+                            unique_violation(table_key, columns, first.key(), &id, prior),
+                        ));
+                    }
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert((id, position));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The pass taken apart for the merge: the shards, the final keys, the
+    /// own repeat.
+    pub(super) fn into_parts(
+        self,
+    ) -> (Vec<FirstHolders>, FinalKeys, Option<(Position, Violation)>) {
+        (self.first_by_key, self.final_by_id, self.repeat)
+    }
+}
+
+/// One shard of every partition's first holders merged: the earliest repeat
+/// across partitions, placed at the later of its two holders and named
+/// against the earlier, as a single pass in source order would report it.
+pub(super) fn merge_unique_shard(
+    table_key: &str,
+    columns: &[String],
+    mut maps: Vec<FirstHolders>,
+) -> Option<(Position, Violation)> {
+    maps.sort_by_key(|map| std::cmp::Reverse(map.len()));
+    let mut maps = maps.into_iter();
+    let mut merged = maps.next()?;
+    let mut first: Option<(Position, Violation)> = None;
+    for map in maps {
+        for (key, (id, position)) in map {
+            match merged.entry(key) {
+                Entry::Occupied(mut held) => {
+                    let (held_id, held_position) = held.get();
+                    let held_position = *held_position;
+                    let (early, late, late_position) = if held_position <= position {
+                        (held_id.clone(), id, position)
+                    } else {
+                        (id, held_id.clone(), held_position)
+                    };
+                    if first.as_ref().is_none_or(|(at, _)| late_position < *at) {
+                        first = Some((
+                            late_position,
+                            unique_violation(table_key, columns, held.key(), &late, &early),
+                        ));
+                    }
+                    if position < held_position {
+                        held.insert((early, position));
+                    }
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert((id, position));
+                }
+            }
+        }
+    }
+    first
+}
+
+/// Every partition's final keys merged, the last by position winning and a
+/// null key removing its id: the group's image, entries sorted by id.
+pub(super) fn merge_unique_image(finals: Vec<FinalKeys>, repeated: bool) -> UniqueImage {
+    let mut merged: FinalKeys = HashMap::new();
+    for map in finals {
+        for (id, (position, key)) in map {
+            match merged.entry(id) {
+                Entry::Occupied(mut held) => {
+                    if position > held.get().0 {
+                        held.insert((position, key));
+                    }
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert((position, key));
+                }
+            }
+        }
+    }
+    let mut entries: Vec<FinalKeyByIdEntry> = merged
+        .into_iter()
+        .filter_map(|(id, (_, key))| key.map(|key| (id, key)))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    UniqueImage {
+        entries,
+        within_batch_violation: repeated,
     }
 }
 

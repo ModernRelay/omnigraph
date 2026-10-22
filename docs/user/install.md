@@ -121,24 +121,23 @@ omnigraph-azure-admission --help
 ```
 
 `omnigraph version` reports what the binary itself speaks, without opening a
-graph or contacting a server. For example, the edge build of commit `9c2b367`
-prints:
+graph or contacting a server. For example, a plain source build prints:
 
 ```text
-omnigraph 0.14.0-edge+9c2b367
+omnigraph 0.14.0
 internal-schema 16 (serves v14 to v16)
-http-contract 0.13
-commit 9c2b3679e8f66062252e7ed6270a9478b4b77413
+http-contract 0.14
 ```
 
-`omnigraph version --json` prints the same facts as one object:
+`omnigraph version --json` also reports the machine-readable CLI protocols:
 
 ```json
 {
-  "version": "0.14.0-edge+9c2b367",
-  "channel": "edge",
-  "commit": "9c2b3679e8f66062252e7ed6270a9478b4b77413",
-  "http_contract": "0.13",
+  "version": "0.14.0",
+  "channel": null,
+  "commit": null,
+  "http_contract": "0.14",
+  "protocols": { "target": 1, "credential": 1, "access": 2 },
   "internal_schema": {
     "writes": 16,
     "serves": [14, 16]
@@ -160,6 +159,10 @@ accepts only an exact match and returns its own value on every response,
 including `HEAD /healthz` ([HTTP contract](operations/server.md#http-contract)).
 When several CLIs are installed, for example one in `~/.local/bin` and an
 older one from Homebrew, choose by this field, not by the package version.
+`protocols.target` and `protocols.credential` identify the `protocol` used by
+target administration and credential JSON reports, respectively.
+`protocols.access` identifies the `omnigraph access --json` shape: protocol 2
+uses `actor_id` in place of protocol 1's `actor`.
 `internal_schema.writes` is the storage-format stamp this binary's commits
 write, and `internal_schema.serves` is the inclusive range, lowest first, that
 normal open accepts; `snapshot --json` reports a graph's own stamp as

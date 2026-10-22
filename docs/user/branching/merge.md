@@ -5,7 +5,7 @@ atomically across the whole graph.
 
 ```bash
 omnigraph branch merge review/2026-04-25 --into main \
-  --store s3://bucket/graph.omni
+  --target ./graph.omni
 ```
 
 The source is positional. `--into` defaults to `main`.
@@ -76,7 +76,7 @@ normal review-branch lifecycle:
 
 ```bash
 omnigraph branch merge review/2026-04-25 --into main --delete-branch \
-  --store s3://bucket/graph.omni
+  --target ./graph.omni
 ```
 
 Deletion happens after a successful merge and has its own authorization check.
@@ -94,7 +94,7 @@ It also releases old history for a later cleanup.
 ## Preview a merge
 
 ```bash
-omnigraph branch merge feature --into main --dry-run --store graph.omni --json
+omnigraph branch merge feature --into main --dry-run --target ./graph.omni --json
 ```
 
 A dry run runs the merge through classification and constraint validation,

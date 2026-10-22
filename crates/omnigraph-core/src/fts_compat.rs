@@ -17,6 +17,8 @@ use sha2::{Digest, Sha256};
 use crate::error::{OmniError, Result};
 
 pub const CERTIFICATE_FILE: &str = "omnigraph_fts_compat.json";
+// This names analyzer semantics, not the running Lance release. The audited
+// Lance 13 default analyzer remains compatible with certificates written on 11.
 pub const ANALYZER_GENERATION: &str = "lance11.0.0-frostem1.20260821.3-v1";
 const FORMAT_VERSION: u32 = 1;
 pub const MAX_CERTIFICATE_BYTES: u64 = 64 * 1024;
@@ -206,10 +208,10 @@ fn verification_key(
 }
 
 pub fn certificate_path(dataset: &Dataset, index: &IndexMetadata) -> Result<Path> {
-    // Mirror Lance 11 Dataset::indice_files_dir (private): an additional base
+    // Mirror Lance 13 Dataset::indice_files_dir (private): an additional base
     // is either a dataset root or already its index directory. URI parsing,
     // credentials, wrappers, and cross-store resolution remain Lance-owned.
-    // https://github.com/lance-format/lance/blob/v11.0.0/rust/lance/src/dataset.rs
+    // https://github.com/lance-format/lance/blob/v13.0.0/rust/lance/src/dataset.rs#L2569
     let indices_dir = match index.base_id {
         None => dataset.indices_dir(),
         Some(base_id) => {
@@ -336,9 +338,9 @@ mod tests {
         // neither a manifest edit nor a lockfile refresh grants that approval.
         const AUDITED_GENERATION: &str = "lance11.0.0-frostem1.20260821.3-v1";
         const AUDITED_VERSIONS: &[(&str, &str)] = &[
-            ("lance", "11.0.0"),
-            ("lance-index", "11.0.0"),
-            ("lance-tokenizer", "11.0.0"),
+            ("lance", "13.0.0"),
+            ("lance-index", "13.0.0"),
+            ("lance-tokenizer", "13.0.0"),
             ("frostem", "1.20260821.3"),
             ("stop-words", "0.10.0"),
             ("unicode-normalization", "0.1.25"),

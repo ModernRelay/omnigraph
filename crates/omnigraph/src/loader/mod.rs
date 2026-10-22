@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{BufRead, BufReader, Cursor};
@@ -65,12 +66,79 @@ pub struct LoadReceipt {
     pub executed: LoadExecuted,
 }
 
+impl LoadReceipt {
+    /// The measurement of a plan the engine ran: `Some` for a `load csv`
+    /// overwrite, whose operators recorded their rows; `None` for an append
+    /// or merge, which the keyed adapters run with no plan executed, and for
+    /// a JSONL load.
+    pub fn executed_plan(&self) -> Option<&LoadExecuted> {
+        (self.plan.is_some() && !self.executed.operators.is_empty()).then_some(&self.executed)
+    }
+}
+
 /// What an executed load measured beside its plan.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadExecuted {
     pub partitions: u32,
     pub rows: u64,
     pub source_bytes: u64,
+    /// One entry per node of the executed plan in post-order, the source
+    /// first, read from the node's operator after the plan ran; empty for a
+    /// load the engine did not run (append and merge).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operators: Vec<LoadOperatorExecuted>,
+}
+
+/// What one operator of an executed load plan did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadOperatorExecuted {
+    /// The plan node's `id`, as the explain document numbers it.
+    pub id: u64,
+    /// The plan node's kind: `CsvSource`, `Validate`, `FragmentWrite`.
+    pub node: String,
+    /// The operator the node built.
+    pub operator: String,
+    /// The rows the operator emitted; the sink counts the rows it staged.
+    pub rows: u64,
+    /// Nanoseconds the operator was computing: the polls of its stream and of
+    /// its workers, never the time it waited for its input or for storage.
+    pub elapsed_compute_ns: u64,
+    /// Nanoseconds from the operator's first poll to its end: the phase's
+    /// wall time, waits included; `0` where no end was recorded.
+    pub wall_ns: u64,
+    /// The output partitions the operator ran, each its own stream: a
+    /// `CsvSource`'s parsers, 1 for every other operator.
+    #[serde(default = "one_partition")]
+    pub partitions: u32,
+    /// The slices of the source a `CsvSource` cut and parsed, in slice order;
+    /// empty for every other operator.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slices: Vec<LoadSliceExecuted>,
+}
+
+fn one_partition() -> u32 {
+    1
+}
+
+/// What one slice of a `CsvSource` measured: a byte range of the capture
+/// parsed whole by one partition.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadSliceExecuted {
+    /// The slice's position in the source, from 0; rows of a slice are the
+    /// same on every run.
+    pub slice: u32,
+    /// The partition that claimed the slice; which one varies between runs.
+    pub partition: u32,
+    /// The records the slice held.
+    pub rows: u64,
+    /// Nanoseconds the slice's parse and normalization took.
+    pub elapsed_compute_ns: u64,
+    /// Nanoseconds after the source's first poll at which the slice was
+    /// claimed.
+    pub start_ns: u64,
+    /// Nanoseconds after the source's first poll at which the slice's last
+    /// batch was sent.
+    pub end_ns: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -483,7 +551,8 @@ impl Omnigraph {
                 branch_created = true;
                 // DST window (loader walk D1 → D2): the implicit fork is
                 // durable, the load has not begun.
-                fail(&LOAD_POST_BRANCH_CREATE_PRE_STAGE)?;
+                fail(&LOAD_POST_BRANCH_CREATE_PRE_STAGE)
+                    .map_err(OmniError::after_earlier_publication)?;
             }
         }
         // Direct-to-target writes: no Run state machine, no `__run__` staging
@@ -503,8 +572,10 @@ impl Omnigraph {
             )
             .await
             .map_err(|error| {
+                // The fork published on its own, so every failure of the rows
+                // follows it.
                 if branch_created {
-                    error.without_pre_effect_evidence()
+                    error.after_earlier_publication()
                 } else {
                     error
                 }
@@ -758,6 +829,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
             capture.size,
             memory.limit(),
             write_budget.bytes(),
+            stage_write_concurrency,
         )
         .await?;
         if mode == LoadMode::Overwrite {
@@ -772,6 +844,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
                 actor_id,
                 history_release_bytes,
                 write_budget,
+                stage_write_concurrency,
                 memory,
                 executed,
             ))
@@ -1194,9 +1267,12 @@ async fn load_jsonl_reader_once<R: BufRead>(
     if let Some(staging_charge) = &staging_charge {
         staging_charge.grow(staged_bytes)?;
     }
+    // From the first staged file to the publisher call nothing is
+    // graph-visible: a failure is definite (`Unpublished`) whatever its cause.
     let staged = staging
         .stage_all_with_concurrency(db, branch, stage_write_concurrency)
-        .await?;
+        .await
+        .map_err(OmniError::unpublished)?;
     let commit =
         publish_staged_load(db, staged, &txn, branch, actor_id, history_release_bytes).await?;
 
@@ -1223,6 +1299,7 @@ async fn load_csv_overwrite_plan(
     actor_id: Option<&str>,
     history_release_bytes: HistoryReleaseBytes,
     write_budget: WriteBudget,
+    stage_write_concurrency: usize,
     memory: &crate::engine::LoadMemory,
     mut executed: LoadExecuted,
 ) -> Result<LoadReceipt> {
@@ -1255,8 +1332,10 @@ async fn load_csv_overwrite_plan(
             db: Arc::clone(db),
             txn: Arc::new(txn.clone()),
             write_budget,
+            writers: stage_write_concurrency,
             staged: Arc::clone(&staged),
         }),
+        slice_bytes: crate::engine::csv_slice_bytes(),
     };
     let context = EngineContext {
         snapshot: Some(snapshot),
@@ -1264,7 +1343,15 @@ async fn load_csv_overwrite_plan(
         graph_index: Arc::new(GraphIndexHandle::none()),
         load: Some(&facts),
     };
-    let rows = crate::engine::execute_load(&bound, &context, memory).await?;
+    let run = crate::engine::execute_load(&bound, &context, memory).await?;
+    let rows = run.rows;
+    executed.operators = run.operators;
+    executed.partitions = executed
+        .operators
+        .iter()
+        .map(|operator| operator.partitions)
+        .max()
+        .unwrap_or(1);
     let staged = staged
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1304,17 +1391,23 @@ async fn publish_staged_load(
     actor_id: Option<&str>,
     history_release_bytes: HistoryReleaseBytes,
 ) -> Result<crate::db::GraphCommit> {
-    fail(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
+    fail(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE).map_err(OmniError::unpublished)?;
     let lineage_intent = db
         .new_lineage_intent_for_branch(branch, actor_id, history_release_bytes)
-        .await?;
+        .await
+        .map_err(OmniError::unpublished)?;
     let crate::exec::staging::CommittedMutation {
         updates,
         expected_versions,
         detached: _,
         gates: _held_gates,
-    } = staged.commit_all(db, branch, txn).await?;
-    fail(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
+    } = staged
+        .commit_all(db, branch, txn)
+        .await
+        .map_err(OmniError::unpublished)?;
+    fail(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER).map_err(OmniError::unpublished)?;
+    // The publisher alone decides between a definite loss and an outcome it
+    // could not read back.
     db.commit_updates_on_branch_with_expected(
         branch,
         &updates,
@@ -1337,6 +1430,7 @@ pub(crate) async fn plan_load(
     source_bytes: u64,
     memory_limit: u64,
     write_max_bytes: u64,
+    load_workers_max: usize,
 ) -> Result<Decision> {
     let stmt = LoadStmt {
         source: request.source.clone(),
@@ -1415,7 +1509,7 @@ pub(crate) async fn plan_load(
         tables,
         source_bytes,
     };
-    let bounds = crate::engine::engine_bounds(memory_limit, write_max_bytes);
+    let bounds = crate::engine::engine_bounds(memory_limit, write_max_bytes, load_workers_max);
     Ok(route(&operation, &source, RouteOverride::Registry, &bounds))
 }
 
@@ -3634,151 +3728,247 @@ pub(crate) fn parse_date64_literal(value: &str) -> Result<i64> {
 
 // ─── Value constraint validation ─────────────────────────────────────────────
 
+/// The first value constraint `batch` violates, in declaration order.
 pub(crate) fn validate_value_constraints(
     batch: &RecordBatch,
     node_type: &omnigraph_compiler::catalog::NodeType,
 ) -> Result<()> {
-    use arrow_array::Array;
+    match value_constraint_failures(batch, node_type)
+        .into_iter()
+        .next()
+    {
+        Some((_, _, error)) => Err(error),
+        None => Ok(()),
+    }
+}
 
-    // Range constraints
-    for rc in &node_type.range_constraints {
-        let Some(col) = batch.column_by_name(&rc.property) else {
-            continue;
+/// Every `@range` and `@check` constraint of `node_type` that `batch`
+/// violates: one entry per constraint in declaration order (the range
+/// constraints, then the check constraints), the constraint's index, its
+/// first violating row and the refusal; a constraint the batch cannot be
+/// checked against (an unchecked type, an invalid pattern, a NaN bound)
+/// refuses at row 0.
+pub(crate) fn value_constraint_failures(
+    batch: &RecordBatch,
+    node_type: &omnigraph_compiler::catalog::NodeType,
+) -> Vec<(usize, usize, OmniError)> {
+    let ranges = node_type
+        .range_constraints
+        .iter()
+        .map(|rc| range_constraint_failure(batch, node_type, rc));
+    let checks = node_type
+        .check_constraints
+        .iter()
+        .map(|cc| check_constraint_failure(batch, node_type, cc));
+    ranges
+        .chain(checks)
+        .enumerate()
+        .filter_map(|(index, failure)| failure.map(|(row, error)| (index, row, error)))
+        .collect()
+}
+
+/// The first row of `batch` outside `rc`'s bounds; a list property bounds
+/// each element, and nulls are never bounded, so an all-null column passes
+/// whatever its physical type.
+fn range_constraint_failure(
+    batch: &RecordBatch,
+    node_type: &omnigraph_compiler::catalog::NodeType,
+    rc: &omnigraph_compiler::catalog::RangeConstraint,
+) -> Option<(usize, OmniError)> {
+    use arrow_array::Array;
+    use arrow_array::cast::AsArray;
+
+    let col = batch.column_by_name(&rc.property)?;
+    if col.logical_null_count() == col.len() {
+        return None;
+    }
+    let bounds = [
+        (rc.min.as_ref(), Ordering::Less, "<", "min"),
+        (rc.max.as_ref(), Ordering::Greater, ">", "max"),
+    ]
+    .map(|(bound, refused, relation, name)| {
+        (bound.map(RangeOperand::bound), refused, relation, name)
+    });
+    let check = |value: RangeOperand| -> Result<()> {
+        if value.is_nan() {
+            return Err(OmniError::manifest(format!(
+                "@range violation on {}.{}: value is NaN",
+                node_type.name, rc.property
+            )));
+        }
+        for (bound, refused, relation, name) in bounds {
+            let Some(bound) = bound else {
+                continue;
+            };
+            let order = value.compare(bound).ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "@range on {}.{} has a NaN {name} bound",
+                    node_type.name, rc.property
+                ))
+            })?;
+            if order == refused {
+                return Err(OmniError::manifest(format!(
+                    "@range violation on {}.{}: value {value} {relation} {name} {bound}",
+                    node_type.name, rc.property
+                )));
+            }
+        }
+        Ok(())
+    };
+    let unchecked = |data_type: &DataType| {
+        OmniError::manifest(format!(
+            "@range on {}.{} cannot check values of type {data_type}",
+            node_type.name, rc.property
+        ))
+    };
+    if let DataType::List(_) = col.data_type() {
+        let list = col.as_list::<i32>();
+        let elements = list.values();
+        let Some(values) = RangeColumn::new(elements) else {
+            return Some((0, unchecked(elements.data_type())));
         };
-        for row in 0..batch.num_rows() {
-            if col.is_null(row) {
+        for (row, span) in list.value_offsets().windows(2).enumerate() {
+            if list.is_null(row) {
                 continue;
             }
-            let value = extract_numeric_value(col, row);
-            if let Some(val) = value {
-                if val.is_nan() {
-                    return Err(OmniError::manifest(format!(
-                        "@range violation on {}.{}: value is NaN",
-                        node_type.name, rc.property
-                    )));
-                }
-                if let Some(ref min) = rc.min {
-                    let min_f = literal_value_to_f64(min);
-                    if val < min_f {
-                        return Err(OmniError::manifest(format!(
-                            "@range violation on {}.{}: value {} < min {}",
-                            node_type.name, rc.property, val, min_f
-                        )));
-                    }
-                }
-                if let Some(ref max) = rc.max {
-                    let max_f = literal_value_to_f64(max);
-                    if val > max_f {
-                        return Err(OmniError::manifest(format!(
-                            "@range violation on {}.{}: value {} > max {}",
-                            node_type.name, rc.property, val, max_f
-                        )));
+            for index in span[0] as usize..span[1] as usize {
+                if !elements.is_null(index) {
+                    if let Err(error) = check(values.value(index)) {
+                        return Some((row, error));
                     }
                 }
             }
         }
-    }
-
-    // Check constraints (regex)
-    for cc in &node_type.check_constraints {
-        let re = regex::Regex::new(&cc.pattern).map_err(|e| {
-            OmniError::manifest(format!(
-                "@check on {}.{} has invalid regex '{}': {}",
-                node_type.name, cc.property, cc.pattern, e
-            ))
-        })?;
-        let Some(col) = batch.column_by_name(&cc.property) else {
-            continue;
+    } else {
+        let Some(values) = RangeColumn::new(col) else {
+            return Some((0, unchecked(col.data_type())));
         };
-        let str_col = col.as_any().downcast_ref::<StringArray>();
-        if let Some(str_col) = str_col {
-            for row in 0..str_col.len() {
-                if str_col.is_null(row) {
-                    continue;
-                }
-                let val = str_col.value(row);
-                if !re.is_match(val) {
-                    return Err(OmniError::manifest(format!(
-                        "@check violation on {}.{}: value '{}' does not match pattern '{}'",
-                        node_type.name, cc.property, val, cc.pattern
-                    )));
+        for row in 0..col.len() {
+            if !col.is_null(row) {
+                if let Err(error) = check(values.value(row)) {
+                    return Some((row, error));
                 }
             }
         }
     }
+    None
+}
 
-    Ok(())
+/// The first row of `batch` whose text leaves `cc`'s pattern.
+fn check_constraint_failure(
+    batch: &RecordBatch,
+    node_type: &omnigraph_compiler::catalog::NodeType,
+    cc: &omnigraph_compiler::catalog::CheckConstraint,
+) -> Option<(usize, OmniError)> {
+    use arrow_array::Array;
+
+    let re = match regex::Regex::new(&cc.pattern) {
+        Ok(re) => re,
+        Err(e) => {
+            return Some((
+                0,
+                OmniError::manifest(format!(
+                    "@check on {}.{} has invalid regex '{}': {}",
+                    node_type.name, cc.property, cc.pattern, e
+                )),
+            ));
+        }
+    };
+    let col = batch.column_by_name(&cc.property)?;
+    let str_col = col.as_any().downcast_ref::<StringArray>()?;
+    (0..str_col.len())
+        .filter(|&row| !str_col.is_null(row))
+        .find(|&row| !re.is_match(str_col.value(row)))
+        .map(|row| {
+            (
+                row,
+                OmniError::manifest(format!(
+                    "@check violation on {}.{}: value '{}' does not match pattern '{}'",
+                    node_type.name,
+                    cc.property,
+                    str_col.value(row),
+                    cc.pattern
+                )),
+            )
+        })
 }
 
 /// Validate that every enum-typed property in `properties` only contains values
 /// from its declared enum value set. Operates on a single `RecordBatch` so it
 /// can be called from any write path that already holds a batch.
-///
-/// Scalar string enums are checked directly. List-of-enum properties are
-/// checked element-by-element across the underlying string values.
 pub(crate) fn validate_enum_constraints(
     batch: &RecordBatch,
     properties: &HashMap<String, omnigraph_compiler::types::PropType>,
     type_name: &str,
 ) -> Result<()> {
+    match enum_constraint_failures(batch, properties, type_name)
+        .into_iter()
+        .next()
+    {
+        Some((_, _, error)) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Every enum-typed property of `properties` with a value of `batch` outside
+/// its declared set: one entry per property, the properties ordered by name,
+/// the property's index in that order, its first offending row and the
+/// refusal. Scalar string enums are checked directly; a list-of-enum property
+/// is checked element by element, the row being the list's.
+pub(crate) fn enum_constraint_failures(
+    batch: &RecordBatch,
+    properties: &HashMap<String, omnigraph_compiler::types::PropType>,
+    type_name: &str,
+) -> Vec<(usize, usize, OmniError)> {
     use arrow_array::{Array, ListArray};
 
-    let mut __dst_pp: Vec<_> = properties.iter().collect();
+    let mut __dst_pp: Vec<_> = properties
+        .iter()
+        .filter_map(|(name, prop_type)| {
+            prop_type
+                .enum_values
+                .as_ref()
+                .map(|allowed| (name, prop_type.list, allowed))
+        })
+        .collect();
     __dst_pp.sort_by(|a, b| a.0.cmp(b.0));
-    for (prop_name, prop_type) in __dst_pp {
-        let Some(allowed) = prop_type.enum_values.as_ref() else {
-            continue;
-        };
-        let Some(col) = batch.column_by_name(prop_name) else {
-            continue;
-        };
-        if prop_type.list {
-            let Some(list_col) = col.as_any().downcast_ref::<ListArray>() else {
-                continue;
+    __dst_pp
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, (prop_name, list, allowed))| {
+            let col = batch.column_by_name(prop_name)?;
+            let invalid = |val: &str| {
+                OmniError::manifest(format!(
+                    "invalid enum value '{}' for {}.{} (expected: {})",
+                    val,
+                    type_name,
+                    prop_name,
+                    allowed.join(", ")
+                ))
             };
-            for row in 0..list_col.len() {
-                if list_col.is_null(row) {
-                    continue;
-                }
-                let item_arr = list_col.value(row);
-                let Some(str_arr) = item_arr.as_any().downcast_ref::<StringArray>() else {
-                    continue;
-                };
-                for i in 0..str_arr.len() {
-                    if str_arr.is_null(i) {
-                        continue;
-                    }
-                    let val = str_arr.value(i);
-                    if !allowed.iter().any(|a| a.as_str() == val) {
-                        return Err(OmniError::manifest(format!(
-                            "invalid enum value '{}' for {}.{} (expected: {})",
-                            val,
-                            type_name,
-                            prop_name,
-                            allowed.join(", ")
-                        )));
-                    }
-                }
-            }
-        } else if let Some(str_col) = col.as_any().downcast_ref::<StringArray>() {
-            for row in 0..str_col.len() {
-                if str_col.is_null(row) {
-                    continue;
-                }
-                let val = str_col.value(row);
-                if !allowed.iter().any(|a| a.as_str() == val) {
-                    return Err(OmniError::manifest(format!(
-                        "invalid enum value '{}' for {}.{} (expected: {})",
-                        val,
-                        type_name,
-                        prop_name,
-                        allowed.join(", ")
-                    )));
-                }
-            }
-        }
-    }
-    Ok(())
+            let found = if list {
+                let list_col = col.as_any().downcast_ref::<ListArray>()?;
+                (0..list_col.len())
+                    .filter(|&row| !list_col.is_null(row))
+                    .find_map(|row| {
+                        let item_arr = list_col.value(row);
+                        let str_arr = item_arr.as_any().downcast_ref::<StringArray>()?;
+                        str_arr
+                            .iter()
+                            .flatten()
+                            .find(|val| !allowed.iter().any(|a| a == val))
+                            .map(|val| (row, invalid(val)))
+                    })
+            } else {
+                let str_col = col.as_any().downcast_ref::<StringArray>()?;
+                (0..str_col.len())
+                    .filter(|&row| !str_col.is_null(row))
+                    .find(|&row| !allowed.iter().any(|a| a == str_col.value(row)))
+                    .map(|row| (row, invalid(str_col.value(row))))
+            };
+            found.map(|(row, error)| (index, row, error))
+        })
+        .collect()
 }
 
 /// Build the composite uniqueness key for `row` over a constraint group's
@@ -4022,37 +4212,113 @@ fn explicit_id_matches_node_key(
     Ok(false)
 }
 
-fn extract_numeric_value(col: &ArrayRef, row: usize) -> Option<f64> {
-    use arrow_array::{
-        Array, Float32Array, Float64Array, Int32Array, Int64Array, UInt32Array, UInt64Array,
-    };
-    if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
-        return Some(a.value(row) as f64);
-    }
-    if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
-        return Some(a.value(row) as f64);
-    }
-    if let Some(a) = col.as_any().downcast_ref::<UInt32Array>() {
-        return Some(a.value(row) as f64);
-    }
-    if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
-        return Some(a.value(row) as f64);
-    }
-    if let Some(a) = col.as_any().downcast_ref::<Float32Array>() {
-        return Some(a.value(row) as f64);
-    }
-    if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
-        return Some(a.value(row));
-    }
-    None
+/// The values of a `@range` column in their declared type.
+enum RangeColumn<'a> {
+    Int32(&'a Int32Array),
+    Int64(&'a Int64Array),
+    UInt32(&'a UInt32Array),
+    UInt64(&'a UInt64Array),
+    Float32(&'a Float32Array),
+    Float64(&'a Float64Array),
 }
 
-fn literal_value_to_f64(v: &omnigraph_compiler::catalog::LiteralValue) -> f64 {
-    use omnigraph_compiler::catalog::LiteralValue;
-    match v {
-        LiteralValue::Integer(n) => *n as f64,
-        LiteralValue::Float(f) => *f,
+impl<'a> RangeColumn<'a> {
+    /// `None` for a type `@range` cannot check, which the caller refuses
+    /// rather than skips.
+    fn new(col: &'a ArrayRef) -> Option<Self> {
+        let any = col.as_any();
+        Some(match col.data_type() {
+            DataType::Int32 => Self::Int32(any.downcast_ref()?),
+            DataType::Int64 => Self::Int64(any.downcast_ref()?),
+            DataType::UInt32 => Self::UInt32(any.downcast_ref()?),
+            DataType::UInt64 => Self::UInt64(any.downcast_ref()?),
+            DataType::Float32 => Self::Float32(any.downcast_ref()?),
+            DataType::Float64 => Self::Float64(any.downcast_ref()?),
+            _ => return None,
+        })
     }
+
+    fn value(&self, row: usize) -> RangeOperand {
+        match self {
+            Self::Int32(values) => RangeOperand::Integer(values.value(row).into()),
+            Self::Int64(values) => RangeOperand::Integer(values.value(row).into()),
+            Self::UInt32(values) => RangeOperand::Integer(values.value(row).into()),
+            Self::UInt64(values) => RangeOperand::Integer(values.value(row).into()),
+            Self::Float32(values) => RangeOperand::Float(values.value(row).into()),
+            Self::Float64(values) => RangeOperand::Float(values.value(row)),
+        }
+    }
+}
+
+/// A `@range` value or bound, compared without rounding. Integers widen to
+/// i128, which holds every I32, I64, U32 and U64 value and every Integer
+/// bound; F32 widens to F64 exactly. An integer and a double compare against
+/// the double's exact value, so a Float bound on an integer property, or an
+/// Integer bound on a float property, rounds neither side.
+#[derive(Clone, Copy)]
+enum RangeOperand {
+    Integer(i128),
+    Float(f64),
+}
+
+impl RangeOperand {
+    fn bound(literal: &omnigraph_compiler::catalog::LiteralValue) -> Self {
+        use omnigraph_compiler::catalog::LiteralValue;
+        match literal {
+            LiteralValue::Integer(value) => Self::Integer((*value).into()),
+            LiteralValue::Float(value) => Self::Float(*value),
+        }
+    }
+
+    fn is_nan(self) -> bool {
+        matches!(self, Self::Float(value) if value.is_nan())
+    }
+
+    /// `None` when either side is NaN.
+    fn compare(self, other: Self) -> Option<Ordering> {
+        match (self, other) {
+            (Self::Integer(left), Self::Integer(right)) => Some(left.cmp(&right)),
+            (Self::Float(left), Self::Float(right)) => left.partial_cmp(&right),
+            (Self::Integer(left), Self::Float(right)) => integer_cmp_float(left, right),
+            (Self::Float(left), Self::Integer(right)) => {
+                integer_cmp_float(right, left).map(Ordering::reverse)
+            }
+        }
+    }
+}
+
+impl fmt::Display for RangeOperand {
+    /// The exact value compared: an integral double prints as its integer,
+    /// since f64's shortest form pads with zeros past 17 digits (2^63 would
+    /// read 9223372036854776000).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Integer(value) => write!(f, "{value}"),
+            Self::Float(value) if value.fract() == 0.0 && value.abs() < i128::MAX as f64 => {
+                write!(f, "{}", value as i128)
+            }
+            Self::Float(value) => write!(f, "{value}"),
+        }
+    }
+}
+
+/// Orders an integer against a double's exact value: the double's integral
+/// part is itself an integer, exact in i128 within i128's range, and when the
+/// two integral parts are equal the double's fraction decides. `None` for NaN.
+fn integer_cmp_float(integer: i128, float: f64) -> Option<Ordering> {
+    if float.is_nan() {
+        return None;
+    }
+    let whole = float.trunc();
+    // `i128::MAX as f64` rounds up to 2^127, above every i128;
+    // `i128::MIN as f64` is -2^127 exactly. Infinities land here too.
+    if whole >= i128::MAX as f64 {
+        return Some(Ordering::Less);
+    }
+    if whole < i128::MIN as f64 {
+        return Some(Ordering::Greater);
+    }
+    Some(integer.cmp(&(whole as i128)).then(whole.total_cmp(&float)))
 }
 
 #[cfg(test)]
@@ -5278,6 +5544,55 @@ node Doc {
         assert!(result.is_err(), "expected NaN to be rejected");
         let err = result.unwrap_err().to_string();
         assert!(err.contains("NaN"), "error should mention NaN: {}", err);
+    }
+
+    /// The schema grammar cannot spell an infinite, NaN or negative-zero
+    /// bound, nor reach i128's edges, so the comparator's corners and the
+    /// spelling of a large integral bound are pinned here; the `.gqt` case
+    /// `range_constraint_compares_integers_exactly` owns the observable
+    /// refusals.
+    #[test]
+    fn range_operands_compare_exactly() {
+        use RangeOperand::{Float, Integer};
+        use std::cmp::Ordering::{Equal, Greater, Less};
+
+        let two_53 = 9_007_199_254_740_992_i128;
+        let two_63 = 9_223_372_036_854_775_808_i128;
+        for (value, bound, expected) in [
+            (Integer(two_53 + 1), Integer(two_53), Some(Greater)),
+            (Integer(two_53 + 1), Float(two_53 as f64), Some(Greater)),
+            (Integer(two_63), Integer(two_63 - 1), Some(Greater)),
+            (
+                Integer(u64::MAX.into()),
+                Float(18_446_744_073_709_551_616.0),
+                Some(Less),
+            ),
+            (Integer(2), Float(2.5), Some(Less)),
+            (Integer(3), Float(2.5), Some(Greater)),
+            (Integer(-2), Float(-2.5), Some(Greater)),
+            (Integer(-3), Float(-2.5), Some(Less)),
+            (Integer(0), Float(-0.0), Some(Equal)),
+            (Integer(0), Float(-0.5), Some(Greater)),
+            (Integer(-1), Float(-0.5), Some(Less)),
+            (Integer(i128::MAX), Float(f64::INFINITY), Some(Less)),
+            (Integer(i128::MIN), Float(f64::NEG_INFINITY), Some(Greater)),
+            (Integer(i128::MIN), Float(i128::MIN as f64), Some(Equal)),
+            (Integer(i128::MAX), Float(i128::MAX as f64), Some(Less)),
+            (Integer(0), Float(f64::NAN), None),
+            (Float(two_53 as f64), Integer(two_53 + 1), Some(Less)),
+            (Float(0.5), Float(0.5), Some(Equal)),
+            (Float(f64::NAN), Float(0.0), None),
+        ] {
+            assert_eq!(value.compare(bound), expected, "{value} against {bound}");
+        }
+        for (operand, shown) in [
+            (Float(9_223_372_036_854_775_808.0), "9223372036854775808"),
+            (Float(-2.5), "-2.5"),
+            (Float(f64::INFINITY), "inf"),
+            (Integer(u64::MAX.into()), "18446744073709551615"),
+        ] {
+            assert_eq!(operand.to_string(), shown);
+        }
     }
 
     #[test]
