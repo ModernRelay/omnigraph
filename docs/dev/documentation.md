@@ -128,7 +128,7 @@ normalizing CRLF line endings to LF. Do not add release headings to fragments.
 ### The release file
 
 The release-prep pull request adds `changelog.d/<version>.md`, named for the
-`version` in `release.json`. It opens with an intro of at most 80 words that
+`version` in `release.json`. It opens with an intro of at most 100 words that
 says what users get from the release and, when it breaks something, what
 they must do before they upgrade. Write the intro in
 [ASD-STE100](https://www.asd-ste100.org/) Simplified Technical English: short
