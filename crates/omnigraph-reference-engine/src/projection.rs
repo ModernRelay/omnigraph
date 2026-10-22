@@ -160,7 +160,10 @@ pub(super) fn literal_to_array(lit: &Literal, num_rows: usize) -> Result<ArrayRe
         Literal::String(s) => Arc::new(StringArray::from(vec![s.as_str(); num_rows])) as ArrayRef,
         Literal::Integer(n) => {
             // Try to match the most common integer types
-            Arc::new(Int64Array::from(vec![*n; num_rows])) as ArrayRef
+            let value = i64::try_from(*n).map_err(|_| {
+                OmniError::manifest("integer literal is outside the 64-bit range".to_string())
+            })?;
+            Arc::new(Int64Array::from(vec![value; num_rows])) as ArrayRef
         }
         Literal::Float(f) => Arc::new(Float64Array::from(vec![*f; num_rows])) as ArrayRef,
         Literal::Bool(b) => Arc::new(BooleanArray::from(vec![*b; num_rows])) as ArrayRef,
@@ -324,7 +327,14 @@ fn literal_list_to_array(items: &[Literal], num_rows: usize) -> Result<ArrayRef>
             for _ in 0..num_rows {
                 for item in items {
                     match item {
-                        Literal::Integer(value) => builder.values().append_value(*value),
+                        Literal::Integer(value) => {
+                            let value = i64::try_from(*value).map_err(|_| {
+                                OmniError::manifest(
+                                    "integer literal is outside the 64-bit range".to_string(),
+                                )
+                            })?;
+                            builder.values().append_value(value);
+                        }
                         _ => builder.values().append_null(),
                     }
                 }

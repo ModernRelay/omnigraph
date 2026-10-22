@@ -593,7 +593,7 @@ mod tests {
         let mut exact = SubqueryAggregate::new(
             &exact_predicate,
             plan_block_aggregate(&exact_predicate.left).unwrap(),
-            &ParamMap::from([("bound".into(), Literal::Integer(i64::MAX))]),
+            &ParamMap::from([("bound".into(), Literal::Integer(i128::from(i64::MAX)))]),
             1,
         )
         .unwrap();
