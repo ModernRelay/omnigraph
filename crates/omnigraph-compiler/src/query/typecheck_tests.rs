@@ -164,12 +164,12 @@ embedding: Vector(3)
 }
 
 #[test]
-fn mutation_target_retains_node_namespace_when_an_edge_shares_its_name() {
+fn mutation_target_retains_its_namespace_when_an_edge_shares_its_name_issue_921() {
     let catalog = setup_same_named_node_and_edge();
     let qf = parse_query(
         r#"
-query insert_shared() {
-insert Shared { label: "node" }
+query insert_shared_node() {
+insert node:Shared { label: "node" }
 }
 "#,
     )
@@ -189,6 +189,99 @@ insert Shared { label: "node" }
         ),
         CheckedQuery::Read(_) => panic!("expected mutation typecheck result"),
     }
+
+    let qf = parse_query(
+        r#"
+query insert_shared_edge() {
+insert edge:Shared { from: "a", to: "b" }
+}
+"#,
+    )
+    .unwrap();
+
+    let checked = typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
+    match checked {
+        CheckedQuery::Mutation(ctx) => assert_eq!(
+            ctx.ops
+                .iter()
+                .map(CheckedMutationOp::target)
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![MutationTarget::Edge {
+                type_name: "Shared".to_string(),
+            }]
+        ),
+        CheckedQuery::Read(_) => panic!("expected mutation typecheck result"),
+    }
+}
+
+/// Issue 921: the bare spelling of a name both namespaces declare is refused;
+/// the statement does not say which one it means.
+#[test]
+fn mutation_target_refuses_an_ambiguous_unqualified_name_issue_921() {
+    let catalog = setup_same_named_node_and_edge();
+    let qf = parse_query(
+        r#"
+query insert_shared() {
+insert Shared { label: "node" }
+}
+"#,
+    )
+    .unwrap();
+
+    let err = typecheck_query_decl(&catalog, qf.single_decl()).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("T60"), "{message}");
+    assert!(message.contains("node:Shared"), "{message}");
+    assert!(message.contains("edge:Shared"), "{message}");
+}
+
+/// Issue 921: a qualified name resolves only in the namespace it names, so a
+/// name the other namespace declares is unknown in the named one.
+#[test]
+fn mutation_target_refuses_a_name_missing_from_its_namespace_issue_921() {
+    let schema = parse_schema(
+        r#"
+node OnlyNode {
+label: String
+}
+edge OnlyEdge: OnlyNode -> OnlyNode {
+label: String?
+}
+"#,
+    )
+    .unwrap();
+    let catalog = build_catalog(&schema).unwrap();
+
+    // The node type is not an edge type.
+    let qf = parse_query(
+        r#"
+query insert_node_as_edge() {
+insert edge:OnlyNode { label: "x" }
+}
+"#,
+    )
+    .unwrap();
+
+    let err = typecheck_query_decl(&catalog, qf.single_decl()).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("T4"), "{message}");
+    assert!(message.contains("unknown edge type `OnlyNode`"), "{message}");
+
+    // The edge type is not a node type.
+    let qf = parse_query(
+        r#"
+query insert_edge_as_node() {
+insert node:OnlyEdge { label: "x" }
+}
+"#,
+    )
+    .unwrap();
+
+    let err = typecheck_query_decl(&catalog, qf.single_decl()).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("T1"), "{message}");
+    assert!(message.contains("unknown node type `OnlyEdge`"), "{message}");
 }
 
 fn setup_list() -> Catalog {

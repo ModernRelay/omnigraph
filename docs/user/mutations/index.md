@@ -13,8 +13,8 @@ query hire($person_id: String, $company_id: String, $role: String) {
 }
 ```
 
-Edge endpoints use the reserved assignments `from` and `to`; their values are
-the logical ids of existing endpoint nodes.
+Edge endpoints use the reserved assignments `from` and `to`; their values are the
+logical ids of existing endpoint nodes.
 
 ## Statements
 
@@ -23,6 +23,11 @@ insert Person { email: $email, display_name: $name }
 update Person set { display_name: $name } where email = $email
 delete Person where email = $email
 ```
+
+A node type and an edge type may share a name, so a mutation names the
+namespace it targets: `node:Person` or `edge:Knows`, the spelling
+[`load csv`](#csv-loading) already uses. A qualified name resolves in that
+namespace only; a bare name both namespaces declare is refused (`T60`).
 
 A `where` on `update` or `delete` takes the same expressions as a read filter
 (see [Boolean expressions and nulls](../queries/index.md#boolean-expressions-and-nulls)):
@@ -46,38 +51,37 @@ parameters and now()``. A compound `where` runs under either `engine` setting.
 Assignment values are constants: literals, parameters, `now()`, and
 comparisons or Boolean operators over them, such as `adult: true or $flag`.
 A constant's value is fixed per invocation: parameters and `now()` are bound
-once before any retry, so a retried mutation computes the same value. It follows the read rules
-for null: with `$flag` null, `true or $flag` is `true` and `false and $flag`
-is `false`, and `$age > 30` with `$age` null is null. A null result assigned
-to a nullable property writes null; on a `Blob` property it clears the cell.
-`null` is a reserved word, so clear a Blob through a nullable parameter such
-as `$content: Blob?`. Assigned to a non-nullable property a
-null result is refused with a typed error that names the property, never
-written as a default. A
-property or system field in a value is refused, for example ``T45: `age`
-cannot appear in an assignment value; assignments and binding matches are
-constants per invocation``.
+once before any retry, so a retried mutation computes the same value. It
+follows the read rules for null: with `$flag` null, `true or $flag` is `true`
+and `false and $flag` is `false`, and `$age > 30` with `$age` null is null. A
+null result assigned to a nullable property writes null; on a `Blob` property
+it clears the cell. `null` is a reserved word, so clear a Blob through a
+nullable parameter such as `$content: Blob?`. Assigned to a non-nullable
+property a null result is refused with a typed error that names the property,
+never written as a default. A property or system field in a value is refused,
+for example ``T45: `age` cannot appear in an assignment value; assignments
+and binding matches are constants per invocation``.
 
-A mutation query may contain several inserts and updates, or several deletes,
-but it cannot mix inserts or updates with deletes. Split that workflow into two
+A mutation query may contain several inserts and updates, or several deletes, but it
+cannot mix inserts or updates with deletes. Split that workflow into two
 queries, or run the queries on a branch and merge when the combined result is
 ready.
 
 ## Atomicity
 
-An effectful mutation query publishes one graph commit. All of its statements
-become visible together, or none do. Separate mutation commands are separate
-commits, even when they run consecutively.
+An effectful mutation query publishes one graph commit. All of its statements become
+visible together, or none do. Separate mutation commands are separate commits,
+even when they run consecutively.
 
-With `--json`, a successful effectful mutation returns `commit` with the
-exact `graph_commit_id` and commit metadata published by that attempt. A
-successful mutation that matches no entities publishes no commit and returns
-`"commit": null`. Load JSON responses use the same exact receipt.
+With `--json`, a successful effectful mutation returns `commit` with the exact
+`graph_commit_id` and commit metadata published by that attempt. A successful
+mutation that matches no entities publishes no commit and returns `"commit":
+null`. Load JSON responses use the same exact receipt.
 
-For a multi-command workflow, use a branch as isolated staging. Earlier changes
-remain committed on that branch; merging makes the resulting branch state
-visible on the target in one atomic step. See
-[Branches, Commits, and History](../branching/index.md).
+For a multi-command workflow, use a branch as isolated staging. Earlier changes remain
+committed on that branch; merging makes the resulting branch state visible on
+the target in one atomic step. See [Branches, Commits, and
+History](../branching/index.md).
 
 ## Insert and update identity
 
@@ -249,36 +253,30 @@ Insert/update mutations and incremental keyed loads are bounded to 8,192
 entities per touched type. The [`write_max_bytes`](../queries/settings.md)
 setting (default 32 MiB) bounds retained row data per type and across all
 touched types. Blob payloads have a separate allowance of the same size,
-including inline bytes, copied external bytes and carried update values.
-Every version of a key written in one mutation counts, so an insert and an
-update of the same row charge its Blob twice.
-Keyed loads also bound their parser estimate independently. A strict JSONL
-load retains its projected input check, `strict_input_arrow_bytes`.
-A CSV load has no whole-statement input check.
-It applies `write_max_bytes` to each staged-write input instead.
-An overwrite stages the reader's 8,192-row batches, and a batch over the
-allowance refuses as `staged_write_input_bytes`.
-An append or merge keeps the keyed adapter's ceilings
-(`retained keyed batch bytes per operation`, `keyed entities for <table>`,
-`keyed entity bytes for <table>`).
-The [`query_memory_bytes`](../queries/settings.md) setting bounds one
-`load csv` statement's tracked memory as a whole: the retained source, every
-decoded batch, validation state and the staging working set.
-A statement the allowance cannot hold refuses with the `query_memory_bytes`
-resource error before any fragment write.
-A CSV load needs roughly the source plus twice its typed input under that
-allowance.
-The source object is bounded by `load_source_max_bytes` before it is read
-(refused as `csv_source_bytes`).
-The loader reads the object once per statement, under the size, etag and
-version its metadata probe captured, and every reprepare attempt reuses those
-bytes.
-An object replaced between the probe and the read refuses as an
-external-source error, and nothing is staged.
-Raising `write_max_bytes` lifts `strict_input_arrow_bytes` and
+including inline bytes, copied external bytes and carried update values. Every
+version of a key written in one mutation counts, so an insert and an update of
+the same row charge its Blob twice. Keyed loads also bound their parser
+estimate independently. A strict JSONL load retains its projected input check,
+`strict_input_arrow_bytes`. A CSV load has no whole-statement input check. It
+applies `write_max_bytes` to each staged-write input instead. An overwrite
+stages the reader's 8,192-row batches, and a batch over the allowance refuses
+as `staged_write_input_bytes`. An append or merge keeps the keyed adapter's
+ceilings (`retained keyed batch bytes per operation`, `keyed entities for
+<table>`, `keyed entity bytes for <table>`). The
+[`query_memory_bytes`](../queries/settings.md) setting bounds one `load csv`
+statement's tracked memory as a whole: the retained source, every decoded
+batch, validation state and the staging working set. A statement the allowance
+cannot hold refuses with the `query_memory_bytes` resource error before any
+fragment write. A CSV load needs roughly the source plus twice its typed input
+under that allowance. The source object is bounded by `load_source_max_bytes`
+before it is read (refused as `csv_source_bytes`). The loader reads the object
+once per statement, under the size, etag and version its metadata probe
+captured, and every reprepare attempt reuses those bytes. An object replaced
+between the probe and the read refuses as an external-source error, and nothing
+is staged. Raising `write_max_bytes` lifts `strict_input_arrow_bytes` and
 `staged_write_input_bytes`; raising `query_memory_bytes` admits a larger
-statement; raising `load_source_max_bytes` lifts `csv_source_bytes`. See
-[Blob limits](../blobs.md#limits).
+statement; raising `load_source_max_bytes` lifts `csv_source_bytes`. See [Blob
+limits](../blobs.md#limits).
 
 Deletes, including cascades, and overwrite loads collecting replaced IDs have
 a separate `write_max_bytes` allowance per operation for those IDs, summed over all
