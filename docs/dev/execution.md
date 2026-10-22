@@ -1021,8 +1021,11 @@ All load modes share the mutation publisher and recovery protocol:
 
 A `load csv` overwrite is the first write plan: the planner routes
 `Operation::Load` to the engine, which lowers `CsvSource → Validate →
-FragmentWrite` to `CsvSourceExec` (one reader over the captured source),
-`ValidateExec` (a pipeline breaker: one pass over the held delta extracts what
+FragmentWrite` to `CsvSourceExec` (up to `max_partitions` readers over the
+captured source, each claiming the next record-aligned 8 MiB slice and tagging
+its batches with the slice index), `ValidateExec` (a pipeline breaker that
+drains every input partition and sorts the held batches back into slice
+order: one pass over the held delta extracts what
 the value, uniqueness and cardinality checks need, the endpoint check reads the
 held batches' endpoint columns in place against each endpoint table's committed
 key set, then the checks are judged in refusal order against the committed
@@ -1030,8 +1033,8 @@ image under each check's access) and DataFusion's `DataSinkExec`
 over `LanceFragmentSink`, which stages the fragments through the mutation
 staging and never commits. The attempt then commits the staged transaction
 detached and publishes once, the epilogue every write shares. Append, merge
-and JSONL loads keep the keyed path below; every load operator runs one
-worker until the parallel source lands.
+and JSONL loads keep the keyed path below; the source is the one wide load
+operator, the validation and the sink run one stream each.
 
 Integer endpoint sets admit their input capacity, directory, retained keys,
 build offsets and parsed probe buffer to `query_memory_bytes` before allocation.

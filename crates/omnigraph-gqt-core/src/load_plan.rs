@@ -21,14 +21,15 @@
 //! `route: plan` is the document's `engine` route, `pipeline` its `executor`
 //! route; the validate lines are the one `Validate` node's checks in order;
 //! a `pipeline` line is one entry of the document's `pipelines`, its source,
-//! its operators, the sink it drains into and the pipelines drained before it;
+//! its operators, the sink it drains into, its partitions when above one and
+//! the pipelines drained before it;
 //! publication is the driver's epilogue, never a plan node, so no line names it.
 
 use omnigraph::loader::LoadExecuted;
 use serde::Serialize;
 use serde_json::Value;
 
-const FORMS: &str = "forms: `load route: <plan|pipeline>`, `load scan: partitions <n> fallback single_scan`, `load validate value <table> [a, b]`, `load validate unique <table> <key|unique> [a, b]: access <delta|probe|scan>`, `load validate edge_ri <edge> <from|to> <Node>: access <delta|probe|scan>`, `load validate cardinality <edge> <from|to> <Node>`, `load validate retained_edges <node> <edge> <from|to>: access <delta|probe|scan>`, `load write: <overwrite fragments|append strict_insert|merge upsert>`, `load pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]`, `load executed: partitions <n> rows <m>`, `load executed <Node>: rows <m>`";
+const FORMS: &str = "forms: `load route: <plan|pipeline>`, `load scan: partitions <n> fallback single_scan`, `load validate value <table> [a, b]`, `load validate unique <table> <key|unique> [a, b]: access <delta|probe|scan>`, `load validate edge_ri <edge> <from|to> <Node>: access <delta|probe|scan>`, `load validate cardinality <edge> <from|to> <Node>`, `load validate retained_edges <node> <edge> <from|to>: access <delta|probe|scan>`, `load write: <overwrite fragments|append strict_insert|merge upsert>`, `load pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ partitions <n>][ after <n>[, <m>]]`, `load executed: partitions <n> rows <m>`, `load executed <Node>: rows <m>`";
 
 const ACCESS: [&str; 3] = ["delta", "probe", "scan"];
 const ENDPOINTS: [&str; 2] = ["from", "to"];
@@ -90,16 +91,18 @@ pub(crate) enum LoadFact {
 }
 
 /// One entry of a planner document's `pipelines`, spelled
-/// `<n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]`: the
-/// pipeline's position, its source node, its operators in run order, the
-/// sink it drains into and the pipelines drained before it. A load section
-/// claims one as `load pipeline …`, a query section as `pipeline …`.
+/// `<n>: <Source>[ -> <Operator>]* => <sink>[ partitions <n>][ after <n>[, <m>]]`:
+/// the pipeline's position, its source node, its operators in run order, the
+/// sink it drains into, the partitions its source runs (spelled only above
+/// one) and the pipelines drained before it. A load section claims one as
+/// `load pipeline …`, a query section as `pipeline …`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct PipelineClaim {
     pub id: u64,
     pub source: String,
     pub operators: Vec<String>,
     pub sink: String,
+    pub partitions: u64,
     pub after: Vec<u64>,
 }
 
@@ -112,6 +115,10 @@ impl PipelineClaim {
         }
         line.push_str(" => ");
         line.push_str(&self.sink);
+        if self.partitions > 1 {
+            line.push_str(" partitions ");
+            line.push_str(&self.partitions.to_string());
+        }
         if !self.after.is_empty() {
             let after: Vec<String> = self.after.iter().map(u64::to_string).collect();
             line.push_str(" after ");
@@ -134,6 +141,10 @@ impl PipelineClaim {
             ),
             None => (sink, Vec::new()),
         };
+        let (sink, partitions) = match sink.split_once(" partitions ") {
+            Some((sink, partitions)) => (sink, partitions.trim().parse().ok().filter(|n| *n >= 1)?),
+            None => (sink, 1),
+        };
         let mut names = chain.split(" -> ").map(operator_name);
         let source = names.next()??;
         let operators = names.collect::<Option<Vec<String>>>()?;
@@ -142,6 +153,7 @@ impl PipelineClaim {
             source,
             operators,
             sink: operator_name(sink)?,
+            partitions,
             after,
         })
     }
@@ -163,6 +175,7 @@ impl PipelineClaim {
                     .map(|operator| text(&operator["name"]))
                     .collect(),
                 sink: text(&pipeline["sink"]["name"]),
+                partitions: pipeline["partitions"].as_u64().unwrap_or(1),
                 after: pipeline["depends_on"]
                     .as_array()
                     .into_iter()
@@ -555,6 +568,8 @@ mod tests {
             "load pipeline 0: CsvSource => Validate",
             "load pipeline 1: Validate -> FragmentWrite => consumer after 0",
             "load pipeline 2: Scan -> HashJoin(probe) -> Projection => consumer after 0, 1",
+            "load pipeline 0: CsvSource => Validate partitions 2",
+            "load pipeline 1: Validate -> FragmentWrite => consumer partitions 3 after 0",
             "load executed: partitions 1 rows 3",
             "load executed FragmentWrite: rows 3",
         ];
@@ -589,6 +604,9 @@ mod tests {
             "load pipeline 0: Csv Source => Validate",
             "load pipeline one: CsvSource => Validate",
             "load pipeline 1: Validate => consumer after one",
+            "load pipeline 0: CsvSource => Validate partitions two",
+            "load pipeline 0: CsvSource => Validate partitions 0",
+            "load pipeline 1: Validate => consumer after 0 partitions 2",
             "load executed CsvSource rows 3",
             "load executed CsvSource: rows three",
             "load executed Csv Source: rows 3",
@@ -614,12 +632,12 @@ mod tests {
                         {"check": "edge_ri", "endpoint": "from", "node_type": "Person", "access": "scan"},
                         {"check": "cardinality", "endpoint": "from", "node_type": "Person", "min": 0, "max": 2, "access": "probe"}
                     ],
-                    "inputs": [{"node": "CsvSource", "max_partitions": 1, "fallback": "single_scan"}]
+                    "inputs": [{"node": "CsvSource", "max_partitions": 2, "fallback": "single_scan"}]
                 }]
             },
             "pipelines": [
-                {"id": 0, "source": {"id": 0, "node": "CsvSource"}, "operators": [], "sink": {"id": 1, "name": "Validate"}, "depends_on": []},
-                {"id": 1, "source": {"id": 1, "node": "Validate"}, "operators": [{"id": 2, "name": "FragmentWrite"}], "sink": {"name": "consumer"}, "depends_on": [0]}
+                {"id": 0, "source": {"id": 0, "node": "CsvSource"}, "partitions": 2, "operators": [], "sink": {"id": 1, "name": "Validate"}, "depends_on": []},
+                {"id": 1, "source": {"id": 1, "node": "Validate"}, "partitions": 1, "operators": [{"id": 2, "name": "FragmentWrite"}], "sink": {"name": "consumer"}, "depends_on": [0]}
             ]
         });
         let executed = LoadExecuted {
@@ -633,6 +651,8 @@ mod tests {
                 rows: 7,
                 elapsed_compute_ns: 12,
                 wall_ns: 34,
+                partitions: 1,
+                slices: Vec::new(),
             }],
         };
         let facts: Vec<String> = plan_facts(&document, &executed)
@@ -648,8 +668,8 @@ mod tests {
                 "load validate unique edge:Knows key [from, to]: access delta",
                 "load validate edge_ri edge:Knows from Person: access scan",
                 "load validate cardinality edge:Knows from Person",
-                "load scan: partitions 1 fallback single_scan",
-                "load pipeline 0: CsvSource => Validate",
+                "load scan: partitions 2 fallback single_scan",
+                "load pipeline 0: CsvSource => Validate partitions 2",
                 "load pipeline 1: Validate -> FragmentWrite => consumer after 0",
                 "load executed: partitions 1 rows 7",
                 "load executed CsvSource: rows 7",

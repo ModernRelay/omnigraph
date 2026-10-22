@@ -307,8 +307,11 @@ and an invalid or `0` value refuses startup instead of running the default.
 The same width is the number of Lance writers a `load csv` overwrite runs at
 once: its batches are cut into runs of at most one Lance file (1 M rows), each
 run written by its own writer, and the files are published in input order, so
-the table's files are the ones a single writer would have produced. Delete
-staging remains serial. This affects preparation only—one request still
+the table's files are the ones a single writer would have produced. It is also
+the most streams that parse the overwrite's source: the source is cut on
+record ends into 8 MiB slices, a stream claims the next slice as it finishes
+one, and the validation puts the slices back in source order, so the rows and
+their order are those of a single parser. Delete staging remains serial. This affects preparation only—one request still
 publishes exactly one graph commit.
 
 A stale strict update, delete, or overwrite can return `read_set_conflict`.

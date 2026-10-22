@@ -3379,6 +3379,7 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "instrumentation.rs: omnigraph_core::instrumentation::RrfGateVerdict",
     "instrumentation.rs: omnigraph_core::instrumentation::StageWriteProbes",
     "instrumentation.rs: omnigraph_core::instrumentation::StorageReadCounts",
+    "instrumentation.rs: omnigraph_core::instrumentation::with_csv_slice_bytes",
     "instrumentation.rs: omnigraph_core::instrumentation::with_external_payload_read_held",
     "instrumentation.rs: omnigraph_core::instrumentation::with_external_payload_read_stalled",
     "instrumentation.rs: omnigraph_core::instrumentation::with_merge_write_probes",

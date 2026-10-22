@@ -416,8 +416,14 @@ overwrite the number of Lance writers (`TableStore::stage_overwrite_batches`
 cuts the batches at Lance's file target into contiguous chunks, runs one
 `execute_uncommitted` per chunk with that many in flight, and joins the
 chunks' fragments in chunk order into the one `Operation::Overwrite`, so the
-files and their order are those of a single call). Delete transactions remain
-serial. The setting changes only
+files and their order are those of a single call), and the most partitions of
+its `CsvSourceExec` (the planner's `max_partitions`, one per 8 MiB of source
+up to this width; the resolve pass cuts the capture on record ends into
+slices, each partition claims the next slice from a shared counter, tags its
+batches with the slice index, and `ValidateExec` drains every partition and
+sorts the held batches by slice before judging them, so the rows reach the
+sink in source order and a refusal names the lowest failed slice's record).
+Delete transactions remain serial. The setting changes only
 fragment preparation: every participant still commits detached and crosses
 one graph-manifest publication.
 

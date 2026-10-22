@@ -1256,6 +1256,8 @@ impl Lower for Walk<'_, '_> {
                 Arc::clone(&load.capture),
                 Arc::clone(self.lowering.catalog),
                 schema,
+                usize::try_from(fields.max_partitions).unwrap_or(1),
+                load.slice_bytes,
             ),
         )
     }

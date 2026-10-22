@@ -14,8 +14,8 @@ use omnigraph_compiler::{SYSTEM_COLUMNS_V3, build_catalog};
 use omnigraph_planner::optimizer::resolve;
 use omnigraph_planner::{
     BoundPlan, Decision, LogicalNode, MemorySource, Operation, PROBE_CHUNK_KEYS, PhysicalNode,
-    PhysicalPlan, RouteOverride, Side, SideId, TableRef, Unrouted, ValidateAccess, ValueTable,
-    route,
+    PhysicalPlan, RouteOverride, SOURCE_PARTITION_BYTES, Side, SideId, TableRef, Unrouted,
+    ValidateAccess, ValueTable, route,
 };
 
 use crate::fixture_bounds::BOUNDS;
@@ -213,6 +213,44 @@ fn node_overwrite_resolves_to_source_validate_chain_and_write() {
     assert_eq!(pipelines[1]["operators"][0]["name"], "FragmentWrite");
     assert_eq!(pipelines[1]["sink"]["name"], "consumer");
     assert_eq!(pipelines[1]["depends_on"], serde_json::json!([0]));
+}
+
+/// One partition per `SOURCE_PARTITION_BYTES`, capped by the bounds' load
+/// workers, carried by the pipeline the source heads while the breaker's
+/// runs one; GQT fixtures stay under one partition, so the arithmetic is here.
+#[test]
+fn source_partitions_are_the_slices_capped_by_the_load_workers() {
+    for (source_bytes, partitions) in [
+        (4096, 1),
+        (SOURCE_PARTITION_BYTES, 1),
+        (SOURCE_PARTITION_BYTES + 1, 2),
+        (3 * SOURCE_PARTITION_BYTES, 3),
+        (100 * SOURCE_PARTITION_BYTES, BOUNDS.load_workers_max),
+    ] {
+        let op = operation(
+            LoadTarget::Node("Person".into()),
+            LoadStmtMode::Overwrite,
+            source_bytes,
+        );
+        let Decision::Engine { plan, explain, .. } =
+            route(&op, &source(), RouteOverride::Registry, &BOUNDS)
+        else {
+            panic!("an overwrite load routes to the engine");
+        };
+        let Some(PhysicalNode::CsvSource { max_partitions, .. }) = chain(&plan).pop() else {
+            panic!("the leaf is the source");
+        };
+        assert_eq!(*max_partitions, partitions, "{source_bytes} bytes");
+        let document = explain.to_value();
+        assert_eq!(
+            document["pipelines"][0]["partitions"], partitions,
+            "{source_bytes} bytes"
+        );
+        assert_eq!(
+            document["pipelines"][1]["partitions"], 1,
+            "{source_bytes} bytes"
+        );
+    }
 }
 
 #[test]

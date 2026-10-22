@@ -185,6 +185,7 @@ impl<'a> QuerySource<'a> {
         engine_bounds(
             self.memory_limit,
             crate::storage_layer::KEYED_WRITE_MAX_BYTES,
+            1,
         )
     }
 
@@ -194,9 +195,15 @@ impl<'a> QuerySource<'a> {
 }
 
 /// The engine's bounds for one plan: the change-feed constants, the pool
-/// `memory_limit` sizes, and the bound on one staged load input (the session's
-/// `write_max_bytes` for a load, the keyed constant for a query's document).
-pub(crate) fn engine_bounds(memory_limit: u64, load_write_max_bytes: u64) -> Bounds {
+/// `memory_limit` sizes, the bound on one staged load input (the session's
+/// `write_max_bytes` for a load, the keyed constant for a query's document),
+/// and the workers one load phase runs at once (the session's
+/// `stage_write_concurrency` for a load, 1 for a query's document).
+pub(crate) fn engine_bounds(
+    memory_limit: u64,
+    load_write_max_bytes: u64,
+    load_workers_max: usize,
+) -> Bounds {
     Bounds {
         hydration_chunk_hard_bytes: 2 * crate::storage_layer::KEYED_WRITE_MAX_BYTES,
         key_width_bytes: KEY_WIDTH_BYTES,
@@ -205,7 +212,7 @@ pub(crate) fn engine_bounds(memory_limit: u64, load_write_max_bytes: u64) -> Bou
         build_key_cap_rows: super::push::BUILD_KEY_CAP_ROWS as u64,
         query_memory_pool_bytes: memory_limit,
         late_materialization_only: false,
-        load_workers_max: 1,
+        load_workers_max: u32::try_from(load_workers_max).unwrap_or(u32::MAX).max(1),
         load_write_max_bytes,
     }
 }

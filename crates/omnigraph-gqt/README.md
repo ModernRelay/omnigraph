@@ -673,7 +673,7 @@ load validate retained_edges <node-table> <edge-table> from|to: access delta|pro
 load write: overwrite fragments
 load write: append strict_insert
 load write: merge upsert
-load pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]
+load pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ partitions <n>][ after <n>[, <m>]]
 load executed: partitions <n> rows <m>
 load executed <Node>: rows <m>
 ```
@@ -688,9 +688,11 @@ identity, and its `access` suffix claims the check's access path.
 `load pipeline` claims one entry of the document's `pipelines` by position:
 its source node, its streaming operators in run order, the sink it drains
 into (a node that holds its whole input, a join's build side, or the
-`consumer`) and, after `after`, the pipelines drained before it starts; an
-overwrite load prints `0: CsvSource => Validate` and
-`1: Validate -> FragmentWrite => consumer after 0`.
+`consumer`), after `partitions` the streams its source runs (the `CsvSource`
+node's `max_partitions`, spelled only above one) and, after `after`, the
+pipelines drained before it starts; an overwrite load prints
+`0: CsvSource => Validate` and `1: Validate -> FragmentWrite => consumer after 0`,
+a source over 8 MiB `0: CsvSource => Validate partitions 2`.
 `load executed:` claims the partitions and rows the load executed;
 `load executed <Node>: rows <m>` claims the rows one node's operator emitted
 (`CsvSource`, `Validate`, or the rows `FragmentWrite` staged), read from the

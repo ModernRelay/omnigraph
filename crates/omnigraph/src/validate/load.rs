@@ -15,8 +15,9 @@ use omnigraph_compiler::types::ScalarType;
 use omnigraph_planner::{ValidateAccess, ValidateSpec};
 
 use super::kernels::{
-    CardPlan, UniqueImageBuilder, card_affected, card_observe, card_violations, orphan_violation,
-    orphans_retained, unique_coalesced_dups, unique_committed_collisions, unique_probe_keys,
+    CardPlan, FinalKeys, FirstHolders, Position, UniqueImage, UniquePartial, card_affected,
+    card_violations, merge_unique_image, merge_unique_shard, orphan_violation, orphans_retained,
+    unique_coalesced_dups, unique_committed_collisions, unique_probe_keys,
 };
 use super::key_set::{IntKeySet, canonical_i64, key_bytes};
 use super::{
@@ -30,7 +31,6 @@ use crate::loader::{LoadMode, validate_enum_constraints, validate_value_constrai
 
 pub(crate) enum LoadPhase {
     RemovedInput,
-    Extracted,
 }
 
 pub(super) type ByteAdmission<'a> = dyn FnMut(usize) -> Result<Box<dyn Send>> + Send + 'a;
@@ -59,6 +59,9 @@ impl LoadAdmission<'_> {
 /// `Ok(())` admits the delta; the first violation in check order, then in
 /// the check's own order, is the error, with the evaluator's text.
 /// Admission charges removed ids and the first retained edge before copying them.
+/// The engine sweeps per partition and calls [`judge_load_swept`]; this
+/// sequential form is the tests' door.
+#[cfg(test)]
 pub(crate) async fn judge_load(
     table: &str,
     checks: &[ValidateSpec],
@@ -66,6 +69,33 @@ pub(crate) async fn judge_load(
     base: &Snapshot,
     mode: LoadMode,
     batches: &[RecordBatch],
+    admission: &mut LoadAdmission<'_>,
+) -> Result<()> {
+    let extracted = Extracted::sweep(
+        table,
+        checks,
+        catalog,
+        batches,
+        catalog.system_columns,
+        mode == LoadMode::Overwrite,
+    )?;
+    judge_load_swept(
+        table, checks, catalog, base, mode, batches, extracted, admission,
+    )
+    .await
+}
+
+/// [`judge_load`] with the sweep already done by the caller: the engine's
+/// `ValidateExec` sweeps each partition's batches as they arrive and merges
+/// the partials ([`Extracted::prepare`], [`Merging::finish`]).
+pub(crate) async fn judge_load_swept(
+    table: &str,
+    checks: &[ValidateSpec],
+    catalog: &Catalog,
+    base: &Snapshot,
+    mode: LoadMode,
+    batches: &[RecordBatch],
+    mut extracted: Extracted,
     admission: &mut LoadAdmission<'_>,
 ) -> Result<()> {
     let system_columns = catalog.system_columns;
@@ -87,13 +117,6 @@ pub(crate) async fn judge_load(
     } else {
         Vec::new()
     };
-    let _phase = admission
-        .phase
-        .as_mut()
-        .map(|admit| admit(LoadPhase::Extracted))
-        .transpose()?;
-    let mut extracted =
-        Extracted::sweep(table, checks, catalog, batches, system_columns, overwrite)?;
     let mut reuse = admission.reuse.as_mut().and_then(|admit| admit());
     let mut cached_base = reuse.as_ref().map(|reuse| {
         let mut snapshot = base.clone();
@@ -121,12 +144,11 @@ pub(crate) async fn judge_load(
         match &spec.check {
             ValidateCheck::Value { .. } => first.refuse(extracted.value.take())?,
             ValidateCheck::Unique { columns, .. } => {
-                let (builder, within_batch) = extracted
+                let (image, repeat) = extracted
                     .unique
                     .remove(&index)
                     .ok_or_else(|| missing_facts(spec))?;
-                first.refuse(within_batch)?;
-                let image = builder.finish();
+                first.refuse(repeat)?;
                 unique_coalesced_dups(table, columns, &image.entries, &mut first.sink())?;
                 first.refuse_pending()?;
                 if spec.consults.is_some() {
@@ -270,21 +292,192 @@ pub(crate) async fn judge_load(
     Ok(())
 }
 
+/// The position of a row: slice `slice` of the source, row `row` inside it.
+pub(crate) fn position(slice: usize, row: u64) -> Position {
+    ((slice as Position) << 32) | (row & 0xffff_ffff)
+}
+
+/// What the sweep extracts, read off the checks once: which facts a
+/// partition keeps and the shards its unique holders split into.
+pub(crate) struct SweepPlan {
+    table: String,
+    needs_value: bool,
+    needs_ids: bool,
+    needs_card: bool,
+    unique: Vec<(usize, Vec<String>)>,
+    input_only: bool,
+    shards: usize,
+}
+
+impl SweepPlan {
+    /// `shards` is the partitions that sweep at once; each partition's unique
+    /// holders split into that many maps so the merge runs shard by shard.
+    pub(crate) fn new(
+        table: &str,
+        checks: &[ValidateSpec],
+        overwrite: bool,
+        shards: usize,
+    ) -> Self {
+        Self {
+            table: table.to_string(),
+            needs_value: checks
+                .iter()
+                .any(|spec| matches!(spec.check, ValidateCheck::Value { .. })),
+            needs_ids: checks.iter().any(|spec| {
+                matches!(spec.check, ValidateCheck::Unique { .. }) && spec.consults.is_some()
+            }),
+            needs_card: checks
+                .iter()
+                .any(|spec| matches!(spec.check, ValidateCheck::Cardinality { .. })),
+            unique: checks
+                .iter()
+                .enumerate()
+                .filter_map(|(index, spec)| match &spec.check {
+                    ValidateCheck::Unique { columns, .. } => Some((index, columns.clone())),
+                    _ => None,
+                })
+                .collect(),
+            input_only: overwrite,
+            shards: shards.max(1),
+        }
+    }
+}
+
+/// The facts one partition extracted from the batches it drained, every row
+/// placed by its [`Position`]; [`Extracted::prepare`] joins the partitions'.
+pub(crate) struct SweepPartial {
+    value: Option<(Position, Violation)>,
+    ids: HashSet<String>,
+    unique: Vec<UniquePartial>,
+    card: HashMap<String, (Position, String)>,
+}
+
+impl SweepPartial {
+    pub(crate) fn new(plan: &SweepPlan) -> Self {
+        Self {
+            value: None,
+            ids: HashSet::new(),
+            unique: plan
+                .unique
+                .iter()
+                .map(|_| UniquePartial::new(plan.input_only, plan.shards))
+                .collect(),
+            card: HashMap::new(),
+        }
+    }
+
+    /// Extract `batch`, whose first row sits at `base`; the partition's
+    /// batches arrive in source order, so within one partial later wins.
+    pub(crate) fn observe(
+        &mut self,
+        plan: &SweepPlan,
+        catalog: &Catalog,
+        batch: &RecordBatch,
+        system_columns: SystemColumns,
+        base: Position,
+    ) -> Result<()> {
+        let table = plan.table.as_str();
+        if plan.needs_value && self.value.is_none() {
+            let type_name = table.split_once(':').map(|(_, name)| name).unwrap_or(table);
+            if let Some(error) = value_check(table, type_name, catalog, batch) {
+                self.value = Some((base, value_violation(table, error)));
+            }
+        }
+        if plan.needs_ids {
+            let ids = string_col(batch, system_columns.id)?;
+            for row in 0..ids.len() {
+                if !ids.is_null(row) {
+                    self.ids.insert(ids.value(row).to_string());
+                }
+            }
+        }
+        for ((_, columns), partial) in plan.unique.iter().zip(&mut self.unique) {
+            partial.observe(table, columns, batch, system_columns, base)?;
+        }
+        if plan.needs_card {
+            let ids = string_col(batch, system_columns.id)?;
+            let srcs = string_col(batch, system_columns.src)?;
+            for row in 0..batch.num_rows() {
+                self.card.insert(
+                    ids.value(row).to_string(),
+                    (
+                        base.saturating_add(row as Position),
+                        srcs.value(row).to_string(),
+                    ),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One shard of every partition's unique holders, merged by the engine
+/// beside the other shards; `check` is the uniqueness check's list index.
+pub(crate) struct UniqueShardJob {
+    pub(crate) check: usize,
+    columns: Vec<String>,
+    maps: Vec<FirstHolders>,
+}
+
+impl UniqueShardJob {
+    pub(crate) fn run(self, table: &str) -> Option<(Position, Violation)> {
+        merge_unique_shard(table, &self.columns, self.maps)
+    }
+}
+
+/// The partitions' facts taken apart: everything but the unique shards
+/// already merged, the shards left to [`UniqueShardJob::run`].
+pub(crate) struct Merging {
+    value: Option<Violation>,
+    ids: HashSet<String>,
+    card: HashMap<String, String>,
+    unique: Vec<(usize, Vec<FinalKeys>, Option<(Position, Violation)>)>,
+}
+
+impl Merging {
+    /// `shards` are the jobs' results with each job's `check`.
+    pub(crate) fn finish(self, shards: Vec<(usize, Option<(Position, Violation)>)>) -> Extracted {
+        let unique = self
+            .unique
+            .into_iter()
+            .map(|(check, finals, own)| {
+                let repeat = shards
+                    .iter()
+                    .filter(|(shard_check, _)| *shard_check == check)
+                    .filter_map(|(_, repeat)| repeat.clone())
+                    .chain(own)
+                    .min_by_key(|(position, _)| *position)
+                    .map(|(_, violation)| violation);
+                let image = merge_unique_image(finals, repeat.is_some());
+                (check, (image, repeat))
+            })
+            .collect();
+        Extracted {
+            value: self.value,
+            ids: self.ids,
+            unique,
+            card: self.card,
+        }
+    }
+}
+
 /// What one sweep over the delta extracts for every check at once.
 #[derive(Default)]
-struct Extracted {
-    /// The first value violation in batch order.
+pub(crate) struct Extracted {
+    /// The first value violation in source order.
     value: Option<Violation>,
     /// Every non-null id of the delta.
     ids: HashSet<String>,
-    /// Per uniqueness check (by list index): its image under construction and
-    /// the first key repeated anywhere in the input.
-    unique: HashMap<usize, (UniqueImageBuilder, Option<Violation>)>,
+    /// Per uniqueness check (by list index): its image and the first key
+    /// repeated anywhere in the input.
+    unique: HashMap<usize, (UniqueImage, Option<Violation>)>,
     /// Last-wins src per edge id, when a cardinality check reads it.
     card: HashMap<String, String>,
 }
 
 impl Extracted {
+    /// Every batch swept in order as one partial, merged alone.
+    #[cfg(test)]
     fn sweep(
         table: &str,
         checks: &[ValidateSpec],
@@ -293,66 +486,90 @@ impl Extracted {
         system_columns: SystemColumns,
         overwrite: bool,
     ) -> Result<Self> {
-        let mut extracted = Self::default();
-        let needs_value = checks
-            .iter()
-            .any(|spec| matches!(spec.check, ValidateCheck::Value { .. }));
-        let needs_ids = checks.iter().any(|spec| {
-            matches!(spec.check, ValidateCheck::Unique { .. }) && spec.consults.is_some()
-        });
-        let needs_card = checks
-            .iter()
-            .any(|spec| matches!(spec.check, ValidateCheck::Cardinality { .. }));
-        let unique_checks: Vec<(usize, &[String])> = checks
-            .iter()
-            .enumerate()
-            .filter_map(|(index, spec)| match &spec.check {
-                ValidateCheck::Unique { columns, .. } => Some((index, columns.as_slice())),
-                _ => None,
-            })
-            .collect();
-        for &(index, _) in &unique_checks {
-            extracted.unique.insert(
-                index,
-                (
-                    if overwrite {
-                        UniqueImageBuilder::for_replacement()
-                    } else {
-                        UniqueImageBuilder::for_input()
-                    },
-                    None,
-                ),
-            );
-        }
-        let type_name = table.split_once(':').map(|(_, name)| name).unwrap_or(table);
+        let plan = SweepPlan::new(table, checks, overwrite, 1);
+        let mut partial = SweepPartial::new(&plan);
+        let mut base = 0;
         for batch in batches {
-            if needs_value && extracted.value.is_none() {
-                extracted.value = value_check(table, type_name, catalog, batch)
-                    .map(|err| value_violation(table, err));
+            partial.observe(&plan, catalog, batch, system_columns, base)?;
+            base += batch.num_rows() as Position;
+        }
+        let (merging, jobs) = Self::prepare(&plan, vec![partial]);
+        let shards = jobs
+            .into_iter()
+            .map(|job| (job.check, job.run(table)))
+            .collect();
+        Ok(merging.finish(shards))
+    }
+
+    /// Join the partitions' partials: the first value violation, the union
+    /// of ids, the last src per edge id, each check's own repeats and final
+    /// keys; the unique holders come back as one job per shard and check.
+    pub(crate) fn prepare(
+        plan: &SweepPlan,
+        partials: Vec<SweepPartial>,
+    ) -> (Merging, Vec<UniqueShardJob>) {
+        let mut value: Option<(Position, Violation)> = None;
+        let mut ids = HashSet::new();
+        let mut card: HashMap<String, (Position, String)> = HashMap::new();
+        let mut shards: Vec<Vec<Vec<FirstHolders>>> = plan
+            .unique
+            .iter()
+            .map(|_| (0..plan.shards).map(|_| Vec::new()).collect())
+            .collect();
+        let mut unique: Vec<(usize, Vec<FinalKeys>, Option<(Position, Violation)>)> = plan
+            .unique
+            .iter()
+            .map(|(check, _)| (*check, Vec::new(), None))
+            .collect();
+        for partial in partials {
+            if let Some((position, violation)) = partial.value {
+                if value.as_ref().is_none_or(|(at, _)| position < *at) {
+                    value = Some((position, violation));
+                }
             }
-            if needs_ids {
-                let ids = string_col(batch, system_columns.id)?;
-                for row in 0..ids.len() {
-                    if !ids.is_null(row) {
-                        extracted.ids.insert(ids.value(row).to_string());
+            ids.extend(partial.ids);
+            for (id, (position, src)) in partial.card {
+                match card.get(&id) {
+                    Some((held, _)) if *held > position => {}
+                    _ => {
+                        card.insert(id, (position, src));
                     }
                 }
             }
-            for &(index, columns) in &unique_checks {
-                let (builder, within_batch) = extracted
-                    .unique
-                    .get_mut(&index)
-                    .expect("every uniqueness check has a builder");
-                builder.observe(table, columns, batch, system_columns, &mut |violation| {
-                    within_batch.get_or_insert(violation);
-                    Ok(())
-                })?;
-            }
-            if needs_card {
-                card_observe(batch, system_columns, &mut extracted.card)?;
+            for (index, unique_partial) in partial.unique.into_iter().enumerate() {
+                let (holders, finals, own) = unique_partial.into_parts();
+                for (shard, map) in holders.into_iter().enumerate() {
+                    shards[index][shard].push(map);
+                }
+                let (_, all_finals, first_own) = &mut unique[index];
+                all_finals.push(finals);
+                if let Some(own) = own {
+                    if first_own.as_ref().is_none_or(|(at, _)| own.0 < *at) {
+                        *first_own = Some(own);
+                    }
+                }
             }
         }
-        Ok(extracted)
+        let jobs = shards
+            .into_iter()
+            .zip(&plan.unique)
+            .flat_map(|(by_shard, (check, columns))| {
+                by_shard.into_iter().map(move |maps| UniqueShardJob {
+                    check: *check,
+                    columns: columns.clone(),
+                    maps,
+                })
+            })
+            .collect();
+        (
+            Merging {
+                value: value.map(|(_, violation)| violation),
+                ids,
+                card: card.into_iter().map(|(id, (_, src))| (id, src)).collect(),
+                unique,
+            },
+            jobs,
+        )
     }
 }
 

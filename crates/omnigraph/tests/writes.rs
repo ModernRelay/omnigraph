@@ -1519,6 +1519,99 @@ async fn load_csv_overwrite_admits_compact_keys_under_default_memory() {
     );
 }
 
+/// A source cut into many slices loads the same rows in the same order as one
+/// slice, and the receipt records every slice; GQT cannot shrink the 8 MiB
+/// slice without an 8 MiB fixture.
+#[tokio::test]
+async fn load_csv_overwrite_from_many_slices_keeps_source_order() {
+    use omnigraph::instrumentation::with_csv_slice_bytes;
+    use omnigraph::loader::CsvLoadRequest;
+    use omnigraph_compiler::query::ast::LoadTarget;
+    use std::io::Write;
+
+    const ROWS: usize = 2_000;
+    let source_dir = tempfile::tempdir().unwrap();
+    let csv_path = source_dir.path().join("people.csv");
+    let mut csv = std::io::BufWriter::new(std::fs::File::create(&csv_path).unwrap());
+    writeln!(csv, "key,name").unwrap();
+    for row in 0..ROWS {
+        writeln!(csv, "{row},p{row:04}").unwrap();
+    }
+    csv.flush().unwrap();
+    drop(csv);
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(source_dir.path()).unwrap(),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let graph_dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(
+            graph_dir.path().to_str().unwrap(),
+            "node Person { key: I64 @key name: String }",
+        )
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy)
+        .unwrap(),
+    );
+    let request = CsvLoadRequest {
+        source: format!("file://{}", csv_path.display()),
+        target: LoadTarget::Node("Person".to_string()),
+        mode: LoadMode::Overwrite,
+        delimiter: b',',
+        header: true,
+        columns: None,
+    };
+    let receipt = with_csv_slice_bytes(64, db.load_csv_as_with_receipt("main", &request, None))
+        .await
+        .unwrap();
+    assert_eq!(receipt.result.nodes_loaded.values().sum::<usize>(), ROWS);
+    let executed = receipt.executed_plan().expect("an overwrite runs the plan");
+    assert_eq!(
+        executed.partitions, 1,
+        "a source under 8 MiB plans one partition"
+    );
+    let source = &executed.operators[0];
+    assert_eq!((source.node.as_str(), source.partitions), ("CsvSource", 1));
+    assert!(source.slices.len() > 1, "{} slices", source.slices.len());
+    assert_eq!(
+        source
+            .slices
+            .iter()
+            .map(|slice| slice.slice)
+            .collect::<Vec<_>>(),
+        (0..source.slices.len() as u32).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        source.slices.iter().map(|slice| slice.rows).sum::<u64>(),
+        ROWS as u64
+    );
+    assert!(
+        executed.operators[1..]
+            .iter()
+            .all(|operator| operator.partitions == 1 && operator.slices.is_empty())
+    );
+    let batches = helpers::read_table(db.db(), "node:Person").await;
+    let keys: Vec<i64> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("key")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(keys, (0..ROWS as i64).collect::<Vec<_>>());
+}
+
 /// Update predicate matching is itself a bounded allocation. The committed
 /// side must stream and charge rows before it is retained/concatenated, rather
 /// than first collecting an arbitrarily wide match set and relying on the

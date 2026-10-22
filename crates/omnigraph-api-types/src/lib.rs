@@ -772,6 +772,39 @@ pub struct LoadOperatorExecutedOutput {
     /// Nanoseconds from the operator's first poll to its end, waits included;
     /// `0` where no end was recorded.
     pub wall_ns: u64,
+    /// The output partitions the operator ran, each its own stream: a
+    /// `CsvSource`'s parsers, 1 for every other operator.
+    #[serde(default = "one_partition")]
+    pub partitions: u32,
+    /// The slices of the source a `CsvSource` cut and parsed, in slice order;
+    /// absent for every other operator.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slices: Vec<LoadSliceExecutedOutput>,
+}
+
+fn one_partition() -> u32 {
+    1
+}
+
+/// What one slice of a `CsvSource` measured: a byte range of the capture
+/// parsed whole by one partition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct LoadSliceExecutedOutput {
+    /// The slice's position in the source, from 0; a slice's rows are the
+    /// same on every run.
+    pub slice: u32,
+    /// The partition that claimed the slice; which one varies between runs.
+    pub partition: u32,
+    /// The records the slice held.
+    pub rows: u64,
+    /// Nanoseconds the slice's parse and normalization took.
+    pub elapsed_compute_ns: u64,
+    /// Nanoseconds after the source's first poll at which the slice was
+    /// claimed.
+    pub start_ns: u64,
+    /// Nanoseconds after the source's first poll at which the slice's last
+    /// batch was sent.
+    pub end_ns: u64,
 }
 
 /// One logical declaration touched by a graph-batch load.
@@ -2886,6 +2919,19 @@ pub fn load_executed_output(executed: &LoadExecuted) -> LoadExecutedOutput {
                     rows: operator.rows,
                     elapsed_compute_ns: operator.elapsed_compute_ns,
                     wall_ns: operator.wall_ns,
+                    partitions: operator.partitions,
+                    slices: operator
+                        .slices
+                        .iter()
+                        .map(|slice| LoadSliceExecutedOutput {
+                            slice: slice.slice,
+                            partition: slice.partition,
+                            rows: slice.rows,
+                            elapsed_compute_ns: slice.elapsed_compute_ns,
+                            start_ns: slice.start_ns,
+                            end_ns: slice.end_ns,
+                        })
+                        .collect(),
                 },
             )
             .collect(),
@@ -3856,6 +3902,15 @@ mod tests {
                 rows: 2,
                 elapsed_compute_ns: 12,
                 wall_ns: 34,
+                partitions: 1,
+                slices: vec![omnigraph::loader::LoadSliceExecuted {
+                    slice: 0,
+                    partition: 0,
+                    rows: 2,
+                    elapsed_compute_ns: 10,
+                    start_ns: 1,
+                    end_ns: 30,
+                }],
             }],
         });
         let change = json!({
@@ -3864,7 +3919,10 @@ mod tests {
             "executed": {
                 "partitions": 1, "rows": 2, "source_bytes": 19,
                 "operators": [{"id": 0, "node": "CsvSource", "operator": "CsvSourceExec",
-                               "rows": 2, "elapsed_compute_ns": 12, "wall_ns": 34}]
+                               "rows": 2, "elapsed_compute_ns": 12, "wall_ns": 34,
+                               "partitions": 1,
+                               "slices": [{"slice": 0, "partition": 0, "rows": 2,
+                                           "elapsed_compute_ns": 10, "start_ns": 1, "end_ns": 30}]}]
             }
         });
         let decoded: ChangeOutput = serde_json::from_value(change.clone()).unwrap();

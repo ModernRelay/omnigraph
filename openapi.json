@@ -14246,16 +14246,79 @@
             "type": "string",
             "description": "The operator the node built."
           },
+          "partitions": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The output partitions the operator ran, each its own stream: a\n`CsvSource`'s parsers, 1 for every other operator.",
+            "minimum": 0
+          },
           "rows": {
             "type": "integer",
             "format": "int64",
             "description": "What the operator emitted; the sink counts what it staged.",
             "minimum": 0
           },
+          "slices": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LoadSliceExecutedOutput"
+            },
+            "description": "The slices of the source a `CsvSource` cut and parsed, in slice order;\nabsent for every other operator."
+          },
           "wall_ns": {
             "type": "integer",
             "format": "int64",
             "description": "Nanoseconds from the operator's first poll to its end, waits included;\n`0` where no end was recorded.",
+            "minimum": 0
+          }
+        }
+      },
+      "LoadSliceExecutedOutput": {
+        "type": "object",
+        "description": "What one slice of a `CsvSource` measured: a byte range of the capture\nparsed whole by one partition.",
+        "required": [
+          "slice",
+          "partition",
+          "rows",
+          "elapsed_compute_ns",
+          "start_ns",
+          "end_ns"
+        ],
+        "properties": {
+          "elapsed_compute_ns": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Nanoseconds the slice's parse and normalization took.",
+            "minimum": 0
+          },
+          "end_ns": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Nanoseconds after the source's first poll at which the slice's last\nbatch was sent.",
+            "minimum": 0
+          },
+          "partition": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The partition that claimed the slice; which one varies between runs.",
+            "minimum": 0
+          },
+          "rows": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The records the slice held.",
+            "minimum": 0
+          },
+          "slice": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The slice's position in the source, from 0; a slice's rows are the\nsame on every run.",
+            "minimum": 0
+          },
+          "start_ns": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Nanoseconds after the source's first poll at which the slice was\nclaimed.",
             "minimum": 0
           }
         }

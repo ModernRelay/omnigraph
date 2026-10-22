@@ -21,7 +21,7 @@ root down:
 |---|---|
 | `FragmentWrite` | `table`, `version`, `mode`, `adapter`; the physical row adds `max_input_bytes`, `max_workers` |
 | `Validate` | `table` and `checks`, every check of the load in the order it runs, which is the refusal precedence |
-| `CsvSource` | `format`, `source`, `source_bytes`, `estimated_rows`, `delimiter`, `header`, `columns`, `table`, `version`; the physical row adds `max_partitions`, `max_workers`, `fallback` |
+| `CsvSource` | `format`, `source`, `source_bytes`, `estimated_rows`, `delimiter`, `header`, `columns`, `table`, `version`; the physical row adds `max_partitions` (the streams that parse the source: one per 8 MiB of it, at most `stage_write_concurrency`), `max_workers`, `fallback` |
 
 Each entry of `checks` carries `check` (`value`, `unique`, `edge_ri`,
 `cardinality` or `retained_edges`), its identity fields, `consults` (the
@@ -63,12 +63,18 @@ The `plan` rows are the query explain's, with these values for a load:
 | `operation` | `kind` (`load`), `mode`, and `tables`: the target and each consulted committed table with its `type_key` and `version` |
 
 An executed load's receipt carries the same document and an `executed`
-object with `partitions`, `rows`, `source_bytes` and `operators`: one entry
-per node of the plan in post-order (the source first), each with the node's
-`id` and `node` kind, the `operator` it built, the `rows` it emitted (the
-sink counts the rows it staged), `elapsed_compute_ns`, the time its stream
-and its workers were polled, and `wall_ns`, the span from its first poll to
-its end with every wait included. The statement's answer, the `ChangeOutput`
-of `omnigraph mutate --json` and of `POST /mutate`, carries the object as
+object with `partitions` (the widest operator's), `rows`, `source_bytes` and
+`operators`: one entry per node of the plan in post-order (the source
+first), each with the node's `id` and `node` kind, the `operator` it built,
+the `rows` it emitted (the sink counts the rows it staged),
+`elapsed_compute_ns`, the time its stream and its workers were polled,
+`wall_ns`, the span from its first poll to its end with every wait included,
+and `partitions`, the streams it ran (1 for every operator but the source).
+The source's entry also lists `slices`, one per record-aligned 8 MiB slice of
+the source in slice order: `slice`, the `partition` that claimed it, its
+`rows`, `elapsed_compute_ns`, and `start_ns` and `end_ns` from the source's
+first poll. The statement's answer, the `ChangeOutput` of
+`omnigraph mutate --json` and of `POST /mutate`, carries the object as
 `executed` beside the counts and the commit. The compute and wall numbers
-are measurements of one run; a GQT case pins only the rows.
+and the claiming partition are measurements of one run; a GQT case pins only
+the rows and the partitions.

@@ -106,6 +106,39 @@ pub struct LoadOperatorExecuted {
     /// Nanoseconds from the operator's first poll to its end: the phase's
     /// wall time, waits included; `0` where no end was recorded.
     pub wall_ns: u64,
+    /// The output partitions the operator ran, each its own stream: a
+    /// `CsvSource`'s parsers, 1 for every other operator.
+    #[serde(default = "one_partition")]
+    pub partitions: u32,
+    /// The slices of the source a `CsvSource` cut and parsed, in slice order;
+    /// empty for every other operator.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slices: Vec<LoadSliceExecuted>,
+}
+
+fn one_partition() -> u32 {
+    1
+}
+
+/// What one slice of a `CsvSource` measured: a byte range of the capture
+/// parsed whole by one partition.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadSliceExecuted {
+    /// The slice's position in the source, from 0; rows of a slice are the
+    /// same on every run.
+    pub slice: u32,
+    /// The partition that claimed the slice; which one varies between runs.
+    pub partition: u32,
+    /// The records the slice held.
+    pub rows: u64,
+    /// Nanoseconds the slice's parse and normalization took.
+    pub elapsed_compute_ns: u64,
+    /// Nanoseconds after the source's first poll at which the slice was
+    /// claimed.
+    pub start_ns: u64,
+    /// Nanoseconds after the source's first poll at which the slice's last
+    /// batch was sent.
+    pub end_ns: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -796,6 +829,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
             capture.size,
             memory.limit(),
             write_budget.bytes(),
+            stage_write_concurrency,
         )
         .await?;
         if mode == LoadMode::Overwrite {
@@ -1301,6 +1335,7 @@ async fn load_csv_overwrite_plan(
             writers: stage_write_concurrency,
             staged: Arc::clone(&staged),
         }),
+        slice_bytes: crate::engine::csv_slice_bytes(),
     };
     let context = EngineContext {
         snapshot: Some(snapshot),
@@ -1311,6 +1346,12 @@ async fn load_csv_overwrite_plan(
     let run = crate::engine::execute_load(&bound, &context, memory).await?;
     let rows = run.rows;
     executed.operators = run.operators;
+    executed.partitions = executed
+        .operators
+        .iter()
+        .map(|operator| operator.partitions)
+        .max()
+        .unwrap_or(1);
     let staged = staged
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1389,6 +1430,7 @@ pub(crate) async fn plan_load(
     source_bytes: u64,
     memory_limit: u64,
     write_max_bytes: u64,
+    load_workers_max: usize,
 ) -> Result<Decision> {
     let stmt = LoadStmt {
         source: request.source.clone(),
@@ -1467,7 +1509,7 @@ pub(crate) async fn plan_load(
         tables,
         source_bytes,
     };
-    let bounds = crate::engine::engine_bounds(memory_limit, write_max_bytes);
+    let bounds = crate::engine::engine_bounds(memory_limit, write_max_bytes, load_workers_max);
     Ok(route(&operation, &source, RouteOverride::Registry, &bounds))
 }
 
