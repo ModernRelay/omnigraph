@@ -2631,12 +2631,6 @@ const MUTABLE_KEY_REQUESTS: &[(&str, &str, usize, &str)] = &[
         "engine adapter forwards its caller's request to the storage crate; the caller is registered",
     ),
     (
-        "omnigraph-server/lib.rs",
-        ".delete(",
-        3,
-        "HTTP DELETE routes (axum), not storage requests",
-    ),
-    (
         "omnigraph-storage/lib.rs",
         ".delete(",
         4,
