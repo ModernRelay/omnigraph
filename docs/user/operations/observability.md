@@ -49,4 +49,3 @@ collector failure never blocks a graph operation. After serving stops, a
 best-effort flush starts in the background with a five-second bound; it never
 delays process exit or changes native shutdown deadlines. Process exit can
 lose buffered spans; telemetry is not durable operation evidence.
-

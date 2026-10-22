@@ -296,11 +296,12 @@ impl OperationRuntime {
                 // Mark the error as its waiter receives it, so the log below
                 // records the status its response sends.
                 let result = result.map_err(ApiError::after_owned_write);
-                crate::telemetry::operation_finished(
-                    "write",
-                    result.result.is_ok(),
-                    result.uncertain,
-                );
+                // Process containment and completion uncertainty are distinct:
+                // scoped storage uncertainty leaves admission open, but remains
+                // an uncertain outcome in telemetry.
+                let telemetry_uncertain =
+                    uncertain || result.as_ref().is_err_and(ApiError::completion_uncertain);
+                crate::telemetry::operation_finished("write", result.is_ok(), telemetry_uncertain);
                 // A known result carries its reservation through pending delivery.
                 // Consumption releases admission before the handler can respond;
                 // abandonment destroys the output before releasing its ownership.

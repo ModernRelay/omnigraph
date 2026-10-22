@@ -520,6 +520,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_write_uncertainty_is_reported_without_containing_the_process() {
+        use omnigraph::error::OmniError;
+
+        for (error, outcome, effects, action) in [
+            (
+                OmniError::manifest_publish_in_doubt("PRIVATE_PUBLICATION_DETAIL"),
+                "uncertain",
+                crate::api::DispositionEffects::Unknown,
+                crate::api::DispositionAction::Reconcile,
+            ),
+            (
+                OmniError::Policy("PRIVATE_POLICY_DETAIL".into()),
+                "failed",
+                crate::api::DispositionEffects::None,
+                crate::api::DispositionAction::Fix,
+            ),
+        ] {
+            let exporter = InMemorySpanExporter::default();
+            let provider = SdkTracerProvider::builder()
+                .with_simple_exporter(exporter.clone())
+                .build();
+            let captured = Capture::default();
+            let writer = captured.clone();
+            let subscriber = subscriber(
+                EnvFilter::new("info"),
+                move || writer.clone(),
+                true,
+                Some(provider.tracer("test")),
+            );
+            async {
+                let runtime = OperationRuntime::new();
+                let response = runtime
+                    .submit((), async move {
+                        OwnedResult::from(Err::<(), _>(crate::ApiError::from_omni(error)))
+                    })
+                    .unwrap()
+                    .result()
+                    .await
+                    .unwrap_err();
+                assert_eq!(response.completion_uncertain(), outcome == "uncertain");
+                assert!(!response.contains_process());
+                let disposition = response.disposition();
+                assert_eq!(disposition.effects, effects);
+                assert_eq!(disposition.action, action);
+                assert!(runtime.wait_logical_owners().await);
+                assert!(!runtime.snapshot().closed);
+                assert_eq!(runtime.snapshot().uncertain_writes, 0);
+                // Observing the failure must not change the native admission
+                // contract: a scoped uncertainty leaves the process available.
+                drop(runtime.try_observe().unwrap());
+            }
+            .with_subscriber(subscriber)
+            .await;
+            provider.force_flush().unwrap();
+            let spans = exporter.get_finished_spans().unwrap();
+            assert_eq!(spans.len(), 1, "{spans:?}");
+            assert_eq!(spans[0].name, "native.operation");
+            assert_eq!(spans[0].status, Status::error(outcome));
+            let logs = captured.output();
+            let completions: Vec<serde_json::Value> = logs
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|line| line["message"] == "native operation completed")
+                .collect();
+            assert_eq!(completions.len(), 1);
+            assert_eq!(completions[0]["operation_kind"], "write");
+            assert_eq!(completions[0]["operation_outcome"], outcome);
+            assert!(!logs.contains("PRIVATE_"), "{logs}");
+            assert!(!format!("{spans:?}").contains("PRIVATE_"));
+            provider.shutdown().unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn malformed_context_and_unknown_routes_never_echo_request_input() {
         let exporter = InMemorySpanExporter::default();
         let provider = SdkTracerProvider::builder()
