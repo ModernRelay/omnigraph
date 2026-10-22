@@ -36,6 +36,8 @@ MARKER = re.compile(r"^<!-- edge-build: (\{.*\}) -->$", re.MULTILINE)
 COMMIT = re.compile(r"[0-9a-f]{40}")
 SCHEMA_LINE = re.compile(r"internal-schema ([0-9]+) \(serves v([0-9]+) to v([0-9]+)\)")
 PREVIEW_HEADING = re.compile(r"# OmniGraph (v[0-9]+\.[0-9]+\.[0-9]+)")
+# The lines `release_notes.render_footer` writes after a format-2 preview.
+FOOTER = ("**Full changelog:** ", "[Upgrade guide](")
 SOURCE_CONTRACT = re.compile(r'^pub const HTTP_API_CONTRACT: &str = "([^"\n]+)";$', re.MULTILINE)
 
 
@@ -189,6 +191,9 @@ def unreleased_notes(preview: str) -> tuple[str, str, list[str]]:
     preamble: list[str] = []
     sections: list[list[str]] = []
     for line in lines[1:]:
+        if line.startswith(FOOTER):
+            # The format-2 footer compares with a tag this build precedes.
+            continue
         if line.startswith("## "):
             sections.append(["#" + line])
         elif sections:
