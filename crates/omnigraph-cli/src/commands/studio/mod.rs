@@ -10,6 +10,7 @@
 //! never names a path or an executable, and opening one runs no write.
 
 mod args;
+mod desktop;
 mod open;
 
 pub(crate) use args::StudioArgs;
@@ -55,7 +56,7 @@ pub(crate) fn run(
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
     let link = prepare(&scope)?;
-    let opening = open::open(platform, &link.link, runner);
+    let opening = open::open(&platform, &link.link, runner);
     deliver(&link, args.json, opening, stdout, stderr)
 }
 
@@ -336,8 +337,14 @@ mod tests {
                 target: &target,
                 graph: None,
             };
-            let (result, stdout, stderr) =
-                run_with(scope, json, Platform::Freedesktop, &mut runner);
+            let (result, stdout, stderr) = run_with(
+                scope,
+                json,
+                Platform::Freedesktop {
+                    data_dirs: Vec::new(),
+                },
+                &mut runner,
+            );
             assert_eq!(result.unwrap(), Completion::exit(REFUSED));
             // Only the handler was asked; nothing was opened.
             assert_eq!(runner.calls.len(), 1);

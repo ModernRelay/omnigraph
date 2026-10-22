@@ -67,13 +67,22 @@ Without `--json` the link is the only line on stdout.
 | Platform | How the link opens |
 |---|---|
 | macOS | `open -b com.modernrelay.omnigraph-studio LINK`: only the application with Studio's bundle identifier |
-| Linux and other Unix desktops | `xdg-open LINK`, only when `xdg-mime query default x-scheme-handler/omnigraph-studio` names a handler |
+| Linux and other Unix desktops | The program of the desktop entry `xdg-mime query default x-scheme-handler/omnigraph-studio` names, run directly with the link in place of `%u` |
 | Windows | The `omnigraph-studio` URL protocol, only when the registry holds one with an open command |
 
-The CLI never hands an unregistered scheme to a generic opener, which would
-pass the link to a web browser. When nothing opens the link, because Studio is
-not installed or no handler is registered for its scheme, the command still
-prints the link, says where to download Studio, and refuses with
-`studio_unavailable`. With `--json` that refusal carries `link` and `install`.
-Studio registers its scheme when installed on macOS; on Linux and Windows the
-command opens a link once Studio registers a handler there.
+On Linux the CLI finds the named desktop entry in `$XDG_DATA_HOME/applications`
+(default `~/.local/share/applications`), then in each `$XDG_DATA_DIRS/applications`
+(default `/usr/local/share:/usr/share`); a `-` in its name may stand for a
+subdirectory. It runs the entry's `Exec` command itself, without a shell,
+replacing `%u` or `%U` with the link and dropping the other field codes. An
+entry that is hidden, runs in a terminal, takes no URL through `%u` or `%U`, or
+uses a form the CLI cannot run exactly as written is refused.
+
+The CLI never hands the link to a generic opener such as `xdg-open`, which
+passes a link it cannot place to a web browser, for example when no display is
+set. When nothing opens the link, because Studio is not installed or no
+handler is registered for its scheme, the command still prints the link, says
+where to download Studio, and refuses with `studio_unavailable`. With `--json`
+that refusal carries `link` and `install`. Studio registers its scheme when
+installed on macOS; on Linux and Windows the command opens a link once Studio
+registers a handler there.

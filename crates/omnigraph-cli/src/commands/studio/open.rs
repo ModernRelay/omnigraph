@@ -1,10 +1,12 @@
 //! Handing a Studio link to the platform. Each platform opens it only through
 //! a handler it names for Studio: on macOS the application with Studio's
-//! bundle identifier, elsewhere the scheme's registered handler. The generic
-//! openers are never asked to open an unregistered scheme, since they hand
-//! one to a web browser.
+//! bundle identifier, on a freedesktop.org desktop the program the scheme's
+//! registered desktop entry runs, on Windows the scheme's registered URL
+//! protocol. No generic opener is asked, since one hands a link it cannot
+//! place to a web browser.
 
 use std::io::{self, Read};
+use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -15,18 +17,24 @@ pub(crate) const SCHEME: &str = "omnigraph-studio";
 /// Where to get Studio when nothing here opens its links.
 pub(crate) const INSTALL_URL: &str = "https://github.com/ModernRelay/omnigraph-studio/releases";
 
-/// How long one platform command may run before the opener stops waiting:
-/// a handler that keeps running has received the link.
-const WAIT: Duration = Duration::from_secs(10);
+/// How long a registration query may run before it counts as unanswered.
+const QUERY_WAIT: Duration = Duration::from_secs(10);
+/// How long the opener waits for the command it starts: one that refuses at
+/// once is seen, and one still running, such as a freedesktop handler that
+/// is Studio itself, has received the link.
+const LAUNCH_WAIT: Duration = Duration::from_secs(2);
 /// The most output a handler query may print.
 const OUTPUT_MAX_BYTES: u64 = 64 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Platform {
     MacOs,
     /// Linux and the other Unix desktops that follow freedesktop.org's
-    /// shared MIME database.
-    Freedesktop,
+    /// shared MIME database, with the base directories desktop entries are
+    /// looked up in.
+    Freedesktop {
+        data_dirs: Vec<PathBuf>,
+    },
     Windows,
     Unsupported,
 }
@@ -38,7 +46,13 @@ impl Platform {
         } else if cfg!(windows) {
             Self::Windows
         } else if cfg!(unix) {
-            Self::Freedesktop
+            Self::Freedesktop {
+                data_dirs: super::desktop::data_dirs(
+                    std::env::var_os("XDG_DATA_HOME"),
+                    std::env::home_dir(),
+                    std::env::var_os("XDG_DATA_DIRS"),
+                ),
+            }
         } else {
             Self::Unsupported
         }
@@ -76,28 +90,13 @@ pub(crate) enum Opening {
 
 /// Open `link` on `platform`. The link is the only argument a command gets
 /// that this process did not fix, and it carries no secret.
-pub(crate) fn open(platform: Platform, link: &str, runner: &mut dyn Runner) -> Opening {
+pub(crate) fn open(platform: &Platform, link: &str, runner: &mut dyn Runner) -> Opening {
     match platform {
         Platform::MacOs => launched(
             runner.launch("open", &["-b", BUNDLE_ID, link]),
             format!("no application has the bundle identifier {BUNDLE_ID}"),
         ),
-        Platform::Freedesktop => {
-            let kind = format!("x-scheme-handler/{SCHEME}");
-            match runner.query("xdg-mime", &["query", "default", kind.as_str()]) {
-                Ok(Exit::Exited {
-                    success: true,
-                    stdout,
-                }) if !stdout.trim().is_empty() => launched(
-                    runner.launch("xdg-open", &[link]),
-                    format!("xdg-open could not open the link with {}", stdout.trim()),
-                ),
-                _ => Opening::Unavailable(format!(
-                    "no application is registered for {SCHEME} links \
-                     (`xdg-mime query default {kind}` names none)"
-                )),
-            }
-        }
+        Platform::Freedesktop { data_dirs } => freedesktop(data_dirs, link, runner),
         Platform::Windows => {
             let key = format!(r"HKCR\{SCHEME}");
             let command = format!(r"{key}\shell\open\command");
@@ -129,6 +128,52 @@ pub(crate) fn open(platform: Platform, link: &str, runner: &mut dyn Runner) -> O
     }
 }
 
+/// The program the registered desktop entry runs, started with the link.
+/// `xdg-open` is never run: without a display its generic path skips the
+/// registered handler and tries web browsers.
+fn freedesktop(data_dirs: &[PathBuf], link: &str, runner: &mut dyn Runner) -> Opening {
+    use super::desktop;
+    let kind = format!("x-scheme-handler/{SCHEME}");
+    let answer = runner.query("xdg-mime", &["query", "default", kind.as_str()]);
+    let id = match &answer {
+        Ok(Exit::Exited {
+            success: true,
+            stdout,
+        }) => desktop::queried_id(stdout),
+        _ => None,
+    };
+    let Some(id) = id else {
+        return Opening::Unavailable(format!(
+            "no application is registered for {SCHEME} links \
+             (`xdg-mime query default {kind}` names none)"
+        ));
+    };
+    let Some(path) = desktop::find_entry(id, data_dirs) else {
+        return Opening::Unavailable(format!(
+            "{id}, the handler xdg-mime names for {SCHEME} links, is in no \
+             applications directory of XDG_DATA_HOME or XDG_DATA_DIRS"
+        ));
+    };
+    let command =
+        match desktop::read_entry(&path).and_then(|entry| desktop::command_line(&entry, link)) {
+            Ok(command) => command,
+            Err(why) => {
+                return Opening::Unavailable(format!(
+                    "the desktop entry {} for {SCHEME} links {why}",
+                    path.display()
+                ));
+            }
+        };
+    let (program, args) = command
+        .split_first()
+        .expect("a command line names its program");
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    launched(
+        runner.launch(program, &args),
+        format!("{program}, the program {id} runs for {SCHEME} links, could not open the link"),
+    )
+}
+
 fn launched(result: io::Result<Exit>, refused: String) -> Opening {
     match result {
         Ok(Exit::Exited { success: true, .. } | Exit::Running) => Opening::Opened,
@@ -148,7 +193,7 @@ impl Runner for SystemRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()?;
-        let Some(status) = wait(&mut child)? else {
+        let Some(status) = wait(&mut child, QUERY_WAIT)? else {
             let _ = child.kill();
             let _ = child.wait();
             return Ok(Exit::Running);
@@ -164,14 +209,19 @@ impl Runner for SystemRunner {
     }
 
     fn launch(&mut self, program: &str, args: &[&str]) -> io::Result<Exit> {
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        // In its own process group, as a desktop launcher starts an
+        // application, so a signal to this terminal job does not reach it.
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let mut child = command.spawn()?;
         // A handler still running has the link; it is left to run.
-        Ok(match wait(&mut child)? {
+        Ok(match wait(&mut child, LAUNCH_WAIT)? {
             Some(status) => Exit::Exited {
                 success: status.success(),
                 stdout: String::new(),
@@ -181,8 +231,8 @@ impl Runner for SystemRunner {
     }
 }
 
-fn wait(child: &mut Child) -> io::Result<Option<ExitStatus>> {
-    let deadline = Instant::now() + WAIT;
+fn wait(child: &mut Child, bound: Duration) -> io::Result<Option<ExitStatus>> {
+    let deadline = Instant::now() + bound;
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(Some(status));
@@ -267,7 +317,7 @@ pub(crate) mod tests {
     fn macos_opens_studio_by_its_bundle_identifier() {
         for answer in [exited(true, ""), Ok(Exit::Running)] {
             let mut runner = Recorded::answering(vec![("open", answer)]);
-            assert_eq!(open(Platform::MacOs, LINK, &mut runner), Opening::Opened);
+            assert_eq!(open(&Platform::MacOs, LINK, &mut runner), Opening::Opened);
             assert_eq!(
                 runner.calls,
                 [argv(&[
@@ -280,31 +330,66 @@ pub(crate) mod tests {
         }
         for answer in [exited(false, ""), missing()] {
             let mut runner = Recorded::answering(vec![("open", answer)]);
-            let reason = unavailable(open(Platform::MacOs, LINK, &mut runner));
+            let reason = unavailable(open(&Platform::MacOs, LINK, &mut runner));
             assert!(reason.contains(BUNDLE_ID), "{reason}");
             assert_eq!(runner.calls.len(), 1);
         }
     }
 
+    /// The program Studio's desktop entry runs in these tests; the recorded
+    /// runner never executes it.
+    const HANDLER: &str = "/opt/omnigraph-studio/bin/omnigraph-studio";
+
+    /// A freedesktop platform whose one data directory holds
+    /// `applications/omnigraph-studio.desktop` with `exec`, when given.
+    fn freedesktop(exec: Option<&str>) -> (tempfile::TempDir, Platform) {
+        let dir = tempfile::tempdir().unwrap();
+        if let Some(exec) = exec {
+            let applications = dir.path().join("applications");
+            std::fs::create_dir(&applications).unwrap();
+            std::fs::write(
+                applications.join("omnigraph-studio.desktop"),
+                format!(
+                    "[Desktop Entry]\nType=Application\nName=OmniGraph Studio\nExec={exec}\n\
+                     MimeType=x-scheme-handler/omnigraph-studio;\n"
+                ),
+            )
+            .unwrap();
+        }
+        let platform = Platform::Freedesktop {
+            data_dirs: vec![dir.path().to_owned()],
+        };
+        (dir, platform)
+    }
+
+    /// The handler `xdg-mime` names is started from its desktop entry's
+    /// `Exec`, with the link in place of `%u`. `xdg-open` never runs, so no
+    /// web browser can stand in for Studio: the recorded runner refuses any
+    /// command it was not given an answer for.
     #[test]
-    fn freedesktop_opens_only_through_a_named_scheme_handler() {
+    fn freedesktop_runs_the_registered_handler_and_no_generic_opener() {
         let query = argv(&[
             "xdg-mime",
             "query",
             "default",
             "x-scheme-handler/omnigraph-studio",
         ]);
-        let mut runner = Recorded::answering(vec![
-            ("xdg-mime", exited(true, "omnigraph-studio.desktop\n")),
-            ("xdg-open", exited(true, "")),
-        ]);
-        assert_eq!(
-            open(Platform::Freedesktop, LINK, &mut runner),
-            Opening::Opened
-        );
-        assert_eq!(runner.calls, [query.clone(), argv(&["xdg-open", LINK])]);
-        // Without a named handler xdg-open is never run: its generic path
-        // would hand the link to a browser.
+        let named = || exited(true, "omnigraph-studio.desktop\n");
+        let (_dir, platform) = freedesktop(Some(&format!("\"{HANDLER}\" --open %u")));
+        for answer in [exited(true, ""), Ok(Exit::Running)] {
+            let mut runner = Recorded::answering(vec![("xdg-mime", named()), (HANDLER, answer)]);
+            assert_eq!(open(&platform, LINK, &mut runner), Opening::Opened);
+            assert_eq!(
+                runner.calls,
+                [query.clone(), argv(&[HANDLER, "--open", LINK])]
+            );
+        }
+        let mut runner =
+            Recorded::answering(vec![("xdg-mime", named()), (HANDLER, exited(false, ""))]);
+        let reason = unavailable(open(&platform, LINK, &mut runner));
+        assert!(reason.contains(HANDLER), "{reason}");
+
+        // Nothing registered: only the query runs.
         for answer in [
             exited(true, ""),
             exited(true, " \n"),
@@ -312,16 +397,78 @@ pub(crate) mod tests {
             missing(),
         ] {
             let mut runner = Recorded::answering(vec![("xdg-mime", answer)]);
-            let reason = unavailable(open(Platform::Freedesktop, LINK, &mut runner));
+            let reason = unavailable(open(&platform, LINK, &mut runner));
             assert!(reason.contains("names none"), "{reason}");
             assert_eq!(runner.calls, std::slice::from_ref(&query));
         }
-        let mut runner = Recorded::answering(vec![
-            ("xdg-mime", exited(true, "omnigraph-studio.desktop\n")),
-            ("xdg-open", exited(false, "")),
-        ]);
-        let reason = unavailable(open(Platform::Freedesktop, LINK, &mut runner));
-        assert!(reason.contains("omnigraph-studio.desktop"), "{reason}");
+        // A registration whose desktop entry is missing, or does not take a
+        // URL, runs nothing either.
+        for (exec, why) in [
+            (None, "in no applications directory"),
+            (Some(format!("{HANDLER} %f")), "exactly one URL"),
+            (Some(format!("{HANDLER} --url=%u")), "field code inside"),
+        ] {
+            let (_dir, platform) = freedesktop(exec.as_deref());
+            let mut runner = Recorded::answering(vec![("xdg-mime", named())]);
+            let reason = unavailable(open(&platform, LINK, &mut runner));
+            assert!(reason.contains(why), "{reason}");
+            assert_eq!(runner.calls, std::slice::from_ref(&query));
+        }
+    }
+
+    /// The registration query is recorded; the launch is real, of a handler
+    /// script the desktop entry names by its absolute path.
+    #[cfg(unix)]
+    struct RealLaunch(Recorded);
+
+    #[cfg(unix)]
+    impl Runner for RealLaunch {
+        fn query(&mut self, program: &str, args: &[&str]) -> io::Result<Exit> {
+            self.0.query(program, args)
+        }
+        fn launch(&mut self, program: &str, args: &[&str]) -> io::Result<Exit> {
+            SystemRunner.launch(program, args)
+        }
+    }
+
+    /// The program the desktop entry names really runs, receives the link as
+    /// one argument, and decides the outcome by its exit.
+    #[cfg(unix)]
+    #[test]
+    fn freedesktop_launches_the_program_its_desktop_entry_names_with_the_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = tempfile::tempdir().unwrap();
+        let received = bin.path().join("received");
+        for (name, exit) in [("handler", 0), ("refusing-handler", 1)] {
+            let script = bin.path().join(name);
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\"; done > '{}'\nexit {exit}\n",
+                    received.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // A platform may hold a new executable's first run for a malware
+            // scan longer than the opener waits; run each once, unbounded.
+            std::process::Command::new(&script).status().unwrap();
+        }
+        for (name, opened) in [("handler", true), ("refusing-handler", false)] {
+            let _ = std::fs::remove_file(&received);
+            let exec = format!("\"{}\" --link %u", bin.path().join(name).display());
+            let (_dir, platform) = freedesktop(Some(&exec));
+            let mut runner = RealLaunch(Recorded::answering(vec![(
+                "xdg-mime",
+                exited(true, "omnigraph-studio.desktop\n"),
+            )]));
+            let opening = open(&platform, LINK, &mut runner);
+            assert_eq!(opening == Opening::Opened, opened, "{name}: {opening:?}");
+            assert_eq!(
+                std::fs::read_to_string(&received).unwrap(),
+                format!("--link\n{LINK}\n")
+            );
+        }
     }
 
     #[test]
@@ -344,7 +491,7 @@ pub(crate) mod tests {
             ("reg", exited(true, "")),
             ("rundll32", exited(true, "")),
         ]);
-        assert_eq!(open(Platform::Windows, LINK, &mut runner), Opening::Opened);
+        assert_eq!(open(&Platform::Windows, LINK, &mut runner), Opening::Opened);
         assert_eq!(
             runner.calls,
             [
@@ -362,7 +509,7 @@ pub(crate) mod tests {
             ),
         ] {
             let mut runner = Recorded::answering(answers);
-            let reason = unavailable(open(Platform::Windows, LINK, &mut runner));
+            let reason = unavailable(open(&Platform::Windows, LINK, &mut runner));
             assert!(reason.contains("URL protocol"), "{reason}");
             assert_eq!(runner.calls, asked);
         }
@@ -371,7 +518,7 @@ pub(crate) mod tests {
     #[test]
     fn an_unsupported_platform_runs_nothing() {
         let mut runner = Recorded::default();
-        unavailable(open(Platform::Unsupported, LINK, &mut runner));
+        unavailable(open(&Platform::Unsupported, LINK, &mut runner));
         assert!(runner.calls.is_empty());
     }
 }
