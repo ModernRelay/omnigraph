@@ -1,0 +1,1 @@
+- Release pages open with an intro and highlights, explain upgrade actions, and link each change to its pull request.
