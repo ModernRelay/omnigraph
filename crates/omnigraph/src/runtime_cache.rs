@@ -167,9 +167,7 @@ impl RuntimeCache {
             if doomed_while_waiting {
                 // fall through to the scan build below
             } else {
-                match GraphIndex::load_persisted(&resolved.snapshot, edge_types, Some(adapter))
-                    .await
-                {
+                match GraphIndex::load_persisted(&resolved.snapshot, edge_types, adapter).await {
                     Some((index, stamps)) => {
                         let index = Arc::new(index);
                         let mut cache = self.graph_indices.lock().await;

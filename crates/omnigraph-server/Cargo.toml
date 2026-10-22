@@ -24,7 +24,7 @@ omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.14.0" }
 omnigraph-policy = { path = "../omnigraph-policy", version = "0.14.0" }
 omnigraph-api-types = { path = "../omnigraph-api-types", version = "0.14.0" }
 omnigraph-cluster = { path = "../omnigraph-cluster", version = "0.14.0" }
-omnigraph-skill = { path = "../../skills", version = "0.14.0" }
+omnigraph-mcp = { path = "../omnigraph-mcp", version = "0.14.0" }
 axum = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
@@ -44,7 +44,6 @@ sha2 = { workspace = true }
 base64 = { workspace = true }
 p256 = { version = "0.13", features = ["ecdsa", "pem"] }
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
-rmcp = { version = "=3.3.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
 libc = "0.2"
 subtle = { workspace = true }
 async-trait = { workspace = true }

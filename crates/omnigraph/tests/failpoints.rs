@@ -10383,11 +10383,12 @@ async fn branch_merge_in_doubt_keeps_input_tags_until_cleanup() {
 }
 
 /// A failed authority probe after the proposal tag of a merge `as commit`
-/// exists releases the tag with the input holds. Rust, not `.gqt`: the
-/// observable is a native tag of a write that returned no id.
+/// exists releases the observed tag but keeps the merge input holds: an
+/// earlier tag create may still land. Rust, not `.gqt`: the observable is
+/// native tags and uncertainty for a write that returned no id.
 #[tokio::test]
 #[serial]
-async fn merge_as_commit_probe_failure_releases_the_proposal_tag() {
+async fn merge_as_commit_probe_failure_retains_inputs_issue_1067() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -10402,6 +10403,7 @@ async fn merge_as_commit_probe_failure_releases_the_proposal_tag() {
     .await
     .unwrap();
     let native = helpers::open_dataset_head_exact(&format!("{uri}/__manifest"), None).await;
+    let target_pin = pinned_version(&db, "target", "node:Person").await;
     let outcome = {
         let _probe = catalog::PROPOSE_POST_TAG_PRE_PROBE.fail_once_at(1);
         db.branch_merge_as_with_options("source", "target", None, true)
@@ -10409,27 +10411,36 @@ async fn merge_as_commit_probe_failure_releases_the_proposal_tag() {
     };
     let error = outcome.unwrap_err();
     assert!(
-        !error.is_manifest_publish_in_doubt(),
-        "a released tag is a conclusive failure: {error}"
+        error.is_manifest_publish_in_doubt(),
+        "a released tag does not fence a pending duplicate create: {error}"
     );
     assert!(
         error.to_string().contains("propose.post_tag_pre_probe"),
         "{error}"
     );
+    assert_eq!(
+        error.completion_evidence(),
+        Some(CompletionEvidence::Uncertain)
+    );
+    assert_eq!(
+        pinned_version(&db, "target", "node:Person").await,
+        target_pin
+    );
     let tags = native.tags().list().await.unwrap();
     assert!(
         !tags.keys().any(|name| name.starts_with("unpublished_")),
-        "a proposal whose input holds are released must not stay addressable: {tags:?}"
+        "rollback removed the observed proposal tag: {tags:?}"
     );
-    assert!(
-        !tags
-            .keys()
-            .any(|name| name.starts_with("__omnigraph_merge_input_v1_")),
-        "a conclusive failure releases the merge input holds: {tags:?}"
+    assert_eq!(
+        tags.keys()
+            .filter(|name| name.starts_with("__omnigraph_merge_input_v1_"))
+            .count(),
+        2,
+        "an uncertain proposal keeps both merge inputs: {tags:?}"
     );
     assert!(
         db.list_unpublished_commits(None).await.unwrap().is_empty(),
-        "no unpublished commit is listed after the undone proposal"
+        "the deleted proposal is absent until any delayed create lands"
     );
 }
 

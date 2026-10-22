@@ -59,14 +59,13 @@ its error class, never by its message; see
 
 ## HTTP contract
 
-Upgrade the v0.13 CLI, server and HTTP integrations together. Every protected
-request requires exactly one `Omnigraph-Http-Api: 0.13`: graph, registry and
+Upgrade the CLI, server and HTTP integrations together. Every protected
+request requires exactly one `Omnigraph-Http-Api: 0.14`: graph, registry and
 cluster-deployment calls, including `/graphs/discovery`, JSON, streams and Blob GET/HEAD. Missing,
 duplicate, combined or unsupported values return `400 api_contract_mismatch`
-after authentication but before graph lookup, body decoding or execution. This
-HTTP identifier is separate from package/storage versions and grants no permission.
-The previous `0.12` value is refused; update integrations to the current routes,
-request/response shapes and credentials before changing their header.
+after authentication but before graph lookup, body decoding or execution. This HTTP identifier is
+separate from package/storage versions and grants no permission. The previous `0.13` value is
+refused; update integrations to the current routes, shapes and credentials before their header.
 
 Ordinary responses, including errors and streams, carry the same header. Check
 it before decoding or emitting the body. A missing/incompatible response header
@@ -103,15 +102,26 @@ Choose one static token source:
 | `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` | Path to that JSON object |
 | `OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET` | Secrets Manager mapping; requires an AWS-enabled build: the container images, the release archives from v0.14.0 and every edge build, or a source build with `cargo build -p omnigraph-server --features aws` |
 
-Send `Authorization: Bearer secret-a`. The token selects the actor for
-authorization and commit attribution; clients cannot claim another actor.
-See [Authorization and actors](policy.md).
+Send `Authorization: Bearer secret-a` (the scheme is case-insensitive). The token selects the
+actor for authorization and commit attribution; clients cannot claim another actor. See
+[Authorization and actors](policy.md). Every 401 carries a `WWW-Authenticate: Bearer` challenge,
+with `error="invalid_token"` when the server refused the token sent.
 
 A server with neither static tokens, signed-token trust, nor policy refuses to start unless you explicitly
 pass `--unauthenticated` (or set `OMNIGRAPH_UNAUTHENTICATED=1`). Use that only
 on a trusted development network. Static tokens without a policy allow only the
 `read` action. Stored-query invocation, export, graph listing, writes, and other
 actions remain denied.
+
+### Assert the actor
+
+A client that means to act as a particular actor sends `Omnigraph-If-Actor: <actor>` with any
+protected request, `/mcp` included. After authentication and the contract check (on `/mcp`,
+before admission), and before graph lookup or any effect, a match changes nothing and a mismatch
+is `412 actor_mismatch` with nothing run; a server without authentication resolves no actor. A
+repeated, padded or empty header is `400 bad_request`. The header never supplies the actor, and a
+server before contract `0.14` refuses the contract first. The CLI sends it for `--as` on served
+writes and on served `cluster plan` and `cluster apply`.
 
 ### Signed data credentials
 
@@ -196,10 +206,9 @@ never fetch keys or call a control service, so publisher outages eventually
 prevent new OIDC access; accepted operations can finish. Admission refresh does
 not restart writers. Graph configuration retains its normal activation.
 
-With this profile configured, the server also serves public
-protected-resource metadata and an OAuth challenge on its [`/mcp`](mcp.md)
-endpoint, so standard OAuth clients such as Claude can sign in. The [MCP guide](mcp.md) describes the
-endpoint, its tools, settings and limits.
+With this profile configured, the server also serves public protected-resource metadata and names it
+in every 401's challenge, so standard OAuth clients such as Claude can sign in. The [MCP guide](mcp.md)
+describes sign-in, which resource identifier to choose, and the endpoint's tools, settings and limits.
 
 ## Route families
 
@@ -240,7 +249,7 @@ Change a managed graph's schema through `cluster apply --target URL --config DIR
 
 ```bash
 curl -sS http://localhost:8080/graphs/knowledge/query \
-  -H 'Omnigraph-Http-Api: 0.13' \
+  -H 'Omnigraph-Http-Api: 0.14' \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -d '{
@@ -259,7 +268,7 @@ writes go to `/mutate` and may select a target `branch`.
 
 ```bash
 curl -sS http://localhost:8080/graphs/knowledge/queries/find_person \
-  -H 'Omnigraph-Http-Api: 0.13' \
+  -H 'Omnigraph-Http-Api: 0.14' \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -d '{"params":{"name":"Ada"}}'
@@ -276,7 +285,7 @@ acting on:
 
 ```bash
 curl -sS http://localhost:8080/graphs/knowledge/mutate/if-graph-commit \
-  -H 'Omnigraph-Http-Api: 0.13' \
+  -H 'Omnigraph-Http-Api: 0.14' \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -H 'Omnigraph-If-Graph-Commit: <graph_commit_id>' \
@@ -331,11 +340,11 @@ resume cursor ([Changes, Diffs and Change Feeds](../branching/changes.md)).
 
 ## Errors and retries
 
-Application errors preserve structured details. Admission limits use `429` with
-`Retry-After`; size limits use `413`, and blocked graphs or closed admission use
-`503`. Admitted writes continue after disconnect. Only the
-CLI's qualified whole-command admission refusal permits exit 75 and caller retry;
-generic 409/503 and lost responses do not. See [failure outcomes](troubleshooting.md#failed-data-write-commands).
+Every error body, an unknown route's and a malformed request's included, carries
+a `code`, its details and a `disposition` (`effects`, `action`; see
+[failed writes](troubleshooting.md#failed-data-write-commands)); a write the
+server could not settle is `outcome_unknown`, with `500`. Admission limits use `429`, size limits `413`, blocked graphs or closed admission `503`, each refusal
+that asks for a retry with `Retry-After`. Admitted writes continue after disconnect.
 
 For TLS, secrets, storage credentials, container examples and Azure admission,
 see [Deployment](../deployment.md).

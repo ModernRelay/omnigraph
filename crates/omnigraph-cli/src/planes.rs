@@ -12,12 +12,15 @@ pub(crate) enum Requirement {
     Graph {
         direct_only: bool,
         root: bool,
-        managed: bool,
+
         catalogue: bool,
     },
     Standalone,
     Registry,
     Root,
+    /// A whole direct root, optionally filtered by `--graph`, or one served
+    /// graph: the server answers per graph, so a server target selects one.
+    RootOrServedGraph,
     Deployment,
     ManagedAccount,
     ManagedCluster,
@@ -29,16 +32,17 @@ pub(crate) enum Requirement {
 pub(crate) fn requirement(command: &Command) -> Requirement {
     use Requirement::*;
     match command {
+        Command::Catalogue(_) => Local,
         Command::Query(_) => Graph {
             direct_only: false,
             root: true,
-            managed: true,
+
             catalogue: true,
         },
         Command::Mutate(_) | Command::Load(_) => Graph {
             direct_only: false,
             root: true,
-            managed: true,
+
             catalogue: false,
         },
         Command::Commit {
@@ -46,7 +50,7 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
         } => Graph {
             direct_only: false,
             root: true,
-            managed: true,
+
             catalogue: false,
         },
         Command::Schema {
@@ -54,7 +58,7 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
         } => Graph {
             direct_only: false,
             root: true,
-            managed: false,
+
             catalogue: true,
         },
         Command::Branch { .. }
@@ -71,7 +75,7 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
         } => Graph {
             direct_only: false,
             root: true,
-            managed: false,
+
             catalogue: false,
         },
         Command::Init(_)
@@ -88,7 +92,7 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
         | Command::Cleanup(_) => Graph {
             direct_only: true,
             root: true,
-            managed: false,
+
             catalogue: false,
         },
         Command::Lint(args) => {
@@ -98,13 +102,19 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
                 Graph {
                     direct_only: true,
                     root: true,
-                    managed: false,
+
                     catalogue: false,
                 }
             }
         }
         Command::Graphs { .. } => Registry,
-        Command::Queries { .. } | Command::Policy { .. } => Root,
+        Command::Queries {
+            command: QueriesCommand::List { .. },
+        } => RootOrServedGraph,
+        Command::Queries {
+            command: QueriesCommand::Validate { .. },
+        }
+        | Command::Policy { .. } => Root,
         Command::Cluster { command } => match command {
             ClusterCommand::Validate { .. } => Local,
             ClusterCommand::Plan { .. }
@@ -127,8 +137,28 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
         Command::Organization { .. } => ManagedAccount,
         Command::Alias(_) => Alias,
         Command::Login { .. } | Command::Logout { .. } => Authentication,
+        // A served graph's access route, or a direct graph's or root graph's
+        // installed policy. Managed data qualifies each wrapper separately,
+        // and the catalogue carries no policy.
+        Command::Access(_) => Graph {
+            direct_only: false,
+            root: true,
+            catalogue: false,
+        },
         Command::Credential { .. } => Credential,
+        Command::Target {
+            command: TargetCommand::Add {
+                cluster: Some(_), ..
+            },
+        } => ManagedAccount,
+        Command::Target {
+            command: TargetCommand::Refresh { .. },
+        } => ManagedCluster,
+        Command::Config {
+            command: crate::commands::targets::ConfigCommand::RecoverOperations { .. },
+        } => ManagedAccount,
         Command::Target { .. }
+        | Command::Config { .. }
         | Command::Embed(_)
         | Command::Skill { .. }
         | Command::Version { .. } => Local,
@@ -138,17 +168,80 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
 pub(crate) fn root_input(command: &Command) -> bool {
     matches!(
         requirement(command),
-        Requirement::Root | Requirement::Deployment
+        Requirement::Root | Requirement::RootOrServedGraph | Requirement::Deployment
     )
+}
+
+/// Whether the operation addresses one graph of `target`, so `--graph` or the
+/// target's `default_graph` must select it before any I/O.
+pub(crate) fn selects_graph(command: &Command, target: &ResolvedTarget) -> bool {
+    match requirement(command) {
+        Requirement::Graph { .. } => true,
+        Requirement::RootOrServedGraph => matches!(target.binding, TargetBinding::Server { .. }),
+        _ => false,
+    }
 }
 
 /// Flag applicability does not acquire configuration or a credential.
 pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
     let need = requirement(&cli.command);
+    if matches!(
+        cli.command,
+        Command::Target {
+            command: TargetCommand::Refresh { .. }
+        }
+    ) && cli.target.is_some()
+    {
+        bail!("target refresh already names its target; remove --target");
+    }
+    if matches!(cli.command, Command::Credential { .. })
+        && (cli.target.is_some() == cli.profile.is_some())
+    {
+        bail!("credentials requires exactly one explicit --profile or --target");
+    }
+    if matches!(
+        cli.command,
+        Command::Config {
+            command: crate::commands::targets::ConfigCommand::RecoverOperations { .. }
+        }
+    ) && cli.profile.is_none()
+    {
+        bail!("operation recovery requires explicit --profile");
+    }
+    if matches!(
+        cli.command,
+        Command::Login {
+            replace_principal: Some(_),
+            ..
+        }
+    ) && cli.profile.is_none()
+        && cli.target.is_none()
+    {
+        bail!("principal replacement requires an explicit existing --profile or managed --target");
+    }
+    if cli.profile.is_some()
+        && !matches!(
+            need,
+            Requirement::ManagedAccount
+                | Requirement::Authentication
+                | Requirement::Credential
+                | Requirement::ManagedOperation
+        )
+    {
+        bail!("{} does not accept --profile", command_label(&cli.command));
+    }
+    if matches!(need, Requirement::ManagedAccount) && cli.target.is_some() {
+        bail!("this operation selects --profile, not --target");
+    }
     if matches!(need, Requirement::Local | Requirement::Alias) && cli.target.is_some() {
         bail!("{} does not accept --target", command_label(&cli.command));
     }
-    if cli.graph.is_some() && !matches!(need, Requirement::Graph { .. } | Requirement::Root) {
+    if cli.graph.is_some()
+        && !matches!(
+            need,
+            Requirement::Graph { .. } | Requirement::Root | Requirement::RootOrServedGraph
+        )
+    {
         bail!("{} does not accept --graph", command_label(&cli.command));
     }
     if cli.graph.is_some() && matches!(&cli.command, Command::Cluster { .. }) {
@@ -162,10 +255,13 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
 
 /// An explicit actor applies only to an actor-consuming operation. Match mixed
 /// families exhaustively so new leaves need a decision; read-only families
-/// refuse as a whole. Served targets still derive identity from credentials.
+/// refuse as a whole. A served target still derives identity from its
+/// credential and carries `--as` as the `Omnigraph-If-Actor` assertion.
 fn accepts_actor(command: &Command) -> bool {
     match command {
         Command::Mutate(_) | Command::Load(_) | Command::RebuildFullTextIndexes(_) => true,
+        // The actor a direct target's policy decides for.
+        Command::Access(_) => true,
         Command::Branch { command } => match command {
             BranchCommand::Create { .. }
             | BranchCommand::Delete { .. }
@@ -192,7 +288,8 @@ fn accepts_actor(command: &Command) -> bool {
         },
         Command::Cluster { command } => match command {
             // Plan checks the intended actor; apply and upgrade attribute it.
-            // validate_target separately refuses --as on served/managed targets.
+            // A served plan or apply asserts it; validate_target refuses
+            // --as on managed targets.
             ClusterCommand::Plan { .. }
             | ClusterCommand::Apply { .. }
             | ClusterCommand::UpgradeLedger { .. } => true,
@@ -212,7 +309,8 @@ fn accepts_actor(command: &Command) -> bool {
             | ClusterCommand::History { .. }
             | ClusterCommand::Cancel { .. } => false,
         },
-        Command::Query(_)
+        Command::Catalogue(_)
+        | Command::Query(_)
         | Command::Snapshot(_)
         | Command::Export(_)
         | Command::Diff(_)
@@ -232,6 +330,7 @@ fn accepts_actor(command: &Command) -> bool {
         | Command::Login { .. }
         | Command::Logout { .. }
         | Command::Target { .. }
+        | Command::Config { .. }
         | Command::Credential { .. }
         | Command::Skill { .. }
         | Command::Version { .. } => false,
@@ -248,8 +347,11 @@ pub(crate) fn validate_target(
     use TargetBinding::*;
     let need = requirement(&cli.command);
     let allowed = match (&need, &target.binding) {
-        (Graph { .. } | Standalone, DirectGraph { .. }) => true,
-        (Graph { root: true, .. } | Root | Deployment, DirectRoot { .. }) => true,
+        (Graph { .. } | Standalone | Alias, DirectGraph { .. }) => true,
+        (
+            Graph { root: true, .. } | Root | RootOrServedGraph | Deployment | Alias,
+            DirectRoot { .. },
+        ) => true,
         (
             Graph {
                 catalogue: true, ..
@@ -261,6 +363,7 @@ pub(crate) fn validate_target(
                 direct_only: false, ..
             }
             | Registry
+            | RootOrServedGraph
             | Deployment
             | Authentication
             | Credential
@@ -268,11 +371,17 @@ pub(crate) fn validate_target(
             Server { .. },
         ) => true,
         (
-            Graph { managed: true, .. } | Registry | Deployment | ManagedCluster,
+            Graph {
+                direct_only: false, ..
+            }
+            | Registry
+            | Deployment
+            | ManagedCluster
+            | Alias,
             Managed(binding),
-        ) => binding.cluster.is_some(),
+        ) => binding.cluster.is_some() && !matches!(cli.command, Command::Access(_)),
         (ManagedAccount, Managed(binding)) => binding.cluster.is_none(),
-        (ManagedOperation | Authentication, Managed(_)) => true,
+        (ManagedOperation | Authentication | Credential, Managed(_)) => true,
         _ => false,
     };
     if !allowed {
@@ -280,6 +389,19 @@ pub(crate) fn validate_target(
             "{} is not available for this target kind and scope",
             command_label(&cli.command)
         );
+    }
+    if let Command::Credential { command } = &cli.command {
+        match &target.binding {
+            Server { .. } if cli.target.is_none() => {
+                bail!("standalone credentials require explicit --target");
+            }
+            Managed(binding)
+                if binding.cluster.is_some() && !matches!(command, CredentialCommand::Export) =>
+            {
+                bail!("managed credentials set/status/remove require explicit --profile");
+            }
+            _ => {}
+        }
     }
     let invocation = match &cli.command {
         Command::Query(args) => Some((
@@ -305,17 +427,18 @@ pub(crate) fn validate_target(
     if cli.graph.is_some() && matches!(target.binding, DirectGraph { .. } | DirectCatalogue) {
         bail!("a direct graph or catalogue target already identifies its graph; remove --graph");
     }
-    if cli.as_actor.is_some() && matches!(target.binding, Server { .. } | Managed(_)) {
+    // A served target derives identity from its credential and sends `--as`
+    // as an assertion the server checks; a managed target asserts nothing.
+    if cli.as_actor.is_some() && matches!(target.binding, Managed(_)) {
         bail!(
-            "--as is only available for direct operations; a served target derives identity from its credential"
+            "--as is not available for a managed target; it derives identity from its credential"
         );
     }
-    if matches!(
-        (&cli.command, &target.binding),
-        (Command::Login { token: Some(_), .. }, Managed(_))
-    ) {
+    if matches!(cli.command, Command::Login { .. } | Command::Logout { .. })
+        && !matches!(target.binding, Managed(_))
+    {
         bail!(
-            "--token applies to server login only; a managed target uses its declared authentication mechanism"
+            "login/logout require a managed profile with provider: omnigraph; use credentials for static tokens"
         );
     }
     if let Command::Cluster { command } = &cli.command {
@@ -409,7 +532,9 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Login { .. } => "login",
         Command::Logout { .. } => "logout",
         Command::Target { .. } => "target",
+        Command::Config { .. } => "config",
         Command::Credential { .. } => "credential",
+        Command::Access(_) => "access",
         Command::Skill { command } => match command {
             SkillCommand::Export { .. } => "skill export",
             SkillCommand::Show { .. } => "skill show",
@@ -457,6 +582,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             ChangesCommand::Baseline { .. } => "changes baseline",
         },
         Command::Query(_) => "query",
+        Command::Catalogue(_) => "catalogue",
         Command::Mutate(_) => "mutate",
         Command::Alias(_) => "alias",
         Command::Policy { .. } => "policy",
@@ -486,13 +612,10 @@ mod tests {
                         Some(
                             "server"
                                 | "store"
-                                | "cluster"
-                                | "profile"
+                                | "connection"
                                 | "managed"
                                 | "direct"
                                 | "quiet"
-                                | "api"
-                                | "organization"
                                 | "uri"
                         )
                     ),
@@ -507,6 +630,22 @@ mod tests {
         }
         let command = crate::cli::Cli::command();
         walk(&command);
+        for selector in ["target", "profile"] {
+            assert!(command.get_arguments().any(|argument| {
+                argument.get_long() == Some(selector) && argument.is_global_set()
+            }));
+        }
+        let conflict = crate::invocation::parse_from([
+            "omnigraph",
+            "cluster",
+            "list",
+            "--profile",
+            "work",
+            "--target",
+            "cluster",
+        ])
+        .unwrap_err();
+        assert_eq!(conflict.kind(), clap::error::ErrorKind::ArgumentConflict);
         assert!(
             !command
                 .get_subcommands()
@@ -521,6 +660,7 @@ mod tests {
             (&["mutate", "-e", "q"], true),
             (&["load", "--data", "d.jsonl", "--mode", "append"], true),
             (&["rebuild-full-text-indexes"], true),
+            (&["access"], true),
             (&["branch", "create", "b"], true),
             (&["branch", "delete", "b"], true),
             (&["branch", "merge", "b"], true),
@@ -640,7 +780,7 @@ mod tests {
             "--server",
             "--store",
             "--cluster",
-            "--profile",
+            "--connection",
             "--managed",
             "--direct",
             "--quiet",
@@ -654,6 +794,19 @@ mod tests {
         }
         for command in ["use", "profile"] {
             assert!(crate::invocation::parse_from(["omnigraph", command]).is_err());
+        }
+        for args in [
+            ["omnigraph", "--profile", "work", "query", "q"],
+            ["omnigraph", "query", "q", "--profile", "work"],
+        ] {
+            let parsed = crate::invocation::parse_from(args).unwrap();
+            assert_eq!(parsed.cli.profile.as_deref(), Some("work"));
+            assert_eq!(
+                super::guard_addressing(&parsed.cli)
+                    .unwrap_err()
+                    .to_string(),
+                "query does not accept --profile"
+            );
         }
     }
 }

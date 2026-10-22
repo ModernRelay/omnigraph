@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-10-01
-updated: 2026-10-03
+updated: 2026-10-21
 discussion: null
 supersedes: []
 superseded_by: []
@@ -19,6 +19,16 @@ blocked_on:
 ---
 
 # RFC: Engine settlement and resource bounds
+
+> **Disposition (2026-10-21):** [Storage outcomes per operation and
+> restartable ownership](2026-10-19-storage-outcomes-and-restartable-ownership.md) replaces "unsupported ambiguous cases
+> retain fail-stop" in Required settlement mechanism. An ambiguous
+> conditional request is resolved by its own re-issue and read-back, and a
+> publication that stays ambiguous is fenced by its version key: it lands
+> before the branch's next publication or never. The storage scope's
+> process-wide uncertain flag becomes per-key state, and its single-attempt
+> clients become clients routed by key class. Native settlement, resource
+> bounds and engine reuse remain gated as below.
 
 ## Summary
 
@@ -395,6 +405,10 @@ create parallel ownership and remains outside this decision.
   dimensions explicitly.
 
 ## Decision log
+
+- 2026-10-21: Added a disposition note: [storage outcomes per operation and
+  restartable ownership](2026-10-19-storage-outcomes-and-restartable-ownership.md) replaces fail-stop for ambiguous storage
+  outcomes with re-issue, version-key fencing and per-key scope state.
 
 - 2026-10-03: Extended Implemented boundary with per-graph logical ownership
   and exact-view resumption. This supplements query-worker joining without

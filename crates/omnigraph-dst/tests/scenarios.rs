@@ -6392,3 +6392,237 @@ fn dst_source_guard_no_runtime_env_mutation() {
         }
     }
 }
+
+/// The graph's publication requests get a definite outcome under storage
+/// faults a served write meets: a throttled transaction-file put is
+/// `Unpublished`; a lost acknowledgement, an unanswered request and an
+/// abandoned request that lands late each end in exactly one commit, through
+/// the commit handler's re-issue; and a request no re-issue settles is in
+/// doubt, with nothing visible. The next write on the same handle publishes.
+#[tokio::test]
+#[serial]
+async fn dst_publication_requests_get_a_definite_outcome_issue_1067() {
+    use omnigraph::error::CompletionEvidence;
+    use omnigraph_dst::lance_faults::{
+        PublicationFault, PublicationFaultMode, PublicationTarget, set_publication_fault,
+    };
+
+    #[derive(Debug, PartialEq)]
+    enum Outcome {
+        Committed,
+        Unpublished,
+        InDoubt,
+    }
+
+    omnigraph_dst::lance_faults::install();
+    let reissues = omnigraph::manifest_request_reissues();
+    let cases = [
+        (
+            PublicationTarget::TransactionFile,
+            PublicationFaultMode::Throttled,
+            1,
+            Outcome::Unpublished,
+        ),
+        (
+            PublicationTarget::ManifestVersion,
+            PublicationFaultMode::LostAck,
+            1,
+            Outcome::Committed,
+        ),
+        (
+            PublicationTarget::ManifestVersion,
+            PublicationFaultMode::Unanswered,
+            1,
+            Outcome::Committed,
+        ),
+        (
+            PublicationTarget::ManifestVersion,
+            PublicationFaultMode::LandsLate(std::time::Duration::from_millis(50)),
+            1,
+            Outcome::Committed,
+        ),
+        (
+            PublicationTarget::ManifestVersion,
+            PublicationFaultMode::Unanswered,
+            1 + reissues,
+            Outcome::InDoubt,
+        ),
+    ];
+    for (n, (target, mode, times, expected)) in cases.into_iter().enumerate() {
+        let root = format!("shared-memory://dst-publication-{n}");
+        let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
+        let db = session(
+            Omnigraph::init_with_storage(&root, TEST_SCHEMA, storage, InitOptions::default())
+                .await
+                .expect("init"),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
+            .await
+            .expect("fixtures");
+        let persons = count_rows(&db, "node:Person").await;
+        let commits = db.list_commits(None).await.unwrap().len();
+        let fault = PublicationFault::new(target, mode, times);
+        set_publication_fault(Some(fault.clone()));
+        let result = mutate_main(
+            &db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Faulted")], &[("$age", 1)]),
+        )
+        .await;
+        set_publication_fault(None);
+        assert_eq!(
+            fault.hits(),
+            times,
+            "case {n}: the rule hit every request it aimed at"
+        );
+        // An abandoned request has had its chance to land.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let outcome = match &result {
+            Ok(_) => Outcome::Committed,
+            Err(error) if error.is_manifest_publish_in_doubt() => Outcome::InDoubt,
+            Err(error) => {
+                assert_eq!(
+                    error.completion_evidence(),
+                    Some(CompletionEvidence::Unpublished),
+                    "case {n}: {error:?}"
+                );
+                Outcome::Unpublished
+            }
+        };
+        assert_eq!(
+            outcome, expected,
+            "case {n} ({target:?}, {mode:?}): {result:?}"
+        );
+        let landed = usize::from(outcome == Outcome::Committed);
+        assert_eq!(
+            count_rows(&db, "node:Person").await,
+            persons + landed,
+            "case {n}"
+        );
+        assert_eq!(
+            db.list_commits(None).await.unwrap().len(),
+            commits + landed,
+            "case {n}: exactly one commit or none"
+        );
+        mutate_main(
+            &db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "After")], &[("$age", 2)]),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("case {n}: the next write publishes: {error:?}"));
+    }
+}
+
+/// LEASE TAKEOVER under seeded timing: an owner beats for a seeded while,
+/// then dies with one heartbeat request in flight that storage applies late,
+/// at a seeded moment that can fall before, during or after a successor's
+/// watch. A beat that lands during the watch sends the successor away, which
+/// is the safe direction; the successor that claims the lock does so only
+/// after a lease and a half of silence since the last beat it saw; and the
+/// dead owner's beats that land after the claim fence nothing: the
+/// successor keeps renewing, and a third process watching it refuses.
+#[test]
+#[serial]
+fn dst_successor_takes_over_a_dead_owners_lease_issue_1067() {
+    use omnigraph_cluster::lease_protocol::{LeaseKeeper, Watch, lease_dir, watch_and_claim};
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    const SECONDS: u32 = 30;
+    let lease = Duration::from_secs(u64::from(SECONDS));
+    for seed in 0..16u64 {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .rng_seed(tokio::runtime::RngSeed::from_bytes(&seed.to_le_bytes()))
+            .enable_time()
+            .start_paused(true)
+            .build_local(Default::default())
+            .expect("seeded paused runtime builds");
+        runtime.block_on(async move {
+            let mut rng = SplitMix64(seed ^ 0x004C_4541_5345);
+            let store: Arc<dyn omnigraph_storage::StorageAdapter> =
+                Arc::new(omnigraph_storage::ObjectStorageAdapter::in_memory());
+            let root = "cluster";
+            let owner =
+                LeaseKeeper::start(store.clone(), root, "owner", SECONDS, Instant::now(), None)
+                    .await
+                    .expect("the owner's first beat lands");
+            tokio::time::sleep(Duration::from_millis(rng.below(90_000))).await;
+            drop(owner);
+            let died = Instant::now();
+            let late = Duration::from_millis(rng.below(150_000));
+            let late_beat = format!("{}/beat-{:020}.json", lease_dir(root, "owner"), u64::MAX);
+            let landed = Arc::new(std::sync::Mutex::new(None));
+            tokio::spawn({
+                let store = store.clone();
+                let landed = landed.clone();
+                async move {
+                    tokio::time::sleep(late).await;
+                    store.write_text_if_absent(&late_beat, "{}").await.unwrap();
+                    *landed.lock().unwrap() = Some(Instant::now());
+                }
+            });
+
+            let mut attempts = 0;
+            let claimed_at = loop {
+                attempts += 1;
+                assert!(attempts <= 4, "seed {seed}: a silent owner is taken over");
+                let watching = Instant::now();
+                match watch_and_claim(store.as_ref(), root, "owner", SECONDS, "successor")
+                    .await
+                    .unwrap()
+                {
+                    Watch::Silent => {
+                        let claimed = Instant::now();
+                        assert!(
+                            claimed.duration_since(watching) >= lease * 3 / 2,
+                            "seed {seed}: a claim waits out a lease and a half"
+                        );
+                        if let Some(at) = *landed.lock().unwrap() {
+                            assert!(
+                                at <= watching || claimed.duration_since(at) >= lease * 3 / 2,
+                                "seed {seed}: no claim within a lease and a half of a seen beat"
+                            );
+                        }
+                        break claimed;
+                    }
+                    Watch::Alive => {
+                        assert!(
+                            landed.lock().unwrap().is_some(),
+                            "seed {seed}: only the late beat can send a successor away"
+                        );
+                    }
+                }
+            };
+            assert!(
+                claimed_at.duration_since(died) >= lease * 3 / 2,
+                "seed {seed}"
+            );
+
+            let successor = LeaseKeeper::start(
+                store.clone(),
+                root,
+                "successor",
+                SECONDS,
+                Instant::now(),
+                None,
+            )
+            .await
+            .expect("the successor's first beat lands");
+            tokio::time::sleep(lease * 6).await;
+            assert!(
+                successor.fenced().borrow().is_none(),
+                "seed {seed}: the dead owner's late beat fences nothing"
+            );
+            assert_eq!(
+                watch_and_claim(store.as_ref(), root, "successor", SECONDS, "third")
+                    .await
+                    .unwrap(),
+                Watch::Alive,
+                "seed {seed}: a live successor keeps a third process out"
+            );
+        });
+    }
+}

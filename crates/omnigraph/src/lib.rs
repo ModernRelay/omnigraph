@@ -79,6 +79,13 @@ pub struct MutationReceipt {
 #[doc(hidden)]
 pub use lance_access::store_registry as dst_lance_store_registry;
 
+/// How many times a manifest request with an ambiguous answer is re-issued;
+/// see `omnigraph_core::manifest_request`.
+#[cfg(feature = "dst")]
+pub fn manifest_request_reissues() -> usize {
+    omnigraph_core::manifest_request::MANIFEST_REQUEST_REISSUES as usize
+}
+
 /// The Lance-realm object-store seam; see `lance_access::object_store_seam`.
 #[cfg(feature = "dst")]
 pub use lance_access::object_store_seam;

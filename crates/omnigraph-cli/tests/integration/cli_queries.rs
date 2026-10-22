@@ -40,7 +40,7 @@ fn served(verb: &str, server: &TestServer) -> assert_cmd::Command {
     command
         .arg(verb)
         .arg("--target")
-        .arg(&server.base_url)
+        .fixture_target(&server.base_url)
         .arg("--graph")
         .arg(STATEMENT_GRAPH_ID);
     command
@@ -310,9 +310,9 @@ fn branch_statements_remote_round_trip_and_delete_needs_consent() {
         "--json fails closed too: {refusal}"
     );
     assert_eq!(
-        refusal["command_outcome"],
+        refusal["disposition"],
         serde_json::json!({
-            "execution":"not_started", "effects":"none", "action":"refresh"
+            "effects":"none", "action":"refresh"
         })
     );
     assert!(refusal.get("http_status").is_none());
@@ -374,7 +374,7 @@ fn branch_statements_remote_round_trip_and_delete_needs_consent() {
 
 #[test]
 fn branch_statement_local_refusals_happen_before_any_round_trip() {
-    let unreachable = "http://127.0.0.1:9";
+    let unreachable = crate::support::managed_http::IntentApiFixture::graph(vec![]);
     let temp = tempdir().unwrap();
     let params_file = temp.path().join("params.json");
     std::fs::write(&params_file, "{}").unwrap();
@@ -385,7 +385,7 @@ fn branch_statement_local_refusals_happen_before_any_round_trip() {
         command
             .args(args)
             .arg("--target")
-            .arg(unreachable)
+            .fixture_target(&unreachable.origin)
             .arg("--graph")
             .arg("g");
         stderr_string(&output_failure(&mut command))
@@ -532,8 +532,8 @@ fn branch_statement_local_refusals_happen_before_any_round_trip() {
         );
         assert!(
             !stderr.contains("error sending request") && !stderr.contains("Connection refused"),
-            "{args:?}: the refusal must not follow a round trip (nothing listens on \
-             {unreachable}); got: {stderr}"
+            "{args:?}: the refusal must not follow a round trip to {}; got: {stderr}",
+            unreachable.origin
         );
     });
 
@@ -583,24 +583,28 @@ fn a_source_this_cli_cannot_parse_is_sent_to_the_server_verbatim() {
                 .arg("-e")
                 .arg(SOURCE)
                 .arg("--target")
-                .arg(&server.origin)
+                .fixture_target(&server.origin)
                 .arg("--graph")
                 .arg("g")
                 .arg("--json"),
         );
         let mut actual = parse_stdout_json(&output);
-        if verb == "mutate" {
-            assert_eq!(actual["http_status"], 400);
-            assert_eq!(
-                actual["command_outcome"],
+        // A read changes nothing; an untyped refusal of a write leaves its
+        // effects unknown.
+        assert_eq!(actual["http_status"], 400);
+        assert_eq!(
+            actual["disposition"],
+            if verb == "mutate" {
                 serde_json::json!({
-                    "execution":"unknown", "effects":"unknown", "action":"reconcile"
+                    "effects":"unknown", "action":"reconcile"
                 })
-            );
-            let fields = actual.as_object_mut().unwrap();
-            fields.remove("http_status");
-            fields.remove("command_outcome");
-        }
+            } else {
+                serde_json::json!({"effects":"none", "action":"fix"})
+            }
+        );
+        let fields = actual.as_object_mut().unwrap();
+        fields.remove("http_status");
+        fields.remove("disposition");
         assert_eq!(
             actual, refusal,
             "{verb} must preserve every original server field"
@@ -782,13 +786,13 @@ fn set_flag_refusals_happen_before_any_open_or_round_trip() {
             "--set {flag}: expected {expected:?}; got: {stderr}"
         );
     }
-    let unreachable = "http://127.0.0.1:9";
+    let unreachable = crate::support::managed_http::IntentApiFixture::graph(vec![]);
     let refusal = |args: &[&str]| -> String {
         let mut command = cli();
         command
             .args(args)
             .arg("--target")
-            .arg(unreachable)
+            .fixture_target(&unreachable.origin)
             .arg("--graph")
             .arg("g");
         stderr_string(&output_failure(&mut command))
@@ -857,8 +861,8 @@ fn set_flag_refusals_happen_before_any_open_or_round_trip() {
         );
         assert!(
             !stderr.contains("error sending request") && !stderr.contains("Connection refused"),
-            "{args:?}: the refusal must not follow a round trip (nothing listens on \
-             {unreachable}); got: {stderr}"
+            "{args:?}: the refusal must not follow a round trip to {}; got: {stderr}",
+            unreachable.origin
         );
     }
 }
@@ -885,7 +889,7 @@ fn alias_unknown_name_errors_listing_defined() {
     let home = tempdir().unwrap();
     std::fs::write(
         home.path().join("config.yaml"),
-        "target_config_version: 1\ntargets:\n  dev:\n    kind: server\n    endpoint: https://x\n    credential: dev\ndefaults:\n  output: json\naliases:\n  who:\n    target: dev\n    query: find_person\n",
+        "version: 1\ntargets:\n  dev:\n    kind: server\n    endpoint: https://x\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_DEV\ndefaults:\n  output: json\naliases:\n  who:\n    target: dev\n    graph: knowledge\n    query: find_person\n",
     )
     .unwrap();
     let output = output_failure(
@@ -908,6 +912,7 @@ fn alias_unknown_name_errors_listing_defined() {
 #[test]
 #[cfg(unix)]
 fn alias_setup_keeps_one_operator_config_across_params_file() {
+    let ca = tls_gateway::ca_path().display();
     use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -923,7 +928,7 @@ fn alias_setup_keeps_one_operator_config_across_params_file() {
         ("jsonl", "csv", &[][..], true, "jsonl"),
         ("json", "jsonl", &["--format", "table"][..], true, "human"),
     ];
-    for (alias_format, default_format, flags, refused, expected_format) in cases {
+    for (default_format, _old_default_format, flags, refused, expected_format) in cases {
         let home = tempdir().unwrap();
         let config = home.path().join("config.yaml");
         let replacement = home.path().join("replacement.yaml");
@@ -945,12 +950,12 @@ fn alias_setup_keeps_one_operator_config_across_params_file() {
         };
         let server = IntentApiFixture::graph(vec![response]);
         let captured_config = format!(
-            "target_config_version: 1\ntargets:\n  prod:\n    kind: server\n    endpoint: '{}'\n    credential: prod\n  graph-owner:\n    kind: server\n    endpoint: '{}/unrelated'\n    credential: graph-owner\ndefaults:\n  output: {default_format}\naliases:\n  who:\n    target: prod\n    graph: knowledge\n    query: find_person\n    args: [name, limit]\n    params: {{name: fixed, limit: 1, source: original-alias}}\n    format: {alias_format}\n",
+            "version: 1\ntargets:\n  prod:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_PROD\n  graph-owner:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/unrelated'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_GRAPH_OWNER\ndefaults:\n  output: {default_format}\naliases:\n  who:\n    target: prod\n    graph: knowledge\n    query: find_person\n    params: {{name: fixed, limit: 2, source: original-alias}}\n",
             server.origin, server.origin
         );
         fs::write(&config, captured_config).unwrap();
         let replacement_config = format!(
-            "target_config_version: 1\ntargets:\n  prod:\n    kind: server\n    endpoint: '{}'\n    credential: prod\n  replacement:\n    kind: server\n    endpoint: '{}/graphs/knowledge'\n    credential: replacement\naliases:\n  who:\n    target: prod\n    graph: replacement\n    query: replacement_query\n    params: {{source: replacement-alias}}\n",
+            "version: 1\ntargets:\n  prod:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_PROD\n  replacement:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/graphs/knowledge'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_REPLACEMENT\naliases:\n  who:\n    target: prod\n    graph: replacement\n    query: replacement_query\n    params: {{source: replacement-alias}}\n",
             trap.origin, server.origin
         );
         fs::write(&replacement, &replacement_config).unwrap();
@@ -971,7 +976,7 @@ fn alias_setup_keeps_one_operator_config_across_params_file() {
             .env("OMNIGRAPH_TOKEN_REPLACEMENT", "replacement-token")
             .env_remove("OMNIGRAPH_BEARER_TOKEN")
             .env_remove("OMNIGRAPH_PROFILE")
-            .args(["alias", "who", "positional-name", "2", "--params-file"])
+            .args(["alias", "who", "--params-file"])
             .arg(&params_file)
             .args(flags)
             .timeout(Duration::from_secs(15));
@@ -1026,7 +1031,23 @@ fn alias_setup_keeps_one_operator_config_across_params_file() {
                     "{output:?}"
                 );
             } else {
-                assert_eq!(parse_stdout_json(&output), refusal, "{output:?}");
+                // An alias is a read: its refusal reports the disposition a
+                // `query` does, with no effects.
+                let mut reported = parse_stdout_json(&output);
+                assert_eq!(
+                    reported["disposition"],
+                    serde_json::json!({"effects":"none","action":"refresh"}),
+                    "{output:?}"
+                );
+                assert_eq!(reported["http_status"], 403, "{output:?}");
+                let reported = reported.as_object_mut().unwrap();
+                reported.remove("disposition");
+                reported.remove("http_status");
+                assert_eq!(
+                    serde_json::Value::Object(reported.clone()),
+                    refusal,
+                    "{output:?}"
+                );
                 assert!(
                     !stderr_string(&output).contains("captured alias denied"),
                     "{output:?}"
@@ -1081,6 +1102,52 @@ fn alias_setup_keeps_one_operator_config_across_params_file() {
 }
 
 #[test]
+fn alias_rejects_non_object_parameters_and_positional_arguments_without_requests() {
+    let server = crate::support::managed_http::IntentApiFixture::graph(Vec::new());
+    let home = tempdir().unwrap();
+    fs::write(
+        home.path().join("config.yaml"),
+        format!(
+            "version: 1\ntargets:\n  srv:\n    kind: server\n    endpoint: '{}'\n    auth: {{provider: anonymous}}\naliases:\n  lookup:\n    target: srv\n    graph: knowledge\n    query: lookup\n    params: {{name: default}}\n",
+            server.origin
+        ),
+    ).unwrap();
+    let params_file = home.path().join("params.json");
+    for params in ["[1]", "\"name\"", "7", "true", "null"] {
+        fs::write(&params_file, params).unwrap();
+        for file in [false, true] {
+            let mut command = cli();
+            command
+                .env("OMNIGRAPH_HOME", home.path())
+                .args(["alias", "lookup", "--json"]);
+            if file {
+                command.arg("--params-file").arg(&params_file);
+            } else {
+                command.args(["--params", params]);
+            }
+            let output = output_failure(&mut command);
+            assert_eq!(output.status.code(), Some(1));
+            assert!(
+                parse_stdout_json(&output)["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("must contain a JSON object")
+            );
+            assert!(server.requests().is_empty());
+        }
+    }
+    let output = output_failure(cli().env("OMNIGRAPH_HOME", home.path()).args([
+        "alias",
+        "lookup",
+        "positional",
+    ]));
+    assert_eq!(output.status.code(), Some(64));
+    assert!(stderr_string(&output).contains("unexpected argument"));
+    assert!(server.requests().is_empty());
+    server.assert_complete();
+}
+
+#[test]
 fn alias_rejects_global_scope_flags_that_the_binding_owns() {
     for (flag, value) in [
         ("--target", "dev"),
@@ -1099,7 +1166,7 @@ fn alias_rejects_global_scope_flags_that_the_binding_owns() {
 #[test]
 fn queries_list_rejects_direct_graph_target() {
     let home = tempdir().unwrap();
-    fs::write(home.path().join("config.yaml"), "target_config_version: 1\ntargets:\n  graph:\n    kind: direct\n    scope: graph\n    uri: ./graph.omni\n").unwrap();
+    fs::write(home.path().join("config.yaml"), "version: 1\ntargets:\n  graph:\n    kind: direct\n    scope: graph\n    uri: file:///data/graph.omni\n").unwrap();
     let output = output_failure(
         cli()
             .env("OMNIGRAPH_HOME", home.path())
@@ -1118,13 +1185,17 @@ fn queries_list_with_as_flag_errors() {
 fn queries_and_policy_refuse_server_targets_before_network() {
     let server = crate::support::managed_http::IntentApiFixture::graph(Vec::new());
     for args in [
-        vec!["queries", "list"],
         vec!["queries", "validate"],
         vec!["policy", "validate"],
         vec!["policy", "test", "--tests", "missing-tests.yaml"],
         vec!["policy", "explain", "--actor", "actor", "--action", "read"],
     ] {
-        let output = output_failure(cli().args(["--target", &server.origin]).args(&args));
+        let output = output_failure(
+            cli()
+                .args(["--target"])
+                .fixture_target(&server.origin)
+                .args(&args),
+        );
         let stderr = stderr_string(&output);
         assert!(
             stderr.contains("not available for this target kind and scope"),
@@ -1133,7 +1204,107 @@ fn queries_and_policy_refuse_server_targets_before_network() {
         assert!(output.stdout.is_empty());
         assert!(server.requests().is_empty());
     }
+    // A server lists one graph's queries, so `queries list` without `--graph`
+    // or a `default_graph` refuses before any request.
+    let output = output_failure(
+        cli()
+            .args(["--target"])
+            .fixture_target(&server.origin)
+            .args(["queries", "list"]),
+    );
+    let stderr = stderr_string(&output);
+    assert!(stderr.contains("graph_required"), "{stderr}");
+    assert!(output.stdout.is_empty());
+    assert!(server.requests().is_empty());
     server.assert_complete();
+}
+
+/// On a server target `queries list` reads `GET /graphs/{id}/queries`, and
+/// `--json` prints that body exactly. The direct root form keeps its own
+/// shape (`mcp_expose`, GQ type names, the whole cluster without `--graph`),
+/// so the two agree on the declarations they share, not byte for byte.
+#[test]
+fn queries_list_on_a_server_target_prints_the_route_body() {
+    let cluster = converged_cluster_with_query(
+        "stored.gq",
+        &format!(
+            "query described($name: String) \
+                @description(\"Find a person by exact name.\") \
+                @instruction(\"Use for exact lookups.\") \
+                {{ match {{ $p: Person {{ name: $name }} }} return {{ $p.age }} }}\n{SET_AGE}\n"
+        ),
+        "      - ./stored.gq\n",
+    );
+    let server = spawn_server_with_cluster(cluster.path());
+    let route: Value = graph_http_client()
+        .get(format!("{}/graphs/knowledge/queries", server.base_url))
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(route["queries"].as_array().unwrap().len(), 2, "{route}");
+
+    let served = output_success(
+        cli()
+            .args(["queries", "list", "--target"])
+            .fixture_target(&server.base_url)
+            .args(["--graph", "knowledge", "--json"]),
+    );
+    assert_eq!(parse_stdout_json(&served), route);
+
+    // A named server target supplies its `default_graph`.
+    let home = tempdir().unwrap();
+    fs::write(
+        home.path().join("config.yaml"),
+        format!(
+            "version: 1\ntargets:\n  srv:\n    kind: server\n    endpoint: '{}'\n    auth:\n      provider: anonymous\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{}'}}\n    default_graph: knowledge\n",
+            server.base_url, tls_gateway::ca_path().display()
+        ),
+    )
+    .unwrap();
+    let human = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .args(["queries", "list", "--target", "srv"]),
+    );
+    assert!(stderr_string(&human).contains("graph=knowledge"));
+    assert_eq!(
+        stdout_string(&human),
+        concat!(
+            "read  described($name: string)\n",
+            "    description: Find a person by exact name.\n",
+            "    instruction: Use for exact lookups.\n",
+            "mutation  set_age($name: string, $age: int)\n",
+        )
+    );
+
+    let direct = parse_stdout_json(&output_success(
+        cli()
+            .args(["queries", "list", "--target"])
+            .arg(cluster.path())
+            .args(["--graph", "knowledge", "--json"]),
+    ));
+    let shared = |body: &Value| -> Vec<Value> {
+        body["queries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|q| {
+                serde_json::json!({
+                    "name": q["name"],
+                    "mutation": q["mutation"],
+                    "description": q.get("description"),
+                    "instruction": q.get("instruction"),
+                    "params": q["params"].as_array().unwrap().iter()
+                        .map(|p| serde_json::json!([p["name"], p["nullable"]]))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect()
+    };
+    assert_eq!(shared(&direct), shared(&route));
 }
 
 // RFC-011: `queries validate`/`list` source the registry + schemas from a
@@ -1525,7 +1696,7 @@ fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
     for &(default_format, flags, expected_format) in cases {
         std::fs::write(
             operator_home.path().join("config.yaml"),
-            format!("target_config_version: 1\ndefaults:\n  output: {default_format}\n"),
+            format!("version: 1\ndefaults:\n  output: {default_format}\n"),
         )
         .unwrap();
         let output = output_failure(

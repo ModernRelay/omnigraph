@@ -5,7 +5,7 @@ storage, or Azure Blob Storage. The server always boots from one cluster root
 and exposes its ready applied graphs under `/graphs/{id}/…`; use
 `--require-all-graphs` when any blocked graph must fail startup.
 
-Servers use the v0.13 HTTP contract and open graph storage formats v14 to v16. The
+Servers use the v0.14 HTTP contract and open graph storage formats v14 to v16. The
 cluster ledger has a separate version: explicitly converting it to v2 preserves
 graph data and history. Start with [Operating a cluster](clusters/index.md) to
 create and apply a deployment bundle.
@@ -94,14 +94,13 @@ stream producers for at most `--shutdown-grace-seconds` (else
 A thread enforces the deadline even if the runtime stalls. Signal handling starts
 after configuration loading, before graph opening. Disconnected work remains in
 the wait; a graph finishing startup during shutdown cannot become available.
-A panic or uncertain startup/write completion closes admission for every graph
-and starts the same shutdown without renewing its deadline. Once HTTP connections
-and other known logical owners finish, it exits 2 immediately; the watchdog is
-the upper bound. Unresolved reservations stay charged until exit. This contains
-the process; it does not prove native I/O settled or the engine can be reused.
-A failure proven to leave the graph unchanged can keep admission open when its
-physical storage requests have also settled. Error status or category alone
-proves nothing; uncertain publication and unclassified failures still fail closed.
+A panic, or an uncertain outcome the engine cannot scope to one write's keys,
+closes admission for every graph and starts the same shutdown without renewing
+its deadline; a storage failure alone never does ([storage failures](operations/storage-failures.md)).
+Once HTTP connections and other known logical owners finish, it exits 2
+immediately; the watchdog is the upper bound. Unresolved reservations stay
+charged until exit. This contains the process; it does not prove native I/O
+settled or the engine can be reused.
 A clean native shutdown exits 0. Set the orchestrator's own
 termination grace longer than this value; a cutoff is crash-equivalent for the
 work it interrupts, and the next open recovers it as after any crash.
@@ -111,14 +110,15 @@ The next server can start normally with the same `--target`. An initial
 `--bootstrap-handoff` receipt is only for the first process; omit it on later
 starts. The data, history and applied configuration remain in place.
 
-Uncertain or interrupted work retains admission and exits nonzero. S3 release
+Uncertain or interrupted work retains admission and exits nonzero; on S3 roots
+a restarted server takes it over through the lock's lease
+([restart after a failure](operations/storage-failures.md#restart-after-a-failure)). S3 release
 uses a conditional marker, so a lost release response cannot delete a later
 owner's lock. A nonclean exit is still a reason to inspect the original outcome,
 not to replay writes. Azure keeps its existing shutdown behavior: even a clean
 exit retains admission and requires the independent Azure recovery procedure.
-The server's storage clients disable hidden mutation retries; if
-`OBJECT_STORE_CLIENT_MAX_RETRIES` is set, it must be `0`. An ambiguous storage
-failure stops new writes rather than allowing a later success to hide it.
+If `OBJECT_STORE_CLIENT_MAX_RETRIES` is set, it must be `0` ([retries](operations/storage-failures.md#retries)).
+A clean shutdown that leaves a reused key unsettled retains admission.
 Other direct writers still follow the [ownership-transfer procedure](#writer-topology).
 
 ## Admission limits
@@ -214,19 +214,17 @@ and storage credentials in the platform's secret store.
 
 ## Unix-socket access
 
-`omnigraph-server` listens on TCP only. Some local clients can open a Unix-domain
-socket but no TCP connection, such as an agent whose sandbox allows one socket
-path. To serve them, run a gateway that relays the socket to the server's
-loopback address unchanged, for example:
+`omnigraph-server` listens on TCP only. For clients with Unix socket support,
+a gateway can relay a socket to its loopback listener:
 
 ```bash
 socat UNIX-LISTEN:/run/omnigraph/server.sock,fork TCP:127.0.0.1:8080
 ```
 
-Clients address it with `--target unix:///run/omnigraph/server.sock`. The
-gateway must pass requests and responses through unchanged, including the
-`Omnigraph-Http-Api` header. Restrict who may connect with the permissions of
-the socket's directory; bearer authentication and policy apply as over TCP.
+The version-1 CLI does not accept Unix socket targets; use a registered HTTPS
+endpoint instead. Relay requests and responses unchanged, including
+`Omnigraph-Http-Api`. Restrict socket-directory permissions; bearer authentication
+and policy still apply.
 
 ## S3-compatible storage
 

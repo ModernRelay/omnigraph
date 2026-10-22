@@ -6,6 +6,701 @@ use omnigraph::db::ReadTarget;
 
 const DATA_TOKEN: &str = "header.payload.signature";
 
+struct ReadBudgetStore {
+    raw: MemoryStore,
+    reads: std::cell::Cell<usize>,
+    budget: usize,
+}
+
+impl Store for ReadBudgetStore {
+    fn persistent(&self) -> bool {
+        false
+    }
+    fn get(&self, key: &str) -> Result<Option<String>> {
+        let reads = self.reads.get() + 1;
+        self.reads.set(reads);
+        if reads > self.budget {
+            return Err(Failure::refused(
+                "keychain_unavailable",
+                "test read failure",
+            ));
+        }
+        self.raw.get(key)
+    }
+    fn put(&self, key: &str, value: &str) -> Result<()> {
+        self.raw.put(key, value)
+    }
+    fn remove(&self, key: &str) -> Result<()> {
+        self.raw.remove(key)
+    }
+}
+
+#[tokio::test]
+async fn cached_resource_uses_one_credential_read_and_propagates_initial_store_failure() {
+    let context = context();
+    let raw = MemoryStore::default();
+    save(
+        &raw,
+        &context,
+        &identity_credential(&context, "https://data.example"),
+    );
+    let store = ReadBudgetStore {
+        raw,
+        reads: Default::default(),
+        budget: 1,
+    };
+    acquire_resource(
+        Some("knowledge"),
+        &context,
+        &store,
+        async |_| Ok(Some("alice".into())),
+        async |_| panic!("valid cache must not issue a credential"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(store.reads.get(), 1);
+    let failure = acquire_resource(
+        Some("knowledge"),
+        &context,
+        &store,
+        async |_| panic!("store failure must not acquire control authority"),
+        async |_| panic!("store failure must not issue a credential"),
+    )
+    .await
+    .err()
+    .expect("store read must fail");
+    assert_eq!(failure.body["type"], "keychain_unavailable");
+    assert_eq!(store.reads.get(), 2);
+}
+
+#[test]
+fn loaded_credential_is_revalidated_before_constructing_graph_or_registry_client() {
+    let context = context();
+    for graph in [Some("knowledge"), None] {
+        let mut credential = identity_credential(&context, "https://data.example");
+        credential.validate(&context).unwrap();
+        expire_identity(&mut credential);
+        let failure = resolve_loaded(graph, &context, credential)
+            .err()
+            .expect("expired credential must not construct a client");
+        assert_eq!(failure.body["type"], "data_credential_expired");
+    }
+}
+
+#[tokio::test]
+async fn loaded_data_credential_expiry_is_rechecked_after_discovery() {
+    for graph in [Some("knowledge"), None] {
+        let expiry = OffsetDateTime::now_utc().unix_timestamp() + 2;
+        let data = IntentApiFixture::graph_with_discovery_hook(
+            vec![IntentReply::json(200, json!({"graphs": []}))],
+            move || {
+                while OffsetDateTime::now_utc().unix_timestamp() < expiry {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            },
+        );
+        let mut context = context();
+        context.endpoint = Some(data.origin.clone());
+        let mut credential = identity_credential(&context, &data.origin);
+        set_identity_expiry(&mut credential, expiry);
+        crate::operator_routing::test_transport_scope(&[&data.origin], async {
+            let client = resolve_loaded(graph, &context, credential).unwrap();
+            let result = if graph.is_some() {
+                client
+                    .invoke_named::<Value>("write", true, None, None, None, None)
+                    .await
+            } else {
+                client.list_graphs().await.map(|_| Value::Null)
+            };
+            assert_eq!(
+                data.requests().len(),
+                1,
+                "expired data credentials must not be dispatched"
+            );
+            assert!(!data.requests()[0].headers.contains_key("authorization"));
+            assert_eq!(
+                result
+                    .unwrap_err()
+                    .downcast_ref::<crate::credential_sources::CredentialError>(),
+                Some(&crate::credential_sources::CredentialError::Expired)
+            );
+        })
+        .await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn valid_data_credential_remains_usable_when_control_expires_during_discovery() {
+    let directory = tempfile::tempdir().unwrap();
+    let expiry = std::sync::Arc::new(std::sync::Mutex::new(None::<OffsetDateTime>));
+    let data = IntentApiFixture::graph_with_discovery_hook(
+        vec![IntentReply::json(200, json!({"graphs": []}))],
+        {
+            let expiry = expiry.clone();
+            move || {
+                let expiry = expiry.lock().unwrap().unwrap();
+                while OffsetDateTime::now_utc() < expiry {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        },
+    );
+    let helper = directory.path().join("helper.sh");
+    let response = directory.path().join("response.json");
+    let calls = directory.path().join("calls");
+    std::fs::write(
+        &helper,
+        "IFS= read -r request\nprintf 'called\\n' >> \"$2\"\ncat \"$1\"\n",
+    )
+    .unwrap();
+    let mut context = context();
+    context.endpoint = Some(data.origin.clone());
+    std::fs::write(
+        directory.path().join("config.yaml"),
+        json!({
+            "version": 1, "profiles": {"work": {
+                "api": context.api, "organization_id": context.organization_id,
+                "auth": {"provider": "exec", "command": ["/bin/sh", helper, response, calls]}
+            }}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let input = crate::operator::InvocationConfig::at(Some(directory.path().to_owned()), None);
+    let cli = crate::invocation::parse_from(["omnigraph", "cluster", "list", "--profile", "work"])
+        .unwrap()
+        .cli;
+    let target = crate::scope::resolve(&cli, &input, directory.path(), false, &mut Vec::new())
+        .unwrap()
+        .unwrap();
+    let authentication = crate::operator_routing::authentication(&cli, &input, Some(&target))
+        .unwrap()
+        .unwrap();
+    crate::operator_routing::test_transport_scope(&[&data.origin], async {
+        crate::operator_routing::AUTH
+            .scope(Some(authentication.clone()), async {
+                let expires = OffsetDateTime::now_utc() + time::Duration::seconds(2);
+                *expiry.lock().unwrap() = Some(expires);
+                std::fs::write(
+                    &response,
+                    json!({"version": 1,
+                        "credential": {"type": "bearer", "token": "expiring-control-test-only"},
+                        "expires_at": expires.format(&Rfc3339).unwrap()
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                authentication.token().await.unwrap();
+                let credential = identity_credential(&context, &data.origin);
+                let expected = format!("Bearer {}", credential.token);
+                let client = resolve_loaded(None, &context, credential).unwrap();
+                client.list_graphs().await.unwrap();
+                assert_eq!(data.requests().len(), 2);
+                assert_eq!(data.requests()[1].headers["authorization"], expected);
+                assert_eq!(
+                    authentication
+                        .token()
+                        .await
+                        .unwrap_err()
+                        .downcast_ref::<crate::credential_sources::CredentialError>(),
+                    Some(&crate::credential_sources::CredentialError::Expired)
+                );
+                assert_eq!(std::fs::read_to_string(&calls).unwrap(), "called\n");
+                data.assert_complete();
+            })
+            .await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn issuance_reuses_rechecked_store_and_returns_persisted_credential_without_rereading() {
+    let mut context = context();
+    let cp = IntentApiFixture::with_origin(|origin| {
+        context.api = origin.into();
+        let credential = identity_credential(&context, "https://data.example");
+        let mut response = credential.metadata();
+        response["token"] = json!(credential.token);
+        vec![IntentReply::json(
+            200,
+            json!({"data":response,"meta":{"cluster_id":context.cluster,"incarnation":context.incarnation}}),
+        )]
+    });
+    crate::operator_routing::test_transport_scope(&[&cp.origin], async {
+        let store = ReadBudgetStore {
+            raw: MemoryStore::default(),
+            reads: Default::default(),
+            budget: 2,
+        };
+        let client = acquire_resource(
+            None,
+            &context,
+            &store,
+            async |_| Ok(Some("alice".into())),
+            async |context| Api::new(context.api.clone(), Some("control-token".into())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.reads.get(), 2);
+        let saved: Credential =
+            serde_json::from_str(&store.raw.get(&key(&context)).unwrap().unwrap()).unwrap();
+        assert!(
+            matches!(client, GraphClient::Remote { token: Some(token), .. } if token == saved.token)
+        );
+        cp.assert_complete();
+    })
+    .await;
+}
+
+#[derive(Default)]
+struct BoundDataStore(MemoryStore);
+
+impl Store for BoundDataStore {
+    fn get(&self, key: &str) -> Result<Option<String>> {
+        self.0.get(&crate::operator_routing::data_namespace(key))
+    }
+    fn put(&self, key: &str, value: &str) -> Result<()> {
+        self.0
+            .put(&crate::operator_routing::data_namespace(key), value)
+    }
+    fn remove(&self, key: &str) -> Result<()> {
+        self.0.remove(&crate::operator_routing::data_namespace(key))
+    }
+}
+
+#[tokio::test]
+async fn stored_token_cache_survives_control_outage_but_not_expiry_or_generation_change() {
+    let data = IntentApiFixture::graph(vec![IntentReply::json(200, json!({"graphs":[]}))]);
+    let mut context = context();
+    context.endpoint = Some(data.origin.clone());
+    let cp = IntentApiFixture::with_origin(|origin| {
+        context.api = origin.into();
+        let credential = identity_credential(&context, &data.origin);
+        let mut response = credential.metadata();
+        response["token"] = json!(credential.token);
+        vec![IntentReply::json(
+            200,
+            json!({"data":response,"meta":{"cluster_id":context.cluster,"incarnation":context.incarnation}}),
+        )]
+    });
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("config.yaml"), format!(
+        "version: 1\nprofiles:\n  work:\n    api: {}\n    organization_id: org_test\n    auth:\n      provider: token\n      source: {{store: {{}}}}\n", cp.origin
+    )).unwrap();
+    let cli =
+        crate::invocation::parse_from(["omnigraph", "credentials", "status", "--profile", "work"])
+            .unwrap()
+            .cli;
+    let binding = || {
+        let input = crate::operator::InvocationConfig::at(Some(directory.path().to_owned()), None);
+        let target =
+            crate::scope::resolve(&cli, &input, directory.path(), true, &mut std::io::sink())
+                .unwrap();
+        crate::operator_routing::authentication(&cli, &input, target.as_ref())
+            .unwrap()
+            .unwrap()
+    };
+    let auth = binding();
+    let persistent = BoundDataStore::default();
+    let api_origin = cp.origin.clone();
+    let data_origin = data.origin.clone();
+    crate::operator_routing::test_transport_scope(&[&api_origin, &data_origin], async {
+        crate::operator_routing::AUTH
+            .scope(Some(auth.clone()), async {
+                let store = ResourceStore::for_profile(
+                    &auth.profile,
+                    &auth.derived_credentials,
+                    &persistent,
+                );
+                let api = Api::new(context.api.clone(), Some("test-control-token".into())).unwrap();
+                mint_for_principal(&store, &context, &api, 3600, Some("alice"))
+                    .await
+                    .unwrap();
+                cp.assert_complete();
+                drop(cp);
+                let client = acquire_resource(
+                    None,
+                    &context,
+                    &store,
+                    async |_| {
+                        panic!("validated stored-token cache must not contact control identity")
+                    },
+                    async |_| panic!("validated stored-token cache must not exchange again"),
+                )
+                .await
+                .unwrap();
+                assert!(client.list_graphs().await.unwrap().graphs.is_empty());
+                let original = store.get(&key(&context)).unwrap().unwrap();
+                let mut expired: Credential = serde_json::from_str(&original).unwrap();
+                expire_identity(&mut expired);
+                store
+                    .put(&key(&context), &serde_json::to_string(&expired).unwrap())
+                    .unwrap();
+                let failure = acquire_resource(
+                    None,
+                    &context,
+                    &store,
+                    async |_| Err(Failure::refused("control_unavailable", "test outage")),
+                    async |_| panic!("failed identity verification must not issue credentials"),
+                )
+                .await
+                .err()
+                .expect("expired credential must require control verification");
+                assert_eq!(failure.body["type"], "control_unavailable");
+                store.put(&key(&context), &original).unwrap();
+                auth.invalidate().unwrap();
+                let failure = acquire_resource(
+                    None,
+                    &context,
+                    &store,
+                    async |_| panic!("stale invocation must refuse locally"),
+                    async |_| panic!("stale invocation must not issue credentials"),
+                )
+                .await
+                .err()
+                .expect("invalidated generation must refuse reuse");
+                assert_eq!(failure.body["type"], "credential_generation_changed");
+            })
+            .await;
+        let fresh = binding();
+        crate::operator_routing::AUTH
+            .scope(Some(fresh.clone()), async {
+                let store = ResourceStore::for_profile(
+                    &fresh.profile,
+                    &fresh.derived_credentials,
+                    &persistent,
+                );
+                assert!(store.get(&key(&context)).unwrap().is_none());
+                let failure = acquire_resource(
+                    None,
+                    &context,
+                    &store,
+                    async |_| Err(Failure::refused("control_unavailable", "test outage")),
+                    async |_| panic!("new generation requires successful verification"),
+                )
+                .await
+                .err()
+                .expect("new generation must require control verification");
+                assert_eq!(failure.body["type"], "control_unavailable");
+            })
+            .await;
+    })
+    .await;
+    data.assert_complete();
+}
+
+#[tokio::test]
+async fn token_clear_skips_unavailable_transport_and_removes_local_credential() {
+    for proxy_conflict in [false, true] {
+        let api = IntentApiFixture::new(vec![]);
+        let directory = tempfile::tempdir().unwrap();
+        crate::operator_routing::test_transport_scope(&[&api.origin], async {
+            crate::operator_routing::test_broken_control_transport_scope(
+                &api.origin,
+                directory.path().join("missing.pem"),
+                proxy_conflict,
+                async {
+                    let mut context = context();
+                    context.api = api.origin.clone();
+                    let store = MemoryStore::default();
+                    save(
+                        &store,
+                        &context,
+                        &credential(&context, "https://data.example"),
+                    );
+                    let cli = crate::invocation::parse_from([
+                        "omnigraph",
+                        "cluster",
+                        "token",
+                        "--clear",
+                        "--target",
+                        "cloud",
+                    ])
+                    .unwrap()
+                    .cli;
+                    let target = crate::targets::ResolvedTarget::new(
+                        crate::targets::TargetBinding::Managed(crate::managed::Binding {
+                            api: api.origin.clone(),
+                            organization_id: Some(context.organization_id.clone()),
+                            cluster: Some(crate::managed::ClusterBinding {
+                                cluster_id: context.cluster.clone(),
+                                cluster_incarnation: context.incarnation.clone(),
+                                endpoint: context.endpoint.clone(),
+                                default_graph: None,
+                            }),
+                            control_auth: crate::managed::ControlAuth::HumanDevice,
+                        }),
+                        crate::targets::TargetProvenance::Explicit {
+                            name: "cloud".into(),
+                        },
+                    );
+                    crate::operator_routing::freeze_transports(&cli, Some(&target)).unwrap();
+                    let result = token_with_store(&cli, &context, None, true, &store)
+                        .await
+                        .unwrap();
+                    assert_eq!(result["data"]["local_credential_removed"], true);
+                    assert_eq!(result["data"]["revocation_performed"], false);
+                    assert!(store.get(&key(&context)).unwrap().is_none());
+                    assert!(api.requests().is_empty());
+                },
+            )
+            .await;
+        })
+        .await;
+        api.assert_complete();
+    }
+}
+
+#[derive(Default)]
+struct UnavailablePersistentStore(std::cell::Cell<usize>);
+
+impl Store for UnavailablePersistentStore {
+    fn get(&self, _: &str) -> Result<Option<String>> {
+        self.0.set(self.0.get() + 1);
+        Err(Failure::refused(
+            "keychain_unavailable",
+            "unavailable persistent test store",
+        ))
+    }
+    fn put(&self, _: &str, _: &str) -> Result<()> {
+        panic!("unavailable store must never receive credentials")
+    }
+    fn remove(&self, _: &str) -> Result<()> {
+        panic!("resource acquisition must not remove persistent custody")
+    }
+}
+
+fn external_profiles() -> Vec<crate::operator_schema::AuthProfile> {
+    use crate::operator_schema::{AuthProfile, TokenSource};
+    vec![
+        AuthProfile::Token {
+            source: TokenSource::Env {
+                env: "EXPLICIT_TEST_TOKEN".into(),
+            },
+        },
+        AuthProfile::Token {
+            source: TokenSource::File {
+                file: "/explicit/token".into(),
+            },
+        },
+        AuthProfile::Exec {
+            command: vec!["/explicit/helper".into()],
+            timeout: "30s".into(),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn external_resource_and_export_acquire_only_invocation_credentials_without_keychain() {
+    for profile in external_profiles() {
+        let mut context = context();
+        let cp = IntentApiFixture::with_origin(|origin| {
+            context.api = origin.to_owned();
+            let credential = identity_credential(&context, "https://data.example");
+            let mut response = credential.metadata();
+            response["token"] = json!(credential.token);
+            vec![IntentReply::json(
+                200,
+                json!({"data":response,"meta":{"cluster_id":context.cluster,"incarnation":context.incarnation}}),
+            )]
+        });
+        crate::operator_routing::test_transport_scope(&[&cp.origin], async {
+        let unavailable = UnavailablePersistentStore::default();
+        let memory = InvocationCredentials::default();
+        let store = ResourceStore::for_profile(&profile, &memory, &unavailable);
+        assert!(!store.persistent());
+        let exported = acquire_resource(
+            None,
+            &context,
+            &store,
+            async |_| Ok(Some("alice".into())),
+            async |context| Api::new(context.api.clone(), Some("external-control-token".into())),
+        )
+        .await
+        .unwrap();
+        let GraphClient::Remote {
+            token: Some(exported),
+            ..
+        } = exported
+        else {
+            panic!("managed export requires the shared remote client");
+        };
+        assert_ne!(exported, "external-control-token");
+        let client = acquire_resource(
+            Some("knowledge"),
+            &context,
+            &store,
+            async |_| Ok(Some("alice".into())),
+            async |_| panic!("same invocation should reuse its validated data credential"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(client, GraphClient::Remote { token: Some(token), .. } if token == exported)
+        );
+        assert_eq!(unavailable.0.get(), 0);
+        assert_eq!(cp.requests().len(), 1);
+        assert_eq!(cp.requests()[0].path, "/v1/clusters/cluster-a/tokens");
+        assert!(
+            InvocationCredentials::default()
+                .get(&key(&context))
+                .unwrap()
+                .is_none()
+        );
+        assert!(!format!("{memory:?}").contains(&exported));
+        cp.assert_complete();
+    }).await;
+    }
+}
+
+#[tokio::test]
+async fn external_source_failure_never_falls_back_or_submits_an_exchange() {
+    for profile in external_profiles() {
+        let unavailable = UnavailablePersistentStore::default();
+        let memory = InvocationCredentials::default();
+        let store = ResourceStore::for_profile(&profile, &memory, &unavailable);
+        let context = context();
+        let failure = acquire_resource(
+            Some("knowledge"),
+            &context,
+            &store,
+            async |_| {
+                Err(Failure::refused(
+                    "credential_unavailable",
+                    "selected external source failed",
+                ))
+            },
+            async |_| {
+                panic!("failed external source must not contact issuer or select another provider")
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(failure.body["type"], "credential_unavailable");
+        assert_eq!(unavailable.0.get(), 0);
+        assert!(memory.get(&key(&context)).unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn persistent_profiles_do_not_fall_back_to_invocation_custody() {
+    use crate::operator_schema::{AuthProfile, Empty, TokenSource};
+    for profile in [
+        AuthProfile::Omnigraph,
+        AuthProfile::Token {
+            source: TokenSource::Store { store: Empty {} },
+        },
+    ] {
+        let unavailable = UnavailablePersistentStore::default();
+        let memory = InvocationCredentials::default();
+        let store = ResourceStore::for_profile(&profile, &memory, &unavailable);
+        assert!(store.persistent());
+        let context = context();
+        let failure = acquire_resource(
+            Some("knowledge"),
+            &context,
+            &store,
+            async |_| {
+                panic!("unavailable persistent custody must fail before identity verification")
+            },
+            async |_| panic!("unavailable persistent custody must fail before exchange"),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(failure.body["type"], "keychain_unavailable");
+        assert_eq!(unavailable.0.get(), 1);
+        assert!(memory.get(&key(&context)).unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn invocation_credentials_require_verified_identity_and_exact_resource_exchange() {
+    for mismatch in [
+        "principal",
+        "tenant",
+        "incarnation",
+        "endpoint",
+        "forbidden",
+    ] {
+        let mut context = context();
+        let cp = IntentApiFixture::with_origin(|origin| {
+            context.api = origin.to_owned();
+            if mismatch == "forbidden" {
+                return vec![IntentReply::json(403, json!({"type":"forbidden"}))];
+            }
+            let mut issued = context.clone();
+            if mismatch == "tenant" {
+                issued.organization_id = "org_other".into();
+            }
+            let credential = identity_credential(
+                &issued,
+                if mismatch == "endpoint" {
+                    "https://wrong.example"
+                } else {
+                    "https://data.example"
+                },
+            );
+            let mut response = credential.metadata();
+            response["token"] = json!(credential.token);
+            vec![IntentReply::json(
+                200,
+                json!({"data":response,"meta":{"cluster_id":context.cluster,"incarnation":if mismatch == "incarnation" { "incarnation-other" } else { "incarnation-a" }}}),
+            )]
+        });
+        crate::operator_routing::test_transport_scope(&[&cp.origin], async {
+            let unavailable = UnavailablePersistentStore::default();
+            let memory = InvocationCredentials::default();
+            let profile = external_profiles().remove(0);
+            let store = ResourceStore::for_profile(&profile, &memory, &unavailable);
+            assert!(
+                acquire_resource(
+                    Some("knowledge"),
+                    &context,
+                    &store,
+                    async |_| Ok(Some(
+                        if mismatch == "principal" {
+                            "bob"
+                        } else {
+                            "alice"
+                        }
+                        .into()
+                    )),
+                    async |context| Api::new(
+                        context.api.clone(),
+                        Some("external-control-token".into())
+                    )
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(unavailable.0.get(), 0);
+            assert!(memory.get(&key(&context)).unwrap().is_none());
+            assert_eq!(cp.requests().len(), 1);
+            cp.assert_complete();
+        })
+        .await;
+    }
+    let profile = external_profiles().remove(0);
+    let memory = InvocationCredentials::default();
+    let unavailable = UnavailablePersistentStore::default();
+    let store = ResourceStore::for_profile(&profile, &memory, &unavailable);
+    assert!(
+        acquire_resource(
+            None,
+            &context(),
+            &store,
+            async |_| Ok(None),
+            async |_| panic!("unverified identity must not exchange credentials")
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(unavailable.0.get(), 0);
+}
+
 #[tokio::test]
 async fn ordinary_graph_command_acquires_missing_or_expired_identity_once_before_submission() {
     for expired in [false, true] {
@@ -20,43 +715,46 @@ async fn ordinary_graph_command_acquires_missing_or_expired_identity_once_before
                 json!({"data":response,"meta":{"cluster_id":context.cluster,"incarnation":"incarnation-a"}}),
             )]
         });
-        let store = MemoryStore::default();
-        if expired {
-            let mut saved = identity_credential(&context, "https://data.example");
-            expire_identity(&mut saved);
-            save(&store, &context, &saved);
-        }
+        crate::operator_routing::test_transport_scope(&[&cp.origin], async {
+            let store = MemoryStore::default();
+            if expired {
+                let mut saved = identity_credential(&context, "https://data.example");
+                expire_identity(&mut saved);
+                save(&store, &context, &saved);
+            }
 
-        let cli =
-            Cli::try_parse_from(["omnigraph", "mutate", "m", "--graph", "knowledge"]).unwrap();
-        let client = resolve_with_acquisition(
-            &cli,
-            &context,
-            &store,
-            async |_| Ok(Some("alice".into())),
-            async |context| Api::new(context.api.clone(), Some("provider-access".into())),
-        )
-        .await
-        .unwrap();
-        let _ = client;
-        assert_eq!(cp.requests().len(), 1);
-        assert_eq!(cp.requests()[0].path, "/v1/clusters/cluster-a/tokens");
-        assert_eq!(
-            cp.requests()[0].body,
-            json!({"version":2,"ttl_seconds":3600})
-        );
-        assert!(
-            resolve_with_acquisition(
+            let cli =
+                Cli::try_parse_from(["omnigraph", "mutate", "m", "--graph", "knowledge"]).unwrap();
+            let client = resolve_with_acquisition(
                 &cli,
                 &context,
                 &store,
                 async |_| Ok(Some("alice".into())),
-                async |_| { panic!("valid graph credential must not call the API") }
+                async |context| Api::new(context.api.clone(), Some("provider-access".into())),
             )
             .await
-            .is_ok()
-        );
-        cp.assert_complete();
+            .unwrap();
+            let _ = client;
+            assert_eq!(cp.requests().len(), 1);
+            assert_eq!(cp.requests()[0].path, "/v1/clusters/cluster-a/tokens");
+            assert_eq!(
+                cp.requests()[0].body,
+                json!({"version":2,"ttl_seconds":3600})
+            );
+            assert!(
+                resolve_with_acquisition(
+                    &cli,
+                    &context,
+                    &store,
+                    async |_| Ok(Some("alice".into())),
+                    async |_| { panic!("valid graph credential must not call the API") }
+                )
+                .await
+                .is_ok()
+            );
+            cp.assert_complete();
+        })
+        .await;
     }
 }
 
@@ -174,25 +872,28 @@ async fn acquisition_never_reuses_another_principal_or_accepts_a_wrong_issued_id
             json!({"data":response,"meta":{"cluster_id":context.cluster,"incarnation":"incarnation-a"}}),
         )]
     });
-    let store = MemoryStore::default();
-    let old = identity_credential(&context, "https://data.example");
-    save(&store, &context, &old);
-    let before = store.get(&key(&context)).unwrap();
+    crate::operator_routing::test_transport_scope(&[&cp.origin], async {
+        let store = MemoryStore::default();
+        let old = identity_credential(&context, "https://data.example");
+        save(&store, &context, &old);
+        let before = store.get(&key(&context)).unwrap();
 
-    let cli = Cli::try_parse_from(["omnigraph", "query", "q", "--graph", "knowledge"]).unwrap();
-    assert!(
-        resolve_with_acquisition(
-            &cli,
-            &context,
-            &store,
-            async |_| Ok(Some("bob".into())),
-            async |context| Api::new(context.api.clone(), Some("bob-provider-token".into()))
-        )
-        .await
-        .is_err()
-    );
-    assert_eq!(store.get(&key(&context)).unwrap(), before);
-    cp.assert_complete();
+        let cli = Cli::try_parse_from(["omnigraph", "query", "q", "--graph", "knowledge"]).unwrap();
+        assert!(
+            resolve_with_acquisition(
+                &cli,
+                &context,
+                &store,
+                async |_| Ok(Some("bob".into())),
+                async |context| Api::new(context.api.clone(), Some("bob-provider-token".into()))
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(store.get(&key(&context)).unwrap(), before);
+        cp.assert_complete();
+    })
+    .await;
 }
 
 fn context() -> Context {
@@ -239,7 +940,10 @@ fn identity_credential(context: &Context, endpoint: &str) -> Credential {
 }
 
 fn expire_identity(credential: &mut Credential) {
-    let expiry = OffsetDateTime::now_utc().unix_timestamp() - 1;
+    set_identity_expiry(credential, OffsetDateTime::now_utc().unix_timestamp() - 1);
+}
+
+fn set_identity_expiry(credential: &mut Credential, expiry: i64) {
     credential.expires_at = OffsetDateTime::from_unix_timestamp(expiry)
         .unwrap()
         .format(&Rfc3339)
@@ -300,11 +1004,15 @@ fn token_arguments_bound_lifetime_and_refuse_removed_actions() {
         "policies",
         "graphs",
         "κnowledge",
-        "1graph",
-        "-graph",
+        "healthz",
+        "openapi",
     ] {
         assert!(graph_id(bad).is_err());
     }
+    for valid in ["1graph", "-graph", "og_catalog", &"a".repeat(64)] {
+        assert!(graph_id(valid).is_ok(), "{valid}");
+    }
+    assert!(graph_id(&"a".repeat(65)).is_err());
     assert!(Cli::try_parse_from(["omnigraph", "cluster", "token", "--clear"]).is_ok());
     assert!(Cli::try_parse_from(["omnigraph", "cluster", "token"]).is_ok());
     assert!(Cli::try_parse_from(["omnigraph", "query", "q", "--direct"]).is_err());
@@ -317,6 +1025,7 @@ async fn minted_data_credential_is_separate_and_works_after_api_stops() {
         IntentReply::json(200, change_reply()),
         IntentReply::json(200, read_reply()),
     ]);
+    crate::operator_routing::test_transport_scope(&[&data.origin], async {
     let mut context = context();
     let cp = IntentApiFixture::with_origin(|origin| {
         context.api = origin.to_owned();
@@ -330,6 +1039,8 @@ async fn minted_data_credential_is_separate_and_works_after_api_stops() {
             json!({"data":response,"meta":{"cluster_id":context.cluster,"incarnation":"incarnation-a"}}),
         )]
     });
+let cp_origin = cp.origin.clone();
+crate::operator_routing::test_transport_scope(&[&cp_origin], async {
     let cp_store = MemoryStore::default();
     cp_store
         .put(&context.api, "unrelated-control-session")
@@ -355,7 +1066,7 @@ async fn minted_data_credential_is_separate_and_works_after_api_stops() {
     assert_eq!(requests[0].body, json!({"version":2,"ttl_seconds":3600}));
     cp.assert_complete();
     drop(cp);
-    let client = load(&data_store, &context, "knowledge").unwrap();
+    let client = resolve_resource(Some("knowledge"), &context, &data_store).unwrap();
     let result = client
         .query(
             Some(ReadTarget::Branch("main".into())),
@@ -409,7 +1120,7 @@ async fn minted_data_credential_is_separate_and_works_after_api_stops() {
         false
     );
     assert_eq!(
-        load(&data_store, &context, "knowledge").err().unwrap().body["type"],
+        resolve_resource(Some("knowledge"), &context, &data_store).err().unwrap().body["type"],
         "data_credential_required"
     );
     assert!(cp_store.get(&context.api).unwrap().is_some());
@@ -417,6 +1128,8 @@ async fn minted_data_credential_is_separate_and_works_after_api_stops() {
         data_store.get(&key(&other)).unwrap().as_deref(),
         Some("other-data-entry")
     );
+}).await;
+}).await;
 }
 
 #[tokio::test]
@@ -434,6 +1147,7 @@ async fn identity_issuance_caches_no_permissions_and_discovers_without_control_c
         IntentReply::json(200, json!({"commits":[commit.clone()]})),
         IntentReply::json(200, commit.clone()),
     ]);
+    crate::operator_routing::test_transport_scope(&[&data.origin], async {
     let mut context = context();
     let cp = IntentApiFixture::with_origin(|origin| {
         context.api = origin.to_owned();
@@ -446,6 +1160,8 @@ async fn identity_issuance_caches_no_permissions_and_discovers_without_control_c
             json!({"data":response,"meta":{"cluster_id":context.cluster,"incarnation":"incarnation-a"}}),
         )]
     });
+let cp_origin = cp.origin.clone();
+crate::operator_routing::test_transport_scope(&[&cp_origin], async {
     let store = MemoryStore::default();
     let api = Api::new(cp.origin.clone(), Some("control-session".into())).unwrap();
     let output = mint(&store, &context, &api, 3600).await.unwrap();
@@ -461,7 +1177,7 @@ async fn identity_issuance_caches_no_permissions_and_discovers_without_control_c
     let saved: Value = serde_json::from_str(&store.get(&key(&context)).unwrap().unwrap()).unwrap();
     assert!(saved.get("grants").is_none());
     assert!(
-        load(&store, &context, "any-graph").is_ok(),
+        resolve_resource(Some("any-graph"), &context, &store).is_ok(),
         "Cedar, not the local cache, decides permission"
     );
     let dir = tempfile::tempdir().unwrap();
@@ -562,6 +1278,8 @@ async fn identity_issuance_caches_no_permissions_and_discovers_without_control_c
     save(&store, &context, &retired);
     let failure = resolve_context(&cli, &context, &store).err().unwrap();
     assert_eq!(failure.body["type"], "data_credential_invalid");
+}).await;
+}).await;
 }
 
 #[tokio::test]
@@ -609,18 +1327,21 @@ async fn identity_issuance_rejects_wrong_profile_and_authority_without_cache_rep
             }
             vec![IntentReply::json(200, envelope)]
         });
-        let store = MemoryStore::default();
-        store.put(&key(&context), "existing-credential").unwrap();
-        let api = Api::new(cp.origin.clone(), Some("control-session".into())).unwrap();
-        assert!(
-            mint(&store, &context, &api, 3600).await.is_err(),
-            "accepted {field}"
-        );
-        assert_eq!(
-            store.get(&key(&context)).unwrap().as_deref(),
-            Some("existing-credential")
-        );
-        cp.assert_complete();
+        crate::operator_routing::test_transport_scope(&[&cp.origin], async {
+            let store = MemoryStore::default();
+            store.put(&key(&context), "existing-credential").unwrap();
+            let api = Api::new(cp.origin.clone(), Some("control-session".into())).unwrap();
+            assert!(
+                mint(&store, &context, &api, 3600).await.is_err(),
+                "accepted {field}"
+            );
+            assert_eq!(
+                store.get(&key(&context)).unwrap().as_deref(),
+                Some("existing-credential")
+            );
+            cp.assert_complete();
+        })
+        .await;
     }
 }
 
@@ -668,7 +1389,7 @@ fn cached_authority_refuses_wrong_bindings_expiry_and_extra_fields() {
         corrupt[field] = value;
         store.put(&key(&context), &corrupt.to_string()).unwrap();
         assert!(
-            load(&store, &context, "knowledge").is_err(),
+            resolve_resource(Some("knowledge"), &context, &store).is_err(),
             "accepted {field}"
         );
     }
@@ -676,7 +1397,7 @@ fn cached_authority_refuses_wrong_bindings_expiry_and_extra_fields() {
         .unwrap()
         .replacen("{", "{\"version\":1,", 1);
     store.put(&key(&context), &duplicate).unwrap();
-    assert!(load(&store, &context, "knowledge").is_err());
+    assert!(resolve_resource(Some("knowledge"), &context, &store).is_err());
 }
 
 struct NoCredentialAccess;
@@ -709,52 +1430,56 @@ async fn managed_commit_reads_use_exact_cached_read_authority_without_api_or_fal
         IntentReply::json(200, json!({"commits":[commit.clone()]})),
         IntentReply::json(200, commit.clone()),
     ]);
-    context.endpoint = Some(server.origin.clone());
-    let cached = credential(&context, &server.origin);
-    for command in [vec!["commit", "list"], vec!["commit", "show", "commit-a"]] {
-        let cli = Cli::try_parse_from(
-            ["omnigraph", "--graph", "knowledge"]
-                .into_iter()
-                .chain(command.clone()),
-        )
-        .unwrap();
-        assert_eq!(
-            resolve_context(&cli, &context, &store).err().unwrap().body["type"],
-            "data_credential_required"
-        );
-        save(&store, &context, &cached);
-        let client = resolve_context(&cli, &context, &store).unwrap();
-        if command[1] == "list" {
-            let output = client.list_commits(Some("main")).await.unwrap();
-            assert_eq!(serde_json::to_value(&output.commits[0]).unwrap(), commit);
-        } else {
-            let output = client.get_commit("commit-a").await.unwrap();
-            assert_eq!(serde_json::to_value(output).unwrap(), commit);
+    crate::operator_routing::test_transport_scope(&[&server.origin], async {
+        context.endpoint = Some(server.origin.clone());
+        let cached = credential(&context, &server.origin);
+        for command in [vec!["commit", "list"], vec!["commit", "show", "commit-a"]] {
+            let cli = Cli::try_parse_from(
+                ["omnigraph", "--graph", "knowledge"]
+                    .into_iter()
+                    .chain(command.clone()),
+            )
+            .unwrap();
+            assert_eq!(
+                resolve_context(&cli, &context, &store).err().unwrap().body["type"],
+                "data_credential_required"
+            );
+            save(&store, &context, &cached);
+            let client = resolve_context(&cli, &context, &store).unwrap();
+            if command[1] == "list" {
+                let output = client.list_commits(Some("main")).await.unwrap();
+                assert_eq!(serde_json::to_value(&output.commits[0]).unwrap(), commit);
+            } else {
+                let output = client.get_commit("commit-a").await.unwrap();
+                assert_eq!(serde_json::to_value(output).unwrap(), commit);
+            }
+            clear(&store, &context).unwrap();
+            let no_graph =
+                Cli::try_parse_from(std::iter::once("omnigraph").chain(command)).unwrap();
+            assert_eq!(
+                resolve_context(&no_graph, &context, &NoCredentialAccess)
+                    .err()
+                    .unwrap()
+                    .body["type"],
+                "graph_required"
+            );
         }
-        clear(&store, &context).unwrap();
-        let no_graph = Cli::try_parse_from(std::iter::once("omnigraph").chain(command)).unwrap();
-        assert_eq!(
-            resolve_context(&no_graph, &context, &NoCredentialAccess)
-                .err()
-                .unwrap()
-                .body["type"],
-            "graph_required"
-        );
-    }
-    let requests = server.workflow_requests();
-    assert_eq!(requests.len(), 2);
-    for (request, path) in requests.iter().zip([
-        "/graphs/knowledge/commits?branch=main",
-        "/graphs/knowledge/commits/commit-a",
-    ]) {
-        assert_eq!(request.method, "GET");
-        assert_eq!(request.path, path);
-        assert_eq!(
-            request.headers["authorization"],
-            format!("Bearer {}", cached.token)
-        );
-    }
-    server.assert_complete();
+        let requests = server.workflow_requests();
+        assert_eq!(requests.len(), 2);
+        for (request, path) in requests.iter().zip([
+            "/graphs/knowledge/commits?branch=main",
+            "/graphs/knowledge/commits/commit-a",
+        ]) {
+            assert_eq!(request.method, "GET");
+            assert_eq!(request.path, path);
+            assert_eq!(
+                request.headers["authorization"],
+                format!("Bearer {}", cached.token)
+            );
+        }
+        server.assert_complete();
+    })
+    .await;
 }
 
 #[test]
@@ -799,80 +1524,91 @@ fn managed_load_uses_identity_and_keeps_target_preflight() {
 #[tokio::test]
 async fn managed_data_transport_refuses_redirect_and_bounds_body() {
     let target = IntentApiFixture::new(vec![]);
-    let batch = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(batch.path(), "{}\n").unwrap();
-    let mut chunked = format!("{:x}\r\n", 8 * 1024 * 1024 + 1).into_bytes();
-    chunked.extend(vec![b' '; 8 * 1024 * 1024 + 1]);
-    chunked.extend_from_slice(b"\r\n0\r\n\r\n");
-    let operations = ["query", "load", "commit-list", "commit-show"];
-    let cases = [
-        (
-            IntentReply {
-                status: 307,
-                headers: vec![("Location".into(), target.origin.clone())],
-                body: vec![],
-            },
-            "redirect",
-        ),
-        (
-            IntentReply {
-                status: 200,
-                headers: vec![("Content-Length".into(), (8 * 1024 * 1024 + 1).to_string())],
-                body: vec![],
-            },
-            "8 MiB",
-        ),
-        (
-            IntentReply {
-                status: 200,
-                headers: vec![("Transfer-Encoding".into(), "chunked".into())],
-                body: chunked,
-            },
-            "8 MiB",
-        ),
-    ];
-    let server = IntentApiFixture::graph(
-        cases
-            .iter()
-            .flat_map(|(reply, _)| std::iter::repeat_n(reply.clone(), operations.len()))
-            .collect(),
-    );
-    let client = GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
-    let mut completed = 0;
-    for (_, expected) in &cases {
-        for operation in operations {
-            let error = match operation {
-                "load" => client
-                    .load(
-                        "main",
-                        None,
-                        batch.path().to_str().unwrap(),
-                        crate::cli::CliLoadMode::Append,
-                        &[],
-                        &mut Vec::new(),
-                    )
-                    .await
-                    .unwrap_err(),
-                "commit-list" => client.list_commits(Some("main")).await.unwrap_err(),
-                "commit-show" => client.get_commit("commit-a").await.unwrap_err(),
-                _ => client
-                    .query(
-                        Some(ReadTarget::Branch("main".into())),
-                        "query q() {}",
-                        Some("q"),
-                        None,
-                        &[],
-                    )
-                    .await
-                    .unwrap_err(),
-            };
-            assert!(error.to_string().contains(expected), "{error}");
-            completed += 1;
-            assert_eq!(server.workflow_requests().len(), completed, "{operation}");
-        }
-    }
-    server.assert_complete();
-    target.assert_complete();
+    crate::operator_routing::test_transport_scope(&[&target.origin], async {
+        let batch = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(batch.path(), "{}\n").unwrap();
+        let mut chunked = format!("{:x}\r\n", 8 * 1024 * 1024 + 1).into_bytes();
+        chunked.extend(vec![b' '; 8 * 1024 * 1024 + 1]);
+        chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+        let operations = ["query", "load", "commit-list", "commit-show"];
+        let cases = [
+            (
+                IntentReply {
+                    status: 307,
+                    headers: vec![("Location".into(), target.origin.clone())],
+                    body: vec![],
+                },
+                "redirect",
+            ),
+            (
+                IntentReply {
+                    status: 200,
+                    headers: vec![("Content-Length".into(), (8 * 1024 * 1024 + 1).to_string())],
+                    body: vec![],
+                },
+                "8 MiB",
+            ),
+            (
+                IntentReply {
+                    status: 200,
+                    headers: vec![("Transfer-Encoding".into(), "chunked".into())],
+                    body: chunked,
+                },
+                "8 MiB",
+            ),
+        ];
+        let server = IntentApiFixture::graph(
+            cases
+                .iter()
+                .flat_map(|(reply, _)| std::iter::repeat_n(reply.clone(), operations.len()))
+                .collect(),
+        );
+        crate::operator_routing::test_transport_scope(&[&server.origin], async {
+            let client = GraphClient::managed(
+                &server.origin,
+                "knowledge",
+                crate::credential_sources::test_credential(&server.origin, DATA_TOKEN),
+            )
+            .unwrap();
+            let mut completed = 0;
+            for (_, expected) in &cases {
+                for operation in operations {
+                    let error = match operation {
+                        "load" => client
+                            .load(
+                                "main",
+                                None,
+                                batch.path().to_str().unwrap(),
+                                crate::cli::CliLoadMode::Append,
+                                &[],
+                                &mut Vec::new(),
+                            )
+                            .await
+                            .unwrap_err(),
+                        "commit-list" => client.list_commits(Some("main")).await.unwrap_err(),
+                        "commit-show" => client.get_commit("commit-a").await.unwrap_err(),
+                        _ => client
+                            .query(
+                                Some(ReadTarget::Branch("main".into())),
+                                "query q() {}",
+                                Some("q"),
+                                None,
+                                &[],
+                            )
+                            .await
+                            .unwrap_err(),
+                    };
+                    assert!(error.to_string().contains(expected), "{error}");
+                    completed += 1;
+                    assert_eq!(server.workflow_requests().len(), completed, "{operation}");
+                }
+            }
+            server.assert_complete();
+            target.assert_complete();
+        })
+        .await;
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -907,39 +1643,43 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
             })
             .collect(),
     );
-    let client = GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
+    crate::operator_routing::test_transport_scope(&[&server.origin], async {
+    let client = GraphClient::managed(&server.origin, "knowledge", crate::credential_sources::test_credential(&server.origin, DATA_TOKEN)).unwrap();
     let mut completed = 0;
     for (status, _) in cases {
         for operation in operations {
-            let (error, evidence) = crate::command_outcome::observe(async {
-                match operation {
-                    "load" => client
-                        .load(
-                            "main",
-                            None,
-                            batch.path().to_str().unwrap(),
-                            crate::cli::CliLoadMode::Append,
-                            &[],
-                            &mut Vec::new(),
-                        )
-                        .await
-                        .unwrap_err(),
-                    "commit-list" => client.list_commits(Some("main")).await.unwrap_err(),
-                    "commit-show" => client.get_commit("commit-a").await.unwrap_err(),
-                    _ => client
-                        .mutate(
-                            Some("main"),
-                            "mutation m() {}",
-                            Some("m"),
-                            None,
-                            Some("head-a"),
-                            &[],
-                            &mut Vec::new(),
-                        )
-                        .await
-                        .unwrap_err(),
-                }
-            })
+            let (error, evidence) = crate::command_outcome::observe(
+                crate::command_outcome::CommandKind::Write,
+                async {
+                    match operation {
+                        "load" => client
+                            .load(
+                                "main",
+                                None,
+                                batch.path().to_str().unwrap(),
+                                crate::cli::CliLoadMode::Append,
+                                &[],
+                                &mut Vec::new(),
+                            )
+                            .await
+                            .unwrap_err(),
+                        "commit-list" => client.list_commits(Some("main")).await.unwrap_err(),
+                        "commit-show" => client.get_commit("commit-a").await.unwrap_err(),
+                        _ => client
+                            .mutate(
+                                Some("main"),
+                                "mutation m() {}",
+                                Some("m"),
+                                None,
+                                Some("head-a"),
+                                &[],
+                                &mut Vec::new(),
+                            )
+                            .await
+                            .unwrap_err(),
+                    }
+                },
+            )
             .await;
             assert!(
                 error
@@ -979,6 +1719,7 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
         }
     }
     server.assert_complete();
+}).await;
 }
 
 #[tokio::test]
@@ -999,114 +1740,76 @@ async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
         vec![IntentReply::json(200, reply)],
         std::time::Duration::from_millis(30_750),
     );
-    let store = MemoryStore::default();
-    context.endpoint = Some(server.origin.clone());
-    let cached = credential(&context, &server.origin);
-    save(&store, &context, &cached);
-    let cli = Cli::try_parse_from([
-        "omnigraph",
-        "load",
-        "--data",
-        batch.to_str().unwrap(),
-        "--graph",
-        "knowledge",
-        "--mode",
-        "append",
-        "--branch",
-        "review",
-        "--from",
-        "main",
-    ])
-    .unwrap();
-    let client = resolve_context(&cli, &context, &store).unwrap();
-    let result = client
-        .load(
-            "review",
-            Some("main"),
+    crate::operator_routing::test_transport_scope(&[&server.origin], async {
+        let store = MemoryStore::default();
+        context.endpoint = Some(server.origin.clone());
+        let cached = credential(&context, &server.origin);
+        save(&store, &context, &cached);
+        let cli = Cli::try_parse_from([
+            "omnigraph",
+            "load",
+            "--data",
             batch.to_str().unwrap(),
-            crate::cli::CliLoadMode::Append,
-            &[],
-            &mut Vec::new(),
-        )
-        .await
+            "--graph",
+            "knowledge",
+            "--mode",
+            "append",
+            "--branch",
+            "review",
+            "--from",
+            "main",
+        ])
         .unwrap();
-    let result = serde_json::to_value(result).unwrap();
-    assert_eq!(result["commit"], commit);
-    assert_eq!(result["commit"]["actor_id"], "principal:alice");
-    assert_eq!(result["base_branch"], "main");
-    assert_eq!(result["branch_created"], true);
-    assert_eq!(result["total_entities"], 2);
-    assert_eq!(result["branch"], "review");
-    let requests = server.workflow_requests();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].method, "POST");
-    assert_eq!(
-        requests[0].path,
-        "/graphs/knowledge/load/ndjson?branch=review&mode=append&from=main"
-    );
-    assert_eq!(requests[0].headers["content-type"], "application/x-ndjson");
-    assert_eq!(
-        requests[0].headers["authorization"],
-        format!("Bearer {}", cached.token)
-    );
-    assert_eq!(requests[0].raw_body, ndjson.as_bytes());
-    assert!(!requests[0].headers.contains_key("x-actor-id"));
-    server.assert_complete();
+        let client = resolve_context(&cli, &context, &store).unwrap();
+        let result = client
+            .load(
+                "review",
+                Some("main"),
+                batch.to_str().unwrap(),
+                crate::cli::CliLoadMode::Append,
+                &[],
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap();
+        let result = serde_json::to_value(result).unwrap();
+        assert_eq!(result["commit"], commit);
+        assert_eq!(result["commit"]["actor_id"], "principal:alice");
+        assert_eq!(result["base_branch"], "main");
+        assert_eq!(result["branch_created"], true);
+        assert_eq!(result["total_entities"], 2);
+        assert_eq!(result["branch"], "review");
+        let requests = server.workflow_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(
+            requests[0].path,
+            "/graphs/knowledge/load/ndjson?branch=review&mode=append&from=main"
+        );
+        assert_eq!(requests[0].headers["content-type"], "application/x-ndjson");
+        assert_eq!(
+            requests[0].headers["authorization"],
+            format!("Bearer {}", cached.token)
+        );
+        assert_eq!(requests[0].raw_body, ndjson.as_bytes());
+        assert!(!requests[0].headers.contains_key("x-actor-id"));
+        server.assert_complete();
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn managed_load_refuses_local_overflow_before_io_and_never_replays_failed_receipts() {
     let file = tempfile::NamedTempFile::new().unwrap();
     let empty_server = IntentApiFixture::new(vec![]);
-    let client =
-        GraphClient::managed(&empty_server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
-    file.as_file().set_len(32 * 1024 * 1024 + 1).unwrap();
-    assert!(
-        client
-            .load(
-                "review",
-                Some("main"),
-                file.path().to_str().unwrap(),
-                crate::cli::CliLoadMode::Append,
-                &[],
-                &mut Vec::new(),
-            )
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("32 MiB")
-    );
-    std::fs::write(file.path(), [255]).unwrap();
-    assert!(
-        client
-            .load(
-                "review",
-                Some("main"),
-                file.path().to_str().unwrap(),
-                crate::cli::CliLoadMode::Append,
-                &[],
-                &mut Vec::new(),
-            )
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("UTF-8")
-    );
-    empty_server.assert_complete();
-    std::fs::write(file.path(), "{}\n").unwrap();
-    for reply in [
-        IntentReply::json(500, json!({"error":"load failed"})),
-        IntentReply::json(429, json!({"error":"busy"})),
-        IntentReply::json(503, json!({"error":"recover first"})),
-        IntentReply {
-            status: 200,
-            headers: vec![("Content-Length".into(), "1000".into())],
-            body: b"{}".to_vec(),
-        },
-        IntentReply::json(200, json!({"not":"a receipt"})),
-    ] {
-        let server = IntentApiFixture::graph(vec![reply]);
-        let client = GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
+    crate::operator_routing::test_transport_scope(&[&empty_server.origin], async {
+        let client = GraphClient::managed(
+            &empty_server.origin,
+            "knowledge",
+            crate::credential_sources::test_credential(&empty_server.origin, DATA_TOKEN),
+        )
+        .unwrap();
+        file.as_file().set_len(32 * 1024 * 1024 + 1).unwrap();
         assert!(
             client
                 .load(
@@ -1118,10 +1821,66 @@ async fn managed_load_refuses_local_overflow_before_io_and_never_replays_failed_
                     &mut Vec::new(),
                 )
                 .await
-                .is_err()
+                .unwrap_err()
+                .to_string()
+                .contains("32 MiB")
         );
-        server.assert_complete();
-    }
+        std::fs::write(file.path(), [255]).unwrap();
+        assert!(
+            client
+                .load(
+                    "review",
+                    Some("main"),
+                    file.path().to_str().unwrap(),
+                    crate::cli::CliLoadMode::Append,
+                    &[],
+                    &mut Vec::new(),
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("UTF-8")
+        );
+        empty_server.assert_complete();
+        std::fs::write(file.path(), "{}\n").unwrap();
+        for reply in [
+            IntentReply::json(500, json!({"error":"load failed"})),
+            IntentReply::json(429, json!({"error":"busy"})),
+            IntentReply::json(503, json!({"error":"recover first"})),
+            IntentReply {
+                status: 200,
+                headers: vec![("Content-Length".into(), "1000".into())],
+                body: b"{}".to_vec(),
+            },
+            IntentReply::json(200, json!({"not":"a receipt"})),
+        ] {
+            let server = IntentApiFixture::graph(vec![reply]);
+            crate::operator_routing::test_transport_scope(&[&server.origin], async {
+                let client = GraphClient::managed(
+                    &server.origin,
+                    "knowledge",
+                    crate::credential_sources::test_credential(&server.origin, DATA_TOKEN),
+                )
+                .unwrap();
+                assert!(
+                    client
+                        .load(
+                            "review",
+                            Some("main"),
+                            file.path().to_str().unwrap(),
+                            crate::cli::CliLoadMode::Append,
+                            &[],
+                            &mut Vec::new(),
+                        )
+                        .await
+                        .is_err()
+                );
+                server.assert_complete();
+            })
+            .await;
+        }
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -1141,14 +1900,27 @@ async fn target_preflight_precedes_credentials_and_missing_data_endpoint_never_c
     .unwrap();
     assert_eq!(error.body["type"], "data_endpoint_required");
     context.endpoint = Some("https://data.example".into());
-    let unsupported = Cli::try_parse_from(["omnigraph", "branch", "list"]).unwrap();
-    assert_eq!(
-        resolve_context(&unsupported, &context, &NoCredentialAccess)
-            .err()
-            .unwrap()
-            .body["type"],
-        "managed_operation_unsupported"
+    let store = MemoryStore::default();
+    save(
+        &store,
+        &context,
+        &credential(&context, "https://data.example"),
     );
+    for args in [
+        vec!["branch", "list"],
+        vec!["schema", "show"],
+        vec!["snapshot"],
+        vec!["export"],
+        vec!["changes", "poll"],
+    ] {
+        let cli = Cli::try_parse_from(
+            std::iter::once("omnigraph")
+                .chain(args)
+                .chain(["--graph", "knowledge"]),
+        )
+        .unwrap();
+        assert!(resolve_context(&cli, &context, &store).is_ok());
+    }
     let graphless = Cli::try_parse_from(["omnigraph", "query", "q"]).unwrap();
     assert_eq!(
         resolve_context(&graphless, &context, &NoCredentialAccess)
@@ -1186,16 +1958,22 @@ async fn token_bootstrap_reports_endpoint_without_configuring_a_data_destination
             json!({"data":response,"meta":{"cluster_id":context.cluster,"incarnation":"incarnation-a"}}),
         )]
     });
-    let store = MemoryStore::default();
-    let api = Api::new(issuer.origin.clone(), Some("control-token".into())).unwrap();
-    let result = mint(&store, &context, &api, 3600).await.unwrap();
-    assert_eq!(result["data"]["endpoint"], "https://issued.example");
-    assert!(context.endpoint.is_none());
-    assert_eq!(
-        load(&store, &context, "knowledge").err().unwrap().body["type"],
-        "data_endpoint_required"
-    );
-    context.endpoint = Some("https://issued.example".into());
-    assert!(load(&store, &context, "knowledge").is_ok());
-    issuer.assert_complete();
+    crate::operator_routing::test_transport_scope(&[&issuer.origin], async {
+        let store = MemoryStore::default();
+        let api = Api::new(issuer.origin.clone(), Some("control-token".into())).unwrap();
+        let result = mint(&store, &context, &api, 3600).await.unwrap();
+        assert_eq!(result["data"]["endpoint"], "https://issued.example");
+        assert!(context.endpoint.is_none());
+        assert_eq!(
+            resolve_resource(Some("knowledge"), &context, &store)
+                .err()
+                .unwrap()
+                .body["type"],
+            "data_endpoint_required"
+        );
+        context.endpoint = Some("https://issued.example".into());
+        assert!(resolve_resource(Some("knowledge"), &context, &store).is_ok());
+        issuer.assert_complete();
+    })
+    .await;
 }

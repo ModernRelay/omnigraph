@@ -169,7 +169,7 @@ on a graph, so a client can show only the actions it is allowed instead of
 learning them from a refusal:
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" -H "Omnigraph-Http-Api: 0.13" \
+curl -H "Authorization: Bearer $TOKEN" -H "Omnigraph-Http-Api: 0.14" \
   "https://graph.example/graphs/knowledge/access?branch=feature&target_branch=main"
 ```
 
@@ -205,7 +205,8 @@ never the rules behind them, and reveals nothing about other actors. A static
 token on a graph without a policy gets `read` alone, and a signed data
 credential without one nothing, as those routes decide; a server without
 authentication allows every graph action and reports no `actor`. The MCP
-`access` tool returns the same body.
+`access` tool returns the same body, and `omnigraph access` prints it for a
+server target ([what you may do at a target](../cli/targets.md#what-you-may-do-at-a-target)).
 
 It reports policy actions, not actor views, so a view can still refuse a
 `change` the policy allows.
@@ -221,11 +222,13 @@ graph/action grants. Version-1 restricted credentials are not accepted.
 For direct CLI writes, actor resolution is:
 
 1. `--as <ACTOR>`;
-2. `operator.actor` in `~/.omnigraph/config.yaml`;
-3. no actor.
+2. no actor.
 
-When a policy is installed, a missing actor is denied. Served writes reject
-`--as` because only the server may resolve their actor.
+The version-1 operator document has no actor field.
+
+When a policy is installed, a missing actor is denied. Only the server
+resolves a served write's actor; there `--as` is an assertion the server checks
+against the token ([Assert the actor](server.md#assert-the-actor)).
 
 Successful graph commits record the actor for the whole atomic change. Inspect
 the audit trail with:
