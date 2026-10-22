@@ -670,6 +670,7 @@ load validate unique <table> key|unique [<cols>]: access delta|probe|scan
 load validate edge_ri <edge-table> from|to <node-type>: access probe|scan
 load validate cardinality <edge-table> from <node-type>
 load validate retained_edges <node-table> <edge-table> from|to: access delta|probe|scan
+load validate removal <table>: scan|none
 load write: overwrite fragments
 load write: append strict_insert
 load write: merge upsert
@@ -684,6 +685,10 @@ for `executor`.
 fallback.
 A `load validate` line claims one check of the `Validate` node with that
 identity, and its `access` suffix claims the check's access path.
+`load validate removal` claims the node's `removal`: `scan` when the plan
+finds the committed ids an overwrite removes, `none` when no planned check
+reads them (an empty committed table, a node target no edge type references,
+an edge target, append and merge).
 `load write` claims the `FragmentWrite` node's mode and adapter.
 `load pipeline` claims one entry of the document's `pipelines` by position:
 its source node, its streaming operators in run order, the sink it drains

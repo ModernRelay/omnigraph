@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::aggregate::AggregateSpec;
 use crate::bound::{BoundPlan, ValueTable};
-use crate::cost::{AccessPath, AntiJoinStrategy, ExpandMode, ExpandPolicy};
+use crate::cost::{AccessPath, AntiJoinStrategy, ExpandMode, ExpandPolicy, ValidateRemoval};
 use crate::error::PlanError;
 use crate::logical::{
     ColumnRef, CsvSourceSpec, FragmentWriteSpec, GqFilter, KeyJoinKind, Predicate,
@@ -355,6 +355,8 @@ pub enum NodeMirror {
         input: NodeId,
         table: String,
         checks: Vec<ValidateSpec>,
+        #[serde(default)]
+        removal: ValidateRemoval,
         max_workers: u32,
     },
     FragmentWrite {
@@ -592,11 +594,13 @@ impl From<&PhysicalNode> for NodeMirror {
                 input,
                 table,
                 checks,
+                removal,
                 max_workers,
             } => Self::Validate {
                 input: *input,
                 table: table.clone(),
                 checks: checks.clone(),
+                removal: *removal,
                 max_workers: *max_workers,
             },
             PhysicalNode::FragmentWrite {
@@ -821,11 +825,13 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 input,
                 table,
                 checks,
+                removal,
                 max_workers,
             } => Self::Validate {
                 input,
                 table,
                 checks,
+                removal,
                 max_workers,
             },
             NodeMirror::FragmentWrite {

@@ -12,7 +12,7 @@ use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::{Catalog, EdgeType};
 use omnigraph_compiler::ir::{Endpoint, ValidateCheck};
 use omnigraph_compiler::types::ScalarType;
-use omnigraph_planner::{ValidateAccess, ValidateSpec};
+use omnigraph_planner::{ValidateAccess, ValidateRemoval, ValidateSpec};
 
 use super::kernels::{
     CardPlan, FinalKeys, FirstHolders, Position, UniqueImage, UniquePartial, card_affected,
@@ -80,17 +80,29 @@ pub(crate) async fn judge_load(
         mode == LoadMode::Overwrite,
     )?;
     judge_load_swept(
-        table, checks, catalog, base, mode, batches, extracted, admission,
+        table,
+        checks,
+        ValidateRemoval::Scan,
+        catalog,
+        base,
+        mode,
+        batches,
+        extracted,
+        admission,
     )
     .await
 }
 
 /// [`judge_load`] with the sweep already done by the caller: the engine's
 /// `ValidateExec` sweeps each partition's batches as they arrive and merges
-/// the partials ([`Extracted::prepare`], [`Merging::finish`]).
+/// the partials ([`Extracted::prepare`], [`Merging::finish`]). `removal` is
+/// the plan's word on the ids an overwrite removes: under `Scan` they are
+/// found before the checks run, under `None` the plan carries no check that
+/// reads them, which the committed table's row count must bear out.
 pub(crate) async fn judge_load_swept(
     table: &str,
     checks: &[ValidateSpec],
+    removal: ValidateRemoval,
     catalog: &Catalog,
     base: &Snapshot,
     mode: LoadMode,
@@ -100,7 +112,10 @@ pub(crate) async fn judge_load_swept(
 ) -> Result<()> {
     let system_columns = catalog.system_columns;
     let overwrite = mode == LoadMode::Overwrite;
-    let removed = if overwrite {
+    if overwrite && removal == ValidateRemoval::None {
+        removal_omitted_soundly(table, checks, catalog, base).await?;
+    }
+    let removed = if overwrite && removal == ValidateRemoval::Scan {
         let _phase = admission
             .phase
             .as_mut()
@@ -843,6 +858,43 @@ where
     Ok(())
 }
 
+/// A plan omits the removal scan only when nothing can read removed ids: no
+/// retained-edge check is planned, and a referenced node target holds no
+/// committed rows; a manifest count the dataset contradicts refuses the load.
+async fn removal_omitted_soundly(
+    table: &str,
+    checks: &[ValidateSpec],
+    catalog: &Catalog,
+    base: &Snapshot,
+) -> Result<()> {
+    if checks
+        .iter()
+        .any(|spec| matches!(spec.check, ValidateCheck::RetainedEdges { .. }))
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "Validate: the plan omits the removal scan of {table} and reads removed ids in a retained-edge check"
+        )));
+    }
+    let Some(name) = table.strip_prefix("node:") else {
+        return Ok(());
+    };
+    let referenced = catalog
+        .edge_types
+        .values()
+        .any(|edge| edge.from_type == name || edge.to_type == name);
+    if !referenced || base.dataset(table).is_none() {
+        return Ok(());
+    }
+    let ds = base.open_lance_dataset(table).await?;
+    let rows = ds.count_rows(None).await.map_err(OmniError::storage)?;
+    if rows == 0 {
+        return Ok(());
+    }
+    Err(OmniError::manifest_internal(format!(
+        "Validate: the plan omits the removal scan of {table} but the committed table holds {rows} rows"
+    )))
+}
+
 fn edge_type_of<'c>(catalog: &'c Catalog, edge_table: &str) -> Result<&'c EdgeType> {
     edge_table
         .strip_prefix("edge:")
@@ -1180,5 +1232,83 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// A plan that omits the removal scan is refused when a retained-edge
+    /// check still reads removed ids, and when the referenced node target
+    /// holds committed rows: the engine never trusts `none` on its own.
+    #[tokio::test]
+    async fn a_none_plan_refuses_a_listed_retained_edge_check_and_a_populated_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = committed_graph(&dir).await;
+        let catalog = db.catalog();
+        let sc = catalog.system_columns;
+        let snapshot = db.snapshot().await;
+        let checks = checks(
+            &catalog,
+            LoadTarget::Node("Person".into()),
+            LoadStmtMode::Overwrite,
+            ValidateAccess::Scan,
+        );
+        let batches = [person_batch(
+            sc,
+            &[("Alice", "alice@x"), ("Bob", "bob@x"), ("Carol", "carol@x")],
+        )];
+        let listed = judge_load_swept(
+            "node:Person",
+            &checks,
+            ValidateRemoval::None,
+            &catalog,
+            &snapshot,
+            LoadMode::Overwrite,
+            &batches,
+            Extracted::sweep("node:Person", &checks, &catalog, &batches, sc, true).unwrap(),
+            &mut LoadAdmission {
+                phase: None,
+                bytes: None,
+                reuse: None,
+                removed: &mut |_| Ok(()),
+                retained: &mut |_| Ok(()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            listed.to_string().contains(
+                "omits the removal scan of node:Person and reads removed ids in a retained-edge check"
+            ),
+            "{listed}"
+        );
+
+        let pruned: Vec<ValidateSpec> = checks
+            .iter()
+            .filter(|spec| !matches!(spec.check, ValidateCheck::RetainedEdges { .. }))
+            .cloned()
+            .collect();
+        let populated = judge_load_swept(
+            "node:Person",
+            &pruned,
+            ValidateRemoval::None,
+            &catalog,
+            &snapshot,
+            LoadMode::Overwrite,
+            &batches,
+            Extracted::sweep("node:Person", &pruned, &catalog, &batches, sc, true).unwrap(),
+            &mut LoadAdmission {
+                phase: None,
+                bytes: None,
+                reuse: None,
+                removed: &mut |_| Ok(()),
+                retained: &mut |_| Ok(()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            populated
+                .to_string()
+                .contains("omits the removal scan of node:Person but the committed table holds"),
+            "{populated}"
+        );
     }
 }
