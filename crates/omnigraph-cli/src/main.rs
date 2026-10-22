@@ -1,5 +1,7 @@
 #![recursion_limit = "256"]
 
+use std::io::Write;
+
 use color_eyre::eyre::Result;
 use tokio::runtime::Runtime;
 
@@ -10,9 +12,17 @@ fn main() -> Result<std::process::ExitCode> {
         .display_env_section(false)
         .display_location_section(false)
         .install()?;
-    let completion = runtime.block_on(omnigraph_cli::app::run_from(std::env::args_os()))?;
-    finish_runtime(runtime, completion.code());
-    Ok(std::process::ExitCode::from(completion.code() as u8))
+    let code = match runtime.block_on(omnigraph_cli::app::run_from(std::env::args_os())) {
+        Ok(completion) => completion.code(),
+        Err(error) => {
+            // Reported as returning it from `main` would, but with the exit
+            // its outcome chose rather than 1, which says nothing changed.
+            let _ = writeln!(std::io::stderr(), "Error: {error:?}");
+            omnigraph_cli::app::exit_code(&error)
+        }
+    };
+    finish_runtime(runtime, code);
+    Ok(std::process::ExitCode::from(code as u8))
 }
 
 fn finish_runtime(runtime: Runtime, exit_code: i32) {

@@ -706,7 +706,8 @@ rules:
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert!(!response.headers().contains_key("retry-after"));
+    // An unavailable graph asks for a retry, and says when.
+    assert_eq!(response.headers()["retry-after"], "60");
     for (id, expected) in [("good", StatusCode::OK), ("unknown", StatusCode::NOT_FOUND)] {
         let (status, body) = json_response(
             &app,

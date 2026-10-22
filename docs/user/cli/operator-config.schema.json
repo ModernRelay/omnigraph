@@ -1,0 +1,657 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OmniGraph operator configuration (format version 1)",
+  "description": "Public operator configuration grammar. Validate the original YAML with the CLI parser before use; JSON Schema validation alone does not establish a usable invocation binding.",
+  "$comment": "The CLI rejects inputs larger than 1048576 UTF-8 bytes before parsing. YAML-only requirements (one document, duplicate keys, explicit tags, merge keys, non-string keys and finite JSON-compatible numbers) must be enforced before JSON Schema validation. Offline parser validation additionally resolves every local profile/target reference and enforces alias graph presence against the referenced target: required for managed, server and direct-root targets, forbidden for direct-graph targets, never inherited from default_graph. It validates canonical URL authority, loopback classification, percent encoding, traversal and prefix boundaries, and resolves relative token/CA paths against the absolute operator-file directory. Schema format annotations are not a substitute for those checks. Runtime checks only for the selected operation include credential/helper/CA availability, proxy environment conflicts and bypass syntax, adapter capability, remote identity/authorization/reachability, stored-query existence and read-only classification, and command output-format support. No credentials, files, environment variables, helpers or network are consulted by offline parsing.",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "profiles": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/name"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/profile"
+      }
+    },
+    "targets": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/name"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/target"
+      }
+    },
+    "aliases": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/name"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/alias"
+      }
+    },
+    "defaults": {
+      "$ref": "#/$defs/defaults"
+    }
+  },
+  "required": [
+    "version"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$(?![\\s\\S])"
+    },
+    "organizationId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,128}$(?![\\s\\S])"
+    },
+    "managedId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,256}$(?![\\s\\S])"
+    },
+    "graphId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9-]{1,64}$(?![\\s\\S])",
+      "not": {
+        "enum": [
+          "policies",
+          "healthz",
+          "openapi",
+          "graphs"
+        ]
+      }
+    },
+    "servedGraphId": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/graphId"
+        },
+        {
+          "const": "og_catalog"
+        }
+      ],
+      "description": "A real graph ID or the served virtual catalogue scope og_catalog."
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "allOf": [
+        {
+          "pattern": "\\S"
+        },
+        {
+          "not": {
+            "pattern": "[\\u0000-\\u001f\\u007f-\\u009f]"
+          }
+        }
+      ]
+    },
+    "path": {
+      "$ref": "#/$defs/text",
+      "description": "Literal filesystem path. Relative paths resolve against the operator file directory, without shell or environment expansion. Availability is checked only for the selected operation."
+    },
+    "httpsUrl": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^[Hh][Tt][Tt][Pp][Ss]://[^/?#@\\s%\\\\]+(?:/[^?#\\s\\\\]*)?$(?![\\s\\S])",
+      "description": "HTTPS base URL; CLI additionally rejects traversal, encoded separators, userinfo and ambiguous encoding, and canonicalizes host/scheme/default port and the directory prefix."
+    },
+    "serverUrl": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://[^/?#@\\s%\\\\]+(?:/[^?#\\s\\\\]*)?$(?![\\s\\S])",
+      "description": "HTTPS, or HTTP only for an explicitly configured loopback server whose auth provider is anonymous. CLI validates the parsed host as loopback."
+    },
+    "localUri": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^[Ff][Ii][Ll][Ee]:///[^?#\\s\\\\]*$(?![\\s\\S])",
+      "description": "Absolute local file URI without authority, query or fragment. No cloud-direct storage variants."
+    },
+    "omnigraphAuth": {
+      "type": "object",
+      "properties": {
+        "provider": {
+          "const": "omnigraph"
+        }
+      },
+      "required": [
+        "provider"
+      ],
+      "additionalProperties": false
+    },
+    "anonymousAuth": {
+      "type": "object",
+      "properties": {
+        "provider": {
+          "const": "anonymous"
+        }
+      },
+      "required": [
+        "provider"
+      ],
+      "additionalProperties": false
+    },
+    "tokenAuth": {
+      "type": "object",
+      "properties": {
+        "provider": {
+          "const": "token"
+        },
+        "source": {
+          "$ref": "#/$defs/tokenSource"
+        }
+      },
+      "required": [
+        "provider",
+        "source"
+      ],
+      "additionalProperties": false
+    },
+    "execAuth": {
+      "type": "object",
+      "properties": {
+        "provider": {
+          "const": "exec"
+        },
+        "command": {
+          "type": "array",
+          "minItems": 1,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/text",
+              "pattern": "^(?:/|[A-Za-z]:[\\\\/]|\\\\\\\\[^\\\\/]+[\\\\/])",
+              "description": "Absolute executable path; the CLI additionally checks absoluteness under the host operating system's path rules."
+            }
+          ],
+          "items": {
+            "type": "string",
+            "not": {
+              "pattern": "\\u0000"
+            }
+          }
+        },
+        "timeout": {
+          "type": "string",
+          "pattern": "^0*(?:[1-9]|[1-9][0-9]|1[01][0-9]|120)s$(?![\\s\\S])",
+          "default": "30s"
+        }
+      },
+      "required": [
+        "provider",
+        "command"
+      ],
+      "additionalProperties": false
+    },
+    "tokenSource": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/storeSource"
+        },
+        {
+          "$ref": "#/$defs/envSource"
+        },
+        {
+          "$ref": "#/$defs/fileSource"
+        }
+      ]
+    },
+    "storeSource": {
+      "type": "object",
+      "properties": {
+        "store": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "store"
+      ],
+      "additionalProperties": false
+    },
+    "envSource": {
+      "type": "object",
+      "properties": {
+        "env": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$(?![\\s\\S])"
+        }
+      },
+      "required": [
+        "env"
+      ],
+      "additionalProperties": false
+    },
+    "fileSource": {
+      "type": "object",
+      "properties": {
+        "file": {
+          "$ref": "#/$defs/path"
+        }
+      },
+      "required": [
+        "file"
+      ],
+      "additionalProperties": false
+    },
+    "profileAuth": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/omnigraphAuth"
+        },
+        {
+          "$ref": "#/$defs/tokenAuth"
+        },
+        {
+          "$ref": "#/$defs/execAuth"
+        }
+      ]
+    },
+    "serverAuth": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/anonymousAuth"
+        },
+        {
+          "$ref": "#/$defs/tokenAuth"
+        },
+        {
+          "$ref": "#/$defs/execAuth"
+        }
+      ]
+    },
+    "profile": {
+      "type": "object",
+      "properties": {
+        "api": {
+          "$ref": "#/$defs/httpsUrl"
+        },
+        "organization_id": {
+          "$ref": "#/$defs/organizationId"
+        },
+        "auth": {
+          "$ref": "#/$defs/profileAuth"
+        },
+        "transport": {
+          "$ref": "#/$defs/transport"
+        }
+      },
+      "required": [
+        "api",
+        "organization_id",
+        "auth"
+      ],
+      "additionalProperties": false
+    },
+    "managedTarget": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "managed"
+        },
+        "profile": {
+          "$ref": "#/$defs/name"
+        },
+        "cluster_id": {
+          "$ref": "#/$defs/managedId"
+        },
+        "cluster_incarnation": {
+          "$ref": "#/$defs/managedId"
+        },
+        "endpoint": {
+          "$ref": "#/$defs/httpsUrl"
+        },
+        "transport": {
+          "$ref": "#/$defs/transport"
+        },
+        "default_graph": {
+          "$ref": "#/$defs/servedGraphId"
+        }
+      },
+      "required": [
+        "kind",
+        "profile",
+        "cluster_id",
+        "cluster_incarnation"
+      ],
+      "additionalProperties": false
+    },
+    "serverTarget": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "server"
+        },
+        "endpoint": {
+          "$ref": "#/$defs/serverUrl"
+        },
+        "auth": {
+          "$ref": "#/$defs/serverAuth"
+        },
+        "transport": {
+          "$ref": "#/$defs/transport"
+        },
+        "default_graph": {
+          "$ref": "#/$defs/servedGraphId"
+        }
+      },
+      "required": [
+        "kind",
+        "endpoint",
+        "auth"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "endpoint": {
+                "pattern": "^[Hh][Tt][Tt][Pp]://"
+              }
+            },
+            "required": [
+              "endpoint"
+            ]
+          },
+          "then": {
+            "properties": {
+              "auth": {
+                "$ref": "#/$defs/anonymousAuth"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "directGraphTarget": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "direct"
+        },
+        "scope": {
+          "const": "graph"
+        },
+        "uri": {
+          "$ref": "#/$defs/localUri"
+        }
+      },
+      "required": [
+        "kind",
+        "scope",
+        "uri"
+      ],
+      "additionalProperties": false
+    },
+    "directRootTarget": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "direct"
+        },
+        "scope": {
+          "const": "root"
+        },
+        "uri": {
+          "$ref": "#/$defs/localUri"
+        },
+        "default_graph": {
+          "$ref": "#/$defs/graphId"
+        }
+      },
+      "required": [
+        "kind",
+        "scope",
+        "uri"
+      ],
+      "additionalProperties": false
+    },
+    "target": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/managedTarget"
+        },
+        {
+          "$ref": "#/$defs/serverTarget"
+        },
+        {
+          "$ref": "#/$defs/directGraphTarget"
+        },
+        {
+          "$ref": "#/$defs/directRootTarget"
+        }
+      ]
+    },
+    "transport": {
+      "type": "object",
+      "$comment": "Version 1 rejects custom destination tls.ca with an explicit HTTPS proxy, for both append and replace modes. HTTP CONNECT remains supported. Environment proxy mode is structurally accepted; the selected resolved route must enforce the same restriction at runtime.",
+      "not": {
+        "required": [
+          "tls",
+          "proxy"
+        ],
+        "properties": {
+          "tls": {
+            "required": [
+              "ca"
+            ]
+          },
+          "proxy": {
+            "required": [
+              "mode",
+              "url"
+            ],
+            "properties": {
+              "mode": {
+                "const": "url"
+              },
+              "url": {
+                "pattern": "^[Hh][Tt][Tt][Pp][Ss]://"
+              }
+            }
+          }
+        }
+      },
+      "properties": {
+        "tls": {
+          "$ref": "#/$defs/tls"
+        },
+        "proxy": {
+          "$ref": "#/$defs/proxy",
+          "default": {
+            "mode": "direct"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "tls": {
+      "type": "object",
+      "properties": {
+        "ca": {
+          "$ref": "#/$defs/ca"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ca": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "enum": [
+            "append",
+            "replace"
+          ]
+        },
+        "file": {
+          "$ref": "#/$defs/path"
+        }
+      },
+      "required": [
+        "mode",
+        "file"
+      ],
+      "additionalProperties": false
+    },
+    "proxy": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/directProxy"
+        },
+        {
+          "$ref": "#/$defs/urlProxy"
+        },
+        {
+          "$ref": "#/$defs/environmentProxy"
+        }
+      ]
+    },
+    "directProxy": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "const": "direct"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "additionalProperties": false
+    },
+    "environmentProxy": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "const": "environment"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "additionalProperties": false
+    },
+    "urlProxy": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "const": "url"
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://[^/?#@\\s%\\\\]+/?$(?![\\s\\S])",
+          "description": "HTTP(S) proxy host and optional port; no userinfo, query, fragment or non-root path."
+        }
+      },
+      "required": [
+        "mode",
+        "url"
+      ],
+      "additionalProperties": false
+    },
+    "defaults": {
+      "type": "object",
+      "properties": {
+        "profile": {
+          "$ref": "#/$defs/name"
+        },
+        "target": {
+          "$ref": "#/$defs/name"
+        },
+        "output": {
+          "type": "string",
+          "enum": [
+            "table",
+            "json",
+            "jsonl",
+            "csv",
+            "kv"
+          ],
+          "default": "table"
+        }
+      },
+      "additionalProperties": false
+    },
+    "alias": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/name"
+        },
+        "query": {
+          "$ref": "#/$defs/text"
+        },
+        "graph": {
+          "$ref": "#/$defs/servedGraphId",
+          "description": "og_catalog is supported only when target references a managed or server target; direct-root aliases require a real graph ID. The CLI enforces this cross-reference constraint."
+        },
+        "params": {
+          "type": "object",
+          "propertyNames": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/text"
+              },
+              {
+                "not": {
+                  "const": "<<"
+                }
+              }
+            ]
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/jsonValue"
+          }
+        }
+      },
+      "required": [
+        "target",
+        "query"
+      ],
+      "additionalProperties": false,
+      "$comment": "graph is conditional on the referenced target, not on an alias-local discriminator. Standard JSON Schema cannot dereference an instance property's value into another instance map. The CLI parser requires graph for managed/server/direct-root and forbids it for direct-graph, even when the target supplies default_graph. query is a literal stored-query identifier, never executed as an inline program or opened as a file."
+    },
+    "jsonValue": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/jsonValue"
+          }
+        },
+        {
+          "type": "object",
+          "propertyNames": {
+            "not": {
+              "const": "<<"
+            }
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/jsonValue"
+          }
+        }
+      ]
+    }
+  }
+}

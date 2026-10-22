@@ -75,39 +75,13 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
     let root = storage_root
         .map(str::to_owned)
         .unwrap_or_else(|| format!("file://{}", temp.path().display()));
-    let initial = parse_stdout_json(&output_success(
-        cli()
-            .args(["--target", &root, "cluster", "apply", "--config"])
-            .arg(temp.path())
-            .arg("--json"),
-    ));
-    assert_eq!(initial["status"], "complete", "{initial}");
-    assert_eq!(initial["result"]["converged"], true, "{initial}");
-    let unlock = || {
-        let status = parse_stdout_json(&output_success(
-            cli().args(["--target", &root, "cluster", "status", "--json"]),
-        ));
-        let lock = status["lock_id"]
-            .as_str()
-            .expect("direct owner retains exact lock");
-        output_success(cli().args(["--target", &root, "cluster", "force-unlock", lock, "--json"]));
-    };
-    unlock();
+    bootstrap_cluster_fixture(temp.path(), &root);
+    let unlock = || unlock_storage_fixture(&root);
     fs::write(
         temp.path().join("seed.jsonl"),
         "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":31}}\n",
     )
     .unwrap();
-    output_success(
-        cli()
-            .args(["--as", "act-live", "load", "--data"])
-            .arg(temp.path().join("seed.jsonl"))
-            .args(["--mode", "merge"])
-            .arg("--target")
-            .arg(format!("{root}/graphs/knowledge.omni")),
-    );
-    unlock();
-
     let bindings = storage_root.is_none().then(LiveBindingsFixture::new);
     let mut server_env = vec![(
         "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
@@ -117,6 +91,20 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
         server_env.extend(bindings.envs());
     }
     let server = spawn_server_with_cluster_env(temp.path(), &server_env);
+    output_success(
+        cli()
+            .envs(server.credential("live-deployment-token"))
+            .args(["load", "--data"])
+            .arg(temp.path().join("seed.jsonl"))
+            .args([
+                "--mode",
+                "merge",
+                "--target",
+                KEYED_SERVER_NAME,
+                "--graph",
+                "knowledge",
+            ]),
+    );
     let original_pid = server.id();
     let original_url = server.base_url.clone();
     let stop = Arc::new(AtomicBool::new(false));
@@ -524,7 +512,7 @@ fn cluster_e2e_offline_deployment_has_root_only_receipts_and_explicit_unlock() {
             "missing.json",
             "--json",
         ]));
-        assert_eq!(refused.status.code(), Some(2));
+        assert_eq!(refused.status.code(), Some(64));
         assert!(String::from_utf8_lossy(&refused.stderr).contains("unexpected argument"));
         for args in [
             vec!["cluster", "upgrade-ledger", "--writers-stopped"],
@@ -613,7 +601,7 @@ fn cluster_e2e_offline_deployment_has_root_only_receipts_and_explicit_unlock() {
         assert!(status["lock_id"].is_null());
         assert_eq!(status["next_sequence"], 3);
         let conflict = output_failure(&mut rooted(&["status", "--config", "."]));
-        assert_eq!(conflict.status.code(), Some(2));
+        assert_eq!(conflict.status.code(), Some(64));
         assert!(String::from_utf8_lossy(&conflict.stderr).contains("unexpected argument"));
     }
 }
@@ -849,7 +837,7 @@ fn cluster_e2e_removed_v1_commands_are_not_executable() {
                 .args(["cluster", command, "--config"])
                 .arg(temp.path()),
         );
-        assert_eq!(refused.status.code(), Some(2));
+        assert_eq!(refused.status.code(), Some(64));
         assert!(String::from_utf8_lossy(&refused.stderr).contains("unrecognized subcommand"));
         assert!(!temp.path().join("__cluster").exists());
     }
@@ -1554,9 +1542,9 @@ impl LiveBindingsFixture {
             ),
             ("AWS_REGION", "us-east-1"),
             ("AWS_DEFAULT_REGION", "us-east-1"),
-            ("AWS_ENDPOINT", self.blobs.origin.as_str()),
-            ("AWS_ENDPOINT_URL", self.blobs.origin.as_str()),
-            ("AWS_ENDPOINT_URL_S3", self.blobs.origin.as_str()),
+            ("AWS_ENDPOINT", self.blobs.http_origin.as_str()),
+            ("AWS_ENDPOINT_URL", self.blobs.http_origin.as_str()),
+            ("AWS_ENDPOINT_URL_S3", self.blobs.http_origin.as_str()),
             ("AWS_ALLOW_HTTP", "true"),
             ("AWS_VIRTUAL_HOSTED_STYLE_REQUEST", "false"),
             ("AWS_S3_FORCE_PATH_STYLE", "true"),
@@ -1570,7 +1558,7 @@ impl LiveBindingsFixture {
         let token = "live-deployment-token";
         let first_profile = yaml_serde::from_str::<yaml_serde::Value>(&format!(
             "kind: openai-compatible\nbase_url: {}/v1\nmodel: space-a\napi_key: ${{OMNIGRAPH_LIFECYCLE_EMBED_KEY}}\n",
-            self.first.origin
+            self.first.http_origin
         )).unwrap();
         fs::write(config_dir.join("bindings.pg"), "node SearchDoc { name: String @key text: String embedding: Vector(3) @embed(\"text\") }\nnode Asset { name: String @key content: Blob? }\n").unwrap();
         bindings_edit_config(config_dir, |config| {
@@ -1623,7 +1611,7 @@ impl LiveBindingsFixture {
         // A new endpoint and graph binding also remove the former definition.
         let replacement = yaml_serde::from_str::<yaml_serde::Value>(&format!(
             "kind: openai-compatible\nbase_url: {}/v2\nmodel: space-c\napi_key: ${{OMNIGRAPH_LIFECYCLE_EMBED_KEY}}\n",
-            self.replacement.origin
+            self.replacement.http_origin
         )).unwrap();
         bindings_edit_config(config_dir, |config| {
             config["providers"]["embedding"]
@@ -1824,6 +1812,7 @@ fn bindings_external_load(server: &TestServer, uri: &str, allowed: bool) {
 
 fn bindings_external_redirect(server: &TestServer, uri: &str) {
     let client = reqwest::blocking::Client::builder()
+        .add_root_certificate(tls_gateway::certificate())
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(10))
         .build()

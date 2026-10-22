@@ -671,3 +671,70 @@ pub(crate) async fn enumerate_commit_changes(
     }
     Ok(CommitEnumeration::Complete)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{Omnigraph, ReadTarget};
+    use crate::loader::LoadMode;
+
+    /// The named-branch re-prove reads `__manifest` on a zero-cache session
+    /// over the store's registry and never through the store's data session.
+    /// Lance keys a cached manifest by dataset URI and version alone where a
+    /// store reports no ETag, so a data session warmed by an earlier page
+    /// must not be the one that answers whether the branch head is unchanged.
+    #[tokio::test]
+    async fn reproving_a_branch_head_reads_nothing_through_the_data_session() {
+        #[cfg(feature = "failpoints")]
+        let _scenario = crate::seams::FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = crate::Session::from_defaults(
+            std::sync::Arc::new(
+                Omnigraph::init(uri, "node Person {\n    name: String @key\n}\n")
+                    .await
+                    .unwrap(),
+            ),
+            omnigraph_compiler::settings::SessionSettings::default(),
+        );
+        db.load(
+            "main",
+            r#"{"type":"Person","data":{"name":"a"}}"#,
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap();
+        db.branch_create("feature").await.unwrap();
+        db.load(
+            "feature",
+            r#"{"type":"Person","data":{"name":"b"}}"#,
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
+        let snapshot = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
+        let store = TableStore::new(
+            db.root_uri(),
+            crate::lance_access::LanceAccessContext::new().data_session(),
+        );
+        // Warm the data session with the branch's own `__manifest` first.
+        crate::db::manifest::ManifestCoordinator::snapshot_at_with_session(
+            store.root_uri(),
+            Some("feature"),
+            snapshot.graph_manifest_version(),
+            &store.session(),
+        )
+        .await
+        .unwrap();
+        let warm = store.session().metadata_cache_stats().await;
+        assert!(warm.num_entries > 0, "the data session was not warmed");
+
+        reprove_named_branch_heads(&store, &snapshot).await.unwrap();
+        let after = store.session().metadata_cache_stats().await;
+        assert_eq!(
+            (after.hits, after.misses, after.num_entries),
+            (warm.hits, warm.misses, warm.num_entries),
+            "the branch-head re-prove consulted the data session's metadata cache"
+        );
+    }
+}

@@ -79,6 +79,7 @@ impl PinnedGraphManifest {
             let mut snapshot = ManifestCoordinator::snapshot_from_state(
                 root_uri,
                 super::read_manifest_state(&dataset).await?,
+                dataset.session(),
             );
             snapshot.graph_branch = native
                 .as_deref()
@@ -101,6 +102,7 @@ impl PinnedGraphManifest {
             root_uri,
             dataset.version().version,
             dataset.manifest().branch.as_deref(),
+            &dataset.session(),
         )?;
         Ok(Self {
             dataset,
@@ -315,6 +317,8 @@ impl ManifestCoordinator {
     /// Resolve a logical graph commit by immutable physical coordinates. A
     /// recreated logical name may reuse its version number, but never its
     /// graph commit id; retired histories remain eligible lookup candidates.
+    /// Test-only: production reads pass the reading handle's control session.
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn pinned_graph_commit(
         root_uri: &str,
         commit: &GraphCommit,
@@ -391,7 +395,9 @@ impl ManifestCoordinator {
     }
 
     /// The commit graph of every retired branch incarnation by native ref,
-    /// over the settled commits `history` has read.
+    /// over the settled commits `history` has read. Test-only: production
+    /// reads pass the reading handle's control session.
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn retired_commit_graphs(
         root_uri: &str,
         history: &HistoryCache,

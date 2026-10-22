@@ -1,10 +1,10 @@
 //! The clap surface: every command, subcommand, and argument struct
-//! Destination selection is exclusively `--target` or `defaults.target`.
+//! Profiles select control operations; targets select resources.
 
 pub(crate) use crate::commands::cluster::{ClusterCommand, ClusterMembersCommand, ClusterRunArgs};
 pub(crate) use crate::commands::control::{GraphsCommand, PolicyCommand, QueriesCommand};
 pub(crate) use crate::commands::local::SkillCommand;
-pub(crate) use crate::commands::targets::{CredentialCommand, TargetCommand};
+pub(crate) use crate::commands::targets::{AccessArgs, CredentialCommand, TargetCommand};
 pub(crate) use crate::managed::args::{
     OrganizationArgs, OrganizationCommand, OrganizationInvitationsCommand,
     OrganizationMembersCommand,
@@ -16,7 +16,7 @@ use crate::commands::history::{DiffArgs, SnapshotArgs};
 use crate::commands::maintenance::{
     CleanupArgs, OptimizeArgs, RebuildFullTextIndexesArgs, RepairArgs, UpgradeArgs,
 };
-use crate::commands::query::{AliasArgs, MutateArgs, QueryArgs};
+use crate::commands::query::{AliasArgs, CatalogueArgs, MutateArgs, QueryArgs};
 pub(crate) use crate::commands::schema::SchemaCommand;
 use crate::commands::schema::{InitArgs, LintArgs};
 pub(crate) use crate::commands::transfer::{BlobCommand, CliLoadMode};
@@ -28,20 +28,25 @@ use crate::embed::EmbedArgs;
 #[command(about = "Omnigraph graph database CLI")]
 #[command(version = crate::commands::local::output::PACKAGE_VERSION.as_str(), disable_version_flag = true)]
 #[command(
-    after_help = "Select a destination with --target NAME|ADDRESS, or configure defaults.target.
-Target kind determines command availability. --config supplies source files only.
-Use target list/show/add/remove/import to manage operator configuration."
+    after_help = "Select resources with --target and account operations with --profile.
+--operator-config selects one operator file.
+--config supplies deployment sources. Use config validate and target inspect for offline checks."
 )]
 pub(crate) struct Cli {
-    /// Named target or inline storage/server address; otherwise defaults.target.
+    #[arg(long, global = true, help = "Named profile for control-plane operations; otherwise defaults.profile", conflicts_with = "target", value_parser = crate::invocation::single_selector("--profile"))]
+    pub(crate) profile: Option<String>,
+    #[arg(long, global = true, help = "Use this operator configuration file instead of the default, without merging", value_parser = crate::invocation::single_selector("--operator-config"))]
+    pub(crate) operator_config: Option<String>,
+    /// Named resource target or inline local storage address; otherwise defaults.target.
     #[arg(long, global = true, value_name = "NAME|ADDRESS", value_parser = crate::invocation::single_selector("--target"))]
     pub(crate) target: Option<String>,
 
     /// Actor id for direct-engine writes and actor-bound cluster operations;
-    /// overrides `operator.actor`. Served targets reject this option and
-    /// resolve the actor from the credential. With a policy configured
-    /// but no actor set, the operation is denied — see
-    /// docs/user/operations/policy.md.
+    /// On a served write it is an assertion: the
+    /// request carries `omnigraph-if-actor`, and the server refuses it
+    /// before anything runs when the bearer token resolves to another actor.
+    /// With a policy configured but no actor set, a direct operation is
+    /// denied — see docs/user/operations/policy.md.
     #[arg(long = "as", global = true, value_name = "ACTOR", value_parser = crate::invocation::single_selector("--as"))]
     pub(crate) as_actor: Option<String>,
 
@@ -75,6 +80,8 @@ pub(crate) enum Command {
     ///
     /// Run a read query.
     Query(QueryArgs),
+    /// Query this binary's engine catalogue without storage, configuration or credentials.
+    Catalogue(CatalogueArgs),
     /// Execute a mutation, or one `branch create`/`delete`/`merge` statement.
     ///
     /// Run a mutation.
@@ -83,7 +90,7 @@ pub(crate) enum Command {
     ///
     /// An alias is a personal binding under `aliases:` in
     /// ~/.omnigraph/config.yaml — name → (target, graph, stored-query name,
-    /// default params). `omnigraph alias <name> [args]` invokes the bound
+    /// default params). `omnigraph alias <name> --params '{"key":"value"}'` invokes the bound
     /// stored query on its server. Living in its own namespace, an alias can
     /// never shadow or be shadowed by a built-in verb. Replaces the removed
     /// `--alias` flag on `query`/`mutate`.
@@ -168,15 +175,23 @@ pub(crate) enum Command {
     },
     /// Generate, clean, or refresh explicit seed embeddings
     Embed(EmbedArgs),
-    /// Authenticate the selected server or managed human-device target.
+    /// Sign in to an existing managed profile, or explicitly create one.
     Login {
-        /// Server token. Prefer piping it on stdin to avoid shell history.
-        #[arg(long)]
-        token: Option<String>,
+        #[arg(long, conflicts_with_all = ["create_profile", "api", "organization"])]
+        replace_principal: Option<String>,
+        /// Create a new local profile after verifying login and organization selection.
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["profile", "target"], value_parser = crate::invocation::single_selector("--create-profile"))]
+        create_profile: Option<String>,
+        /// Control-plane endpoint for the new profile; defaults to https://platform.omnigraph.dev.
+        #[arg(long, requires = "create_profile", conflicts_with_all = ["profile", "target"])]
+        api: Option<String>,
+        /// Organization to verify when creating the profile; otherwise discover it during login.
+        #[arg(long, requires = "create_profile", conflicts_with_all = ["profile", "target"])]
+        organization: Option<String>,
         #[arg(long)]
         json: bool,
     },
-    /// Remove the selected server credential or revoke its managed session.
+    /// Remove the selected managed session and attempt remote revocation.
     Logout {
         #[arg(long)]
         json: bool,
@@ -186,10 +201,21 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: TargetCommand,
     },
-    /// Read a selected server credential for another local client.
+    /// Say who you are at a target and what you may do there: the actions
+    /// the graph's policy grants, graph-wide and on a branch.
+    Access(AccessArgs),
+    /// Manage an explicitly selected owner/profile credential or export access through a pipe.
+    #[command(name = "credentials")]
     Credential {
         #[command(subcommand)]
         command: CredentialCommand,
+    },
+    #[command(
+        about = "Validate operator configuration, rename bindings, or recover interrupted edits"
+    )]
+    Config {
+        #[command(subcommand)]
+        command: crate::commands::targets::ConfigCommand,
     },
     /// Export or print the agent skill built into this binary, which matches
     /// this CLI's commands and HTTP contract.

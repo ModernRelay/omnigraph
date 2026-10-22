@@ -37,6 +37,10 @@ pub(super) struct Session {
 }
 
 impl Session {
+    pub(super) fn access_token(&self) -> &str {
+        &self.access_token
+    }
+
     pub(super) async fn revoke(&self) -> bool {
         revoke(&self.origin, self.access_token.clone()).await
     }
@@ -113,6 +117,7 @@ fn key(saved: &Session) -> Result<String> {
         &saved.identity.account_id,
         &saved.identity.principal_id,
         &saved.identity.subject,
+        &saved.identity.session_id,
     );
     let bytes = serde_json::to_vec(&tuple).map_err(|_| invalid())?;
     Ok(format!("credential:{:x}", Sha256::digest(bytes)))
@@ -184,16 +189,18 @@ fn index(store: &dyn Store, origin: &str) -> Result<Index> {
 }
 
 /// Check the bounded cache without selecting an organization or renewing a session.
-pub(super) fn validate_custody(store: &dyn Store, origin: &str) -> Result<()> {
+pub(super) fn validate_custody(store: &dyn Store, origin: &str) -> Result<Vec<Session>> {
     let index = index(store, origin)?;
+    let mut sessions = Vec::new();
     for (organization, reference) in index.sessions {
         let raw = store.get(&reference)?.ok_or_else(invalid)?;
         let saved = parse(&raw, origin)?;
         if key(&saved)? != reference || saved.identity.account_id != organization {
             return Err(invalid());
         }
+        sessions.push(saved);
     }
-    Ok(())
+    Ok(sessions)
 }
 
 pub(super) fn load_selected(
@@ -238,6 +245,18 @@ pub(super) fn load(store: &dyn Store, origin: &str) -> Result<Option<Session>> {
 pub(super) fn save(store: &dyn Store, saved: &Session) -> Result<()> {
     let value = serde_json::to_string(saved).map_err(|_| invalid())?;
     parse(&value, &saved.origin)?;
+    let claim = session_claim(&saved.config, &saved.identity.session_id)?;
+    let owner = crate::operator_routing::journal_owner().unwrap_or_else(|| "test-unbound".into());
+    if store
+        .session_owner(&claim)?
+        .is_some_and(|previous| previous != owner)
+    {
+        return Err(Failure::refused(
+            "session_identity_mismatch",
+            "provider session belongs to another owner/profile",
+        ));
+    }
+    store.claim_session(&claim, &owner)?;
     let selected = key(saved)?;
     let mut index = index(store, &saved.origin)?;
     let previous = index
@@ -291,7 +310,46 @@ pub(super) fn check_device_session(
             ));
         }
     }
+    if store
+        .session_owner(&session_claim(config, &initial.sid)?)?
+        .is_some()
+    {
+        return Err(Failure::refused(
+            "session_identity_mismatch",
+            "device sign-in reused a previously claimed provider session; start a fresh sign-in",
+        ));
+    }
     Ok(initial)
+}
+
+fn session_claim(config: &provider::Config, sid: &str) -> Result<String> {
+    let bytes =
+        serde_json::to_vec(&(&config.issuer, &config.client_id, sid)).map_err(|_| invalid())?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+pub(super) fn check_replacement(
+    store: &dyn Store,
+    saved: &Session,
+    confirmed: Option<&str>,
+) -> Result<()> {
+    if confirmed.is_some_and(|principal| principal != saved.identity.principal_id) {
+        return Err(Failure::refused(
+            "principal_replacement_mismatch",
+            "verified new principal does not match --replace-principal",
+        ));
+    }
+    if let Some(previous) = load_selected(store, &saved.origin, Some(&saved.identity.account_id))? {
+        if previous.identity.principal_id != saved.identity.principal_id
+            && confirmed != Some(saved.identity.principal_id.as_str())
+        {
+            return Err(Failure::refused(
+                "principal_replacement_required",
+                "profile belongs to another principal; confirm the new verified principal with login --replace-principal PRINCIPAL_ID",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(super) async fn select_device_organization(
@@ -464,7 +522,9 @@ pub(super) async fn credential(
 ) -> Result<String> {
     let saved = selected_session(store, origin, identity)?;
     let provider = provider::Provider::new(&saved.config)?;
-    credential_selected(store, origin, identity, &provider).await
+    Ok(credential_loaded(store, saved, &provider)
+        .await?
+        .access_token)
 }
 
 fn selected_session(store: &dyn Store, origin: &str, identity: &Identity) -> Result<Session> {
@@ -486,37 +546,51 @@ pub(super) async fn credential_with(
     provider: &provider::Provider,
 ) -> Result<String> {
     let saved = load_selected(store, origin, None)?.ok_or_else(login_required)?;
-    credential_selected(store, origin, &saved.identity, provider).await
+    Ok(credential_loaded(store, saved, provider)
+        .await?
+        .access_token)
 }
 
+#[cfg(test)]
 pub(super) async fn credential_selected(
     store: &dyn Store,
     origin: &str,
     identity: &Identity,
     provider: &provider::Provider,
 ) -> Result<String> {
-    let mut saved = selected_session(store, origin, identity)?;
+    let saved = selected_session(store, origin, identity)?;
+    Ok(credential_loaded(store, saved, provider)
+        .await?
+        .access_token)
+}
+
+pub(super) async fn credential_loaded(
+    store: &dyn Store,
+    mut saved: Session,
+    provider: &provider::Provider,
+) -> Result<Session> {
     let now = OffsetDateTime::now_utc();
     if saved.state == RefreshState::LoginRequired || timestamp(&saved.refresh_expires_at)? <= now {
         return Err(login_required());
     }
     if timestamp(&saved.expires_at)? > now + time::Duration::seconds(30) {
-        return Ok(saved.access_token);
+        return Ok(saved);
     }
     if saved.state == RefreshState::Pending {
         return if timestamp(&saved.expires_at)? > now {
-            Ok(saved.access_token)
+            Ok(saved)
         } else {
             Err(unknown())
         };
     }
     match refresh(store, &mut saved, provider).await {
-        Ok(()) => Ok(saved.access_token),
-        Err(_)
-            if saved.state != RefreshState::LoginRequired
+        Ok(()) => Ok(saved),
+        Err(error)
+            if error.body["type"] == "refresh_outcome_unknown"
+                && saved.state != RefreshState::LoginRequired
                 && timestamp(&saved.expires_at)? > OffsetDateTime::now_utc() =>
         {
-            Ok(saved.access_token)
+            Ok(saved)
         }
         Err(error) => Err(error),
     }
@@ -541,14 +615,6 @@ pub(super) async fn logout(
         .as_ref()
         .map(|s| s.identity.account_id.as_str())
         .or(organization);
-    let confirmed = if let Some(saved) = &saved {
-        match credential(store, origin, &saved.identity).await {
-            Ok(token) => revoke(origin, token).await,
-            Err(_) => false,
-        }
-    } else {
-        false
-    };
     if let Some(org) = org {
         let mut index = index(store, origin)?;
         if let Some(selected) = index.sessions.remove(org) {
@@ -563,6 +629,11 @@ pub(super) async fn logout(
             store.remove(&selected)?;
         }
     }
+    let confirmed = if let Some(saved) = &saved {
+        revoke(origin, saved.access_token.clone()).await
+    } else {
+        false
+    };
     Ok(
         json!({"data":{"logged_out":true,"organization_id":org,"local_credentials_removed":true,"provider_revocation_confirmed":confirmed},"meta":{}}),
     )

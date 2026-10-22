@@ -299,12 +299,10 @@ pub(super) fn refuse_statement_envelope(envelope: &Envelope<'_>, has_target: boo
     Ok(())
 }
 
-/// Alias defaults, positional values, then explicit JSON form one parameter map.
-/// Its caller preserves credential setup before validating these values.
+/// Alias defaults and explicit JSON form one parameter map.
 pub(super) fn alias_params(
     alias_name: &str,
     alias: &OperatorAlias,
-    args: &[String],
     explicit: Option<Value>,
 ) -> Result<Map<String, Value>> {
     let mut params = Map::new();
@@ -314,21 +312,10 @@ pub(super) fn alias_params(
         };
         params.insert(key.to_string(), serde_json::to_value(value)?);
     }
-    if args.len() > alias.args.len() {
-        bail!(
-            "alias '{alias_name}' takes {} positional arg(s) ({}), got {}",
-            alias.args.len(),
-            alias.args.join(", "),
-            args.len()
-        );
-    }
-    for (name, value) in alias.args.iter().zip(args) {
-        params.insert(
-            name.clone(),
-            serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string())),
-        );
-    }
-    if let Some(Value::Object(explicit)) = explicit {
+    if let Some(explicit) = explicit {
+        let Value::Object(explicit) = explicit else {
+            bail!("alias '{alias_name}': --params and --params-file must contain a JSON object");
+        };
         for (key, value) in explicit {
             params.insert(key, value);
         }
@@ -429,21 +416,29 @@ mod tests {
     }
 
     #[test]
-    fn alias_parameters_keep_defaults_positionals_and_explicit_precedence() {
+    fn alias_parameters_keep_defaults_and_explicit_precedence() {
         let alias: OperatorAlias = yaml_serde::from_str(
-            "target: example\nquery: lookup\nargs: [name, enabled]\nparams:\n  name: default\n  limit: 4\n",
+            "target: example\nquery: lookup\nparams:\n  name: default\n  limit: 4\n",
         )
         .unwrap();
         let params = alias_params(
             "lookup",
             &alias,
-            &["positional".into(), "true".into()],
-            Some(serde_json::json!({"name": "explicit"})),
+            Some(serde_json::json!({"name": "explicit", "enabled": true})),
         )
         .unwrap();
         assert_eq!(
             serde_json::Value::Object(params),
             serde_json::json!({"name": "explicit", "enabled": true, "limit": 4})
         );
+        for explicit in [
+            serde_json::json!([1]),
+            serde_json::json!("name"),
+            serde_json::json!(7),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+        ] {
+            assert!(alias_params("lookup", &alias, Some(explicit)).is_err());
+        }
     }
 }

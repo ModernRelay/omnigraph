@@ -67,7 +67,13 @@ pub(crate) enum QueriesCommand {
         #[arg(long)]
         json: bool,
     },
-    /// List a cluster's registered stored queries (name, params).
+    /// List stored queries (name, params): a cluster root's registry, or one
+    /// served graph's catalog.
+    ///
+    /// A direct root reads its applied state; `--graph` narrows it to one
+    /// graph. A server target reads `GET /graphs/{id}/queries` for the graph
+    /// `--graph` or the target's `default_graph` selects, and `--json` prints
+    /// that response body.
     List {
         #[arg(long)]
         json: bool,

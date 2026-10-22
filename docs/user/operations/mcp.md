@@ -2,8 +2,9 @@
 
 `omnigraph-server` serves the Model Context Protocol at `/mcp`, so Claude,
 ChatGPT, Cursor and other MCP clients can work with a graph with a URL and the
-caller's own credential. It is the only OmniGraph MCP implementation; it
-replaces the `@modernrelay/omnigraph-mcp` npm package.
+caller's own credential. MCP shares the server's listener and lifecycle; no
+separate service is needed. It replaces the `@modernrelay/omnigraph-mcp` npm
+package.
 
 Every tool calls the same handler as its HTTP route, under the same actor and
 the same [policy](policy.md) action. A tool appearing in the list is not
@@ -16,16 +17,18 @@ tokens, signed data tokens, or an
 [OIDC resource identity](server.md#oidc-resource-identities-and-mcp)
 (`--oidc-identity-trust`). A server without credentials has no MCP.
 
-| Credentials | `/mcp` | OAuth discovery and challenge |
-|---|---|---|
-| Static or signed data tokens | mounted | none |
-| OIDC resource identity, alone or with tokens | mounted | served |
+| Credentials | `/mcp` | OAuth discovery | Challenge on a 401 |
+|---|---|---|---|
+| Static or signed data tokens | mounted | none | `Bearer` |
+| OIDC resource identity, alone or with tokens | mounted | served | `Bearer resource_metadata="<url>"` |
 
 With static or signed tokens, configure the client with the URL and an
 `Authorization: Bearer <token>` header; Claude Code and Cursor support this
 directly. With OIDC, the resource identifier in the trust file is the URL users
 enter in their MCP client, for example `https://graphs.example.com/mcp`, and the
-client signs in through OAuth.
+client signs in through OAuth. With an identifier naming the service root,
+clients that accept a path prefix can also sign in from other routes; see
+[Sign-in and discovery](#sign-in-and-discovery).
 
 The endpoint is stateless Streamable HTTP built on the official Rust MCP SDK:
 each request is a `POST` that carries its own bearer credential and gets a JSON
@@ -35,7 +38,8 @@ later unauthenticated request.
 ### Sign-in and discovery
 
 A request without a valid credential is refused with 401 before its body is
-read. With OIDC, the response's challenge names the protected-resource metadata:
+read, with the same [challenge](server.md#authentication) as every other route.
+With OIDC, the challenge names the protected-resource metadata:
 
 ```text
 WWW-Authenticate: Bearer resource_metadata="https://graphs.example.com/.well-known/oauth-protected-resource/mcp"
@@ -43,7 +47,18 @@ WWW-Authenticate: Bearer resource_metadata="https://graphs.example.com/.well-kno
 
 When a bearer credential was presented and refused (expired, wrong audience,
 unknown subject), the challenge also carries `error="invalid_token"`, which tells
-a client to refresh or sign in again.
+a client to refresh or sign in again. Without OIDC the challenge is `Bearer`,
+which advertises no sign-in flow.
+
+The server has one resource identifier, so every route's challenge names the
+same metadata. RFC 9728 §3.3 has a client that followed a challenge require the
+metadata's `resource` to equal the URL it requested, so a strict client uses the
+metadata only on the URL the identifier names. Some clients accept an identifier
+whose path is a prefix of that URL, as the MCP TypeScript SDK does
+(`checkResourceAllowed`). For them, an identifier naming the service root, such
+as `https://graphs.example.com`, covers every route, and one naming
+`https://graphs.example.com/mcp` covers only this endpoint. Name the service root
+when clients that accept a prefix should discover sign-in from any route.
 
 The server answers the metadata both at `/.well-known/oauth-protected-resource`
 and at the advertised path: the well-known prefix followed by the resource
@@ -133,7 +148,7 @@ Write tools follow one contract:
 - **A lost response is an unknown outcome.** A write runs to completion even when
   the caller stops waiting. A write still running after 30 seconds, or one whose
   completion the server cannot confirm, returns `isError` with
-  `"outcome_unknown": true`. A write the client cancelled, timed out or lost the
+  `code: outcome_unknown`. A write the client cancelled, timed out or lost the
   connection for returns nothing, and means the same. Before replaying it, read
   the target with `read` or `snapshot` and compare `graph_commit_id`, or list the
   branch with `commits_list`; replay a `mutate` with `if_graph_commit`, so a write
@@ -160,8 +175,8 @@ The best-practices references are the `omnigraph` agent skill's own files,
 compiled into the server, so they always match its version.
 
 A resource read runs the same handler and policy action as its tool. A refusal
-is a JSON-RPC error whose `data` carries the HTTP `status` and `error` body; an
-unknown resource or graph is error `-32002`.
+is a JSON-RPC error whose `data` carries the refused tool call's content below;
+an unknown resource or graph is error `-32002`.
 
 ## Results and errors
 
@@ -169,15 +184,16 @@ A successful call returns the route's JSON response body as structured content,
 plus a text copy for older clients. `health`, `graphs`, `schema`, `queries`,
 `access` and `branches_list` declare an output schema.
 
-A refused call returns `isError: true` with one of two shapes:
-
-- `{"status": <HTTP status>, "error": <the route's error body>}` when the route
-  refused it, for example 403 for a policy denial, 404 for an unknown or hidden
-  graph, 503 for a graph that is not available;
-- `{"code": "...", "message": "..."}` when the MCP layer refused it:
-  `capacity_exceeded`, `cancelled`, `deadline_exceeded` or `result_too_large`.
-
-A write adds `"outcome_unknown": true` to either shape when it may have happened.
+A refused call returns `isError: true` with
+`{"status": <HTTP status>, "error": <error body>}`: the error body every HTTP
+route answers, with its `code`, `disposition` and details, and the status the
+same failure answers over HTTP, for example 403 for a policy denial, 404 for an
+unknown or hidden graph, 503 for a graph that is not available. The MCP layer's
+own refusals use the same body: `unauthorized` without a verified credential,
+`too_many_requests` beyond the concurrent limit, and `cancelled`,
+`deadline_exceeded` or `result_too_large`, which only MCP sends and which carry
+no `status`. A write that may have happened, one whose call was cancelled or
+passed its wait included, answers `outcome_unknown` with `effects: unknown`.
 
 ## Limits
 

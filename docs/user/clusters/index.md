@@ -52,7 +52,7 @@ require `read` and `schema_apply` on the affected graphs. Direct deletion also
 enforces an installed graph policy and requires an authorized `--as` actor.
 Deployment status requires `config_manage`, not unrelated data access. New graphs
 need suitable declared policies too.
-The server derives the actor from its bearer token; `--as` is for direct access.
+The server derives the actor from its bearer token; there `--as` only asserts it.
 
 ## Bootstrap a cluster
 
@@ -116,26 +116,14 @@ Edit and validate the bundle, then submit it to the running owner:
 
 ```bash
 omnigraph cluster validate --config ./company-brain
-OMNIGRAPH_TOKEN_PRODUCTION='secret' omnigraph cluster apply \
+omnigraph cluster apply \
   --target production --config ./company-brain --json
 ```
 
-`production` names a complete server target in the operator config. Its credential
-is bound to that endpoint:
-
-```yaml
-# ~/.omnigraph/config.yaml
-target_config_version: 1
-targets:
-  production:
-    kind: server
-    endpoint: https://graph.example.com
-    credential: production
-```
-
-`omnigraph login --target production` stores the token instead of the variable. An
-inline URLs use the deepest matching registered endpoint credential, or remain anonymous;
-see [server credentials](../cli/index.md#use-a-server).
+`production` names a server target with an owner-local authentication profile.
+Configure it and install a token or declare an external source using the
+[operator reference](../cli/targets.md). No implicit token environment override
+or static-token login remains.
 
 With a server target, omitted `storage` binds the bundle to the selected server’s
 canonical root. An explicit absolute `storage` must match that root; relative
@@ -246,7 +234,7 @@ schema effects. It is not remote authentication.
 A lost connection does not mean failure. Observe the original ID:
 
 ```bash
-OMNIGRAPH_TOKEN_PRODUCTION='secret' omnigraph cluster status \
+omnigraph cluster status \
   --target production --deployment-id '<DEPLOYMENT_ID>' --json
 ```
 

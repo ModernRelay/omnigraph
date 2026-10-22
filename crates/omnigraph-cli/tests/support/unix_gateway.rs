@@ -28,6 +28,7 @@ impl UnixGateway {
     /// an application-support directory does, so a client must decode the
     /// percent-escaped path of its `unix://` URL.
     pub fn new(origin: &str) -> Self {
+        let origin = super::tls_gateway::http_upstream(origin);
         let upstream = origin
             .strip_prefix("http://")
             .expect("the gateway forwards to a plain TCP origin")

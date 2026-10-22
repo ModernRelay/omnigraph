@@ -217,6 +217,58 @@ async fn storage_failure_while_staging_is_definite_issue_1067() {
     assert_eq!(count_rows(&db, "node:Person").await, 1);
 }
 
+/// A storage failure while the publisher writes the `__manifest`
+/// transaction file, before Lance sends the manifest, is definite: the error
+/// carries `Unpublished` and is not a publication in doubt, the graph is
+/// unchanged, and the next write on the same handle publishes. This is the
+/// shape of the 2026-10-19 containment, where one throttled transaction-file
+/// PUT was answered in doubt. The fault is real backend I/O: a file planted
+/// where `__manifest/_transactions/` goes.
+#[tokio::test]
+async fn publisher_failure_before_the_manifest_put_is_definite_issue_1067() {
+    use omnigraph::error::CompletionEvidence;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = session(Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap());
+    let transactions = dir.path().join("__manifest/_transactions");
+    let parked = dir.path().join("__manifest/_transactions.parked");
+    assert!(transactions.is_dir(), "init wrote the genesis transaction");
+    std::fs::rename(&transactions, &parked).unwrap();
+    std::fs::write(&transactions, b"not a directory").unwrap();
+
+    let error = mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "stranded")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        !error.is_manifest_publish_in_doubt(),
+        "no manifest request was sent: {error:?}"
+    );
+    assert_eq!(
+        error.completion_evidence(),
+        Some(CompletionEvidence::Unpublished),
+        "a publisher failure before the manifest put is definite: {error:?}"
+    );
+
+    std::fs::remove_file(&transactions).unwrap();
+    std::fs::rename(&parked, &transactions).unwrap();
+    assert_eq!(count_rows(&db, "node:Person").await, 0);
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "after")], &[("$age", 31)]),
+    )
+    .await
+    .expect("the next write on the same handle publishes");
+    assert_eq!(count_rows(&db, "node:Person").await, 1);
+}
+
 /// Mutation text the parser refuses keeps its diagnostic through the engine
 /// door, as read text does: the code and the position survive, and nothing
 /// is published.

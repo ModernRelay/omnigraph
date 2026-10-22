@@ -5556,6 +5556,7 @@ version = "0.14.0"
 dependencies = [
  "omnigraph-compiler",
  "omnigraph-engine",
+ "omnigraph-policy",
  "serde",
  "serde_json",
  "utoipa",
@@ -5655,11 +5656,13 @@ dependencies = [
  "bytes",
  "clap",
  "color-eyre",
+ "core-foundation 0.10.1",
  "futures",
  "keyring",
  "lance",
  "lance-index",
  "libc",
+ "libyaml-rs",
  "omnigraph-api-types",
  "omnigraph-cluster",
  "omnigraph-compiler",
@@ -5669,13 +5672,17 @@ dependencies = [
  "omnigraph-skill",
  "percent-encoding",
  "predicates",
+ "rcgen",
  "reqwest 0.12.28",
+ "security-framework 3.7.0",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "time",
  "tokio",
+ "tokio-rustls",
  "url",
  "uuid",
  "workos",
@@ -5700,6 +5707,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tracing",
  "ulid",
  "yaml_serde",
 ]
@@ -5776,8 +5784,10 @@ dependencies = [
  "lance-core",
  "lance-io",
  "object_store 0.14.2",
+ "omnigraph-cluster",
  "omnigraph-compiler",
  "omnigraph-engine",
+ "omnigraph-storage",
  "rand 0.9.4",
  "serde_json",
  "serial_test",
@@ -5905,6 +5915,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnigraph-mcp"
+version = "0.14.0"
+dependencies = [
+ "axum",
+ "color-eyre",
+ "omnigraph-skill",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "omnigraph-planner"
 version = "0.14.0"
 dependencies = [
@@ -5989,12 +6013,11 @@ dependencies = [
  "omnigraph-cluster",
  "omnigraph-compiler",
  "omnigraph-engine",
+ "omnigraph-mcp",
  "omnigraph-policy",
- "omnigraph-skill",
  "p256",
  "regex",
  "reqwest 0.12.28",
- "rmcp",
  "rsa",
  "serde",
  "serde_json",
@@ -7216,6 +7239,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcgen"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
+dependencies = [
+ "pem 3.0.6",
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "yasna",
+]
+
+[[package]]
 name = "redb"
 version = "3.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7732,9 +7768,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -9353,18 +9389,18 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.8"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d46a5a140e6f7afeccd8eae97eff335163939eac8b929834875168b29b3d267"
+checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.8"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf85cb06032201fa7c6f829d7db5a7e5aa45bcc0655327713065f6f0576731bf"
+checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -9935,6 +9971,15 @@ dependencies = [
  "libyaml-rs",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "yasna"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
+dependencies = [
+ "time",
 ]
 
 [[package]]

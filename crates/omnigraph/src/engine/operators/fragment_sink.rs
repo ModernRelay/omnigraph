@@ -97,7 +97,8 @@ impl DataSink for LanceFragmentSink {
         let db = &self.write.db;
         let txn = &self.write.txn;
         let branch = txn.branch.as_deref();
-        let mut staging = MutationStaging::new(self.write.write_budget);
+        let mut staging = MutationStaging::new(self.write.write_budget)
+            .with_overwrite_writers(self.write.writers);
         let opened = db
             .open_for_mutation_on_branch(
                 branch,
@@ -238,6 +239,7 @@ mod tests {
             db: Arc::clone(db),
             txn,
             write_budget: WriteBudget::default(),
+            writers: 2,
             staged: Arc::clone(&staged),
         };
         let sink =

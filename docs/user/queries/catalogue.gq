@@ -1,7 +1,7 @@
 // The engine catalogue: the built-in `@` node types every omnigraph binary
 // answers from its own registries. Read-only, never stored, never declared
 // in a user schema; listed here for reference. `omnigraph schema show
-// og_catalog` prints the same declarations from the running binary.
+// --target SERVER --graph og_catalog` reads the serving binary's declarations.
 
 node @Operator {
     name: String @key

@@ -5,29 +5,6 @@ use color_eyre::eyre::Result;
 use serde::Serialize;
 use std::io::Write;
 
-pub(crate) fn finish_login(target: &str, json: bool, stdout: &mut dyn Write) -> Result<()> {
-    if json {
-        write_json(
-            &serde_json::json!({"target": target, "credential_stored": true}),
-            stdout,
-        )
-    } else {
-        writeln!(stdout, "stored credential for target '{target}'")?;
-        Ok(())
-    }
-}
-pub(crate) fn finish_logout(target: &str, json: bool, stdout: &mut dyn Write) -> Result<()> {
-    if json {
-        write_json(
-            &serde_json::json!({"target": target, "credential_removed": true}),
-            stdout,
-        )
-    } else {
-        writeln!(stdout, "removed credential for target '{target}'")?;
-        Ok(())
-    }
-}
-
 /// The version this binary reports, `omnigraph --version` included
 /// ([`omnigraph_api_types::build`]).
 pub(crate) static PACKAGE_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
@@ -54,6 +31,7 @@ pub(crate) struct VersionOutput {
 pub(crate) struct ProtocolVersionsOutput {
     pub(crate) target: u32,
     pub(crate) credential: u32,
+    pub(crate) access: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,6 +66,7 @@ impl VersionOutput {
             protocols: ProtocolVersionsOutput {
                 target: crate::targets::TARGET_PROTOCOL,
                 credential: crate::targets::CREDENTIAL_PROTOCOL,
+                access: crate::targets::ACCESS_PROTOCOL,
             },
             internal_schema: InternalSchemaOutput {
                 writes: INTERNAL_MANIFEST_SCHEMA_VERSION,

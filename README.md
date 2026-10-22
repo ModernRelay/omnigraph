@@ -7,14 +7,14 @@
 
 <p align="center">
   <strong>Object-storage native graph database with branching and typed ontology.</strong><br>
-  <sub>Unified retrieval engine (vector/bm25/graph) · Git-style workflows · Open data format (Lance)</sub>
+  <sub>Unified retrieval engine (vector/BM25/graph) · Git-style workflows · Open data format (Lance)</sub>
 </p>
 
 <p align="center">
   <a href="docs/user/quickstart.md">Quickstart</a> &nbsp;·&nbsp;
   <a href="docs/user/clusters/index.md">Docs</a> &nbsp;·&nbsp;
   <a href="https://github.com/ModernRelay/omnigraph-cookbooks">Cookbooks</a> &nbsp;·&nbsp;
-  <a href="docs/user/cli/reference.md">CLI</a>
+  <a href="docs/user/cli/reference.md">CLI</a> &nbsp;·&nbsp;
   <a href="https://www.omnigraph.dev/llms.txt">llms.txt</a>
 </p>
 
@@ -25,7 +25,9 @@
 
 <hr>
 
-Omnigraph is engineered for the new workload introduced by long-horizon agents: Multiple agents sharing a typed world model to continuously retrieve and store context and coordinate work. Agents and UIs can become thin stateless consumers of a durable state.
+Omnigraph is engineered for the new workload introduced by long-horizon agents: multiple agents sharing a typed world model to continuously retrieve and store context and coordinate work. Agents and UIs can become thin stateless consumers of durable state.
+
+Omnigraph Cloud is Omnigraph as a service: managed storage, servers, releases, backups, compaction and scaling, with access by token through the same CLI, SDKs and MCP server. Private preview; [join the waitlist](https://www.omnigraph.dev/cloud?utm_source=github&utm_medium=readme&utm_campaign=cloud-waitlist).
 
 ## Capabilities
 
@@ -208,7 +210,7 @@ Both npm packages are versioned in lockstep with `omnigraph-server`.
 - [Cluster guide](docs/user/clusters/index.md) · [Deployment guide](docs/user/deployment.md) · [CLI reference](docs/user/cli/reference.md)
 - [Schema](docs/user/schema/index.md) · [Queries](docs/user/queries/index.md) · [Search](docs/user/search/index.md) · [Policy](docs/user/operations/policy.md)
 
-## Build And Test
+## Build and test
 
 ```bash
 cargo build --workspace

@@ -511,15 +511,20 @@ impl CommitGraph {
         Ok(registry)
     }
 
+    /// Test-only: production reads pass the reading handle's control session.
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn open(root_uri: &str) -> Result<Self> {
         Self::open_branch(root_uri, None).await
     }
 
     /// Fails with the typed branch miss when `branch` is not a live branch.
+    /// Test-only: production reads pass the reading handle's control session.
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn open_at_branch(root_uri: &str, branch: &str) -> Result<Self> {
         Self::open_branch(root_uri, Some(branch)).await
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     async fn open_branch(root_uri: &str, branch: Option<&str>) -> Result<Self> {
         let session = crate::lance_access::control_session();
         let (rows, dataset) =

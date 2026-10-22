@@ -518,7 +518,8 @@ impl Omnigraph {
                 branch_created = true;
                 // DST window (loader walk D1 → D2): the implicit fork is
                 // durable, the load has not begun.
-                fail(&LOAD_POST_BRANCH_CREATE_PRE_STAGE)?;
+                fail(&LOAD_POST_BRANCH_CREATE_PRE_STAGE)
+                    .map_err(OmniError::after_earlier_publication)?;
             }
         }
         // Direct-to-target writes: no Run state machine, no `__run__` staging
@@ -538,8 +539,10 @@ impl Omnigraph {
             )
             .await
             .map_err(|error| {
+                // The fork published on its own, so every failure of the rows
+                // follows it.
                 if branch_created {
-                    error.without_pre_effect_evidence()
+                    error.after_earlier_publication()
                 } else {
                     error
                 }
@@ -807,6 +810,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
                 actor_id,
                 history_release_bytes,
                 write_budget,
+                stage_write_concurrency,
                 memory,
                 executed,
             ))
@@ -1261,6 +1265,7 @@ async fn load_csv_overwrite_plan(
     actor_id: Option<&str>,
     history_release_bytes: HistoryReleaseBytes,
     write_budget: WriteBudget,
+    stage_write_concurrency: usize,
     memory: &crate::engine::LoadMemory,
     mut executed: LoadExecuted,
 ) -> Result<LoadReceipt> {
@@ -1293,6 +1298,7 @@ async fn load_csv_overwrite_plan(
             db: Arc::clone(db),
             txn: Arc::new(txn.clone()),
             write_budget,
+            writers: stage_write_concurrency,
             staged: Arc::clone(&staged),
         }),
     };
