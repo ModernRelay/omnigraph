@@ -262,6 +262,8 @@ impl OperationRuntime {
         R: Send + 'static,
         F: Future<Output = OwnedResult<T>> + Send + 'static,
     {
+        use tracing::instrument::WithSubscriber as _;
+
         {
             let mut state = locked(&self.inner.state);
             if state.closed {
@@ -275,6 +277,8 @@ impl OperationRuntime {
             reservation: Some(Box::new(reservation)),
         };
         let (sender, receiver) = oneshot::channel();
+        // A span retains its subscriber, but entering it does not install that
+        // subscriber for Span::current() or events on a detached task.
         tokio::spawn(
             async move {
                 // The write runs as its request's submitted write: an error it
@@ -330,7 +334,8 @@ impl OperationRuntime {
                     owner,
                 });
             }
-            .instrument(crate::telemetry::operation_span("write")),
+            .instrument(crate::telemetry::operation_span("write"))
+            .with_current_subscriber(),
         );
         Ok(OwnedResponse(receiver))
     }
@@ -484,6 +489,8 @@ impl ReadObserver {
         R: Send + 'static,
         F: Future<Output = Result<T, ApiError>> + Send + 'static,
     {
+        use tracing::instrument::WithSubscriber as _;
+
         let (sender, receiver) = oneshot::channel();
         let response_observer = self.clone();
         tokio::spawn(
@@ -504,7 +511,8 @@ impl ReadObserver {
                 // No result history: an absent waiter drops the result here.
                 let _ = sender.send(result);
             }
-            .instrument(crate::telemetry::operation_span("read")),
+            .instrument(crate::telemetry::operation_span("read"))
+            .with_current_subscriber(),
         );
         OwnedReadResponse {
             receiver,

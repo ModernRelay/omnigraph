@@ -486,11 +486,36 @@ mod tests {
         );
         assert_eq!(http.parent_span_id.to_string(), "b7ad6b7169203331");
         assert!(matches!(http.status, Status::Error { .. }));
+        let logs = captured.output();
+        let native_completions: Vec<serde_json::Value> = logs
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|line| line["message"] == "native operation completed")
+            .collect();
+        assert_eq!(native_completions.len(), 2, "{logs}");
         for native in spans.iter().filter(|span| span.name == "native.operation") {
             assert_eq!(native.parent_span_id, http.span_context.span_id());
             assert_eq!(native.span_context.trace_id(), http.span_context.trace_id());
+            let completion = native_completions
+                .iter()
+                .find(|line| line["span_id"] == native.span_context.span_id().to_string())
+                .expect("owned task completion uses its captured subscriber and span");
+            assert_eq!(
+                completion["trace_id"],
+                http.span_context.trace_id().to_string()
+            );
+            assert_eq!(completion["operation_outcome"], "succeeded");
         }
-        let logs = captured.output();
+        assert!(
+            native_completions
+                .iter()
+                .any(|line| line["operation_kind"] == "write")
+        );
+        assert!(
+            native_completions
+                .iter()
+                .any(|line| line["operation_kind"] == "read")
+        );
         let completion: serde_json::Value = logs
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
@@ -534,7 +559,7 @@ mod tests {
                 OmniError::Policy("PRIVATE_POLICY_DETAIL".into()),
                 "failed",
                 crate::api::DispositionEffects::None,
-                crate::api::DispositionAction::Fix,
+                crate::api::DispositionAction::Refresh,
             ),
         ] {
             let exporter = InMemorySpanExporter::default();
