@@ -3806,8 +3806,11 @@ fn dst_predict_born_on_both_person_probe() {
 /// seeded universes with the window's milestone plan woven into the stream,
 /// its setup crash (`setup_crash_for`) when it has one, and a record-only
 /// probe over the whole universe (`probe_window`). Reports per-window
-/// crossed/not and the tally. Every window must cross except those in
-/// `harness::REACH_EXPECTED_DARK`, and no universe may trip an oracle.
+/// crossed/not and the tally. Every window must cross on one of its seeds
+/// except those in `harness::REACH_EXPECTED_DARK`; the first cross wins, so
+/// a seed that trips an oracle fails the census only when no seed of that
+/// window crosses (`errored`), since the census asks whether the window is
+/// reachable.
 ///   cd crates/omnigraph-dst && cargo test --locked --test scenarios dst_window_reach_probe -- --ignored --nocapture
 #[test]
 #[serial]
