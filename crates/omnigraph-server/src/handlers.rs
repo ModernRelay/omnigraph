@@ -153,6 +153,7 @@ pub(crate) async fn server_ready(
         (status = 200, description = "List of registered graphs", body = GraphListResponse),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`) before a successful response", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -359,7 +360,14 @@ pub(crate) fn add_cluster_graph_id_parameter(item: &mut utoipa::openapi::PathIte
 pub(crate) fn graph_id_path_parameter() -> Parameter {
     let mut parameter = Parameter::new("graph_id");
     parameter.parameter_in = ParameterIn::Path;
-    parameter.description = Some("Graph id to route the request to.".to_string());
+    parameter.description = Some(
+        "Graph id to route the request to. The `og_` prefix is reserved for system graphs. \
+         `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query \
+         and GET /schema with their ordinary response bodies. Its query refuses `branch` \
+         and `snapshot`; every other route under /graphs/og_catalog returns 405 \
+         `method_not_allowed` before effects."
+            .to_string(),
+    );
     parameter.schema = Some(Object::with_type(Type::String).into());
     parameter
 }
@@ -778,6 +786,7 @@ pub(crate) fn authorize_request(
         (status = 200, description = "Graph snapshot", body = api::SnapshotOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`) before a successful response", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -830,7 +839,7 @@ pub(crate) async fn server_snapshot(
         (status = 200, description = "The actions the caller's credential may take", body = api::AccessOutput),
         (status = 400, description = "An unknown or repeated parameter, a target branch without a branch, or a branch name that is not canonical", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 500, description = "The installed policy could not be evaluated", body = ErrorOutput),
+        (status = 500, description = "The installed policy could not be evaluated (code `internal`)", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -895,6 +904,7 @@ pub(crate) fn access_body(
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "A full-text index requires explicit rebuilding (full_text_index_rebuild_required) or has no segment at the snapshot (full_text_index_required); neither is cleared by retrying", body = ErrorOutput),
         (status = 424, description = "A load explain could not probe an allowed external source", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`) before a successful response", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -1021,7 +1031,7 @@ struct BlobBinaryBody(Vec<u8>);
                 ("ETag" = String),
                 ("Omnigraph-Snapshot-Id" = String),
             )),
-        (status = 500, description = "Stored Blob integrity or pre-header delivery refusal, including ranged external descriptors that cannot be redirected", body = ErrorOutput),
+        (status = 500, description = "Stored Blob integrity failure (code `internal`) or pre-header delivery refusal, including ranged external descriptors that cannot be redirected", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -1084,7 +1094,7 @@ pub(crate) async fn server_blob_get(
                 ("ETag" = String),
                 ("Omnigraph-Snapshot-Id" = String),
             )),
-        (status = 500, description = "Stored Blob integrity or pre-header delivery refusal, including ranged external descriptors that cannot be redirected; HEAD responses have no body"),
+        (status = 500, description = "Stored Blob integrity failure (code `internal`) or pre-header delivery refusal, including ranged external descriptors that cannot be redirected; HEAD responses have no body"),
     ),
     security(("bearer_token" = [])),
 )]
@@ -1137,6 +1147,7 @@ pub(crate) async fn server_blob_head(
         (status = 415, description = "Content-Type must be application/octet-stream", body = ErrorOutput),
         (status = 424, description = "An allowed external Blob source carried from the entity could not be read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write", body = ErrorOutput),
         (status = 503, description = "Write admission is closed or an overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
@@ -1251,6 +1262,7 @@ pub(crate) async fn server_blob_put(
         (status = 413, description = "The entity's carried Blob payloads exceed the write's payload limit", body = ErrorOutput),
         (status = 424, description = "An allowed external Blob source carried from the entity could not be read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write", body = ErrorOutput),
         (status = 503, description = "Write admission is closed or an overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
@@ -1477,6 +1489,7 @@ fn redact_blob_api_error(
         (status = 413, description = "Export cut or transport capacity exhausted", body = ErrorOutput),
         (status = 415, description = "Request body must use application/json", body = ErrorOutput),
         (status = 404, description = "Branch not found", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`) before a successful response", body = ErrorOutput),
         (status = 503, description = "Recovery required", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
@@ -2046,6 +2059,7 @@ fn engine_error_with_cause(error: OmniError) -> (ApiError, Option<RedactedCause>
         (status = 413, description = "Keyed write exceeds the per-commit entity or byte ceiling", body = ErrorOutput),
         (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
@@ -2118,6 +2132,7 @@ pub(crate) async fn server_mutate(
         (status = 413, description = "Keyed write exceeds the per-commit entity or byte ceiling", body = ErrorOutput),
         (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
@@ -2193,7 +2208,7 @@ pub(crate) fn parse_optional_invoke_body(
         (status = 413, description = "Stored keyed mutation exceeds the per-commit entity or byte ceiling", body = ErrorOutput),
         (status = 424, description = "A stored mutation could not probe or read an allowed external Blob source", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
-        (status = 500, description = "Policy evaluation error (a denial is reported as 404, not 500)", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write", body = ErrorOutput),
         (status = 503, description = "A stored mutation is blocked by a durable recovery intent", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
@@ -2243,7 +2258,7 @@ pub(crate) async fn server_invoke_query(
         (status = 413, description = "Stored keyed mutation exceeds the per-commit entity or byte ceiling", body = ErrorOutput),
         (status = 424, description = "A stored mutation could not probe or read an allowed external Blob source", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
-        (status = 500, description = "Policy evaluation error (a denial is reported as 404, not 500)", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write", body = ErrorOutput),
         (status = 503, description = "A stored mutation is blocked by a durable recovery intent", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
@@ -2404,6 +2419,7 @@ async fn invoke_stored_query(
         (status = 200, description = "Stored-query catalog (every stored query, with typed params)", body = QueriesCatalogOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`) before a successful response", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -2450,6 +2466,7 @@ pub(crate) async fn server_list_queries(
         (status = 200, description = "Current schema source", body = SchemaOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`) before a successful response", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -2597,6 +2614,7 @@ async fn run_json_load(
         (status = 413, description = "Load input or external Blob admission exceeds a bounded per-operation entity or byte ceiling", body = ErrorOutput),
         (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
@@ -2677,6 +2695,7 @@ async fn collect_graph_batch_body(body: Body) -> std::result::Result<Bytes, ApiE
         (status = 415, description = "Content-Type must be application/x-ndjson", body = ErrorOutput),
         (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
@@ -2793,6 +2812,7 @@ pub(crate) async fn server_load_ndjson(
         (status = 200, description = "List of branches", body = BranchListOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`) before a successful response", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -2858,6 +2878,7 @@ async fn branch_list_body(
         (status = 409, description = "Branch already exists, or the commit `from_commit` names cannot start a branch; see branch_start_refusal", body = ErrorOutput),
         (status = 410, description = "The commit `from_commit` names is no longer retained; see branch_start_refusal", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
@@ -3079,6 +3100,7 @@ fn branch_method_not_allowed(action: Option<BranchAction>) -> Response {
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 404, description = "Branch not found", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
@@ -3158,6 +3180,7 @@ async fn branch_delete_body(
         (status = 413, description = "Merge entity, byte, or recovery-chain ceiling exceeded before effects", body = ErrorOutput),
         (status = 424, description = "A merge could not probe or read an allowed external Blob source", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
@@ -3379,6 +3402,7 @@ async fn delete_merged_source_branch(
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 404, description = "Branch not found", body = ErrorOutput),
         (status = 413, description = "Requested limit exceeds 1000 commits per page", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`) before a successful response", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -3523,6 +3547,7 @@ pub(crate) struct CommitPath {
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 404, description = "Commit not found", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`) before a successful response", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -3569,6 +3594,7 @@ pub(crate) async fn server_commit_show(
         (status = 409, description = "The target's state moved under the proposal's authority (code `conflict`), or the commit is unattached and cannot publish (code `unattached_cannot_publish`, no durable effect)", body = ErrorOutput),
         (status = 412, description = "The target head moved past the commit's captured parent; the commit can only be dropped", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
@@ -3620,6 +3646,7 @@ pub(crate) async fn server_commit_publish(
         (status = 404, description = "Commit not found, or its drop is not permitted", body = ErrorOutput),
         (status = 409, description = "The commit is published", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
@@ -4285,7 +4312,7 @@ pub(crate) fn parse_change_query(
         (status = 409, description = "Commit cannot be entity-diffed (parentless commit or schema boundary); see change_diff_refusal", body = api::ChangeErrorOutput),
         (status = 410, description = "Required retained history is no longer readable; see change_feed_gap and capture a new baseline", body = api::ChangeErrorOutput),
         (status = 413, description = "Requested limit exceeds the public change ceiling", body = api::ChangeErrorOutput),
-        (status = 500, description = "Internal failure while reading changes", body = api::ChangeErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`) while reading changes", body = api::ChangeErrorOutput),
         (status = 503, description = "Recovery required before changes can be read", body = api::ChangeErrorOutput),
     ),
     security(("bearer_token" = [])),
@@ -4402,7 +4429,7 @@ fn required_diff_param(value: Option<String>, name: &str) -> std::result::Result
         (status = 409, description = "The two sides cross a schema boundary; see change_diff_refusal", body = api::ChangeErrorOutput),
         (status = 410, description = "Retained history for an endpoint is no longer readable; see change_feed_gap", body = api::ChangeErrorOutput),
         (status = 413, description = "Requested limit exceeds the public change ceiling", body = api::ChangeErrorOutput),
-        (status = 500, description = "Internal failure while reading changes", body = api::ChangeErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`) while reading changes", body = api::ChangeErrorOutput),
         (status = 503, description = "Recovery required before changes can be read", body = api::ChangeErrorOutput),
     ),
     security(("bearer_token" = [])),
@@ -4550,7 +4577,7 @@ pub(crate) fn authorize_branch_reads(
         (status = 409, description = "The base and the source head cross a schema boundary; see change_diff_refusal", body = api::ChangeErrorOutput),
         (status = 410, description = "Retained history for the base is no longer readable; see change_feed_gap", body = api::ChangeErrorOutput),
         (status = 413, description = "Requested limit exceeds the public change ceiling", body = api::ChangeErrorOutput),
-        (status = 500, description = "Internal failure while reading changes", body = api::ChangeErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`) while reading changes", body = api::ChangeErrorOutput),
         (status = 503, description = "Recovery required before changes can be read", body = api::ChangeErrorOutput),
     ),
     security(("bearer_token" = [])),
@@ -4624,7 +4651,7 @@ pub(crate) async fn branch_diff_page(
         (status = 401, description = "Unauthorized", body = api::ChangeErrorOutput),
         (status = 403, description = "The actor cannot read one of the branches", body = api::ChangeErrorOutput),
         (status = 404, description = "A branch is not found", body = api::ChangeErrorOutput),
-        (status = 500, description = "Internal failure while reading lineage", body = api::ChangeErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`) while reading lineage", body = api::ChangeErrorOutput),
         (status = 503, description = "Recovery required before lineage can be read", body = api::ChangeErrorOutput),
     ),
     security(("bearer_token" = [])),
@@ -4800,7 +4827,7 @@ fn parse_change_feed_start(
         (status = 409, description = "The feed crossed an unprovable schema boundary; see change_diff_refusal", body = api::ChangeErrorOutput),
         (status = 410, description = "Feed gap: required history was reclaimed; reset via the baseline handshake", body = api::ChangeErrorOutput),
         (status = 413, description = "Requested limit exceeds the public change ceiling", body = api::ChangeErrorOutput),
-        (status = 500, description = "Internal failure while reading changes", body = api::ChangeErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`) while reading changes", body = api::ChangeErrorOutput),
         (status = 503, description = "Recovery required before changes can be read", body = api::ChangeErrorOutput),
     ),
     security(("bearer_token" = [])),
@@ -4877,7 +4904,7 @@ pub(crate) async fn server_changes_feed(
         (status = 403, description = "Forbidden", body = api::ChangeErrorOutput),
         (status = 404, description = "Branch not found", body = api::ChangeErrorOutput),
         (status = 413, description = "Baseline cut or transport capacity exhausted", body = api::ChangeErrorOutput),
-        (status = 500, description = "Internal failure while capturing the baseline", body = api::ChangeErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`) while capturing the baseline", body = api::ChangeErrorOutput),
         (status = 503, description = "Recovery required", body = api::ChangeErrorOutput),
     ),
     security(("bearer_token" = [])),

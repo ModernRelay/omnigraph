@@ -13,6 +13,8 @@ use omnigraph_server::{AppState, build_app, served_openapi};
 use serde_json::Value;
 use tower::ServiceExt;
 
+mod conventions;
+
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../omnigraph/tests/fixtures")

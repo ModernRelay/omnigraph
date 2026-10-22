@@ -1060,8 +1060,9 @@ pub struct ChangeFeedOutput {
 pub struct CommitChangesQuery {
     /// Opaque continuation from the preceding page of this response.
     pub page_token: Option<String>,
-    /// Maximum changes per page. Server default applies when absent; above
-    /// the public ceiling the request fails with 413.
+    /// Maximum changes per page, 1 to 8192; defaults to 1000. Above 8192
+    /// the request fails with 413; zero is refused with 400.
+    #[param(minimum = 1, maximum = 8192, default = 1000)]
     pub limit: Option<usize>,
     /// Repeatable filter: node | edge.
     #[serde(default)]
@@ -1112,8 +1113,9 @@ pub struct DiffQuery {
     pub to: String,
     /// Opaque continuation from the preceding page of this response.
     pub page_token: Option<String>,
-    /// Maximum changes per page. Server default applies when absent; above
-    /// the public ceiling the request fails with 413.
+    /// Maximum changes per page, 1 to 8192; defaults to 1000. Above 8192
+    /// the request fails with 413; zero is refused with 400.
+    #[param(minimum = 1, maximum = 8192, default = 1000)]
     pub limit: Option<usize>,
     /// Repeatable filter: node | edge.
     #[serde(default)]
@@ -1137,7 +1139,9 @@ pub struct BranchDiffQuery {
     pub target: Option<String>,
     /// Opaque continuation from the preceding page of this response.
     pub page_token: Option<String>,
-    /// Maximum changes per page, as for `GET /diff`.
+    /// Maximum changes per page, 1 to 8192; defaults to 1000. Above 8192
+    /// the request fails with 413; zero is refused with 400.
+    #[param(minimum = 1, maximum = 8192, default = 1000)]
     pub limit: Option<usize>,
     /// Repeatable filter: node | edge.
     #[serde(default)]
@@ -1186,11 +1190,17 @@ pub struct ChangeFeedQuery {
     /// Continuation of one bounded poll (keeps its captured cut). Mutually
     /// exclusive with `cursor` and `start`.
     pub page_token: Option<String>,
+    /// Maximum changes per page, 1 to 8192; defaults to 1000. Above 8192
+    /// the request fails with 413; zero is refused with 400.
+    #[param(minimum = 1, maximum = 8192, default = 1000)]
     pub limit: Option<usize>,
+    /// Repeatable filter: node | edge.
     #[serde(default)]
     pub kind: Vec<EntityKindOutput>,
+    /// Repeatable filter: accepted-schema type name.
     #[serde(default)]
     pub r#type: Vec<String>,
+    /// Repeatable filter: insert | update | delete.
     #[serde(default)]
     pub op: Vec<ChangeOpOutput>,
     /// Repeatable session setting, `name=value` in GQ spelling
@@ -1892,6 +1902,7 @@ pub struct ExportRequest {
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct SnapshotQuery {
+    /// Branch whose snapshot to read. Defaults to `main`.
     pub branch: Option<String>,
 }
 
@@ -2083,6 +2094,7 @@ impl AccessOutput {
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct CommitListQuery {
+    /// Branch whose commits to list. Defaults to `main`.
     pub branch: Option<String>,
     /// `true` lists the unpublished commits whose recorded target is `branch`
     /// (writes `as commit` awaiting `commit publish`), newest first, instead
@@ -2094,8 +2106,9 @@ pub struct CommitListQuery {
     /// the branch's history. Refused together with `unpublished`.
     #[serde(default)]
     pub unattached: bool,
-    /// Commits per page of the branch's history, 1 to 1000; the page names
-    /// the head it resolved and a `next_page_token`. Without `limit` and
+    /// Commits per page of the branch's history, 1 to 1000; defaults to 100
+    /// when `page_token` is supplied. The page names the head it resolved
+    /// and a `next_page_token`. Without `limit` and
     /// `page_token` the whole history is listed. Refused with `unpublished`
     /// or `unattached`; above 1000 the request fails with 413.
     #[param(minimum = 1, maximum = 1000)]

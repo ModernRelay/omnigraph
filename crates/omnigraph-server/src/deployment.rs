@@ -321,6 +321,7 @@ fn active_result(
 #[utoipa::path(
     get, path = "/cluster/deployments", tag = "cluster", operation_id = "deployment_status",
     responses((status = 200, body = DeploymentStatusResponse), (status = 403, body = crate::api::ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`) while evaluating deployment access", body = crate::api::ErrorOutput),
         (status = 503, description = "Deployment ownership changed during the bounded ledger observation; retry this GET within the caller deadline", body = crate::api::ErrorOutput)),
     security(("bearer_token" = []))
 )]
@@ -390,7 +391,8 @@ async fn lookup_status(
     request_body = PlanRequest,
     responses((status = 200, body = Object), (status = 400, body = crate::api::ErrorOutput),
         (status = 403, body = crate::api::ErrorOutput), (status = 409, body = crate::api::ErrorOutput),
-        (status = 413, body = crate::api::ErrorOutput), (status = 415, body = crate::api::ErrorOutput)),
+        (status = 413, body = crate::api::ErrorOutput), (status = 415, body = crate::api::ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`) while evaluating deployment access or planning", body = crate::api::ErrorOutput)),
     security(("bearer_token" = []))
 )]
 pub(crate) async fn plan(
@@ -429,6 +431,7 @@ pub(crate) async fn plan(
     responses((status = 200, body = DeploymentResponse), (status = 202, description = "Durably accepted; poll the exact receipt until in_progress is false and inspect active", body = DeploymentResponse), (status = 400, body = crate::api::ErrorOutput),
         (status = 403, body = crate::api::ErrorOutput), (status = 409, body = crate::api::ErrorOutput),
         (status = 413, body = crate::api::ErrorOutput), (status = 415, body = crate::api::ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`), or unsettled deployment completion (code `outcome_unknown`); reconcile the original deployment identity before submitting another deployment", body = crate::api::ErrorOutput),
         (status = 503, body = crate::api::ErrorOutput)),
     security(("bearer_token" = []))
 )]

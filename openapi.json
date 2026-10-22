@@ -280,6 +280,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`) while evaluating deployment access",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "Deployment ownership changed during the bounded ledger observation; retry this GET within the caller deadline; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -634,6 +655,27 @@
                   "type": "string"
                 },
                 "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled deployment completion (code `outcome_unknown`); reconcile the original deployment identity before submitting another deployment",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
               }
             },
             "content": {
@@ -1249,6 +1291,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`) while evaluating deployment access or planning",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -1456,6 +1519,27 @@
           },
           "412": {
             "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal failure (code `internal`) before a successful response",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -1692,7 +1776,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -1905,7 +1989,7 @@
             }
           },
           "500": {
-            "description": "The installed policy could not be evaluated",
+            "description": "The installed policy could not be evaluated (code `internal`)",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -1972,7 +2056,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -2494,7 +2578,7 @@
             }
           },
           "500": {
-            "description": "Stored Blob integrity or pre-header delivery refusal, including ranged external descriptors that cannot be redirected",
+            "description": "Stored Blob integrity failure (code `internal`) or pre-header delivery refusal, including ranged external descriptors that cannot be redirected",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -2559,7 +2643,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -2961,6 +3045,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "Write admission is closed or an overlapping durable recovery intent must be resolved before retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -3006,7 +3111,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -3347,6 +3452,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "Write admission is closed or an overlapping durable recovery intent must be resolved before retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -3392,7 +3518,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -3764,7 +3890,7 @@
             }
           },
           "500": {
-            "description": "Stored Blob integrity or pre-header delivery refusal, including ranged external descriptors that cannot be redirected; HEAD responses have no body",
+            "description": "Stored Blob integrity failure (code `internal`) or pre-header delivery refusal, including ranged external descriptors that cannot be redirected; HEAD responses have no body",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -3817,7 +3943,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -4032,6 +4158,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`) before a successful response",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -4077,7 +4224,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -4386,6 +4533,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "An overlapping durable recovery intent must be resolved before retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -4433,7 +4601,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -4469,11 +4637,13 @@
           {
             "name": "limit",
             "in": "query",
-            "description": "Maximum changes per page, as for `GET /diff`.",
+            "description": "Maximum changes per page, 1 to 8192; defaults to 1000. Above 8192\nthe request fails with 413; zero is refused with 400.",
             "required": false,
             "schema": {
               "type": "integer",
-              "minimum": 0
+              "default": 1000,
+              "maximum": 8192,
+              "minimum": 1
             }
           },
           {
@@ -4785,7 +4955,7 @@
             }
           },
           "500": {
-            "description": "Internal failure while reading changes",
+            "description": "Internal failure (code `internal`) while reading changes",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -4852,7 +5022,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -5161,6 +5331,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "An overlapping durable recovery intent must be resolved before retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -5208,7 +5399,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -5442,7 +5633,7 @@
             }
           },
           "500": {
-            "description": "Internal failure while reading lineage",
+            "description": "Internal failure (code `internal`) while reading lineage",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -5509,7 +5700,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -5733,6 +5924,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "An overlapping durable recovery intent must be resolved before retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -5780,7 +5992,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -5825,15 +6037,19 @@
           {
             "name": "limit",
             "in": "query",
+            "description": "Maximum changes per page, 1 to 8192; defaults to 1000. Above 8192\nthe request fails with 413; zero is refused with 400.",
             "required": false,
             "schema": {
               "type": "integer",
-              "minimum": 0
+              "default": 1000,
+              "maximum": 8192,
+              "minimum": 1
             }
           },
           {
             "name": "kind",
             "in": "query",
+            "description": "Repeatable filter: node | edge.",
             "required": false,
             "schema": {
               "type": "array",
@@ -5845,6 +6061,7 @@
           {
             "name": "type",
             "in": "query",
+            "description": "Repeatable filter: accepted-schema type name.",
             "required": false,
             "schema": {
               "type": "array",
@@ -5856,6 +6073,7 @@
           {
             "name": "op",
             "in": "query",
+            "description": "Repeatable filter: insert | update | delete.",
             "required": false,
             "schema": {
               "type": "array",
@@ -6149,7 +6367,7 @@
             }
           },
           "500": {
-            "description": "Internal failure while reading changes",
+            "description": "Internal failure (code `internal`) while reading changes",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -6216,7 +6434,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -6484,7 +6702,7 @@
             }
           },
           "500": {
-            "description": "Internal failure while capturing the baseline",
+            "description": "Internal failure (code `internal`) while capturing the baseline",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -6551,7 +6769,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -6560,6 +6778,7 @@
           {
             "name": "branch",
             "in": "query",
+            "description": "Branch whose commits to list. Defaults to `main`.",
             "required": false,
             "schema": {
               "type": "string"
@@ -6586,7 +6805,7 @@
           {
             "name": "limit",
             "in": "query",
-            "description": "Commits per page of the branch's history, 1 to 1000; the page names\nthe head it resolved and a `next_page_token`. Without `limit` and\n`page_token` the whole history is listed. Refused with `unpublished`\nor `unattached`; above 1000 the request fails with 413.",
+            "description": "Commits per page of the branch's history, 1 to 1000; defaults to 100\nwhen `page_token` is supplied. The page names the head it resolved\nand a `next_page_token`. Without `limit` and\n`page_token` the whole history is listed. Refused with `unpublished`\nor `unattached`; above 1000 the request fails with 413.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -6833,6 +7052,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`) before a successful response",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -6880,7 +7120,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -7104,6 +7344,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`) before a successful response",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -7149,7 +7410,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -7366,6 +7627,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "An overlapping durable recovery intent must be resolved before retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -7413,7 +7695,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -7440,11 +7722,13 @@
           {
             "name": "limit",
             "in": "query",
-            "description": "Maximum changes per page. Server default applies when absent; above\nthe public ceiling the request fails with 413.",
+            "description": "Maximum changes per page, 1 to 8192; defaults to 1000. Above 8192\nthe request fails with 413; zero is refused with 400.",
             "required": false,
             "schema": {
               "type": "integer",
-              "minimum": 0
+              "default": 1000,
+              "maximum": 8192,
+              "minimum": 1
             }
           },
           {
@@ -7747,7 +8031,7 @@
             }
           },
           "500": {
-            "description": "Internal failure while reading changes",
+            "description": "Internal failure (code `internal`) while reading changes",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -7814,7 +8098,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -8038,6 +8322,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "An overlapping durable recovery intent must be resolved before retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -8085,7 +8390,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -8121,11 +8426,13 @@
           {
             "name": "limit",
             "in": "query",
-            "description": "Maximum changes per page. Server default applies when absent; above\nthe public ceiling the request fails with 413.",
+            "description": "Maximum changes per page, 1 to 8192; defaults to 1000. Above 8192\nthe request fails with 413; zero is refused with 400.",
             "required": false,
             "schema": {
               "type": "integer",
-              "minimum": 0
+              "default": 1000,
+              "maximum": 8192,
+              "minimum": 1
             }
           },
           {
@@ -8416,7 +8723,7 @@
             }
           },
           "500": {
-            "description": "Internal failure while reading changes",
+            "description": "Internal failure (code `internal`) while reading changes",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -8483,7 +8790,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -8788,6 +9095,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`) before a successful response",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "Recovery required; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -8835,7 +9163,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -9144,6 +9472,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "An overlapping durable recovery intent must be resolved before retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -9191,7 +9540,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -9549,6 +9898,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "An overlapping durable recovery intent must be resolved before retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -9596,7 +9966,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -9905,6 +10275,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "An overlapping durable recovery intent must be resolved before retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -9952,7 +10343,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -10270,6 +10661,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "An overlapping durable recovery intent must be resolved before retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -10317,7 +10729,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -10532,6 +10944,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`) before a successful response",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -10579,7 +11012,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -10904,7 +11337,7 @@
             }
           },
           "500": {
-            "description": "Policy evaluation error (a denial is reported as 404, not 500)",
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -10971,7 +11404,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -11305,7 +11738,7 @@
             }
           },
           "500": {
-            "description": "Policy evaluation error (a denial is reported as 404, not 500)",
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -11372,7 +11805,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -11681,6 +12114,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`) before a successful response",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -11728,7 +12182,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -11943,6 +12397,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`) before a successful response",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -11990,7 +12465,7 @@
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -11999,6 +12474,7 @@
           {
             "name": "branch",
             "in": "query",
+            "description": "Branch whose snapshot to read. Defaults to `main`.",
             "required": false,
             "schema": {
               "type": "string"
@@ -12203,6 +12679,27 @@
                   "type": "string"
                 },
                 "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal failure (code `internal`) before a successful response",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
               }
             },
             "content": {
@@ -15320,5 +15817,55 @@
         "scheme": "bearer"
       }
     }
-  }
+  },
+  "tags": [
+    {
+      "name": "access",
+      "description": "Actions available to the authenticated actor"
+    },
+    {
+      "name": "blobs",
+      "description": "Graph Blob values and conditional byte delivery"
+    },
+    {
+      "name": "branches",
+      "description": "Graph branches and merges"
+    },
+    {
+      "name": "changes",
+      "description": "Bounded graph differences and change feeds"
+    },
+    {
+      "name": "cluster",
+      "description": "Cluster deployment planning and execution"
+    },
+    {
+      "name": "commits",
+      "description": "Graph commit history and publication"
+    },
+    {
+      "name": "health",
+      "description": "Process health and readiness probes"
+    },
+    {
+      "name": "management",
+      "description": "Server graph inventory and OAuth resource metadata"
+    },
+    {
+      "name": "mutations",
+      "description": "Graph mutations and data loading"
+    },
+    {
+      "name": "queries",
+      "description": "Inline and stored queries, and graph exports"
+    },
+    {
+      "name": "schema",
+      "description": "Accepted graph schemas"
+    },
+    {
+      "name": "snapshots",
+      "description": "Coherent graph snapshot metadata"
+    }
+  ]
 }
