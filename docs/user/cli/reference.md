@@ -1,52 +1,52 @@
 # CLI reference
 
-This page maps the CLI; the installed binary is the exact reference:
-
-```bash
-omnigraph --help
-omnigraph <command> --help
-omnigraph <command> <subcommand> --help
-```
+Use `omnigraph --help` or `omnigraph <command> --help` for exact installed flags.
 
 ## Addressing a graph
 
-Most graph commands accept one of these scopes:
+Resource commands resolve one target from `--target NAME|LOCAL_PATH` or
+`defaults.target`. Account commands use `--profile NAME` or
+`defaults.profile`; see [selection rules](targets.md#selection-and-defaults). An unknown, incomplete or unsupported
+target refuses; it never falls back to another backend. Folder context and
+source configuration do not select destinations. Every backend invocation prints
+its resolved target to stderr, including its kind, scope and selection source.
+Machine results remain on stdout.
 
-| Scope | Use |
+| Target | Example |
 |---|---|
-| positional URI | Direct access for commands whose positional slot is not used by another value |
-| `--store <URI>` | Direct access to one `file://`, `s3://`, or `az://` graph; the exact token `og_catalog` (also as `--graph og_catalog` on a server) is the [engine catalogue](../queries/catalogue.md), serving `query` and `schema show` with no store opened |
-| `--server <NAME\|URL> --graph <ID>` | A graph served by a multi-graph server at an `http://`, `https://` or [`unix://`](index.md#use-a-server-through-a-unix-socket) URL |
-| `--cluster <DIR\|URI> --graph <ID>` | Direct maintenance of a cluster-managed graph |
-| `--profile <NAME>` | A named scope from operator config |
+| Registered direct graph | `omnigraph query --target local -e 'branch list'` |
+| Inline direct graph | `omnigraph query --target ./graph.omni -e 'branch list'` |
+| Direct cluster root and graph | `omnigraph query --target ./cluster --graph knowledge -e 'branch list'` |
+| Server | `omnigraph query --target standalone --graph knowledge find_person` |
+| Managed cluster | `omnigraph query --target production --graph knowledge find_person` |
 
-A bare local path is accepted where a graph URI is expected. `--server` and
-`--store` are mutually exclusive. A store already identifies one graph, so it
-cannot be combined with `--graph`.
+A registered direct target declares `scope: graph` or `scope: root`; a root or
+server requires `--graph` or its own `default_graph` for graph operations. No
+request discovers a graph to select automatically. Inline addresses are local paths or `file://` URIs only. Register remote
+endpoints; cloud-direct and catalogue targets are unsupported. Use `./name` for a
+relative filesystem address; a bare name selects a registered target.
+`init --schema graph.pg ./graph.omni` remains a creation convenience; it cannot
+be combined with `--target`.
 
-Common global flags:
-
-| Flag | Meaning |
-|---|---|
-| `--as <ACTOR>` | Actor for direct writes and cluster operations |
-| `--yes` | Non-interactive consent for destructive writes to non-local storage |
-| `--quiet` | Suppress the resolved write target printed to stderr |
-
-A served write refuses `--as` ("`--as` is not allowed on a served write"): the
-server resolves the actor from the bearer token. Drop it, or use `--store <uri>`.
+`--as ACTOR` attributes supported direct operations. A served target derives its
+actor from its credential and sends `--as` as the `Omnigraph-If-Actor` assertion,
+exiting 4 on a mismatch ([Assert the actor](../operations/server.md#assert-the-actor));
+a managed target refuses it. `--yes` supplies noninteractive consent for destructive
+operations on nonlocal storage. The retired `--quiet` cannot hide the destination.
 
 ## Commands
 
 | Command | Purpose | Scope |
 |---|---|---|
 | `init` | Create an empty graph from a `.pg` schema | direct |
+| `catalogue` | Query this binary's engine registries with `-e` or `--query`; optional `--json` | local, no operator config or graph storage |
 | `query` | Run a read query, or a branch read (`branch list`, `diff`, `merge-base`, `merge … dry run`), `show`, or `explain` statement | direct or served |
 | `mutate` | Run an insert/update/delete query (`as commit` leaves it unpublished; `as unattached branch [on "<id>"]` records a snapshot that never publishes), or a `branch create`, `branch delete`, `branch merge`, `commit publish`, `commit drop`, or [`load csv`](../mutations/index.md#csv-loading) statement | direct or served |
 | `load` | Load graph JSONL in `overwrite`, `append`, or `merge` mode | direct or served |
 | `blob get/stat/put/clear` | Read, inspect, replace or clear one Blob cell | direct or served |
 | `branch create/list/delete/merge/diff/merge-base` | Manage graph branches; `create --from-commit` starts a branch at a commit, `merge --as-commit` leaves the merge unpublished, `merge --dry-run` reports the outcome or conflicts and writes nothing, `diff` reviews what a branch changed since its merge base, `merge-base` prints that base | direct or served |
 | `snapshot` | Show a branch snapshot: `internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version | direct or served |
-| `commit list/show/changes/publish/drop` | Inspect history (`list --limit`/`--page-token` for one page of it, `list --unpublished` for a branch's unpublished commits, `list --unattached` for its live unattached snapshots; the two flags exclude each other and paging) or one commit's entity changes; publish an unpublished commit onto its recorded target branch (an unattached snapshot refuses with `unattached_cannot_publish`), or drop it (an unattached snapshot takes every descendant with it); `publish` and `drop` take `--as` on a direct graph, the reads refuse it | direct or served |
+| `commit list/show/changes/publish/drop` | Inspect history (`list --limit`/`--page-token` for one page of it, `list --unpublished` for a branch's unpublished commits, `list --unattached` for its live unattached snapshots; the two flags exclude each other and paging) or one commit's entity changes; publish an unpublished commit onto its recorded target branch (an unattached snapshot refuses with `unattached_cannot_publish`), or drop it (an unattached snapshot takes every descendant with it); `publish` and `drop` take `--as`, the reads refuse it | direct or served |
 | `diff` | Net entity changes between two points: branches or commit ids (`--from`, `--to`) | direct or served |
 | `changes poll/baseline` | Consume a branch change feed or establish a new baseline | direct or served |
 | `export` | Stream a branch as JSONL | direct or served |
@@ -61,21 +61,23 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `repair` | Report each table's Lance history against its registration (`no_drift` or `foreign_drift`) | direct |
 | `cleanup` | Delete table versions that no retained graph commit pins, under an explicit retention policy ([Maintenance](../operations/maintenance.md#cleanup)) | direct |
 | `graphs list` | List graph metadata or minimal identity discovery | served |
-| `queries list/validate` | Inspect or validate a cluster query registry | cluster |
+| `queries list` | List stored queries: a cluster root's registry (`--graph` narrows it to one graph), or one served graph's catalog, whose `--json` is the body of `GET /graphs/{id}/queries` | cluster or served |
+| `queries validate` | Type-check a cluster's applied query registry | cluster |
 | `cluster validate/plan/apply/...` | Operate self-hosted declarative state; [deployment/recovery flags](../clusters/index.md) | config, server, explicit root |
-| `cluster <command> --managed` | Operate a managed service cluster | managed API and folder context |
+| `cluster create/list/members/pull/push/delete/undo-delete/token/operation/history/cancel` | Operate a managed cluster | profile or managed target |
 | `policy validate/test/explain` | Validate or evaluate applied policy | cluster |
 | `embed` | Generate, clean, or refresh seed embeddings | local tooling |
-| `login`, `logout` | Manage a named server credential or a managed API session | local or managed API |
-| `use` | Select a managed cluster for a config directory | managed API |
-| `profile list/show` | Inspect operator profiles | local |
-| `alias` | Invoke a personal stored-query alias | served |
+| `login`, `logout` | Create a profile with `login --create-profile NAME` or manage an existing `omnigraph` profile session | managed profile |
+| `target list/inspect/add/refresh/remove` | Inspect/edit targets; managed add/refresh uses discovery | local or managed API |
+| `credentials set/status/remove/export` | Manage static custody or export access to a pipe; explicit profile or standalone target required | profile or server; managed target for export |
+| `config validate` | Validate the whole operator file offline | local |
+| `config rename-profile/rename-target/recover-rename` | Rename local bindings while preserving custody, or finish an interrupted rename ([syntax](targets.md#rename-registrations-and-profiles)) | local |
+| `config recover-operations --source DIR` | Preserve legacy folder lifecycle evidence; no operation submission | profile, local evidence |
+| `access` | Say who you are at a target and which actions its policy grants, graph-wide and on a branch ([access](targets.md#what-you-may-do-at-a-target)) | direct or served |
+| `alias` | Invoke a personal stored-query alias bound to one target | served |
+| `organization members/invitations` | Administer organization membership and invitations | profile |
 | `skill export/show` | Export the agent skill built into this binary, or print one of its files ([matching skill](index.md#give-an-agent-the-matching-skill)) | local |
-| `version` | Print the package version, HTTP contract and storage formats; `--json` prints `version`, `http_contract` and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
-
-`rebuild-full-text-indexes` accepts `--branch` (default `main`), `--json`, and
-`--as` for actor attribution. Direct maintenance does not load server policy;
-see the [rebuild procedure](../operations/maintenance.md#rebuild-full-text-indexes).
+| `version` | Print the package version, HTTP contract and storage formats; `--json` includes `version`, `http_contract`, `protocols` (`target`, `credential`, `access`) and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
 
 ## Query inputs and output
 
@@ -100,43 +102,42 @@ envelope pretty and the `rows` array compact; a refusal follows [Diagnostics](..
 
 ### Machine-readable read and write positions
 
-`query --json` returns `graph_commit_id` when its read snapshot has a graph
-head. The id and rows share one pinned snapshot; use that id for a later
-conditional mutation.
+`query --json` returns `graph_commit_id` when its read snapshot has a graph head. The id and
+rows share one pinned snapshot; use that id for a later conditional mutation.
 
 Successful `mutate --json` and `load --json` responses include `commit`, the exact commit published by
-that attempt. It contains `graph_commit_id`, optional `graph_branch`,
-`graph_manifest_version`, optional parent and merged-parent ids, optional
-`actor_id`, and `created_at` in Unix microseconds. A successful mutation
-that changes no entities returns `"commit": null`.
+that attempt: `graph_commit_id`, optional `graph_branch`, `graph_manifest_version`, optional parent and
+merged-parent ids, optional `actor_id`, and `created_at` in Unix microseconds. A successful mutation
+that changes no entities returns `"commit": null`. On every target `load --json` prints the body of
+`POST /graphs/{id}/load/ndjson`, with the write's `actor_id` and a `base_branch` that is `null` without `--from`.
 
-`--json` and read `--format json` preserve structured errors on stdout. Data-write failures
-report [whole-command outcomes and exits](../operations/troubleshooting.md#failed-data-write-commands).
-Verified HTTP conditional mismatches exit 4; embedded mismatches exit 1 because writable open can complete earlier work.
+`--json` and read `--format json` preserve structured errors on stdout. Data-write and read failures
+report [whole-command outcomes and exits](../operations/troubleshooting.md#failed-data-write-commands); a refused command line exits 64.
+Verified conditional mismatches exit 4, embedded or served, when nothing else in the command ran.
 
 ### Conditional mutations
 
 ```bash
-omnigraph query find_person --query queries.gq --store graph.omni --json
-omnigraph mutate update_person --query queries.gq --store graph.omni \
+omnigraph query find_person --query queries.gq --target ./graph.omni --json
+omnigraph mutate update_person --query queries.gq --target ./graph.omni \
   --if-commit <graph_commit_id> --json
 ```
 
 `--if-commit` runs the mutation only while the target branch is still at that
 commit. Any intervening commit on the branch invalidates the condition, even
 when it changed unrelated data. A mismatch has no effect and exits with code
-4 against a server, 1 on an embedded `--store` run; JSON output includes `precondition_failure` with `expected` and optional
+4, against a server or embedded; JSON output includes `precondition_failure` with `expected` and optional
 `actual` commit ids. Re-read and decide again instead of retrying blindly.
 
 ## Storage upgrade
 
 ```bash
-omnigraph upgrade ./graph.omni --check --json
-omnigraph upgrade ./graph.omni --json
-omnigraph schema upgrade-system-columns ./graph.omni --check --json
+omnigraph upgrade --target ./graph.omni --check --json
+omnigraph upgrade --target ./graph.omni --json
+omnigraph schema upgrade-system-columns --target ./graph.omni --check --json
 ```
 
-`--store` is an alternative to the positional storage URI. `omnigraph upgrade`
+`omnigraph upgrade --target ADDRESS`
 converts a standalone v8, v9 (release 0.11.x) or v13 graph to v16, offline and
 in place, keeping branches and commit history, and stamps a v14 or v15 graph
 to v16 with one metadata-only commit per live branch; stop every process using
@@ -148,7 +149,7 @@ and `recovery_required` (a pending attempt, finished as `recovery.action` says,
 or leftover recovery files) exit 1. The report names the formats, the route,
 the `work` counts, findings and the recovery action. Server and cluster
 addressing are refused; see [storage upgrade](../operations/upgrade.md#storage-upgrade).
-`schema upgrade-system-columns` is a separate operation on a served graph: [system-column upgrade](../operations/upgrade.md#system-column-upgrade-legacy-spellings).
+`schema upgrade-system-columns` is a separate operation on a supported standalone graph: [system-column upgrade](../operations/upgrade.md#system-column-upgrade-legacy-spellings).
 
 ## Load modes
 
@@ -164,7 +165,7 @@ addressing are refused; see [storage upgrade](../operations/upgrade.md#storage-u
 missing branch from an explicit base. Overwrite is destructive and may require
 `--yes` for non-local storage.
 
-In a selected managed folder, implicit `load --graph <ID>` uses the separate
+For a managed cluster target, `load --target NAME --graph <ID>` uses the separate
 cached data credential. It requires `change`, plus `branch_create` when
 `--from` is present. Managed loads bound input to 32 MiB, responses to 8 MiB,
 and one request to 300 seconds; uncertain writes are never automatically
@@ -176,171 +177,91 @@ Diffs, branch review and change feeds: [Changes, Diffs and Change Feeds](../bran
 ## Blob commands
 
 ```text
-omnigraph blob get|stat|put|clear <node|edge> <TYPE> <ID> <PROPERTY> [scope] [options]
+omnigraph blob get|stat|put|clear <node|edge> <TYPE> <ID> <PROPERTY> --target NAME|ADDRESS [options]
 ```
 
 `get` accepts `--branch` or `--snapshot`, `--offset`, `--length`, and
 `--out <PATH>`. `stat` accepts `--branch` or `--snapshot` and `--json`. `put`
 reads `--file <PATH>` or stdin; `put` and `clear` accept `--branch`,
-`--if-match <TAG>`, `--json` and, on `--store`, `--as`. See [Blob values](../blobs.md).
+`--if-match <TAG>`, `--json` and `--as` (on a served target, an assertion). See [Blob values](../blobs.md).
 
 ## Operator configuration
 
-The default path is `~/.omnigraph/config.yaml`. Set `OMNIGRAPH_HOME` to use a different directory.
-
-```yaml
-operator:
-  actor: act-alice
-
-defaults:
-  output: table
-  server: prod
-  default_graph: knowledge
-
-servers:
-  prod:
-    url: https://graph.example.com
-
-clusters:
-  company:
-    root: s3://company-data/omnigraph
-
-profiles:
-  prod-knowledge: {server: prod, default_graph: knowledge}
-  company-admin: {cluster: company, default_graph: knowledge}
-  local-dev: {store: file:///tmp/dev.omni}
-
-aliases:
-  experts:
-    server: prod
-    graph: knowledge
-    query: find_experts
-    args: [topic]
-    params:
-      limit: 20
-    format: table
-```
-
-Each profile binds exactly one of `server`, `cluster`, or `store`. Select it with
-`--profile` or `OMNIGRAPH_PROFILE`. Explicit flags override values filled by a profile.
-
-Bearer tokens never belong in `config.yaml`. Bind one to a declared server with
-`omnigraph login <server>` or `OMNIGRAPH_TOKEN_<NAME>`; the CLI sends it only to
-URLs under that server's `url` (see [server credentials](index.md#use-a-server)).
+[Operator configuration](targets.md) owns the version-1 grammar, defaults,
+provider protocols, transport limits, credential custody and upgrade procedure.
+Use `--operator-config FILE` to select one file; `--config DIR` selects source.
+There is no backward compatibility or `target import`. No secrets belong in YAML.
 
 ## Managed cluster commands
 
-Add `--managed` to select the managed service explicitly. Without it, `cluster`
-uses self-hosted configuration or an explicit server/root and ignores managed
-folder context. The flag can appear before or after the subcommand.
+Account operations use a profile. Resource operations use a managed target
+referencing it; see [registration](targets.md#login-and-registration).
 
-| Session command | Behavior |
-|---|---|
-| `omnigraph login --api ORIGIN [--organization ORG_ID]` | Reuse cached access or print a WorkOS device verification URL/code; credentials stay in the OS keychain, JSON contains identity/expiry only |
-| `omnigraph logout --api ORIGIN [--organization ORG_ID]` | Clear only the selected organization's control credentials and request provider revocation; `provider_revocation_confirmed` reports its outcome; accepted work continues |
-| `omnigraph use CLUSTER_ID --api ORIGIN [--organization ORG_ID] [--config DIR] [--json]` | Verify cluster access and atomically bind the selected directory |
-
-The secret-free `DIR/.omnigraph/context` is:
-
-```yaml
-version: 2
-cluster: CLUSTER_ID
-api: https://control.example
-organization_id: org_customer
+```bash
+omnigraph login --create-profile work
+omnigraph cluster list --profile work --json
+omnigraph target add production --profile work --cluster CLUSTER_ID
 ```
 
-Without a folder or `--organization`, exactly one cached organization is required.
-Fresh login selects its organization using only its new session; failure or
-uncertainty preserves cached sessions and requires fresh login. OS-keychain
-consent is outside the 35-second selection and verification network budget.
+The target pins cluster ID/incarnation and an optional service-attested endpoint.
+Data operations require that endpoint. Refresh is explicit; token issuance cannot
+retarget an invocation.
 
-Fully explicit `login`/`logout` select independently of the folder; ordinary
-commands refuse conflicts. To replace an old or invalid regular context, sign in
-with `--api` and `--organization`, then run fully explicit `use`. Context lookup
-uses only `--config` (default `.`); links, special files and files over 16 KiB refuse.
-See the [authentication contract](../../rfcs/2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients)
-for origin validation, separate organization sessions, identity pins and renewal bounds.
-
-| Managed command | Behavior |
+| Managed command | Target and behavior |
 |---|---|
-| `cluster list --managed --api ORIGIN [--organization ORG]` | List clusters visible to the selected organization |
-| `cluster members list --managed` | List [explicitly enrolled people](managed-lifecycle.md#list-cluster-members); requires the bound cluster's `status` permission |
-| `cluster pull --managed --out NEW_DIR [--rev REVISION]` | Download the bound cluster's exact configuration and context into a new directory |
-| `cluster plan --managed [--rev REVISION]` | Prepare a preview of the full pushed commit ID, or resolve the bound head when omitted |
-| `cluster apply --managed --plan PREVIEW_ID` | Deliver that exact preview under current permissions |
-| `cluster status --managed [DEPLOYMENT_ID] [--wait]` | Read labeled cluster observations, or an exact delivery; `--wait` requires its ID |
-| `cluster history --managed [--limit N] [--since RFC3339]` | Read newest deliveries first, default and maximum 100; filter creation time inclusively before the limit |
-| `cluster cancel --managed DEPLOYMENT_ID` | Cancel your queued delivery before its first dispatch attempt |
+| `login` / `logout` | Selected `omnigraph` profile (also via a managed target) |
+| `cluster create NAME`, `cluster list` | Profile; create returns identity without binding a folder |
+| `cluster members list` | Cluster target; list explicit enrollment |
+| `cluster pull --out NEW_DIR [--rev REVISION]` | Download configuration into a new directory |
+| `cluster push --config DIR --expected-revision REVISION --message TEXT` | Upload source using an exact revision |
+| `cluster plan [--rev REVISION]` | Preview pushed source |
+| `cluster apply --plan PREVIEW_ID` | Submit that exact preview |
+| `cluster status [DEPLOYMENT_ID] [--wait]` | Observe the cluster or one exact delivery |
+| `cluster history`, `cluster cancel DEPLOYMENT_ID` | Observe or cancel managed deliveries |
+| `cluster delete --incarnation ID`, `cluster undo-delete --incarnation ID --deletion-id ID` | Assert the target incarnation before lifecycle submission |
+| `cluster operation OPERATION_ID [--wait]` | Observe a lifecycle operation using its matching profile or managed target |
 
-See [managed lifecycle](managed-lifecycle.md) for cluster operations and [team administration](managed-team.md) for `organization --managed` (`org`), invitation commands and versioned member changes.
-All accept `--config DIR` and `--json`. Plan and apply also accept
-`--idempotency-key KEY`, `--no-wait`, and `--timeout SECONDS`. An omitted key is
-generated and printed before submission. Retain it and the exact request after
-uncertainty: replaying the same key/body retrieves the same reservation;
-changed input refuses. The CLI never repeats a submission automatically.
-Once an ID is known, observe it. Cancellation is idempotent, but refuses after
-possible dispatch and cannot stop native effects.
-Plan and apply read pushed source, not uncommitted local edits; use
-`cluster push --managed` to upload. Previews hold no change lease. Source edits
-grant no deployment permission: applied policy authorizes native effects.
-A stale generation or changed policy refuses without substituting a preview.
+Pass `--profile NAME` for account operations and `--target NAME` for resource
+operations, or set the corresponding independent default.
+`--config DIR` names source files only: managed push accepts it, while managed
+plan/apply read pushed source and refuse it. Managed operations never fall back
+to direct storage. Self-hosted `validate`, `observe`, `force-unlock`, and
+`upgrade-ledger` are unavailable for managed targets.
 
-Plan returns its synchronous preview. Replaying its key returns metadata,
-without redisclosing the saved native plan. Apply and exact-ID status waiting
-poll every two seconds for up to 300 seconds. `--timeout` accepts 1–3600
-seconds. Reaching the deadline stops only the local wait; continue with
-`cluster status --managed DEPLOYMENT_ID --wait`. Apply `--no-wait` prints the
-durable delivery reservation and both product/native IDs, then exits 0;
-it does not establish native acceptance or activation. Every HTTP request has a
-10-second deadline and an 8 MiB response limit; configuration download allows
-120 seconds and 64 MiB encoded (8 MiB of file contents). Redirects are refused.
-`--json` prints one API envelope to stdout with its native fields and separate
-source, delivery, archive and runtime observations intact. Progress and idempotency keys use
-stderr; refusals use a JSON problem object with a `type` field.
+Authentication uses only the selected owner-local provider. It never falls back
+to another profile, source or interactive login. Control-session renewal preserves
+the principal and organization and never replays a submitted graph mutation.
+Token and helper sources do not establish qualified workload federation.
+
+Managed plan/apply use `--idempotency-key KEY`, `--no-wait`, and
+`--timeout SECONDS`. Keep the key and exact request after an uncertain outcome;
+replay retrieves the same reservation and changed input refuses. Once an ID is
+known, observe it. Polling uses a two-second interval and a default 300-second
+local deadline (allowed range 1–3600); a timeout stops the local wait, not the
+remote operation. `--no-wait` confirms a reservation, not native acceptance or
+activation. Requests refuse redirects and bound their responses.
 
 | Managed deployment result | Exit code |
 |---|---|
 | Prepared preview, valid observation, confirmed cancellation, or explicit no-wait reservation | 0 |
-| Waited apply/status: fresh converged native result, active runtime and archived evidence | 0 |
-| Native failure/nonconverged result, transport or protocol error | 1 |
+| Waited result with fresh convergence, active runtime and archived evidence | 0 |
+| Native failure, nonconverged result, transport or protocol error | 1 |
 | Explicit refusal | 2 |
-| Local wait deadline with delivery, observation, activation or archive unresolved | 5 |
+| Local deadline or unresolved preview replay | 5 |
 
-Snapshot reads exit 0 without implying deployment success. Historical results
-cannot establish current activation. Unresolved preview replay exits 5 with its
-ID. There is no plan abandonment or inferred retry safety/exit 75 from HTTP.
-Cloud lifecycle commands retain their [separate outcomes](managed-lifecycle.md#recover-an-uncertain-response).
-Applied policy authorizes execution. `--as`, `--server`, `--profile`, `--graph`,
-`--store`, and global `--cluster` do not select managed cluster operations.
-
-For unattended execution, supply an accepted service bearer and its API origin:
-
-```bash
-export OMNIGRAPH_CONTROL_API=https://control.example
-# Supply OMNIGRAPH_CONTROL_TOKEN through your CI secret mechanism.
-omnigraph cluster apply --managed --plan PREVIEW_ID --idempotency-key DEPLOYMENT_KEY --json
-```
-
-The canonical `OMNIGRAPH_CONTROL_API` must match the selected context. A
-missing or mismatched pair refuses before any request. These credentials are
-separate from [server credentials](index.md#use-a-server) and operator profiles.
-
-`--managed` requires context except `create`, `list` and explicit-origin operation
-lookup; `--direct` is rejected. Managed API failures never trigger local deployment.
-Service-only `create`, `list`, `pull`, `push`, `delete`, `undo-delete`, `token`, `operation`, `history` and `cancel` require `--managed`. Local `validate`,
-`observe`, `force-unlock`, and `upgrade-ledger` reject it. Managed `plan` takes
-`--rev` and managed `apply` requires `--plan`; self-hosted deployment flags cannot
-be combined with them.
-Use `cluster operation --managed OPERATION_ID [--wait]` for service lifecycle observation;
-self-hosted `cluster status --deployment-id ID` addresses a native receipt.
+See [managed lifecycle](managed-lifecycle.md), [team administration](managed-team.md)
+and [managed data access](managed-data.md) for custody, permission and bounded
+request details. JSON emits one response on stdout; the resolved target,
+progress and idempotency information go to stderr.
 
 ## Managed data access
 
-After login and cluster selection, use `graphs list` to discover graphs, then
-`query`, `mutate`, `load`, or commit reads with `--graph` from the managed folder.
-Missing or expired identity credentials are acquired before the operation;
-applied Cedar policy decides permissions. See [managed data access](managed-data.md)
-for offline behavior, identity binding, discovery and credential clearing.
+A managed target uses the common served graph client, including schema reads,
+branches, snapshots, history, exports, Blob operations and change feeds. Select a graph explicitly or use its configured
+`default_graph`; discovery only lists available IDs. A separate identity
+credential authenticates the data endpoint, and applied Cedar policy decides
+permissions. Direct-only maintenance, schema changes and root administration
+remain unavailable through a managed data endpoint.
 
 ## Confirmation rules
 

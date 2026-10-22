@@ -12,7 +12,7 @@ omnigraph-server --cluster s3://bucket/prefix --bind 0.0.0.0:8080
 ```
 
 The server loads the cluster's applied revision and serves each graph under
-`/graphs/{id}`. `cluster apply --server` activates schema and stored-query
+`/graphs/{id}`. `cluster apply --target` activates schema and stored-query
 changes and new graphs without a restart; a direct `cluster apply` needs the
 server stopped. There is no single-graph server mode. A stopped server, even
 after a clean exit, leaves the cluster lock: once its writes have settled,
@@ -32,7 +32,7 @@ termination grace. Check rollout readiness with `GET /readyz`, not `/healthz`.
 | `GET /healthz`, `/openapi.json` | Process metadata |
 | `GET /readyz` | Replica readiness, applied revision and served/ready/loading/blocked counts |
 | `GET /graphs` | List graphs with their availability (`graph_list`) |
-| `POST /cluster/deployments`, `GET /cluster/deployments[/{id}]` | Submit and inspect a `cluster apply --server` deployment (`config_manage`) |
+| `POST /cluster/deployments`, `GET /cluster/deployments[/{id}]` | Submit and inspect a `cluster apply --target` deployment (`config_manage`) |
 | `/graphs/{id}/query`, `/mutate` | Inline GQ reads and writes |
 | `/graphs/{id}/mutate/if-graph-commit` | Conditional inline mutation (header `Omnigraph-If-Graph-Commit`) |
 | `/graphs/{id}/queries` | List/invoke stored queries; `/queries/{name}/if-graph-commit` for conditional writes |
@@ -47,7 +47,7 @@ termination grace. Check rollout readiness with `GET /readyz`, not `/healthz`.
 | `GET /graphs/{id}/access` | The caller's actor and allowed actions (`?branch=`, `&target_branch=`); check before a write instead of learning from a 403 |
 
 Every request to a graph, registry or deployment route must carry exactly one
-`Omnigraph-Http-Api: 0.13` header; a missing, repeated or other value is
+`Omnigraph-Http-Api: 0.14` header; a missing, repeated or other value is
 refused with `400 api_contract_mismatch` before graph access. Responses carry
 the same header. `/healthz`, `/readyz` and `/openapi.json` need none. Upgrade
 the CLI, server and HTTP clients together.
@@ -85,11 +85,12 @@ never activates a revision.
 
 Bearer tokens map actors at the server boundary. Request headers and bodies
 cannot choose another actor. Configure token sources on the server process;
-clients can store a named server token with:
+clients configure `auth: {provider: token, source: {store: {}}}` on `production`
+using the [operator reference](../../../docs/user/cli/targets.md), then install it:
 
 ```bash
-echo "$TOKEN" | omnigraph login production
-omnigraph query get_person --server production --graph knowledge
+printf '%s\n' "$TOKEN" | omnigraph credentials set --target production --stdin
+omnigraph query get_person --target production --graph knowledge
 ```
 
 A server with no credential source (static tokens or signed-token trust) and no
@@ -118,13 +119,13 @@ Graph-scoped actions are:
 | `read` | Queries, snapshots, branches, commits, Blob reads, and change polling |
 | `export` | Export and change-feed baseline capture |
 | `change` | Mutations and loads |
-| `schema_apply` | Schema changes: `cluster apply --server` needs it on each existing graph whose schema changes |
+| `schema_apply` | Schema changes: `cluster apply --target` needs it on each existing graph whose schema changes |
 | `branch_create`, `branch_delete`, `branch_merge` | Corresponding branch operation |
 | `invoke_query` | Entry to a stored query |
 | `admin` | Reserved; no current public operation |
 
 `graph_list` is cluster-scoped and controls `GET /graphs`. `config_manage` is
-cluster-scoped too and authorizes `cluster apply --server`; put it in a rule
+cluster-scoped too and authorizes `cluster apply --target`; put it in a rule
 of its own. A stored read needs
 `invoke_query` plus `read`; a stored mutation needs `invoke_query` plus
 `change`. A denied and unknown stored-query name both appear as `404` to a
@@ -173,9 +174,9 @@ protected branches are the bundle's top-level `protected_branches: [main, …]`
 list. `invoke_query`, `graph_list` and `config_manage` take no branch scope.
 
 ```bash
-omnigraph policy validate --cluster . --graph knowledge
-omnigraph policy test --cluster . --graph knowledge --tests policy.tests.yaml
-omnigraph policy explain --cluster . --graph knowledge \
+omnigraph policy validate --target . --graph knowledge
+omnigraph policy test --target . --graph knowledge --tests policy.tests.yaml
+omnigraph policy explain --target . --graph knowledge \
   --actor act-alice --action read --branch main
 ```
 
@@ -194,7 +195,7 @@ Served requests always use the server's policy engine. Embedded engine hosts
 can also install a policy engine, and every mutating engine entry point then
 enforces it.
 
-The standalone CLI opening `--store` or a positional URI does **not** load the
+The standalone CLI opening a direct `--target` does **not** load the
 cluster server's Cedar bundle. Its `--as` value records actor attribution but
 does not recreate server authorization. Protect raw graph storage with object
 store IAM/ACLs and restrict who can run direct maintenance. Served writes reject

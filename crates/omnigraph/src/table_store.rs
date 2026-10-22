@@ -53,7 +53,7 @@ use lance_datafusion::exec::{
     ExecutionStatsCallback, ExecutionSummaryCounts, HardCapBatchSizeExec, LanceExecutionOptions,
     collect_execution_metrics,
 };
-use lance_file::version::LanceFileVersion;
+use lance_file::{version::LanceFileVersion, writer::FileWriterOptions};
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
 use lance_index::{IndexType, is_system_index};
 use lance_linalg::distance::MetricType;
@@ -107,6 +107,19 @@ pub(crate) const INSERT_ABSENCE_V1: &str = "v1";
 const EXTERNAL_BLOB_PROBE_CONCURRENCY: usize = 8;
 const EXTERNAL_BLOB_REFERENCE_RESOURCE: &str = "external Blob reference cells";
 const EXTERNAL_BLOB_URI_METADATA_RESOURCE: &str = "external Blob URI metadata bytes";
+
+// Lance divides this per-writer accumulation allowance among top-level fields.
+// A complete input array can overshoot a column's threshold; nested leaves and
+// concurrent writers have independent queues. This is not an operation-wide
+// memory reservation. Keep copying slices so a small column cannot retain its
+// whole source batch. V2_2 does not enforce max_page_bytes in its encoder.
+fn budgeted_file_writer_options(write_budget: WriteBudget) -> FileWriterOptions {
+    FileWriterOptions {
+        data_cache_bytes: Some(write_budget.bytes()),
+        keep_original_array: Some(false),
+        max_page_bytes: None,
+    }
+}
 
 // Lance's ordinary Scanner stream executes SortExec with an unbounded memory
 // pool and spilling disabled. Every OmniGraph-ordered scan instead uses an
@@ -1502,6 +1515,10 @@ decide_seam! {
 }
 
 impl TableStore {
+    pub(crate) fn session(&self) -> Arc<lance::session::Session> {
+        self.session.clone()
+    }
+
     pub fn new(root_uri: &str, session: Arc<lance::session::Session>) -> Self {
         Self {
             root_uri: root_uri.trim_end_matches('/').to_string(),
@@ -1522,9 +1539,9 @@ impl TableStore {
     /// Authorize, normalize, deduplicate, and probe every URI before any
     /// external payload read, target ref creation, table commit, or
     /// graph-visible effect. Scalar-only preparation may already have produced
-    /// temporary in-memory or staged inputs. The graph session supplies the
-    /// process-wide shared registry, so one operation does not create cold
-    /// clients per row.
+    /// temporary in-memory or staged inputs. External sources retain their
+    /// independent provider registry; a selected graph destination never
+    /// overrides the source address or creates a cold client per row.
     pub(crate) async fn preflight_external_blob_uris(
         &self,
         uris: &[String],
@@ -1584,7 +1601,7 @@ impl TableStore {
         }
 
         crate::instrumentation::record_external_blob_preflight_inputs(uri_count);
-        let registry = self.session.store_registry();
+        let registry = crate::lance_access::external_source_registry(&self.session);
         let entries = futures::stream::iter(pending.into_values().map(|(normalized, aliases)| {
             let registry = Arc::clone(&registry);
             async move {
@@ -1735,7 +1752,8 @@ impl TableStore {
         if entry.native_dataset_branch.is_none() {
             return self.open_at_entry(entry).await;
         }
-        let dataset = match open_dataset_entry(entry, &self.root_uri, None).await {
+        let fresh = crate::lance_access::statement_session(self.session.store_registry(), 0, 0);
+        let dataset = match open_dataset_entry(entry, &self.root_uri, Some(&fresh)).await {
             Ok(dataset) => dataset,
             Err(error @ OmniError::HistoricalVersionReclaimed { .. }) => {
                 // Cleanup can reclaim a pinned version of a live fork (a
@@ -3360,6 +3378,7 @@ impl TableStore {
         let ds = Arc::new(ds);
         let params = WriteParams {
             mode: WriteMode::Append,
+            file_writer_options: Some(budgeted_file_writer_options(write_budget)),
             allow_external_blob_outside_bases: false,
             auto_cleanup: None,
             skip_auto_cleanup: true,
@@ -4052,7 +4071,8 @@ impl TableStore {
             ));
         }
 
-        let store_params = crate::storage::lance_store_params_for_uri(dataset_uri)?;
+        let store_params =
+            crate::storage::lance_store_params_for_session(dataset_uri, &self.session)?;
         let handler = crate::storage_layer::lance_clone::configured_commit_handler(
             dataset_uri,
             &Some(store_params.clone()),
@@ -4335,7 +4355,10 @@ impl TableStore {
     pub async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedWrite> {
         let params = WriteParams {
             mode: WriteMode::Create,
-            store_params: Some(crate::storage::lance_store_params_for_uri(dataset_uri)?),
+            store_params: Some(crate::storage::lance_store_params_for_session(
+                dataset_uri,
+                &self.session,
+            )?),
             enable_stable_row_ids: true,
             data_storage_version: Some(LanceFileVersion::V2_2),
             allow_external_blob_outside_bases: true,
@@ -4636,36 +4659,68 @@ impl TableStore {
 
     /// Stage an overwrite from one batch; see [`Self::stage_overwrite_batches`].
     pub async fn stage_overwrite(&self, ds: &Dataset, batch: RecordBatch) -> Result<StagedWrite> {
-        self.stage_overwrite_batches(ds, vec![batch]).await
+        self.stage_overwrite_batches(ds, vec![batch], WriteBudget::default(), 1)
+            .await
     }
 
     /// Stage an overwrite (write_fragments + Operation::Overwrite { schema, fragments })
-    /// from the batches as they were produced, never concatenated. Returns a
-    /// StagedWrite carrying the replacement fragments. HEAD does NOT advance.
+    /// from the batches as they were produced, never concatenated, through
+    /// up to `writers` Lance writers at once. Returns a StagedWrite carrying
+    /// the replacement fragments. HEAD does NOT advance.
     ///
     /// Lance shape: `InsertBuilder::with_params(WriteParams { mode: Overwrite, .. })
     /// .execute_uncommitted(batches)` produces a `Transaction` whose
     /// `Operation::Overwrite` carries the new schema + fragments, sized by
-    /// Lance's own fragment target. Zero-row batches contribute nothing; with
-    /// no row at all the transaction carries no fragment and the first batch's
-    /// schema, or the dataset's own schema when no batch was given. The
-    /// transaction is committed via `commit_staged` (same call as
-    /// `stage_append`).
+    /// Lance's own fragment target, and writes those files one after another.
+    /// So the batches are cut at that target into contiguous chunks, one call
+    /// per chunk with `writers` calls in flight, and the chunks' fragments
+    /// are joined in chunk order into one `Operation::Overwrite`: the files
+    /// one call would write, in the order it would write them, numbered by
+    /// Lance at commit (the staged scan view numbers them `1..=n` itself,
+    /// whatever each call numbered). A chunk that fails leaves the finished
+    /// chunks' files unreferenced, like every staged-but-unpublished write.
+    /// Zero-row batches contribute nothing; with no row at all the
+    /// transaction carries no fragment and the first batch's schema, or the
+    /// dataset's own schema when no batch was given. The transaction is
+    /// committed via `commit_staged` (same call as `stage_append`).
     pub async fn stage_overwrite_batches(
         &self,
         ds: &Dataset,
         batches: Vec<RecordBatch>,
+        write_budget: WriteBudget,
+        writers: usize,
+    ) -> Result<StagedWrite> {
+        self.stage_overwrite_chunks(ds, batches, write_budget, writers, overwrite_chunk_rows())
+            .await
+    }
+
+    /// [`Self::stage_overwrite_batches`] with the chunk target spelled out; refuses
+    /// mixed schemas among the non-empty batches before any writer starts, as one
+    /// Lance call would, since an overwrite takes whatever schema each call brings.
+    async fn stage_overwrite_chunks(
+        &self,
+        ds: &Dataset,
+        batches: Vec<RecordBatch>,
+        write_budget: WriteBudget,
+        writers: usize,
+        chunk_rows: usize,
     ) -> Result<StagedWrite> {
         // Existing graph datasets retain stable row IDs through Overwrite;
         // keep the flag explicit at this write site too. This is not the
         // separate Lance migration API for legacy datasets without stable IDs.
         // See `stage_overwrite_preserves_stable_row_ids` and docs/dev/lance.md.
         let schema = batches.first().map(RecordBatch::schema);
-        let batches: Vec<RecordBatch> = batches
-            .into_iter()
-            .filter(|batch| batch.num_rows() > 0)
-            .collect();
-        let (transaction, mut new_fragments) = if batches.is_empty() {
+        let mut filled = batches.iter().filter(|batch| batch.num_rows() > 0);
+        if let Some(first) = filled.next()
+            && let Some(other) = filled.find(|batch| batch.schema() != first.schema())
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "stage_overwrite_batches: all batches must share one schema, {}",
+                first_schema_difference(&first.schema(), &other.schema())
+            )));
+        }
+        let chunks = overwrite_chunks(batches, chunk_rows);
+        let (transaction, mut new_fragments) = if chunks.is_empty() {
             let schema = match schema {
                 Some(schema) => {
                     LanceSchema::try_from(schema.as_ref()).map_err(OmniError::lance_internal)?
@@ -4686,19 +4741,36 @@ impl TableStore {
         } else {
             let params = WriteParams {
                 mode: WriteMode::Overwrite,
+                file_writer_options: Some(budgeted_file_writer_options(write_budget)),
                 enable_stable_row_ids: true,
                 allow_external_blob_outside_bases: true,
                 auto_cleanup: None,
                 skip_auto_cleanup: true,
                 ..Default::default()
             };
-            let transaction = InsertBuilder::new(Arc::new(ds.clone()))
-                .with_params(&params)
-                .execute_uncommitted(batches)
-                .await
-                .map_err(|error| OmniError::storage(error).unpublished())?;
-            let new_fragments = match &transaction.operation {
-                Operation::Overwrite { fragments, .. } => fragments.clone(),
+            let writers = writers.clamp(1, chunks.len());
+            let ds = Arc::new(ds.clone());
+            let transactions = futures::stream::iter(chunks)
+                .map(|chunk| {
+                    let ds = Arc::clone(&ds);
+                    let params = &params;
+                    async move {
+                        InsertBuilder::new(ds)
+                            .with_params(params)
+                            .execute_uncommitted(chunk)
+                            .await
+                            .map_err(|error| OmniError::storage(error).unpublished())
+                    }
+                })
+                .buffered(writers)
+                .try_collect::<Vec<Transaction>>()
+                .await?;
+            let mut transactions = transactions.into_iter();
+            let mut transaction = transactions.next().ok_or_else(|| {
+                OmniError::manifest_internal("stage_overwrite_batches: no chunk was written")
+            })?;
+            let fragments = match &mut transaction.operation {
+                Operation::Overwrite { fragments, .. } => fragments,
                 other => {
                     return Err(OmniError::manifest_internal(format!(
                         "stage_overwrite_batches: unexpected Lance operation {:?}",
@@ -4706,6 +4778,24 @@ impl TableStore {
                     )));
                 }
             };
+            for later in transactions {
+                match later.operation {
+                    Operation::Overwrite {
+                        fragments: chunk_fragments,
+                        ..
+                    } => fragments.extend(chunk_fragments),
+                    other => {
+                        return Err(OmniError::manifest_internal(format!(
+                            "stage_overwrite_batches: unexpected Lance operation {:?}",
+                            std::mem::discriminant(&other)
+                        )));
+                    }
+                }
+            }
+            let mut new_fragments = fragments.clone();
+            new_fragments
+                .iter_mut()
+                .for_each(|fragment| fragment.id = 0);
             (transaction, new_fragments)
         };
         // These IDs belong only to the pre-commit scan view. All committed
@@ -5424,6 +5514,70 @@ fn prior_stages_fragment_count(prior_stages: &[StagedWrite]) -> u64 {
         .iter()
         .map(|s| s.new_fragments.len() as u64)
         .sum()
+}
+
+/// The rows one overwrite chunk holds: Lance's file target, so a chunk is
+/// the file one call would cut there.
+fn overwrite_chunk_rows() -> usize {
+    WriteParams::default().max_rows_per_file
+}
+
+/// Cut `batches` into contiguous runs of exactly `chunk_rows` rows, the last
+/// run shorter, a batch straddling the target sliced without a copy,
+/// zero-row batches dropped.
+fn overwrite_chunks(batches: Vec<RecordBatch>, chunk_rows: usize) -> Vec<Vec<RecordBatch>> {
+    let chunk_rows = chunk_rows.max(1);
+    let mut chunks = Vec::new();
+    let mut current: Vec<RecordBatch> = Vec::new();
+    let mut rows = 0;
+    for mut batch in batches.into_iter().filter(|batch| batch.num_rows() > 0) {
+        while rows + batch.num_rows() >= chunk_rows {
+            let fill = chunk_rows - rows;
+            current.push(batch.slice(0, fill));
+            chunks.push(std::mem::take(&mut current));
+            rows = 0;
+            batch = batch.slice(fill, batch.num_rows() - fill);
+        }
+        if batch.num_rows() > 0 {
+            rows += batch.num_rows();
+            current.push(batch);
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+/// The first field on which two overwrite batches' schemas differ, both
+/// types named, for the one-schema refusal.
+fn first_schema_difference(
+    expected: &arrow_schema::Schema,
+    found: &arrow_schema::Schema,
+) -> String {
+    let (expected, found) = (expected.fields(), found.fields());
+    if let Some((a, b)) = expected.iter().zip(found.iter()).find(|(a, b)| a != b) {
+        return format!(
+            "field `{}` {} in one batch and `{}` {} in another",
+            a.name(),
+            a.data_type(),
+            b.name(),
+            b.data_type()
+        );
+    }
+    match expected.len().cmp(&found.len()) {
+        std::cmp::Ordering::Less => format!(
+            "field `{}` {} in one batch only",
+            found[expected.len()].name(),
+            found[expected.len()].data_type()
+        ),
+        std::cmp::Ordering::Greater => format!(
+            "field `{}` {} in one batch only",
+            expected[found.len()].name(),
+            expected[found.len()].data_type()
+        ),
+        std::cmp::Ordering::Equal => "the schemas differ in metadata only".to_string(),
+    }
 }
 
 /// Assign sequential fragment IDs starting at `start_id`. Mirrors Lance's

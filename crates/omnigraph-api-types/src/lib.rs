@@ -7,7 +7,7 @@ use omnigraph::db::{
     GraphCommit, GraphCommitKind, MergeOutcome, ReadTarget, SchemaApplyResult, Snapshot,
 };
 use omnigraph::error::{MergeConflict, MergeConflictKind};
-use omnigraph::loader::{LoadMode, LoadReceipt, LoadResult};
+use omnigraph::loader::{LoadExecuted, LoadMode, LoadOperatorExecuted, LoadReceipt, LoadResult};
 use omnigraph_compiler::SchemaMigrationStep;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::error::CompilerError;
@@ -27,11 +27,18 @@ use utoipa::{IntoParams, ToSchema};
 /// re-exported so a wire consumer needs no second dependency for it.
 pub use omnigraph_compiler::settings;
 
-/// The single request/response discriminator for the v0.13 HTTP contract.
+/// The single request/response discriminator for the v0.14 HTTP contract.
 /// This is independent of the package version and graph-storage stamp.
 pub const HTTP_API_CONTRACT_HEADER: &str = "omnigraph-http-api";
 /// Exact header value; consumers must reject missing or repeated values.
-pub const HTTP_API_CONTRACT: &str = "0.13";
+pub const HTTP_API_CONTRACT: &str = "0.14";
+/// An optional request header naming the actor the caller expects its
+/// credential to resolve to. The server refuses a mismatch with
+/// [`ErrorCode::ActorMismatch`] before graph lookup or effects; a matching
+/// value changes nothing, so the header can only narrow a request. Contract
+/// 0.14 introduced it, so a server that speaks [`HTTP_API_CONTRACT`] enforces
+/// it and an older one refuses the request before reading the header.
+pub const IF_ACTOR_HEADER: &str = "omnigraph-if-actor";
 
 /// How a binary identifies its build: the one derivation the CLI's
 /// `omnigraph version`, the server's `/healthz` and its MCP server info all
@@ -669,6 +676,10 @@ pub struct ChangeOutput {
     /// Present only when the request was a branch statement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<BranchOutcomeOutput>,
+    /// Present only when the request was a `load csv` statement whose plan
+    /// the engine ran (`mode overwrite`): what the plan measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executed: Option<LoadExecutedOutput>,
 }
 
 /// Load capability for a batch touching a node type with declared `@embed`.
@@ -725,6 +736,42 @@ pub struct IngestOutput {
     pub embedding_generation: Option<LoadEmbeddingGeneration>,
     pub actor_id: Option<String>,
     pub commit: Option<CommitOutput>,
+}
+
+/// What a `load csv` statement's plan measured as it ran, beside the
+/// statement's [`ChangeOutput`]: the source partitions and bytes it read, the
+/// count its sink staged, and what each operator did. Absent for an append
+/// or merge load, which the keyed adapters run, and for every other change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct LoadExecutedOutput {
+    /// Source partitions the plan read.
+    pub partitions: u32,
+    /// Entities the sink staged.
+    pub rows: u64,
+    /// Bytes of the captured source.
+    pub source_bytes: u64,
+    /// One entry per node of the executed plan in post-order, the source
+    /// first.
+    pub operators: Vec<LoadOperatorExecutedOutput>,
+}
+
+/// What one operator of an executed load plan did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct LoadOperatorExecutedOutput {
+    /// The plan node's `id`, as the explain document numbers it.
+    pub id: u64,
+    /// The plan node's kind: `CsvSource`, `Validate`, `FragmentWrite`.
+    pub node: String,
+    /// The operator the node built.
+    pub operator: String,
+    /// What the operator emitted; the sink counts what it staged.
+    pub rows: u64,
+    /// Nanoseconds the operator was computing: the polls of its stream and of
+    /// its workers, never the time it waited for its input or for storage.
+    pub elapsed_compute_ns: u64,
+    /// Nanoseconds from the operator's first poll to its end, waits included;
+    /// `0` where no end was recorded.
+    pub wall_ns: u64,
 }
 
 /// One logical declaration touched by a graph-batch load.
@@ -1198,8 +1245,14 @@ pub struct ChangeBaselineRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeErrorOutput {
     pub error: String,
+    /// The failure's registry code, as on [`ErrorOutput`].
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = ErrorCode, required = true)]
     pub code: Option<ErrorCode>,
+    /// What the request did and what to do next, as on [`ErrorOutput`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = DispositionOutput, required = true)]
+    pub disposition: Option<DispositionOutput>,
     /// Set when a requested limit exceeds a public ceiling, or a single change
     /// exceeds the poll's own byte ceiling.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1815,6 +1868,7 @@ pub struct IngestRequest {
 
 /// Query parameters for `POST /load/ndjson`.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct GraphBatchLoadQuery {
     /// Target branch. Defaults to `main`. Without `from`, it must exist.
     pub branch: Option<String>,
@@ -1836,6 +1890,7 @@ pub struct ExportRequest {
 }
 
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct SnapshotQuery {
     pub branch: Option<String>,
 }
@@ -1868,6 +1923,80 @@ pub enum AccessAction {
     InvokeQuery,
 }
 
+impl AccessAction {
+    /// Every action the access report names, in report order.
+    pub const ALL: [AccessAction; 10] = [
+        AccessAction::Read,
+        AccessAction::Export,
+        AccessAction::Change,
+        AccessAction::SchemaApply,
+        AccessAction::BranchCreate,
+        AccessAction::BranchDelete,
+        AccessAction::BranchMerge,
+        AccessAction::CommitPublish,
+        AccessAction::CommitDrop,
+        AccessAction::InvokeQuery,
+    ];
+
+    /// Whether the report decides this action from `branch` into
+    /// `target_branch` (`branch_create`, `branch_merge`), rather than on
+    /// `branch` alone.
+    pub fn is_transition(self) -> bool {
+        access_slot(self.into()) == Some(AccessSlot::Transition)
+    }
+}
+
+/// Where the access report puts a named branch for an action: the slot of
+/// the policy request the route that performs it builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessSlot {
+    /// Decided only graph-wide: the action names no branch.
+    GraphWide,
+    /// The named branch is the source (`read`, `export`, `change`).
+    Source,
+    /// The named branch is the target (`schema_apply`, `branch_delete`,
+    /// `commit_publish`, `commit_drop`).
+    Target,
+    /// From the named branch into `target_branch` (`branch_create`,
+    /// `branch_merge`).
+    Transition,
+}
+
+/// Each policy action's slot in the access report, or `None` for one no
+/// graph's report names. The match is exhaustive, so a new policy action is
+/// classified here before it compiles, for the route and the CLI at once.
+fn access_slot(action: omnigraph_policy::PolicyAction) -> Option<AccessSlot> {
+    use omnigraph_policy::PolicyAction as P;
+    match action {
+        P::Read | P::Export | P::Change => Some(AccessSlot::Source),
+        P::SchemaApply | P::BranchDelete | P::CommitPublish | P::CommitDrop => {
+            Some(AccessSlot::Target)
+        }
+        P::BranchCreate | P::BranchMerge => Some(AccessSlot::Transition),
+        P::InvokeQuery => Some(AccessSlot::GraphWide),
+        // Server- or operator-scoped: no graph's access report names them.
+        P::Admin | P::GraphList | P::ConfigManage => None,
+    }
+}
+
+impl From<AccessAction> for omnigraph_policy::PolicyAction {
+    fn from(access: AccessAction) -> Self {
+        use omnigraph_policy::PolicyAction as P;
+        match access {
+            AccessAction::Read => P::Read,
+            AccessAction::Export => P::Export,
+            AccessAction::Change => P::Change,
+            AccessAction::SchemaApply => P::SchemaApply,
+            AccessAction::BranchCreate => P::BranchCreate,
+            AccessAction::BranchDelete => P::BranchDelete,
+            AccessAction::BranchMerge => P::BranchMerge,
+            AccessAction::CommitPublish => P::CommitPublish,
+            AccessAction::CommitDrop => P::CommitDrop,
+            AccessAction::InvokeQuery => P::InvokeQuery,
+        }
+    }
+}
+
 /// What the caller's own credential may do on one graph, by the graph's
 /// installed policy. It names actions, never the rules that allow them, and
 /// says nothing about any other actor.
@@ -1895,7 +2024,64 @@ pub struct AccessOutput {
     pub actions: Vec<AccessAction>,
 }
 
+impl AccessOutput {
+    /// Decide every action in the shape a policy decides it: graph-wide; on
+    /// `branch` (`read`, `export` and `change` as the request's branch, the
+    /// branch-targeted actions as its target); and from `branch` to
+    /// `target_branch` for `branch_create` and `branch_merge`. `allowed`
+    /// is the decision for one action with its branch and target branch.
+    pub fn evaluate<E>(
+        actor: Option<String>,
+        graph_id: String,
+        branch: Option<String>,
+        target_branch: Option<String>,
+        mut allowed: impl FnMut(AccessAction, Option<&str>, Option<&str>) -> Result<bool, E>,
+    ) -> Result<Self, E> {
+        let mut graph_wide = Vec::new();
+        for access in AccessAction::ALL {
+            if allowed(access, None, None)? {
+                graph_wide.push(access);
+            }
+        }
+        let mut actions = Vec::new();
+        if let Some(branch) = branch.as_deref() {
+            for slot in [
+                AccessSlot::Source,
+                AccessSlot::Target,
+                AccessSlot::Transition,
+            ] {
+                for access in AccessAction::ALL {
+                    if access_slot(access.into()) != Some(slot) {
+                        continue;
+                    }
+                    let (source, target) = match slot {
+                        AccessSlot::Source => (Some(branch), None),
+                        AccessSlot::Target => (None, Some(branch)),
+                        AccessSlot::Transition => match target_branch.as_deref() {
+                            Some(target) => (Some(branch), Some(target)),
+                            None => continue,
+                        },
+                        AccessSlot::GraphWide => continue,
+                    };
+                    if allowed(access, source, target)? {
+                        actions.push(access);
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            actor,
+            graph_id,
+            graph_wide,
+            branch,
+            target_branch,
+            actions,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct CommitListQuery {
     pub branch: Option<String>,
     /// `true` lists the unpublished commits whose recorded target is `branch`
@@ -1965,34 +2151,210 @@ pub struct ReadinessOutput {
     pub shutdown_grace_seconds: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ErrorCode {
-    Unauthorized,
-    Forbidden,
-    BadRequest,
-    /// 400: the request lacks the exact supported HTTP contract header.
-    /// Authentication and contract admission precede graph access and effects.
-    ApiContractMismatch,
-    NotFound,
-    /// 405 Method Not Allowed — the route exists but the active server
-    /// mode doesn't serve this method (e.g. `GET /graphs` in single-graph
-    /// mode). Distinct from 404 so clients can tell "wrong context" from
-    /// "no such resource."
-    MethodNotAllowed,
-    Conflict,
-    /// 409: the commit is an unattached snapshot, a kind that never
-    /// publishes. Distinct from `conflict`, the authority-moved refusal of a
-    /// publishable proposal.
-    UnattachedCannotPublish,
-    /// 429 Too Many Requests — per-actor admission cap exceeded.
-    /// Clients should respect the `Retry-After` header.
-    TooManyRequests,
-    /// 503: operation admission is closed; reconcile any earlier write.
-    ServiceUnavailable,
-    /// 503: a known graph is unavailable. Does not authorize replay.
-    GraphUnavailable,
-    Internal,
+/// Declares [`ErrorCode`] from one list: each code's wire name, the HTTP
+/// status a server sends it under, and its documentation. The published
+/// description and every server's status come from this list, so a code
+/// cannot be sent under a status its documentation does not name.
+macro_rules! error_codes {
+    ($( $(#[doc = $doc:literal])+ $code:ident = $name:literal, [$($status:literal),*]; )+) => {
+        /// The registry of error codes. A server sends each code under the
+        /// HTTP statuses the list names; a code with none never appears in an
+        /// HTTP response.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        pub enum ErrorCode {
+            $( $(#[doc = $doc])+ #[serde(rename = $name)] $code, )+
+        }
+
+        impl ErrorCode {
+            /// Every code, in registry order.
+            pub const ALL: &'static [ErrorCode] = &[$(ErrorCode::$code),+];
+
+            /// The code's wire spelling.
+            pub const fn as_str(self) -> &'static str {
+                match self { $(ErrorCode::$code => $name,)+ }
+            }
+
+            /// The HTTP statuses a server answers this code with, the usual
+            /// one first; empty for a code no HTTP response carries. Only a
+            /// code's details choose among several, as
+            /// [`ErrorOutput::http_status`] says.
+            pub const fn http_statuses(self) -> &'static [u16] {
+                match self { $(ErrorCode::$code => &[$($status),*],)+ }
+            }
+
+            /// What the code means, as its registry entry documents it.
+            pub fn description(self) -> String {
+                let doc: &'static [&'static str] = match self { $(ErrorCode::$code => &[$($doc),+],)+ };
+                doc.iter().map(|line| line.trim()).collect::<Vec<_>>().join(" ")
+            }
+        }
+    };
+}
+
+error_codes! {
+    /// The request carries no credential the server accepts: a bearer token
+    /// is missing, unknown or expired. Supply one the server is configured
+    /// to verify.
+    Unauthorized = "unauthorized", [401];
+    /// The credential's actor may not do this: policy denies the action, or
+    /// the action needs a policy permit the server has not been given.
+    Forbidden = "forbidden", [403];
+    /// The request is malformed or invalid: a body, query string, path
+    /// parameter or header that does not decode, a query the compiler
+    /// refuses (see `diagnostic`), or a value refused before any effect.
+    BadRequest = "bad_request", [400];
+    /// The request lacks exactly one `Omnigraph-Http-Api` header naming the
+    /// contract this server speaks. Authentication and this check precede
+    /// graph access and effects.
+    ApiContractMismatch = "api_contract_mismatch", [400];
+    /// The request's `Omnigraph-If-Actor` header names another actor
+    /// than its credential resolves to. Nothing ran.
+    ActorMismatch = "actor_mismatch", [412];
+    /// A write whose completion the server could not settle: it may or may
+    /// not have published. Read the target before writing again; never
+    /// replay the write blindly. An MCP write call that was cancelled or
+    /// passed its deadline answers it too.
+    OutcomeUnknown = "outcome_unknown", [500];
+    /// A request precondition no longer holds: the branch head moved past
+    /// `Omnigraph-If-Graph-Commit` (see `precondition_failure`), or a Blob's
+    /// `If-Match` names a value the cell no longer holds (a write's
+    /// `blob_precondition_failure` names the current one). Nothing was
+    /// written.
+    PreconditionFailed = "precondition_failed", [412];
+    /// An overlapping durable recovery intent must be resolved first; see
+    /// `recovery_required`.
+    RecoveryRequired = "recovery_required", [503];
+    /// An admitted external Blob source could not be probed or read; see
+    /// `external_blob_source`.
+    ExternalBlobSource = "external_blob_source", [424];
+    /// Retained history can no longer reconstruct a change continuation; see
+    /// `change_feed_gap`. Resume from a new baseline.
+    ChangeFeedGap = "change_feed_gap", [410];
+    /// The graph, branch, commit, query, entity or route the request names
+    /// does not exist, or the caller may not learn that it does.
+    NotFound = "not_found", [404];
+    /// The request path is served, but not with the request's method.
+    MethodNotAllowed = "method_not_allowed", [405];
+    /// The request body did not arrive before its deadline; nothing was
+    /// admitted.
+    RequestTimeout = "request_timeout", [408];
+    /// The request conflicts with the graph's current state: a concurrent
+    /// change, an existing id, a merge conflict, an index that must be built
+    /// first, or a commit that cannot be diffed. The details say which.
+    Conflict = "conflict", [409];
+    /// `branch create` could not start the branch at the commit
+    /// `from_commit` named, and nothing was created; see
+    /// `branch_start_refusal`, whose `not_retained` reason answers 410.
+    BranchStartRefusal = "branch_start_refusal", [409, 410];
+    /// The commit is an unattached snapshot, a kind that never publishes.
+    /// Distinct from `conflict`, the authority-moved refusal of a publishable
+    /// proposal.
+    UnattachedCannotPublish = "unattached_cannot_publish", [409];
+    /// The request body, or the work it asks for, exceeds a bounded limit;
+    /// `resource_limit` names the limit when it is the operation's. Split or
+    /// reduce the request.
+    PayloadTooLarge = "payload_too_large", [413];
+    /// The request body's content type is not one the route accepts.
+    UnsupportedMediaType = "unsupported_media_type", [415];
+    /// The requested Blob byte range lies outside the value; see
+    /// `blob_range`.
+    RangeNotSatisfiable = "range_not_satisfiable", [416];
+    /// Admission capacity is exhausted: an actor's, the server's, or the MCP
+    /// endpoint's concurrent tool calls. Nothing started; retry after
+    /// `Retry-After`.
+    TooManyRequests = "too_many_requests", [429];
+    /// Operation admission is closed, or a deployment observation raced an
+    /// owner change. Nothing started; retry after `Retry-After`, reconciling
+    /// any earlier write first.
+    ServiceUnavailable = "service_unavailable", [503];
+    /// A known graph is not being served. The request did not start, so it
+    /// may be retried once the graph is served again.
+    GraphUnavailable = "graph_unavailable", [503];
+    /// The server failed. An error before any write took no effect; see the
+    /// server log.
+    Internal = "internal", [500];
+    /// MCP only: the client cancelled a read tool call. A cancelled write
+    /// answers `outcome_unknown`.
+    Cancelled = "cancelled", [];
+    /// MCP only: a read tool call passed its deadline. A write that does
+    /// answers `outcome_unknown`.
+    DeadlineExceeded = "deadline_exceeded", [];
+    /// MCP only: a tool result exceeds the result limit. Narrow the read.
+    ResultTooLarge = "result_too_large", [];
+}
+
+impl utoipa::PartialSchema for ErrorCode {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        let mut description = String::from(
+            "The registry of error codes. A server sends each code under the HTTP statuses \
+             named with it; a code without one never appears in an HTTP response.\n",
+        );
+        for code in Self::ALL {
+            let status = statuses_label(code.http_statuses());
+            description.push_str(&format!(
+                "\n- `{}` ({status}): {}",
+                code.as_str(),
+                code.description()
+            ));
+        }
+        ObjectBuilder::new()
+            .schema_type(Type::String)
+            .description(Some(description))
+            .enum_values(Some(Self::ALL.iter().map(|code| code.as_str())))
+            .into()
+    }
+}
+
+impl ToSchema for ErrorCode {}
+
+/// The statuses a code is sent under, as the published registry lists them.
+fn statuses_label(statuses: &[u16]) -> String {
+    if statuses.is_empty() {
+        return "no HTTP status".to_string();
+    }
+    statuses
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+impl ErrorCode {
+    /// What a refusal with this code asks of its caller. A server's
+    /// disposition takes it unless the error names something to recover, or
+    /// the request's effects are unknown and must be reconciled first.
+    pub const fn action(self) -> DispositionAction {
+        match self {
+            Self::TooManyRequests | Self::ServiceUnavailable | Self::GraphUnavailable => {
+                DispositionAction::Retry
+            }
+            Self::RecoveryRequired => DispositionAction::Recover,
+            Self::OutcomeUnknown => DispositionAction::Reconcile,
+            Self::RequestTimeout | Self::Cancelled | Self::DeadlineExceeded => {
+                DispositionAction::Retry
+            }
+            // The request itself is wrong; no state it could read changes that.
+            Self::Unauthorized
+            | Self::BadRequest
+            | Self::ApiContractMismatch
+            | Self::ActorMismatch
+            | Self::NotFound
+            | Self::MethodNotAllowed
+            | Self::UnattachedCannotPublish
+            | Self::BranchStartRefusal
+            | Self::PayloadTooLarge
+            | Self::UnsupportedMediaType
+            | Self::RangeNotSatisfiable
+            | Self::ResultTooLarge => DispositionAction::Fix,
+            // The state the request met refused it, or the server failed.
+            Self::Forbidden
+            | Self::PreconditionFailed
+            | Self::Conflict
+            | Self::ExternalBlobSource
+            | Self::ChangeFeedGap
+            | Self::Internal => DispositionAction::Refresh,
+        }
+    }
 }
 
 /// Structured details for a publisher-level OCC failure. Surfaces alongside
@@ -2018,8 +2380,10 @@ pub struct ReadSetConflictOutput {
 }
 
 /// A strict insert rejected because `entity_id` already names an entity in the
-/// selected node or edge type. The operation is effect-free when this output is returned;
-/// partial or ambiguous attempts surface `recovery_required` instead.
+/// selected node or edge type. The refused write changed nothing; an earlier
+/// step of the same request, such as the branch a load forks, may already have
+/// published, which the error's `disposition` states. Partial or ambiguous
+/// attempts surface `recovery_required` instead.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct KeyConflictOutput {
     pub entity_kind: EntityKindOutput,
@@ -2049,8 +2413,7 @@ pub struct BlobRangeOutput {
 }
 
 /// Structured details for an allowed external Blob source that could not be
-/// probed or read. The top-level `code` remains optional so this additive
-/// detail can roll out without extending the closed [`ErrorCode`] enum.
+/// probed or read, sent with [`ErrorCode::ExternalBlobSource`].
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ExternalBlobSourceOutput {
     /// Normalized, credential-free URI spelling (or a redacted placeholder).
@@ -2088,9 +2451,8 @@ pub struct PreconditionFailureOutput {
 }
 
 /// A change continuation can no longer be reconstructed from retained history
-/// (HTTP 410). Recovery is the baseline handshake; retrying the same cursor
-/// cannot succeed. `code` stays unset: this structured detail is the
-/// machine-readable discriminator, as with `external_blob_source`.
+/// (HTTP 410), sent with [`ErrorCode::ChangeFeedGap`]. Recovery is the
+/// baseline handshake; retrying the same cursor cannot succeed.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeFeedGapOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2141,6 +2503,16 @@ pub enum BranchStartRefusalReason {
     /// A reason added by a newer server; the branch was not created.
     #[serde(other)]
     Unknown,
+}
+
+impl BranchStartRefusalReason {
+    /// The HTTP status a server answers a refusal for this reason with.
+    pub const fn http_status(self) -> u16 {
+        match self {
+            Self::NotRetained => 410,
+            _ => 409,
+        }
+    }
 }
 
 /// A branch create refused at the graph commit `from_commit` named; nothing
@@ -2279,11 +2651,60 @@ impl From<&omnigraph_compiler::QueryDiagnostic> for DiagnosticOutput {
     }
 }
 
+/// What a refused or failed request did and what its caller should do next.
+/// A server states it on every error response, computed where that knowledge
+/// is; a client that lost the response knows less, and says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DispositionOutput {
+    pub effects: DispositionEffects,
+    pub action: DispositionAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DispositionEffects {
+    /// The operation took no effect: it was refused, or lost to another before
+    /// anything it staged became reachable.
+    None,
+    /// An earlier step of the same operation published, as the branch a load
+    /// forks before its data does, and the failing step was refused before it
+    /// wrote anything. Read the target to see what the earlier step left.
+    Partial,
+    /// The operation may have taken effect; the server cannot say.
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DispositionAction {
+    /// Correct the request first: its credential, input, path or client.
+    /// Sent again unchanged, it fails the same way.
+    Fix,
+    /// Read the current state, then decide whether and how to send the
+    /// request again; the state it met refused it.
+    Refresh,
+    /// Repeat the same request later, honoring `Retry-After` when present.
+    Retry,
+    /// Resolve what the error names first: a durable recovery intent, or a
+    /// full-text index to build.
+    Recover,
+    /// Find out whether the operation took effect before writing again.
+    Reconcile,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ErrorOutput {
     pub error: String,
+    /// The failure's registry code. Servers set it on every error response; it
+    /// is absent only from a body built outside a server.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = ErrorCode, required = true)]
     pub code: Option<ErrorCode>,
+    /// What the request did and what to do next. Servers set it on every error
+    /// response; it is absent only from a body built outside a server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = DispositionOutput, required = true)]
+    pub disposition: Option<DispositionOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merge_conflicts: Vec<MergeConflictOutput>,
     /// Set when the conflict is a publisher CAS rejection. The caller's
@@ -2307,18 +2728,16 @@ pub struct ErrorOutput {
     /// `start..end` is half-open and `length` is the selected Blob length.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blob_range: Option<BlobRangeOutput>,
-    /// Set with HTTP 424 when an external Blob URI passed admission policy but
-    /// its source could not be probed or read. This optional detail is the
-    /// machine-readable discriminator; `code` is omitted.
+    /// Set with HTTP 424 and `external_blob_source` when an external Blob URI
+    /// passed admission policy but its source could not be probed or read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_blob_source: Option<ExternalBlobSourceOutput>,
     /// Set when an overlapping durable recovery intent must be resolved before
     /// retry. Its dataset effects may or may not have started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_required: Option<RecoveryRequiredOutput>,
-    /// Set when a mutation's graph-commit precondition failed
-    /// (HTTP 412). Like `recovery_required`, this structured field carries
-    /// the machine-readable meaning and `code` is omitted.
+    /// Set with HTTP 412 and `precondition_failed` when a mutation's
+    /// graph-commit precondition failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub precondition_failure: Option<PreconditionFailureOutput>,
     /// Set with HTTP 412 when a Blob write's `If-Match` did not hold for the
@@ -2355,12 +2774,26 @@ pub struct ErrorOutput {
 }
 
 impl ErrorOutput {
+    /// The HTTP status a server answers this body with: its code's usual one,
+    /// or the one its details select for a code sent under several. `None`
+    /// for a body without a code, or one whose code no HTTP response carries.
+    pub fn http_status(&self) -> Option<u16> {
+        let code = self.code?;
+        if code == ErrorCode::BranchStartRefusal
+            && let Some(refusal) = &self.branch_start_refusal
+        {
+            return Some(refusal.reason.http_status());
+        }
+        code.http_statuses().first().copied()
+    }
+
     /// An error body carrying `error` and nothing else; every typed detail is
     /// absent.
     pub fn message(error: impl Into<String>) -> Self {
         Self {
             error: error.into(),
             code: None,
+            disposition: None,
             merge_conflicts: Vec::new(),
             published_dataset_version_conflict: None,
             read_set_conflict: None,
@@ -2433,6 +2866,29 @@ pub fn commit_output(commit: &GraphCommit) -> CommitOutput {
         published: commit.published,
         kind: commit.kind.into(),
         root_commit_id: commit.root_commit_id.clone(),
+    }
+}
+
+/// The receipt's measurement on the wire, for a load whose plan ran.
+pub fn load_executed_output(executed: &LoadExecuted) -> LoadExecutedOutput {
+    LoadExecutedOutput {
+        partitions: executed.partitions,
+        rows: executed.rows,
+        source_bytes: executed.source_bytes,
+        operators: executed
+            .operators
+            .iter()
+            .map(
+                |operator: &LoadOperatorExecuted| LoadOperatorExecutedOutput {
+                    id: operator.id,
+                    node: operator.node.clone(),
+                    operator: operator.operator.clone(),
+                    rows: operator.rows,
+                    elapsed_compute_ns: operator.elapsed_compute_ns,
+                    wall_ns: operator.wall_ns,
+                },
+            )
+            .collect(),
     }
 }
 
@@ -3011,6 +3467,98 @@ pub struct GraphDiscoveryResponse {
 
 #[cfg(test)]
 mod tests {
+    /// Every code says what it means and whether a server sends it, under
+    /// which status; one that no HTTP response carries names the surface that
+    /// sends it. The published enum lists every code once, in its wire
+    /// spelling, beside its status.
+    #[test]
+    fn every_reported_access_action_has_a_slot() {
+        use super::{AccessAction, access_slot};
+        for access in AccessAction::ALL {
+            assert!(
+                access_slot(access.into()).is_some(),
+                "{access:?} is reported but has no slot"
+            );
+        }
+        let transitions: Vec<AccessAction> = AccessAction::ALL
+            .into_iter()
+            .filter(|access| access.is_transition())
+            .collect();
+        assert_eq!(
+            transitions,
+            [AccessAction::BranchCreate, AccessAction::BranchMerge]
+        );
+    }
+
+    #[test]
+    fn every_error_code_documents_its_status() {
+        use super::ErrorCode;
+        use utoipa::openapi::RefOr;
+        use utoipa::openapi::schema::Schema;
+
+        let mut names = std::collections::BTreeSet::new();
+        for code in ErrorCode::ALL {
+            assert!(names.insert(code.as_str()), "{code:?} listed twice");
+            assert_eq!(
+                serde_json::to_value(code).unwrap(),
+                serde_json::json!(code.as_str())
+            );
+            let description = code.description();
+            assert!(description.len() > 20, "{code:?}: {description}");
+            let statuses = code.http_statuses();
+            assert!(
+                statuses.iter().all(|status| (400..600).contains(status)),
+                "{code:?}: {statuses:?}"
+            );
+            if statuses.is_empty() {
+                assert!(
+                    description.starts_with("MCP only:") || description.starts_with("CLI only"),
+                    "{code:?} has no HTTP status, so it names the surface that sends it: \
+                     {description}"
+                );
+            }
+            // A body answers under one of its code's statuses.
+            let mut body = super::ErrorOutput::message("refused");
+            body.code = Some(*code);
+            assert_eq!(body.http_status(), statuses.first().copied(), "{code:?}");
+        }
+        // The one code sent under two statuses: its details choose.
+        let mut body = super::ErrorOutput::message("refused");
+        body.code = Some(ErrorCode::BranchStartRefusal);
+        for (reason, status) in [
+            (super::BranchStartRefusalReason::NotRetained, 410),
+            (super::BranchStartRefusalReason::SchemaChanged, 409),
+            (super::BranchStartRefusalReason::UnattachedSnapshot, 409),
+        ] {
+            body.branch_start_refusal = Some(super::BranchStartRefusalOutput {
+                reason,
+                graph_commit_id: "01JTEST".into(),
+                type_name: None,
+                branch: None,
+            });
+            assert_eq!(body.http_status(), Some(status), "{reason:?}");
+            assert!(
+                ErrorCode::BranchStartRefusal
+                    .http_statuses()
+                    .contains(&status)
+            );
+        }
+        let RefOr::T(Schema::Object(schema)) = <ErrorCode as utoipa::PartialSchema>::schema()
+        else {
+            panic!("ErrorCode is a string enum");
+        };
+        assert_eq!(schema.enum_values.unwrap().len(), ErrorCode::ALL.len());
+        let description = schema.description.unwrap();
+        for code in ErrorCode::ALL {
+            let status = super::statuses_label(code.http_statuses());
+            assert!(
+                description.contains(&format!("- `{}` ({status}): ", code.as_str())),
+                "{description}"
+            );
+        }
+        assert!(description.contains("- `branch_start_refusal` (409, 410): "));
+    }
+
     #[test]
     fn edge_builds_report_a_prerelease_naming_their_commit() {
         use super::build::versioned;
@@ -3291,6 +3839,44 @@ mod tests {
                 .to_string()
                 .contains("missing field `commit`")
         );
+    }
+
+    /// A `load csv` change carries the plan's measurement as `executed`,
+    /// absent from the wire for every other change.
+    #[test]
+    fn change_receipts_carry_the_executed_load_plan_only_when_it_ran() {
+        let executed = load_executed_output(&LoadExecuted {
+            partitions: 1,
+            rows: 2,
+            source_bytes: 19,
+            operators: vec![LoadOperatorExecuted {
+                id: 0,
+                node: "CsvSource".to_string(),
+                operator: "CsvSourceExec".to_string(),
+                rows: 2,
+                elapsed_compute_ns: 12,
+                wall_ns: 34,
+            }],
+        });
+        let change = json!({
+            "branch": "main", "query_name": "load csv",
+            "affected_nodes": 2, "affected_edges": 0, "actor_id": null, "commit": null,
+            "executed": {
+                "partitions": 1, "rows": 2, "source_bytes": 19,
+                "operators": [{"id": 0, "node": "CsvSource", "operator": "CsvSourceExec",
+                               "rows": 2, "elapsed_compute_ns": 12, "wall_ns": 34}]
+            }
+        });
+        let decoded: ChangeOutput = serde_json::from_value(change.clone()).unwrap();
+        assert_eq!(decoded.executed.as_ref(), Some(&executed));
+        assert_eq!(serde_json::to_value(decoded).unwrap(), change);
+        let plain = json!({
+            "branch": "main", "query_name": "insert_person",
+            "affected_nodes": 1, "affected_edges": 0, "actor_id": null, "commit": null
+        });
+        let decoded: ChangeOutput = serde_json::from_value(plain.clone()).unwrap();
+        assert!(decoded.executed.is_none());
+        assert_eq!(serde_json::to_value(decoded).unwrap(), plain);
     }
 
     #[test]

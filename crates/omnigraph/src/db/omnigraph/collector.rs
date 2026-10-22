@@ -887,8 +887,12 @@ async fn retained_merge_bases(
             if resolver.search().needs_import() {
                 if retired.is_none() {
                     retired = Some(
-                        ManifestCoordinator::retired_commit_graphs(db.root_uri(), &db.history)
-                            .await?,
+                        ManifestCoordinator::retired_commit_graphs_with_session(
+                            db.root_uri(),
+                            &db.history,
+                            &db.control_session(),
+                        )
+                        .await?,
                     );
                 }
                 for (native, graph) in retired.as_ref().expect("retired histories were loaded") {
@@ -1078,7 +1082,7 @@ pub(crate) async fn plan_collection(
                     report
                         .protected_manifest_branches
                         .extend(tag.branch.iter().cloned());
-                    let snapshot = candidate.snapshot(db.root_uri())?;
+                    let snapshot = candidate.snapshot(db.root_uri(), &db.control_session())?;
                     record_roots(db, &snapshot, &mut roots, &mut tables);
                 }
             }
@@ -1102,7 +1106,7 @@ pub(crate) async fn plan_collection(
                     report
                         .protected_manifest_branches
                         .extend(tag.branch.iter().cloned());
-                    let snapshot = candidate.snapshot(db.root_uri())?;
+                    let snapshot = candidate.snapshot(db.root_uri(), &db.control_session())?;
                     record_roots(db, &snapshot, &mut roots, &mut tables);
                     report.retained_unattached_tags.push(record);
                 }
@@ -1170,7 +1174,7 @@ pub(crate) async fn plan_collection(
                 .extend(candidate.property.native_branch.iter().cloned());
             record_roots(
                 db,
-                &candidate.snapshot(db.root_uri())?,
+                &candidate.snapshot(db.root_uri(), &db.control_session())?,
                 &mut roots,
                 &mut tables,
             );
@@ -1180,7 +1184,12 @@ pub(crate) async fn plan_collection(
     let (bases, imported_owners) = retained_merge_bases(db, &captured_lineages, live_count).await?;
     report.protected_manifest_branches.extend(imported_owners);
     for base in bases {
-        let pinned = ManifestCoordinator::pinned_graph_commit(db.root_uri(), &base).await?;
+        let pinned = ManifestCoordinator::pinned_graph_commit_with_session(
+            db.root_uri(),
+            &base,
+            &db.control_session(),
+        )
+        .await?;
         report
             .protected_manifest_branches
             .extend(pinned.dataset.manifest().branch.iter().cloned());
@@ -2300,6 +2309,7 @@ mod borrowed_origin_tests {
             &mut source,
             "legacy-table",
             restored_version,
+            None,
         )
         .await
         .unwrap();
@@ -2458,19 +2468,28 @@ mod borrowed_origin_tests {
         let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
         let mut source = snapshot.open_lance_dataset("node:Person").await.unwrap();
         let version = source.version().version;
-        let fork =
-            crate::storage_layer::lance_clone::create_branch(&mut source, "native-only", version)
-                .await
-                .unwrap();
+        let fork = crate::storage_layer::lance_clone::create_branch(
+            &mut source,
+            "native-only",
+            version,
+            None,
+        )
+        .await
+        .unwrap();
         let native_version = fork.version().version;
         source
             .tags()
             .create("native-reader", ("native-only", native_version))
             .await
             .unwrap();
-        crate::storage_layer::lance_clone::create_branch(&mut source, "unrelated-native", version)
-            .await
-            .unwrap();
+        crate::storage_layer::lance_clone::create_branch(
+            &mut source,
+            "unrelated-native",
+            version,
+            None,
+        )
+        .await
+        .unwrap();
         let table_uri = source.uri().to_string();
         drop((source, fork, snapshot));
         load_person(&db, "current", 99).await;
@@ -2934,6 +2953,7 @@ mod native_table_tag_tests {
                 &mut source,
                 "registered-native",
                 source_version,
+                None,
             )
             .await
             .unwrap();

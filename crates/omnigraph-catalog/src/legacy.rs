@@ -15,7 +15,7 @@ mod record;
 pub use census::{
     CensusCounts, CensusError, CensusHead, CensusInput, CensusRef, FindingCode, LegacyCensus,
     LegacyFinding, LegacyPlan, MAX_CENSUS_CELLS, MAX_CENSUS_SNAPSHOT_BYTES, census, census_within,
-    conversion_batch, materialize, plan,
+    census_within_with_session, conversion_batch, materialize, plan,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1525,8 +1525,13 @@ pub mod write {
         pub async fn fork(&mut self, source: Option<&str>, native: &str) -> Result<u64> {
             let mut dataset = self.head(source)?.clone();
             let version = dataset.version().version;
-            match crate::branch_control::create_branch_recoverably(&mut dataset, native, version)
-                .await?
+            match crate::branch_control::create_branch_recoverably(
+                &mut dataset,
+                native,
+                version,
+                None,
+            )
+            .await?
             {
                 crate::branch_control::BranchCreateOutcome::Created => {}
                 crate::branch_control::BranchCreateOutcome::RefAlreadyExists => {

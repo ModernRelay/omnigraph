@@ -1,0 +1,3 @@
+- Create profiles explicitly with `login --create-profile NAME`; ordinary login and managed target discovery honor `defaults.profile`. Standalone targets now use one flat `auth` provider: remove named auth maps and `default_auth`, use separate targets for different identities, and reinstall their stored tokens with `credentials set --target NAME --stdin`. The old `--register`, `--auth`, `target register`, and `config rename-auth` spellings are removed. Target listing now shows destinations, managed profiles, and the default marker. See [operator configuration][cli-profile-consistency].
+
+[cli-profile-consistency]: ../docs/user/cli/targets.md

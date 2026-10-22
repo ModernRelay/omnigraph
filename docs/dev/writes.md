@@ -33,7 +33,8 @@ versions are unpublished staging, which `cleanup`'s collector reclaims once
 their recorded publication authority is provably gone. The caller retries
 from a fresh snapshot. A successful publication is the whole write: no table
 effect has post-publication work. A lost acknowledgement is resolved
-against the exact attempted manifest; unavailable readback stays indeterminate.
+by re-issuing the identical manifest request and reading the attempted
+version back; unavailable readback stays indeterminate.
 No writer arms a recovery record, and no write replans around a partial state, because
 no partial state is ever visible. Schema apply and the system-column upgrade
 include the replacement schema-contract row in the same publication as their
@@ -410,7 +411,12 @@ concurrency. The `stage_write_concurrency` session setting (`process` scope,
 range `1..=64`; process default `OMNIGRAPH_LOAD_CONCURRENCY`, an invalid or
 `0` value refusing startup instead of running the default) selects that
 width for both Load and
-ordinary insert/update mutations (default 8). Delete transactions remain
+ordinary insert/update mutations (default 8), and inside one `load csv`
+overwrite the number of Lance writers (`TableStore::stage_overwrite_batches`
+cuts the batches at Lance's file target into contiguous chunks, runs one
+`execute_uncommitted` per chunk with that many in flight, and joins the
+chunks' fragments in chunk order into the one `Operation::Overwrite`, so the
+files and their order are those of a single call). Delete transactions remain
 serial. The setting changes only
 fragment preparation: every participant still commits detached and crosses
 one graph-manifest publication.
@@ -453,6 +459,17 @@ ID's UTF-8 length plus one 24-byte `String` slot before copying it.
 Overwrite's bulk input is not subject to the keyed aggregate row/batch limits.
 These are representation limits, not a combined allocator/RSS budget; native
 scan buffers, conversion copies and validation's derived state are outside them.
+The captured `WriteBudget` also supplies `FileWriterOptions.data_cache_bytes`
+for absence-proven strict inserts and staged overwrite batches. Lance divides
+this accumulation target by top-level field count. At the default 32 MiB,
+fewer than four fields receive a higher threshold than Lance's native 8 MiB
+per field, and more than four receive a lower threshold. A field flushes after
+an incoming array crosses its threshold. Nested encoders can each hold a
+share, and concurrent table writers each receive the target. Buffered slices
+keep copying enabled. These writes retain the existing dataset's V2_2 format,
+and no encoded-page-size bound is added. Native merge-insert does not expose
+writer options, so upserts and known-present updates retain native buffering
+defaults.
 Refusal precedes the current
 operation's fragment staging and publication, though writable open may have
 completed earlier schema work and a load may already have created its branch.
@@ -528,16 +545,19 @@ carried stored external reference the policy refuses fails as
 | Retryable authority movement before effects on a replay-safe adapter | Discard the complete attempt and reprepare boundedly |
 | Strict read-set movement | `ReadSetChanged` |
 | Exact duplicate on strict insert | `KeyConflict` |
-| Mutation, load, Blob write or merge fails before publication, after detached effects | Typed error; no graph movement; the detached staging is unpublished and the collector reclaims it once its recorded authority is gone. The table store marks an opaque error (storage, I/O, internal) of a staged write or a detached commit `CompletionEvidence::Unpublished` at the source, and the mutation, load, Blob and merge writers mark the steps between, so a server does not treat that logical error as uncertain; native storage settlement is checked independently, and a typed refusal keeps its shape; the publisher alone reports an outcome it could not read back as in doubt |
+| Mutation, load, Blob write or merge fails before publication, after detached effects | Typed error; no graph movement; the detached staging is unpublished and the collector reclaims it once its recorded authority is gone. The table store marks an opaque error (storage, I/O, internal) of a staged write or a detached commit `CompletionEvidence::Unpublished` at the source, and the mutation, load, Blob and merge writers mark the steps between, so a server does not treat that logical error as uncertain; native storage settlement is checked independently, and a typed refusal keeps its shape |
+| A manifest request no re-issue settles | The write is reported in doubt and nothing records it. The version is created only if absent, so the request lands before the branch's next publication or never: that publication either loads it as the head and builds on it, or takes the version first, after which the late request fails its precondition (a race between the two is the ordinary version-CAS retry). The attempt's detached effects stay unreachable unless it lands, and the collector keeps them while their recorded publication authority is current |
+| The publisher fails | Every publisher failure carries its evidence. Its reads, preparation and history archiving, and a manifest request that was never sent (a failed transaction-file put precedes it) or that the store refused outright, are `Unpublished`. A manifest request with an ambiguous answer is re-issued unchanged by the dataset's commit handler until the store answers it; Lance reads a held version back by its transaction. Lance deletes the attempt's transaction file only on a missing version the commit's own request record calls definitive, so a request that may still land keeps the file its manifest would name. A version that may hold the commit after that is read back, and only an outcome the read-back cannot settle is reported in doubt |
 | Schema apply or the system-column upgrade reports an error after proven publication | `RecoveryRequired` can name the committed outcome; its tables and contract are durable, and refresh/reopen rebuilds only the in-memory view |
 | A foreign linear commit lands above a table's `omnigraph.last_linear_version` | No read or write resolves it; `repair` reports the table as `foreign_drift` and never adopts the commit; the collector deletes neither its manifest nor its files and lists it under `foreign_versions` |
 | A sidecar from a build that predates detached commits is present | A read-write open refuses until that build has resolved it |
 | `commit publish` of an unpublished commit whose target head moved past its captured parent, or whose target incarnation is retired | `PreconditionFailed` naming the captured parent and the current head, or not found; the proposal stays retained until `cleanup` releases its expired tag |
 | `commit publish` or `commit drop` of a published commit id | Publish answers the established published commit; drop is a conflict |
-| A proposal tag's creation or deletion reports an ambiguous result | The tag is read back: a matching tag is success, a differing tag an integrity error, an unavailable readback `manifest_publish_in_doubt` |
+| A proposal tag's creation or deletion reports an ambiguous result | The tag is read back: a matching tag is success, a differing tag an integrity error, an unavailable readback `manifest_publish_in_doubt`. After a proposal or unattached snapshot tag is created, a failed authority probe remains in doubt even if rollback deletes the tag: an earlier conditional create may recreate it. Only proven expiry of the captured authority makes that refusal definite |
 
-The `Unpublished` annotations cover the named writer envelopes and the table
-store's staged-write and detached-commit sites. Other opaque schema and maintenance
+The `Unpublished` annotations cover the named writer envelopes, the table
+store's staged-write and detached-commit sites, and every publisher failure
+whose manifest request cannot land. Other opaque schema and maintenance
 preparation errors without completion evidence remain uncertain. A
 post-publication `RecoveryRequired` or an uncertain publication is never
 changed into definite non-publication by these annotations.
@@ -563,7 +583,7 @@ before it stages anything; a load's implicit fork checks `branch_create` before
 the fork, and nothing after it checks policy. A refusal that follows an effect
 answers a success with details instead, as the source deletion of
 `branch merge --delete-branch` does. The CLI relies on this order: it reports
-those three refusals as `not_started` with no effects. `ApiError::from_omni`
+those three refusals with `effects: none`. `ApiError::from_omni`
 cannot tell an early `OmniError::Policy` from a late one, so an `enforce` call
 after a durable effect would make that report wrong. The server's
 `auth_policy::signed_identities_obey_current_policy_and_attribute_writes` and

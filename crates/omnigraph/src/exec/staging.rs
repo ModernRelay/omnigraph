@@ -140,6 +140,10 @@ pub(crate) struct MutationStaging {
     /// `RetryableCommitConflict` as a 500. See
     /// [`MutationOpKind::strict_pre_stage_version_check`].
     pub(crate) op_kinds: HashMap<String, MutationOpKind>,
+    /// The Lance writers one table's overwrite runs at once; `Default` leaves
+    /// 0 and the store treats 0 as one writer, [`Self::with_overwrite_writers`]
+    /// widens it.
+    overwrite_writers: usize,
 }
 
 decide_seam! {
@@ -156,8 +160,16 @@ impl MutationStaging {
         Self {
             write_budget,
             deleted_id_budget: DeletedIdBudget::new(write_budget),
+            overwrite_writers: 1,
             ..Self::default()
         }
+    }
+
+    /// Run each table's overwrite through up to `writers` Lance writers at
+    /// once; see `TableStore::stage_overwrite_batches`.
+    pub(crate) fn with_overwrite_writers(mut self, writers: usize) -> Self {
+        self.overwrite_writers = writers.max(1);
+        self
     }
 
     pub(crate) fn write_budget(&self) -> WriteBudget {
@@ -483,6 +495,7 @@ impl MutationStaging {
             deleted_ids,
             deleted_id_budget: _,
             op_kinds: _,
+            overwrite_writers,
         } = self;
 
         let mut stage_inputs: Vec<(String, PreparedPendingTable, StagedTablePath, u64)> =
@@ -613,7 +626,16 @@ impl MutationStaging {
                     if stage_idx > 0 {
                         fail(&LOAD_BETWEEN_TABLE_STAGES)?;
                     }
-                    stage_pending_table(db, table_key, table, path, expected, write_budget).await
+                    stage_pending_table(
+                        db,
+                        table_key,
+                        table,
+                        path,
+                        expected,
+                        write_budget,
+                        overwrite_writers,
+                    )
+                    .await
                 },
             ))
             .buffered(concurrency)
@@ -785,6 +807,7 @@ async fn stage_pending_table(
     path: StagedTablePath,
     expected: u64,
     write_budget: WriteBudget,
+    overwrite_writers: usize,
 ) -> Result<Option<StagedTableEntry>> {
     let ds = db
         .open_pinned_for_write(&path.full_path, &path.entry)
@@ -811,7 +834,9 @@ async fn stage_pending_table(
                 .await?
         }
         PreparedPendingTable::Overwrite { batches } => {
-            db.storage().stage_overwrite_batches(&ds, batches).await?
+            db.storage()
+                .stage_overwrite_batches(&ds, batches, write_budget, overwrite_writers)
+                .await?
         }
     };
     Ok(Some(StagedTableEntry {

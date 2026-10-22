@@ -29,13 +29,21 @@ mod config;
 mod deployment;
 mod diff;
 mod graph_read;
+mod lease;
 mod serve;
 mod state_lock;
 mod store;
 mod types;
+pub use lease::{LeaseFence, LeaseFenced};
+/// The lease protocol's parts, for deterministic simulation of an owner's
+/// death and a successor's takeover.
+#[cfg(any(test, feature = "test-util"))]
+pub mod lease_protocol {
+    pub use crate::lease::{LeaseKeeper, Watch, lease_dir, watch_and_claim};
+}
 pub use admission::{
     ClusterAdmission, ClusterAdmissionPurpose, acquire_cluster_admission, acquire_graph_admission,
-    canonical_graph_uri,
+    acquire_graph_admission_with_binding, canonical_graph_uri,
 };
 pub use authorization::{
     AuthorizedEffect, AuthorizedPlanOutput, IdentityAuthorization, PlanAuthorization,
@@ -51,12 +59,14 @@ pub use graph_read::GraphReadAuthority;
 #[cfg(any(test, feature = "test-util"))]
 pub use serve::read_serving_snapshot_with_display_root;
 pub use serve::{
-    AdmittedServingSnapshot, RootBoundServingSnapshot, ServingBlockedGraph, ServingGraph,
-    ServingPolicy, ServingQuery, ServingSnapshot, acquire_serving_admission,
-    admit_serving_snapshot, cluster_graph_ids, cluster_root_for_graph_uri,
+    AdmittedServingSnapshot, ClusterGraphLocation, RootBoundServingSnapshot, ServingBlockedGraph,
+    ServingGraph, ServingPolicy, ServingQuery, ServingSnapshot, acquire_serving_admission,
+    admit_serving_snapshot, cluster_graph_for_graph_binding, cluster_graph_ids,
+    cluster_graph_ids_with_binding, cluster_root_for_graph_binding, cluster_root_for_graph_uri,
     read_deployment_serving_snapshot, read_root_bound_serving_snapshot,
     read_root_bound_serving_snapshot_from_storage, read_serving_snapshot,
-    read_serving_snapshot_from_storage, resolve_graph_storage_uri,
+    read_serving_snapshot_from_storage, read_serving_snapshot_with_binding,
+    resolve_graph_storage_uri, resolve_graph_storage_uri_with_binding,
 };
 use store::ClusterStore;
 pub use types::*;
@@ -79,7 +89,7 @@ fn store_for(config_dir: &Path, storage_root: Option<&str>) -> Result<ClusterSto
 }
 
 pub fn validate_config_dir(config_dir: impl AsRef<Path>) -> ValidateOutput {
-    let mut outcome = load_desired(config_dir.as_ref());
+    let mut outcome = config::capture_desired_source(config_dir.as_ref()).outcome;
     // This release intentionally tightens the historical permissive URI
     // behavior. Keep the notice on the validate surface (rather than every
     // plan/apply invocation): a valid graph with no bases must make its
@@ -144,6 +154,43 @@ pub async fn plan_config_dir_as(config_dir: impl AsRef<Path>, actor: Option<Stri
         actor,
         None,
         &mut None,
+        None,
+        None,
+    ))
+    .await
+}
+
+/// Plan source files against a separately selected direct storage root.
+/// The source's optional storage declaration is an equality assertion only.
+pub async fn plan_config_dir_at_root_as(
+    config_dir: impl AsRef<Path>,
+    root: &str,
+    actor: Option<String>,
+) -> PlanOutput {
+    Box::pin(plan_config_dir_impl(
+        config_dir.as_ref(),
+        actor,
+        None,
+        &mut None,
+        Some(root),
+        None,
+    ))
+    .await
+}
+
+/// Plan source against a target with provider authority already captured.
+pub async fn plan_config_dir_with_binding_as(
+    config_dir: impl AsRef<Path>,
+    binding: &omnigraph_storage::CapturedStorageBinding,
+    actor: Option<String>,
+) -> PlanOutput {
+    Box::pin(plan_config_dir_impl(
+        config_dir.as_ref(),
+        actor,
+        None,
+        &mut None,
+        Some(binding.uri()),
+        Some(binding),
     ))
     .await
 }
@@ -159,6 +206,8 @@ pub async fn plan_config_dir_authorized(
         None,
         Some(identity),
         &mut authorization,
+        None,
+        None,
     ))
     .await;
     AuthorizedPlanOutput {
@@ -172,16 +221,25 @@ async fn plan_config_dir_impl(
     actor: Option<String>,
     identity: Option<&IdentityAuthorization>,
     authorization: &mut Option<PlanAuthorization>,
+    selected_root: Option<&str>,
+    binding: Option<&omnigraph_storage::CapturedStorageBinding>,
 ) -> PlanOutput {
     let authority = LedgerAuthority::Observed;
-    let captured = config::capture_desired(config_dir);
+    let captured = match selected_root {
+        Some(root) => config::capture_desired_at_root(config_dir, root),
+        None => config::capture_desired(config_dir),
+    };
     let outcome = captured.outcome;
     let mut diagnostics = outcome.diagnostics;
     let storage_root = outcome
         .desired
         .as_ref()
         .and_then(|desired| desired.storage_root.clone());
-    let backend = match store_for(&outcome.config_dir, storage_root.as_deref()) {
+    let selected_store = match binding {
+        Some(binding) => ClusterStore::for_storage_binding(binding),
+        None => store_for(&outcome.config_dir, storage_root.as_deref()),
+    };
+    let backend = match selected_store {
         Ok(backend) => backend,
         Err(diagnostic) => {
             diagnostics.push(diagnostic);
@@ -314,7 +372,7 @@ async fn plan_config_dir_impl(
             None => DeploymentCaller::storage_owner(actor),
         };
         let preflight = match bundle {
-            Ok(bundle) => preflight_deployment_at(&bundle, &caller, snapshot).await,
+            Ok(bundle) => preflight_deployment_at(&bundle, &caller, snapshot, &backend).await,
             Err(error) => Err(error),
         };
         match preflight {
@@ -472,15 +530,51 @@ pub async fn force_unlock_config_dir(
 /// Inspect the current catalog and graph observations without changing authority.
 /// The ledger bytes, revision and ownership lock remain untouched.
 pub async fn observe_config_dir(config_dir: impl AsRef<Path>) -> StateSyncOutput {
-    let outcome = load_desired(config_dir.as_ref());
+    observe_desired(load_desired(config_dir.as_ref()), None).await
+}
+
+/// Observe the selected direct root using local source solely as desired input.
+pub async fn observe_config_dir_at_root(
+    config_dir: impl AsRef<Path>,
+    root: &str,
+) -> StateSyncOutput {
+    observe_desired(
+        config::capture_desired_at_root(config_dir.as_ref(), root).outcome,
+        None,
+    )
+    .await
+}
+
+/// Observe the selected root using its captured provider authority.
+pub async fn observe_config_dir_with_binding(
+    config_dir: impl AsRef<Path>,
+    binding: &omnigraph_storage::CapturedStorageBinding,
+) -> StateSyncOutput {
+    observe_desired(
+        config::capture_desired_at_root(config_dir.as_ref(), binding.uri()).outcome,
+        Some(binding),
+    )
+    .await
+}
+
+async fn observe_desired(
+    outcome: LoadOutcome,
+    binding: Option<&omnigraph_storage::CapturedStorageBinding>,
+) -> StateSyncOutput {
     let mut diagnostics = outcome.diagnostics;
-    let backend = match store_for(
-        &outcome.config_dir,
-        outcome
-            .desired
-            .as_ref()
-            .and_then(|desired| desired.storage_root.as_deref()),
-    ) {
+    let source_store = || {
+        store_for(
+            &outcome.config_dir,
+            outcome
+                .desired
+                .as_ref()
+                .and_then(|desired| desired.storage_root.as_deref()),
+        )
+    };
+    let backend = match binding
+        .map(ClusterStore::for_storage_binding)
+        .unwrap_or_else(source_store)
+    {
         Ok(backend) => backend,
         Err(diagnostic) => {
             diagnostics.push(diagnostic);
@@ -488,10 +582,12 @@ pub async fn observe_config_dir(config_dir: impl AsRef<Path>) -> StateSyncOutput
         }
     };
     let mut observations = backend.observations();
-    backend
-        .observe_lock(&mut observations, &mut diagnostics)
-        .await;
-    warn_pending_recovery_sidecars(&backend, &mut diagnostics).await;
+    if !has_errors(&diagnostics) {
+        backend
+            .observe_lock(&mut observations, &mut diagnostics)
+            .await;
+        warn_pending_recovery_sidecars(&backend, &mut diagnostics).await;
+    }
     let mut state = if has_errors(&diagnostics) {
         None
     } else {
@@ -621,13 +717,13 @@ fn payload_finding_diagnostic(address: &str, finding: &PayloadFinding) -> Diagno
         PayloadFinding::Missing => Diagnostic::warning(
             "catalog_payload_missing",
             address,
-            "catalog payload blob is missing; re-run `cluster apply` to republish",
+            "catalog payload blob is missing; restore the authoritative payload matching its recorded digest",
         ),
         PayloadFinding::Mismatch { actual_digest } => Diagnostic::warning(
             "catalog_payload_mismatch",
             address,
             format!(
-                "catalog payload blob does not match the recorded digest (actual sha256:{actual_digest}); re-run `cluster apply` to republish"
+                "catalog payload blob does not match the recorded digest (actual sha256:{actual_digest}); restore the authoritative payload matching its recorded digest"
             ),
         ),
         // An unverifiable blob must not report healthy.

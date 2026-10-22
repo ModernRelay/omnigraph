@@ -550,9 +550,9 @@ impl Omnigraph {
         Self::init_with_storage_impl(uri, schema_source, storage_for_uri(uri)?, options).await
     }
 
-    // Injected-storage constructor: test-only authority, exists only
-    // under the `dst` feature (see the feature doc in Cargo.toml).
-    #[cfg(feature = "dst")]
+    /// Create a graph using an explicit captured storage provider.
+    ///
+    /// Admission, control objects and Lance data access retain this binding.
     pub async fn init_with_storage(
         uri: &str,
         schema_source: &str,
@@ -599,8 +599,7 @@ impl Omnigraph {
         legacy_system_columns: bool,
         prepared: Option<&PreparedGraphCreate>,
     ) -> Result<Self> {
-        let lance_access =
-            crate::lance_access::LanceAccessContext::with_io_scope(storage.io_scope());
+        let lance_access = crate::lance_access::LanceAccessContext::with_storage(storage.as_ref());
         let storage = crate::storage::decorate(storage);
         let root = normalize_root_uri(uri)?;
         let write_queue_identity = write_queue_root_identity(&root)?;
@@ -772,6 +771,33 @@ impl Omnigraph {
         Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadOnly).await
     }
 
+    /// Whether a graph exists at `uri`: `false` only when Lance finds no
+    /// `__manifest` dataset at the root. Every other failure is the error, so
+    /// a manifest that names a missing object or a missing ref never reads as
+    /// an absent graph, although an open reports both with the same storage
+    /// kind. Opens the latest `__manifest` version and drops it; it reads no
+    /// graph state and writes nothing.
+    ///
+    /// This is a point-in-time observation: a graph created or removed
+    /// afterwards changes what a later open finds.
+    pub async fn exists(uri: &str) -> Result<bool> {
+        Self::exists_with_storage(uri, storage_for_uri(uri)?).await
+    }
+
+    /// [`Self::exists`] through the caller's explicit storage binding, the
+    /// binding a following [`Self::open_read_only_with_storage`] uses.
+    pub async fn exists_with_storage(uri: &str, storage: Arc<dyn StorageAdapter>) -> Result<bool> {
+        let lance_access = crate::lance_access::LanceAccessContext::with_storage(storage.as_ref());
+        let root = normalize_root_uri(uri)?;
+        let manifest = crate::instrumentation::open_dataset_if_present(
+            &crate::db::manifest::manifest_uri(&root),
+            Some(&lance_access.control_session()),
+            crate::instrumentation::manifest_wrapper(),
+        )
+        .await?;
+        Ok(manifest.is_some())
+    }
+
     /// Observe that no legacy recovery sidecar is present.
     /// Performs no graph open, recovery, cleanup, or object-body reads. Any
     /// pending JSON, including malformed or unsupported sidecars, refuses.
@@ -782,8 +808,14 @@ impl Omnigraph {
     /// not writer exclusion or a transferable recovery capability. Callers must
     /// retain their existing writer exclusion through any subsequent effect.
     pub async fn ensure_no_pending_recovery(uri: &str) -> Result<()> {
+        Self::ensure_no_pending_recovery_with_storage(uri, storage_for_uri(uri)?).await
+    }
+
+    pub async fn ensure_no_pending_recovery_with_storage(
+        uri: &str,
+        storage: Arc<dyn StorageAdapter>,
+    ) -> Result<()> {
         let root = normalize_root_uri(uri)?;
-        let storage = storage_for_uri(&root)?;
         let identity = write_queue_root_identity(&root)?;
         let queues = crate::db::write_queue::WriteQueueManager::for_root(&identity);
         let _schema_gate = queues.acquire_schema_shared().await;
@@ -798,7 +830,12 @@ impl Omnigraph {
     /// [`SnapshotDataset::has_external_base_paths`](crate::db::SnapshotDataset::has_external_base_paths)
     /// as false.
     pub async fn manifest_has_external_base_paths(&self, branch: Option<&str>) -> Result<bool> {
-        crate::db::manifest::manifest_has_external_base_paths(&self.root_uri, branch).await
+        crate::db::manifest::manifest_has_external_base_paths_with_session(
+            &self.root_uri,
+            branch,
+            &self.control_session(),
+        )
+        .await
     }
 
     /// Open with a caller-supplied [`StorageAdapter`]. Used by init/test paths
@@ -808,10 +845,7 @@ impl Omnigraph {
         Self::open_with_storage_and_mode(uri, storage, OpenMode::ReadWrite).await
     }
 
-    // Read-only injected-storage twin, so a harness can audit the same
-    // universe through the read-only open path. Test-only authority,
-    // exists only under the `dst` feature (see the Cargo.toml feature doc).
-    #[cfg(feature = "dst")]
+    /// Read-only open retaining the caller's explicit storage binding.
     pub async fn open_read_only_with_storage(
         uri: &str,
         storage: Arc<dyn StorageAdapter>,
@@ -824,8 +858,7 @@ impl Omnigraph {
         storage: Arc<dyn StorageAdapter>,
         mode: OpenMode,
     ) -> Result<Self> {
-        let lance_access =
-            crate::lance_access::LanceAccessContext::with_io_scope(storage.io_scope());
+        let lance_access = crate::lance_access::LanceAccessContext::with_storage(storage.as_ref());
         let storage = crate::storage::decorate(storage);
         let root = normalize_root_uri(uri)?;
         let write_queue_identity = write_queue_root_identity(&root)?;
@@ -1606,7 +1639,7 @@ impl Omnigraph {
                 effective_graph_head.as_deref().unwrap_or("<absent>"),
             )));
         }
-        let snapshot = Snapshot::wrap(base.snapshot(self.uri())?);
+        let snapshot = Snapshot::wrap(base.snapshot(self.uri(), &self.control_session())?);
         let (catalog, identity) = self.accepted_catalog_for_snapshot(&snapshot).await?;
         let (_, live_identity) = self.accepted_catalog_for_snapshot(&live).await?;
         if live_identity != identity {
@@ -2172,15 +2205,28 @@ impl Omnigraph {
     /// `resolve_target` additionally assembles the lineage projection the OCC
     /// read never consults. Skipping that work is a pure read-cost reduction,
     /// not a freshness change.
+    ///
+    /// The re-read goes through this handle's control session, so it observes
+    /// the destination the handle is bound to rather than one the ambient
+    /// provider configuration selects.
     pub(crate) async fn fresh_snapshot_for_branch_unchecked(
         &self,
         branch: Option<&str>,
     ) -> Result<Snapshot> {
+        let session = self.control_session();
         let manifest = match branch {
             Some(branch) => {
-                crate::db::manifest::ManifestCoordinator::open_at_branch(self.uri(), branch).await?
+                crate::db::manifest::ManifestCoordinator::open_at_branch_with_session(
+                    self.uri(),
+                    branch,
+                    &session,
+                )
+                .await?
             }
-            None => crate::db::manifest::ManifestCoordinator::open(self.uri()).await?,
+            None => {
+                crate::db::manifest::ManifestCoordinator::open_with_session(self.uri(), &session)
+                    .await?
+            }
         };
         Ok(Snapshot::wrap(manifest.snapshot()))
     }
@@ -2432,10 +2478,11 @@ impl Omnigraph {
             .current_branch()
             .map(str::to_string);
         let mut snapshot = Snapshot::wrap(
-            crate::db::manifest::ManifestCoordinator::snapshot_at(
+            crate::db::manifest::ManifestCoordinator::snapshot_at_with_session(
                 self.uri(),
                 branch.as_deref(),
                 version,
+                &self.control_session(),
             )
             .await?,
         );
@@ -3965,7 +4012,7 @@ impl Omnigraph {
                 source.version()
             )));
         }
-        let snapshot = Snapshot::wrap(record.snapshot(self.root_uri())?);
+        let snapshot = Snapshot::wrap(record.snapshot(self.root_uri(), &self.control_session())?);
         // Every record carries the contract its commit was written under:
         // the storage upgrade gives each converted commit one too. A commit
         // from before the upgrade is refused where its `__manifest` version

@@ -170,9 +170,13 @@ pub(super) async fn upgrade_system_columns(
         )
     };
     db.refresh_coordinator_only().await?;
-    let stamp = crate::db::manifest::internal_schema_stamp_at(db.uri(), None)
-        .await?
-        .ok_or_else(|| OmniError::manifest_internal("opened graph has no internal-schema stamp"))?;
+    let stamp = crate::db::manifest::internal_schema_stamp_at_with_session(
+        db.uri(),
+        None,
+        &db.control_session(),
+    )
+    .await?
+    .ok_or_else(|| OmniError::manifest_internal("opened graph has no internal-schema stamp"))?;
     report.stamp_before = stamp;
     report.stamp_after = stamp;
     let (accepted, accepted_identity) = {
@@ -207,9 +211,13 @@ pub(super) async fn upgrade_system_columns(
     )
     .await?;
     report.outcome = SystemColumnUpgradeOutcome::Completed;
-    report.stamp_after = crate::db::manifest::internal_schema_stamp_at(db.uri(), None)
-        .await?
-        .unwrap_or(stamp);
+    report.stamp_after = crate::db::manifest::internal_schema_stamp_at_with_session(
+        db.uri(),
+        None,
+        &db.control_session(),
+    )
+    .await?
+    .unwrap_or(stamp);
     report.graph_manifest_version = Some(graph_manifest_version);
     Ok(report)
 }

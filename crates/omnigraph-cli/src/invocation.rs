@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use clap::{Arg, ArgAction, CommandFactory, FromArgMatches};
 
-use crate::cli::{Cli, ClusterCommand, ClusterRunArgs, Command};
+use crate::cli::Cli;
 use crate::read_format::ReadOutputFormat;
 
 #[derive(Debug)]
@@ -23,6 +23,20 @@ pub(crate) struct ParsedInvocation {
 pub(crate) enum MachineErrors {
     Json,
     Jsonl,
+}
+
+/// Clap propagates globals by replacing ancestor matches with the deepest one.
+/// Validate each occurrence while parsing, before that replacement can hide an
+/// ambiguous destination or actor. The state is fresh for each command tree and
+/// shared only by clones of this parser as Clap propagates the global argument.
+pub(crate) fn single_selector(flag: &'static str) -> clap::builder::ValueParser {
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    clap::builder::ValueParser::from(move |value: &str| -> Result<String, String> {
+        if seen.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return Err(format!("{flag} cannot be used multiple times"));
+        }
+        Ok(value.to_owned())
+    })
 }
 
 fn command() -> clap::Command {
@@ -78,162 +92,25 @@ where
         machine,
         explicit_config,
     };
-    validate_cluster_arguments(&parsed.cli, parsed.explicit_config)?;
     Ok(parsed)
-}
-
-/// Cross-level argument relations must be checked after Clap propagates global
-/// values: subcommand validation cannot see `--cluster` given before `cluster`.
-fn validate_cluster_arguments(
-    cli: &Cli,
-    explicit_config: bool,
-) -> std::result::Result<(), clap::Error> {
-    if matches!(&cli.command, Command::Organization { managed: false, .. }) {
-        return Err(Cli::command().error(
-            clap::error::ErrorKind::ArgumentConflict,
-            "organization commands require --managed",
-        ));
-    }
-    let Command::Cluster { managed, command } = &cli.command else {
-        return Ok(());
-    };
-    let conflict =
-        |message| Cli::command().error(clap::error::ErrorKind::ArgumentConflict, message);
-    if *managed {
-        match command {
-            ClusterCommand::Validate { .. }
-            | ClusterCommand::Observe { .. }
-            | ClusterCommand::ForceUnlock { .. }
-            | ClusterCommand::UpgradeLedger { .. } => {
-                return Err(conflict("this command cannot be used with --managed"));
-            }
-            ClusterCommand::Apply {
-                deployment_id,
-                writers_stopped,
-                plan,
-                ..
-            } => {
-                if deployment_id.is_some() || *writers_stopped {
-                    return Err(conflict(
-                        "--deployment-id and --writers-stopped cannot be used with --managed",
-                    ));
-                }
-                if plan.is_none() {
-                    return Err(Cli::command().error(
-                        clap::error::ErrorKind::MissingRequiredArgument,
-                        "cluster apply --managed requires --plan <PREVIEW_ID>",
-                    ));
-                }
-            }
-            ClusterCommand::Status { deployment_id, .. } if deployment_id.is_some() => {
-                return Err(conflict(
-                    "--managed status accepts a positional DEPLOYMENT_ID; --deployment-id selects a server or storage deployment",
-                ));
-            }
-            _ => {}
-        }
-        // The managed dispatcher rejects competing target selectors before
-        // reading context, preserving its structured scope diagnostics.
-        return Ok(());
-    }
-    match command {
-        ClusterCommand::Create { .. }
-        | ClusterCommand::List { .. }
-        | ClusterCommand::Members { .. }
-        | ClusterCommand::Pull { .. }
-        | ClusterCommand::Push { .. }
-        | ClusterCommand::Delete { .. }
-        | ClusterCommand::UndoDelete { .. }
-        | ClusterCommand::Token { .. }
-        | ClusterCommand::Operation { .. }
-        | ClusterCommand::History { .. }
-        | ClusterCommand::Cancel { .. } => {
-            return Err(conflict("this command requires --managed"));
-        }
-        ClusterCommand::Plan { revision, run, .. }
-            if revision.is_some()
-                || run.no_wait
-                || run.timeout.is_some()
-                || run.idempotency_key.is_some() =>
-        {
-            return Err(conflict(
-                "plan options --rev, --no-wait, --timeout and --idempotency-key require --managed",
-            ));
-        }
-        ClusterCommand::Apply { plan, run, .. }
-            if plan.is_some() || run.idempotency_key.is_some() =>
-        {
-            return Err(conflict("--plan and --idempotency-key require --managed"));
-        }
-        ClusterCommand::Status {
-            run_id: Some(_), ..
-        } => {
-            return Err(conflict(
-                "a positional delivery ID requires --managed; use --deployment-id for a server or storage deployment",
-            ));
-        }
-        _ => {}
-    }
-    if cli.server.is_none()
-        && matches!(
-            command,
-            ClusterCommand::Apply {
-                run: ClusterRunArgs { no_wait: true, .. },
-                ..
-            } | ClusterCommand::Apply {
-                run: ClusterRunArgs {
-                    timeout: Some(_),
-                    ..
-                },
-                ..
-            } | ClusterCommand::Status { wait: true, .. }
-        )
-    {
-        return Err(Cli::command().error(
-            clap::error::ErrorKind::ArgumentConflict,
-            "deployment wait options require --server <SERVER>",
-        ));
-    }
-    if cli.cluster.is_some() && explicit_config {
-        return Err(Cli::command().error(
-            clap::error::ErrorKind::ArgumentConflict,
-            "--cluster and explicit --config cannot be used together",
-        ));
-    }
-    if cli.cluster.is_none()
-        && cli.server.is_none()
-        && matches!(
-            command,
-            ClusterCommand::UpgradeLedger { .. }
-                | ClusterCommand::Apply {
-                    writers_stopped: true,
-                    ..
-                }
-                | ClusterCommand::Status {
-                    deployment_id: Some(_),
-                    ..
-                }
-        )
-    {
-        return Err(Cli::command().error(
-            clap::error::ErrorKind::MissingRequiredArgument,
-            "this deployment operation requires --cluster <ROOT>",
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::{ClusterCommand, Command};
     use clap::error::ErrorKind;
 
     #[test]
     fn config_provenance_preserves_explicit_current_directory() {
         for (extra, expected_path, explicit) in [
-            (vec![], ".", false),
-            (vec!["--config", "."], ".", true),
-            (vec!["--config", "unopened-source"], "unopened-source", true),
+            (vec![], None, false),
+            (vec!["--config", "."], Some("."), true),
+            (
+                vec!["--config", "unopened-source"],
+                Some("unopened-source"),
+                true,
+            ),
         ] {
             let parsed =
                 parse_from(["omnigraph", "cluster", "plan"].into_iter().chain(extra)).unwrap();
@@ -245,86 +122,7 @@ mod tests {
             else {
                 panic!("expected cluster plan");
             };
-            assert_eq!(config, PathBuf::from(expected_path));
-        }
-    }
-
-    #[test]
-    fn explicit_config_conflict_preserves_global_flag_positions() {
-        for args in [
-            vec![
-                "omnigraph",
-                "--cluster",
-                "unopened-root",
-                "cluster",
-                "status",
-            ],
-            vec![
-                "omnigraph",
-                "cluster",
-                "--cluster",
-                "unopened-root",
-                "status",
-            ],
-            vec![
-                "omnigraph",
-                "cluster",
-                "status",
-                "--cluster",
-                "unopened-root",
-            ],
-        ] {
-            let parsed = parse_from(args.clone()).unwrap();
-            assert_eq!(parsed.cli.cluster.as_deref(), Some("unopened-root"));
-            assert!(!parsed.explicit_config);
-            let error =
-                parse_from(args.into_iter().chain(["--config", ".", "--json"])).unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
-            assert_eq!(error.exit_code(), 2);
-            assert!(error.use_stderr());
-            assert!(
-                error
-                    .to_string()
-                    .contains("--cluster and explicit --config cannot be used together")
-            );
-        }
-    }
-
-    #[test]
-    fn cross_level_validation_preserves_first_error() {
-        for (args, expected) in [
-            (
-                vec!["cluster", "apply", "--managed", "--deployment-id", "id"],
-                "--deployment-id and --writers-stopped cannot be used with --managed",
-            ),
-            (
-                vec![
-                    "cluster",
-                    "apply",
-                    "--cluster",
-                    "unopened-root",
-                    "--no-wait",
-                    "--config",
-                    ".",
-                ],
-                "deployment wait options require --server <SERVER>",
-            ),
-            (
-                vec![
-                    "organization",
-                    "members",
-                    "list",
-                    "--store",
-                    "unopened-store",
-                ],
-                "organization commands require --managed",
-            ),
-        ] {
-            let error = parse_from(std::iter::once("omnigraph").chain(args)).unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
-            assert_eq!(error.exit_code(), 2);
-            assert!(error.use_stderr());
-            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(config, expected_path.map(PathBuf::from));
         }
     }
 
@@ -335,6 +133,15 @@ mod tests {
             (vec!["query", "q", "--format", "table"], None),
             (vec!["query", "q", "--format", "arrow"], None),
             (vec!["query", "q", "--json"], Some(MachineErrors::Json)),
+            (vec!["catalogue", "-e", "query q() {}"], None),
+            (
+                vec!["catalogue", "-e", "query q() {}", "--json"],
+                Some(MachineErrors::Json),
+            ),
+            (
+                vec!["catalogue", "--query", "catalogue.gq", "--json"],
+                Some(MachineErrors::Json),
+            ),
             (
                 vec!["query", "q", "--format", "json"],
                 Some(MachineErrors::Json),
@@ -349,7 +156,7 @@ mod tests {
             ),
             (vec!["branch", "list", "--json"], Some(MachineErrors::Json)),
             (
-                vec!["organization", "--managed", "--json", "members", "list"],
+                vec!["organization", "--json", "members", "list"],
                 Some(MachineErrors::Json),
             ),
             (vec!["version"], None),
@@ -360,13 +167,71 @@ mod tests {
     }
 
     #[test]
+    fn catalogue_requires_one_source_and_has_no_graph_state_options() {
+        for args in [
+            vec!["catalogue"],
+            vec!["catalogue", "-e", "q", "--query", "q.gq"],
+            vec!["catalogue", "-e", "q", "--branch", "main"],
+            vec!["catalogue", "-e", "q", "--snapshot", "snapshot"],
+        ] {
+            assert!(parse_from(std::iter::once("omnigraph").chain(args)).is_err());
+        }
+    }
+
+    #[test]
+    fn global_selectors_are_singletons_across_command_levels() {
+        for flag in [
+            "--target",
+            "--profile",
+            "--operator-config",
+            "--graph",
+            "--as",
+        ] {
+            for args in [
+                vec![
+                    flag.into(),
+                    "one".into(),
+                    "branch".into(),
+                    "list".into(),
+                    flag.into(),
+                    "two".into(),
+                ],
+                vec![
+                    "cluster".into(),
+                    format!("{flag}=one"),
+                    "status".into(),
+                    format!("{flag}=two"),
+                ],
+            ] {
+                let error =
+                    parse_from(std::iter::once("omnigraph".to_owned()).chain(args)).unwrap_err();
+                assert_eq!(error.exit_code(), 2);
+                assert!(
+                    error.to_string().contains("cannot be used multiple times"),
+                    "{error}"
+                );
+            }
+        }
+        // The count belongs to one parse, and option-looking values after `--`
+        // are still positional input rather than selectors.
+        for _ in 0..2 {
+            parse_from([
+                "omnigraph",
+                "--target",
+                "one",
+                "query",
+                "--",
+                "--target=literal",
+            ])
+            .unwrap();
+        }
+    }
+
+    #[test]
     fn help_and_version_return_before_cross_level_validation() {
         for (args, kind) in [
             (vec!["--help"], ErrorKind::DisplayHelp),
-            (
-                vec!["cluster", "apply", "--managed", "--help"],
-                ErrorKind::DisplayHelp,
-            ),
+            (vec!["cluster", "apply", "--help"], ErrorKind::DisplayHelp),
             (vec!["-v"], ErrorKind::DisplayVersion),
             (vec!["--version"], ErrorKind::DisplayVersion),
         ] {

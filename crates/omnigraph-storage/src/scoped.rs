@@ -17,8 +17,11 @@
 //!   uncertainty must reach the logical owner independently of this scope.
 //! - Other keys (refs, version hints, control objects and unknown paths),
 //!   if-match replacements and recursive deletes stay conservative. An
-//!   unacknowledged request makes the scope uncertain even if its caller
-//!   consumes the error. Rename accounts for its source deletion too.
+//!   unacknowledged request leaves its key unsettled even if its caller
+//!   consumes the error: a later request to that key, which the earlier one
+//!   could still overwrite by landing late, is refused, and the scope refuses
+//!   a clean release. Other keys are unaffected. Rename accounts for its
+//!   source deletion too.
 //! - A manifest write the store did not acknowledge may still land after
 //!   Lance reads it back as absent and tries to delete its transaction file.
 //!   One sticky flag therefore refuses transaction-file deletion throughout
@@ -31,7 +34,27 @@
 //!   abort fails or the handle is abandoned: the object exists whole or not at
 //!   all. Leftover parts are the bucket's to expire. Unacknowledged manifest
 //!   completion retains transaction files by the same rule above.
+//!
+//! Requests are routed by class. Reads and unconditional writes of fresh
+//! immutable keys go to a retrying client: a retry re-sends the same bytes
+//! to a name only this request uses, so its late copies are the ones a lost
+//! acknowledgement already allows. Conditional requests and mutable keys go
+//! to a single-attempt client: a conditional request is resolved by its
+//! owner's re-issue and read-back, which needs every attempt to be its own,
+//! and a mutable key is the class whose late landing matters. A multipart
+//! upload follows its key's class, and its parts, completion and abort follow
+//! the upload.
+//!
+//! [`StorageIoScope::fence`] is stronger than closing. It is for an owner
+//! that has lost its right to write, when a successor may act: it refuses
+//! every later request, including the parts, completion and abort of an
+//! admitted multipart upload, and it cancels every admitted request still
+//! running. A cancelled request's future is dropped, so its client sends no
+//! further attempt and no retry. A request already sent may still be
+//! applied by the store, as after a crash, and its caller sees an ambiguous
+//! error rather than this scope's definite refusal.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
@@ -62,16 +85,51 @@ pub struct StorageIoScope {
 struct ScopeInner {
     state: Mutex<ScopeState>,
     changed: Notify,
+    /// Wakes every admitted request when the scope is fenced.
+    fence: Notify,
 }
 
 #[derive(Debug, Default)]
 struct ScopeState {
     pending: usize,
     closed: bool,
-    uncertain: bool,
+    /// The owner lost its right to write: nothing more is sent.
+    fenced: bool,
+    /// Mutable keys whose last request has an unknown outcome. Bounded by
+    /// [`MAX_UNSETTLED_KEYS`]; past the bound `unsettled_overflow` refuses
+    /// every mutation rather than growing.
+    unsettled: BTreeSet<Path>,
+    unsettled_overflow: bool,
     /// An unacknowledged manifest write may still land. Retain transaction
     /// files for this scope's lifetime with bounded, conservative state.
     hold_transaction_deletes: bool,
+}
+
+/// How many unsettled mutable keys one scope remembers. A store that leaves
+/// this many mutable requests unanswered is failing; past the bound the
+/// scope refuses every mutation, and reads continue.
+pub const MAX_UNSETTLED_KEYS: usize = 4096;
+
+impl ScopeState {
+    /// The first unsettled key `request` touches: its own key, or for a
+    /// recursive delete any key under its prefix.
+    fn unsettled_conflict(&self, request: &Request) -> bool {
+        if request.op == "delete_prefix" {
+            let prefix = request.path.as_ref();
+            return self.unsettled.iter().any(|key| {
+                key.as_ref() == prefix || key.as_ref().starts_with(&format!("{prefix}/"))
+            });
+        }
+        self.unsettled.contains(&request.path)
+    }
+
+    fn unsettle(&mut self, path: &Path) {
+        if self.unsettled.len() < MAX_UNSETTLED_KEYS {
+            self.unsettled.insert(path.clone());
+        } else if !self.unsettled.contains(path) {
+            self.unsettled_overflow = true;
+        }
+    }
 }
 
 impl StorageIoScope {
@@ -79,8 +137,16 @@ impl StorageIoScope {
         Self::default()
     }
 
+    /// Whether some mutable key's last request has an unknown outcome. A
+    /// clean release requires this to be false; serving does not.
     pub fn is_uncertain(&self) -> bool {
-        self.inner.state.lock().unwrap().uncertain
+        let state = self.inner.state.lock().unwrap();
+        !state.unsettled.is_empty() || state.unsettled_overflow
+    }
+
+    /// How many mutable keys this scope holds unsettled.
+    pub fn unsettled_keys(&self) -> usize {
+        self.inner.state.lock().unwrap().unsettled.len()
     }
 
     pub fn pending(&self) -> usize {
@@ -90,6 +156,50 @@ impl StorageIoScope {
     /// Irreversibly refuse new mutation admission.
     pub fn close(&self) {
         self.inner.state.lock().unwrap().closed = true;
+    }
+
+    /// Irreversibly stop sending: refuse every later request, including the
+    /// parts, completion and abort of an admitted multipart upload, and
+    /// cancel every admitted request still running (see the module
+    /// documentation). For an owner whose lease fenced, so that it sends
+    /// nothing after a successor may act, however long the process lives.
+    pub fn fence(&self) {
+        {
+            let mut state = self.inner.state.lock().unwrap();
+            state.closed = true;
+            state.fenced = true;
+        }
+        self.inner.fence.notify_waiters();
+    }
+
+    pub fn is_fenced(&self) -> bool {
+        self.inner.state.lock().unwrap().fenced
+    }
+
+    /// Resolves once the scope is fenced.
+    async fn fenced(&self) {
+        loop {
+            let fence = self.inner.fence.notified();
+            tokio::pin!(fence);
+            fence.as_mut().enable();
+            if self.is_fenced() {
+                return;
+            }
+            fence.await;
+        }
+    }
+
+    /// Run an admitted request until it answers or the scope is fenced. A
+    /// fence drops the request's future, so its client sends nothing more.
+    async fn until_fenced<T>(
+        &self,
+        request: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        tokio::select! {
+            biased;
+            result = request => result,
+            () = self.fenced() => Err(fenced_in_flight_error()),
+        }
     }
 
     /// Wait until all admitted requests and multipart lifetimes have settled
@@ -107,13 +217,27 @@ impl StorageIoScope {
         }
     }
 
-    /// Wrap a client whose mutating requests perform at most one attempt.
+    /// Wrap a client whose mutating requests perform at most one attempt,
+    /// for every request class.
     ///
     /// The caller must configure that client (and any outer retry layer) before
-    /// wrapping it. Scoped adapter constructors do so for their own clients.
+    /// wrapping it.
     pub fn wrap_object_store(&self, inner: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+        self.wrap_object_stores(Arc::clone(&inner), inner)
+    }
+
+    /// Wrap two clients of one store: `retrying` serves reads and fresh
+    /// immutable writes with its own bounded retries; `single` performs at
+    /// most one attempt per request and serves conditional requests and
+    /// mutable keys.
+    pub fn wrap_object_stores(
+        &self,
+        retrying: Arc<dyn ObjectStore>,
+        single: Arc<dyn ObjectStore>,
+    ) -> Arc<dyn ObjectStore> {
         Arc::new(ScopedObjectStore {
-            inner,
+            inner: retrying,
+            single,
             scope: self.clone(),
         })
     }
@@ -123,8 +247,11 @@ impl StorageIoScope {
         if state.closed {
             return Err(closed_error());
         }
-        if state.uncertain {
-            return Err(uncertain_error());
+        if state.unsettled_overflow {
+            return Err(unsettled_overflow_error());
+        }
+        if state.unsettled_conflict(&request) {
+            return Err(unsettled_error(&request.path));
         }
         if state.hold_transaction_deletes && request.deletes_transactions() {
             // A settled refusal: Lance's best-effort cleanup logs it and
@@ -149,8 +276,17 @@ impl StorageIoScope {
         // Only an admitted multipart lifetime can call this. Its outstanding
         // guard prevents an idle observation before the child is registered.
         let mut state = self.inner.state.lock().unwrap();
-        if state.uncertain && !cleanup {
-            return Err(uncertain_error());
+        // A close lets an admitted upload finish or abort; a fence sends
+        // nothing more, its cleanup included. Leftover parts are the
+        // bucket's to expire.
+        if state.fenced {
+            return Err(fenced_error());
+        }
+        if !cleanup && state.unsettled_overflow {
+            return Err(unsettled_overflow_error());
+        }
+        if !cleanup && state.unsettled_conflict(&request) {
+            return Err(unsettled_error(&request.path));
         }
         state.pending += 1;
         Ok(Mutation {
@@ -272,23 +408,65 @@ fn is_uuid(text: &str) -> bool {
             .all(|(group, len)| group.len() == len && group.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+/// The `store` of every error the scope returns for a request it refuses
+/// before sending it. A caller may read such an error as definite: no copy of
+/// the request can land.
+pub const OWNED_STORE_NAME: &str = "owned storage";
+
 fn closed_error() -> object_store::Error {
     object_store::Error::Generic {
-        store: "owned storage",
+        store: OWNED_STORE_NAME,
         source: std::io::Error::other("storage mutation admission is closed").into(),
     }
 }
 
-fn uncertain_error() -> object_store::Error {
+fn fenced_error() -> object_store::Error {
     object_store::Error::Generic {
-        store: "owned storage",
-        source: std::io::Error::other("a prior storage mutation has an uncertain outcome").into(),
+        store: OWNED_STORE_NAME,
+        source: std::io::Error::other("storage mutation is fenced; nothing more is sent").into(),
+    }
+}
+
+/// The `store` of the error a request cancelled by a fence returns. Not
+/// [`OWNED_STORE_NAME`]: the request may already have been sent, so its
+/// outcome is unknown.
+const FENCED_REQUEST_STORE_NAME: &str = "fenced storage request";
+
+fn fenced_in_flight_error() -> object_store::Error {
+    object_store::Error::Generic {
+        store: FENCED_REQUEST_STORE_NAME,
+        source: std::io::Error::other(
+            "storage mutation was fenced while this request was in flight; it may still land",
+        )
+        .into(),
+    }
+}
+
+fn unsettled_overflow_error() -> object_store::Error {
+    object_store::Error::Generic {
+        store: OWNED_STORE_NAME,
+        source: std::io::Error::other(format!(
+            "more than {MAX_UNSETTLED_KEYS} keys in this storage scope have requests with unknown \
+             outcomes; it refuses every mutation until a replacement scope"
+        ))
+        .into(),
+    }
+}
+
+fn unsettled_error(path: &Path) -> object_store::Error {
+    object_store::Error::Generic {
+        store: OWNED_STORE_NAME,
+        source: std::io::Error::other(format!(
+            "a prior request to '{path}' has an unknown outcome and could still land; \
+             this key stays refused until a replacement scope"
+        ))
+        .into(),
     }
 }
 
 fn transaction_file_held_error() -> object_store::Error {
     object_store::Error::Generic {
-        store: "owned storage",
+        store: OWNED_STORE_NAME,
         source: std::io::Error::other(
             "a manifest write with an unknown outcome may name this transaction file; it stays until cleanup from a replacement scope",
         )
@@ -346,7 +524,7 @@ impl Mutation {
                 path = %self.request.path,
                 conditional = self.request.conditional,
                 error = %error,
-                "storage request outcome unknown on a mutable key; the owned storage scope is now uncertain"
+                "storage request outcome unknown on a mutable key; this key is now unsettled"
             );
         }
         result
@@ -397,9 +575,9 @@ impl Drop for Mutation {
                 tracing::error!(
                     op = self.request.op,
                     path = %self.request.path,
-                    "storage request abandoned on a mutable key; the owned storage scope is now uncertain"
+                    "storage request abandoned on a mutable key; this key is now unsettled"
                 );
-                state.uncertain = true;
+                state.unsettle(&self.request.path);
             }
         }
         state.hold_transaction_deletes |= self.hold_transactions;
@@ -411,8 +589,22 @@ impl Drop for Mutation {
 
 #[derive(Debug)]
 struct ScopedObjectStore {
+    /// Reads and fresh immutable writes; retries within its own budget.
     inner: Arc<dyn ObjectStore>,
+    /// Conditional requests and mutable keys; one attempt per request.
+    single: Arc<dyn ObjectStore>,
     scope: StorageIoScope,
+}
+
+impl ScopedObjectStore {
+    /// The client a request goes to (see the module documentation).
+    fn client(&self, request: &Request) -> &Arc<dyn ObjectStore> {
+        if request.conditional || request.class == KeyClass::Mutable {
+            &self.single
+        } else {
+            &self.inner
+        }
+    }
 }
 
 impl fmt::Display for ScopedObjectStore {
@@ -437,8 +629,13 @@ impl ObjectStore for ScopedObjectStore {
             // key. Only Create has the numbered-manifest exemption.
             request.class = KeyClass::Mutable;
         }
+        let client = Arc::clone(self.client(&request));
         let mutation = self.scope.begin(request)?;
-        mutation.finish(self.inner.put_opts(path, payload, opts).await)
+        mutation.finish(
+            self.scope
+                .until_fenced(client.put_opts(path, payload, opts))
+                .await,
+        )
     }
 
     async fn put_multipart_opts(
@@ -447,8 +644,13 @@ impl ObjectStore for ScopedObjectStore {
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
         let request = Request::new("multipart", path, false);
+        let client = Arc::clone(self.client(&request));
         let lifetime = self.scope.begin(request.clone())?;
-        match self.inner.put_multipart_opts(path, opts).await {
+        match self
+            .scope
+            .until_fenced(client.put_multipart_opts(path, opts))
+            .await
+        {
             Ok(inner) => Ok(Box::new(ScopedUpload {
                 inner,
                 lifetime: Some(lifetime),
@@ -471,18 +673,25 @@ impl ObjectStore for ScopedObjectStore {
         &self,
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
-        let inner = self.inner.clone();
+        let retrying = self.inner.clone();
+        let single = self.single.clone();
         let scope = self.scope.clone();
         // Track each one-key request to its acknowledgement. In particular,
         // ObjectStoreExt::delete consumes one item then drops this stream.
         locations
             .map(move |path| {
-                let inner = inner.clone();
+                let retrying = retrying.clone();
+                let single = single.clone();
                 let scope = scope.clone();
                 async move {
                     let path = path?;
-                    let mutation = scope.begin(Request::new("delete", &path, false))?;
-                    mutation.finish(inner.delete(&path).await)?;
+                    let request = Request::new("delete", &path, false);
+                    let client = match request.class {
+                        KeyClass::Immutable => retrying,
+                        KeyClass::Mutable => single,
+                    };
+                    let mutation = scope.begin(request)?;
+                    mutation.finish(scope.until_fenced(client.delete(&path)).await)?;
                     Ok(path)
                 }
             })
@@ -508,8 +717,14 @@ impl ObjectStore for ScopedObjectStore {
 
     async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> Result<()> {
         let conditional = matches!(opts.mode, object_store::CopyMode::Create);
-        let mutation = self.scope.begin(Request::new("copy", to, conditional))?;
-        mutation.finish(self.inner.copy_opts(from, to, opts).await)
+        let request = Request::new("copy", to, conditional);
+        let client = Arc::clone(self.client(&request));
+        let mutation = self.scope.begin(request)?;
+        mutation.finish(
+            self.scope
+                .until_fenced(client.copy_opts(from, to, opts))
+                .await,
+        )
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> Result<()> {
@@ -535,12 +750,21 @@ impl ObjectStore for ScopedObjectStore {
                 mode: object_store::CopyMode::Create,
                 extensions: opts.extensions,
             };
-            match self.inner.copy_opts(from, to, copy).await {
+            match self
+                .scope
+                .until_fenced(self.single.copy_opts(from, to, copy))
+                .await
+            {
                 Err(error) => mutation.finish(Err(error)),
                 Ok(()) => {
+                    if self.scope.is_fenced() {
+                        // The copy landed, so this is no refusal; the source
+                        // delete is never sent.
+                        return mutation.finish(Err(fenced_in_flight_error()));
+                    }
                     let mutation =
                         mutation.with_request(Request::new("rename source delete", from, false))?;
-                    mutation.finish(self.inner.delete(from).await)
+                    mutation.finish(self.scope.until_fenced(self.single.delete(from)).await)
                 }
             }
         } else {
@@ -551,8 +775,13 @@ impl ObjectStore for ScopedObjectStore {
                 // cannot establish settlement of a mutable source removal.
                 request.class = KeyClass::Mutable;
             }
+            let client = Arc::clone(self.client(&request));
             let mutation = self.scope.begin(request)?;
-            mutation.finish(self.inner.rename_opts(from, to, opts).await)
+            mutation.finish(
+                self.scope
+                    .until_fenced(client.rename_opts(from, to, opts))
+                    .await,
+            )
         }
     }
 }
@@ -587,7 +816,8 @@ impl MultipartUpload for ScopedUpload {
             Err(error) => return Box::pin(async move { Err(error) }),
         };
         let part = self.inner.put_part(payload);
-        Box::pin(async move { mutation.finish(part.await) })
+        let scope = self.scope.clone();
+        Box::pin(async move { mutation.finish(scope.until_fenced(part).await) })
     }
 
     async fn complete(&mut self) -> Result<PutResult> {
@@ -597,7 +827,7 @@ impl MultipartUpload for ScopedUpload {
         let mutation = self
             .scope
             .begin_child(self.child("multipart complete"), false)?;
-        let result = mutation.finish(self.inner.complete().await);
+        let result = mutation.finish(self.scope.until_fenced(self.inner.complete()).await);
         if result.is_ok() {
             self.lifetime.take().unwrap().settle();
         }
@@ -611,7 +841,7 @@ impl MultipartUpload for ScopedUpload {
         let mutation = self
             .scope
             .begin_child(self.child("multipart abort"), true)?;
-        let result = mutation.finish(self.inner.abort().await);
+        let result = mutation.finish(self.scope.until_fenced(self.inner.abort()).await);
         if result.is_ok() {
             self.lifetime.take().unwrap().settle();
         }
@@ -870,17 +1100,219 @@ mod tests {
             scope.wait_idle().await;
             assert!(
                 scope.is_uncertain(),
-                "lost {point:?} acknowledgement must poison"
+                "lost {point:?} acknowledgement must leave its key unsettled"
             );
-            // A higher layer cannot turn its retry into apparent success.
+            // A higher layer cannot turn its retry into apparent success: a
+            // later request to the same key is refused before it is sent.
+            let key = Path::from(if point == Point::Delete {
+                "source"
+            } else {
+                "target"
+            });
+            let before = store.get(&key).await.is_ok();
+            let refused = store.put(&key, "retried".into()).await.unwrap_err();
             assert!(
-                store
-                    .put(&Path::from("later"), "later".into())
-                    .await
-                    .is_err()
+                refused.to_string().contains("unknown outcome"),
+                "{point:?}: {refused}"
             );
-            assert!(store.get(&Path::from("later")).await.is_err());
+            assert_eq!(
+                store.get(&key).await.is_ok(),
+                before,
+                "{point:?}: the refused retry wrote nothing"
+            );
         }
+    }
+
+    /// An unsettled mutable key refuses later requests to itself, including
+    /// a recursive delete over it, and nothing else: other mutable keys,
+    /// immutable keys and reads stay admitted. A clean release still refuses.
+    #[tokio::test]
+    async fn an_unsettled_key_refuses_only_itself_issue_1067() {
+        let (scope, store, _) = fixture(Point::Delete, true).await;
+        let tag = Path::from("g/__manifest/_refs/tags/t.json");
+        store.put(&tag, "tag".into()).await.unwrap();
+        assert!(
+            store.delete(&tag).await.is_err(),
+            "the delete's answer is lost"
+        );
+        assert!(scope.is_uncertain());
+        assert_eq!(scope.unsettled_keys(), 1);
+
+        let refused = store.put(&tag, "recreated".into()).await.unwrap_err();
+        assert!(refused.to_string().contains("unknown outcome"), "{refused}");
+        let deleted = store
+            .delete_stream(futures::stream::iter(vec![Ok(tag.clone())]).boxed())
+            .next()
+            .await
+            .unwrap();
+        assert!(deleted.is_err(), "a delete of the same key is refused too");
+
+        let other = Path::from("g/__manifest/_refs/tags/u.json");
+        store
+            .put(&other, "another key".into())
+            .await
+            .expect("another mutable key is admitted");
+        store
+            .put(&Path::from("g/node_Person/data/f.lance"), "data".into())
+            .await
+            .expect("an immutable key is admitted");
+        assert!(store.get(&other).await.is_ok(), "reads continue");
+        scope.close();
+        scope.wait_idle().await;
+        assert!(scope.is_uncertain(), "a clean release still refuses");
+    }
+
+    /// Counts the requests one client of a store serves.
+    #[derive(Debug)]
+    struct Counted {
+        inner: Arc<InMemory>,
+        served: Arc<Mutex<Vec<String>>>,
+        name: &'static str,
+    }
+
+    impl fmt::Display for Counted {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.name)
+        }
+    }
+
+    impl Counted {
+        fn note(&self, op: &str, path: &Path) {
+            self.served
+                .lock()
+                .unwrap()
+                .push(format!("{} {op} {path}", self.name));
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for Counted {
+        async fn put_opts(&self, p: &Path, d: PutPayload, o: PutOptions) -> Result<PutResult> {
+            self.note("put", p);
+            self.inner.put_opts(p, d, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            p: &Path,
+            o: PutMultipartOptions,
+        ) -> Result<Box<dyn MultipartUpload>> {
+            self.note("multipart", p);
+            self.inner.put_multipart_opts(p, o).await
+        }
+        async fn get_opts(&self, p: &Path, o: GetOptions) -> Result<GetResult> {
+            self.note("get", p);
+            self.inner.get_opts(p, o).await
+        }
+        fn delete_stream(
+            &self,
+            paths: BoxStream<'static, Result<Path>>,
+        ) -> BoxStream<'static, Result<Path>> {
+            let served = Arc::clone(&self.served);
+            let name = self.name;
+            self.inner.delete_stream(
+                paths
+                    .inspect(move |path| {
+                        if let Ok(path) = path {
+                            served.lock().unwrap().push(format!("{name} delete {path}"));
+                        }
+                    })
+                    .boxed(),
+            )
+        }
+        fn list(&self, p: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+            self.inner.list(p)
+        }
+        async fn list_with_delimiter(&self, p: Option<&Path>) -> Result<ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy_opts(&self, from: &Path, to: &Path, o: CopyOptions) -> Result<()> {
+            self.note("copy", to);
+            self.inner.copy_opts(from, to, o).await
+        }
+    }
+
+    /// Reads and fresh immutable writes go to the retrying client; a
+    /// conditional request and every request to a mutable key go to the
+    /// single-attempt client, whose every attempt the owner sees.
+    #[tokio::test]
+    async fn requests_route_by_class_issue_1067() {
+        let inner = Arc::new(InMemory::new());
+        let served = Arc::new(Mutex::new(Vec::new()));
+        let client = |name| {
+            Arc::new(Counted {
+                inner: Arc::clone(&inner),
+                served: Arc::clone(&served),
+                name,
+            }) as Arc<dyn ObjectStore>
+        };
+        let scope = StorageIoScope::new();
+        let store = scope.wrap_object_stores(client("retrying"), client("single"));
+        let data = Path::from("g/node_Person/data/f.lance");
+        let txn = Path::from("g/node_Person/_transactions/1-0c41.txn");
+        let manifest = Path::from("g/__manifest/_versions/2.manifest");
+        let lock = Path::from("g/__cluster/lock.json");
+        let tag = Path::from("g/__manifest/_refs/tags/t.json");
+        store.put(&data, "data".into()).await.unwrap();
+        store.put(&txn, "txn".into()).await.unwrap();
+        store
+            .put_opts(
+                &manifest,
+                "manifest".into(),
+                object_store::PutMode::Create.into(),
+            )
+            .await
+            .unwrap();
+        store.put(&lock, "lock".into()).await.unwrap();
+        store.put(&tag, "tag".into()).await.unwrap();
+        store.get(&lock).await.unwrap();
+        store.delete(&txn).await.unwrap();
+        store.delete(&tag).await.unwrap();
+        assert_eq!(
+            *served.lock().unwrap(),
+            [
+                "retrying put g/node_Person/data/f.lance",
+                "retrying put g/node_Person/_transactions/1-0c41.txn",
+                "single put g/__manifest/_versions/2.manifest",
+                "single put g/__cluster/lock.json",
+                "single put g/__manifest/_refs/tags/t.json",
+                "retrying get g/__cluster/lock.json",
+                "retrying delete g/node_Person/_transactions/1-0c41.txn",
+                "single delete g/__manifest/_refs/tags/t.json",
+            ]
+        );
+    }
+
+    /// The scope remembers a bounded number of unsettled keys. Past the bound
+    /// it refuses every mutation rather than grow, and reads continue.
+    #[tokio::test]
+    async fn unsettled_keys_are_bounded_issue_1067() {
+        let (scope, store, _) = fixture(Point::Put, true).await;
+        for n in 0..MAX_UNSETTLED_KEYS {
+            let key = Path::from(format!("g/__cluster/key-{n}.json"));
+            assert!(store.put(&key, "x".into()).await.is_err());
+        }
+        assert_eq!(scope.unsettled_keys(), MAX_UNSETTLED_KEYS);
+        let fresh = Path::from("g/node_Person/data/fresh.lance");
+        let admitted = store.put(&fresh, "x".into()).await.unwrap_err();
+        assert!(
+            admitted.to_string().contains("acknowledgement lost"),
+            "below the bound other keys are admitted: {admitted}"
+        );
+        assert!(
+            store
+                .put(&Path::from("g/__cluster/one-more.json"), "x".into())
+                .await
+                .is_err()
+        );
+        let refused = store
+            .put(&Path::from("g/node_Person/data/next.lance"), "x".into())
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("unknown outcomes"),
+            "past the bound every mutation is refused: {refused}"
+        );
+        assert!(store.get(&fresh).await.is_ok(), "reads continue");
     }
 
     /// Lance's table layout, anchored at the tail of a key: the files it
@@ -1074,9 +1506,19 @@ mod tests {
             scope.wait_idle().await;
             assert!(
                 scope.is_uncertain(),
-                "a lost acknowledgement on {key} poisons"
+                "a lost acknowledgement on {key} leaves it unsettled"
             );
             let refused = store
+                .put(&Path::from(key), "again".into())
+                .await
+                .unwrap_err();
+            assert!(
+                refused.to_string().contains("unknown outcome"),
+                "{key}: a later request to the unsettled key is refused: {refused}"
+            );
+            // The fixture loses every put's acknowledgement; what matters is
+            // that another key is still admitted rather than refused.
+            let admitted = store
                 .put(
                     &Path::from("g/node_Person/data/later.lance"),
                     "later".into(),
@@ -1084,8 +1526,8 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(
-                refused.to_string().contains("uncertain outcome"),
-                "{key}: the poisoned scope admits nothing: {refused}"
+                admitted.to_string().contains("acknowledgement lost"),
+                "{key}: other keys stay admitted: {admitted}"
             );
         }
         let (scope, store, _) = fixture(Point::Delete, true).await;
@@ -1571,6 +2013,85 @@ mod tests {
             scope.wait_idle().await;
             assert!(!scope.is_uncertain(), "a cancelled immutable put settles");
         }
+    }
+
+    /// A fence cancels every admitted request still running, so its client
+    /// sends nothing more, at every mutation boundary. The cancelled request
+    /// may already have been sent, so its error is not the scope's definite
+    /// refusal. Everything later is refused, including the parts, completion
+    /// and abort of an upload admitted before the fence; reads continue.
+    #[tokio::test]
+    async fn a_fence_stops_admitted_requests_and_later_parts_issue_1067() {
+        for point in POINTS {
+            let (scope, store, fault) = fixture(point, false).await;
+            let task = tokio::spawn(mutate(store, point));
+            tokio::time::timeout(Duration::from_secs(2), fault.entered.notified())
+                .await
+                .unwrap();
+            scope.fence();
+            let error = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap_or_else(|_| panic!("{point:?}: a fence ends an admitted request"))
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    object_store::Error::Generic { store, .. } if store == FENCED_REQUEST_STORE_NAME
+                ),
+                "{point:?}: {error}"
+            );
+            scope.wait_idle().await;
+            assert!(scope.is_fenced());
+        }
+
+        let scope = StorageIoScope::new();
+        let inner = Arc::new(InMemory::new());
+        inner
+            .put(&Path::from("source"), "original".into())
+            .await
+            .unwrap();
+        let store = scope.wrap_object_store(inner);
+        let path = Path::from("g/node_Person/data/3f2c4d9e.lance");
+        let mut upload = store.put_multipart(&path).await.unwrap();
+        upload.put_part("data".into()).await.unwrap();
+        scope.fence();
+        let refusals = [
+            upload.put_part("more".into()).await.unwrap_err(),
+            upload.complete().await.map(|_| ()).unwrap_err(),
+            upload.abort().await.unwrap_err(),
+            store
+                .put(&path, "data".into())
+                .await
+                .map(|_| ())
+                .unwrap_err(),
+        ];
+        for refused in refusals {
+            assert!(
+                matches!(
+                    refused,
+                    object_store::Error::Generic { store, .. } if store == OWNED_STORE_NAME
+                ),
+                "nothing is sent after a fence: {refused}"
+            );
+        }
+        drop(upload);
+        scope.wait_idle().await;
+        assert!(
+            store.get(&path).await.is_err(),
+            "the upload never completed"
+        );
+        assert_eq!(
+            store
+                .get(&Path::from("source"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            "original",
+            "reads continue"
+        );
     }
 
     /// A delete the store answers "not found" is definite on any key, and a

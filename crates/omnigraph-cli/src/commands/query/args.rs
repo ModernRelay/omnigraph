@@ -7,9 +7,32 @@ use clap::Args;
 use crate::read_format::ReadOutputFormat;
 
 #[derive(Debug, Args)]
+pub(crate) struct CatalogueArgs {
+    /// GQ source file to query against the local engine catalogue.
+    #[arg(
+        long,
+        conflicts_with = "query_string",
+        required_unless_present = "query_string"
+    )]
+    pub(crate) query: Option<PathBuf>,
+    /// Inline GQ source to query against the local engine catalogue.
+    #[arg(
+        short = 'e',
+        long = "query-string",
+        value_name = "GQ",
+        conflicts_with = "query",
+        required_unless_present = "query"
+    )]
+    pub(crate) query_string: Option<String>,
+    /// Print the read result as JSON.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
 pub(crate) struct QueryArgs {
     /// Query name. With no `--query`/`-e`, the stored query to invoke from
-    /// the catalog (served — addressed via --server/--profile). With
+    /// the catalog (served — addressed via --target). With
     /// `--query`/`-e`, selects which query in that ad-hoc source to run.
     pub(crate) name: Option<String>,
     /// Ad-hoc query file (a `.gq` you're authoring / break-glass), one branch read statement
@@ -47,7 +70,7 @@ pub(crate) struct QueryArgs {
 #[derive(Debug, Args)]
 pub(crate) struct MutateArgs {
     /// Query name. With no `--query`/`-e`, the stored mutation to invoke
-    /// from the catalog (served — addressed via --server/--profile). With
+    /// from the catalog (served — addressed via --target). With
     /// `--query`/`-e`, selects which query in that ad-hoc source to run.
     pub(crate) name: Option<String>,
     /// Ad-hoc mutation file (a `.gq` you're authoring / break-glass), or
@@ -86,8 +109,6 @@ pub(crate) struct MutateArgs {
 pub(crate) struct AliasArgs {
     /// Alias name (a key under `aliases:` in ~/.omnigraph/config.yaml).
     pub(crate) name: String,
-    /// Positional args bound to the alias's declared `args` params, in order.
-    pub(crate) args: Vec<String>,
     #[command(flatten)]
     pub(crate) params: ParamsArgs,
     #[arg(long, conflicts_with = "json")]

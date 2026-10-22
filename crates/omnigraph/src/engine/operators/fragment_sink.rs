@@ -11,7 +11,9 @@ use async_trait::async_trait;
 use datafusion::common::Result as DfResult;
 use datafusion::datasource::sink::DataSink;
 use datafusion::execution::TaskContext;
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, SendableRecordBatchStream};
 use futures::StreamExt;
 
@@ -88,10 +90,15 @@ impl DataSink for LanceFragmentSink {
         let mut work = WorkMemory::new(Arc::clone(context), "LanceFragmentSink")?;
         work.set_metrics(self.metrics.clone());
         work.metric(STAGED_ROWS, 0);
+        MetricBuilder::new(&self.metrics)
+            .start_timestamp(0)
+            .record();
+        let baseline = BaselineMetrics::new(&self.metrics, 0);
         let db = &self.write.db;
         let txn = &self.write.txn;
         let branch = txn.branch.as_deref();
-        let mut staging = MutationStaging::new(self.write.write_budget);
+        let mut staging = MutationStaging::new(self.write.write_budget)
+            .with_overwrite_writers(self.write.writers);
         let opened = db
             .open_for_mutation_on_branch(
                 branch,
@@ -116,6 +123,7 @@ impl DataSink for LanceFragmentSink {
         let mut rows: usize = 0;
         while let Some(batch) = data.next().await {
             let batch = batch?;
+            let _timer = baseline.elapsed_compute().timer();
             let bytes = write_batch_bytes(&batch).map_err(external)?.rows;
             if bytes > self.max_input_bytes {
                 return Err(external(OmniError::resource_limit(
@@ -130,16 +138,21 @@ impl DataSink for LanceFragmentSink {
                 .append_batch(&self.table, batch.schema(), PendingMode::Overwrite, batch)
                 .map_err(external)?;
         }
-        let staged = staging
-            .stage_all_with_concurrency(db, branch, 1)
-            .await
-            .map_err(external)?;
+        let mut staging = Box::pin(staging.stage_all_with_concurrency(db, branch, 1));
+        let staged = futures::future::poll_fn(|cx| {
+            let _timer = baseline.elapsed_compute().timer();
+            staging.as_mut().poll(cx)
+        })
+        .await
+        .map_err(external)?;
         *self
             .write
             .staged
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(staged);
         work.metric(STAGED_ROWS, rows);
+        baseline.record_output(rows);
+        baseline.done();
         u64::try_from(rows).map_err(|_| {
             external(OmniError::manifest(
                 "staged row count exceeds u64".to_string(),
@@ -226,6 +239,7 @@ mod tests {
             db: Arc::clone(db),
             txn,
             write_budget: WriteBudget::default(),
+            writers: 2,
             staged: Arc::clone(&staged),
         };
         let sink =

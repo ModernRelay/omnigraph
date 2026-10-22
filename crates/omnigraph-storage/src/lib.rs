@@ -17,8 +17,11 @@ use url::Url;
 
 use thiserror::Error;
 
+mod binding;
+pub use binding::{CapturedStorageBinding, StorageDestination, storage_handle_for_binding};
+
 mod scoped;
-pub use scoped::StorageIoScope;
+pub use scoped::{OWNED_STORE_NAME, StorageIoScope};
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
@@ -1260,6 +1263,19 @@ impl ObjectStorageAdapter {
         self
     }
 
+    /// Scope a remote adapter over two clients of one store: `retrying`
+    /// serves reads with bounded retries, and the single-attempt client this
+    /// adapter was built with serves its conditional and mutable writes.
+    fn with_scope_and_retrying(
+        mut self,
+        scope: StorageIoScope,
+        retrying: Arc<dyn ObjectStore>,
+    ) -> Self {
+        self.store = scope.wrap_object_stores(retrying, self.store);
+        self.scope = Some(scope);
+        self
+    }
+
     /// S3 backend scoped to the bucket named in `root_uri`. Credentials and
     /// endpoint come from the standard `AWS_*` environment variables (the
     /// same ones Lance reads for its dataset stores).
@@ -1275,9 +1291,6 @@ impl ObjectStorageAdapter {
     fn s3_from_root_uri_with_scope(root_uri: &str, scope: Option<StorageIoScope>) -> Result<Self> {
         let location = parse_s3_uri(root_uri)?;
         let mut builder = AmazonS3Builder::from_env().with_bucket_name(&location.bucket);
-        if scope.is_some() {
-            builder = builder.with_retry(single_attempt_retry_config());
-        }
 
         if let Some(endpoint) = env::var("AWS_ENDPOINT_URL_S3")
             .ok()
@@ -1293,6 +1306,27 @@ impl ObjectStorageAdapter {
             builder = builder.with_virtual_hosted_style_request(false);
         }
 
+        let build = |builder: AmazonS3Builder| {
+            builder.build().map_err(|err| {
+                let kind = classify_object_store_error(&err);
+                StorageError::backend(
+                    kind,
+                    format!(
+                        "failed to initialize s3 storage for '{}': {}",
+                        root_uri, err
+                    ),
+                )
+            })
+        };
+        let retrying = match scope {
+            Some(_) => Some(build(
+                builder.clone().with_retry(scoped_read_retry_config()),
+            )?),
+            None => None,
+        };
+        if scope.is_some() {
+            builder = builder.with_retry(single_attempt_retry_config());
+        }
         let store = builder.build().map_err(|err| {
             let kind = classify_object_store_error(&err);
             StorageError::backend(
@@ -1316,9 +1350,11 @@ impl ObjectStorageAdapter {
             #[cfg(test)]
             omit_write_etag: false,
         };
-        Ok(match scope {
-            Some(scope) => adapter.with_scope(scope),
-            None => adapter,
+        Ok(match (scope, retrying) {
+            (Some(scope), Some(retrying)) => {
+                adapter.with_scope_and_retrying(scope, Arc::new(retrying))
+            }
+            _ => adapter,
         })
     }
 
@@ -1357,6 +1393,9 @@ impl ObjectStorageAdapter {
         // CanonicalAzureRoot captured the backend selection.
         let mut builder = MicrosoftAzureBuilder::new();
         for (key, value) in &root.azure_options {
+            if matches!(key.as_str(), "client_max_retries" | "client_retry_timeout") {
+                continue;
+            }
             let key = AzureConfigKey::from_str(key).map_err(|_| {
                 StorageError::backend(
                     StorageFailureKind::Configuration,
@@ -1370,8 +1409,35 @@ impl ObjectStorageAdapter {
             .with_container_name(root.container())
             .with_endpoint(root.storage_endpoint.clone())
             .with_use_emulator(false);
+        let retrying = match scope {
+            Some(_) => Some(
+                builder
+                    .clone()
+                    .with_retry(scoped_read_retry_config())
+                    .build()
+                    .map_err(|_| {
+                        StorageError::backend(
+                            StorageFailureKind::Configuration,
+                            format!(
+                                "failed to initialize Azure storage for '{}'; verify the captured Azure configuration",
+                                root.canonical_uri()
+                            ),
+                        )
+                    })?,
+            ),
+            None => None,
+        };
         if scope.is_some() {
             builder = builder.with_retry(single_attempt_retry_config());
+        } else if root.azure_options.contains_key("client_max_retries") {
+            builder = builder.with_retry(binding::captured_retry_config(
+                root.azure_options
+                    .get("client_max_retries")
+                    .map(String::as_str),
+                root.azure_options
+                    .get("client_retry_timeout")
+                    .map(String::as_str),
+            )?);
         }
         let store = builder.build().map_err(|_| {
             StorageError::backend(
@@ -1394,9 +1460,11 @@ impl ObjectStorageAdapter {
             #[cfg(test)]
             omit_write_etag: false,
         };
-        Ok(match scope {
-            Some(scope) => adapter.with_scope(scope),
-            None => adapter,
+        Ok(match (scope, retrying) {
+            (Some(scope), Some(retrying)) => {
+                adapter.with_scope_and_retrying(scope, Arc::new(retrying))
+            }
+            _ => adapter,
         })
     }
 
@@ -2362,6 +2430,16 @@ pub fn storage_handle_for_uri_scoped(uri: &str, scope: StorageIoScope) -> Result
 fn single_attempt_retry_config() -> object_store::RetryConfig {
     object_store::RetryConfig {
         max_retries: 0,
+        ..Default::default()
+    }
+}
+
+/// A scoped adapter's reads retry the way Lance's own clients do: three
+/// retries within three minutes. Its writes keep the single attempt above.
+fn scoped_read_retry_config() -> object_store::RetryConfig {
+    object_store::RetryConfig {
+        max_retries: 3,
+        retry_timeout: std::time::Duration::from_secs(180),
         ..Default::default()
     }
 }

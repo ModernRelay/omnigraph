@@ -35,6 +35,7 @@ export budget and must not share a binary with the other export tests.
 | `omnigraph-engine` | `crates/omnigraph/tests/` plus focused in-source tests | `tests/helpers/` and `tests/fixtures/` |
 | `omnigraph-policy` | In-source Cedar policy parsing and evaluation tests | Module-local fixtures |
 | `omnigraph-cluster` | In-source lifecycle, deployment and admission tests; `tests/failpoints.rs`; `tests/identity_recovery.rs`; `tests/s3_cluster.rs` | Module-local fixtures |
+| `omnigraph-mcp` | In-source protocol, settings, catalog and bounded-result tests | Module-local fixtures |
 | `omnigraph-server` | `crates/omnigraph-server/tests/` | `tests/support/mod.rs` |
 | `omnigraph-cli` | In-source application, runtime, parsing, output and transport tests plus `crates/omnigraph-cli/tests/` | `tests/support/mod.rs` |
 | `omnigraph-skill` | In-source `src/lib.rs`: the embedded table is sorted and `file` finds every path. The CLI owns the rest. In-source `src/skill.rs` holds the skill's command index (`references/commands.md`) and condensed reference (`SKILL.md`) to the clap tree and its storage-format line to `omnigraph version`; `integration/cli_schema_config.rs` owns `skill export` and `skill show`, including byte identity with `skills/omnigraph`; `scripts/check-docs.py` holds `metadata.version` and the declared HTTP contract to the CLI | None |
@@ -164,6 +165,21 @@ backup and read the candidate-written root with the predecessor before claiming
 a qualified rollback. This is independent of graph-stamp conversion; unchanged
 V2_2 files and format 16 do not establish reader compatibility on their own.
 
+The core `captured_provider` test runs isolated subprocesses because native
+provider environment snapshots are process-wide. It exercises S3 and Azure
+control-object and native Lance reads/conditional creates against fake HTTP
+endpoints, destination aliases and ambient-option drift, including cached Azure
+options and rotating credential providers. Storage's `binding` unit tests own
+option classification and fixed defaults; these are not live-cloud qualification.
+The engine's `bound_storage.rs` (S3-configured, run by the RustFS job; its own
+binary because it re-executes itself) carries a bound handle's whole workload
+past that capture: a child whose ambient endpoint variables name a recording
+decoy, with unsigned requests and disabled conditional puts, runs writes, the
+`@card` live re-read, a racing publish, a branch create, merge and delete,
+historical CSR and commit-addressed reads, the change feed, export and
+maintenance, and the decoy must see no request. The in-source
+`changes::enumerate` test owns the change feed's fresh re-prove session.
+
 ## Server and CLI ownership
 
 CLI `system_remote` runs the actual CLI, server and fault proxy in the ordinary
@@ -180,7 +196,9 @@ existing parity matrix. Query semantics remain in GQT, not duplicated in these
 CLI boundary tests.
 Schema-family application tests verify that failed result delivery preserves an
 applied schema and its actor with one publication, and that an undeliverable
-target line precedes writable open. Init output failure leaves a readable graph;
+target line precedes writable open. The same application owner injects write and
+flush failures into mutation-scope diagnostics; `cli_data` checks ordinary and GQ
+branch scopes while keeping JSON stdout parseable. Init output failure leaves a readable graph;
 lint report failures and subsequent invocations remain reusable. Extend the
 existing `cli_schema_config`, `cli_cluster` and `cli_data` owners for addressing,
 cluster ownership and offline source-read ordering.
@@ -200,13 +218,26 @@ filtering and wrong-plane refusal before configuration or HTTP access. The exist
 `system_remote` deployment matrix owns real server completion after delivery loss;
 these CLI changes require no additional query-semantic GQT cases.
 
-Local command tests in `commands/local` own supplied login input, credential
-changes after report failure, captured profile configuration, and completed skill
-or embedding files after output loss. `skill.rs` owns exact file delivery and its
-existing broken-pipe exception. Extend `cli_schema_config` for version and skill
-process behavior and `cli_data` for profile/embedding output. Its existing
-discovery-swap fixture also replaces the credential file, requiring registry
-probing and the subsequent command to retain the original token. Application and
+Operator schema/routing owners cover whole-document validity, independent
+profile/target defaults, single-identity managed profiles, standalone auth
+selection and immutable target-to-profile bindings.
+Credential-source owners cover bounded stdin/env/file/exec acquisition, absence
+of fallback, helper failures and secret redaction. Target/application tests own
+static set/remove, no-network/no-helper/noninteractive status and pipe-only export
+before secret acquisition. Managed authentication tests own independent profile
+sessions, principal/session collision refusal, refresh coordination and logout
+cache clearing; lifecycle fixtures retain original-identity recovery checks.
+Transport owners cover prefix boundaries, no redirects, explicit proxy selection,
+CA capture and unsupported trust combinations. Extend the shared served-client
+fixtures across managed and standalone graph commands instead of adding an
+allowlist-specific test setup.
+
+`commands/local` retains version, skill and embedding output ownership.
+`skill.rs` owns exact file delivery and its broken-pipe exception; extend
+`cli_schema_config` for process behavior. Credential replacement during discovery
+must not change the token used by an already captured invocation.
+
+Application and
 managed-output tests own completion, partial-write and flush failures; managed
 authentication/lifecycle fixtures own the pre-dispatch diagnostic gates and
 accepted-identity recovery output when stderr fails. Application tests keep
@@ -216,22 +247,38 @@ barrier test proves reported failures do not wait for blocked runtime work;
 `cli_schema_config` owns help/version/refusal statuses with closed streams.
 These are CLI boundary contracts; query-semantic GQT cases remain unchanged.
 
+The operator-config owners also cover read-only YAML and parent directories with
+writable private credential state, preservation/conflict checks when relocating
+legacy state, and explicit profile creation versus default-profile login.
+The existing client and managed-auth fixtures delay discovery or a later request
+past credential expiry and assert that no authenticated operation is dispatched.
+Standalone flat-auth fixtures retain distinct-target identity isolation, including
+two targets sharing an endpoint; no auth-name fallback remains.
+
 The `system_remote` deployment matrix holds a real
 admitted request through drain, disconnects or times out the caller before
 durable acceptance, and loses replies after acceptance. Exact-ID observation
 must finish with one ledger result, one schema publication and the same server
-PID; neither apply nor recovery polling may resubmit. The `unix://` server
-transport goes through `tests/support/unix_gateway.rs`, a byte-for-byte
-Unix-socket relay to the server's TCP address: `system_remote` runs the CLI's
-data verbs through it, and the in-source `client.rs` tests own the request
-target, discovery and refusals over the socket.
+PID; neither apply nor recovery polling may resubmit. The old Unix-gateway
+fixture does not qualify a version-1 operator transport: Unix socket targets are
+unsupported. Keep lower-level transport coverage distinct from public resolver
+capability/refusal tests.
 
 Server suites are organized by public route: `auth_policy`, `data_routes`, `schema_routes`, `stored_queries`, `multi_graph`, `boot_settings`, object-store coverage in `s3`, and the generated contract in `openapi`.
+
+`omnigraph-mcp` owns protocol, catalog and formatting tests. Server
+`integration/mcp.rs` keeps the real HTTP fixture for authentication, policy,
+tool/route and error-disposition parity, limits and response lifetimes. The
+server adapter's in-source tests own canonical protocol-refusal projection,
+including lost and oversized write results; `boot_settings` covers MCP across
+shutdown and restart. Extend these owners instead of adding a second server
+fixture to the MCP crate.
 
 Per-graph serving transitions extend these owners: in-source `registry` tests
 own capture/close ordering, drain-only deployment deadlines, affected activation
 scope, schema identity and candidate bounds;
-`operations`, `ingress` and `mcp` own detached execution and output lifetimes.
+`operations`, `ingress` and the server's MCP adapter own detached execution and
+output lifetimes.
 `stored_queries` parks a request before engine capture, `data_routes` retains
 disconnected writes and stream bytes, and `boot_settings`/`mcp` check authorized
 availability. The same owners cover coherent schema/query batch activation; these assertions
@@ -249,8 +296,10 @@ turnover, exercising bounded re-observation for aggregate and exact status.
 CLI `cli_cluster` owns submit-once polling, transient 429/503 and truncated-body
 retries, malformed-receipt refusal, terminal outcomes and caller timeout without
 replay. Its managed fixtures cover status/history scope and filters, explicit
-`--managed` selection, and wrong-mode refusals before context or external access.
-Direct apply must ignore both valid and malformed managed folder context.
+managed target selection, and unsupported target-kind refusals before credentials
+or external access. Default target selection refuses applicable retired folder
+routing; explicit direct targets never route through it. Legacy lifecycle custody
+remains guarded even with explicit selection.
 Managed deployment fixtures also exercise immutable preview/delivery bodies,
 original-ID recovery, current authorization refusals, bounded waiting through
 uncertain delivery/archival, and queued-only cancellation. They do not replace
@@ -570,6 +619,15 @@ Query behavior has two test tiers. A `.gqt` case owns what is visible in rows, c
 `crates/omnigraph/tests/integration/engine_v2_plan_replay.rs` owns the replay, including refusal of altered result schemas and missing, duplicate, unused or altered node-object declarations. Each test gathers one query through `Session::query_inspected`, serializes the run's replay envelope (`Executed::replay_envelope`: the query's source and name, the accepted scope, the schema digest, the `BoundPlan` through the planner's mirrors and an exact-fragment member's derivation), reads it back (the plan must read back equal), and executes it twice through `Session::replay_bound_plan`, a door that recompiles the named query against the target's catalog, binds it to the plan's own values, accepts the plan again and takes no session setting. Each replay must return the run's rows, record the run's search decisions (gate verdicts and probe attempts) and repeat its trace: `id`, `operator` and `status` per row, `rung` and `ran` per attempt, and `actual_rows` wherever both attempts are `drained`. `drained` says the consumer pulled the operator's stream to its end; below an operator that stopped early (a `Limit`, a `Sort` with a fetch), a producer's count is a lower bound that depends on how far ahead its channel ran, and is not compared. One query per node kind that has a switch or a ladder: a `HashJoin` over an `Expand` (both switches on the report), a `nearest` ladder with an edge (two rungs), an `rrf` fusion, a `Limit` of zero (everything below skipped), a bulk `AntiJoin`, an `Aggregate`. Three more tests own the pins: after an edge write the replay of a traversal is refused, after an insert the replay of an unfiltered count is refused, and a write to a table the plan never read leaves the replay accepted, because `engine::plan_pins_snapshot` compares the plan's `Assumptions.datasets` (path, Lance branch and version per table key the planner read, or its absence) against the snapshot; a pin mismatch and a changed schema are conflicts. The envelope's own outcomes are tested there too: another envelope version asks for the query again, an exact-fragment member replays only with its unedited derivation, an edited plan that drops a predicate is invalid evidence, and an envelope claiming full full-text coverage of a partially indexed property is refused against the pinned snapshot.
 
 The scrubbed side is `crates/omnigraph/tests/engine_v2_scrubbed_replay.rs` (process environment, which no case can express): a grep that fails on any `std::env` read under `crates/omnigraph/src/engine/` outside `plan_source.rs`, the one permitted reader of configuration, before planning; two replays that set an ambient value the plan did not capture (the task-local memory limit, `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER`) and require the captured one to win; and the replay of a plan gathered under one `ann_nprobes` in a session set to another. `Session::replay_bound_plan` takes no settings argument and sizes the pool from the plan's memory limit. The inventory sweep is one case per input class that a case can set two ways, `cases/v2/planner/input_*.gqt` (`engine`, `ann_nprobes`, index build state), each requiring equal rows or a plan line that differs, and the clock class is one of the replay plans of `integration/engine_v2_plan_replay.rs`; the `ran` line and the `nprobes` claim of `--- expect plan` are what a differing plan line is spelled with.
+
+GQT also owns the public ANN diagnostics contract: every inspected query checks
+metric types and names, attempt identities, scan/probe attribution and same-run
+profile preservation. Existing ranked-scan cases use `diagnostics present` to
+refuse silent metric loss, including one missing RRF arm; see the
+[GQT plan assertions](../../crates/omnigraph-gqt/README.md#plan-expectations).
+Rust retains controlled partition layouts and independent native-counter oracles
+in `search.rs`, plus synthetic missing/zero/unknown/maximum metric inputs and
+replay separation in `engine/search.rs` and `engine/report/tests.rs`.
 
 The `--- expect plan` of an inspected step reads the explain document of that same `Executed`, never a second planning run; its `ran` lines read the report of that run (`crates/omnigraph-gqt-core/src/report.rs` reads the rows). A parameter refusal, a settings error and a query that failed produce no `Executed` and keep their ordinary checks.
 

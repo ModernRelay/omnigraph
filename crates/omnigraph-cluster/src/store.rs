@@ -30,9 +30,16 @@ use crate::{
 #[derive(Debug, Clone)]
 pub(crate) struct ClusterStore {
     adapter: Arc<dyn StorageAdapter>,
+    /// The same root outside any owner's storage scope, with the backend's
+    /// own retries. The lock's lease writes through it: a heartbeat is a
+    /// fresh key whose late landing only keeps a successor waiting, so its
+    /// requests neither need the scope's accounting nor stop when the scope
+    /// closes for a release.
+    lease_adapter: Arc<dyn StorageAdapter>,
     /// Concrete backend evidence used by lock/authority factories. Unlike the
     /// public adapter trait, callers cannot implement this handle.
     storage: StorageHandle,
+    binding: Option<omnigraph_storage::CapturedStorageBinding>,
     /// Normalized storage-root URI, no trailing slash: `file:///abs/dir`
     /// (the default config-dir layout), `s3://bucket/prefix`, or
     /// `az://container/prefix`.
@@ -48,6 +55,23 @@ pub(crate) struct StateSnapshot {
     pub(crate) state: Option<ClusterState>,
     /// Content identity (`sha256:<hex>`) — the public CAS vocabulary.
     pub(crate) state_cas: Option<String>,
+}
+
+/// Canonical address equality never initializes an ambient provider client.
+pub(crate) fn canonical_storage_root(root: &str) -> Result<String, Diagnostic> {
+    let normalized = normalize_root_uri(root)
+        .map_err(|error| Diagnostic::error("storage_root_invalid", "storage", error.to_string()))?;
+    match storage_kind_for_uri(&normalized)
+        .map_err(|error| Diagnostic::error("storage_root_invalid", "storage", error.to_string()))?
+    {
+        StorageKind::Local => {
+            let path = std::fs::canonicalize(normalized.trim_start_matches("file://")).map_err(
+                |error| Diagnostic::error("storage_root_invalid", "storage", error.to_string()),
+            )?;
+            Ok(format!("file://{}", path.to_string_lossy()))
+        }
+        _ => Ok(normalized),
+    }
 }
 
 fn bootstrap_lock_error(error: StateLockError) -> Diagnostic {
@@ -70,7 +94,7 @@ fn decode_ledger(text: &str, upgrade: bool) -> Result<(ClusterState, bool), Diag
             return Err(Diagnostic::error(
                 "ledger_upgrade_required",
                 CLUSTER_STATE_FILE,
-                "completed receipts contain obsolete runtime fields; stop serving, writers and maintenance, establish prior I/O quiescence, then run `omnigraph --cluster <cluster-root> cluster upgrade-ledger --writers-stopped`",
+                "completed receipts contain obsolete runtime fields; stop serving, writers and maintenance, establish prior I/O quiescence, then run `omnigraph cluster upgrade-ledger --target <cluster-root> --writers-stopped`",
             ));
         }
         return Err(invalid(strict_error.to_string()));
@@ -166,10 +190,11 @@ impl ClusterStore {
         if self.kind() == StorageKind::Azure {
             return Ok(self);
         }
-        self.storage = omnigraph_storage::storage_handle_for_uri_scoped(&self.root, scope)
-            .map_err(|error| {
-                Diagnostic::error("storage_root_invalid", "storage", error.to_string())
-            })?;
+        self.storage = match &self.binding {
+            Some(binding) => omnigraph_storage::storage_handle_for_binding(binding, Some(scope)),
+            None => omnigraph_storage::storage_handle_for_uri_scoped(&self.root, scope),
+        }
+        .map_err(|error| Diagnostic::error("storage_root_invalid", "storage", error.to_string()))?;
         self.adapter = self.storage.adapter();
         Ok(self)
     }
@@ -189,8 +214,10 @@ impl ClusterStore {
             .expect("local storage adapter construction is infallible for file:// roots");
         let adapter = storage.adapter();
         Self {
+            lease_adapter: adapter.clone(),
             adapter,
             storage,
+            binding: None,
             root,
             display_root,
         }
@@ -228,9 +255,64 @@ impl ClusterStore {
         })?;
         Ok(Self {
             adapter: storage.adapter(),
+            lease_adapter: storage.adapter(),
             storage,
+            binding: None,
             root: normalized.clone(),
             display_root: normalized,
+        })
+    }
+
+    /// Keep provider authority captured by the CLI across every control and graph open.
+    pub(crate) fn for_storage_binding(
+        binding: &omnigraph_storage::CapturedStorageBinding,
+    ) -> Result<Self, Diagnostic> {
+        let storage =
+            omnigraph_storage::storage_handle_for_binding(binding, None).map_err(|error| {
+                Diagnostic::error("storage_root_invalid", "storage", error.to_string())
+            })?;
+        let normalized = normalize_root_uri(binding.uri()).map_err(|error| {
+            Diagnostic::error("storage_root_invalid", "storage", error.to_string())
+        })?;
+        let display_root = normalized.trim_start_matches("file://").to_owned();
+        let root = if binding.kind() == StorageKind::Local {
+            format!("file://{display_root}")
+        } else {
+            normalized
+        };
+        Ok(Self {
+            adapter: storage.adapter(),
+            lease_adapter: storage.adapter(),
+            storage,
+            binding: Some(binding.clone()),
+            root,
+            display_root,
+        })
+    }
+
+    pub(crate) fn storage_binding(&self) -> Option<&omnigraph_storage::CapturedStorageBinding> {
+        self.binding.as_ref()
+    }
+
+    pub(crate) fn graph_storage(
+        &self,
+        uri: &str,
+    ) -> Result<Arc<dyn omnigraph::storage::StorageAdapter>, Diagnostic> {
+        let result = if let Some(binding) = &self.binding {
+            let binding = binding.for_uri(uri).map_err(|error| {
+                Diagnostic::error("storage_root_invalid", "storage", error.to_string())
+            })?;
+            match self.io_scope() {
+                Some(scope) => omnigraph::storage::storage_for_binding_scoped(&binding, scope),
+                None => omnigraph::storage::storage_for_binding(&binding),
+            }
+        } else if let Some(scope) = self.io_scope() {
+            omnigraph::storage::storage_for_uri_scoped(uri, scope)
+        } else {
+            omnigraph::storage::storage_for_uri(uri)
+        };
+        result.map_err(|error| {
+            Diagnostic::error("storage_root_invalid", "storage", error.to_string())
         })
     }
 
@@ -240,6 +322,7 @@ impl ClusterStore {
 
     #[cfg(test)]
     pub(crate) fn with_bootstrap_test_adapter(mut self, adapter: Arc<dyn StorageAdapter>) -> Self {
+        self.lease_adapter = adapter.clone();
         self.adapter = adapter;
         self
     }
@@ -320,6 +403,7 @@ impl ClusterStore {
     ) -> Result<StateLockGuard, Diagnostic> {
         crate::state_lock::claim_bootstrap_lock(
             self.adapter.clone(),
+            self.lease_adapter.clone(),
             self.kind(),
             &self.uri(CLUSTER_LOCK_FILE),
             id,
@@ -1058,6 +1142,7 @@ impl ClusterStore {
         let lock_uri = self.uri(CLUSTER_LOCK_FILE);
         match acquire_state_lock(
             self.adapter.clone(),
+            self.lease_adapter.clone(),
             self.storage.kind(),
             &lock_uri,
             operation,
@@ -1090,6 +1175,16 @@ impl ClusterStore {
         }
     }
 
+    /// Best-effort removal of a stopped lease's beats before its release.
+    pub(crate) async fn remove_lease_dir(&self, dir: &str) {
+        // The error and the directory name storage paths, which logs never
+        // carry. Heartbeats left under a released lock's id are inert: no
+        // successor watches an id that no longer holds the lock.
+        if self.lease_adapter.delete_prefix(dir).await.is_err() {
+            tracing::warn!("could not remove a released lease's heartbeats");
+        }
+    }
+
     pub(crate) async fn release_settled(&self, lock_id: &str) -> Result<(), Diagnostic> {
         // Permanently close graph/control adapters before the final lock write.
         // This private client can only execute the exact-owner release below;
@@ -1109,15 +1204,20 @@ impl ClusterStore {
             None
         };
         let adapter = if let Some(scope) = &release_scope {
-            omnigraph_storage::storage_handle_for_uri_scoped(&self.root, scope.clone())
-                .map_err(|error| {
-                    Diagnostic::error(
-                        "cluster_admission_release_failed",
-                        CLUSTER_LOCK_FILE,
-                        error.to_string(),
-                    )
-                })?
-                .adapter()
+            match &self.binding {
+                Some(binding) => {
+                    omnigraph_storage::storage_handle_for_binding(binding, Some(scope.clone()))
+                }
+                None => omnigraph_storage::storage_handle_for_uri_scoped(&self.root, scope.clone()),
+            }
+            .map_err(|error| {
+                Diagnostic::error(
+                    "cluster_admission_release_failed",
+                    CLUSTER_LOCK_FILE,
+                    error.to_string(),
+                )
+            })?
+            .adapter()
         } else {
             self.adapter.clone()
         };

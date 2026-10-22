@@ -493,6 +493,25 @@ producer-held chunks, queued buffers and consumer handoffs are all charged.
 failures; blocked CPU work also checks cooperative cancellation. This is a
 producer/stream bridge, not a parallel graph-partition scheduler.
 
+Whether an operator holds its input is one planner fact,
+`PhysicalNode::shape()` (`PipelineShape::Streaming` or `Breaker`), and the
+inputs a node drains whole before its streamed input runs are
+`PhysicalNode::collected_sides()`; explain's `pipelines`, the push executor
+and the engine read both. The engine makes the shape a consequence of
+construction (`engine/operators/shape.rs`): every operator holds one shape
+value and builds its output stream only through it. `Breaker` owns the
+materialization (`stream`: one batch sliced out after the body returns;
+`held`: a producer whose collect stage has no sender and whose emit stage has
+no input), `Streaming` drives the operator one input batch at a time
+(`map`: an inline adapter; `produce`: a producer calling the `Streamed`
+body's `open`, then `batch` per input batch, then `finish`, and executing the
+streamed input only after `open`, so a collected side or a filled runtime
+filter is in place first), and `Source` is a leaf's free producer. A join
+drains a side only through `CollectedSide`. The producer channel, the
+breaker's slicer and the poll counter are private to that module, so no
+operator declares an emission beside the stream it builds, and the lowering
+compares nothing but DataFusion's own `AggregateExec`.
+
 `QueryResources` tracks retained Arrow buffers by allocation identity. Child
 arrays and null buffers participate, and shared views or slices reuse one
 charge while any operator lease retains that allocation. This avoids charging
@@ -577,7 +596,7 @@ over a string query, whose embedding needs the embedding client, gets a
 `--- expect plan` compares it; case settings and query prefixes apply.
 A load statement's explain (`explain load csv …`) answers the same document
 under the same `explain_version`, its `datafusion` row saying the operators
-are lowered only at execution ([explain.md](../user/queries/explain.md#explaining-a-load-statement)).
+are lowered only at execution ([explain-load.md](../user/queries/explain-load.md)).
 Destination hydration uses the planned projection; edge-property attach
 retains its complete property projection.
 
@@ -736,14 +755,22 @@ absence); `Expand.versions` records every selected member's version, while the
 same fact printed for the reader.
 It is `pub` and `#[doc(hidden)]` for the replay tests
 ([testing.md](testing.md#plan-replay)): with the settings gone from the
-context, the memory limit on the plan and the snapshot pinned, rows and
-report are a function of the serialized bound plan and the snapshot, and a
-replay repeats the run's trace.
+context, the memory limit on the plan and the snapshot pinned, result rows,
+operator choices and adaptive search decisions are a function of the
+serialized bound plan and the snapshot, and a replay repeats those choices.
+Optional ANN diagnostics are observations of that run: elapsed timings and
+cache-dependent work can vary between replays and do not participate in
+plan decisions or deterministic trace comparisons.
 
 The report is also the `profile` surface
 ([explain.md](../user/queries/explain.md#profile)): `Executed::profile`
 writes each report row back as one row in the explain row schema, `tree`
 `profile`, `node` the plan node's kind, `detail` the row's own fields.
+Nearest scans additionally copy a bounded set of native counters and timers
+from the completed scan's execution summary into separate `ann_metrics`
+rows. Each row identifies its scan, overfetch rung and probe attempt; absent
+metrics stay absent. Timings are cumulative nanoseconds and may overlap,
+including across concurrent partitions. They are not additive query latency.
 
 The read engine's implementation is `Walk` in `engine/lower.rs`, with
 `Op = Arc<dyn ExecutionPlan>`. `sort_merge_join`, `hydrate_by_address`,

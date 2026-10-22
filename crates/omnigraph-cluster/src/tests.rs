@@ -727,9 +727,9 @@ fn overlap_diagnostic_paths(outcome: &LoadOutcome) -> Vec<String> {
         .collect()
 }
 
-/// A base over the cluster storage root would let any writer copy another
-/// graph's tables or the cluster ledger into a readable Blob cell. Every
-/// scope is refused at validation, before plan or apply can record it.
+/// A base over the destination would expose tables or the cluster ledger.
+/// Source-only validation cannot infer that destination from its directory;
+/// selected-root capture checks the actual destination before any effects.
 #[test]
 fn external_blob_config_rejects_bases_overlapping_storage_root() {
     let dir = fixture();
@@ -773,7 +773,29 @@ graphs:
     );
 
     let validated = validate_config_dir(dir.path());
-    assert!(!validated.ok, "{:?}", validated.diagnostics);
+    assert!(validated.ok, "{:?}", validated.diagnostics);
+    let selected = tempdir().unwrap();
+    let selected_capture =
+        config::capture_desired_at_root(dir.path(), selected.path().to_str().unwrap()).outcome;
+    assert!(
+        !has_errors(&selected_capture.diagnostics),
+        "{:?}",
+        selected_capture.diagnostics
+    );
+    // Offline validation must preserve the same allowed policies and digests
+    // that a safe destination accepts, rather than replacing them with Deny.
+    assert_eq!(
+        validated.resource_digests,
+        selected_capture.desired.unwrap().resource_digests
+    );
+    let colocated_capture =
+        config::capture_desired_at_root(dir.path(), dir.path().to_str().unwrap()).outcome;
+    assert_eq!(
+        overlap_diagnostic_paths(&colocated_capture),
+        overlap_diagnostic_paths(&outcome)
+    );
+    assert!(!dir.path().join(CLUSTER_STATE_FILE).exists());
+    assert!(!selected.path().join(CLUSTER_STATE_FILE).exists());
 
     // A declared object-store root is the one prefix every graph and the
     // ledger live under; only a sibling prefix is admitted. This is pure
@@ -806,6 +828,8 @@ graphs:
             "{base}: {:?}",
             outcome.diagnostics
         );
+        let validated = validate_config_dir(dir.path());
+        assert!(!validated.ok, "{base}: {:?}", validated.diagnostics);
         let desired = outcome.desired.unwrap();
         assert_eq!(
             desired.graphs[0].external_blob_policy,
@@ -1562,7 +1586,7 @@ async fn force_unlock_unsupported_lock_version_fails_and_preserves_lock() {
     fs::create_dir_all(&state_dir).unwrap();
     fs::write(
             state_dir.join("lock.json"),
-            r#"{"version":3,"lock_id":"held-lock","operation":"plan","created_at":"1970-01-01T00:00:00Z","pid":123}"#,
+            r#"{"version":4,"lock_id":"held-lock","operation":"plan","created_at":"1970-01-01T00:00:00Z","pid":123}"#,
         )
         .unwrap();
 
@@ -1956,7 +1980,7 @@ async fn offline_deployment_upgrade_preserves_data_history_and_applied_facts() {
         let needs_upgrade = deployment_status(root, None, &caller).await.unwrap_err();
         assert_eq!(needs_upgrade.code, "ledger_upgrade_required");
         assert!(needs_upgrade.message.contains(
-            "omnigraph --cluster <cluster-root> cluster upgrade-ledger --writers-stopped"
+            "omnigraph cluster upgrade-ledger --target <cluster-root> --writers-stopped"
         ));
         assert_eq!(fs::read(&legacy_path).unwrap(), previous_bytes);
         assert_eq!(

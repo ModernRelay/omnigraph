@@ -72,7 +72,9 @@ pub(crate) const KEYED_WRITE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Immutable allowance captured from the effective session once per operation.
 /// Each existing row, payload, parser and removed-id account has this ceiling;
-/// the accounts remain independent and keep their original scopes.
+/// the accounts remain independent and keep their original scopes. Strict
+/// inserts and overwrites also use it as each native file writer's accumulation
+/// target, which can overshoot and is not a total memory ceiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WriteBudget(u64);
 
@@ -829,12 +831,14 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     ) -> Result<StagedHandle>;
 
     /// Stage an overwrite from the batches as they were produced: one
-    /// `Operation::Overwrite` whose fragments hold every row, sized by Lance;
-    /// see `TableStore::stage_overwrite_batches`.
+    /// `Operation::Overwrite` whose fragments hold every row, sized by Lance,
+    /// `writers` Lance writers at once; see `TableStore::stage_overwrite_batches`.
     async fn stage_overwrite_batches(
         &self,
         snapshot: &SnapshotHandle,
         batches: Vec<RecordBatch>,
+        write_budget: WriteBudget,
+        writers: usize,
     ) -> Result<StagedHandle>;
 
     /// Stage a rename-only column alteration; see
@@ -1407,10 +1411,18 @@ impl TableStorage for TableStore {
         &self,
         snapshot: &SnapshotHandle,
         batches: Vec<RecordBatch>,
+        write_budget: WriteBudget,
+        writers: usize,
     ) -> Result<StagedHandle> {
-        TableStore::stage_overwrite_batches(self, snapshot.dataset(), batches)
-            .await
-            .map(StagedHandle::new)
+        TableStore::stage_overwrite_batches(
+            self,
+            snapshot.dataset(),
+            batches,
+            write_budget,
+            writers,
+        )
+        .await
+        .map(StagedHandle::new)
     }
 
     async fn stage_rename_columns(

@@ -120,28 +120,15 @@ pub(crate) async fn run_blob(
     let operation = capture_blob(command, stdin, stdin_is_terminal)?;
     let client = match &operation {
         BlobOperation::Get { .. } | BlobOperation::Stat { .. } => {
-            GraphClient::resolve(
-                scope.operator,
-                scope.capability,
-                scope.server,
-                scope.graph,
-                None,
-                scope.profile,
-                scope.store,
-                stderr,
-            )
-            .await?
+            GraphClient::from_target(scope.operator, scope.target, scope.graph, None, stderr)
+                .await?
         }
         BlobOperation::Write { .. } => {
-            GraphClient::resolve_with_policy(
+            GraphClient::from_target(
                 scope.operator,
-                scope.capability,
-                scope.server,
+                scope.target,
                 scope.graph,
-                None,
                 scope.actor,
-                scope.profile,
-                scope.store,
                 stderr,
             )
             .await?

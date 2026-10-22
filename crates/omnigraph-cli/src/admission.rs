@@ -5,6 +5,7 @@ use std::io::Write;
 use std::{collections::BTreeMap, future::Future, sync::Arc};
 
 use color_eyre::eyre::{Result, eyre};
+use omnigraph::storage::{CapturedStorageBinding, storage_for_binding};
 use omnigraph_cluster::{ClusterAdmission, ClusterAdmissionPurpose};
 use tokio::sync::Mutex;
 
@@ -20,14 +21,19 @@ pub(crate) async fn scope<F: Future>(future: F) -> F::Output {
 
 /// Read commands never acquire writer admission or run the writable capability
 /// probe. Cluster authority is observed around the open, not held as a lease.
-pub(crate) async fn open_read_only(
-    uri: &str,
+pub(crate) async fn open_read_only_with_binding(
+    binding: &CapturedStorageBinding,
     expected_state_cas: Option<&str>,
 ) -> Result<omnigraph::db::Omnigraph> {
-    let authority = omnigraph_cluster::GraphReadAuthority::capture(uri, expected_state_cas)
-        .await
-        .map_err(report)?;
-    let db = omnigraph::db::Omnigraph::open_read_only(uri).await?;
+    let authority =
+        omnigraph_cluster::GraphReadAuthority::capture_with_binding(binding, expected_state_cas)
+            .await
+            .map_err(report)?;
+    let db = omnigraph::db::Omnigraph::open_read_only_with_storage(
+        binding.uri(),
+        storage_for_binding(binding)?,
+    )
+    .await?;
     if let Some(authority) = authority {
         authority.validate_opened(&db).await.map_err(report)?;
     }
@@ -36,33 +42,29 @@ pub(crate) async fn open_read_only(
 
 /// Acquire before the writable opener (including its capability probe), and
 /// reuse only the same canonical root's admission during this command.
-pub(crate) async fn ensure_graph(uri: &str, stderr: &mut dyn Write) -> Result<()> {
-    let Some(root) = omnigraph_cluster::cluster_root_for_graph_uri(uri)
+pub(crate) async fn ensure_graph_with_binding(
+    binding: &CapturedStorageBinding,
+    stderr: &mut dyn Write,
+) -> Result<()> {
+    let uri = binding.uri();
+    let Some(root) = omnigraph_cluster::cluster_root_for_graph_binding(binding)
         .await
         .map_err(report)?
     else {
         return Ok(());
     };
-    let root = omnigraph::storage::normalize_root_uri(&root)?;
-    let key = if omnigraph::storage::storage_kind_for_uri(&root)?
-        == omnigraph::storage::StorageKind::Local
-    {
-        std::fs::canonicalize(&root)?
-            .to_str()
-            .ok_or_else(|| eyre!("cluster root is not valid UTF-8"))?
-            .to_owned()
-    } else {
-        root
-    };
+    let key = binding.for_uri(&root)?.identity();
     let owners = COMMAND.try_with(Arc::clone).unwrap_or_default();
     let mut owners = owners.lock().await;
     if let Some(owner) = owners.get(&key) {
         return owner.validate_graph_uri(uri).await.map_err(report);
     }
-    if let Some(owner) =
-        omnigraph_cluster::acquire_graph_admission(uri, ClusterAdmissionPurpose::GraphOperation)
-            .await
-            .map_err(report)?
+    if let Some(owner) = omnigraph_cluster::acquire_graph_admission_with_binding(
+        binding,
+        ClusterAdmissionPurpose::GraphOperation,
+    )
+    .await
+    .map_err(report)?
     {
         // Report before dispatch as well as before any command-local exit or
         // lost output. Success of an arbitrary CLI command is not a qualified

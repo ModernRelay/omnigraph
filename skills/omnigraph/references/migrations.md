@@ -4,8 +4,8 @@ The rest of this skill targets the current CLI and HTTP contract. The versioned
 procedures below use their named predecessor binaries. Read this page before replacing
 an older binary, rebuilding a graph, or translating earlier API examples.
 
-Current HTTP integrations must use exactly `Omnigraph-Http-Api: 0.13`, including
-the current routes, shapes and credentials. A `0.12` peer is refused before data
+Current HTTP integrations must use exactly `Omnigraph-Http-Api: 0.14`, including
+the current routes, shapes and credentials. A `0.13` peer is refused before data
 dispatch or graph access; changing an old integration's header alone is not an
 upgrade. See [server policy](server-policy.md).
 
@@ -194,8 +194,8 @@ state. Then rebuild every full-text index on every live branch that needs
 full-text search:
 
 ```bash
-omnigraph branch list --store graph.omni --json
-omnigraph rebuild-full-text-indexes --store graph.omni \
+omnigraph-v0.10 branch list --store graph.omni --json
+omnigraph-v0.10 rebuild-full-text-indexes --store graph.omni \
   --branch main --as operator --json
 ```
 
@@ -220,26 +220,42 @@ v0.10 also removes ambiguous client vocabulary such as `table_key`, `row_id`,
 entity, property, graph-manifest, and published-dataset terms plus
 `export --type`. See the [v0.10.0 upgrade procedure](https://github.com/ModernRelay/omnigraph/blob/v0.10.0/docs/user/operations/upgrade.md).
 
+## Operator configuration rewrite
+
+`version: 1` replaces the old target format without backward compatibility.
+Replace account targets and connections with profiles, flatten every
+`auth` to one provider object, and split managed identities into separate profiles.
+Change managed target `connection` to `profile` and `defaults.connection` to
+`defaults.profile`; remove `default_auth` and `--auth`. Standalone identities
+use separate targets; reinstall their stored tokens with `credentials set
+--target NAME --stdin` rather than guessing an old named identity. Use `--profile`
+instead of `--connection` and `login --create-profile NAME` for explicit setup.
+Bare login uses the existing default profile. There is no config
+importer. `config recover-operations --source DIR --profile NAME`
+preserves matching legacy folder lifecycle evidence separately; retain old operator
+homes and reconcile unresolved operations under the original identity and key. See the primary
+[operator reference](../../../docs/user/cli/targets.md#upgrade-from-the-old-format).
+
 ## Pre-0.7 configuration
 
 | Before | Current |
 |---|---|
 | `omnigraph.yaml` | `cluster.yaml` for team deployment plus `~/.omnigraph/config.yaml` for operator settings |
-| `cli.actor` | `operator.actor` |
-| `cli.graph` / `server.graph` | `defaults.default_graph` plus optional `defaults.server` |
+| `cli.actor` / `operator.actor` | Explicit `--as ACTOR` for direct writes |
+| `cli.graph` / `server.graph` | a target’s `default_graph` plus `defaults.target` |
 | `targets:` / `target:` | `graphs:` / `graph:` |
 
 `omnigraph.yaml` is removed and there is no automatic config migration. Move
 schema/query/policy declarations into `cluster.yaml`; move identity, named
-servers, output defaults, profiles, and aliases into the operator file.
+targets, output defaults and aliases into the versioned operator file.
 
 ## Retired addressing and verbs
 
 | Before | Current |
 |---|---|
-| `--target <name>` | `--server`, `--store`, `--cluster`, or `--profile`, as the command permits |
-| positional HTTP URL | `--server <name|url>` |
-| `--cluster-graph <id>` | `--cluster <dir|uri> --graph <id>` |
+| `--server`, `--store`, `--cluster`, old resource `--profile` | `--target NAME\|LOCAL_PATH` for resources, `--profile NAME` for account operations; rebuild configuration without an importer |
+| positional backend URL or URI | `--target NAME\|ADDRESS` (only `init` retains its positional creation address) |
+| `--cluster-graph <id>` | `--target ROOT --graph ID` |
 | query `--name <q>` | positional query name plus `--query`/`-e` for ad-hoc source |
 | `ingest` | `load --mode <append|merge|overwrite>` |
 | `read` / `change` | `query` / `mutate` |
@@ -249,11 +265,11 @@ servers, output defaults, profiles, and aliases into the operator file.
 The server is cluster-only: start it with `omnigraph-server --cluster
 <dir|file://|s3://|az://>`. Data-plane commands do not take the cluster
 control-plane `--config` flag. `policy` and the stored-query registry use
-`--cluster` plus optional `--graph`.
+`--target ROOT` plus optional `--graph`.
 
 Direct `schema apply` remains available for a non-cluster store. A cluster-only
 server rejects the legacy schema-apply route with `409`; edit the declared `.pg`
-and submit it with `cluster apply --server <name|url> --config <dir>`.
+and submit it with `cluster apply --target NAME --config DIR`.
 
 ## HTTP compatibility aliases
 

@@ -40,14 +40,14 @@ each row's `source` says whether the value came from the environment.
 
 Every setting has a scope. A `request` setting is set by any caller. A
 `process` setting is set only by the process that hosts the engine: the
-server from its environment, and a direct CLI run (`--store`) from its
+server from its environment, and a direct CLI run (`--target`) from its
 environment, its `--set` values and the file; a served caller's `settings`
 field, `set` query parameter or `set` line naming one is refused.
 
 A setting reaches the engine through one of three doors:
 
 - CLI: `--set name=value`, repeatable, on `omnigraph query`, `mutate`,
-  `branch merge`, `commit changes` and `changes poll`, and direct `--store` loads; see the
+  `branch merge`, `commit changes` and `changes poll`, and direct `--target` loads; see the
   [CLI guide](../cli/index.md#session-settings).
 - HTTP body: the `settings` object on `POST /query`, `POST /mutate`,
   `POST /mutate/if-graph-commit` and `POST /branches/merge`, one key per
@@ -73,7 +73,7 @@ refuses startup; no default is substituted.
 | `rrf_plan` | enum `auto`, `force_prefilter`, `force_postfilter` | `auto` | process | `OMNIGRAPH_RRF_PLAN` | the reciprocal rank fusion plan on a traversal-constrained `nearest`, for diagnosis |
 | `merge_lineage` | enum `off`, `on`, `verify` | `on` (a debug build defaults to `verify`) | request | `OMNIGRAPH_MERGE_LINEAGE` | how a merge finds the entities it classifies: the full-scan walk, the lineage path, or both compared |
 | `ann_nprobes` | integer, at least `0` | `20` | request | `OMNIGRAPH_ANN_NPROBES` | the partition cap per index delta of a `nearest` scan; `0` is no cap |
-| `stage_write_concurrency` | integer `1..=64` | `8` | process | `OMNIGRAPH_LOAD_CONCURRENCY` | the width of the staged-write fan-out for `load` and `mutate` |
+| `stage_write_concurrency` | integer `1..=64` | `8` | process | `OMNIGRAPH_LOAD_CONCURRENCY` | the width of the staged-write fan-out for `load` and `mutate`: tables staged at once, and the Lance writers of one `load csv` overwrite |
 | `traversal_work_limit` | integer `1..=9223372036854775807` | `1000000` | request | `OMNIGRAPH_TRAVERSAL_WORK_LIMIT` | shared traversal row-work cap for statements containing alternatives or wildcard |
 | `write_max_bytes` | integer, at least `1` | `33554432` (32 MiB) | request | `OMNIGRAPH_WRITE_MAX_BYTES` | independent row-data and Blob-payload allowances for bounded writes; changes the existing mutate, load and materializing branch-merge limits; a value raised above the default is held in memory as one typed batch at an overwrite load's commit; a `load csv` statement applies it to each staged-write input: an overwrite stages the reader's 8,192-row batches and refuses a batch over it as `staged_write_input_bytes`, while append and merge keep the keyed adapter's ceilings |
 | `load_source_max_bytes` | integer, at least `1` | `33554432` (32 MiB) | request | `OMNIGRAPH_LOAD_SOURCE_MAX_BYTES` | the largest object a `load csv` statement reads, checked before any payload byte is fetched; a served load is additionally bounded by the server's workload admission |
@@ -112,6 +112,17 @@ captured once for an operation, including its retries and merge publication.
 A one-row keyed write costs about 1 to 3 KiB of row data from Arrow buffer
 rounding, so allowances below a few KiB refuse every write.
 
+Strict inserts and overwrite writes also pass `write_max_bytes` to Lance as
+the buffer accumulation target for each data-file writer. Lance divides it
+across top-level columns instead of using its default 8 MiB per column.
+The default 32 MiB target therefore raises or lowers each column's threshold
+depending on the number of columns.
+This is a flush threshold, not a total memory cap: the incoming array can
+cross it, nested fields and encoding have additional working memory, and
+concurrent table writers each receive the target. Upserts and updates use
+Lance merge-insert, which does not expose this option and keeps its native
+buffering defaults. Row and Blob admission limits still apply to those writes.
+
 Neither byte setting has a fixed maximum. A lower environment value is a
 process default, so a request may still select any value of at least `1`.
 Raising `write_max_bytes` above the default admits a larger staged-write
@@ -119,7 +130,7 @@ input (a JSONL load's typed batch, a CSV overwrite's reader batch), held in
 memory at commit; raising `load_source_max_bytes` admits a
 larger `load csv` source object into memory before parsing. On a server both
 stay bounded by workload admission (`OMNIGRAPH_GLOBAL_BYTES_MAX`,
-`OMNIGRAPH_PER_ACTOR_BYTES_MAX`). Embedded sessions and direct `--store` CLI
+`OMNIGRAPH_PER_ACTOR_BYTES_MAX`). Embedded sessions and direct `--target` CLI
 loads can override them; a `load csv` statement travels on `/mutate`, whose
 `settings` field and `set` prefix apply. The JSONL HTTP load routes inherit
 the process default and accept no request setting; remote CLI loads of those
