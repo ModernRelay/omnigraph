@@ -3,7 +3,7 @@ rfc: "2026-10-19-http-api-conventions"
 title: "HTTP API conventions"
 track: maintainer
 status: draft
-implementation: not-started
+implementation: in-progress
 authors:
   - Ragnor Comerford
 created: 2026-10-19
@@ -122,9 +122,11 @@ note.
 | Protected-resource metadata | `/.well-known/oauth-protected-resource`, `/.well-known/oauth-protected-resource/{resource_path}` | `oauthProtectedResourceMetadata`, `oauthProtectedResourceMetadataAtResourcePath` |
 | Not in the spec | `/openapi.json`, `/mcp`, `/graphs/og_catalog/…` | none; see [Coverage](#coverage) |
 
-The first four classes are `ALWAYS_FLAT_PATHS` in `handlers.rs`: they stay
-flat and get no prefix. Their operationIds stay pinned rows until the
-operation table binds them. The protected-resource metadata keeps its ids for
+The first four classes stay flat and get no prefix. The implementation derives
+their path classification from `omnigraph-api-types::operations::HTTP_OPERATIONS`
+instead of keeping a separate `ALWAYS_FLAT_PATHS` list in `handlers.rs`.
+Their operationIds are pinned inventory entries; graph operationIds render
+from their canonical names. The protected-resource metadata keeps its ids for
 good, because RFC 9728 defines that operation and its path, not OmniGraph.
 
 ### Paths and parameters
@@ -470,6 +472,18 @@ it does not change unknown-query-parameter handling on other routes.
 
 ## Rollout
 
+The implementation is prepared as three stacked PRs, in merge order. None
+has merged yet:
+
+- [#1131](https://github.com/ModernRelay/omnigraph/pull/1131): OpenAPI
+  conventions, the documentation-driven lint and additive documentation.
+- [#1132](https://github.com/ModernRelay/omnigraph/pull/1132): the shared
+  operation inventory, checked against actual HTTP registrations, MCP tools
+  and CLI commands.
+- [#1133](https://github.com/ModernRelay/omnigraph/pull/1133): HTTP contract
+  0.15, SDK naming, `actor_id`, commit `listing`, access protocol 2 and MCP
+  client migration.
+
 1. **The lint, its table and the additive documentation.** Today's exceptions
    are pinned as they stand. The same change documents the six missing
    parameter descriptions, the `limit` bounds of diffs and changes, 401 on the
@@ -525,6 +539,10 @@ page-token design remain in the table.
   MCP's breaking tool-schema migration from HTTP contract admission, required
   explicit refusal of retired commit-list selectors, and added required-error
   coverage checks to the existing OpenAPI owner.
+- 2026-10-22: Recorded the three stacked implementation PRs and contract 0.15
+  for the rename batch. Flat-path classification now derives from the shared
+  operation inventory; the implementation remains in progress until the
+  stack merges.
 
 [graph-access]: 2026-10-16-graph-access-serving-and-cross-process-writes.md
 [one-set]: 2026-10-16-graph-access-serving-and-cross-process-writes.md#one-set-of-operations
