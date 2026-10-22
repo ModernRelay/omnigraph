@@ -144,8 +144,8 @@ omnigraph query sources_for_claim --target standalone --graph knowledge \
 omnigraph credentials status --target standalone --json
 ```
 
-The profile's declared source is the only credential source. There is no
-implicit environment override or plaintext credential file. `login` and `logout`
+The server target's declared `auth` is the only credential source. There is no
+implicit environment override or plaintext credential fallback. `login` and `logout`
 manage platform sessions; static tokens use `credentials set/remove`.
 The server resolves the actor from authentication; on a served write `--as`
 only asserts it. Register remote endpoints rather than passing inline URLs.

@@ -33,9 +33,10 @@ counts only cases under `cases/`.
 ## Explicit execution
 
 Every case starts with its issue header and a required runner section.
-Schema and seed sections are optional together; without them, the runner
-requires `--store <URI>`. A case may have zero steps, including a dataset
-containing only schema and seed. Configuration has no default target,
+Schema and seed sections are optional together; without them, embedded execution
+requires `--store <URI>` and served execution uses the selected server graph
+without schema validation or seed loading. A case may have zero steps, including
+a dataset containing only schema and seed. Configuration has no default target,
 storage, seed or timeout:
 
 ```yaml
@@ -417,8 +418,8 @@ The store places, their methods and the actions each honors are RFC 0066's
 table; a place-and-action pair outside it, or listed but not implemented, is
 refused at admission naming the table row. An old `--- fault` block
 converts by renaming the section and its `return_error` action to
-`action: fail`; `at`, `occurrence` and `scope` keep their names. Process crashes,
-server/CLI sessions and network simulation are future extensions.
+`action: fail`; `at`, `occurrence` and `scope` keep their names. The DST runner
+does not support process crashes, server/CLI sessions or network simulation.
 
 ## Concurrent block
 

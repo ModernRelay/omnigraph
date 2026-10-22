@@ -110,7 +110,7 @@ and omits null-valued property keys; change images keep explicit nulls.
 Load command:
 
 ```bash
-omnigraph load --data seed.jsonl --mode merge s3://my-bucket/repos/spike-intel
+omnigraph load --data seed.jsonl --mode merge --target ./spike-intel.omni
 ```
 
 `--from <base>` forks a missing `--branch` from `<base>` before loading (the
@@ -159,7 +159,7 @@ Branches exist for **data review**, not schema changes. Schema goes straight to 
 ### The review loop
 
 ```bash
-REPO=s3://my-bucket/repos/spike-intel
+REPO=./spike-intel.omni
 
 # 1. Create feature branch from main
 omnigraph branch create --from main staging-2026-04-14 --target $REPO
@@ -245,8 +245,8 @@ omnigraph commit list --target $REPO --branch main --json        # history
 
 `export` is the right tool for large-snapshot inspection — don't try to page through the whole graph with read queries.
 
-> **Cluster note:** everything in this file applies unchanged in cluster
-> deployments — the control plane owns schema/queries/policies; rows, loads,
-> and branches stay on the data plane against the derived graph roots
-> (`<dir>/graphs/<id>.omni`, or `<storage>/graphs/<id>.omni` for an S3-backed
-> cluster).
+> **Cluster note:** the control plane owns schema/queries/policies; rows,
+> loads and branches use the same data commands with a registered server or
+> managed target and `--graph ID` (or its default graph). For direct local
+> access, select the cluster root with `--target ROOT --graph ID` and stop the
+> serving owner before writing. Cloud storage URIs are not CLI direct targets.

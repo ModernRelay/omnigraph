@@ -31,7 +31,7 @@ The HTTP handler authorizes both change and any requested branch creation before
 
 `POST /graphs/{graph_id}/load` and the engine `load_as` accept a JSON envelope whose `data` field contains loader-compatible NDJSON. This preserves historical coercions and shapes that the strict graph-batch boundary intentionally refuses: a nullable scalar or list item of the wrong JSON type becomes NULL (a non-nullable property then refuses the load), and a list that is not a JSON array is refused. `Date` and `DateTime` are the exception on both paths: their string form already goes through a fallible parser, so a NULL for a wrong-typed value would be a lost error rather than a coercion, and such a value is refused with the property named.
 
-The engine `ingest*` methods are deprecated aliases over the same loader, with no separate fast path or durability contract. CLI and HTTP integrations use `load` or `/load/ndjson`.
+The engine `ingest*` methods are deprecated parser/default shims over the same loader, with no separate fast path or durability contract. They retain the old default of forking a missing branch from `main` when no base is supplied. CLI and HTTP integrations use `load` or `/load/ndjson`, which require an explicit base to create a missing branch.
 
 ## Transaction contract
 
@@ -41,11 +41,11 @@ All surfaces converge on the same writer:
 2. Capture one accepted catalog and branch snapshot.
 3. Parse, canonicalize, coalesce, validate, and enforce referential/cardinality constraints.
 4. Stage at most one exact Lance transaction per touched table.
-5. Arm ordinary recovery-v9 before the first durable table effect.
-6. Commit all table effects, then publish their versions and graph lineage in one manifest CAS.
+5. Acquire the write gates, revalidate the captured authority and commit the staged work as detached table versions.
+6. Publish all table pins and graph lineage in one manifest CAS.
 7. Return success only after the graph commit is durable and visible.
 
-A missing target branch is created only when the caller explicitly supplies a base (`from` over HTTP/CLI). Without a base, a missing branch is an error; a typo never forks implicitly.
+For `load`, a missing target branch is created only when the caller explicitly supplies a base (`from` over HTTP/CLI). Without a base, a missing branch is an error; a typo never forks implicitly.
 
 Load modes are shared across the surfaces:
 
@@ -53,9 +53,9 @@ Load modes are shared across the surfaces:
 - `append` strictly inserts absent IDs;
 - `overwrite` replaces each named table's contents.
 
-One batch may touch several logical declarations. Cross-table visibility is still atomic: readers see all published table versions or none. An error after recovery is armed returns recovery-required rather than claiming rollback or success.
+One batch may touch several logical declarations. Cross-table visibility is atomic: readers see all published table versions or none. A failure before the manifest request does not publish the batch's rows; detached table effects remain unreachable staging. The publisher distinguishes a definite refusal from an uncertain manifest outcome; callers must resolve the latter before repeating the load. No ordinary load arms a recovery record. See [writes.md](writes.md#the-protocol) and [recovery.md](recovery.md).
 
-The write envelope is bounded before arm. Keyed work is limited to 8,192 retained rows per table. The session's `write_max_bytes` (default 32 MiB) independently bounds retained row data, logical Blob payloads and parsing estimates, preserving the existing table and operation scopes. An Overwrite load collects committed IDs absent from its replacement under a separate removed-ID allowance of the same size; each ID is charged its UTF-8 length plus 24 bytes. Overwrite keeps its bulk-input behavior and is exempt from keyed aggregate row/batch limits. See [writes.md](writes.md#keyed-writes). The HTTP strict-batch body has its own fixed 32 MiB ceiling. Clients split larger incremental imports into explicit batches and accept one graph commit per batch.
+The write envelope is bounded before staging. Keyed work is limited to 8,192 retained rows per table. The session's `write_max_bytes` (default 32 MiB) independently bounds retained row data, logical Blob payloads and parsing estimates, preserving the existing table and operation scopes. An Overwrite load collects committed IDs absent from its replacement under a separate removed-ID allowance of the same size; each ID is charged its UTF-8 length plus 24 bytes. Overwrite keeps its bulk-input behavior and is exempt from keyed aggregate row/batch limits. See [writes.md](writes.md#keyed-writes). The HTTP strict-batch body has its own fixed 32 MiB ceiling. Clients split larger incremental imports into explicit batches and accept one graph commit per batch.
 
 ## Blob and index behavior
 
@@ -76,5 +76,5 @@ If an application needs durable acceptance before graph visibility, put an exter
 - Parser, batching, branch creation, modes, bounds, and actor attribution: in-source `crates/omnigraph/src/loader/` tests.
 - Atomic table staging and recovery: `crates/omnigraph/tests/writes.rs`, `integration/recovery.rs`, and `failpoints.rs`.
 - Strict and compatibility HTTP routes: `crates/omnigraph-server/tests/integration/data_routes.rs`, auth coverage, and `integration/openapi.rs`.
-- CLI local/remote behavior and deprecation signal: `crates/omnigraph-cli/tests/integration/system_local.rs`, `system_remote.rs`, and `parity_matrix.rs`.
+- CLI local/remote load behavior: `crates/omnigraph-cli/tests/integration/system_local.rs`, `system_remote.rs`, and `parity_matrix.rs`.
 - Absence of retired durable surfaces: `crates/omnigraph/tests/forbidden_apis.rs` and configuration rejection tests.
