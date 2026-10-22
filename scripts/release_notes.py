@@ -40,6 +40,9 @@ SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 PROVENANCE = re.compile(r"^<!-- release-notes: (.+) -->$", re.MULTILINE)
 PROVENANCE_MARKER = re.compile(r"<!--\s*release-notes\b", re.IGNORECASE)
 LEGACY_PREFIX = "# OmniGraph v0.12.0\n\nUnreleased.\n\n"
+# Format 1 pages were published as `OmniGraph` and are verified byte for byte;
+# format 2 writes the product name as it is spelled now.
+PRODUCT_NAME = {1: "OmniGraph", 2: "Omnigraph"}
 DEFINITION = re.compile(r"^\[([^\]]+)\]: (\S+)$")
 RELEASE_FILE = re.compile(r"changelog\.d/(v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))\.md")
 SQUASH_SUBJECT = re.compile(r"\(#([1-9][0-9]*)\)$")
@@ -555,7 +558,7 @@ def render_header(selection: Selection, info: dict) -> str:
     status = f"Released {info['date']}." if info["date"] else "Unreleased preview."
     if selection.working_tree:
         status = f"Working-tree preview based on `{selection.target}`; includes local and untracked notes."
-    return (f"# OmniGraph {info['version']}\n\n{status}\n\n"
+    return (f"# {PRODUCT_NAME[info['format']]} {info['version']}\n\n{status}\n\n"
             "<!-- release-notes: " + json.dumps(info, sort_keys=True, separators=(",", ":")) + " -->\n\n")
 
 
@@ -772,7 +775,7 @@ def render_index(repo: Repository, pending: dict[str, str] | None = None, direct
         status = ""
         if PROVENANCE_MARKER.search(content):
             info = snapshot_info(content)
-            if info["version"] != version or not content.startswith(f"# OmniGraph {version}\n\nReleased {info['date']}.\n"):
+            if info["version"] != version or not content.startswith(f"# {PRODUCT_NAME[info['format']]} {version}\n\nReleased {info['date']}.\n"):
                 raise NotesError(f"{version}: snapshot filename, heading and provenance disagree")
             status = f": released {info['date']}"
         elif tuple(map(int, VERSION.fullmatch(version).groups())) >= (0, 12, 0):

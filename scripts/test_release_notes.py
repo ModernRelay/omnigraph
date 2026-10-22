@@ -24,7 +24,7 @@ CONFIG = json.dumps({"version": "v0.13.0", "base": "previous", "legacy": None}).
 RELEASE = "changelog.d/v0.13.0.md"
 
 
-def release_text(intro="OmniGraph 0.13 makes reads cheaper.", why=None, highlights=3, body="Scans read only named columns.",
+def release_text(intro="Omnigraph 0.13 makes reads cheaper.", why=None, highlights=3, body="Scans read only named columns.",
                  contributors=("azimafroozeh", "pronskiy")):
     parts = [intro, ""]
     if why is not None:
@@ -185,7 +185,7 @@ class ReleaseNotesTests(unittest.TestCase):
 
     def test_release_file_splits_intro_why_and_highlights(self):
         release = notes.split_release_file(RELEASE, release_text(why="The write path changed.").decode())
-        self.assertEqual(release.intro, "OmniGraph 0.13 makes reads cheaper.")
+        self.assertEqual(release.intro, "Omnigraph 0.13 makes reads cheaper.")
         self.assertEqual(release.why, "The write path changed.")
         self.assertEqual([title for title, _ in release.highlights], ["Highlight 1", "Highlight 2", "Highlight 3"])
         self.assertTrue(release.highlights_text.startswith("### Highlight 1"))
@@ -209,7 +209,7 @@ class ReleaseNotesTests(unittest.TestCase):
             (release_text(highlights=6), "v0.13.1", False, "6 highlights; write 0 to 5"),
             (release_text(body=" ".join(["word"] * 151)), "v0.13.0", False, "highlight 'Highlight 1' has 151 words"),
             (release_text() + b"\n## Roadmap\n\nLater.\n", "v0.13.0", False, "not '## Roadmap'"),
-            (b"# OmniGraph\n\n" + release_text(), "v0.13.0", False, "allowed headings"),
+            (b"# Omnigraph\n\n" + release_text(), "v0.13.0", False, "allowed headings"),
             (release_text(intro="Intro.\n\n### Stray"), "v0.13.0", False, "belong under"),
             (release_text().replace(b"## Highlights\n\n", b"## Highlights\n\nLoose text.\n\n"), "v0.13.0", False, "start every highlight"),
             (release_text(why="One.") + b"\n## Why these changes\n\nTwo.\n", "v0.13.0", False, "appears twice"),
@@ -299,7 +299,7 @@ class ReleaseNotesTests(unittest.TestCase):
         self.put("changelog.d/crash.fixed.md", b"- Fix a crash.\n")
         self.repo.subjects.update({NEW: "feat: predicate (#803)", "changelog.d/upgrade.breaking.md": "feat!: contract (#814)"})
         _, _, content = self.snapshot2()
-        order = ["OmniGraph 0.13 makes reads cheaper.", "## Highlights", "### Highlight 1", "## Upgrade actions",
+        order = ["Omnigraph 0.13 makes reads cheaper.", "## Highlights", "### Highlight 1", "## Upgrade actions",
                  "The write path changed.", "- Upgrade together.", "## Features", "- A new predicate.",
                  "## Fixes", "- Fix a crash.", "**Full changelog:**"]
         positions = [content.index(text) for text in order]
@@ -342,12 +342,12 @@ class ReleaseNotesTests(unittest.TestCase):
                     notes.check_release_inputs(selected, "v0.13.0", complete=True)
 
     def test_format_two_joins_soft_wrapped_lines(self):
-        self.put(RELEASE, release_text(intro="OmniGraph 0.13 makes\nreads cheaper.",
+        self.put(RELEASE, release_text(intro="Omnigraph 0.13 makes\nreads cheaper.",
                                        body="Scans read only\nnamed columns.\n\n```text\nline one\nline two\n```"))
         self.put("changelog.d/wrapped.fixed.md", b"- A wrapped note\n  that continues.\n")
         self.put("changelog.d/hard.fixed.md", b"- A hard break\\\n  stays.\n")
         _, _, content = self.snapshot2()
-        self.assertIn("OmniGraph 0.13 makes reads cheaper.\n", content)
+        self.assertIn("Omnigraph 0.13 makes reads cheaper.\n", content)
         self.assertIn("Scans read only named columns.\n\n```text\nline one\nline two\n```", content)
         self.assertIn("- A wrapped note that continues.\n", content)
         self.assertIn("- A hard break\\\n  stays.\n", content)
@@ -397,7 +397,7 @@ class ReleaseNotesTests(unittest.TestCase):
             del tree[NEW]
         self.put("changelog.d/v0.13.1.md", release_text(highlights=0))
         _, _, content = self.snapshot2("v0.13.1")
-        self.assertIn("OmniGraph 0.13 makes reads cheaper.\n\nNo user-visible changes recorded.", content)
+        self.assertIn("Omnigraph 0.13 makes reads cheaper.\n\nNo user-visible changes recorded.", content)
         self.assertNotIn("## Highlights", content)
         self.assertNotIn("## Upgrade actions", content)
 
@@ -405,8 +405,8 @@ class ReleaseNotesTests(unittest.TestCase):
         self.put(RELEASE, RELEASE_TEXT)
         selected, info, content = self.snapshot2()
         body = notes.render(self.repo, selected, info, "v0.13.0", header=False)
-        self.assertTrue(content.startswith("# OmniGraph v0.13.0\n\nReleased 2026-10-20.\n\n<!-- release-notes: "))
-        self.assertTrue(body.startswith("OmniGraph 0.13 makes reads cheaper."))
+        self.assertTrue(content.startswith("# Omnigraph v0.13.0\n\nReleased 2026-10-20.\n\n<!-- release-notes: "))
+        self.assertTrue(body.startswith("Omnigraph 0.13 makes reads cheaper."))
         self.assertNotIn("<!-- release-notes", body)
 
     def test_release_file_links_follow_the_note_link_rules(self):
@@ -442,7 +442,7 @@ class ReleaseNotesTests(unittest.TestCase):
         with patch.object(notes, "Repository", return_value=self.repo), patch("sys.stdout", output):
             self.assertEqual(notes.main(["body", "--tag", "v0.13.0", "--target", AUDITED]), 0)
         body = output.getvalue()
-        self.assertTrue(body.startswith("OmniGraph 0.13 makes reads cheaper."))
+        self.assertTrue(body.startswith("Omnigraph 0.13 makes reads cheaper."))
         self.assertNotIn("<!-- release-notes", body)
         self.assertIn(f"([#803]({notes.REPOSITORY}/pull/803))", body)
 

@@ -35,7 +35,8 @@ CORE_VERSION = re.compile(r"v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:[-+].*)?")
 MARKER = re.compile(r"^<!-- edge-build: (\{.*\}) -->$", re.MULTILINE)
 COMMIT = re.compile(r"[0-9a-f]{40}")
 SCHEMA_LINE = re.compile(r"internal-schema ([0-9]+) \(serves v([0-9]+) to v([0-9]+)\)")
-PREVIEW_HEADING = re.compile(r"# OmniGraph (v[0-9]+\.[0-9]+\.[0-9]+)")
+# Format-1 previews spell the name `OmniGraph`, format 2 `Omnigraph`.
+PREVIEW_HEADING = re.compile(r"# Omni[Gg]raph (v[0-9]+\.[0-9]+\.[0-9]+)")
 # The lines `release_notes.render_footer` writes after a format-2 preview.
 FOOTER = ("**Full changelog:** ", "[Upgrade guide](")
 SOURCE_CONTRACT = re.compile(r'^pub const HTTP_API_CONTRACT: &str = "([^"\n]+)";$', re.MULTILINE)
@@ -187,7 +188,7 @@ def unreleased_notes(preview: str) -> tuple[str, str, list[str]]:
     lines = preview.splitlines(keepends=True)
     heading = PREVIEW_HEADING.fullmatch(lines[0].rstrip("\n")) if lines else None
     if heading is None:
-        raise BodyError("release-note preview does not start with `# OmniGraph vX.Y.Z`")
+        raise BodyError("release-note preview does not start with `# Omnigraph vX.Y.Z`")
     preamble: list[str] = []
     sections: list[list[str]] = []
     for line in lines[1:]:
