@@ -37,7 +37,7 @@ puts each changed path in one class:
 
 | Class | Paths | Jobs that run |
 |---|---|---|
-| documentation | `docs/**/*.md` (`.mdx`, `.rst`, `.adoc`), `changelog.d/*.md`, `changelog.d/release.json`, the root `README.md`, `AGENTS.md`, `CLAUDE.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `LICENSE`, `LICENSE.md` | the always-on guards (`Classify Changes`, `Check AGENTS.md Links`, `Check Workflow Action Pins`, `Fix Regression Gate`, `PR Title`, `Release Note Gate`, `Storage Upgrade Compatibility`, `Dependency Guard (cargo deny)`; of these only `Check AGENTS.md Links` reads documentation, through `scripts/check-docs.py`) |
+| documentation | `docs/**/*.md` (`.mdx`, `.rst`, `.adoc`), `changelog.d/*.md`, `changelog.d/release.json`, the root `README.md`, `AGENTS.md`, `CLAUDE.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `LICENSE`, `LICENSE.md` | the always-on guards (`Classify Changes`, `Check AGENTS.md Links`, `Check Workflow Action Pins`, `Fix Regression Gate`, `PR Title`, `Storage Upgrade Compatibility`, `Dependency Guard (cargo deny)`; of these only `Check AGENTS.md Links` reads documentation, through `scripts/check-docs.py`) |
 | GQT cases | `.gqt` files anywhere under `crates/omnigraph-gqt/cases/` (recursive discovery) | the guards plus `GQ Logic Tests` (`run_gqt`) |
 | deployment | `Dockerfile`, `.dockerignore`, `docker/**`, `deploy/**` | the guards plus `Azure Contract Guards`, `Container Entrypoint`, `Azure Deployment Validation` (`run_deployment`) |
 | engine input | every other path: `crates/**` (a text fixture under a crate is source code; only the `.gqt` corpus is a class of its own), `tools/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/**`, `scripts/**`, `.github/**`, anything unlisted | every job (`run_full_ci`, which also sets `run_gqt` and `run_deployment`) |
@@ -294,23 +294,22 @@ refusals, runtime type invariants and each output/CLI mode. When editing the
 checker, also run `python3 -m mypy --strict scripts/check-pr-title.py` in a
 development environment with mypy installed. The enum dispatches are exhaustive.
 
+On a pull request `PR Title` also checks its release notes with
+`scripts/check-release-note.py`, which reads the type and `!` from the title
+`scripts/check-pr-title.py` accepted: a `feat`, `fix` or `perf` pull request
+adds a `changelog.d` note and a `!` title adds a `.breaking.md` note, unless
+the pull request carries the `skip-changelog` label
+([release notes](documentation.md#release-notes)).
+
 It is a policy check on
 `pull_request_target` like the regression gate, re-run on every title edit,
-and the pull request head is never fetched. On the merge queue's branch it
+push and label change; the pull request head is fetched only as data for the
+release-note diff range, never checked out or executed. On the merge queue's branch it
 checks the first line of the group commit's message, minus the ` (#N)`
 suffix: the subject the queue lands, fixed when the group is built, so a
 title edit after queueing cannot change what lands unchecked
-([branch-protection.md](branch-protection.md), Merge queue).
-
-`Release Note Gate` (`release-note-gate.yml`) checks the pull request's
-release notes with `scripts/check-release-note.py`, run from the base branch
-on `pull_request_target`. It reads the type and `!` from a title `PR Title`
-accepts, through the same `scripts/check-pr-title.py`, and fails on a title
-that check refuses. A `feat`, `fix` or `perf` pull request adds a
-`changelog.d` note and a `!` title adds a `.breaking.md` note, unless the
-pull request carries the `skip-changelog` label. Title and label edits re-run
-the gate; the merge-group run reports a pass without a check. See
-[release notes](documentation.md#release-notes).
+([branch-protection.md](branch-protection.md), Merge queue). The notes were
+checked on the pull request, so the merge-group run does not check them again.
 
 The `Check AGENTS.md Links` context also runs `scripts/check-docs.py`, which
 validates local documentation links, user/developer audience boundaries, RFC
