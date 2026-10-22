@@ -217,10 +217,17 @@ class ReleaseNotesTests(unittest.TestCase):
             with self.subTest(message=message), self.assertRaisesRegex(notes.NotesError, message):
                 notes.check_release_file(RELEASE, raw, version, breaking)
 
-    def test_format_follows_the_version(self):
-        self.assertEqual(notes.format_for("v0.12.0"), 1)
-        for version in ("v0.13.0", "v0.12.1", "v1.0.0"):
-            self.assertEqual(notes.format_for(version), 2)
+    def test_format_follows_the_release_config(self):
+        base = {"version": "v0.13.0", "base": "previous", "legacy": None}
+        self.assertEqual(notes.format_for(base), 1)
+        self.assertEqual(notes.format_for(dict(base, format=2)), 2)
+        for value in (3, 0, "2", True, None):
+            self.repo.working[notes.CONFIG] = json.dumps(dict(base, format=value)).encode()
+            with self.subTest(format=value), self.assertRaisesRegex(notes.NotesError, "format must be 1 or 2"):
+                notes.read_config(self.repo, None)
+        self.repo.working[notes.CONFIG] = json.dumps(dict(base, extra=1)).encode()
+        with self.assertRaisesRegex(notes.NotesError, "optional format"):
+            notes.read_config(self.repo, None)
 
     def test_previous_tag_reads_only_version_tags(self):
         for base, expected in (("refs/tags/v0.12.0", "v0.12.0"), ("v0.12.0", "v0.12.0"), ("previous", None),
@@ -270,7 +277,7 @@ class ReleaseNotesTests(unittest.TestCase):
 
     def snapshot2(self, version="v0.13.0"):
         self.repo.refs["refs/tags/v0.12.0"] = BASE
-        config = json.dumps({"version": version, "base": "refs/tags/v0.12.0", "legacy": None}).encode()
+        config = json.dumps({"version": version, "base": "refs/tags/v0.12.0", "legacy": None, "format": 2}).encode()
         for tree in (self.repo.trees[TARGET], self.repo.trees[AUDITED], self.repo.working):
             tree[notes.CONFIG] = config
         selected = notes.select(self.repo, "refs/tags/v0.12.0", "HEAD", release_version=version)
@@ -483,7 +490,27 @@ class ReleaseNotesTests(unittest.TestCase):
                 notes.check_working_notes(root, errors)
         self.assertTrue(any("over the 200-character limit" in error for error in errors), errors)
 
-    def test_preview_cli_uses_format_two_for_new_versions(self):
+    def test_format_one_cycle_accepts_a_long_note(self):
+        self.snapshot2()
+        self.put(notes.CONFIG, json.dumps({"version": "v0.13.0", "base": "refs/tags/v0.12.0", "legacy": None}).encode())
+        self.repo.working["changelog.d/wordy.fixed.md"] = b"- " + b"word " * 50 + b"\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "docs/releases").mkdir(parents=True)
+            (root / "docs/releases/README.md").write_text(notes.render_index(self.repo, directory=root / "docs/releases"))
+            errors = []
+            with patch.object(notes, "Repository", return_value=self.repo):
+                notes.check_working_notes(root, errors)
+        self.assertEqual(errors, [])
+
+    def test_snapshot_format_must_match_the_release_config(self):
+        selected, info, _ = self.snapshot2()
+        with tempfile.TemporaryDirectory() as directory:
+            self.repo.root = Path(directory)
+            with self.assertRaisesRegex(notes.NotesError, "format must match"):
+                notes.write_snapshot(self.repo, selected, dict(info, format=1), False, False)
+
+    def test_preview_cli_uses_the_configured_format(self):
         self.snapshot2()
         output = io.StringIO()
         with patch.object(notes, "Repository", return_value=self.repo), patch("sys.stdout", output):

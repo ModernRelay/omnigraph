@@ -57,7 +57,7 @@ ORDER_ITEM = re.compile(r"- ([a-z0-9]+(?:-[a-z0-9]+)*\.[a-z]+\.md)")
 CONTRIBUTORS_HEADING = "Contributors"
 CONTRIBUTOR_ITEM = re.compile(r"- @([A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38})")
 PREVIOUS_TAG = re.compile(r"(?:refs/tags/)?(v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))")
-FORMAT_ONE_VERSIONS = frozenset({"v0.12.0"})
+CONFIG_KEYS = frozenset({"version", "base", "legacy", "format"})
 FORMAT1_KEYS = frozenset({"format", "version", "date", "base", "target", "notes", "legacy", "working_tree", "config"})
 FORMAT2_KEYS = FORMAT1_KEYS | {"release", "links", "previous"}
 PENDING_RELEASE_FILE = "Intro and highlights are written in the release-prep pull request."
@@ -487,9 +487,10 @@ def select(repo: Repository, base: str | None, target: str, legacy: str | None =
                      digest(repo.read(None if working_tree else target_sha, CONFIG)), release, links)
 
 
-def format_for(version: str) -> int:
-    """v0.12.0 was published in format 1 and stays there; every later release uses format 2."""
-    return 1 if version in FORMAT_ONE_VERSIONS else 2
+def format_for(config: dict) -> int:
+    """The open cycle's format: release.json's `format`, or 1 when it has none. The
+    post-release bump that opens a cycle sets it; a snapshot records its own."""
+    return config.get("format", 1)
 
 
 def previous_tag(base: str | None) -> str | None:
@@ -655,8 +656,10 @@ def render(repo: Repository, selection: Selection, info: dict, publication_ref: 
 
 def read_config(repo: Repository, revision: str | None) -> dict:
     config = json.loads(repo.read(revision, CONFIG))
-    if not isinstance(config, dict) or set(config) != {"version", "base", "legacy"}:
-        raise NotesError(f"{CONFIG}: expected exactly version, base and legacy")
+    if not isinstance(config, dict) or not {"version", "base", "legacy"} <= set(config) <= CONFIG_KEYS:
+        raise NotesError(f"{CONFIG}: expected version, base, legacy and an optional format")
+    if "format" in config and (type(config["format"]) is not int or config["format"] not in (1, 2)):
+        raise NotesError(f"{CONFIG}: format must be 1 or 2")
     if not isinstance(config["version"], str) or not VERSION.fullmatch(config["version"]):
         raise NotesError(f"{CONFIG}: invalid version")
     if config["base"] is not None and (not isinstance(config["base"], str) or not config["base"]):
@@ -666,11 +669,12 @@ def read_config(repo: Repository, revision: str | None) -> dict:
     return config
 
 
-def require_configured_selection(repo: Repository, selected: Selection, version: str) -> None:
+def require_configured_selection(repo: Repository, selected: Selection, version: str, notes_format: int) -> None:
     config = read_config(repo, None if selected.working_tree else selected.target)
     base = repo.resolve(config["base"]) if config["base"] is not None else None
-    if config["version"] != version or base != selected.base or config["legacy"] != selected.legacy:
-        raise NotesError("snapshot base, version and legacy source must match changelog.d/release.json")
+    if (config["version"] != version or base != selected.base or config["legacy"] != selected.legacy
+            or format_for(config) != notes_format):
+        raise NotesError("snapshot base, version, legacy source and format must match changelog.d/release.json")
 
 
 def check_format2_record(info: dict) -> None:
@@ -721,7 +725,7 @@ def verify_snapshot(repo: Repository, content: str, audited: str | None = None) 
     two = info["format"] == 2
     selected = select(repo, info["base"], source, info["legacy"], freeze_legacy=True,
                       release_version=info["version"] if two else None)
-    require_configured_selection(repo, selected, info["version"])
+    require_configured_selection(repo, selected, info["version"], info["format"])
     previous = previous_tag(read_config(repo, selected.target)["base"]) if two else None
     expected_info = metadata(selected, info["version"], info["date"], info["format"], previous)
     expected_info["target"] = info["target"]
@@ -811,7 +815,7 @@ def write_index(repo: Repository) -> Path:
 def write_snapshot(repo: Repository, selection: Selection, info: dict, replace: bool, replace_legacy: bool) -> Path:
     if selection.working_tree or not info["date"]:
         raise NotesError("snapshots require a date and committed inputs")
-    require_configured_selection(repo, selection, info["version"])
+    require_configured_selection(repo, selection, info["version"], info["format"])
     if info["format"] == 2:
         check_release_inputs(selection, info["version"], complete=True)
     if selection.legacy and selection.baseline != migration_baseline(repo, selection.target, selection.legacy, freeze=True):
@@ -857,13 +861,13 @@ def check_working_notes(root: Path, errors: list[str]) -> None:
         repo = Repository(root)
         config = read_config(repo, None)
         version = config["version"]
-        two = format_for(version) == 2
+        two = format_for(config) == 2
         selected = select(repo, config["base"], "HEAD", config["legacy"], working_tree=True,
                           release_version=version if two else None)
         path = root / "docs/releases" / f"{version}.md"
         if two and not path.exists():
             check_release_inputs(selected, version, complete=False)
-        render(repo, selected, metadata(selected, version, None, format_for(version), previous_tag(config["base"])))
+        render(repo, selected, metadata(selected, version, None, format_for(config), previous_tag(config["base"])))
         if path.exists():
             current = path.read_text(encoding="utf-8")
             if selected.legacy and not PROVENANCE_MARKER.search(current):
@@ -933,10 +937,10 @@ def main(argv: list[str] | None = None) -> int:
         target = repo.resolve(args.target or "HEAD")
         config = read_config(repo, None if working else target)
         version = args.version or config["version"]
-        two = format_for(version) == 2
+        two = format_for(config) == 2
         base = None if args.initial_release else (args.base or config["base"])
         selected = select(repo, base, target, config["legacy"], working, release_version=version if two else None)
-        info = metadata(selected, version, args.date, format_for(version), previous_tag(base))
+        info = metadata(selected, version, args.date, format_for(config), previous_tag(base))
         if args.command == "preview":
             if two:
                 check_release_inputs(selected, version, complete=False)
