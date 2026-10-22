@@ -325,6 +325,8 @@ CLI suites own their named planes: cluster lifecycle, data commands, stored quer
 
 CLI `integration/cli_mcp.rs` owns the stdio MCP bridge against a real served cluster and a stand-in endpoint: refusals before any I/O, tool listing under the server's write setting and `--write`, graph binding, reads equal to the server's own `/mcp` answers, a Unix-socket endpoint refused before it connects, `--as`, credential re-reading from the target's `auth` source after a 401 without resending, the server's `WWW-Authenticate` challenge relayed with a 401, cancellation, and unreachable servers or lost answers that start nothing and resend nothing. In-source `commands/mcp` tests own framing, binding and narrowing rules, and that the bridge names no server or MCP implementation crate.
 
+CLI `integration/cli_data.rs` owns `studio` through stand-in platform openers on `PATH`: the `--json` link and its digests equal to `target inspect --json`, no credential read, `studio_unavailable` that opens nothing, and direct, managed and inline targets refused before any I/O. In-source `commands/studio` tests own the link format and each platform's opener behind an injected command runner, so no test opens anything; `target_identity` tests own the `home` and `binding` digests.
+
 Deployment tests extend these owners: cluster `tests.rs` pins no-reset
 ledger conversion, captured source bytes, exact-ID lookup, bounded results and
 exact applied schema identity after receipt eviction; `admission.rs` pins lifetime

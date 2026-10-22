@@ -135,7 +135,7 @@ exit follows from the disposition:
 
 Maintenance commands (`init`, `upgrade`, `optimize`, `rebuild-full-text-indexes`,
 `repair`, `cleanup`, `schema upgrade-system-columns`), `cluster`, `policy`,
-`target`, `credential`, `mcp` and the managed commands keep their own exits for now:
+`target`, `credential`, `mcp`, `studio` and the managed commands keep their own exits for now:
 their exit 1 does not by itself say that nothing changed, so read their report;
 `mcp` answers each relayed request with its own disposition.
 

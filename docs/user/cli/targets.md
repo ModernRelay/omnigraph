@@ -179,12 +179,12 @@ endpoint preserves the old pin and reports `endpoint_available: false`.
 Normal requests never adopt changed endpoints or follow redirects.
 
 `target list` shows each destination, its managed profile, and the default marker.
-`target list`, `target inspect NAME [--resolved]` and `config validate` are
-offline, with optional `--json`. `target add NAME` without `--cluster` reads a
-complete target JSON object from piped stdin (64 KiB limit); terminal or empty
-input produces setup guidance. Managed add uses `--profile` or `defaults.profile`.
-`target remove NAME` preserves credentials and journals; references must remain
-valid. Add/remove never switch defaults.
+`target list`, `target inspect NAME [--resolved]` and `config validate` are offline, with optional
+`--json`. `target inspect --json` also reports `home` and, for a server target, `binding`: the digests
+a [Studio link](studio.md#the-link) carries. `target add NAME` without `--cluster` reads a complete
+target JSON object from piped stdin (64 KiB limit); terminal or empty input produces setup guidance.
+Managed add uses `--profile` or `defaults.profile`. `target remove NAME` preserves credentials and
+journals; references must remain valid. Add/remove never switch defaults.
 Discovery-backed add and refresh contact the service. Resolved inspection expands
 the profile and provider; identity is unknown and transport availability is not checked.
 

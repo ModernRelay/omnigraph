@@ -5,6 +5,7 @@ pub(crate) use crate::commands::cluster::{ClusterCommand, ClusterMembersCommand,
 pub(crate) use crate::commands::control::{GraphsCommand, PolicyCommand, QueriesCommand};
 pub(crate) use crate::commands::local::SkillCommand;
 pub(crate) use crate::commands::mcp::McpArgs;
+pub(crate) use crate::commands::studio::StudioArgs;
 pub(crate) use crate::commands::targets::{AccessArgs, CredentialCommand, TargetCommand};
 pub(crate) use crate::managed::args::{
     OrganizationArgs, OrganizationCommand, OrganizationInvitationsCommand,
@@ -220,6 +221,17 @@ pub(crate) enum Command {
     /// discovers or hosts a server. stdout carries only MCP messages and
     /// diagnostics go to stderr.
     Mcp(McpArgs),
+    /// Open OmniGraph Studio on an existing server target, print its link
+    /// and exit.
+    ///
+    /// The `omnigraph-studio://open` link names the target, `--graph` when
+    /// given, and digests of the target's binding and of this operator home,
+    /// which Studio checks against its own resolution of the target. It
+    /// carries no secret and acquires no credential. Direct and managed
+    /// targets refuse. Without Studio, or anything on this platform that
+    /// handles its links, it prints the link and refuses with
+    /// `studio_unavailable`; it never opens a browser.
+    Studio(StudioArgs),
     #[command(
         about = "Validate operator configuration, rename bindings, or recover interrupted edits"
     )]

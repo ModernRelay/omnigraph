@@ -13,6 +13,7 @@
 - Stored queries
 - Operator config & credentials
 - MCP for agents (mcp)
+- Open Studio (studio)
 - Addressing a graph
 - Output formats and positions · health check
 - Organization administration (members and invitations)
@@ -60,6 +61,7 @@ prints the exact flags of the installed binary.
 | `config` | `validate` `rename-profile` `rename-target` `recover-rename` `recover-operations` | Validate/edit operator bindings or preserve legacy operation evidence |
 | `access` | — | Say who you are at a target and which actions its policy grants, graph-wide and on a branch |
 | `mcp` | — | Relay an agent's stdio MCP to an existing server target's `/mcp`, bound to one graph; read-only tools unless `--write` |
+| `studio` | — | Open OmniGraph Studio on an existing server target through an `omnigraph-studio://open` link, and print the link |
 | `skill` | `export` `show` | Export or print this skill as built into the CLI |
 | `version` | — | Print the CLI version, the HTTP contract it speaks and the storage formats it writes and serves; `--json` prints them as one object |
 
@@ -427,6 +429,22 @@ tools only with `--mcp-allow-writes`. `--as` asserts the actor on every
 request. Direct and managed targets refuse with `target_kind_unsupported`; the
 bridge never starts a server. A lost answer is never resent: an
 `outcome_unknown` error means read the target and reconcile before replaying.
+
+## Open Studio
+
+```bash
+omnigraph studio --target staging --graph knowledge --json
+```
+
+`omnigraph studio` opens OmniGraph Studio on an existing server target with an
+`omnigraph-studio://open?target=NAME&binding=…&home=…[&graph=G]` link, prints
+the link and exits. It sends no request and reads no credential; Studio
+resolves the target itself and refuses a link whose `binding` or `home`
+digest differs from what `target inspect NAME --json` reports in its own
+operator home. Direct and managed targets refuse with
+`target_kind_unsupported`. Where nothing opens Studio's links it prints the
+link and refuses with `studio_unavailable`; it never opens a browser. See
+[Open Studio](../../../docs/user/cli/studio.md).
 
 ## Addressing a Graph
 

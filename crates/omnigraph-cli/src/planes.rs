@@ -19,6 +19,9 @@ pub(crate) enum Requirement {
     /// One graph of an existing server, reached only over HTTP: a client of
     /// the server, never of its storage.
     ServedGraph,
+    /// An existing server as a whole, handed to another client: `--graph` may
+    /// name one of its graphs but is not required, and no request is sent.
+    ServedTarget,
     Registry,
     Root,
     /// A whole direct root, optionally filtered by `--graph`, or one served
@@ -112,6 +115,7 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
         }
         Command::Graphs { .. } => Registry,
         Command::Mcp(_) => ServedGraph,
+        Command::Studio(_) => ServedTarget,
         Command::Queries {
             command: QueriesCommand::List { .. },
         } => RootOrServedGraph,
@@ -247,6 +251,7 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
                 | Requirement::Root
                 | Requirement::RootOrServedGraph
                 | Requirement::ServedGraph
+                | Requirement::ServedTarget
         )
     {
         bail!("{} does not accept --graph", command_label(&cli.command));
@@ -343,6 +348,7 @@ fn accepts_actor(command: &Command) -> bool {
         | Command::Target { .. }
         | Command::Config { .. }
         | Command::Credential { .. }
+        | Command::Studio(_)
         | Command::Skill { .. }
         | Command::Version { .. } => false,
     }
@@ -357,9 +363,12 @@ pub(crate) fn validate_target(
     use Requirement::*;
     use TargetBinding::*;
     let need = requirement(&cli.command);
-    if need == ServedGraph && !matches!(target.binding, Server { .. }) {
+    if matches!(need, ServedGraph | ServedTarget) && !matches!(target.binding, Server { .. }) {
         let label = command_label(&cli.command);
         let why = match &target.binding {
+            Managed(_) if need == ServedTarget => {
+                format!("{label} does not open a managed target; it opens a server target")
+            }
             Managed(_) => format!(
                 "{label} does not relay to a managed target; it connects to a server target"
             ),
@@ -388,6 +397,7 @@ pub(crate) fn validate_target(
                 direct_only: false, ..
             }
             | ServedGraph
+            | ServedTarget
             | Registry
             | RootOrServedGraph
             | Deployment
@@ -562,6 +572,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Credential { .. } => "credential",
         Command::Access(_) => "access",
         Command::Mcp(_) => "mcp",
+        Command::Studio(_) => "studio",
         Command::Skill { command } => match command {
             SkillCommand::Export { .. } => "skill export",
             SkillCommand::Show { .. } => "skill show",
@@ -767,6 +778,8 @@ mod tests {
             (&["cleanup"], false),
             (&["mcp"], true),
             (&["mcp", "--write"], true),
+            // Studio's actor is its credential's; the link asserts none.
+            (&["studio"], false),
         ];
         for &(args, accepts_actor) in cases {
             let argv = ["omnigraph"]

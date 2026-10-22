@@ -671,6 +671,10 @@ pub const CLI_ONLY_OPERATIONS: &[CliOnlyOperation] = &[
         "mcp",
         "Relays the MCP protocol to an existing server; --write opts into write tools. It is not a graph HTTP command.",
     ),
+    cli_only(
+        "studio",
+        "Opens OmniGraph Studio on an existing server target through a link; it sends no request to the server and is not a graph HTTP command.",
+    ),
     cli_only("skill export", LOCAL),
     cli_only("skill show", LOCAL),
     cli_only("version", LOCAL),
