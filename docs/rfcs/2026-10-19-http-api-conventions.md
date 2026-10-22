@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - Ragnor Comerford
 created: 2026-10-19
-updated: 2026-10-21
+updated: 2026-10-22
 discussion: https://github.com/ModernRelay/omnigraph/pull/1089
 supersedes: []
 superseded_by: []
@@ -165,22 +165,29 @@ good, because RFC 9728 defines that operation and its path, not OmniGraph.
   success and redirect statuses keep their HTTP meaning: 202 when
   `POST /cluster/deployments` durably accepts a deployment, and 206, 302 and
   304 on Blob GET (302 and 304 on HEAD too).
-- **Errors**: `ErrorCode` in `omnigraph-api-types` owns every code, the
-  statuses it is sent under and the `disposition` action it asks for.
-  `ApiError::status` sends the status of the code a response answers. The
-  guide and the lint read statuses from the registry and copy none. The
-  conventions below rest on these registry facts at 0.14:
-  - An error body answers 503 only with `service_unavailable` or
-    `graph_unavailable`, which ask for a retry after `Retry-After`, or with
-    `recovery_required`, which asks the caller to recover, not to retry.
-    `/readyz` answers 503 as a probe result while the replica is not ready.
-  - A write the server could not settle answers 500 `outcome_unknown`,
-    whatever failed underneath, with `effects: unknown` and `action:
-    reconcile`. The caller reads the target before writing again and never
-    replays the write, as [Storage outcomes per operation and restartable
+- **Errors**: `ErrorCode` in `omnigraph-api-types` owns every code, its
+  statuses and its default action. The returned `disposition.action` is
+  authoritative: `ApiError` accounts for the request's effects and recovery
+  intent before answering. Clients must not infer permission to retry from
+  the code or status alone. `ApiError::status` sends the status of the code a
+  response answers; the guide and the lint read statuses from the registry
+  and copy none.
+  - An error body answers 503 with `service_unavailable`, `graph_unavailable`
+    or `recovery_required`. When the returned action is `retry`, the caller
+    honors `Retry-After`; `reconcile` or `recover` must be completed instead.
+    For example, closed admission after an owned write can answer 503
+    `service_unavailable` with `effects: unknown`, `action: reconcile` and no
+    `Retry-After`. `recovery_required` retains its code and asks for recovery,
+    even with unknown effects. `/readyz` answers 503 as a probe result while
+    the replica is not ready.
+  - An uncertain write completion that requires reconciliation answers 500
+    `outcome_unknown`, with `effects: unknown` and `action: reconcile`; a
+    recovery intent keeps `recovery_required` and `action: recover`. The
+    caller reads the target before writing again and never blindly replays
+    the write, as [Storage outcomes per operation and restartable
     ownership][storage-outcomes] and the [dispositions][dispositions] of the
-    graph-access RFC decide. An unknown publication blocks nothing: later
-    writes to its branch proceed.
+    graph-access RFC decide. An unknown storage publication alone blocks
+    nothing: later writes to its branch proceed.
   - 413 `payload_too_large` covers a body and bounded work: a `limit` above its
     ceiling, and the entity, byte and chain ceilings of mutate, load, merge,
     diffs and changes. It asks the caller to split the work. A zero `limit` is
@@ -305,6 +312,16 @@ to every protected operation, 429 and 503 to graph and deployment routes, and
 408 and 413 to those of them that take a body. The lint adds no response to
 any operation.
 
+Response coverage is checked independently of those descriptions. In step 1,
+the existing per-operation assertions in the OpenAPI owner require the errors
+each handler can send, including `outcome_unknown` for an operation that can
+submit an owned write. Required statuses come from `ErrorCode::http_statuses`.
+Removing a required response, or its named code, must fail even when no
+remaining description mentions that code. When the operation table lands,
+its operation capabilities drive the shared write-outcome assertions; this
+replaces the per-operation checks rather than adding another route or status
+registry. HTTP method alone cannot identify a write: POST also serves reads.
+
 The lint extends the checks that already live in that file:
 `openapi_operations_have_tags`, `multi_mode_operation_ids_are_unique`, the
 Title-Case header check in
@@ -318,9 +335,10 @@ rows are permanent classes, such as protocol-defined paths and process
 probes. Each other row names the batch or design that removes it.
 
 **Batches.** A batch is the set of renames that ship under one HTTP contract
-value. The server accepts exactly one: `require_contract` refuses every other
-value before graph lookup. A batch therefore moves clients and servers
-together, as 0.13 and 0.14 did. Additive changes, such as newly documented
+value. Protected HTTP routes accept exactly one: `require_contract` refuses
+every other value before graph lookup. A batch therefore moves HTTP clients
+and servers together, as 0.13 and 0.14 did. MCP has its separate migration
+obligations below. Additive changes, such as newly documented
 responses, bounds and descriptions, need no new value and land with the lint.
 
 **Not in this RFC.** Statuses, operation names, the change-route schema, the
@@ -339,10 +357,11 @@ page-token design above. `WWW-Authenticate` on graph-route 401s is appendix
 - Invariant 10: trust stays at the boundary. No header supplies the trusted
   actor: the bearer credential resolves it, and `Omnigraph-If-Actor` only
   checks the actor the credential already resolved.
-- Invariant 11: failures are bounded and observable. A retry is what a code's
-  `disposition` asks for. An unsettled write answers 500 `outcome_unknown` and
-  is reconciled, never replayed. No convention here asks for a retry the
-  registry does not.
+- Invariant 11: failures are bounded and observable. Only the returned
+  `disposition.action` authorizes a retry; the registry's default cannot
+  override unknown effects or a recovery intent. An uncertain completion
+  requires reconciliation or recovery before another write, never blind
+  replay.
 - Invariant 12: one source of truth. The conventions are one table that the
   lint reads. Statuses stay in `ErrorCode`, router responses in
   `describe_contract`, operation names in the operation table and the
@@ -361,17 +380,33 @@ release-note row per change:
 | operationIds rendered from the operation table, without `cluster_` | Every operation under `/graphs/{graph_id}` | Regenerate SDKs. Method names change; the wire does not. |
 | `{branch}` becomes `{branch_name}`, `{name}` becomes `{query_name}`, `{id}` becomes `{deployment_id}` | `/branches/{branch}`; `/queries/{name}` and `/queries/{name}/if-graph-commit`; `/cluster/deployments/{id}` | SDK argument names change; URLs do not. |
 | `*Response` becomes `*Output`; enums drop `Output`; `BlobEntityKind` and `EntityKindOutput` become one `EntityKind` | The 5 `*Response` schemas and the 6 `*Output` enums | SDK type names change; values do not. |
-| `AccessOutput.actor` becomes `actor_id` | `GET …/access`, MCP `access`, `omnigraph access --json` | Read `actor_id`. The CLI's access protocol moves from 1 to 2. |
-| `unpublished` and `unattached` become one `listing` enum: `history` (the default), `unpublished`, `unattached` | `GET …/commits` | Send `listing=unpublished` for `unpublished=true`. Those listings still refuse `limit` and `page_token`. |
+| `AccessOutput.actor` becomes `actor_id` | `GET …/access`, MCP `access`, `omnigraph access --json` | Read `actor_id`. The CLI's access protocol moves from 1 to 2; MCP clients follow the tool-schema migration below. |
+| `unpublished` and `unattached` become one `listing` enum: `history` (the default), `unpublished`, `unattached` | `GET …/commits` | Send `listing=unpublished` or `listing=unattached` instead of the corresponding true boolean. Non-history listings still refuse `limit` and `page_token`; retired selectors are rejected as described below. |
 
 Dropping `cluster_` updates `multi_mode_openapi_prefixes_operation_ids_with_cluster`
 to assert the table's ids. Uniqueness then rests on
 `multi_mode_operation_ids_are_unique` and the lint. Old spellings are not kept
-as aliases, because the server accepts one contract: a client that still sends
-0.14 is refused with 400 `api_contract_mismatch` before graph lookup. The
-batch changes names in `openapi.json` and two wire spellings, `actor_id` and
-`listing`; no storage, query or authorization contract changes. A reverted
-batch is another new value.
+as aliases. On protected HTTP routes, a client that still sends 0.14 is
+refused with 400 `api_contract_mismatch` before graph lookup. The batch changes
+names in `openapi.json` and two wire spellings, `actor_id` and `listing`; no
+storage, query or authorization contract changes. A reverted HTTP batch is
+another new value.
+
+The HTTP contract header does not fence `/mcp`. Renaming MCP `access.actor`
+to `actor_id` is an intentional breaking tool-output change in the same
+release. After the server upgrade, MCP clients reconnect and refresh cached
+tool schemas through `tools/list`; clients with fixed response types must
+update them to `actor_id` before reconnecting. Old MCP clients are not
+automatically refused. The release note must say so. MCP protocol negotiation
+stays unchanged, with no field alias or additional version mechanism.
+
+For commit listing, either retired query key, `unpublished` or `unattached`,
+answers 400 `bad_request` regardless of its value or whether `listing` is also
+present. Query deserialization must not silently ignore these keys and fall
+back to `history`, even when the caller sends the new contract header. A
+caller that previously sent a false boolean omits it or sends
+`listing=history`. This is a narrow refusal for the two retired selectors;
+it does not change unknown-query-parameter handling on other routes.
 
 ## Alternatives
 
@@ -402,7 +437,26 @@ batch is another new value.
 
 - `crates/omnigraph-server/tests/integration/openapi.rs` owns the new lint,
   beside `openapi_spec_is_up_to_date`, and extends the checks named in
-  [Design](#design).
+  [Design](#design). Exercise the coverage check against a generated-spec copy
+  with a required write response removed, and one with only its code removed;
+  both must fail. A newly inventoried write must require the same outcome.
+- The existing `ApiError` disposition and retry-header tests remain the owner
+  for 503 `service_unavailable` after an owned write: unknown effects,
+  reconciliation and no `Retry-After`, alongside ordinary retry and recovery
+  cases. Documentation must agree with these final response facts.
+- `data_routes` extends its commit-list cases with the new contract header:
+  omitted `listing` and `listing=history` select history, while
+  `listing=unpublished` and `listing=unattached` select their distinct
+  populations. Each retired key is
+  refused with 400 for true, false and empty values, alone or beside
+  `listing`; invalid enum values and the non-history paging refusals stay
+  covered.
+- The existing MCP catalog and server `mcp` parity owners cover initialization
+  without the HTTP contract header, rediscovery through `tools/list`, and
+  `access` execution. The output schema requires `actor_id` and has no `actor`
+  property; the structured result contains `actor_id`, omits `actor`, and
+  equals the HTTP access body. MCP protocol negotiation and the HTTP
+  contract-header exemption remain covered.
 - The rename batch updates the existing route owners: `data_routes`,
   `auth_policy`, `schema_routes`, `stored_queries`, `multi_graph`,
   `boot_settings` and `mcp`, plus the CLI's `GraphHttpClient`, its access
@@ -421,11 +475,15 @@ batch is another new value.
    parameter descriptions, the `limit` bounds of diffs and changes, 401 on the
    `/cluster/*` routes, the 500 each handler can send (`outcome_unknown` on a
    write included), the top-level `tags` array and the reserved `og_catalog`
-   id. It needs no new contract value and can land now.
+   id, with the required-response assertions in the same change. It needs no
+   new contract value and can land now.
 2. **The rename batch**, under the next contract value after 0.14, once the
    operation table lands in `omnigraph-api-types`, so that the operationIds
    render from it. Its rows are the table in
    [Compatibility and reversibility](#compatibility-and-reversibility).
+   Ship the retired-selector refusals, MCP schema/result parity checks and
+   explicit MCP client upgrade instructions in this batch. The HTTP contract
+   bump alone does not establish MCP compatibility.
    Contract 0.14 already shipped with the graph-access stack
    ([#1074](https://github.com/ModernRelay/omnigraph/pull/1074) and
    [#1076](https://github.com/ModernRelay/omnigraph/pull/1076)):
@@ -462,6 +520,11 @@ page-token design remain in the table.
   next contract value after 0.14, bounded lists become a page-token design
   shared with #1012, the audit counts were refreshed against `openapi.json`,
   and the conventions became one table the lint reads.
+- 2026-10-22: Clarified that the final response disposition controls retry,
+  including reconciliation after a 503 and the recovery exception. Separated
+  MCP's breaking tool-schema migration from HTTP contract admission, required
+  explicit refusal of retired commit-list selectors, and added required-error
+  coverage checks to the existing OpenAPI owner.
 
 [graph-access]: 2026-10-16-graph-access-serving-and-cross-process-writes.md
 [one-set]: 2026-10-16-graph-access-serving-and-cross-process-writes.md#one-set-of-operations
