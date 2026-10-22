@@ -649,9 +649,19 @@ run every five seconds and access refuses at the original 300-second snapshot
 or token expiry. The exact format and limits are in
 [Identity credentials and applied policy authorization](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients).
 
-This profile enables `/.well-known/oauth-protected-resource` and `/mcp`. MCP
-uses the official Rust SDK and the existing stored-query/discovery handlers.
-The initial tools are read-only; invocation checks the stored query kind and
-the same Cedar policy as HTTP. A registered resource or listed tool is never
-a permission grant. Static-token deployments and the native signed-token
-profiles retain their existing behavior.
+The server mounts `/mcp` whenever it has a bearer credential source: static
+tokens, signed data tokens or OIDC. OIDC additionally enables
+`/.well-known/oauth-protected-resource` and the metadata path advertised in the
+authentication challenge. Ad-hoc reads and write tools require their separate
+boot opt-ins; every invocation uses the same handlers and policy as HTTP.
+A registered resource or listed tool is never a permission grant.
+
+`omnigraph-mcp` owns the SDK integration, tool/resource catalog, settings,
+argument decoding, result formatting and response deadlines. The server adapter
+owns authentication, OAuth metadata, handler dispatch and admission, retaining
+execution ownership when the caller stops waiting. It also supplies the canonical
+`ApiError` projection for protocol refusals and handler failures, including the
+unknown-effect disposition when an admitted write's result cannot be delivered.
+The protocol crate wraps these bodies without a second error-code registry.
+Both transports share one listener and serving lifecycle. The supported tools
+and limits live in the [MCP guide](../user/operations/mcp.md).
