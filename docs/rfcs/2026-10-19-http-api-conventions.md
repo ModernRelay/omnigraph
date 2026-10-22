@@ -23,20 +23,22 @@ The HTTP API gets one written style, held by a test over the generated
 lists and the spec's coverage. It adds no second source beside the owners that
 already hold a contract: the `ErrorCode` registry owns codes and statuses, the
 operation table of [Graph access and cross-process writes][graph-access] owns
-operation names, and the shipped code owns branch-action dispatch, the
+operation names, and the existing code owns branch-action dispatch, the
 fail-closed graph-commit routes and the change-route error schema.
 
 Today's deviations are pinned as named exceptions, so a new one fails CI. One
-batch of renames removes most of them under the next HTTP contract value after
-0.14. The renames change spellings only: operationIds, path parameter names,
-schema names, one response field and one query parameter. No route moves, and
-no status, operation meaning, authorization or storage effect changes.
+batch of renames removes most of them within HTTP contract 0.14, which is still
+in development and has not been released. Merged prerelease code does not
+establish a released contract. The renames change spellings only: operationIds,
+path parameter names, schema names, one response field and one query parameter.
+No route moves, and no status, operation meaning, authorization or storage
+effect changes.
 
 ## Motivation
 
 The spec grew one route at a time, and each route made its own local choices.
-An audit of `openapi.json` at contract 0.14, 41 operations on 34 paths, found
-the following:
+An audit of the prerelease `openapi.json` at contract 0.14, 41 operations on
+34 paths, found the following:
 
 - **operationIds** use six forms: 22 are `cluster_` plus camelCase, 4
   `cluster_` plus snake_case, 4 `cluster_` plus one word (`cluster_export`,
@@ -97,9 +99,10 @@ long-term cost.
 
 ## User and operational behavior
 
-Clients see the conventions below. Nothing changes on the wire until the
-rename batch ships under a new contract value, announced in a breaking release
-note.
+Clients see the conventions below when the rename batch lands in the
+unreleased 0.14 contract. Clients built against earlier development commits
+must adopt the renamed fields and selectors; the HTTP contract header remains
+0.14. A breaking release note records those changes.
 
 ### Names
 
@@ -338,10 +341,13 @@ probes. Each other row names the batch or design that removes it.
 
 **Batches.** A batch is the set of renames that ship under one HTTP contract
 value. Protected HTTP routes accept exactly one: `require_contract` refuses
-every other value before graph lookup. A batch therefore moves HTTP clients
-and servers together, as 0.13 and 0.14 did. MCP has its separate migration
-obligations below. Additive changes, such as newly documented
-responses, bounds and descriptions, need no new value and land with the lint.
+every other value before graph lookup. An incompatible change to a released
+contract requires a new value and moves HTTP clients and servers together.
+This batch completes the unreleased 0.14 contract, so it keeps 0.14; the header
+does not distinguish earlier development builds from the final release. MCP
+has its separate migration obligations below. Additive changes, such as newly
+documented responses, bounds and descriptions, need no new value and land with
+the lint.
 
 **Not in this RFC.** Statuses, operation names, the change-route schema, the
 conditional routes and the branch-action URLs keep their owners. Merging
@@ -374,8 +380,8 @@ No deny-list item is involved.
 ## Compatibility and reversibility
 
 The lint, its table and the additive documentation are free to land and to
-revert. The rename batch takes one new contract value, with one breaking
-release-note row per change:
+revert. The rename batch completes HTTP contract 0.14 before release, with one
+breaking release-note row per change:
 
 | Change | Where | Breaking-note row |
 |---|---|---|
@@ -388,11 +394,13 @@ release-note row per change:
 Dropping `cluster_` updates `multi_mode_openapi_prefixes_operation_ids_with_cluster`
 to assert the table's ids. Uniqueness then rests on
 `multi_mode_operation_ids_are_unique` and the lint. Old spellings are not kept
-as aliases. On protected HTTP routes, a client that still sends 0.14 is
-refused with 400 `api_contract_mismatch` before graph lookup. The batch changes
-names in `openapi.json` and two wire spellings, `actor_id` and `listing`; no
-storage, query or authorization contract changes. A reverted HTTP batch is
-another new value.
+as aliases. Protected HTTP routes continue to require 0.14 and refuse other
+values with 400 `api_contract_mismatch` before graph lookup. A prerelease
+client sending 0.14 is not automatically refused: it must use the final
+response fields and selectors. The batch changes names in `openapi.json` and
+two wire spellings, `actor_id` and `listing`; no storage, query or authorization
+contract changes. After 0.14 is released, an incompatible change or reversal
+requires another contract value; pre-release corrections do not.
 
 The HTTP contract header does not fence `/mcp`. Renaming MCP `access.actor`
 to `actor_id` is an intentional breaking tool-output change in the same
@@ -405,7 +413,7 @@ stays unchanged, with no field alias or additional version mechanism.
 For commit listing, either retired query key, `unpublished` or `unattached`,
 answers 400 `bad_request` regardless of its value or whether `listing` is also
 present. Query deserialization must not silently ignore these keys and fall
-back to `history`, even when the caller sends the new contract header. A
+back to `history`, even when the caller sends the required 0.14 header. A
 caller that previously sent a false boolean omits it or sends
 `listing=history`. This is a narrow refusal for the two retired selectors;
 it does not change unknown-query-parameter handling on other routes.
@@ -446,7 +454,7 @@ it does not change unknown-query-parameter handling on other routes.
   for 503 `service_unavailable` after an owned write: unknown effects,
   reconciliation and no `Retry-After`, alongside ordinary retry and recovery
   cases. Documentation must agree with these final response facts.
-- `data_routes` extends its commit-list cases with the new contract header:
+- `data_routes` extends its commit-list cases with the unchanged 0.14 header:
   omitted `listing` and `listing=history` select history, while
   `listing=unpublished` and `listing=unattached` select their distinct
   populations. Each retired key is
@@ -480,9 +488,9 @@ has merged yet:
 - [#1132](https://github.com/ModernRelay/omnigraph/pull/1132): the shared
   operation inventory, checked against actual HTTP registrations, MCP tools
   and CLI commands.
-- [#1133](https://github.com/ModernRelay/omnigraph/pull/1133): HTTP contract
-  0.15, SDK naming, `actor_id`, commit `listing`, access protocol 2 and MCP
-  client migration.
+- [#1133](https://github.com/ModernRelay/omnigraph/pull/1133): standardize the
+  unreleased HTTP contract 0.14 with SDK naming, `actor_id`, commit `listing`,
+  access protocol 2 and MCP client migration.
 
 1. **The lint, its table and the additive documentation.** Today's exceptions
    are pinned as they stand. The same change documents the six missing
@@ -491,18 +499,19 @@ has merged yet:
    write included), the top-level `tags` array and the reserved `og_catalog`
    id, with the required-response assertions in the same change. It needs no
    new contract value and can land now.
-2. **The rename batch**, under the next contract value after 0.14, once the
+2. **The rename batch**, within the unreleased contract 0.14, once the
    operation table lands in `omnigraph-api-types`, so that the operationIds
    render from it. Its rows are the table in
    [Compatibility and reversibility](#compatibility-and-reversibility).
    Ship the retired-selector refusals, MCP schema/result parity checks and
-   explicit MCP client upgrade instructions in this batch. The HTTP contract
-   bump alone does not establish MCP compatibility.
-   Contract 0.14 already shipped with the graph-access stack
+   explicit MCP client upgrade instructions in this batch. HTTP admission
+   does not establish MCP compatibility.
+   The graph-access stack merged code for contract 0.14
    ([#1074](https://github.com/ModernRelay/omnigraph/pull/1074) and
    [#1076](https://github.com/ModernRelay/omnigraph/pull/1076)):
-   `disposition`, the code registry and `Omnigraph-If-Actor`. Nothing in this
-   RFC rides it.
+   `disposition`, the code registry and `Omnigraph-If-Actor`. Those merges are
+   prerelease development, not a published 0.14 release. This RFC completes
+   that same contract without advancing the HTTP contract value.
 
 `implementation` moves to `in-progress` with step 1 and to `complete` when
 step 2 ships and only the permanent classes and the rows owned by the
@@ -530,19 +539,25 @@ page-token design remain in the table.
   graph-access operation table, the `cluster_` prefix drops in the rename
   batch, and the non-graph path classes are named. The fail-closed conditional
   routes, `ChangeErrorOutput` and the `BranchAction` dispatch stay; the
-  branch-action move and the route merges are dropped. The renames take the
-  next contract value after 0.14, bounded lists become a page-token design
-  shared with #1012, the audit counts were refreshed against `openapi.json`,
-  and the conventions became one table the lint reads.
+  branch-action move and the route merges are dropped. The draft then assigned
+  the renames to a contract after 0.14 (corrected below); bounded lists become
+  a page-token design shared with #1012, the audit counts were refreshed
+  against `openapi.json`, and the conventions became one table the lint reads.
 - 2026-10-22: Clarified that the final response disposition controls retry,
   including reconciliation after a 503 and the recovery exception. Separated
   MCP's breaking tool-schema migration from HTTP contract admission, required
   explicit refusal of retired commit-list selectors, and added required-error
   coverage checks to the existing OpenAPI owner.
-- 2026-10-22: Recorded the three stacked implementation PRs and contract 0.15
-  for the rename batch. Flat-path classification now derives from the shared
-  operation inventory; the implementation remains in progress until the
-  stack merges.
+- 2026-10-22: Recorded the three stacked implementation PRs and initially
+  assigned contract 0.15 to the rename batch (corrected below). Flat-path
+  classification now derives from the shared operation inventory; the
+  implementation remains in progress until the stack merges.
+- 2026-10-22: Corrected the release assumption: 0.14 remains unreleased, and
+  merged graph-access code is prerelease development. The rename batch stays
+  within HTTP contract 0.14; #1133 standardizes that contract instead of
+  advancing it to 0.15. Access protocol 2, the MCP client upgrade and explicit
+  retired-selector refusal remain. New HTTP contract values are required for
+  incompatible changes after release, not for this pre-release correction.
 
 [graph-access]: 2026-10-16-graph-access-serving-and-cross-process-writes.md
 [one-set]: 2026-10-16-graph-access-serving-and-cross-process-writes.md#one-set-of-operations
