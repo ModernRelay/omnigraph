@@ -4,21 +4,22 @@ use std::future::Future;
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query, RawQuery, Request, State};
+use axum::extract::{RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use omnigraph_mcp::{
-    AdmissionError, Host, HostError, Pending, ResourceOutput, ResourceRequest, ToolCall,
-    ToolRequest, ToolResult, change_query,
+    AdmissionError, Host, HostError, Pending, ProtocolError, ResourceOutput, ResourceRequest,
+    ToolCall, ToolRequest, ToolResult, change_query,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::OwnedSemaphorePermit;
 
-use crate::api::InvokeStoredQueryRequest;
+use crate::api::{ErrorCode, InvokeStoredQueryRequest};
+use crate::extract::{ApiJson, ApiPath, ApiQuery};
 use crate::handlers::{self, QueryNamePath};
 use crate::ingress::McpGraphRequest;
 use crate::serving::GraphRequest;
@@ -235,6 +236,10 @@ impl Host for ServerHost {
         admitted(parts)
     }
 
+    fn error(&self, error: ProtocolError, write: bool) -> HostError {
+        project_error(protocol_error(error, write), write)
+    }
+
     fn start_tool(
         &self,
         context: Admitted,
@@ -245,7 +250,8 @@ impl Host for ServerHost {
         let actor = context.actor.clone();
         let input = context.input.clone();
         let graph = context.graph.clone();
-        start_owned(context, permit, async move {
+        let write = request.is_write();
+        start_owned(context, permit, write, async move {
             host.execute(request, actor, input, graph).await
         })
     }
@@ -259,7 +265,7 @@ impl Host for ServerHost {
         let host = self.clone();
         let actor = context.actor.clone();
         let graph = context.graph.clone();
-        start_owned(context, permit, async move {
+        start_owned(context, permit, false, async move {
             host.read(request, actor, graph).await
         })
     }
@@ -268,7 +274,12 @@ impl Host for ServerHost {
 /// Register before returning the observation future: a caller can cancel or
 /// expire without ever polling that future. Execution retains every reservation
 /// until its owned work settles, including graph selection after cancellation.
-fn start_owned<T, F>(context: Admitted, permit: OwnedSemaphorePermit, operation: F) -> Pending<T>
+fn start_owned<T, F>(
+    context: Admitted,
+    permit: OwnedSemaphorePermit,
+    write: bool,
+    operation: F,
+) -> Pending<T>
 where
     T: Send + 'static,
     F: Future<Output = Result<T, ApiError>> + Send + 'static,
@@ -276,18 +287,89 @@ where
     let read = context
         .observer
         .spawn_read((context.input, permit, context.graph), operation);
-    Box::pin(async move { read.result().await.map_err(host_error) })
+    Box::pin(async move {
+        read.result()
+            .await
+            .map_err(|error| host_error(error, write))
+    })
 }
 
-fn host_error(error: ApiError) -> HostError {
-    let status = error.status;
-    let uncertain = error.completion_uncertain();
-    HostError::from_output(status, &error.into_output(), uncertain)
+/// Project the canonical API contract before crossing the protocol boundary.
+/// A failed write receipt must preserve its unknown effects even when the error
+/// body itself cannot fit the MCP response bound.
+fn host_error(mut error: ApiError, write: bool) -> HostError {
+    if write && (error.completion_uncertain() || error.code == ErrorCode::ResultTooLarge) {
+        error = error.after_owned_write();
+    }
+    project_error(error, write)
+}
+
+fn project_error(error: ApiError, write: bool) -> HostError {
+    let output = error.into_output();
+    let status = output
+        .http_status()
+        .and_then(|status| StatusCode::from_u16(status).ok());
+    HostError::from_output(status, &output).unwrap_or_else(|failure| {
+        let mut error = protocol_error(failure, write);
+        if write {
+            error = error.after_owned_write();
+        }
+        let output = error.into_output();
+        let status = output
+            .http_status()
+            .and_then(|status| StatusCode::from_u16(status).ok());
+        HostError::from_output(status, &output).expect("fixed MCP refusal fits the result bound")
+    })
+}
+
+/// MCP refusals use the server's one error-code and disposition registry.
+fn protocol_error(error: ProtocolError, write: bool) -> ApiError {
+    let unknown = "The write keeps running and its outcome is unknown. Before replaying it, read the target (`read` or `snapshot`, comparing `graph_commit_id`) or list the branch with `commits_list`, and replay a `mutate` with `if_graph_commit`.";
+    let wait_ended = |code, reason: &str| {
+        let mut error = ApiError::new(code, format!("{reason} {unknown}")).after_owned_write();
+        error.completion_uncertain = true;
+        error
+    };
+    match error {
+        ProtocolError::Unauthenticated => {
+            ApiError::unauthorized("A verified bearer credential is required.")
+        }
+        ProtocolError::MissingContext => ApiError::internal("MCP admission context is missing."),
+        ProtocolError::Capacity => ApiError::too_many_requests(
+            "The server is handling its maximum concurrent MCP tool calls.",
+        ),
+        ProtocolError::Cancelled if write => {
+            wait_ended(ErrorCode::Cancelled, "The write's call was cancelled.")
+        }
+        ProtocolError::Cancelled => ApiError::new(ErrorCode::Cancelled, "The read was cancelled."),
+        ProtocolError::Deadline if write => wait_ended(
+            ErrorCode::DeadlineExceeded,
+            "The write passed its 30 second wait.",
+        ),
+        ProtocolError::Deadline => ApiError::new(
+            ErrorCode::DeadlineExceeded,
+            "The read exceeded its 30 second deadline.",
+        ),
+        ProtocolError::ResultTooLarge | ProtocolError::InvalidResult => {
+            let error = if matches!(error, ProtocolError::ResultTooLarge) {
+                ApiError::new(
+                    ErrorCode::ResultTooLarge,
+                    "The result exceeds 1 MiB; use a narrower stored query.",
+                )
+            } else {
+                ApiError::internal("could not encode MCP result")
+            };
+            if write {
+                error.after_owned_write()
+            } else {
+                error
+            }
+        }
+    }
 }
 
 fn bounded_result<T: Serialize>(value: &T) -> Result<ToolResult, ApiError> {
-    omnigraph_mcp::bounded_result(value)
-        .map_err(|_| ApiError::internal("could not encode MCP result"))
+    omnigraph_mcp::bounded_result(value).map_err(|error| protocol_error(error, false))
 }
 
 impl ServerHost {
@@ -346,7 +428,7 @@ impl ServerHost {
                     Extension(handle),
                     Extension(input),
                     Some(Extension(actor)),
-                    Path(QueryNamePath { name: args.name }),
+                    ApiPath(QueryNamePath { name: args.name }),
                     HeaderMap::new(),
                     Bytes::from(body),
                 )
@@ -366,7 +448,7 @@ impl ServerHost {
                     state(),
                     Extension(handle),
                     Some(Extension(actor)),
-                    Ok(Json(request)),
+                    ApiJson(request),
                 )
                 .await?;
                 bounded_result(&output.0)
@@ -376,7 +458,7 @@ impl ServerHost {
                 let output = handlers::server_snapshot(
                     Extension(handle),
                     Some(Extension(actor)),
-                    Query(crate::api::SnapshotQuery {
+                    ApiQuery(crate::api::SnapshotQuery {
                         branch: args.branch,
                     }),
                 )
@@ -406,7 +488,7 @@ impl ServerHost {
                 let output = handlers::server_commit_list(
                     Extension(handle),
                     Some(Extension(actor)),
-                    Query(crate::api::CommitListQuery {
+                    ApiQuery(crate::api::CommitListQuery {
                         branch: args.branch,
                         unpublished: false,
                         unattached: false,
@@ -422,7 +504,7 @@ impl ServerHost {
                 let output = handlers::server_commit_show(
                     Extension(handle),
                     Some(Extension(actor)),
-                    Path(handlers::CommitPath {
+                    ApiPath(handlers::CommitPath {
                         commit_id: args.commit_id,
                     }),
                 )
@@ -435,7 +517,7 @@ impl ServerHost {
                 let output = handlers::server_commit_changes(
                     Extension(handle),
                     Some(Extension(actor)),
-                    Path(handlers::CommitPath {
+                    ApiPath(handlers::CommitPath {
                         commit_id: args.commit_id,
                     }),
                     RawQuery(query),
@@ -464,7 +546,7 @@ impl ServerHost {
             ToolCall::Mutate(args) => {
                 let ingress = write_ingress()?;
                 let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let request = Json(request_body(json!({
+                let request = ApiJson(request_body(json!({
                     "query": args.query,
                     "name": args.name,
                     "params": args.params,
@@ -485,7 +567,7 @@ impl ServerHost {
                             Extension(ingress),
                             Some(Extension(actor)),
                             headers,
-                            Ok(request),
+                            request,
                         )
                         .await?
                     }
@@ -496,7 +578,7 @@ impl ServerHost {
                             Extension(ingress),
                             Some(Extension(actor)),
                             HeaderMap::new(),
-                            Ok(request),
+                            request,
                         )
                         .await?
                     }
@@ -517,7 +599,7 @@ impl ServerHost {
                     Extension(handle),
                     Extension(ingress),
                     Some(Extension(actor)),
-                    Json(request),
+                    ApiJson(request),
                 )
                 .await?;
                 bounded_result(&output.0)
@@ -530,7 +612,7 @@ impl ServerHost {
                     Extension(handle),
                     Extension(ingress),
                     Some(Extension(actor)),
-                    Json(crate::api::BranchCreateRequest {
+                    ApiJson(crate::api::BranchCreateRequest {
                         from: args.from,
                         from_commit: args.from_commit,
                         name: args.name,
@@ -547,7 +629,7 @@ impl ServerHost {
                     Extension(handle),
                     Extension(ingress),
                     Some(Extension(actor)),
-                    Path(handlers::BranchPath { branch: args.name }),
+                    ApiPath(handlers::BranchPath { branch: args.name }),
                 )
                 .await?;
                 bounded_result(&output.0)
@@ -564,7 +646,7 @@ impl ServerHost {
                     Extension(handle),
                     Extension(ingress),
                     Some(Extension(actor)),
-                    Ok(Json(request)),
+                    ApiJson(request),
                 )
                 .await?;
                 bounded_result(&output.0)
@@ -674,6 +756,134 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::Semaphore;
 
+    fn error_body(error: HostError) -> Value {
+        let result = error.into_tool_result();
+        assert_eq!(result.is_error, Some(true));
+        assert!(serde_json::to_vec(&result).unwrap().len() <= omnigraph_mcp::RESULT_BYTES);
+        let body = result.structured_content.unwrap();
+        assert!(body.get("outcome_unknown").is_none(), "{body}");
+        body
+    }
+
+    #[test]
+    fn a_write_whose_wait_ends_first_reports_an_unknown_outcome() {
+        let unknown = json!({"effects": "unknown", "action": "reconcile"});
+        for refusal in [ProtocolError::Cancelled, ProtocolError::Deadline] {
+            let body = error_body(project_error(protocol_error(refusal, true), true));
+            assert_eq!(body["status"], 500, "{body}");
+            assert_eq!(body["error"]["code"], "outcome_unknown", "{body}");
+            assert_eq!(body["error"]["disposition"], unknown, "{body}");
+        }
+        // A handler failure the server cannot settle is an unknown outcome
+        // for a write only; a refusal before effects remains a known one.
+        for (error, write, code, disposition) in [
+            (ApiError::internal("lost"), true, "outcome_unknown", unknown),
+            (
+                ApiError::bad_request("refused"),
+                true,
+                "bad_request",
+                json!({"effects": "none", "action": "fix"}),
+            ),
+            (
+                ApiError::internal("lost"),
+                false,
+                "internal",
+                json!({"effects": "none", "action": "refresh"}),
+            ),
+        ] {
+            let body = error_body(host_error(error, write));
+            assert_eq!(body["error"]["code"], code, "{body}");
+            assert_eq!(body["error"]["disposition"], disposition, "{body}");
+        }
+    }
+
+    #[test]
+    fn protocol_refusals_use_the_server_error_registry() {
+        for write in [false, true] {
+            for (refusal, status, code, action) in [
+                (
+                    ProtocolError::Unauthenticated,
+                    Some(401),
+                    "unauthorized",
+                    "fix",
+                ),
+                (
+                    ProtocolError::MissingContext,
+                    Some(500),
+                    "internal",
+                    "refresh",
+                ),
+                (
+                    ProtocolError::Capacity,
+                    Some(429),
+                    "too_many_requests",
+                    "retry",
+                ),
+            ] {
+                let body = error_body(project_error(protocol_error(refusal, write), write));
+                assert_eq!(body["status"], json!(status), "{body}");
+                assert_eq!(body["error"]["code"], code, "{body}");
+                assert_eq!(
+                    body["error"]["disposition"],
+                    json!({"effects": "none", "action": action}),
+                    "{body}"
+                );
+            }
+        }
+        for (refusal, code, action) in [
+            (ProtocolError::Cancelled, "cancelled", "retry"),
+            (ProtocolError::Deadline, "deadline_exceeded", "retry"),
+            (ProtocolError::ResultTooLarge, "result_too_large", "fix"),
+        ] {
+            let body = error_body(project_error(protocol_error(refusal, false), false));
+            assert!(body.get("status").is_none(), "{body}");
+            assert_eq!(body["error"]["code"], code, "{body}");
+            assert_eq!(
+                body["error"]["disposition"],
+                json!({"effects": "none", "action": action}),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_tool_results_and_error_bodies_preserve_write_effects() {
+        // The first DTO fits by itself, but not with the SDK's text copy.
+        // The second exceeds even the DTO bound. Both are call errors, so a
+        // write whose receipt cannot be delivered must be reconciled.
+        for length in [
+            omnigraph_mcp::RESULT_BYTES * 3 / 4,
+            omnigraph_mcp::RESULT_BYTES + 1,
+        ] {
+            let value = json!({"text": "x".repeat(length)});
+            for write in [false, true] {
+                let disposition = if write {
+                    json!({"effects": "unknown", "action": "reconcile"})
+                } else {
+                    json!({"effects": "none", "action": "fix"})
+                };
+                for error in [
+                    bounded_result(&value).unwrap_err(),
+                    // The refusal itself has to fit the complete result too.
+                    ApiError::bad_request("x".repeat(length)),
+                ] {
+                    let body = error_body(host_error(error, write));
+                    assert!(body.get("status").is_none(), "{body}");
+                    assert_eq!(body["error"]["code"], "result_too_large", "{body}");
+                    assert_eq!(body["error"]["disposition"], disposition, "{body}");
+                }
+                // The protocol's final response-size check uses the same
+                // server projection as a handler's bounded DTO conversion.
+                let body = error_body(project_error(
+                    protocol_error(ProtocolError::ResultTooLarge, write),
+                    write,
+                ));
+                assert_eq!(body["error"]["code"], "result_too_large", "{body}");
+                assert_eq!(body["error"]["disposition"], disposition, "{body}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn cancelled_or_expired_mcp_read_retains_capacity_until_execution_finishes() {
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -711,6 +921,7 @@ mod tests {
                         graph,
                     },
                     slots.clone().try_acquire_owned().unwrap(),
+                    false,
                     async move {
                         // Graph resolution can happen after MCP cancellation
                         // has already returned its error to the HTTP task.

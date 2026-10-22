@@ -33,6 +33,7 @@ loading reject branch-statement files.
 omnigraph queries validate --target .             # all applied graphs
 omnigraph queries validate --target . --graph dev # one graph
 omnigraph queries list --target . --graph dev     # names and typed params
+omnigraph queries list --target prod --graph dev --json # a server's GET /graphs/{id}/queries body
 ```
 
 - `cluster validate --config .` checks desired `.gq` sources before apply.
@@ -41,8 +42,12 @@ omnigraph queries list --target . --graph dev     # names and typed params
   edits. Registry drift or duplicate names quarantine the affected graph by
   default while healthy graphs serve; startup is fatal when no healthy graph
   remains or `--require-all-graphs` is set.
-- Both commands take `--target <dir|uri>`; `--graph` narrows the operation to
-  one declared graph.
+- Both commands take a cluster root `--target <dir|uri>`; `--graph` narrows the
+  operation to one declared graph. `queries list` also takes a server target,
+  where `--graph` or the target's `default_graph` selects the graph and `--json`
+  prints the route's body: its parameters carry `kind` (`string`, `int`, `list`
+  with `item_kind`, `vector` with `vector_dim`, ...) rather than the root
+  form's GQ `type`.
 - `queries` is distinct from `lint` — `lint` validates a single `.gq` file you point it at; `queries validate` validates the registry the server will actually serve.
 
 ## HTTP surface

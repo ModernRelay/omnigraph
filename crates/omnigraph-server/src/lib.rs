@@ -5,6 +5,7 @@ pub mod api;
 mod blob_transport;
 mod deployment;
 mod export_transport;
+mod extract;
 mod handlers;
 mod http_contract;
 mod ingress;
@@ -12,6 +13,7 @@ mod mcp;
 pub mod operations;
 mod redacted_cause;
 mod settings;
+use extract::{ApiJson, ApiPath, ApiQuery};
 use handlers::*;
 use settings::*;
 pub use settings::{
@@ -58,8 +60,7 @@ use api::{
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
-use axum::extract::rejection::{JsonRejection, QueryRejection};
-use axum::extract::{Extension, OriginalUri, Path, Query, Request, State};
+use axum::extract::{Extension, OriginalUri, Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
@@ -472,11 +473,33 @@ struct OpenedGraph {
 /// [`api::ErrorOutput`] remains the wire contract.
 #[derive(Debug)]
 pub struct ApiError {
-    status: StatusCode,
-    code: Option<ErrorCode>,
+    /// Every error the server answers names its registry code, and answers
+    /// under one of that code's HTTP statuses: its usual one unless its
+    /// details choose another.
+    code: ErrorCode,
     message: Box<str>,
     details: Option<Box<ApiErrorDetails>>,
     completion_uncertain: bool,
+    /// Set once the error follows an owned write, the only place an operation
+    /// can have had effects: it came back through the owned-write boundary,
+    /// or the request that raised it had submitted one. Errors of reads and
+    /// refusals before admission never set it, so they never have effects.
+    owned_write: bool,
+    /// Set when an earlier step of the error's operation publishes on its own,
+    /// as the fork a load makes of a missing branch does, so a refusal of a
+    /// later step follows that publication.
+    compound: bool,
+    /// Set when the engine proved the failing step published nothing itself,
+    /// with no-effect or no-publication evidence, whatever its type.
+    unpublished: bool,
+    /// The outcome is unknown only for storage requests whose uncertainty
+    /// is scoped to their own keys: a publication in doubt, whose late
+    /// landing its version key fences (the version is created only if
+    /// absent, so it lands before the branch's next publication or never),
+    /// or an opaque storage failure, whose mutable keys the storage scope
+    /// holds unsettled. Such an error reports its unknown outcome but does
+    /// not contain the process.
+    scoped_unknown: bool,
 }
 
 #[derive(Debug)]
@@ -497,6 +520,43 @@ enum ApiErrorDetails {
     FullTextIndexRebuildRequired(api::FullTextIndexRebuildRequiredOutput),
     FullTextIndexRequired(api::FullTextIndexRequiredOutput),
     Diagnostic(api::DiagnosticOutput),
+}
+
+/// What a detail says about the operation that failed with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailClass {
+    /// A refusal the engine gives before its one publication, so a refused
+    /// publication did not happen.
+    Refusal,
+    /// Something must be resolved or built before the operation can run.
+    Recovery,
+    /// A read's refusal, which says nothing of a write's effects.
+    Read,
+}
+
+impl ApiErrorDetails {
+    /// Exhaustive, so a new detail must decide whether it refuses before
+    /// publication.
+    fn class(&self) -> DetailClass {
+        match self {
+            Self::MergeConflicts(_)
+            | Self::PublishedDatasetVersionConflict(_)
+            | Self::ReadSetConflict(_)
+            | Self::KeyConflict(_)
+            | Self::ResourceLimit(_)
+            | Self::ExternalBlobSource(_)
+            | Self::PreconditionFailure(_)
+            | Self::BlobPreconditionFailure(_)
+            | Self::BranchStartRefusal(_)
+            | Self::Diagnostic(_) => DetailClass::Refusal,
+            Self::RecoveryRequired(_)
+            | Self::FullTextIndexRebuildRequired(_)
+            | Self::FullTextIndexRequired(_) => DetailClass::Recovery,
+            Self::BlobRange(_) | Self::ChangeFeedGap(_) | Self::ChangeDiffRefusal(_) => {
+                DetailClass::Read
+            }
+        }
+    }
 }
 
 impl AppState {
@@ -1037,190 +1097,150 @@ fn hash_bearer_tokens(bearer_tokens: Vec<(String, String)>) -> Arc<[(BearerToken
 }
 
 impl ApiError {
-    pub fn unauthorized(message: impl Into<String>) -> Self {
+    /// An error with `code` and no details, answered under the code's HTTP
+    /// status. A definite refusal: nothing it reports may have taken effect
+    /// unless it returns through an owned write.
+    pub(crate) fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
-            completion_uncertain: false,
-            status: StatusCode::UNAUTHORIZED,
-            code: Some(ErrorCode::Unauthorized),
+            code,
             message: message.into().into_boxed_str(),
             details: None,
+            completion_uncertain: false,
+            owned_write: false,
+            compound: false,
+            unpublished: false,
+            scoped_unknown: false,
         }
+    }
+
+    fn with_details(mut self, details: ApiErrorDetails) -> Self {
+        self.details = Some(Box::new(details));
+        self
+    }
+
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Unauthorized, message)
     }
 
     pub fn forbidden(message: impl Into<String>) -> Self {
-        Self {
-            completion_uncertain: false,
-            status: StatusCode::FORBIDDEN,
-            code: Some(ErrorCode::Forbidden),
-            message: message.into().into_boxed_str(),
-            details: None,
-        }
+        Self::new(ErrorCode::Forbidden, message)
     }
 
     pub fn bad_request(message: impl Into<String>) -> Self {
-        Self {
-            completion_uncertain: false,
-            status: StatusCode::BAD_REQUEST,
-            code: Some(ErrorCode::BadRequest),
-            message: message.into().into_boxed_str(),
-            details: None,
-        }
-    }
-
-    fn json_rejection(context: &str, rejection: JsonRejection) -> Self {
-        let status = match rejection.status() {
-            // Axum classifies serde data-shape failures as 422. OmniGraph's
-            // documented request-contract refusal is the typed 400 lane.
-            StatusCode::UNPROCESSABLE_ENTITY => StatusCode::BAD_REQUEST,
-            status => status,
-        };
-        let mut error = Self::bad_request(format!("{context}: {}", rejection.body_text()));
-        // Axum uses JsonRejection for data/syntax failures (400), a body-limit
-        // failure (413), and a missing/wrong JSON Content-Type (415). Keep the
-        // transport status while projecting every case into ErrorOutput.
-        error.status = status;
-        error
+        Self::new(ErrorCode::BadRequest, message)
     }
 
     pub fn not_found(message: impl Into<String>) -> Self {
-        Self {
-            completion_uncertain: false,
-            status: StatusCode::NOT_FOUND,
-            code: Some(ErrorCode::NotFound),
-            message: message.into().into_boxed_str(),
-            details: None,
-        }
+        Self::new(ErrorCode::NotFound, message)
     }
 
-    /// HTTP 405 Method Not Allowed. Used when the route is mounted but
-    /// the active server mode doesn't serve it (`GET /graphs` in
-    /// single-graph mode returns this instead of 404 so clients can
-    /// distinguish "wrong context" from "no such resource").
+    /// HTTP 405 Method Not Allowed: the path is routed but does not serve the
+    /// request's method, which a client can tell from "no such resource".
     pub fn method_not_allowed(message: impl Into<String>) -> Self {
-        Self {
-            completion_uncertain: false,
-            status: StatusCode::METHOD_NOT_ALLOWED,
-            code: Some(ErrorCode::MethodNotAllowed),
-            message: message.into().into_boxed_str(),
-            details: None,
-        }
+        Self::new(ErrorCode::MethodNotAllowed, message)
     }
 
     pub fn conflict(message: impl Into<String>) -> Self {
-        Self {
-            completion_uncertain: false,
-            status: StatusCode::CONFLICT,
-            code: Some(ErrorCode::Conflict),
-            message: message.into().into_boxed_str(),
-            details: None,
-        }
+        Self::new(ErrorCode::Conflict, message)
     }
 
     /// HTTP 409 with [`ErrorCode::UnattachedCannotPublish`]: a publish
     /// addressed an unattached snapshot, a kind that never publishes; no
     /// durable effect happened.
     fn unattached_cannot_publish(message: impl Into<String>) -> Self {
-        Self {
-            completion_uncertain: false,
-            status: StatusCode::CONFLICT,
-            code: Some(ErrorCode::UnattachedCannotPublish),
-            message: message.into().into_boxed_str(),
-            details: None,
-        }
+        Self::new(ErrorCode::UnattachedCannotPublish, message)
     }
 
     fn unsupported_media_type(message: impl Into<String>) -> Self {
-        Self {
-            completion_uncertain: false,
-            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            code: Some(ErrorCode::BadRequest),
-            message: message.into().into_boxed_str(),
-            details: None,
-        }
+        Self::new(ErrorCode::UnsupportedMediaType, message)
     }
 
     pub(crate) fn range_not_satisfiable(start: u64, end: u64, length: u64) -> Self {
-        Self {
-            completion_uncertain: false,
-            status: StatusCode::RANGE_NOT_SATISFIABLE,
-            code: Some(ErrorCode::BadRequest),
-            // Keep the pre-existing `OmniError` display spelling stable while
-            // adding the structured wire fields below.
-            message: format!(
+        // Keep the pre-existing `OmniError` display spelling stable while
+        // adding the structured wire fields below.
+        Self::new(
+            ErrorCode::RangeNotSatisfiable,
+            format!(
                 "blob range [{start}, {end}) is not satisfiable for a value of length {length}"
-            )
-            .into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::BlobRange(api::BlobRangeOutput {
-                start,
-                end,
-                length,
-            }))),
-        }
+            ),
+        )
+        .with_details(ApiErrorDetails::BlobRange(api::BlobRangeOutput {
+            start,
+            end,
+            length,
+        }))
     }
 
-    /// HTTP 412 for a Blob representation validator mismatch. This is distinct
-    /// from the graph-commit write precondition below: it retains the existing
-    /// closed [`ErrorCode::Conflict`] signal and has no write-precondition
-    /// details because no mutation was attempted.
+    /// HTTP 412 for a Blob read whose `If-Match` names no current
+    /// representation. It has no write-precondition details because no write
+    /// was attempted.
     pub(crate) fn blob_precondition_failed(message: impl Into<String>) -> Self {
-        Self {
-            completion_uncertain: false,
-            status: StatusCode::PRECONDITION_FAILED,
-            code: Some(ErrorCode::Conflict),
-            message: message.into().into_boxed_str(),
-            details: None,
-        }
+        Self::new(ErrorCode::PreconditionFailed, message)
     }
 
     /// HTTP 412 for a Blob write whose `If-Match` did not hold. The
     /// `blob_precondition_failure` detail carries the cell's current
-    /// validator, and the response repeats it in `ETag` when there is one.
-    /// It keeps the closed [`ErrorCode::Conflict`] signal and never the
-    /// graph-commit `precondition_failure` detail.
+    /// validator, and the response repeats it in `ETag` when there is one;
+    /// it never carries the graph-commit `precondition_failure` detail.
     pub(crate) fn blob_write_precondition_failed(current_etag: Option<String>) -> Self {
-        Self {
-            completion_uncertain: false,
-            status: StatusCode::PRECONDITION_FAILED,
-            code: Some(ErrorCode::Conflict),
-            message: format!(
+        Self::new(
+            ErrorCode::PreconditionFailed,
+            format!(
                 "Blob write precondition failed; the cell's current validator is {}",
                 current_etag.as_deref().unwrap_or("<none>")
-            )
-            .into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::BlobPreconditionFailure(
-                api::BlobPreconditionFailureOutput { current_etag },
-            ))),
-        }
+            ),
+        )
+        .with_details(ApiErrorDetails::BlobPreconditionFailure(
+            api::BlobPreconditionFailureOutput { current_etag },
+        ))
     }
 
     pub fn internal(message: impl Into<String>) -> Self {
-        Self {
-            completion_uncertain: true,
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: Some(ErrorCode::Internal),
-            message: message.into().into_boxed_str(),
-            details: None,
-        }
+        let mut error = Self::new(ErrorCode::Internal, message);
+        error.completion_uncertain = true;
+        error
     }
 
     /// Refusal before an operation acquires ownership in a closed runtime.
     fn admission_closed() -> Self {
-        Self {
-            completion_uncertain: false,
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: Some(ErrorCode::ServiceUnavailable),
-            message:
-                "server operation admission is closed; reconcile any prior write before retrying"
-                    .into(),
-            details: None,
-        }
+        Self::new(
+            ErrorCode::ServiceUnavailable,
+            "server operation admission is closed; reconcile any prior write before retrying",
+        )
     }
 
-    /// The HTTP status this error maps to. Test-only: production reads the
-    /// status through `IntoResponse`.
-    #[cfg(test)]
+    /// The HTTP status a response to this error sends: the status of the code
+    /// it answers under, so a write the server could not settle sends 500
+    /// whatever failed underneath. The response is built from it, and every
+    /// log of an error's status reads it, so the two cannot disagree. It
+    /// judges the facts the error carries; a response first adds its
+    /// request's.
     pub(crate) fn status(&self) -> StatusCode {
-        self.status
+        let code = self.answered_code(self.disposition());
+        let status = match self.details.as_deref() {
+            Some(ApiErrorDetails::BranchStartRefusal(refusal))
+                if code == ErrorCode::BranchStartRefusal =>
+            {
+                Some(refusal.reason.http_status())
+            }
+            _ => code.http_statuses().first().copied(),
+        };
+        // A code no HTTP response carries belongs to MCP results, which never
+        // become a response; reaching one here is a server failure.
+        status
+            .and_then(|status| StatusCode::from_u16(status).ok())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+    }
+
+    /// The code a response to this error carries. A write the server could
+    /// not settle is named by what its caller must do, whatever failed
+    /// underneath; a recovery intent keeps its own code.
+    fn answered_code(&self, disposition: api::DispositionOutput) -> ErrorCode {
+        if disposition.action == api::DispositionAction::Reconcile && self.completion_uncertain {
+            ErrorCode::OutcomeUnknown
+        } else {
+            self.code
+        }
     }
 
     /// The human-readable message body, used by tests to assert the wire
@@ -1231,20 +1251,13 @@ impl ApiError {
     }
 
     /// HTTP 424 Failed Dependency for an external Blob source that passed the
-    /// graph's admission policy but could not be probed or read. The admitted
-    /// HTTP contract identifies this condition through the optional structured
-    /// detail; the top-level `code` remains unset.
+    /// graph's admission policy but could not be probed or read, with the
+    /// `external_blob_source` detail.
     fn external_blob_source(uri: String, reason: String) -> Self {
         let message = format!("external blob source '{uri}' is unavailable: {reason}");
-        Self {
-            completion_uncertain: false,
-            status: StatusCode::FAILED_DEPENDENCY,
-            code: None,
-            message: message.into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::ExternalBlobSource(
-                api::ExternalBlobSourceOutput { uri, reason },
-            ))),
-        }
+        Self::new(ErrorCode::ExternalBlobSource, message).with_details(
+            ApiErrorDetails::ExternalBlobSource(api::ExternalBlobSourceOutput { uri, reason }),
+        )
     }
 
     /// HTTP 429 Too Many Requests — actor exceeded their per-actor
@@ -1252,13 +1265,7 @@ impl ApiError {
     /// `Retry-After` header. Mapped from `RejectReason::InFlightCountExceeded`
     /// and `RejectReason::ByteBudgetExceeded`.
     pub fn too_many_requests(message: impl Into<String>) -> Self {
-        Self {
-            completion_uncertain: false,
-            status: StatusCode::TOO_MANY_REQUESTS,
-            code: Some(ErrorCode::TooManyRequests),
-            message: message.into().into_boxed_str(),
-            details: None,
-        }
+        Self::new(ErrorCode::TooManyRequests, message)
     }
 
     /// Convert a `WorkloadController` rejection into the matching
@@ -1283,135 +1290,73 @@ impl ApiError {
     }
 
     fn merge_conflict(conflicts: Vec<api::MergeConflictOutput>) -> Self {
-        Self {
-            completion_uncertain: false,
-            status: StatusCode::CONFLICT,
-            code: Some(ErrorCode::Conflict),
-            message: summarize_merge_conflicts(&conflicts).into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::MergeConflicts(conflicts))),
-        }
+        Self::conflict(summarize_merge_conflicts(&conflicts))
+            .with_details(ApiErrorDetails::MergeConflicts(conflicts))
     }
 
     fn published_dataset_version_conflict(
         message: String,
         details: api::PublishedDatasetVersionConflictOutput,
     ) -> Self {
-        Self {
-            completion_uncertain: false,
-            status: StatusCode::CONFLICT,
-            code: Some(ErrorCode::Conflict),
-            message: message.into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::PublishedDatasetVersionConflict(
-                details,
-            ))),
-        }
+        Self::conflict(message)
+            .with_details(ApiErrorDetails::PublishedDatasetVersionConflict(details))
     }
 
     fn read_set_conflict(message: String, details: api::ReadSetConflictOutput) -> Self {
-        Self {
-            completion_uncertain: false,
-            status: StatusCode::CONFLICT,
-            code: Some(ErrorCode::Conflict),
-            message: message.into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::ReadSetConflict(details))),
-        }
+        Self::conflict(message).with_details(ApiErrorDetails::ReadSetConflict(details))
     }
 
     fn key_conflict(message: String, details: api::KeyConflictOutput) -> Self {
-        Self {
-            completion_uncertain: false,
-            status: StatusCode::CONFLICT,
-            code: Some(ErrorCode::Conflict),
-            message: message.into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::KeyConflict(details))),
-        }
+        Self::conflict(message).with_details(ApiErrorDetails::KeyConflict(details))
     }
 
+    /// HTTP 413: the operation exceeds a bounded resource, with the
+    /// `resource_limit` detail naming it.
     fn resource_limit(message: String, details: api::ResourceLimitOutput) -> Self {
-        Self {
-            completion_uncertain: false,
-            status: StatusCode::PAYLOAD_TOO_LARGE,
-            code: Some(ErrorCode::BadRequest),
-            message: message.into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::ResourceLimit(details))),
-        }
+        Self::new(ErrorCode::PayloadTooLarge, message)
+            .with_details(ApiErrorDetails::ResourceLimit(details))
     }
 
     fn recovery_required(message: String, operation_id: String) -> Self {
-        Self {
-            completion_uncertain: false,
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            // The admitted HTTP contract identifies this condition through
-            // `recovery_required`; the top-level `code` remains unset.
-            code: None,
-            message: message.into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::RecoveryRequired(
-                api::RecoveryRequiredOutput { operation_id },
-            ))),
-        }
+        Self::new(ErrorCode::RecoveryRequired, message).with_details(
+            ApiErrorDetails::RecoveryRequired(api::RecoveryRequiredOutput { operation_id }),
+        )
     }
 
     /// HTTP 412 Precondition Failed — an
-    /// `Omnigraph-If-Graph-Commit` graph-head precondition no longer holds.
-    /// The admitted HTTP contract identifies this condition through
-    /// `precondition_failure`; the top-level `code` remains unset.
+    /// `Omnigraph-If-Graph-Commit` graph-head precondition no longer holds,
+    /// with the `precondition_failure` detail.
     fn precondition_failed(message: String, details: api::PreconditionFailureOutput) -> Self {
-        Self {
-            completion_uncertain: false,
-            status: StatusCode::PRECONDITION_FAILED,
-            code: None,
-            message: message.into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::PreconditionFailure(details))),
-        }
+        Self::new(ErrorCode::PreconditionFailed, message)
+            .with_details(ApiErrorDetails::PreconditionFailure(details))
     }
 
     /// HTTP 410 Gone — retained history can no longer reconstruct a change
-    /// continuation. `code` stays unset ([`ErrorCode`] is closed); the
-    /// `change_feed_gap` detail is the machine-readable discriminator and the
-    /// baseline handshake is the only recovery.
+    /// continuation, with the `change_feed_gap` detail; the baseline
+    /// handshake is the only recovery.
     fn change_feed_gap(cursor: Option<String>, first_unreadable_commit_id: String) -> Self {
-        Self {
-            completion_uncertain: false,
-            status: StatusCode::GONE,
-            code: None,
-            message: format!("change feed gap at commit '{first_unreadable_commit_id}'")
-                .into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::ChangeFeedGap(
-                api::ChangeFeedGapOutput {
-                    cursor,
-                    first_unreadable_commit_id,
-                },
-            ))),
-        }
+        Self::new(
+            ErrorCode::ChangeFeedGap,
+            format!("change feed gap at commit '{first_unreadable_commit_id}'"),
+        )
+        .with_details(ApiErrorDetails::ChangeFeedGap(api::ChangeFeedGapOutput {
+            cursor,
+            first_unreadable_commit_id,
+        }))
     }
 
     /// HTTP 409 Conflict — a well-formed entity-diff request this commit
     /// cannot satisfy (parentless genesis or an unprovable schema boundary).
     fn change_diff_refusal(message: String, details: api::ChangeDiffRefusalOutput) -> Self {
-        Self {
-            completion_uncertain: false,
-            status: StatusCode::CONFLICT,
-            code: Some(ErrorCode::Conflict),
-            message: message.into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::ChangeDiffRefusal(details))),
-        }
+        Self::conflict(message).with_details(ApiErrorDetails::ChangeDiffRefusal(details))
     }
 
     /// HTTP 409, or 410 Gone when the commit is no longer retained: `branch
     /// create` cannot start a branch at the commit `from` named, and nothing
     /// was created. The `branch_start_refusal` detail carries the reason.
     fn branch_start_refusal(message: String, details: api::BranchStartRefusalOutput) -> Self {
-        let status = match details.reason {
-            api::BranchStartRefusalReason::NotRetained => StatusCode::GONE,
-            _ => StatusCode::CONFLICT,
-        };
-        Self {
-            completion_uncertain: false,
-            status,
-            code: (status == StatusCode::CONFLICT).then_some(ErrorCode::Conflict),
-            message: message.into_boxed_str(),
-            details: Some(Box::new(ApiErrorDetails::BranchStartRefusal(details))),
-        }
+        Self::new(ErrorCode::BranchStartRefusal, message)
+            .with_details(ApiErrorDetails::BranchStartRefusal(details))
     }
 
     /// A refused query: HTTP 400 with the one-line message, plus the
@@ -1426,13 +1371,90 @@ impl ApiError {
         response
     }
 
+    /// Mark an error as one an owned write returned. Only such an error can
+    /// leave effects unknown.
+    pub(crate) fn after_owned_write(mut self) -> Self {
+        self.owned_write = true;
+        self
+    }
+
+    /// Carry what the request being served has done onto the error itself.
+    /// That record is task-local, so an error that crosses into another task
+    /// on its way to a response, as an MCP tool call's does, takes it along.
+    pub(crate) fn with_request_facts(mut self) -> Self {
+        self.owned_write |= crate::operations::request_submitted_write();
+        self
+    }
+
+    /// What the operation did and what its caller should do next.
+    ///
+    /// Before a request submits an owned write nothing it does has effects, so
+    /// every error there took none. Once it has, an error may follow effects:
+    /// an uncertain completion may have published, and every error of a
+    /// compound operation follows its earlier step, such as the branch a load
+    /// forks before its rows. Otherwise only the refusals a write meets before
+    /// it starts (authentication, the contract, the actor assertion, policy,
+    /// admission capacity, a request precondition), the typed refusals an
+    /// engine gives before its one publication, and a step the engine proved
+    /// published nothing took none; after an earlier step published, those
+    /// leave that step's effects alone.
+    ///
+    /// The action is what the failing step asks of its caller, unless its
+    /// effects are unknown, which must be reconciled first.
+    fn disposition(&self) -> api::DispositionOutput {
+        use api::{DispositionAction, DispositionEffects};
+        let class = self.details.as_deref().map(ApiErrorDetails::class);
+        // Something must be resolved or rebuilt before the operation can run.
+        let recovery = class == Some(DetailClass::Recovery);
+        let step = if recovery {
+            DispositionAction::Recover
+        } else {
+            self.code.action()
+        };
+        let effects = if !self.owned_write {
+            DispositionEffects::None
+        } else if self.completion_uncertain {
+            DispositionEffects::Unknown
+        } else {
+            let refused_before_start = matches!(
+                self.code,
+                ErrorCode::Unauthorized
+                    | ErrorCode::ApiContractMismatch
+                    | ErrorCode::ActorMismatch
+                    | ErrorCode::Forbidden
+                    | ErrorCode::PreconditionFailed
+                    | ErrorCode::TooManyRequests
+            );
+            let typed_refusal = class == Some(DetailClass::Refusal);
+            match (refused_before_start && !recovery) || typed_refusal || self.unpublished {
+                true if self.compound => DispositionEffects::Partial,
+                true => DispositionEffects::None,
+                false => DispositionEffects::Unknown,
+            }
+        };
+        let action = match effects {
+            DispositionEffects::Unknown if !recovery => DispositionAction::Reconcile,
+            _ => step,
+        };
+        api::DispositionOutput { effects, action }
+    }
+
     pub(crate) fn completion_uncertain(&self) -> bool {
         self.completion_uncertain
+    }
+
+    /// Whether this error's unknown outcome leaves the process's own state
+    /// unproven, so the process must be contained: an uncertain completion
+    /// the engine does not scope to its storage keys.
+    pub(crate) fn contains_process(&self) -> bool {
+        self.completion_uncertain && !self.scoped_unknown
     }
 
     fn from_omni(err: OmniError) -> Self {
         let cause = redacted_cause::RedactedCause::of(&err);
         let (err, evidence) = err.into_completion_evidence();
+        let storage_outcome = err.is_manifest_publish_in_doubt()
+            || matches!(&err, OmniError::Storage(_) | OmniError::Io(_));
         // Keep completion classification separate from HTTP status. Generic
         // DataFusion erases plan-vs-execution provenance: if an owned write
         // unexpectedly returns it, contain the epoch until typed engine
@@ -1722,19 +1744,37 @@ impl ApiError {
                 | omnigraph::error::CompletionEvidence::Unpublished,
             ) => {
                 response.completion_uncertain = false;
+                response.unpublished = true;
             }
             Some(omnigraph::error::CompletionEvidence::Uncertain) => {
                 response.completion_uncertain = true;
             }
+            // The graph moved before this failure. A failing step that proved
+            // it published nothing settled; without that proof, what it did is
+            // what its status says, as with no evidence.
+            Some(omnigraph::error::CompletionEvidence::PartlyPublished { step_unpublished }) => {
+                response.compound = true;
+                if step_unpublished {
+                    response.completion_uncertain = false;
+                    response.unpublished = true;
+                }
+            }
             None => {}
         }
+        response.scoped_unknown = response.completion_uncertain && storage_outcome;
+        // The error carries what its request has done, as one leaving an
+        // owned read's task does, so its status is the one its response sends.
+        let response = response.with_request_facts();
         if response.completion_uncertain {
-            // The record of why a write may be contained: the failure's class
-            // and status, never its message, which can carry object URIs. It
-            // shares the request's span with the containment log.
+            // The record of a write's unknown outcome: the failure's class,
+            // the status its response sends, and whether its uncertainty is
+            // scoped to its keys and branch, never its message, which can
+            // carry object URIs. It shares the request's span with the
+            // containment log.
             tracing::warn!(
-                status = %response.status,
+                status = %response.status(),
                 ?cause,
+                scoped = response.scoped_unknown,
                 "engine failure without definite completion evidence"
             );
         }
@@ -1790,19 +1830,18 @@ fn format_key_conflict(
     )
 }
 
-/// Constant `Retry-After` value (seconds) emitted on 429 responses.
+/// Constant `Retry-After` value (seconds) emitted on every 429 and every 503
+/// whose action is `retry`.
 const RETRY_AFTER_SECONDS: &str = "60";
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let error = self.with_request_facts();
+        // The answered code fixes the status: a write the server could not
+        // settle answers 500 whatever failed underneath.
+        let status = error.status();
         let mut headers = axum::http::HeaderMap::new();
-        if matches!(self.code, Some(ErrorCode::TooManyRequests)) {
-            headers.insert(
-                axum::http::header::RETRY_AFTER,
-                axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
-            );
-        }
-        if let Some(ApiErrorDetails::BlobPreconditionFailure(failure)) = self.details.as_deref()
+        if let Some(ApiErrorDetails::BlobPreconditionFailure(failure)) = error.details.as_deref()
             && let Some(etag) = failure
                 .current_etag
                 .as_deref()
@@ -1810,8 +1849,21 @@ impl IntoResponse for ApiError {
         {
             headers.insert(axum::http::header::ETAG, etag);
         }
-        let status = self.status;
-        (status, headers, Json(self.into_output())).into_response()
+        let output = error.into_judged_output();
+        if output
+            .disposition
+            .is_some_and(|disposition| disposition.action == api::DispositionAction::Retry)
+            && matches!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+            )
+        {
+            headers.insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
+            );
+        }
+        (status, headers, Json(output)).into_response()
     }
 }
 
@@ -1819,8 +1871,25 @@ impl ApiError {
     /// Preserve the same typed details in a compound result as in an ordinary
     /// error response.
     fn into_output(self) -> ErrorOutput {
+        self.with_request_facts().into_judged_output()
+    }
+
+    /// The output of one step's error, such as a merge's optional source
+    /// deletion, judged by that step alone: it may have taken effect only when
+    /// its own completion is uncertain.
+    pub(crate) fn into_step_output(mut self) -> ErrorOutput {
+        self.owned_write = self.completion_uncertain;
+        self.compound = false;
+        self.into_judged_output()
+    }
+
+    /// The output of an error whose facts are final.
+    fn into_judged_output(self) -> ErrorOutput {
+        let disposition = self.disposition();
+        let code = self.answered_code(disposition);
         let mut output = ErrorOutput::message(self.message);
-        output.code = self.code;
+        output.code = Some(code);
+        output.disposition = Some(disposition);
         if let Some(details) = self.details {
             match *details {
                 ApiErrorDetails::MergeConflicts(value) => output.merge_conflicts = value,
@@ -1864,7 +1933,30 @@ impl ApiError {
 /// Project an engine failure into the shared error body, including structured
 /// details, for embedded callers that compose a second effect after success.
 pub fn engine_error_output(error: OmniError) -> api::ErrorOutput {
-    ApiError::from_omni(error).into_output()
+    ApiError::from_omni(error).into_step_output()
+}
+
+/// Project an engine failure into the error body a server answers for a
+/// request with the same facts, so an embedded caller reports what a served
+/// one would.
+///
+/// `after_write`: the request had submitted a write before this failure, so
+/// the failure may follow its effects. Without it the failure did not start,
+/// whatever its cause, and keeps its own code. When the engine says an earlier
+/// step of the same operation published, as the fork a load makes of a
+/// missing branch does, even a refusal of a later step follows a publication;
+/// a fork is itself a write, so that changes the disposition only together with
+/// `after_write`.
+pub fn engine_error_output_after(error: OmniError, after_write: bool) -> api::ErrorOutput {
+    let mut error = ApiError::from_omni(error);
+    error.owned_write = after_write;
+    error.into_judged_output()
+}
+
+/// The error body of an embedded read's engine failure: a read writes
+/// nothing, so it did not start and keeps its own code.
+pub fn engine_read_error_output(error: OmniError) -> api::ErrorOutput {
+    engine_error_output_after(error, false)
 }
 
 #[cfg(test)]
@@ -2018,36 +2110,602 @@ mod api_error_tests {
             .await
             .unwrap();
         let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error.code, None, "ErrorCode stays closed; the detail rides");
+        assert_eq!(error.code, Some(ErrorCode::ChangeFeedGap));
         let gap = error.change_feed_gap.expect("structured feed gap");
         assert_eq!(gap.cursor.as_deref(), Some("opaque-cursor"));
         assert_eq!(gap.first_unreadable_commit_id, "01JTESTGAP");
     }
 
+    async fn output_of(error: ApiError) -> ErrorOutput {
+        let body = axum::body::to_bytes(error.into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_error_after_a_write_reports_what_it_may_have_done() {
+        use api::{DispositionAction, DispositionEffects, DispositionOutput};
+        let none = |action| {
+            Some(DispositionOutput {
+                effects: DispositionEffects::None,
+                action,
+            })
+        };
+        let partial = |action| {
+            Some(DispositionOutput {
+                effects: DispositionEffects::Partial,
+                action,
+            })
+        };
+        let unknown = |action| {
+            Some(DispositionOutput {
+                effects: DispositionEffects::Unknown,
+                action,
+            })
+        };
+
+        // Before any write, nothing took effect.
+        let error = output_of(ApiError::internal("read failed")).await;
+        assert_eq!(error.code, Some(ErrorCode::Internal));
+        assert_eq!(error.disposition, none(DispositionAction::Refresh));
+        for error in [
+            ApiError::too_many_requests("busy"),
+            ApiError::admission_closed(),
+        ] {
+            assert_eq!(
+                output_of(error).await.disposition,
+                none(DispositionAction::Retry)
+            );
+        }
+
+        // An uncertain write may have published: it is named by what the
+        // caller must do, whatever failed underneath.
+        let error = output_of(ApiError::internal("publish in doubt").after_owned_write()).await;
+        assert_eq!(error.code, Some(ErrorCode::OutcomeUnknown));
+        assert_eq!(error.disposition, unknown(DispositionAction::Reconcile));
+
+        // An untyped error after a write may follow its publication.
+        let error = output_of(ApiError::conflict("lost the publish").after_owned_write()).await;
+        assert_eq!(error.code, Some(ErrorCode::Conflict));
+        assert_eq!(error.disposition, unknown(DispositionAction::Reconcile));
+        // A typed refusal comes before the one publication it refuses, but
+        // may follow an earlier publication of a compound operation.
+        let refused = || {
+            ApiError::read_set_conflict(
+                "changed".into(),
+                api::ReadSetConflictOutput {
+                    member: "main".into(),
+                    expected: None,
+                    actual: None,
+                },
+            )
+        };
+        let lost = || refused().after_owned_write();
+        assert_eq!(
+            output_of(lost()).await.disposition,
+            none(DispositionAction::Refresh)
+        );
+        // A branch start refused at its commit created nothing, and that
+        // commit can never start the branch.
+        let error = output_of(
+            ApiError::from_omni(OmniError::branch_start_refused(
+                "01JTESTROOT",
+                BranchStartRefusal::UnattachedSnapshot,
+            ))
+            .after_owned_write(),
+        )
+        .await;
+        assert_eq!(error.code, Some(ErrorCode::BranchStartRefusal));
+        assert_eq!(error.disposition, none(DispositionAction::Fix));
+        let compound = |mut error: ApiError| {
+            error.compound = true;
+            error
+        };
+        let error = output_of(compound(lost())).await;
+        assert_eq!(error.code, Some(ErrorCode::Conflict));
+        assert_eq!(error.disposition, partial(DispositionAction::Refresh));
+        // The engine's mark of an earlier publication is that fact.
+        let marked = ApiError::from_omni(
+            OmniError::key_conflict("node:Person", "Alice").after_earlier_publication(),
+        )
+        .after_owned_write();
+        assert!(marked.compound && !marked.completion_uncertain);
+        let error = output_of(marked).await;
+        assert_eq!(error.code, Some(ErrorCode::Conflict));
+        assert_eq!(error.disposition, partial(DispositionAction::Refresh));
+
+        // Refusals a write meets before it starts took no effect, unless an
+        // earlier step of the operation published.
+        let error = output_of(ApiError::forbidden("denied").after_owned_write()).await;
+        assert_eq!(error.disposition, none(DispositionAction::Refresh));
+        let error = output_of(ApiError::too_many_requests("busy").after_owned_write()).await;
+        assert_eq!(error.disposition, none(DispositionAction::Retry));
+        let error = output_of(compound(ApiError::forbidden("denied").after_owned_write())).await;
+        assert_eq!(error.code, Some(ErrorCode::Forbidden));
+        assert_eq!(error.disposition, partial(DispositionAction::Refresh));
+
+        // Without the owned-write mark, a request that submitted a write
+        // still counts its later errors as after it.
+        let error = crate::operations::scope_request(async {
+            let runtime = crate::operations::OperationRuntime::default();
+            let _ = runtime
+                .submit((), async { Ok::<_, ApiError>(()).into() })
+                .unwrap()
+                .result()
+                .await;
+            output_of(ApiError::internal("receipt failed")).await
+        })
+        .await;
+        assert_eq!(error.disposition, unknown(DispositionAction::Reconcile));
+
+        // Both facts cross the task boundary of an owned read, as an MCP tool
+        // call's error does on its way to the response built in another task.
+        let runtime = crate::operations::OperationRuntime::default();
+        let writes = runtime.clone();
+        let error = runtime
+            .try_observe()
+            .unwrap()
+            .spawn_read((), async move {
+                writes
+                    .submit((), async move { Err::<(), _>(refused()).into() })?
+                    .result()
+                    .await
+                    .map_err(compound)
+            })
+            .result()
+            .await
+            .unwrap_err();
+        let error = output_of(error).await;
+        assert_eq!(error.code, Some(ErrorCode::Conflict));
+        assert_eq!(error.disposition, partial(DispositionAction::Refresh));
+        let writes = runtime.clone();
+        let error = runtime
+            .try_observe()
+            .unwrap()
+            .spawn_read((), async move {
+                writes
+                    .submit((), async { Ok::<_, ApiError>(()).into() })?
+                    .result()
+                    .await?;
+                Err::<(), _>(ApiError::internal("could not encode the result"))
+            })
+            .result()
+            .await
+            .unwrap_err();
+        let error = output_of(error).await;
+        assert_eq!(error.code, Some(ErrorCode::OutcomeUnknown));
+        assert_eq!(error.disposition, unknown(DispositionAction::Reconcile));
+    }
+
+    /// Every error answers under one of its code's statuses, a write the server
+    /// could not settle under 500 whatever failed underneath, and every 429
+    /// or 503 that asks for a retry says when. The status a log reads from
+    /// the error is the one its response sends.
+    #[tokio::test]
+    async fn the_answered_code_fixes_the_status_and_retry_after() {
+        let answer = |error: ApiError| async move {
+            let response = error.into_response();
+            let status = response.status();
+            let retry_after = response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .map(|value| value.to_str().unwrap().to_string());
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let output: ErrorOutput = serde_json::from_slice(&body).unwrap();
+            (status, output.code.unwrap(), retry_after)
+        };
+        let retry = Some(RETRY_AFTER_SECONDS.to_string());
+        for (error, status, code, retry_after) in [
+            (
+                ApiError::too_many_requests("busy"),
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorCode::TooManyRequests,
+                retry.clone(),
+            ),
+            (
+                ApiError::admission_closed(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::ServiceUnavailable,
+                retry.clone(),
+            ),
+            (
+                ApiError::new(ErrorCode::GraphUnavailable, "graph is loading"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::GraphUnavailable,
+                retry.clone(),
+            ),
+            // A recovery intent is resolved, not waited out.
+            (
+                ApiError::from_omni(OmniError::RecoveryRequired {
+                    operation_id: "01JTESTRECOVERY".to_string(),
+                    reason: "pending recovery intent".to_string(),
+                }),
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::RecoveryRequired,
+                None,
+            ),
+            // Closed admission after a write must be reconciled first.
+            (
+                ApiError::admission_closed().after_owned_write(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::ServiceUnavailable,
+                None,
+            ),
+            (
+                ApiError::new(ErrorCode::RequestTimeout, "too slow"),
+                StatusCode::REQUEST_TIMEOUT,
+                ErrorCode::RequestTimeout,
+                None,
+            ),
+            (
+                ApiError::unsupported_media_type("not JSON"),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                ErrorCode::UnsupportedMediaType,
+                None,
+            ),
+            (
+                ApiError::from_omni(OmniError::DataFusion("bad plan".into())),
+                StatusCode::BAD_REQUEST,
+                ErrorCode::BadRequest,
+                None,
+            ),
+            (
+                ApiError::from_omni(OmniError::DataFusion("lost".into())).after_owned_write(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::OutcomeUnknown,
+                None,
+            ),
+        ] {
+            let logged = error.status();
+            let answered = answer(error).await;
+            assert_eq!(answered, (status, code, retry_after));
+            assert_eq!(logged, status, "{code:?}");
+            assert!(code.http_statuses().contains(&status.as_u16()), "{code:?}");
+        }
+    }
+
+    /// An uncertain engine failure's warning, and the error a contained write
+    /// logs, record the status the response sends: a read's failure keeps
+    /// its code's, and one after a write answers `outcome_unknown` with 500
+    /// whatever its cause's code, whether the write translated it or the
+    /// request did after submitting the write.
+    #[tokio::test]
+    async fn an_uncertain_engine_failure_logs_the_status_its_response_sends() {
+        use crate::operations::{OperationRuntime, OwnedResult, scope_request};
+        const WARNING: &str = "engine failure without definite completion evidence";
+        const CONTAINMENT: &str = "owned write ended without a definite outcome";
+        // A `bad_request` whose completion is unknown.
+        let failure = || ApiError::from_omni(OmniError::DataFusion("execution failure".into()));
+        let assert_logged =
+            |capture: &test_log_capture::Capture, message: &str, sent: StatusCode| {
+                let logs = capture.output();
+                let lines: Vec<&str> = logs.lines().filter(|line| line.contains(message)).collect();
+                assert_eq!(lines.len(), 1, "{message}: {logs}");
+                assert!(lines[0].contains(&format!("status={sent}")), "{logs}");
+            };
+        // Tracing caches a log site's interest when the site is first hit, and
+        // a concurrent test reaching it under no subscriber caches it as never.
+        // Hit both sites first, so installing each capture below rebuilds it.
+        drop(failure());
+        let _ = OperationRuntime::default()
+            .submit((), async {
+                OwnedResult::from(Err::<(), _>(ApiError::internal("first")))
+            })
+            .unwrap()
+            .result()
+            .await;
+
+        let read = test_log_capture::Capture::default();
+        let logs = tracing::subscriber::set_default(read.subscriber("warn"));
+        let sent = scope_request(async { failure().into_response().status() }).await;
+        drop(logs);
+        assert_eq!(sent, StatusCode::BAD_REQUEST);
+        assert_logged(&read, WARNING, sent);
+
+        let after_write = test_log_capture::Capture::default();
+        let logs = tracing::subscriber::set_default(after_write.subscriber("warn"));
+        let runtime = OperationRuntime::default();
+        let sent = scope_request(async {
+            runtime
+                .submit((), async { Ok::<_, ApiError>(()).into() })
+                .unwrap()
+                .result()
+                .await
+                .unwrap();
+            failure().into_response().status()
+        })
+        .await;
+        drop(logs);
+        assert_eq!(sent, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_logged(&after_write, WARNING, sent);
+
+        let in_write = test_log_capture::Capture::default();
+        let logs = tracing::subscriber::set_default(in_write.subscriber("warn"));
+        let runtime = OperationRuntime::default();
+        let sent = scope_request(async {
+            runtime
+                .submit(
+                    (),
+                    async move { OwnedResult::from(Err::<(), _>(failure())) },
+                )
+                .unwrap()
+                .result()
+                .await
+                .unwrap_err()
+                .into_response()
+                .status()
+        })
+        .await;
+        drop(logs);
+        assert_eq!(sent, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_logged(&in_write, WARNING, sent);
+        assert_logged(&in_write, CONTAINMENT, sent);
+    }
+
+    /// Each class of refusal asks its caller for one thing. Before any write
+    /// none of them took effect; after one, a refusal of the failing step
+    /// leaves only an earlier step's effects, and any other error must be
+    /// reconciled unless it names something to recover.
+    #[tokio::test]
+    async fn each_refusal_class_names_its_effects_and_action() {
+        use api::{DispositionAction as Action, DispositionEffects as Effects};
+        let recovery = || {
+            ApiError::from_omni(OmniError::RecoveryRequired {
+                operation_id: "01JTESTRECOVERY".to_string(),
+                reason: "pending recovery intent".to_string(),
+            })
+        };
+        let key_conflict = || ApiError::from_omni(OmniError::key_conflict("node:Person", "Alice"));
+        let resource_limit = || {
+            ApiError::from_omni(OmniError::ResourceLimitExceeded {
+                resource: "keyed write entities for node:Person".to_string(),
+                limit: 1,
+                actual: 2,
+            })
+        };
+        let cases = [
+            (
+                "unauthorized",
+                ApiError::unauthorized("no token"),
+                Action::Fix,
+            ),
+            (
+                "bad request",
+                ApiError::bad_request("malformed"),
+                Action::Fix,
+            ),
+            (
+                "not found",
+                ApiError::not_found("no such branch"),
+                Action::Fix,
+            ),
+            (
+                "method",
+                ApiError::method_not_allowed("not served"),
+                Action::Fix,
+            ),
+            ("resource limit", resource_limit(), Action::Fix),
+            (
+                "range",
+                ApiError::range_not_satisfiable(4, 9, 8),
+                Action::Fix,
+            ),
+            (
+                "media type",
+                ApiError::unsupported_media_type("not JSON"),
+                Action::Fix,
+            ),
+            (
+                "blob precondition",
+                ApiError::blob_write_precondition_failed(None),
+                Action::Refresh,
+            ),
+            (
+                "body deadline",
+                ApiError::new(ErrorCode::RequestTimeout, "too slow"),
+                Action::Retry,
+            ),
+            ("policy", ApiError::forbidden("denied"), Action::Refresh),
+            ("key conflict", key_conflict(), Action::Refresh),
+            ("busy", ApiError::too_many_requests("busy"), Action::Retry),
+            ("closed", ApiError::admission_closed(), Action::Retry),
+            ("recovery", recovery(), Action::Recover),
+        ];
+        for (name, error, action) in cases {
+            let before = output_of(error).await.disposition.unwrap();
+            assert_eq!(
+                (before.effects, before.action),
+                (Effects::None, action),
+                "{name}"
+            );
+        }
+        // After a write, a refusal of the failing step names its own action
+        // and, after an earlier publication, partial effects.
+        for (name, error, effects, action) in [
+            (
+                "policy",
+                ApiError::forbidden("denied"),
+                Effects::None,
+                Action::Refresh,
+            ),
+            ("limit", resource_limit(), Effects::None, Action::Fix),
+            (
+                "busy",
+                ApiError::too_many_requests("busy"),
+                Effects::None,
+                Action::Retry,
+            ),
+        ] {
+            let after = output_of(error.after_owned_write())
+                .await
+                .disposition
+                .unwrap();
+            assert_eq!((after.effects, after.action), (effects, action), "{name}");
+        }
+        for (name, error, action) in [
+            ("conflict", key_conflict(), Action::Refresh),
+            ("limit", resource_limit(), Action::Fix),
+        ] {
+            let mut error = error.after_owned_write();
+            error.compound = true;
+            let after = output_of(error).await.disposition.unwrap();
+            assert_eq!(
+                (after.effects, after.action),
+                (Effects::Partial, action),
+                "{name}"
+            );
+        }
+        // Effects nobody can name are reconciled, unless recovery comes first.
+        for (name, error, action) in [
+            ("untyped", ApiError::not_found("gone"), Action::Reconcile),
+            ("uncertain", ApiError::internal("lost"), Action::Reconcile),
+            ("recovery", recovery(), Action::Recover),
+        ] {
+            let after = output_of(error.after_owned_write())
+                .await
+                .disposition
+                .unwrap();
+            assert_eq!(
+                (after.effects, after.action),
+                (Effects::Unknown, action),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_embedded_engine_error_reports_what_a_served_request_would() {
+        use api::{DispositionAction, DispositionEffects, DispositionOutput};
+        let none = |action| {
+            Some(DispositionOutput {
+                effects: DispositionEffects::None,
+                action,
+            })
+        };
+        let partial = |action| {
+            Some(DispositionOutput {
+                effects: DispositionEffects::Partial,
+                action,
+            })
+        };
+        let unknown = |action| {
+            Some(DispositionOutput {
+                effects: DispositionEffects::Unknown,
+                action,
+            })
+        };
+        // An untyped engine error is uncertain by construction: after a write
+        // it may follow a publication, but a read wrote nothing.
+        let reclaimed =
+            || OmniError::manifest_internal("historical published dataset version 1 was reclaimed");
+        for read in [
+            engine_read_error_output(reclaimed()),
+            engine_error_output_after(reclaimed(), false),
+            engine_error_output_after(reclaimed().after_earlier_publication(), false),
+        ] {
+            assert_eq!(read.code, Some(ErrorCode::Internal));
+            assert_eq!(read.disposition, none(DispositionAction::Refresh));
+        }
+        for write in [
+            engine_error_output_after(reclaimed(), true),
+            engine_error_output_after(reclaimed().after_earlier_publication(), true),
+            engine_error_output(reclaimed()),
+        ] {
+            assert_eq!(write.code, Some(ErrorCode::OutcomeUnknown));
+            assert_eq!(write.disposition, unknown(DispositionAction::Reconcile));
+        }
+
+        // A step the engine settled keeps its proof: before or after an
+        // earlier publication of the same operation it published nothing
+        // itself and keeps its code. Without the proof it may have published.
+        let failed_put = || OmniError::Io(std::io::Error::other("detached manifest put failed"));
+        for (error, code, disposition) in [
+            (
+                failed_put().unpublished(),
+                ErrorCode::Internal,
+                none(DispositionAction::Refresh),
+            ),
+            (
+                failed_put().unpublished().after_earlier_publication(),
+                ErrorCode::Internal,
+                partial(DispositionAction::Refresh),
+            ),
+            (
+                failed_put().after_earlier_publication().unpublished(),
+                ErrorCode::Internal,
+                partial(DispositionAction::Refresh),
+            ),
+            (
+                failed_put().after_earlier_publication(),
+                ErrorCode::OutcomeUnknown,
+                unknown(DispositionAction::Reconcile),
+            ),
+            (
+                failed_put()
+                    .unpublished()
+                    .after_earlier_publication()
+                    .with_completion_evidence(omnigraph::error::CompletionEvidence::Uncertain),
+                ErrorCode::OutcomeUnknown,
+                unknown(DispositionAction::Reconcile),
+            ),
+        ] {
+            let message = error.to_string();
+            let output = engine_error_output_after(error, true);
+            assert_eq!(output.code, Some(code), "{message}");
+            assert_eq!(output.disposition, disposition, "{message}");
+        }
+
+        // A typed refusal of the write's one publication did not start it;
+        // after an earlier publication of the same operation it follows one,
+        // which only the engine's own mark says.
+        let refusals: [fn() -> OmniError; 2] = [
+            || OmniError::Policy("change denied".into()),
+            || OmniError::key_conflict("node:Person", "Alice"),
+        ];
+        for refusal in refusals {
+            let code = engine_error_output_after(refusal(), false).code;
+            for (after_write, compound, disposition) in [
+                (false, false, none(DispositionAction::Refresh)),
+                (false, true, none(DispositionAction::Refresh)),
+                (true, false, none(DispositionAction::Refresh)),
+                (true, true, partial(DispositionAction::Refresh)),
+            ] {
+                let error = if compound {
+                    refusal().after_earlier_publication()
+                } else {
+                    refusal()
+                };
+                let output = engine_error_output_after(error, after_write);
+                assert_eq!(output.code, code, "{after_write} {compound}");
+                assert_eq!(output.disposition, disposition, "{after_write} {compound}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn branch_start_refusal_is_typed_409_or_410() {
-        for (reason, status, code, wire, type_name) in [
+        for (reason, status, wire, type_name) in [
             (
                 BranchStartRefusal::NotRetained {
                     table_key: "node:Person".to_string(),
                     published_dataset_version: 7,
                 },
                 StatusCode::GONE,
-                None,
                 api::BranchStartRefusalReason::NotRetained,
                 Some("Person".to_string()),
             ),
             (
                 BranchStartRefusal::SchemaChanged,
                 StatusCode::CONFLICT,
-                Some(ErrorCode::Conflict),
                 api::BranchStartRefusalReason::SchemaChanged,
                 None,
             ),
             (
                 BranchStartRefusal::EarlierStorageFormat,
                 StatusCode::CONFLICT,
-                Some(ErrorCode::Conflict),
                 api::BranchStartRefusalReason::EarlierStorageFormat,
                 None,
             ),
@@ -2056,34 +2714,42 @@ mod api_error_tests {
                     branch: "gone".to_string(),
                 },
                 StatusCode::CONFLICT,
-                Some(ErrorCode::Conflict),
                 api::BranchStartRefusalReason::BranchDeleted,
                 None,
             ),
             (
                 BranchStartRefusal::UnpublishedCommit,
                 StatusCode::CONFLICT,
-                Some(ErrorCode::Conflict),
                 api::BranchStartRefusalReason::UnpublishedCommit,
                 None,
             ),
             (
                 BranchStartRefusal::UnattachedSnapshot,
                 StatusCode::CONFLICT,
-                Some(ErrorCode::Conflict),
                 api::BranchStartRefusalReason::UnattachedSnapshot,
                 None,
             ),
         ] {
             let error = OmniError::branch_start_refused("01JTESTROOT", reason).before_effect();
             let message = error.to_string();
-            let response = ApiError::from_omni(error).into_response();
+            // Branch create is an owned write; the refusal at its commit
+            // created nothing, and that commit can never start the branch.
+            let response = ApiError::from_omni(error)
+                .after_owned_write()
+                .into_response();
             assert_eq!(response.status(), status);
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
                 .unwrap();
             let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
-            assert_eq!(error.code, code);
+            assert_eq!(error.code, Some(ErrorCode::BranchStartRefusal));
+            assert_eq!(
+                error.disposition,
+                Some(api::DispositionOutput {
+                    effects: api::DispositionEffects::None,
+                    action: api::DispositionAction::Fix,
+                })
+            );
             assert_eq!(error.error, message);
             let refusal = error.branch_start_refusal.expect("structured refusal");
             assert_eq!(refusal.reason, wire);
@@ -2195,7 +2861,7 @@ mod api_error_tests {
     }
 
     #[tokio::test]
-    async fn recovery_required_503_omits_closed_error_code() {
+    async fn recovery_required_503_carries_its_code_and_a_recover_action() {
         let response = ApiError::from_omni(OmniError::RecoveryRequired {
             operation_id: "01JTESTRECOVERY".to_string(),
             reason: "pending recovery intent".to_string(),
@@ -2207,7 +2873,11 @@ mod api_error_tests {
             .await
             .unwrap();
         let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error.code, None);
+        assert_eq!(error.code, Some(ErrorCode::RecoveryRequired));
+        assert_eq!(
+            error.disposition.map(|disposition| disposition.action),
+            Some(api::DispositionAction::Recover)
+        );
         assert_eq!(
             error.recovery_required.unwrap().operation_id,
             "01JTESTRECOVERY"
@@ -2257,7 +2927,7 @@ mod api_error_tests {
             .await
             .unwrap();
         let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error.code, Some(ErrorCode::BadRequest));
+        assert_eq!(error.code, Some(ErrorCode::PayloadTooLarge));
         let details = error.resource_limit.expect("structured resource limit");
         assert_eq!(details.resource, "keyed write entities for node:Person");
         assert_eq!(details.limit, 8192);
@@ -2278,7 +2948,7 @@ mod api_error_tests {
             .await
             .unwrap();
         let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error.code, Some(ErrorCode::BadRequest));
+        assert_eq!(error.code, Some(ErrorCode::RangeNotSatisfiable));
         assert_eq!(
             error.error,
             "blob range [4, 9) is not satisfiable for a value of length 8"
@@ -2297,7 +2967,7 @@ mod api_error_tests {
         let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
         assert_eq!(error.code, Some(ErrorCode::Internal));
 
-        // A Blob write's failed If-Match: 412 under the closed conflict code,
+        // A Blob write's failed If-Match: 412 under the precondition code,
         // the current validator in the detail and in `ETag`, and never the
         // graph-commit precondition detail.
         for current in [Some("\"current\""), None] {
@@ -2317,7 +2987,7 @@ mod api_error_tests {
                 .await
                 .unwrap();
             let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
-            assert_eq!(error.code, Some(ErrorCode::Conflict));
+            assert_eq!(error.code, Some(ErrorCode::PreconditionFailed));
             assert!(error.precondition_failure.is_none());
             assert_eq!(
                 error
@@ -2381,7 +3051,7 @@ mod api_error_tests {
             .await
             .unwrap();
         let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error.code, None);
+        assert_eq!(error.code, Some(ErrorCode::ExternalBlobSource));
         let details = error
             .external_blob_source
             .expect("structured external Blob source details");
@@ -2882,7 +3552,7 @@ pub fn build_app(state: AppState) -> Router {
     //   4. `resolve_graph_handle` — captures `serving::GraphRequest` based on
     //      the active mode (single: the only handle; multi: lookup by
     //      `{graph_id}` in the URI path).
-    let per_graph_protected = Router::new()
+    let per_graph_routes = Router::new()
         .route("/snapshot", get(server_snapshot))
         .route("/access", get(server_access))
         // Register HEAD explicitly. Axum's GET fallback would invoke the GET
@@ -2934,17 +3604,13 @@ pub fn build_app(state: AppState) -> Router {
         .route("/commits/{commit_id}/changes", get(server_commit_changes))
         .route("/diff", get(server_diff))
         .route("/changes", get(server_changes_feed))
-        .route("/changes/baseline", post(server_changes_baseline))
-        .route_layer(middleware::from_fn_with_state(
+        .route("/changes/baseline", post(server_changes_baseline));
+    let per_graph_protected = guarded(&state, per_graph_routes, |routes| {
+        routes.route_layer(middleware::from_fn_with_state(
             state.clone(),
             resolve_graph_handle,
         ))
-        .route_layer(middleware::from_fn(require_expected_actor))
-        .route_layer(middleware::from_fn(http_contract::require_contract))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_bearer_auth,
-        ));
+    });
 
     // Management endpoints (`GET /graphs`) live alongside the per-graph
     // router. They go through bearer auth but NOT through
@@ -2952,54 +3618,34 @@ pub fn build_app(state: AppState) -> Router {
     //
     // Runtime add/remove (`POST /graphs`, `DELETE /graphs/{id}`) is not
     // exposed — inventory additions use the server-owned deployment route.
-    let management = Router::new()
-        .route("/graphs", get(server_graphs_list))
-        .route("/graphs/discovery", get(server_graphs_discovery))
-        .route_layer(middleware::from_fn(require_expected_actor))
-        .route_layer(middleware::from_fn(http_contract::require_contract))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_bearer_auth,
-        ));
+    let management = guarded(
+        &state,
+        Router::new()
+            .route("/graphs", get(server_graphs_list))
+            .route("/graphs/discovery", get(server_graphs_discovery)),
+        |routes| routes,
+    );
 
-    let deployments = Router::new()
+    let deployment_routes = Router::new()
         .route("/cluster/plan", post(deployment::plan))
         .route(
             "/cluster/deployments",
             get(deployment::status).post(deployment::apply),
         )
-        .route("/cluster/deployments/{id}", get(deployment::lookup))
-        .layer(DefaultBodyLimit::max(deployment::REQUEST_BYTES))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            |State(state): State<AppState>, request: Request, next: Next| async move {
-                ingress::admit(&state, request, next).await
-            },
-        ))
-        .route_layer(middleware::from_fn(require_expected_actor))
-        .route_layer(middleware::from_fn(http_contract::require_contract))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_bearer_auth,
-        ));
+        .route("/cluster/deployments/{id}", get(deployment::lookup));
+    let deployments = guarded(&state, deployment_routes, |routes| {
+        admitted(
+            &state,
+            routes.layer(DefaultBodyLimit::max(deployment::REQUEST_BYTES)),
+        )
+    });
 
-    let catalogue = Router::new()
+    let catalogue_routes = Router::new()
         .route("/query", post(handlers::catalogue::catalogue_query))
         .route("/schema", get(handlers::catalogue::catalogue_schema))
         .route("/{*rest}", any(handlers::catalogue::catalogue_refused))
-        .route("/", any(handlers::catalogue::catalogue_refused))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            |State(state): State<AppState>, request: Request, next: Next| async move {
-                ingress::admit(&state, request, next).await
-            },
-        ))
-        .route_layer(middleware::from_fn(require_expected_actor))
-        .route_layer(middleware::from_fn(http_contract::require_contract))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_bearer_auth,
-        ));
+        .route("/", any(handlers::catalogue::catalogue_refused));
+    let catalogue = guarded(&state, catalogue_routes, |routes| admitted(&state, routes));
 
     // RFC-011 cluster-only: per-graph routes always nest under
     // `/graphs/{graph_id}/...`; there are no flat single-graph routes.
@@ -3019,10 +3665,60 @@ pub fn build_app(state: AppState) -> Router {
     if state.has_credential_source() {
         app = app.merge(mcp::router(state.clone()));
     }
-    app.layer(middleware::from_fn(http_contract::identify_response))
+    // The unrouted answer, and the method fallback of the public routes. A
+    // protected route already has its own, from `guarded`, which this one
+    // leaves alone. Inside the layers, so both answer with the contract
+    // header.
+    app.fallback(unrouted)
+        .method_not_allowed_fallback(method_not_served)
+        .layer(middleware::from_fn(http_contract::identify_response))
         .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// A protected router: its routes, then `inner` (the router's own layers),
+/// then the guards every protected router shares, outer first: bearer
+/// authentication, the HTTP contract and the actor assertion.
+///
+/// The method fallback goes on first, so the guards wrap it: a method the
+/// path does not serve is refused by them like one it serves, and a request
+/// learns which methods a path serves only once they admit it. Installed
+/// after the guards, as the router-wide fallback in `build_app` is, it would
+/// answer before them: axum replaces a route's default fallback wholesale,
+/// layers included.
+fn guarded(
+    state: &AppState,
+    routes: Router<AppState>,
+    inner: impl FnOnce(Router<AppState>) -> Router<AppState>,
+) -> Router<AppState> {
+    inner(routes.method_not_allowed_fallback(method_not_served))
+        .route_layer(middleware::from_fn(require_expected_actor))
+        .route_layer(middleware::from_fn(http_contract::require_contract))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer_auth,
+        ))
+}
+
+/// `routes` behind workload admission.
+fn admitted(state: &AppState, routes: Router<AppState>) -> Router<AppState> {
+    routes.route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        |State(state): State<AppState>, request: Request, next: Next| async move {
+            ingress::admit(&state, request, next).await
+        },
+    ))
+}
+
+/// An unrouted path answers the error body every other refusal does.
+async fn unrouted() -> ApiError {
+    ApiError::not_found("no route matches the request path")
+}
+
+/// A routed path that does not serve the request's method.
+async fn method_not_served() -> ApiError {
+    ApiError::method_not_allowed("the request path does not serve this method")
 }
 
 pub async fn serve(config: ServerConfig) -> Result<()> {
@@ -3175,6 +3871,21 @@ async fn serve_config(
         .with_mcp_settings(mcp);
     deployment::initialize_boot_activation(&state);
     let retained_admission = state.cluster_admission.clone();
+    if let Some(admission) = retained_admission.as_ref() {
+        // A fenced lease means a successor may take over the cluster: this
+        // process stops writing and exits without releasing the lock. The
+        // watch holds no admission reference, so it never delays release.
+        let fence = admission.lease_fence();
+        let operations = operations.clone();
+        tokio::spawn(async move {
+            let fenced = fence.fenced().await;
+            error!(
+                ?fenced,
+                "cluster admission lease fenced; containing process"
+            );
+            operations.contain();
+        });
+    }
     let startup_owner = operations
         .own_startup()
         .map_err(|error| eyre!(error.message))?;

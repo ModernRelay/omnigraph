@@ -14837,6 +14837,8 @@ struct ManifestRequestFault {
     fired: Arc<std::sync::atomic::AtomicBool>,
     manifest_puts: Arc<std::sync::atomic::AtomicUsize>,
     deferred: Arc<std::sync::Mutex<Option<DeferredCreate>>>,
+    /// Set when the store answers manifest creates again.
+    healed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ManifestRequestFault {
@@ -14846,6 +14848,7 @@ impl ManifestRequestFault {
             fired: Arc::default(),
             manifest_puts: Arc::default(),
             deferred: Arc::default(),
+            healed: Arc::default(),
         }
     }
 
@@ -14856,12 +14859,22 @@ impl ManifestRequestFault {
 
     /// Apply the held create now; returns whether one was held.
     async fn land(&self) -> bool {
+        self.try_land()
+            .await
+            .map(|answer| answer.unwrap())
+            .is_some()
+    }
+
+    /// Send the held create now, and return the store's answer to it.
+    async fn try_land(&self) -> Option<object_store::Result<()>> {
         let deferred = self.deferred.lock().unwrap().take();
-        let Some((store, location, payload, options)) = deferred else {
-            return false;
-        };
-        store.put_opts(&location, payload, options).await.unwrap();
-        true
+        let (store, location, payload, options) = deferred?;
+        Some(store.put_opts(&location, payload, options).await.map(drop))
+    }
+
+    /// The store answers manifest creates again.
+    fn heal(&self) {
+        self.healed.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -14965,7 +14978,9 @@ impl object_store::ObjectStore for ManifestRequestFaultStore {
             ManifestFault::EveryManifestPut if numbered_manifest => {
                 Err(ambiguous_store_error("503 Service Unavailable"))
             }
-            ManifestFault::LandsAfterGiveUp if numbered_manifest => {
+            ManifestFault::LandsAfterGiveUp
+                if numbered_manifest && !self.fault.healed.load(Ordering::SeqCst) =>
+            {
                 if first(true) {
                     *self.fault.deferred.lock().unwrap() = Some((
                         Arc::clone(&self.original),
@@ -15226,6 +15241,93 @@ async fn unresolved_manifest_create_keeps_its_transaction_file_issue_1067() {
             .exists(),
         "the transaction file {transaction} named by the late manifest is kept"
     );
+}
+
+/// An unknown publication needs no record to stay safe: its manifest version
+/// is created only if absent, so it lands before the branch's next
+/// publication or never. If the next publication takes the version first,
+/// the late request fails its precondition and only that publication is
+/// visible; if the late request lands first, the next publication builds on
+/// it.
+#[tokio::test]
+async fn unknown_publication_lands_before_the_next_publication_or_never_issue_1067() {
+    for late_first in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
+        ManifestCoordinator::init(&uri, &build_test_catalog())
+            .await
+            .unwrap();
+        let before = open_manifest_dataset(&uri, None)
+            .await
+            .unwrap()
+            .version()
+            .version;
+        let fault = ManifestRequestFault::new(ManifestFault::LandsAfterGiveUp);
+        let probes = || crate::instrumentation::QueryIoProbes {
+            manifest_wrapper: Some(Arc::new(fault.clone())),
+            ..Default::default()
+        };
+        let publisher = GraphNamespacePublisher::new(&uri, None);
+        let unknown = lineage_intent(None, None);
+        let error = crate::instrumentation::with_query_io_probes(
+            probes(),
+            publisher.publish(&[], &HashMap::new(), Some(&unknown)),
+        )
+        .await
+        .expect_err("no manifest create is answered");
+        assert!(error.is_manifest_publish_in_doubt(), "{error:?}");
+        if late_first {
+            fault
+                .try_land()
+                .await
+                .expect("the first create was held")
+                .expect("the late create lands on a free version");
+        }
+        fault.heal();
+        let next = lineage_intent(None, None);
+        crate::instrumentation::with_query_io_probes(
+            probes(),
+            publisher.publish(&[], &HashMap::new(), Some(&next)),
+        )
+        .await
+        .expect("the branch publishes again");
+        if !late_first {
+            let late = fault.try_land().await.expect("the first create was held");
+            assert!(
+                matches!(late, Err(object_store::Error::AlreadyExists { .. })),
+                "a late create cannot replace the next publication: {late:?}"
+            );
+        }
+        let latest = open_manifest_dataset(&uri, None).await.unwrap();
+        assert_eq!(
+            read_manifest_rows(&latest)
+                .await
+                .unwrap()
+                .head
+                .graph_commit_id,
+            next.graph_commit_id,
+            "late_first={late_first}: the next publication is the head"
+        );
+        if late_first {
+            assert_eq!(latest.version().version, before + 2);
+            let landed = latest.checkout_version(before + 1).await.unwrap();
+            assert_eq!(
+                read_manifest_rows(&landed)
+                    .await
+                    .unwrap()
+                    .head
+                    .graph_commit_id,
+                unknown.graph_commit_id,
+                "the late create is the version the next publication built on"
+            );
+        } else {
+            assert_eq!(
+                latest.version().version,
+                before + 1,
+                "the late create never landed"
+            );
+        }
+    }
 }
 
 /// Use Lance's stock object-store implementation of local files for the

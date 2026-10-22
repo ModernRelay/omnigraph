@@ -11,7 +11,12 @@ mod resources;
 mod result;
 mod settings;
 
-pub use arguments::*;
+pub use arguments::{
+    AccessArguments, BranchArguments, BranchCreateArguments, BranchDeleteArguments,
+    BranchMergeArguments, ChangeFilters, ChangesPollArguments, CommitArguments,
+    CommitChangesArguments, CommitsListArguments, GraphArguments, InvalidArguments, LoadArguments,
+    MutateArguments, QueryArguments, ReadArguments, ToolCall, ToolRequest, change_query,
+};
 pub use resources::{ResourceOutput, ResourceRequest};
 pub use result::{HostError, bounded_result};
 pub use rmcp::model::CallToolResult as ToolResult;
@@ -21,7 +26,7 @@ use axum::Router;
 use axum::http::{StatusCode, request::Parts};
 use catalog::*;
 use resources::*;
-use result::{api_failure, failure, fit_result, outcome_unknown};
+use result::check_result;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ErrorData, Implementation,
     ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
@@ -41,7 +46,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Wire-input bound reserved by the host before it collects an MCP body.
 pub const REQUEST_BYTES: usize = 64 * 1024;
-const RESULT_BYTES: usize = 1024 * 1024;
+/// Maximum encoded tool result, including the SDK's text compatibility copy.
+pub const RESULT_BYTES: usize = 1024 * 1024;
 const READ_DEADLINE: Duration = Duration::from_secs(30);
 // Observation ends before common clients' 60-second timeout; owned work continues.
 const WRITE_DEADLINE: Duration = READ_DEADLINE;
@@ -60,6 +66,19 @@ pub enum AdmissionError {
     MissingContext,
 }
 
+/// A protocol failure for the host to judge using its canonical error model.
+/// These events are not wire codes: the host owns their status and disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolError {
+    Unauthenticated,
+    MissingContext,
+    Capacity,
+    Cancelled,
+    Deadline,
+    ResultTooLarge,
+    InvalidResult,
+}
+
 /// The narrow connection to the embedding server's existing request runtime.
 ///
 /// `start_*` must synchronously start owned work before returning its response
@@ -69,6 +88,10 @@ pub enum AdmissionError {
 /// storage or acquiring another admission lease.
 pub trait Host: Clone + Send + Sync + 'static {
     type Context: Send + 'static;
+    /// Project a protocol failure through the same error contract as handlers.
+    /// `write` preserves the need to reconcile an unfinished write or a write
+    /// whose result cannot be delivered. The returned error must be bounded.
+    fn error(&self, error: ProtocolError, write: bool) -> HostError;
     fn admit(&self, parts: Option<&Parts>) -> Result<Self::Context, AdmissionError>;
     fn start_tool(
         &self,
@@ -137,91 +160,60 @@ struct GraphTools<H> {
 
 /// Why a tool call or resource read produced no handler result.
 enum Refusal {
-    Unauthenticated,
-    MissingContext,
-    Capacity,
-    Cancelled,
-    Deadline,
+    Protocol(ProtocolError),
     Api(HostError),
 }
 
 impl Refusal {
-    /// The `isError` tool result. A write's caller learns when its wait ended
-    /// before the owned write did, or when the server could not tell whether
-    /// the write completed: the outcome is unknown and must be reconciled, never
-    /// replayed blindly.
-    async fn tool_result(self, write: bool) -> CallToolResult {
-        let unknown = "The write keeps running and its outcome is unknown. Before replaying it, read the target (`read` or `snapshot`, comparing `graph_commit_id`) or list the branch with `commits_list`, and replay a `mutate` with `if_graph_commit`.";
+    fn tool_result(self, host: &impl Host, write: bool) -> CallToolResult {
         match self {
-            Refusal::Unauthenticated => failure(
-                "unauthenticated",
-                "A verified bearer credential is required.",
-            ),
-            Refusal::MissingContext => {
-                failure("internal_error", "MCP admission context is missing.")
-            }
-            Refusal::Capacity => failure(
-                "capacity_exceeded",
-                "The server is handling its maximum concurrent MCP tool calls.",
-            ),
-            Refusal::Cancelled if write => outcome_unknown("cancelled", unknown),
-            Refusal::Cancelled => failure("cancelled", "The read was cancelled."),
-            Refusal::Deadline if write => outcome_unknown("deadline_exceeded", unknown),
-            Refusal::Deadline => failure(
-                "deadline_exceeded",
-                "The read exceeded its 30 second deadline.",
-            ),
-            Refusal::Api(error) => {
-                let uncertain = write && error.completion_uncertain();
-                let mut result = api_failure(error);
-                if uncertain {
-                    if let Some(Value::Object(body)) = result.structured_content.as_mut() {
-                        body.insert("outcome_unknown".into(), Value::Bool(true));
-                    }
-                }
-                result
-            }
+            Self::Protocol(error) => host.error(error, write),
+            Self::Api(error) => error,
         }
+        .into_tool_result()
     }
 
-    /// The JSON-RPC error a resource read answers with.
-    async fn resource_error(self) -> ErrorData {
-        match self {
-            Refusal::Api(error) => {
-                let status = error.status;
-                let body = api_failure(error).structured_content;
-                if status == StatusCode::NOT_FOUND {
-                    ErrorData::resource_not_found("resource not found", body)
-                } else if status.is_client_error() {
-                    ErrorData::invalid_request("resource read refused", body)
-                } else {
-                    ErrorData::internal_error("resource read failed", body)
-                }
+    /// A resource read carries the same canonical error envelope in `data`.
+    fn resource_error(self, host: &impl Host) -> ErrorData {
+        let status = match &self {
+            Self::Api(error) => error.status(),
+            Self::Protocol(_) => None,
+        };
+        let refused = status.is_some_and(|status| status.is_client_error())
+            || matches!(self, Self::Protocol(ProtocolError::Unauthenticated));
+        let message = match &self {
+            Self::Api(_) if status == Some(StatusCode::NOT_FOUND) => "resource not found",
+            Self::Api(_) if refused => "resource read refused",
+            Self::Api(_) => "resource read failed",
+            Self::Protocol(ProtocolError::Unauthenticated) => {
+                "a verified bearer credential is required"
             }
-            Refusal::Unauthenticated => {
-                ErrorData::invalid_request("a verified bearer credential is required", None)
+            Self::Protocol(ProtocolError::MissingContext) => "MCP admission context is missing",
+            Self::Protocol(ProtocolError::Capacity) => {
+                "the server is handling its maximum concurrent MCP calls"
             }
-            Refusal::MissingContext => {
-                ErrorData::internal_error("MCP admission context is missing", None)
-            }
-            Refusal::Capacity => ErrorData::internal_error(
-                "the server is handling its maximum concurrent MCP calls",
-                None,
-            ),
-            Refusal::Cancelled => ErrorData::internal_error("the read was cancelled", None),
-            Refusal::Deadline => {
-                ErrorData::internal_error("the read exceeded its 30 second deadline", None)
-            }
+            Self::Protocol(ProtocolError::Cancelled) => "the read was cancelled",
+            Self::Protocol(ProtocolError::Deadline) => "the read exceeded its 30 second deadline",
+            Self::Protocol(ProtocolError::ResultTooLarge) => "the resource exceeds 1 MiB",
+            Self::Protocol(ProtocolError::InvalidResult) => "could not encode MCP resource",
+        };
+        let data = self.tool_result(host, false).structured_content;
+        if status == Some(StatusCode::NOT_FOUND) {
+            ErrorData::resource_not_found(message, data)
+        } else if refused {
+            ErrorData::invalid_request(message, data)
+        } else {
+            ErrorData::internal_error(message, data)
         }
     }
 }
 
 impl From<AdmissionError> for Refusal {
     fn from(error: AdmissionError) -> Self {
-        match error {
-            AdmissionError::Unauthenticated => Self::Unauthenticated,
-            AdmissionError::MissingContext => Self::MissingContext,
-        }
+        Self::Protocol(match error {
+            AdmissionError::Unauthenticated => ProtocolError::Unauthenticated,
+            AdmissionError::MissingContext => ProtocolError::MissingContext,
+        })
     }
 }
 
@@ -231,18 +223,23 @@ where
     C: Future<Output = ()>,
 {
     tokio::select! {
-        _ = cancelled => Err(Refusal::Cancelled),
+        _ = cancelled => Err(Refusal::Protocol(ProtocolError::Cancelled)),
         result = tokio::time::timeout(deadline, pending) => {
             match result {
                 Ok(Ok(result)) => Ok(result),
                 Ok(Err(error)) => Err(Refusal::Api(error)),
-                Err(_) => Err(Refusal::Deadline),
+                Err(_) => Err(Refusal::Protocol(ProtocolError::Deadline)),
             }
         }
     }
 }
 
 impl<H: Host> GraphTools<H> {
+    fn fit_result(&self, result: ToolResult, write: bool) -> ToolResult {
+        check_result(result)
+            .unwrap_or_else(|error| self.host.error(error, write).into_tool_result())
+    }
+
     async fn run_tool<C>(
         &self,
         context: H::Context,
@@ -255,7 +252,7 @@ impl<H: Host> GraphTools<H> {
     {
         let permit = Arc::clone(&self.slots)
             .try_acquire_owned()
-            .map_err(|_| Refusal::Capacity)?;
+            .map_err(|_| Refusal::Protocol(ProtocolError::Capacity))?;
         // Transfer ownership before cancellation can drop the observation.
         let pending = self.host.start_tool(context, request, permit);
         observe(pending, cancelled, deadline).await
@@ -302,7 +299,9 @@ impl<H: Host> ServerHandler for GraphTools<H> {
         let write = spec.gate == Gate::Writes;
         let admitted = match self.host.admit(context.extensions.get::<Parts>()) {
             Ok(admitted) => admitted,
-            Err(refusal) => return Ok(Refusal::from(refusal).tool_result(write).await.into()),
+            Err(refusal) => {
+                return Ok(Refusal::from(refusal).tool_result(&self.host, write).into());
+            }
         };
         let request = ToolRequest::new(
             spec.name,
@@ -319,9 +318,9 @@ impl<H: Host> ServerHandler for GraphTools<H> {
             .await;
         let result = match result {
             Ok(result) => result,
-            Err(refusal) => refusal.tool_result(write).await,
+            Err(refusal) => refusal.tool_result(&self.host, write),
         };
-        Ok(fit_result(result).into())
+        Ok(self.fit_result(result, write).into())
     }
 
     async fn list_resources(
@@ -386,11 +385,13 @@ impl<H: Host> ServerHandler for GraphTools<H> {
             .map_err(Refusal::from);
         let admitted = match admitted {
             Ok(admitted) => admitted,
-            Err(refusal) => return Err(refusal.resource_error().await),
+            Err(refusal) => return Err(refusal.resource_error(&self.host)),
         };
         let permit = match Arc::clone(&self.slots).try_acquire_owned() {
             Ok(permit) => permit,
-            Err(_) => return Err(Refusal::Capacity.resource_error().await),
+            Err(_) => {
+                return Err(Refusal::Protocol(ProtocolError::Capacity).resource_error(&self.host));
+            }
         };
         let resource = resource.into_request().ok_or_else(|| {
             ErrorData::internal_error("static resources are answered without a graph read", None)
@@ -411,7 +412,7 @@ impl<H: Host> ServerHandler for GraphTools<H> {
                 ])
                 .into())
             }
-            Err(refusal) => Err(refusal.resource_error().await),
+            Err(refusal) => Err(refusal.resource_error(&self.host)),
         }
     }
 }

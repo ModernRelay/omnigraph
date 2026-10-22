@@ -279,18 +279,10 @@ fn blob_get_rejects_zero_overflow_and_out_of_bounds_ranges() {
         }]);
         let output = cli()
             .args([
-                "blob",
-                "get",
-                "node",
-                "Document",
-                "readme",
-                "content",
-                "--target",
-                &server.origin,
-                "--graph",
-                "knowledge",
-                "--out",
+                "blob", "get", "node", "Document", "readme", "content", "--target",
             ])
+            .fixture_target(&server.origin)
+            .args(["--graph", "knowledge", "--out"])
             .arg(&destination)
             .timeout(std::time::Duration::from_secs(15))
             .output()
@@ -594,10 +586,16 @@ fn blob_stat_fails_loudly_for_null_missing_and_non_blob_cells() {
                 .arg("--target")
                 .arg(&graph),
         );
-        assert!(
-            output.stdout.is_empty(),
-            "{case}: failure must not masquerade as Blob metadata"
+        // The failure is the failure envelope, never Blob metadata.
+        let failure = parse_stdout_json(&output);
+        assert!(failure["error"].is_string(), "{case}: {failure}");
+        assert_eq!(
+            failure["disposition"]["effects"], "none",
+            "{case}: {failure}"
         );
+        for metadata in ["kind", "size", "etag"] {
+            assert!(failure.get(metadata).is_none(), "{case}: {failure}");
+        }
     }
 }
 
@@ -727,14 +725,15 @@ fn blob_put_and_clear_write_receipts_and_refuse_bad_input_before_scope() {
             .arg(&original)
             .arg("--json"),
     );
-    assert_eq!(stale.status.code(), Some(1), "an embedded mismatch exits 1");
+    // The engine refused the write before it published, as a server does.
+    assert_eq!(stale.status.code(), Some(4), "an embedded mismatch exits 4");
     let refused = parse_stdout_json(&stale);
     assert_eq!(
         refused["blob_precondition_failure"]["current_etag"],
         stat_etag(readme).as_str()
     );
     assert!(refused.get("precondition_failure").is_none(), "{refused}");
-    assert_eq!(refused["command_outcome"]["action"], "refresh");
+    assert_eq!(refused["disposition"]["action"], "refresh");
 
     let cleared = parse_stdout_json(&output_success(
         blob("clear", readme)
@@ -805,7 +804,7 @@ fn blob_put_and_clear_write_receipts_and_refuse_bad_input_before_scope() {
             "actual": 32 * 1024 * 1024 + 1,
         })
     );
-    assert_eq!(refused["command_outcome"]["execution"], "not_started");
+    assert_eq!(refused["disposition"]["effects"], "none");
     assert!(!absent.exists(), "neither arm opened the store");
 
     // If-Match precedes reading the input; a missing input in turn precedes
@@ -826,7 +825,9 @@ fn blob_put_and_clear_write_receipts_and_refuse_bad_input_before_scope() {
                     "--file",
                 ])
                 .arg(temp.path().join("missing.bin"))
-                .args(["--target", &server.origin, "--graph", "knowledge", "--json"]),
+                .args(["--target"])
+                .fixture_target(&server.origin)
+                .args(["--graph", "knowledge", "--json"]),
         );
         let refused = parse_stdout_json(&output);
         assert!(
@@ -834,8 +835,8 @@ fn blob_put_and_clear_write_receipts_and_refuse_bad_input_before_scope() {
             "{validator}: {refused}"
         );
         assert_eq!(
-            refused["command_outcome"],
-            json!({"execution":"not_started", "effects":"none", "action":"refresh"})
+            refused["disposition"],
+            json!({"effects":"none", "action":"refresh"})
         );
         assert!(server.requests().is_empty());
         server.assert_complete();
@@ -1104,7 +1105,12 @@ fn maintenance_refuses_server_targets_before_network() {
         "cleanup",
         "upgrade",
     ] {
-        let output = output_failure(cli().arg(command).args(["--target", &server.origin]));
+        let output = output_failure(
+            cli()
+                .arg(command)
+                .args(["--target"])
+                .fixture_target(&server.origin),
+        );
         assert!(
             String::from_utf8_lossy(&output.stderr)
                 .contains("not available for this target kind and scope"),
@@ -1128,8 +1134,15 @@ fn retired_address_flags_refuse_before_resolving_a_target() {
         let output =
             output_failure(cli().args(["query", flag, "./graph.omni", "-e", "branch list"]));
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let (exit, diagnostic) = if flag == "--profile" {
+            (1, "query does not accept --profile")
+        } else {
+            (64, "unexpected argument")
+        };
+        assert_eq!(output.status.code(), Some(exit), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
         assert!(
-            stderr.contains("unexpected argument") && stderr.contains(flag),
+            stderr.contains(diagnostic) && stderr.contains(flag),
             "{stderr}"
         );
     }
@@ -1290,7 +1303,7 @@ fn repair_reports_foreign_drift_and_refuses_removed_flags() {
     assert_eq!(manifest_dataset_version(&graph), graph_manifest_before);
     for flag in ["--confirm", "--force"] {
         let refused = output_failure(cli().arg("repair").arg(flag).arg("--target").arg(&graph));
-        assert_eq!(refused.status.code(), Some(2));
+        assert_eq!(refused.status.code(), Some(64));
         assert_eq!(manifest_dataset_version(&graph), graph_manifest_before);
     }
 }
@@ -1447,7 +1460,7 @@ fn removed_cli_spellings_refuse_and_canonical_commands_remain_available() {
         vec!["export", "--jsonl"],
     ] {
         let output = output_failure(cli().args(&args));
-        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert_eq!(output.status.code(), Some(64), "{args:?}: {output:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("unrecognized subcommand") || stderr.contains("unexpected argument"),
@@ -1505,8 +1518,8 @@ fn lint_can_resolve_graph_from_registered_target() {
     fs::write(
         home.path().join("config.yaml"),
         format!(
-            "target_config_version: 1\ntargets:\n  lint-graph:\n    kind: direct\n    scope: graph\n    uri: {}\n",
-            serde_json::to_string(&graph).unwrap()
+            "version: 1\ntargets:\n  lint-graph:\n    kind: direct\n    scope: graph\n    uri: {}\n",
+            serde_json::to_string(url::Url::from_file_path(&graph).unwrap().as_str()).unwrap()
         ),
     )
     .unwrap();
@@ -1562,7 +1575,7 @@ query list_people() {
             .arg("--query")
             .arg(&query_path)
             .arg("--target")
-            .arg(&server.origin),
+            .fixture_target(&server.origin),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(2));
@@ -1755,6 +1768,15 @@ fn load_json_outputs_summary_for_main_branch() {
     );
     assert!(payload["commit"]["graph_commit_id"].is_string());
     assert!(payload["commit"]["graph_manifest_version"].is_number());
+    // The load route's body, field for field: no address, the write's actor
+    // (none is configured here) and a null base branch without `--from`.
+    assert!(payload.get("uri").is_none(), "{payload}");
+    assert_eq!(payload.get("base_branch"), Some(&Value::Null));
+    assert_eq!(payload.get("actor_id"), Some(&Value::Null));
+    assert_eq!(payload["actor_id"], payload["commit"]["actor_id"]);
+    let body: omnigraph_api_types::GraphBatchLoadOutput =
+        serde_json::from_value(payload.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&body).unwrap(), payload);
 
     let commits = parse_stdout_json(&output_success(
         cli()
@@ -1872,7 +1894,7 @@ fn read_named_and_default_targets_match_the_inline_target() {
     std::fs::write(
         home.join("config.yaml"),
         format!(
-            "target_config_version: 1\ndefaults:\n  target: local\ntargets:\n  local:\n    kind: direct\n    scope: graph\n    uri: '{}'\n",
+            "version: 1\ndefaults:\n  target: local\ntargets:\n  local:\n    kind: direct\n    scope: graph\n    uri: 'file://{}'\n",
             graph.to_string_lossy()
         ),
     )
@@ -2048,7 +2070,7 @@ fn read_resolves_uri_from_default_store_scope() {
     let home = tempdir().unwrap();
     std::fs::write(
         home.path().join("config.yaml"),
-        format!("target_config_version: 1\ndefaults:\n  target: local\ntargets:\n  local:\n    kind: direct\n    scope: graph\n    uri: {}\n", graph.to_string_lossy()),
+        format!("version: 1\ndefaults:\n  target: local\ntargets:\n  local:\n    kind: direct\n    scope: graph\n    uri: file://{}\n", graph.to_string_lossy()),
     )
     .unwrap();
 
@@ -2105,7 +2127,7 @@ fn read_uses_operator_default_output_format() {
     let operator_home = tempdir().unwrap();
     fs::write(
         operator_home.path().join("config.yaml"),
-        "target_config_version: 1\ndefaults:\n  output: csv\n",
+        "version: 1\ndefaults:\n  output: csv\n",
     )
     .unwrap();
 
@@ -2491,8 +2513,8 @@ fn mutate_if_commit_lost_cas_preserves_details_embedded_issue_365() {
         .unwrap();
     assert_eq!(
         lost.status.code(),
-        Some(1),
-        "embedded writable open prevents whole-command no-effect proof; stderr: {}",
+        Some(4),
+        "the engine refused before it published, as a server does; stderr: {}",
         String::from_utf8_lossy(&lost.stderr)
     );
     let body: Value = serde_json::from_slice(&lost.stdout)
@@ -2502,8 +2524,8 @@ fn mutate_if_commit_lost_cas_preserves_details_embedded_issue_365() {
         Value::String(stale_head)
     );
     assert_eq!(
-        body["command_outcome"],
-        serde_json::json!({"execution":"unknown","effects":"unknown","action":"refresh"})
+        body["disposition"],
+        serde_json::json!({"effects":"none","action":"refresh"})
     );
 
     let verify = output_success(
@@ -2546,7 +2568,7 @@ fn remote_if_commit_fails_closed_against_an_older_server() {
         let output = cli()
             .arg("mutate")
             .arg("--target")
-            .arg(&server.origin)
+            .fixture_target(&server.origin)
             .arg("--graph")
             .arg("legacy")
             .arg("-e")
@@ -2564,9 +2586,9 @@ fn remote_if_commit_fails_closed_against_an_older_server() {
         assert_eq!(error["http_status"], status);
         assert_eq!(error["request_dispatched"], false);
         assert_eq!(
-            error["command_outcome"],
+            error["disposition"],
             serde_json::json!({
-                "execution":"not_started", "effects":"none", "action":"refresh"
+                "effects":"none", "action":"fix"
             })
         );
         let requests = server.requests();
@@ -2589,6 +2611,7 @@ fn remote_if_commit_fails_closed_against_an_older_server() {
 /// any request.
 #[test]
 fn served_credential_follows_the_sent_url_issue_1022() {
+    let ca = tls_gateway::ca_path().display();
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
 
     let rows = || {
@@ -2622,18 +2645,17 @@ fn served_credential_follows_the_sent_url_issue_1022() {
     };
 
     // A server declared under a path prefix.
-    let fixture = IntentApiFixture::graph(vec![discovery(), rows(), discovery(), rows()]);
+    let fixture = IntentApiFixture::graph(vec![discovery(), rows()]);
     fs::write(
         home.path().join("config.yaml"),
         format!(
-            "target_config_version: 1\ntargets:\n  tenant-a:\n    kind: server\n    endpoint: '{}/tenant-a'\n    credential: tenant-a\n",
+            "version: 1\ntargets:\n  tenant-a:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/tenant-a'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_TENANT_A\n",
             fixture.origin
         ),
     )
     .unwrap();
     let tenant_a = ("OMNIGRAPH_TOKEN_TENANT_A", "tenant-a-token");
-    let prefixed = format!("{}/tenant-a", fixture.origin);
-    output_success(&mut query(tenant_a, &prefixed, "knowledge"));
+    output_success(&mut query(tenant_a, "tenant-a", "knowledge"));
     assert_eq!(
         authorization(&fixture),
         (
@@ -2641,13 +2663,11 @@ fn served_credential_follows_the_sent_url_issue_1022() {
             Some("Bearer tenant-a-token".to_string())
         )
     );
-    // Its address followed by `..` is sent to a sibling prefix: no token.
+    // Inline addresses, including escaped siblings, cannot select credentials.
     let escaped = format!("{}/tenant-a/../tenant-b", fixture.origin);
-    output_success(&mut query(tenant_a, &escaped, "knowledge"));
-    assert_eq!(
-        authorization(&fixture),
-        ("/tenant-b/graphs/knowledge/queries/q".to_string(), None)
-    );
+    let before = fixture.requests().len();
+    output_failure(&mut query(tenant_a, &escaped, "knowledge"));
+    assert_eq!(fixture.requests().len(), before);
     fixture.assert_complete();
 
     // A `--graph` that is not one plain path segment is refused before any
@@ -2656,7 +2676,7 @@ fn served_credential_follows_the_sent_url_issue_1022() {
     fs::write(
         home.path().join("config.yaml"),
         format!(
-            "target_config_version: 1\ntargets:\n  tenant-a:\n    kind: server\n    endpoint: '{}/tenant-a'\n    credential: tenant-a\n",
+            "version: 1\ntargets:\n  tenant-a:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/tenant-a'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_TENANT_A\n",
             fixture.origin
         ),
     )
@@ -2689,24 +2709,19 @@ fn served_credential_follows_the_sent_url_issue_1022() {
     {
         use crate::support::unix_gateway::UnixGateway;
 
-        let declared = IntentApiFixture::graph(vec![rows()]);
-        let other = IntentApiFixture::graph(vec![rows()]);
+        let declared = IntentApiFixture::graph(vec![]);
+        let other = IntentApiFixture::graph(vec![]);
         let declared_socket = UnixGateway::new(&declared.origin);
         let other_socket = UnixGateway::new(&other.origin);
         fs::write(
             home.path().join("config.yaml"),
-            format!("target_config_version: 1\ntargets:\n  og:\n    kind: server\n    endpoint: '{}'\n    credential: og\n", declared_socket.url()),
+            format!("version: 1\ntargets:\n  og:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_OG\n", declared_socket.url()),
         )
         .unwrap();
         let og = ("OMNIGRAPH_TOKEN_OG", "og-token");
-        output_success(&mut query(og, "og", "knowledge"));
-        assert_eq!(
-            authorization(&declared),
-            (
-                "/graphs/knowledge/queries/q".to_string(),
-                Some("Bearer og-token".to_string())
-            )
-        );
+        output_failure(&mut query(og, "og", "knowledge"));
+        assert!(declared.requests().is_empty());
+        assert_eq!(declared_socket.connections(), 0);
         // `<socket>/../../..` is the directory both gateways' directories share.
         let other_dir = other_socket
             .socket
@@ -2720,11 +2735,9 @@ fn served_credential_follows_the_sent_url_issue_1022() {
             "{}/../../../{other_dir}/gate way/s.sock",
             declared_socket.url()
         );
-        output_success(&mut query(og, &escaped, "knowledge"));
-        assert_eq!(
-            authorization(&other),
-            ("/graphs/knowledge/queries/q".to_string(), None)
-        );
+        output_failure(&mut query(og, &escaped, "knowledge"));
+        assert!(other.requests().is_empty());
+        assert_eq!(other_socket.connections(), 0);
         declared.assert_complete();
         other.assert_complete();
     }
@@ -2761,7 +2774,7 @@ fn remote_json_errors_preserve_server_codes_and_details() {
                 "error":"request exceeds the write budget",
                 "resource_limit":{"resource":"entities","limit":100,"actual":101}
             }),
-            1,
+            2,
         ),
         (
             vec!["mutate", "restricted", "--if-commit", "head-before"],
@@ -2779,7 +2792,7 @@ fn remote_json_errors_preserve_server_codes_and_details() {
                 "error":"wrong status cannot establish a conditional refusal",
                 "precondition_failure":{"expected":"head-before","actual":"head-after"}
             }),
-            1,
+            2,
         ),
         (
             vec!["mutate", "restricted", "--if-commit", "head-before"],
@@ -2788,7 +2801,7 @@ fn remote_json_errors_preserve_server_codes_and_details() {
                 "error":"wrong condition cannot establish this request's refusal",
                 "precondition_failure":{"expected":"another-condition","actual":"head-after"}
             }),
-            1,
+            2,
         ),
         (
             vec!["mutate", "restricted"],
@@ -2797,7 +2810,7 @@ fn remote_json_errors_preserve_server_codes_and_details() {
                 "error":"unsolicited condition cannot establish a refusal",
                 "precondition_failure":{"expected":"head-before","actual":"head-after"}
             }),
-            1,
+            2,
         ),
         (
             vec!["mutate", "restricted", "--if-commit", "head-before"],
@@ -2807,7 +2820,7 @@ fn remote_json_errors_preserve_server_codes_and_details() {
                 "precondition_failure":{"expected":"head-before","actual":"head-after"},
                 "recovery_required":{"operation_id":"published"}
             }),
-            1,
+            2,
         ),
     ] {
         let formats: &[&[&str]] = if arguments[0] == "query" {
@@ -2825,7 +2838,9 @@ fn remote_json_errors_preserve_server_codes_and_details() {
         |(arguments, status, body, exit, format)| {
             let server = IntentApiFixture::graph(vec![IntentReply::json(status, body.clone())]);
             let output = cli()
-                .args(["--target", &server.origin, "--graph", "knowledge"])
+                .args(["--target"])
+                .fixture_target(&server.origin)
+                .args(["--graph", "knowledge"])
                 .args(&arguments)
                 .args(format)
                 .output()
@@ -2838,27 +2853,22 @@ fn remote_json_errors_preserve_server_codes_and_details() {
             let mut actual = serde_json::from_slice::<Value>(&output.stdout).unwrap_or_else(|error| {
                 panic!("{arguments:?} {format:?} lost structured HTTP {status}: {error}; {output:?}")
             });
-            if arguments[0] == "mutate" {
-                // A verified precondition and a typed policy denial both refuse
-                // before effects; every other row leaves the outcome unknown.
-                let (execution, effects) = if exit == 4 || body["code"] == "forbidden" {
-                    ("not_started", "none")
-                } else {
-                    ("unknown", "unknown")
-                };
-                assert_eq!(actual["http_status"], status);
-                assert_eq!(
-                    actual["command_outcome"]["execution"], execution,
-                    "{arguments:?}: {actual}"
-                );
-                assert_eq!(
-                    actual["command_outcome"]["effects"], effects,
-                    "{arguments:?}: {actual}"
-                );
-                let fields = actual.as_object_mut().unwrap();
-                fields.remove("http_status");
-                fields.remove("command_outcome");
-            }
+            // A read changes nothing, and a verified precondition and a typed
+            // policy denial both refuse before effects; every other row
+            // leaves the effects unknown.
+            let effects = if arguments[0] != "mutate" || exit == 4 || body["code"] == "forbidden" {
+                "none"
+            } else {
+                "unknown"
+            };
+            assert_eq!(actual["http_status"], status);
+            assert_eq!(
+                actual["disposition"]["effects"], effects,
+                "{arguments:?}: {actual}"
+            );
+            let fields = actual.as_object_mut().unwrap();
+            fields.remove("http_status");
+            fields.remove("disposition");
             assert_eq!(
                 actual, body,
                 "{arguments:?} {format:?} must preserve the server's complete error contract"
@@ -2870,6 +2880,143 @@ fn remote_json_errors_preserve_server_codes_and_details() {
             server.assert_complete();
         },
     );
+}
+
+/// A served load its policy refuses ran nothing, so it exits 1 with
+/// `not_started` whether or not `--from` would have forked its branch: the
+/// server authorizes the load, the fork included, before its write. An
+/// embedded write carries no cluster policy; `command_outcome`'s tests own
+/// the embedded projection of an engine policy refusal.
+#[test]
+fn a_policy_refused_served_load_reports_not_started() {
+    let cluster = converged_loaded_cluster("knowledge", Some(POLICY_YAML));
+    let rows = cluster.path().join("rows.jsonl");
+    fs::write(
+        &rows,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Refused\",\"age\":1}}\n",
+    )
+    .unwrap();
+    // act-bruno may change an unprotected branch but neither create a branch
+    // nor change `main`.
+    let load = |branch: &str| {
+        vec![
+            "load".to_string(),
+            "--mode".into(),
+            "append".into(),
+            "--data".into(),
+            rows.to_string_lossy().into_owned(),
+            "--branch".into(),
+            branch.into(),
+            "--from".into(),
+            "main".into(),
+            "--json".into(),
+        ]
+    };
+    let assert_refused = |arm: &str, output: &std::process::Output| {
+        assert_eq!(output.status.code(), Some(1), "{arm}: {output:?}");
+        let body = parse_stdout_json(output);
+        assert_eq!(body["code"], "forbidden", "{arm}: {body}");
+        assert_eq!(
+            body["disposition"],
+            json!({"effects":"none","action":"refresh"}),
+            "{arm}: {body}"
+        );
+    };
+    let server = spawn_server_with_cluster_env(
+        cluster.path(),
+        &[(
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+            r#"{"act-bruno":"bruno-token"}"#,
+        )],
+    );
+    let operator = KeyedServer::new(&server.base_url);
+    for branch in ["fresh", "main"] {
+        let output = cli()
+            .envs(operator.env("bruno-token"))
+            .args(load(branch))
+            .args(["--target", KEYED_SERVER_NAME, "--graph", "knowledge"])
+            .output()
+            .unwrap();
+        assert_refused(&format!("served {branch}"), &output);
+    }
+    // The refused fork left no branch.
+    let branches = parse_stdout_json(&output_success(
+        cli()
+            .envs(operator.env("bruno-token"))
+            .args(["branch", "list", "--json"])
+            .args(["--target", KEYED_SERVER_NAME, "--graph", "knowledge"]),
+    ));
+    assert!(
+        !branches["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == "fresh"),
+        "{branches}"
+    );
+}
+
+/// An embedded load reports what the engine did rather than a prediction.
+/// Onto a branch that exists, `--from` forks nothing, so a refused payload ran
+/// nothing. Onto a missing branch the fork publishes before the payload is
+/// read, so the same refusal follows that publication and the branch stays.
+#[test]
+fn an_embedded_load_reports_its_fork_from_the_engine() {
+    let temp = tempfile::tempdir().unwrap();
+    let graph = temp.path().join("graph.omni");
+    init_graph(&graph);
+    load_fixture(&graph);
+    output_success(
+        cli()
+            .args(["branch", "create", "feature", "--target"])
+            .arg(&graph),
+    );
+    let rows = temp.path().join("rows.jsonl");
+    fs::write(&rows, "not valid graph NDJSON\n").unwrap();
+    let load = |branch: &str| {
+        cli()
+            .args(["load", "--mode", "append", "--data"])
+            .arg(&rows)
+            .args(["--branch", branch, "--from", "main", "--json", "--target"])
+            .arg(&graph)
+            .output()
+            .unwrap()
+    };
+    let branches = || {
+        parse_stdout_json(&output_success(
+            cli()
+                .args(["branch", "list", "--json", "--target"])
+                .arg(&graph),
+        ))["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap().to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let before = branches();
+
+    let existing = load("feature");
+    assert_eq!(existing.status.code(), Some(1), "{existing:?}");
+    assert_eq!(
+        parse_stdout_json(&existing)["disposition"],
+        json!({"effects":"none","action":"fix"}),
+        "{existing:?}"
+    );
+    assert_eq!(branches(), before, "no fork onto an existing branch");
+
+    let forked = load("fresh");
+    assert_eq!(forked.status.code(), Some(2), "{forked:?}");
+    let body = parse_stdout_json(&forked);
+    // The fork published, and the engine marks the load's later error as
+    // following it without proving that the failing step wrote nothing, so
+    // the whole command's effects are unknown.
+    assert_eq!(
+        body["disposition"],
+        json!({"effects":"unknown","action":"reconcile"}),
+        "{body}"
+    );
+    assert!(branches().contains("fresh"), "the fork published");
 }
 
 /// Whole-command outcome classification needs real CLI processes and a wire
@@ -2902,8 +3049,8 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
         ],
         vec!["blob", "clear", "node", "Document", "readme", "content"],
     ];
-    let not_started = |action: &str| serde_json::json!({"execution":"not_started","effects":"none","action":action});
-    let unknown = |action: &str| serde_json::json!({"execution":"unknown","effects":"unknown","action":action});
+    let not_started = |action: &str| serde_json::json!({"effects":"none","action":action});
+    let unknown = |action: &str| serde_json::json!({"effects":"unknown","action":action});
     let cases = [
         (
             429,
@@ -2914,31 +3061,31 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
         (
             429,
             serde_json::json!({"error":"unqualified proxy throttle"}),
-            1,
+            2,
             unknown("reconcile"),
         ),
         (
             409,
             serde_json::json!({"error":"conflict","code":"conflict"}),
-            1,
+            2,
             unknown("reconcile"),
         ),
         (
             503,
             serde_json::json!({"error":"unavailable"}),
-            1,
+            2,
             unknown("reconcile"),
         ),
         (
             409,
             serde_json::json!({"error":"authority changed","read_set_conflict":{"member":"graph_head","expected":"before","actual":"after"}}),
-            1,
+            2,
             unknown("refresh"),
         ),
         (
             409,
             serde_json::json!({"error":"input too large","resource_limit":{"resource":"entities","limit":10,"actual":11}}),
-            1,
+            2,
             unknown("refresh"),
         ),
         // Admission probes an external Blob source before any effect; the
@@ -2946,25 +3093,25 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
         (
             424,
             serde_json::json!({"error":"source unavailable","external_blob_source":{"uri":"s3://bucket/object","reason":"not found"}}),
-            1,
+            2,
             unknown("refresh"),
         ),
         (
             424,
             serde_json::json!({"error":"source unavailable"}),
-            1,
+            2,
             unknown("reconcile"),
         ),
         (
             503,
             serde_json::json!({"error":"schema completion required","recovery_required":{"operation_id":"published-commit"}}),
-            1,
+            2,
             unknown("recover"),
         ),
         (
             429,
             serde_json::json!({"error":"contradictory refusal","code":"too_many_requests","recovery_required":{"operation_id":"published-commit"}}),
-            1,
+            2,
             unknown("recover"),
         ),
         // The server answers these before admission: bearer authentication,
@@ -2973,7 +3120,7 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
             401,
             serde_json::json!({"error":"invalid bearer token","code":"unauthorized"}),
             1,
-            not_started("refresh"),
+            not_started("fix"),
         ),
         (
             403,
@@ -2985,26 +3132,26 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
             400,
             serde_json::json!({"error":"exactly one contract header is required","code":"api_contract_mismatch"}),
             1,
-            not_started("refresh"),
+            not_started("fix"),
         ),
         // Only the code under its own status proves the refusal; contradictory
         // effect evidence outranks it.
         (
             403,
             serde_json::json!({"error":"denied by an intermediary"}),
-            1,
+            2,
             unknown("reconcile"),
         ),
         (
             400,
             serde_json::json!({"error":"misplaced denial","code":"forbidden"}),
-            1,
+            2,
             unknown("reconcile"),
         ),
         (
             403,
             serde_json::json!({"error":"contradictory denial","code":"forbidden","recovery_required":{"operation_id":"published-commit"}}),
-            1,
+            2,
             unknown("recover"),
         ),
     ];
@@ -3015,12 +3162,14 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
     for_each_concurrently(
         matrix,
         CASE_WORKERS,
-        |(arguments, (status, body, exit, outcome))| {
+        |(arguments, (status, body, exit, disposition))| {
             let mut reply = IntentReply::json(*status, body.clone());
             reply.headers.push(("Retry-After".into(), "17".into()));
             let server = IntentApiFixture::graph(vec![reply]);
             let output = cli()
-                .args(["--target", &server.origin, "--graph", "knowledge"])
+                .args(["--target"])
+                .fixture_target(&server.origin)
+                .args(["--graph", "knowledge"])
                 .args(arguments)
                 .arg("--json")
                 .output()
@@ -3034,11 +3183,11 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
             assert_eq!(actual["http_status"], *status);
             assert_eq!(actual["retry_after"], "17");
             assert_eq!(
-                &actual["command_outcome"], outcome,
+                &actual["disposition"], disposition,
                 "{arguments:?} HTTP {status} {body}"
             );
             let fields = actual.as_object_mut().unwrap();
-            fields.remove("command_outcome");
+            fields.remove("disposition");
             fields.remove("http_status");
             fields.remove("retry_after");
             // No credential is bound to the fixture's URL, so a 401 also says
@@ -3048,13 +3197,11 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
                 assert_eq!(
                     missing_credential,
                     Some(json!({
-                        "unbound": server.origin,
-                        "hint": format!(
-                            "no credential is bound to {}: declare a target for it under `targets:` in \
-                             {HERMETIC_OPERATOR_HOME}/config.yaml, then run \
-                             `omnigraph login --target <target>` or set OMNIGRAPH_TOKEN_<NAME>",
-                            server.origin
-                        )
+                        "target": "test-server",
+                        "auth": "anonymous",
+                        "hint": "target `test-server` uses anonymous authentication: configure a token or exec \
+                                 provider; for a token provider with source: store, run \
+                                 `omnigraph credentials set --target test-server --stdin`"
                     }))
                 );
             } else {
@@ -3079,22 +3226,16 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
             body: b"{unfinished".to_vec(),
         }]);
         let output = cli()
-            .args([
-                "--target",
-                &server.origin,
-                "--graph",
-                "knowledge",
-                "mutate",
-                "stored_write",
-                "--json",
-            ])
+            .args(["--target"])
+            .fixture_target(&server.origin)
+            .args(["--graph", "knowledge", "mutate", "stored_write", "--json"])
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(output.status.code(), Some(2));
         let actual = parse_stdout_json(&output);
         assert_eq!(
-            actual["command_outcome"],
-            serde_json::json!({"execution":"unknown","effects":"unknown","action":"reconcile"})
+            actual["disposition"],
+            serde_json::json!({"effects":"unknown","action":"reconcile"})
         );
         assert_eq!(actual["http_status"], 200);
         assert_eq!(server.requests().len(), 2);
@@ -3146,13 +3287,22 @@ fn remote_response_contract_errors_preserve_status_and_hide_untrusted_bodies() {
             ]);
         let mut command = cli();
         command
-            .args(["--target", &server.origin, "--graph", "knowledge"])
+            .args(["--target"])
+            .fixture_target(&server.origin)
+            .args(["--graph", "knowledge"])
             .args(&arguments);
         let output = command.output().unwrap();
-        assert_eq!(output.status.code(), Some(1));
+        // A write's response lost its contract, so its effects are unknown;
+        // a read has none.
+        let write = arguments[0] == "mutate";
+        assert_eq!(output.status.code(), Some(if write { 2 } else { 1 }));
         if arguments.len() > 2 {
             let error = parse_stdout_json(&output);
             assert_eq!(error["code"], "api_contract_mismatch");
+            assert_eq!(
+                error["disposition"]["effects"],
+                if write { "unknown" } else { "none" }
+            );
             assert_eq!(error["http_status"], status);
             assert_eq!(error["request_dispatched"], true);
             assert!(
@@ -3212,24 +3362,40 @@ fn remote_human_and_invalid_json_errors_remain_diagnostics() {
             body: body.as_bytes().to_vec(),
         }]);
         let mut command = cli();
-        command.args([
-            "--target",
-            &server.origin,
-            "--graph",
-            "knowledge",
-            "query",
-            "restricted",
-        ]);
+        command
+            .args(["--target"])
+            .fixture_target(&server.origin)
+            .args(["--graph", "knowledge", "query", "restricted"]);
         if json {
             command.arg("--json");
         }
         let output = command.output().unwrap();
         assert_eq!(output.status.code(), Some(1));
-        assert!(output.stdout.is_empty(), "{output:?}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains(expected),
-            "{output:?}"
-        );
+        if json {
+            // An untrusted body is never structure: its status and text
+            // become the CLI's own failure, which a read cannot leave with
+            // effects.
+            let failure = parse_stdout_json(&output);
+            assert!(
+                failure["error"].as_str().unwrap().contains(expected),
+                "{failure}"
+            );
+            assert_eq!(failure["http_status"], 403);
+            assert_eq!(failure["disposition"]["effects"], "none");
+            // Only the resolved destination precedes it, on stderr.
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .all(|line| line.starts_with("target ")),
+                "{output:?}"
+            );
+        } else {
+            assert!(output.stdout.is_empty(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(expected),
+                "{output:?}"
+            );
+        }
         server.assert_complete();
     }
 }
@@ -3335,6 +3501,7 @@ fn read_supports_inline_query_string() {
 
 #[test]
 fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
+    let ca = tls_gateway::ca_path().display();
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
 
     let cases: &[(&str, Option<&str>, &[&str], &str)] = &[
@@ -3354,12 +3521,8 @@ fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
         let replacement = home.path().join("replacement.yaml");
         let credentials = home.path().join("credentials");
         let replacement_credentials = home.path().join("replacement-credentials");
-        fs::write(
-            &credentials,
-            "[prod]\ntoken = captured-root-token\n[graph-owner]\ntoken = captured-graph-token\n",
-        )
-        .unwrap();
-        let replacement_tokens = "[prod]\ntoken = changed-root-token\n[graph-owner]\ntoken = changed-graph-token\n[replacement]\ntoken = replacement-token\n";
+        fs::write(&credentials, "captured-root-token\n").unwrap();
+        let replacement_tokens = "changed-root-token\n";
         fs::write(&replacement_credentials, replacement_tokens).unwrap();
         #[cfg(unix)]
         {
@@ -3415,14 +3578,13 @@ fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
         fs::write(
             &config,
             format!(
-                "target_config_version: 1\ntargets:\n  prod:\n    kind: server\n    endpoint: '{}'\n    credential: prod\n  graph-owner:\n    kind: server\n    endpoint: '{}/unrelated'\n    credential: graph-owner\ndefaults:\n  output: csv\n  table_max_column_width: 8\n  table_cell_layout: wrap\n",
+                "version: 1\ntargets:\n  prod:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    auth:\n      provider: token\n      source:\n        file: ./credentials\n  graph-owner:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/unrelated'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_GRAPH_OWNER\ndefaults:\n  output: csv\n",
                 server.origin, server.origin
             ),
         )
         .unwrap();
-        fs::write(&credentials, format!("[prod]\nendpoint = {}\ntoken = captured-root-token\n[graph-owner]\nendpoint = {}/unrelated\ntoken = captured-graph-token\n", server.origin, server.origin)).unwrap();
         let replacement_config = format!(
-            "target_config_version: 1\ntargets:\n  prod:\n    kind: server\n    endpoint: '{}'\n    credential: prod\n  replacement:\n    kind: server\n    endpoint: '{}'\n    credential: replacement\ndefaults:\n  output: json\n  table_max_column_width: 80\n  table_cell_layout: truncate\n",
+            "version: 1\ntargets:\n  prod:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    auth:\n      provider: token\n      source:\n        file: ./credentials\n  replacement:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_REPLACEMENT\ndefaults:\n  output: json\n",
             trap.origin, server.origin
         );
         fs::write(&replacement, &replacement_config).unwrap();
@@ -3470,12 +3632,7 @@ fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
             ),
             "csv" => assert_eq!(stdout, "p.name\noriginal-server\n"),
             "table" => {
-                assert!(stdout.lines().any(|line| line == "original"), "{stdout}");
-                assert!(
-                    stdout.lines().any(|line| line.trim_end() == "-server"),
-                    "{stdout}"
-                );
-                assert!(!stdout.contains("original-server"), "{stdout}");
+                assert!(stdout.contains("original-server"), "{stdout}");
             }
             _ => unreachable!(),
         }
@@ -3524,21 +3681,22 @@ fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
 
 #[test]
 fn composed_http_routes_refuse_crossing_captured_auth_boundaries() {
+    let ca = tls_gateway::ca_path().display();
     use crate::support::managed_http::IntentApiFixture;
 
     // A graph base can have the selected owner while a later route suffix
     // belongs to another owner. No discovery or data request may cross it.
     for (root_auth, nested_auth, extra, suffix, args) in [
         (
-            "credential: parent",
-            "auth: anonymous",
+            "auth: {provider: token, source: {env: OMNIGRAPH_TOKEN_PARENT}}",
+            "auth: {provider: anonymous}",
             "",
             "graphs/knowledge/branches",
             vec!["branch", "list", "--json"],
         ),
         (
-            "credential: parent",
-            "credential: child",
+            "auth: {provider: token, source: {env: OMNIGRAPH_TOKEN_PARENT}}",
+            "auth: {provider: token, source: {env: OMNIGRAPH_TOKEN_CHILD}}",
             "",
             "graphs/knowledge/query",
             vec![
@@ -3549,29 +3707,29 @@ fn composed_http_routes_refuse_crossing_captured_auth_boundaries() {
             ],
         ),
         (
-            "auth: anonymous",
-            "credential: child",
+            "auth: {provider: anonymous}",
+            "auth: {provider: token, source: {env: OMNIGRAPH_TOKEN_CHILD}}",
             "",
             "graphs/knowledge/branches",
             vec!["branch", "list", "--json"],
         ),
         (
-            "credential: parent",
-            "auth: anonymous",
+            "auth: {provider: token, source: {env: OMNIGRAPH_TOKEN_PARENT}}",
+            "auth: {provider: anonymous}",
             "    default_graph: '../invalid'\n",
             "graphs/knowledge/branches",
             vec!["branch", "list", "--json"],
         ),
         (
-            "credential: parent",
+            "auth: {provider: token, source: {env: OMNIGRAPH_TOKEN_PARENT}}",
             "",
             "",
             "graphs/knowledge/branches",
             vec!["branch", "list", "--json"],
         ),
         (
-            "credential: parent",
-            "auth: anonymous",
+            "auth: {provider: token, source: {env: OMNIGRAPH_TOKEN_PARENT}}",
+            "auth: {provider: anonymous}",
             "",
             "healthz",
             vec!["branch", "list", "--json"],
@@ -3580,7 +3738,7 @@ fn composed_http_routes_refuse_crossing_captured_auth_boundaries() {
         let server = IntentApiFixture::new(vec![]);
         let home = tempdir().unwrap();
         fs::write(home.path().join("config.yaml"), format!(
-            "target_config_version: 1\ntargets:\n  parent:\n    kind: server\n    endpoint: '{}/api'\n    {root_auth}\n    default_graph: knowledge\n  nested:\n    kind: server\n    endpoint: '{}/api/{suffix}'\n    {nested_auth}\n{extra}",
+            "version: 1\ntargets:\n  parent:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/api'\n    {root_auth}\n    default_graph: knowledge\n  nested:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/api/{suffix}'\n    {nested_auth}\n{extra}",
             server.origin, server.origin,
         )).unwrap();
         let output = output_failure(
@@ -3597,7 +3755,13 @@ fn composed_http_routes_refuse_crossing_captured_auth_boundaries() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            diagnostic.contains("credential_scope_mismatch"),
+            if !extra.is_empty() {
+                diagnostic.contains("target_config_invalid")
+                    && diagnostic.contains("targets.nested.default_graph")
+            } else {
+                diagnostic.contains("credential_scope_mismatch")
+                    || (nested_auth.is_empty() && diagnostic.contains("auth"))
+            },
             "{root_auth}/{nested_auth}/{suffix}: {diagnostic}"
         );
         assert!(!diagnostic.contains("parent-secret"));
@@ -3622,7 +3786,12 @@ fn ambiguous_or_positional_http_scopes_are_rejected_without_network_io() {
         vec!["branch", "merge", "feature", "--uri", "graph.omni"],
         vec!["query", "--target", "./graph.omni", "-e", "branch list"],
     ] {
-        let output = output_failure(cli().args(["--target", &server.origin]).args(&arguments));
+        let output = output_failure(
+            cli()
+                .args(["--target"])
+                .fixture_target(&server.origin)
+                .args(&arguments),
+        );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("unexpected argument")
@@ -3638,13 +3807,14 @@ fn ambiguous_or_positional_http_scopes_are_rejected_without_network_io() {
 /// An invalid endpoint never reinterprets that registered target as direct storage.
 #[test]
 fn server_scope_refuses_a_non_server_scheme_issue_979() {
+    let ca = tls_gateway::ca_path().display();
     let home = tempdir().unwrap();
     for endpoint in [
         "ftp://graph.example.com",
         "s3://bucket/graph.omni",
         "file:///tmp/graph.omni",
     ] {
-        fs::write(home.path().join("config.yaml"), format!("target_config_version: 1\ntargets:\n  bad:\n    kind: server\n    endpoint: {endpoint}\n    auth: anonymous\n")).unwrap();
+        fs::write(home.path().join("config.yaml"), format!("version: 1\ntargets:\n  bad:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: {endpoint}\n    auth:\n      provider: anonymous\n")).unwrap();
         for arguments in [
             vec!["query", "-e", "branch list"],
             vec!["graphs", "list"],
@@ -3658,7 +3828,7 @@ fn server_scope_refuses_a_non_server_scheme_issue_979() {
             );
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
-                stderr.contains("target_invalid") && stderr.contains("HTTP endpoint"),
+                stderr.contains("endpoint"),
                 "{endpoint} {arguments:?}: {stderr}"
             );
         }
@@ -3701,7 +3871,9 @@ fn as_on_a_served_write_asserts_the_actor() {
         ]);
         let output = cli()
             .args(write)
-            .args(["--target", &server.origin, "--graph", "knowledge"])
+            .args(["--target"])
+            .fixture_target(&server.origin)
+            .args(["--graph", "knowledge"])
             .args(["--as", "act-nope", "--json"])
             .output()
             .unwrap();
@@ -3709,8 +3881,8 @@ fn as_on_a_served_write_asserts_the_actor() {
         let error = parse_stdout_json(&output);
         assert_eq!(error["code"], "actor_mismatch", "{write:?}: {error}");
         assert_eq!(
-            error["command_outcome"],
-            json!({"execution":"not_started","effects":"none","action":"refresh"}),
+            error["disposition"],
+            json!({"effects":"none","action":"fix"}),
             "{write:?}: {error}"
         );
         let requests = server.requests();
@@ -3735,7 +3907,9 @@ fn as_on_a_served_write_asserts_the_actor() {
         }]);
         let output = cli()
             .args(write)
-            .args(["--target", &older.origin, "--graph", "knowledge"])
+            .args(["--target"])
+            .fixture_target(&older.origin)
+            .args(["--graph", "knowledge"])
             .args(["--as", "act-nope", "--json"])
             .output()
             .unwrap();
@@ -4125,44 +4299,55 @@ fn branch_delete_against_non_local_scope_refuses_without_yes() {
     };
     use crate::support::managed_http::IntentApiFixture;
 
-    // The complete S3 destination still reaches no storage before consent.
-    let output = output_failure(
-        s3().arg("branch")
-            .arg("delete")
-            .arg("--target")
-            .arg("s3://fake-bucket/g.omni")
-            .arg("feature")
-            .arg("--json"),
-    );
-    let output = parse_stdout_json(&output);
-    let error = output["error"].as_str().unwrap();
-    assert!(error.contains("refusing destructive `branch delete`") && error.contains("--yes"));
-    assert_eq!(output["command_outcome"]["effects"], "none");
+    // Direct cloud addressing is retired independently of destructive consent.
+    // Neither provider may open storage, even when the caller supplies --yes.
+    for target in ["s3://fake-bucket/g.omni", "az://fake-container/g.omni"] {
+        for consent in [vec![], vec!["--yes"]] {
+            let output = output_failure(
+                s3().env_clear()
+                    .env("OMNIGRAPH_HOME", HERMETIC_OPERATOR_HOME)
+                    .args(["branch", "delete", "--target", target, "feature", "--json"])
+                    .args(consent),
+            );
+            let output = parse_stdout_json(&output);
+            let error = output["error"].as_str().unwrap();
+            assert!(
+                error.contains("inline access supports local storage only"),
+                "{error}"
+            );
+            assert_eq!(output["disposition"]["effects"], "none");
+        }
+    }
 
     // Both commit-drop spellings use the same consent gate before submission.
     for arguments in [
+        vec!["branch", "delete", "feature"],
         vec!["commit", "drop", "proposal"],
         vec!["mutate", "-e", "commit drop \"proposal\""],
     ] {
         let server = IntentApiFixture::graph(vec![]);
-        let output = output_failure(cli().args(&arguments).args([
-            "--target",
-            &server.origin,
-            "--graph",
-            "knowledge",
-            "--json",
-        ]));
+        let output = output_failure(
+            cli()
+                .args(&arguments)
+                .args(["--target"])
+                .fixture_target(&server.origin)
+                .args(["--graph", "knowledge", "--json"]),
+        );
         let error = parse_stdout_json(&output);
         assert!(
             error["error"]
                 .as_str()
                 .unwrap()
-                .contains("refusing destructive `commit drop`"),
+                .contains(if arguments[0] == "branch" {
+                    "refusing destructive `branch delete`"
+                } else {
+                    "refusing destructive `commit drop`"
+                }),
             "{arguments:?}: {error}"
         );
         assert_eq!(
-            error["command_outcome"],
-            serde_json::json!({"execution":"not_started", "effects":"none", "action":"refresh"}),
+            error["disposition"],
+            serde_json::json!({"effects":"none", "action":"refresh"}),
             "{arguments:?}"
         );
         let requests = server.requests();
@@ -4182,60 +4367,27 @@ fn branch_delete_against_non_local_scope_refuses_without_yes() {
 #[test]
 fn branch_delete_against_non_local_scope_passes_gate_with_yes() {
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
-
-    // With --yes the gate is bypassed; the command then fails for an unrelated
-    // reason (the fake bucket can't be opened), so the refusal must be ABSENT.
-    let empty_listing = IntentReply {
-        status: 200,
-        headers: Vec::new(),
-        body: br#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>fake-bucket</Name><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>"#.to_vec(),
-    };
-    let mut replies = vec![empty_listing];
-    replies.extend(vec![
-        IntentReply::json(
-            404,
-            serde_json::json!({"error":"no such key"})
-        );
-        15
-    ]);
-    let bucket = IntentApiFixture::new(replies);
-    let mut command = cli();
-    command.envs([
-        ("AWS_ACCESS_KEY_ID", "gate-test-key"),
-        ("AWS_SECRET_ACCESS_KEY", "gate-test-secret"),
-        ("AWS_SESSION_TOKEN", ""),
-        ("AWS_CONFIG_FILE", "/nonexistent/omnigraph-gate-aws-config"),
-        (
-            "AWS_SHARED_CREDENTIALS_FILE",
-            "/nonexistent/omnigraph-gate-aws-credentials",
-        ),
-        ("AWS_REGION", "us-east-1"),
-        ("AWS_DEFAULT_REGION", "us-east-1"),
-        ("AWS_ENDPOINT", bucket.origin.as_str()),
-        ("AWS_ENDPOINT_URL", bucket.origin.as_str()),
-        ("AWS_ENDPOINT_URL_S3", bucket.origin.as_str()),
-        ("AWS_ALLOW_HTTP", "true"),
-        ("AWS_VIRTUAL_HOSTED_STYLE_REQUEST", "false"),
-        ("AWS_S3_FORCE_PATH_STYLE", "true"),
-        ("AWS_EC2_METADATA_DISABLED", "true"),
-        ("OBJECT_STORE_CLIENT_MAX_RETRIES", "0"),
-        ("OBJECT_STORE_CLIENT_RETRY_TIMEOUT", "2"),
-    ]);
+    let server = IntentApiFixture::graph(vec![IntentReply::json(
+        404,
+        json!({"error":"branch absent", "code":"not_found"}),
+    )]);
     let output = output_failure(
-        command
-            .arg("branch")
-            .arg("delete")
-            .arg("--target")
-            .arg("s3://fake-bucket/g.omni")
-            .arg("feature")
-            .arg("--yes")
-            .arg("--json"),
+        cli()
+            .args(["branch", "delete", "feature", "--yes", "--json", "--target"])
+            .fixture_target(&server.origin)
+            .args(["--graph", "knowledge"]),
     );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        !stderr.contains("refusing destructive"),
-        "--yes should bypass the confirm gate; stderr: {stderr}"
+    let diagnostic = format!(
+        "{}{}",
+        stdout_string(&output),
+        String::from_utf8_lossy(&output.stderr)
     );
+    assert!(!diagnostic.contains("refusing destructive"), "{diagnostic}");
+    let requests = server.workflow_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "DELETE");
+    assert_eq!(requests[0].path, "/graphs/knowledge/branches/feature");
+    server.assert_complete();
 }
 
 #[test]
@@ -4266,9 +4418,9 @@ fn overwrite_load_against_non_local_scope_refuses_without_yes() {
         output["error"]
             .as_str()
             .unwrap()
-            .contains("refusing destructive `load --mode overwrite`")
+            .contains("inline access supports local storage only")
     );
-    assert_eq!(output["command_outcome"]["effects"], "none");
+    assert_eq!(output["disposition"]["effects"], "none");
 
     let temp = tempdir().unwrap();
     let server = crate::support::managed_http::IntentApiFixture::graph(vec![]);
@@ -4276,7 +4428,9 @@ fn overwrite_load_against_non_local_scope_refuses_without_yes() {
         cli()
             .args(["load", "--mode", "overwrite", "--data"])
             .arg(temp.path().join("missing.jsonl"))
-            .args(["--target", &server.origin, "--graph", "knowledge", "--json"]),
+            .args(["--target"])
+            .fixture_target(&server.origin)
+            .args(["--graph", "knowledge", "--json"]),
     );
     let refused = parse_stdout_json(&output);
     assert!(
@@ -4287,8 +4441,8 @@ fn overwrite_load_against_non_local_scope_refuses_without_yes() {
         "consent must precede reading --data: {refused}"
     );
     assert_eq!(
-        refused["command_outcome"],
-        json!({"execution":"not_started", "effects":"none", "action":"refresh"})
+        refused["disposition"],
+        json!({"effects":"none", "action":"refresh"})
     );
     assert!(
         server.requests().is_empty(),
@@ -4315,31 +4469,30 @@ fn cleanup_against_non_local_scope_refuses_without_yes() {
         ]);
         command
     };
-    // Past the --confirm preview gate, a non-local cleanup still needs --yes.
-    let output = output_failure(
-        s3().arg("cleanup")
-            .arg("--target")
-            .arg("s3://fake-bucket/g.omni")
-            .arg("--keep")
-            .arg("5")
-            .arg("--confirm")
-            .arg("--json"),
-    );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("refusing destructive `cleanup`"),
-        "expected a non-local cleanup refusal; stderr: {stderr}"
-    );
-    let preview = output_success(s3().args([
-        "cleanup",
-        "--target",
-        "s3://fake-bucket/g.omni",
-        "--keep",
-        "5",
-        "--json",
-    ]));
-    assert!(preview.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&preview.stderr).contains("rerun with --confirm"));
+    // Cloud-direct selection is not in the version-1 grammar, with or without
+    // either confirmation flag. Refusal must precede credential/storage I/O.
+    for flags in [vec![], vec!["--confirm"], vec!["--confirm", "--yes"]] {
+        let output = output_failure(
+            s3().args([
+                "cleanup",
+                "--target",
+                "s3://fake-bucket/g.omni",
+                "--keep",
+                "5",
+                "--json",
+            ])
+            .args(flags),
+        );
+        let diagnostic = format!(
+            "{}{}",
+            stdout_string(&output),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            diagnostic.contains("inline access supports local storage only"),
+            "{diagnostic}"
+        );
+    }
 
     // Invalid retention is diagnosed before either consent or cloud access.
     let refused = output_failure(s3().args([
@@ -4351,8 +4504,16 @@ fn cleanup_against_non_local_scope_refuses_without_yes() {
         "--confirm",
         "--json",
     ]));
-    assert!(refused.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("invalid duration 'invalid'"));
+    let diagnostic = format!(
+        "{}{}",
+        stdout_string(&refused),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        diagnostic.contains("inline access supports local storage only")
+            || diagnostic.contains("invalid duration 'invalid'"),
+        "{diagnostic}"
+    );
     assert!(
         bucket.requests().is_empty(),
         "consent must precede storage access"
@@ -4554,17 +4715,20 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
         ("review", " main "),
     ] {
         let server = IntentApiFixture::graph(vec![]);
-        let output = output_failure(cli().args([
-            "--target",
-            &server.origin,
-            "--graph",
-            "knowledge",
-            "branch",
-            "merge",
-            source,
-            "--into",
-            target,
-        ]));
+        let output = output_failure(
+            cli()
+                .args(["--target"])
+                .fixture_target(&server.origin)
+                .args([
+                    "--graph",
+                    "knowledge",
+                    "branch",
+                    "merge",
+                    source,
+                    "--into",
+                    target,
+                ]),
+        );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("has leading or trailing whitespace")
@@ -4624,7 +4788,10 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
             }
             let server = IntentApiFixture::graph(vec![IntentReply::json(200, body.clone())]);
             let mut command = cli();
-            command.args(["--target", &server.origin, "--graph", "knowledge"]);
+            command
+                .args(["--target"])
+                .fixture_target(&server.origin)
+                .args(["--graph", "knowledge"]);
             if statement {
                 command.args(["mutate", "-e", "branch merge review into main", "--json"]);
             } else {
@@ -4633,7 +4800,8 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
             let output = command.output().unwrap();
             assert_eq!(
                 output.status.code(),
-                Some(if valid { 0 } else { 1 }),
+                // A receipt that contradicts the request leaves effects unknown.
+                Some(if valid { 0 } else { 2 }),
                 "{body}: {output:?}"
             );
             if valid {
@@ -4702,9 +4870,9 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
             }
             let server = IntentApiFixture::graph(vec![IntentReply::json(200, body.clone())]);
             let output = cli()
+                .args(["--target"])
+                .fixture_target(&server.origin)
                 .args([
-                    "--target",
-                    &server.origin,
                     "--graph",
                     "knowledge",
                     "branch",
@@ -4719,7 +4887,8 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
                 .unwrap();
             assert_eq!(
                 output.status.code(),
-                Some(if valid { 0 } else { 1 }),
+                // A receipt that contradicts the request leaves effects unknown.
+                Some(if valid { 0 } else { 2 }),
                 "{body}: {output:?}"
             );
             if valid {
@@ -5139,9 +5308,9 @@ fn cli_fails_for_missing_schema_or_data_file() {
         "{refused}"
     );
     assert_eq!(
-        refused["command_outcome"],
-        json!({"execution":"unknown", "effects":"unknown", "action":"reconcile"}),
-        "embedded load opens writable storage before reading --data"
+        refused["disposition"],
+        json!({"effects":"none", "action":"refresh"}),
+        "embedded load reads --data before it opens storage"
     );
     let after = parse_stdout_json(&output_success(
         cli()
@@ -5164,7 +5333,9 @@ fn cli_fails_for_missing_schema_or_data_file() {
         command
             .args(["load", "--mode", "append", "--data"])
             .arg(&missing_data)
-            .args(["--target", &server.origin, "--graph", "knowledge", "--json"]);
+            .args(["--target"])
+            .fixture_target(&server.origin)
+            .args(["--graph", "knowledge", "--json"]);
         if let Some(settings) = settings {
             command.args(["--set", settings]);
         }
@@ -5174,8 +5345,8 @@ fn cli_fails_for_missing_schema_or_data_file() {
             "{settings:?}: {refused}"
         );
         assert_eq!(
-            refused["command_outcome"],
-            json!({"execution":"not_started", "effects":"none", "action":"refresh"}),
+            refused["disposition"],
+            json!({"effects":"none", "action":"refresh"}),
             "served load validates settings and reads --data before HTTP"
         );
         assert!(server.requests().is_empty());
@@ -5225,12 +5396,12 @@ fn cli_fails_for_invalid_merge_requests() {
 fn target_home() -> tempfile::TempDir {
     let home = tempdir().unwrap();
     fs::write(home.path().join("config.yaml"),
-        "target_config_version: 1\ndefaults:\n  target: staging\ntargets:\n  staging:\n    kind: server\n    endpoint: https://graph.example.com\n    credential: prod\n    default_graph: kb\n  localdev:\n    kind: direct\n    scope: graph\n    uri: file:///data/dev.omni\n").unwrap();
+        "version: 1\ndefaults:\n  target: staging\ntargets:\n  staging:\n    kind: server\n    endpoint: https://graph.example.com\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_PROD\n    default_graph: kb\n  localdev:\n    kind: direct\n    scope: graph\n    uri: file:///data/dev.omni\n").unwrap();
     home
 }
 
 #[test]
-fn target_list_names_each_binding_and_marks_the_default() {
+fn target_list_names_each_binding_offline() {
     let home = target_home();
     let output = output_success(
         cli()
@@ -5238,44 +5409,348 @@ fn target_list_names_each_binding_and_marks_the_default() {
             .args(["target", "list"]),
     );
     let stdout = stdout_string(&output);
-    assert!(stdout.contains("staging (default)"), "{stdout}");
-    assert!(stdout.contains("https://graph.example.com"), "{stdout}");
-    assert!(stdout.contains("file:///data/dev.omni"), "{stdout}");
+    assert!(stdout.contains("staging\tserver"), "{stdout}");
+    assert!(stdout.contains("localdev\tdirect"), "{stdout}");
     assert!(only_target_report(&output));
 }
 
 #[test]
-fn target_list_and_show_have_the_same_versioned_binding() {
+fn target_list_and_inspect_have_the_same_versioned_binding() {
     let home = target_home();
     let list = parse_stdout_json(&output_success(
         cli()
             .env("OMNIGRAPH_HOME", home.path())
             .args(["target", "list", "--json"]),
     ));
-    assert_eq!(list["protocol"], 1);
-    assert_eq!(list["default_target"], "staging");
-    let local = list["targets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|target| target["name"] == "localdev")
-        .unwrap();
+    let local = &list["localdev"];
     let shown = parse_stdout_json(&output_success(
-        cli()
-            .env("OMNIGRAPH_HOME", home.path())
-            .args(["target", "show", "localdev", "--json"]),
+        cli().env("OMNIGRAPH_HOME", home.path()).args([
+            "target",
+            "inspect",
+            "localdev",
+            "--resolved",
+            "--json",
+        ]),
     ));
-    assert_eq!(shown["kind"], "direct");
-    assert_eq!(shown["scope"], "graph");
-    assert_eq!(shown["uri"], "file:///data/dev.omni");
-    assert_eq!(shown["binding"], local["binding"]);
-    assert_eq!(shown["default"], false);
+    assert_eq!(shown["target"]["kind"], "direct");
+    assert_eq!(shown["target"]["scope"], "graph");
+    assert_eq!(shown["target"]["uri"], "file:///data/dev.omni");
+    assert_eq!(&shown["target"], local);
+    assert_eq!(shown["identity"]["status"], "unknown");
     let missing = output_failure(
         cli()
             .env("OMNIGRAPH_HOME", home.path())
-            .args(["target", "show", "missing"]),
+            .args(["target", "inspect", "missing"]),
     );
     assert!(String::from_utf8_lossy(&missing.stderr).contains("unknown target"));
+}
+
+/// `access` says what the caller may do at a target. A cluster graph's
+/// applied policy decides for the declared actor, whether a root target with
+/// `--graph` or the graph's own store is addressed; a standalone graph
+/// without a policy allows everything once it opens; a store that holds no
+/// graph refuses, a damaged one keeps its own failure; a server target
+/// answers through its access route with the target's token, `--as` riding
+/// as the actor assertion; and a catalogue or managed target refuses before
+/// any I/O.
+#[test]
+fn access_reports_what_the_caller_may_do_at_a_target() {
+    use crate::support::managed_http::{IntentApiFixture, IntentReply};
+
+    let actions = |report: &Value, key: &str| -> Vec<String> {
+        report[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("{key}: {report}"))
+            .iter()
+            .map(|action| action.as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // A cluster graph through a root target: its applied policy decides for
+    // the declared actor.
+    let cluster = converged_loaded_cluster("knowledge", Some(POLICY_YAML));
+    let decide = |actor: Option<&str>, branch: &str| -> Value {
+        let mut command = cli();
+        command
+            .arg("access")
+            .arg("--target")
+            .arg(cluster.path())
+            .args(["--graph", "knowledge", "--branch", branch, "--json"]);
+        if let Some(actor) = actor {
+            command.args(["--as", actor]);
+        }
+        parse_stdout_json(&output_success(&mut command))
+    };
+    let feature = decide(Some("act-bruno"), "feature");
+    assert_eq!(feature["protocol"], 1, "{feature}");
+    assert_eq!(feature["source"], "direct", "{feature}");
+    assert_eq!(feature["graph_id"], "knowledge");
+    assert_eq!(feature["actor"], "act-bruno");
+    assert!(
+        actions(&feature, "actions").contains(&"change".to_string()),
+        "{feature}"
+    );
+    let main = decide(Some("act-bruno"), "main");
+    assert!(
+        actions(&main, "actions").contains(&"read".to_string()),
+        "{main}"
+    );
+    assert!(
+        !actions(&main, "actions").contains(&"change".to_string()),
+        "{main}"
+    );
+    let nobody = decide(None, "feature");
+    assert!(actions(&nobody, "graph_wide").is_empty(), "{nobody}");
+    assert!(actions(&nobody, "actions").is_empty(), "{nobody}");
+    // A graph the cluster does not apply has no policy to read, so access
+    // refuses rather than report every action allowed.
+    let unknown = output_failure(
+        cli()
+            .arg("access")
+            .arg("--target")
+            .arg(cluster.path())
+            .args(["--graph", "missing", "--json"]),
+    );
+    assert_eq!(unknown.status.code(), Some(1), "{unknown:?}");
+    let refusal = parse_stdout_json(&unknown);
+    assert_eq!(refusal["code"], "not_found", "{refusal}");
+    assert_eq!(refusal["disposition"]["effects"], "none", "{refusal}");
+    assert!(
+        refusal["error"].as_str().unwrap().contains("knowledge"),
+        "{refusal}"
+    );
+    // The same graph addressed by its store answers from the cluster's
+    // applied ledger, exactly as the root target does, and an unapplied
+    // `storage:` in the cluster's configuration moves neither answer.
+    let store = cluster.path().join("graphs").join("knowledge.omni");
+    let by_store = || {
+        parse_stdout_json(&output_success(
+            cli().arg("access").arg("--target").arg(&store).args([
+                "--as",
+                "act-bruno",
+                "--branch",
+                "main",
+                "--json",
+            ]),
+        ))
+    };
+    let mut expected = main.clone();
+    expected["target"] = json!(store.to_string_lossy());
+    assert_eq!(by_store(), expected);
+    let config = cluster.path().join("cluster.yaml");
+    let applied = fs::read_to_string(&config).unwrap();
+    let elsewhere = tempdir().unwrap();
+    fs::write(
+        &config,
+        format!("storage: {}\n{applied}", elsewhere.path().display()),
+    )
+    .unwrap();
+    assert_eq!(by_store(), expected);
+    assert_eq!(decide(Some("act-bruno"), "main"), main);
+    fs::write(&config, applied).unwrap();
+    // Legacy recovery evidence quarantines the cluster's only graph, so the
+    // loader serves nothing; the graph is unavailable, not the cluster
+    // broken, through either address.
+    let recoveries = cluster.path().join("__cluster").join("recoveries");
+    fs::create_dir_all(&recoveries).unwrap();
+    fs::write(
+        recoveries.join("op-pending.json"),
+        json!({
+            "schema_version": 1,
+            "operation_id": "op-pending",
+            "started_at": "1970-01-01T00:00:00Z",
+            "kind": "schema_apply",
+            "graph_id": "knowledge",
+            "graph_uri": store.to_string_lossy(),
+            "desired_schema_digest": "pending",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    for target in [cluster.path().to_path_buf(), store.clone()] {
+        let mut command = cli();
+        command.arg("access").arg("--target").arg(&target);
+        if target == cluster.path() {
+            command.args(["--graph", "knowledge"]);
+        }
+        let quarantined = output_failure(command.args(["--branch", "main", "--json"]));
+        // The code's own action and exit, as a server answers it.
+        assert_eq!(quarantined.status.code(), Some(75), "{quarantined:?}");
+        let refusal = parse_stdout_json(&quarantined);
+        assert_eq!(refusal["code"], "graph_unavailable", "{refusal}");
+        assert_eq!(
+            refusal["disposition"],
+            json!({"effects": "none", "action": "retry"}),
+            "{refusal}"
+        );
+        assert!(
+            refusal["error"]
+                .as_str()
+                .unwrap()
+                .contains("awaits recovery"),
+            "{refusal}"
+        );
+    }
+
+    // A store that holds no graph has no policy to report.
+    let temp = tempdir().unwrap();
+    let missing = output_failure(
+        cli()
+            .arg("access")
+            .arg("--target")
+            .arg(temp.path().join("absent.omni"))
+            .args(["--branch", "main", "--json"]),
+    );
+    assert_eq!(missing.status.code(), Some(1), "{missing:?}");
+    let refusal = parse_stdout_json(&missing);
+    assert_eq!(refusal["code"], "not_found", "{refusal}");
+    assert_eq!(refusal["disposition"]["effects"], "none", "{refusal}");
+    // A graph whose manifest names a missing object is damaged, not absent:
+    // the open's own failure stands.
+    let damaged = temp.path().join("damaged.omni");
+    init_graph(&damaged);
+    fs::remove_dir_all(damaged.join("__manifest").join("data")).unwrap();
+    let failure = output_failure(
+        cli()
+            .arg("access")
+            .arg("--target")
+            .arg(&damaged)
+            .args(["--branch", "main", "--json"]),
+    );
+    let failure = parse_stdout_json(&failure);
+    assert_eq!(failure["code"], "internal", "{failure}");
+    assert_eq!(failure["disposition"]["effects"], "none", "{failure}");
+
+    // A standalone graph without a policy allows every action.
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    let rows = IntentReply::json(
+        200,
+        json!({
+            "actor":"act-me", "graph_id":"knowledge", "graph_wide":["read"],
+            "branch":"main", "target_branch":null, "actions":["read","change"]
+        }),
+    );
+    let served = IntentApiFixture::graph(vec![rows]);
+    let operator = KeyedServer::new(&served.origin);
+    let home = operator.home();
+    let config = home.join("config.yaml");
+    let server_config = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        format!(
+            "{server_config}    default_graph: knowledge\n  \
+             local:\n    kind: direct\n    scope: graph\n    uri: '{}'\n  \
+             cloud:\n    kind: managed\n    profile: service\n    \
+             cluster_id: cluster\n    cluster_incarnation: one\n    default_graph: knowledge\n\
+             profiles:\n  service:\n    api: https://api.example.com\n    organization_id: org\n    \
+             auth: {{provider: omnigraph}}\n",
+            url::Url::from_file_path(&graph).unwrap()
+        ),
+    )
+    .unwrap();
+    let local = parse_stdout_json(&output_success(cli().env("OMNIGRAPH_HOME", home).args([
+        "access",
+        "--target",
+        "local",
+        "--branch",
+        "main",
+        "--target-branch",
+        "feature",
+        "--json",
+    ])));
+    assert_eq!(local["target"], "local");
+    assert_eq!(local["source"], "direct");
+    assert_eq!(local["graph_id"], "default", "{local}");
+    assert_eq!(local["target_branch"], "feature", "{local}");
+    for action in [
+        "read",
+        "change",
+        "branch_create",
+        "branch_merge",
+        "commit_publish",
+    ] {
+        assert!(
+            actions(&local, "actions").contains(&action.to_string()),
+            "{action}: {local}"
+        );
+    }
+    // The text names the target branch for the actions decided into it.
+    let text = output_success(cli().env("OMNIGRAPH_HOME", home).args([
+        "access",
+        "--target",
+        "local",
+        "--branch",
+        "main",
+        "--target-branch",
+        "feature",
+    ]));
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(
+        text.contains("\nfrom main into feature: branch_create, branch_merge\n"),
+        "{text}"
+    );
+    let on_main = text
+        .lines()
+        .find(|line| line.starts_with("on main: "))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(
+        on_main.contains("change") && !on_main.contains("branch_create"),
+        "{text}"
+    );
+
+    // A server target asks its access route, with the target's token, and
+    // `--as` rides as the actor assertion.
+    let report = parse_stdout_json(&output_success(
+        cli().envs(operator.env("served-token")).args([
+            "access",
+            "--target",
+            KEYED_SERVER_NAME,
+            "--as",
+            "act-me",
+            "--branch",
+            "main",
+            "--json",
+        ]),
+    ));
+    assert_eq!(report["source"], "server", "{report}");
+    assert_eq!(report["target"], KEYED_SERVER_NAME);
+    assert_eq!(actions(&report, "actions"), ["read", "change"]);
+    let requests = served.workflow_requests();
+    let request = requests.last().unwrap();
+    assert_eq!(request.method, "GET");
+    assert!(
+        request.path.starts_with("/graphs/knowledge/access"),
+        "{}",
+        request.path
+    );
+    assert_eq!(
+        request.headers.get("authorization").map(String::as_str),
+        Some("Bearer served-token")
+    );
+    assert_eq!(
+        request
+            .headers
+            .get("omnigraph-if-actor")
+            .map(String::as_str),
+        Some("act-me")
+    );
+    served.assert_complete();
+
+    // The catalogue carries no policy and managed data qualifies each
+    // operation separately: both refuse before any I/O.
+    for (target, code) in [
+        ("og_catalog", "target_unknown"),
+        ("cloud", "target_incompatible"),
+    ] {
+        let refused = output_failure(
+            cli()
+                .env("OMNIGRAPH_HOME", home)
+                .args(["access", "--target", target, "--json"]),
+        );
+        let refusal = parse_stdout_json(&refused);
+        assert_eq!(refusal["code"], code, "{target}: {refusal}");
+    }
 }
 
 #[test]
@@ -5287,13 +5762,21 @@ fn legacy_profile_commands_and_environment_cannot_select_a_backend() {
             String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand 'profile'")
         );
     }
+    // A retired ambient profile cannot select even a configured target.
+    // Remove the legitimate default so no real endpoint is considered.
+    let config = fs::read_to_string(home.path().join("config.yaml")).unwrap();
+    fs::write(
+        home.path().join("config.yaml"),
+        config.replace("defaults:\n  target: staging\n", ""),
+    )
+    .unwrap();
     let output = output_failure(
         cli()
             .env("OMNIGRAPH_HOME", home.path())
             .env("OMNIGRAPH_PROFILE", "staging")
             .args(["query", "q"]),
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("OMNIGRAPH_PROFILE is retired"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("target_required"));
 }
 
 /// The SUCCESS path, asserted end-to-end: exit 0, a non-empty paired
@@ -5417,103 +5900,185 @@ fn changes_baseline_failure_preserves_existing_out_file() {
 #[test]
 fn catalogue_scope_reads_the_binary_registries_without_a_store() {
     let operators = "query operators() { match { $o: @Operator } return { $o.name, $o.inputs } }";
-    let output = output_success(
-        cli()
-            .arg("query")
-            .arg("--target")
-            .arg("og_catalog")
-            .arg("-e")
-            .arg(operators)
-            .arg("--json"),
-    );
-    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(value["row_count"].as_u64().unwrap() > 0, "{value}");
-    assert!(value["target"]["branch"].is_null(), "{value}");
-    assert!(value["graph_commit_id"].is_null(), "{value}");
-    assert!(
-        value["rows"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|row| row["o.name"] == "Scan"),
-        "{value}"
-    );
-
-    let schema = output_success(cli().args(["schema", "show", "--target", "og_catalog"]));
-    let listing = String::from_utf8_lossy(&schema.stdout);
-    assert!(listing.contains("node @Operator"), "{listing}");
-
-    for reset in ["reset query_memory_bytes;", "reset all;"] {
-        let output = output_success(
+    let reset_one = format!("reset query_memory_bytes; {operators}");
+    let reset_all = format!("reset all; {operators}");
+    let commands = [
+        vec!["schema", "show"],
+        vec!["query", "-e", operators],
+        vec!["query", "--set", "query_memory_bytes=1", "-e", &reset_one],
+        vec!["query", "--set", "query_memory_bytes=1", "-e", &reset_all],
+        vec!["query", "--branch", "main", "-e", operators],
+        vec![
+            "mutate",
+            "-e",
+            "query add() { insert @Operator { name: \"Teleport\" } }",
+        ],
+        vec![
+            "query",
+            "-e",
+            "explain load csv \"file:///unavailable.csv\" into node:Person mode overwrite header",
+        ],
+    ];
+    let home = tempdir().unwrap();
+    let work = tempdir().unwrap();
+    let config = home.path().join("config.yaml");
+    let poison = "version: [invalid operator configuration";
+    fs::write(&config, poison).unwrap();
+    let query_file = home.path().join("catalogue.gq");
+    fs::write(&query_file, operators).unwrap();
+    let missing_config = home.path().join("missing.yaml");
+    for explicit_config in [None, Some(&config), Some(&missing_config)] {
+        for from_file in [false, true] {
+            for machine in [false, true] {
+                let mut invocation = cli();
+                invocation
+                    .env("OMNIGRAPH_HOME", home.path())
+                    .current_dir(work.path())
+                    .arg("catalogue");
+                if let Some(path) = explicit_config {
+                    invocation.arg("--operator-config").arg(path);
+                }
+                if from_file {
+                    invocation.arg("--query").arg(&query_file);
+                } else {
+                    invocation.args(["-e", operators]);
+                }
+                if machine {
+                    invocation.arg("--json");
+                }
+                let output = output_success(&mut invocation);
+                assert!(output.stderr.is_empty(), "{output:?}");
+                if machine {
+                    let result = parse_stdout_json(&output);
+                    assert!(!result["rows"].as_array().unwrap().is_empty(), "{result}");
+                    assert!(result["target"]["branch"].is_null(), "{result}");
+                    assert!(result["target"]["snapshot"].is_null(), "{result}");
+                    assert!(result["graph_commit_id"].is_null(), "{result}");
+                } else {
+                    assert!(!output.stdout.is_empty());
+                }
+                assert_eq!(fs::read_to_string(&config).unwrap(), poison);
+                assert_eq!(fs::read_dir(work.path()).unwrap().count(), 0);
+                assert_eq!(fs::read_dir(home.path()).unwrap().count(), 2);
+            }
+        }
+    }
+    for flag in ["--target", "--profile", "--graph", "--as"] {
+        let output = output_failure(
             cli()
-                .args([
-                    "query",
-                    "--target",
-                    "og_catalog",
-                    "--set",
-                    "query_memory_bytes=1",
-                ])
-                .arg("-e")
-                .arg(format!("{reset} {operators}"))
-                .arg("--json"),
+                .env("OMNIGRAPH_HOME", home.path())
+                .current_dir(work.path())
+                .args(["catalogue", "-e", operators, flag, "unavailable", "--json"]),
         );
-        let reset_value: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(reset_value["rows"], value["rows"]);
+        let error = parse_stdout_json(&output);
+        assert!(error["error"].as_str().unwrap().contains(flag), "{error}");
+        assert_eq!(error["disposition"]["effects"], "none", "{error}");
+        assert_ne!(error["code"], "target_config_invalid", "{error}");
+    }
+    for source in [
+        "query add() { insert @Operator { name: \"Teleport\" } }",
+        "branch list",
+        "query missing() { match { $n: Missing } return { $n } }",
+    ] {
+        let output = output_failure(
+            cli()
+                .env("OMNIGRAPH_HOME", home.path())
+                .current_dir(work.path())
+                .args(["catalogue", "-e", source, "--json"]),
+        );
+        let error = parse_stdout_json(&output);
+        assert_eq!(error["disposition"]["effects"], "none", "{error}");
+        assert_ne!(error["code"], "target_config_invalid", "{error}");
+        assert!(error.get("rows").is_none(), "{error}");
+        assert_eq!(fs::read_dir(work.path()).unwrap().count(), 0);
+    }
+    for (source, code, message) in [
+        (
+            "version: 1\n",
+            "target_unknown",
+            "unknown target 'og_catalog'",
+        ),
+        (
+            "version: 1\ntargets:\n  og_catalog:\n    kind: catalogue\n",
+            "target_config_invalid",
+            "catalogue",
+        ),
+    ] {
+        fs::write(&config, source).unwrap();
+        for command in &commands {
+            for machine in [false, true] {
+                let mut invocation = cli();
+                invocation
+                    .env("OMNIGRAPH_HOME", home.path())
+                    .current_dir(work.path())
+                    .args(command)
+                    .args(["--target", "og_catalog"]);
+                if machine {
+                    invocation.arg("--json");
+                }
+                let output = output_failure(&mut invocation);
+                assert_eq!(output.status.code(), Some(1), "{command:?}: {output:?}");
+                if machine {
+                    let error = parse_stdout_json(&output);
+                    assert_eq!(error["code"], code, "{command:?}: {error}");
+                    assert_eq!(
+                        error["disposition"],
+                        serde_json::json!({"effects": "none", "action": "fix"})
+                    );
+                    assert!(
+                        error["error"].as_str().unwrap().contains(message),
+                        "{error}"
+                    );
+                    assert!(error.get("rows").is_none(), "{error}");
+                    assert!(error.get("commit").is_none(), "{error}");
+                } else {
+                    assert!(output.stdout.is_empty(), "{output:?}");
+                    let diagnostic = String::from_utf8_lossy(&output.stderr);
+                    assert!(
+                        diagnostic.contains(code) && diagnostic.contains(message),
+                        "{diagnostic}"
+                    );
+                }
+                assert_eq!(fs::read_to_string(&config).unwrap(), source);
+                assert_eq!(
+                    fs::read_dir(work.path()).unwrap().count(),
+                    0,
+                    "refusal must not create a graph or load staging files"
+                );
+            }
+        }
+        if code == "target_config_invalid" {
+            let invalid = output_failure(
+                cli()
+                    .env("OMNIGRAPH_HOME", home.path())
+                    .args(["config", "validate", "--json"]),
+            );
+            let invalid = parse_stdout_json(&invalid);
+            assert_eq!(invalid["code"], code);
+            assert!(invalid["error"].as_str().unwrap().contains("catalogue"));
+        }
     }
 
-    let with_branch = output_failure(
-        cli()
-            .arg("query")
-            .arg("--target")
-            .arg("og_catalog")
-            .arg("--branch")
-            .arg("main")
-            .arg("-e")
-            .arg(operators),
-    );
-    let stderr = String::from_utf8_lossy(&with_branch.stderr);
-    assert!(stderr.contains("no branches or snapshots"), "{stderr}");
-
-    let write = output_failure(
-        cli()
-            .arg("mutate")
-            .arg("--target")
-            .arg("og_catalog")
-            .arg("-e")
-            .arg("query add() { insert @Operator { name: \"Teleport\" } }"),
-    );
-    let stderr = String::from_utf8_lossy(&write.stderr);
-    assert!(
-        stderr.contains("target_incompatible")
-            && stderr.contains("mutate is not available for this target kind and scope"),
-        "{stderr}"
-    );
-
-    let temp = tempdir().unwrap();
+    // An explicitly relative file path still has ordinary direct-storage
+    // meaning; removing the magic name does not reserve that filesystem name.
+    fs::write(&config, "version: 1\n").unwrap();
     let relative = output_failure(
         cli()
-            .current_dir(temp.path())
-            .arg("query")
-            .arg("--target")
-            .arg("./og_catalog")
-            .arg("-e")
-            .arg(operators),
+            .env("OMNIGRAPH_HOME", home.path())
+            .current_dir(work.path())
+            .args(["query", "--target", "./og_catalog", "-e", operators]),
     );
-    let stderr = String::from_utf8_lossy(&relative.stderr);
-    assert!(!stderr.contains("not available under"), "{stderr}");
-
-    let explain_load = output_failure(cli().args(["query", "--target", "og_catalog", "-e"]).arg(
-        "explain load csv \"file:///unavailable.csv\" into node:Person mode overwrite header",
-    ));
-    let stderr = String::from_utf8_lossy(&explain_load.stderr);
-    assert!(
-        stderr.contains("`explain load` is not available under `og_catalog`"),
-        "{stderr}"
-    );
+    let diagnostic = String::from_utf8_lossy(&relative.stderr);
+    assert!(!diagnostic.contains("target_unknown"), "{diagnostic}");
+    assert!(!diagnostic.contains("not available under"), "{diagnostic}");
 }
 
+// Ordinary named-server forwarding: `og_catalog` here is an opaque graph ID,
+// and the scripted server owns its reply. This does not grant the CLI a magic
+// target or specify a locally interpreted catalogue view.
 #[test]
 fn remote_catalogue_reads_preserve_optional_targets() {
+    let ca = tls_gateway::ca_path().display();
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
 
     let query = "query engine() { match { $e: @Engine } return { $e.version } }";
@@ -5545,7 +6110,7 @@ fn remote_catalogue_reads_preserve_optional_targets() {
                 fs::write(
                     home.path().join("config.yaml"),
                     format!(
-                        "target_config_version: 1\ntargets:\n  catalogue:\n    kind: server\n    endpoint: '{}'\n    auth: anonymous\n    default_graph: og_catalog\n",
+                        "version: 1\ntargets:\n  catalogue:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    auth:\n      provider: anonymous\n    default_graph: og_catalog\n",
                         server.origin
                     ),
                 )
@@ -5560,7 +6125,7 @@ fn remote_catalogue_reads_preserve_optional_targets() {
                 if named_target {
                     command.args(["--target", "catalogue"]);
                 } else {
-                    command.args(["--target", &server.origin, "--graph", "og_catalog"]);
+                    command.args(["--target", "catalogue", "--graph", "og_catalog"]);
                 }
                 command.args(["query", "-e", &source, "--json"]);
                 if let Some((flag, value)) = selector {

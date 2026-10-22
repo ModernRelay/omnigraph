@@ -184,7 +184,11 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
                     } else {
                         "--target"
                     },
-                    &server.base_url,
+                    &if binary == old.as_path() {
+                        server.legacy_base_url()
+                    } else {
+                        support::KEYED_SERVER_NAME.to_owned()
+                    },
                     "--graph",
                     "knowledge",
                     "--json",
@@ -207,7 +211,11 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
                     } else {
                         "--target"
                     },
-                    &server.base_url,
+                    &if binary == old.as_path() {
+                        server.legacy_base_url()
+                    } else {
+                        support::KEYED_SERVER_NAME.to_owned()
+                    },
                     "--config",
                 ])
                 .arg(root)
@@ -215,6 +223,7 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
         ))
     };
     let http = reqwest::blocking::Client::builder()
+        .add_root_certificate(support::tls_gateway::certificate())
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
@@ -1416,7 +1425,9 @@ fn human_report_lines(
 
 #[test]
 fn current_v10_refuses_and_rebuilds_genuine_v09_graph_end_to_end() {
-    use crate::support::{parse_stdout_json, resolved_snapshot_id, spawn_server_with_cluster};
+    use crate::support::{
+        FixtureTarget, parse_stdout_json, resolved_snapshot_id, spawn_server_with_cluster,
+    };
     use serde_json::json;
     use std::fs;
 
@@ -1673,14 +1684,26 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
 
     assert_rebuilt_v10_graph(&rebuilt);
 
-    let query_command = |target: &[&str], branch: &str, name: &str, params: &str| {
+    let target_command = |target: &[&str]| {
         let mut command = cli();
+        if target
+            .get(1)
+            .is_some_and(|value| value.starts_with("https://"))
+        {
+            command
+                .arg("--target")
+                .fixture_target(target[1])
+                .args(&target[2..]);
+        } else {
+            command.args(target);
+        }
         command
-            .args([
-                "query", name, "--query", query_path, "--branch", branch, "--params", params,
-                "--json",
-            ])
-            .args(target);
+    };
+    let query_command = |target: &[&str], branch: &str, name: &str, params: &str| {
+        let mut command = target_command(target);
+        command.args([
+            "query", name, "--query", query_path, "--branch", branch, "--params", params, "--json",
+        ]);
         command
     };
     let direct = ["--target", rebuilt_uri];
@@ -1743,46 +1766,36 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
             }
         }
         for target in [&direct[..], &remote[..]] {
-            let blob = output_success(
-                cli()
-                    .args([
-                        "blob",
-                        "get",
-                        "node",
-                        "BinaryAsset",
-                        "blob-sentinel",
-                        "payload",
-                        "--branch",
-                        branch,
-                    ])
-                    .args(target),
-            );
+            let blob = output_success(target_command(target).args([
+                "blob",
+                "get",
+                "node",
+                "BinaryAsset",
+                "blob-sentinel",
+                "payload",
+                "--branch",
+                branch,
+            ]));
             assert_eq!(blob.stdout, [0, 1, 2, 3, 255]);
         }
     }
 
     let before = resolved_snapshot_id(&rebuilt, "review");
-    let change = parse_stdout_json(&output_success(
-        cli()
-            .args([
-                "mutate",
-                "revise",
-                "--query",
-                query_path,
-                "--branch",
-                "review",
-                "--params",
-                r#"{"body":"verified after rebuild"}"#,
-                "--json",
-            ])
-            .args(remote),
-    ));
+    let change = parse_stdout_json(&output_success(target_command(&remote).args([
+        "mutate",
+        "revise",
+        "--query",
+        query_path,
+        "--branch",
+        "review",
+        "--params",
+        r#"{"body":"verified after rebuild"}"#,
+        "--json",
+    ])));
     assert_eq!(change["affected_nodes"], 1);
     assert_ne!(resolved_snapshot_id(&rebuilt, "review"), before);
     output_success(
-        cli()
-            .args(["branch", "merge", "review", "--into", "main", "--json"])
-            .args(remote),
+        target_command(&remote).args(["branch", "merge", "review", "--into", "main", "--json"]),
     );
     let expected = parse_stdout_json(&output_success(&mut query_command(
         &remote, "main", "docs", "{}",
@@ -2072,12 +2085,22 @@ enum SnapshotRead {
 /// the commits: a refusal naming it is an answer for a commit written before.
 fn property_read(label: &str, property: &str, output: std::process::Output) -> SnapshotRead {
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains(property) && !stderr.contains(" was reclaimed") {
+        let refusal = refusal_text(&output);
+        if refusal.contains(property) && !refusal.contains(" was reclaimed") {
             return SnapshotRead::NoSuchProperty;
         }
     }
     snapshot_read(label, output)
+}
+
+/// A failed read's refusal: the `error` of the JSON failure on stdout, which a
+/// `--json` read writes, and whatever stderr carries.
+fn refusal_text(output: &std::process::Output) -> String {
+    let stdout = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        .ok()
+        .and_then(|failure| failure["error"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    format!("{stdout}\n{}", String::from_utf8_lossy(&output.stderr))
 }
 
 fn snapshot_read(label: &str, output: std::process::Output) -> SnapshotRead {
@@ -2086,7 +2109,7 @@ fn snapshot_read(label: &str, output: std::process::Output) -> SnapshotRead {
         normalize_f32_and_nulls(&mut rows);
         return SnapshotRead::Rows(rows);
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = refusal_text(&output);
     let reclaimed = stderr
         .split_once("historical published dataset version ")
         .and_then(|(_, rest)| rest.split_once(" was reclaimed"))

@@ -104,7 +104,8 @@ fn as_on_a_served_cluster_command_exits_4_on_another_actor() {
         for json in [true, false] {
             let api = IntentApiFixture::graph(vec![IntentReply::json(412, refusal.clone())]);
             let mut cmd = cli();
-            cmd.args(["cluster", command, "--target", &api.origin])
+            cmd.args(["cluster", command, "--target"])
+                .fixture_target(&api.origin)
                 .args(["--as", "act-nope", "--config"])
                 .arg(root.path());
             if json {
@@ -138,25 +139,20 @@ fn as_on_a_served_cluster_command_exits_4_on_another_actor() {
 
 #[test]
 fn core_remote_status_uses_only_the_selected_target_credential() {
+    let ca = tls_gateway::ca_path().display();
     let status = serde_json::json!({"status":{"canonical_root":"file:///server-only-storage","ledger_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","state_revision":1,"result_revision":0,"next_sequence":1,"lock_id":"server-owner","outstanding_id":null,"lookup":null},"active":false,"in_progress":false});
-    for mode in ["named", "inline_registered", "inline_anonymous"] {
+    for mode in ["named", "named_anonymous"] {
         let api = IntentApiFixture::graph(vec![IntentReply::json(200, status.clone())]);
         let operator = KeyedServer::new(&api.origin);
-        let anonymous_home = tempdir().unwrap();
-        let target = if mode == "named" {
-            KEYED_SERVER_NAME
-        } else {
-            &api.origin
-        };
         let mut command = cli();
         command.envs(operator.env("keyed-status-token"));
-        if mode == "inline_anonymous" {
-            command.env("OMNIGRAPH_HOME", anonymous_home.path());
+        if mode == "named_anonymous" {
+            command.env("OMNIGRAPH_HOME", tls_gateway::anonymous_home(&api.origin));
         }
         let output = output_success(
             command
                 .env("OMNIGRAPH_BEARER_TOKEN", "must-not-leak")
-                .args(["cluster", "status", "--target", target, "--json"]),
+                .args(["cluster", "status", "--target", KEYED_SERVER_NAME, "--json"]),
         );
         assert_eq!(parse_stdout_json(&output), status);
         let requests = api.workflow_requests();
@@ -165,8 +161,29 @@ fn core_remote_status_uses_only_the_selected_target_credential() {
         assert_eq!(requests[0].path, "/cluster/deployments");
         assert_eq!(
             requests[0].headers.get("authorization").map(String::as_str),
-            (mode != "inline_anonymous").then_some("Bearer keyed-status-token")
+            (mode != "named_anonymous").then_some("Bearer keyed-status-token")
         );
+        assert_no_core_effects(operator.home());
+        api.assert_complete();
+    }
+    // Inline served selectors no longer inherit registered credentials and
+    // cannot dispatch anonymously either. Keep these refusals separate from
+    // the named-target credential assertions above.
+    for registered in [false, true] {
+        let api = IntentApiFixture::graph(vec![]);
+        let operator = KeyedServer::new(&api.origin);
+        let mut command = cli();
+        if registered {
+            command.envs(operator.env("must-not-leak"));
+        }
+        let refused =
+            output_failure(command.args(["cluster", "status", "--target", &api.origin, "--json"]));
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("inline access supports local storage only"),
+            "{refused:?}"
+        );
+        assert!(api.requests().is_empty());
         assert_no_core_effects(operator.home());
         api.assert_complete();
     }
@@ -180,7 +197,7 @@ fn core_remote_status_uses_only_the_selected_target_credential() {
         fs::write(
             &config_path,
             format!(
-                "{config}  nested:\n    kind: server\n    endpoint: '{}/{}'\n    auth: anonymous\n",
+                "{config}  nested:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/{}'\n    auth:\n      provider: anonymous\n",
                 api.origin, suffix
             ),
         )
@@ -217,8 +234,17 @@ fn core_remote_retired_selectors_refuse_before_operator_or_backend_access() {
             &api.origin,
             "--json",
         ]));
-        assert_eq!(output.status.code(), Some(2));
-        assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
+        let (exit, diagnostic) = if selector == "--profile" {
+            (1, "cluster does not accept --profile")
+        } else {
+            (64, "unexpected argument")
+        };
+        assert_eq!(output.status.code(), Some(exit), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(diagnostic),
+            "{output:?}"
+        );
     }
     assert!(api.requests().is_empty());
     assert_no_core_effects(home.path());
@@ -361,15 +387,9 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
         let api = IntentApiFixture::graph(replies);
         let mut command = cli();
         command
-            .args([
-                "cluster",
-                "apply",
-                "--target",
-                &api.origin,
-                "--deployment-id",
-                id,
-                "--config",
-            ])
+            .args(["cluster", "apply", "--target"])
+            .fixture_target(&api.origin)
+            .args(["--deployment-id", id, "--config"])
             .arg(temp.path())
             .arg("--json");
         if mode == "accepted" {
@@ -434,15 +454,9 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
         ]);
         let mut command = cli();
         command
-            .args([
-                "cluster",
-                "apply",
-                "--target",
-                &api.origin,
-                "--deployment-id",
-                id,
-                "--config",
-            ])
+            .args(["cluster", "apply", "--target"])
+            .fixture_target(&api.origin)
+            .args(["--deployment-id", id, "--config"])
             .arg(temp.path())
             .args(["--json", "--timeout", "10"]);
         if no_wait {
@@ -481,18 +495,12 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
         IntentReply::json(200, accepted.clone()),
         IntentReply::json(200, complete.clone()),
     ]);
-    let observed = output_success(cli().args([
-        "cluster",
-        "status",
-        "--target",
-        &api.origin,
-        "--deployment-id",
-        id,
-        "--wait",
-        "--timeout",
-        "10",
-        "--json",
-    ]));
+    let observed = output_success(
+        cli()
+            .args(["cluster", "status", "--target"])
+            .fixture_target(&api.origin)
+            .args(["--deployment-id", id, "--wait", "--timeout", "10", "--json"]),
+    );
     assert_eq!(parse_stdout_json(&observed), complete);
     assert!(
         api.workflow_requests()
@@ -525,17 +533,15 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
         ]);
         let api = IntentApiFixture::graph(replies);
         let mut command = cli();
-        command.timeout(std::time::Duration::from_secs(15)).args([
-            "cluster",
-            if apply { "apply" } else { "status" },
-            "--target",
-            &api.origin,
-            "--deployment-id",
-            id,
-            "--timeout",
-            "10",
-            "--json",
-        ]);
+        command
+            .timeout(std::time::Duration::from_secs(15))
+            .args([
+                "cluster",
+                if apply { "apply" } else { "status" },
+                "--target",
+            ])
+            .fixture_target(&api.origin)
+            .args(["--deployment-id", id, "--timeout", "10", "--json"]);
         if apply {
             command.arg("--config").arg(temp.path());
         } else {
@@ -565,18 +571,12 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
     invalid_json.body = b"{".to_vec();
     for reply in [invalid_json, IntentReply::json(200, serde_json::json!({}))] {
         let api = IntentApiFixture::graph(vec![reply]);
-        let output = output_failure(cli().args([
-            "cluster",
-            "status",
-            "--target",
-            &api.origin,
-            "--deployment-id",
-            id,
-            "--wait",
-            "--timeout",
-            "10",
-            "--json",
-        ]));
+        let output = output_failure(
+            cli()
+                .args(["cluster", "status", "--target"])
+                .fixture_target(&api.origin)
+                .args(["--deployment-id", id, "--wait", "--timeout", "10", "--json"]),
+        );
         assert_ne!(output.status.code(), Some(5), "{output:?}");
         let requests = api.workflow_requests();
         assert_eq!(requests.len(), 1, "invalid receipt must not be retried");
@@ -612,16 +612,12 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
             }
         };
         let api = IntentApiFixture::graph(vec![IntentReply::json(200, response.clone())]);
-        let output = output_failure(cli().args([
-            "cluster",
-            "status",
-            "--target",
-            &api.origin,
-            "--deployment-id",
-            id,
-            "--wait",
-            "--json",
-        ]));
+        let output = output_failure(
+            cli()
+                .args(["cluster", "status", "--target"])
+                .fixture_target(&api.origin)
+                .args(["--deployment-id", id, "--wait", "--json"]),
+        );
         assert_eq!(parse_stdout_json(&output), response);
         api.assert_complete();
     }
@@ -989,7 +985,7 @@ fn managed_lifecycle_wait_reports_tombstone_and_checks_every_poll_identity() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
-    assert_eq!(parse_stdout_json(&output)["type"], "context_mismatch");
+    assert_eq!(parse_stdout_json(&output)["type"], "target_mismatch");
     assert!(!temp.path().join(".omnigraph/context").exists());
     api.assert_complete();
 }
@@ -1225,14 +1221,11 @@ fn managed_cluster_members_requires_cluster_target_and_rejects_duplicate_selecto
     let output = output_failure(
         managed_account_cli(temp.path(), &api.origin).args(["members", "list", "--json"]),
     );
-    assert_eq!(output.status.code(), Some(2));
-    let refusal = parse_stdout_json(&output);
-    assert_eq!(refusal["code"], "target_incompatible");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
     assert!(
-        refusal["error"]
-            .as_str()
-            .unwrap()
-            .contains("kind and scope")
+        String::from_utf8_lossy(&output.stderr).contains("cluster does not accept --profile"),
+        "{output:?}"
     );
     for args in [
         vec!["--direct"],
@@ -1244,7 +1237,7 @@ fn managed_cluster_members_requires_cluster_target_and_rejects_duplicate_selecto
                 .args(["members", "list", "--json"])
                 .args(args),
         );
-        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.status.code(), Some(64));
     }
     assert!(api.requests().is_empty());
     assert_no_core_effects(temp.path());
@@ -1560,7 +1553,7 @@ fn managed_lifecycle_local_lock_and_direct_flags_refuse_without_submission() {
             .arg("--json")
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.status.code(), Some(64));
         assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
     }
     assert!(api.workflow_requests().is_empty());
@@ -1675,7 +1668,18 @@ fn managed_data_process_refuses_missing_graph_and_actor_override_before_keychain
             .args(&args)
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        if code == "argument_conflict" {
+            assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
+            assert!(output.stdout.is_empty());
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(message),
+                "{output:?}"
+            );
+            assert_no_core_effects(temp.path());
+            continue;
+        }
+        let exit = if args[0] == "cluster" { 2 } else { 1 };
+        assert_eq!(output.status.code(), Some(exit), "{args:?}: {output:?}");
         let problem = parse_stdout_json(&output);
         assert_eq!(problem["code"], code, "{args:?}: {problem}");
         assert!(
@@ -1730,6 +1734,7 @@ fn managed_data_named_server_ignores_folder_context() {
 
 #[test]
 fn managed_data_issue_633_explicit_targets_ignore_folder_context() {
+    let ca = tls_gateway::ca_path().display();
     for malformed in [false, true] {
         for selector in ["--target"] {
             for verb in ["query", "mutate", "load"] {
@@ -1769,7 +1774,7 @@ fn managed_data_issue_633_explicit_targets_ignore_folder_context() {
                 fs::write(
                     home.join("config.yaml"),
                     format!(
-                        "target_config_version: 1\ntargets:\n  staging:\n    kind: server\n    endpoint: {}\n    credential: staging\n    default_graph: knowledge\n",
+                        "version: 1\ntargets:\n  staging:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: {}\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_STAGING\n    default_graph: knowledge\n",
                         data.origin
                     ),
                 )
@@ -1872,8 +1877,22 @@ fn managed_status_and_history_verify_selected_target_identity() {
         .collect();
     let api = lifecycle_fixture(replies);
     write_managed_target(temp.path(), &api.origin);
+    let config_path = managed_home(temp.path()).join("config.yaml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        format!(
+            "{}\ndefaults:\n  profile: other\n",
+            config.replace(
+                "profiles:\n",
+                "profiles:\n  other:\n    api: https://other.example.test\n    organization_id: account-two\n    auth: {provider: token, source: {env: CLI_TEST_OTHER_TOKEN}}\n",
+            )
+        ),
+    )
+    .unwrap();
     for (index, (args, path, response, refused)) in reads.into_iter().enumerate() {
         let output = managed_cli(temp.path(), &api.origin)
+            .env_remove("CLI_TEST_OTHER_TOKEN")
             .args(args)
             .arg("--json")
             .output()
@@ -2031,7 +2050,10 @@ fn managed_apply_polls_original_delivery_without_resubmission_or_cancellation() 
             if timeout { queued } else { complete }
         );
         if timeout {
-            assert!(String::from_utf8_lossy(&output.stderr).contains("cluster status --target"));
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("cluster status delivery-one --target NAME")
+            );
         }
         assert_control_request(
             &api.workflow_requests()[0],
@@ -2352,17 +2374,22 @@ fn managed_redirect_and_oversized_reply_fail_without_following_or_core_effects()
 }
 
 #[test]
-fn managed_origin_mismatch_and_api_down_never_open_core() {
+fn managed_auth_selector_and_api_down_never_open_core() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
     let api = lifecycle_fixture(vec![]);
     write_managed_target(temp.path(), &api.origin);
     let mismatch = managed_cli(temp.path(), &api.origin)
-        .env("OMNIGRAPH_CONTROL_API", "https://other.example")
+        .args(["--auth", "unknown-profile"])
         .args(["apply", "--plan", "saved-plan", "--json"])
         .output()
         .unwrap();
-    assert_eq!(mismatch.status.code(), Some(2));
+    assert_eq!(mismatch.status.code(), Some(64), "{mismatch:?}");
+    assert!(mismatch.stdout.is_empty(), "{mismatch:?}");
+    assert!(
+        String::from_utf8_lossy(&mismatch.stderr).contains("unexpected argument '--auth'"),
+        "{mismatch:?}"
+    );
     assert!(api.requests().is_empty());
     assert_no_core_effects(temp.path());
     let origin = api.origin.clone();
@@ -2832,19 +2859,15 @@ fn cluster_apply_locked_exits_nonzero() {
 }
 
 #[test]
-fn cluster_apply_uses_operator_actor_from_omnigraph_home() {
+fn cluster_apply_uses_explicit_actor_with_version1_operator_home() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
     let operator_home = tempdir().unwrap();
-    fs::write(
-        operator_home.path().join("config.yaml"),
-        "target_config_version: 1
-operator:
-  actor: act-operator
-",
-    )
-    .unwrap();
-    for (extra, expected) in [(vec![], "act-operator"), (vec!["--as", "andrew"], "andrew")] {
+    fs::write(operator_home.path().join("config.yaml"), "version: 1\n").unwrap();
+    for (extra, expected) in [
+        (vec!["--as", "act-operator"], "act-operator"),
+        (vec!["--as", "andrew"], "andrew"),
+    ] {
         let output = output_success(
             cli()
                 .current_dir(temp.path())
@@ -2868,8 +2891,7 @@ operator:
 #[test]
 fn cluster_commands_ignore_legacy_omnigraph_yaml() {
     // RFC-011: the CLI never reads omnigraph.yaml for cluster commands — a
-    // present (even malformed) legacy file is inert. The actor falls back to
-    // `operator.actor`, then to none (no loud failure on absence).
+    // present (even malformed) legacy file is inert. No actor is inferred.
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
     fs::write(temp.path().join("omnigraph.yaml"), "{{{{ not yaml").unwrap();
@@ -3238,7 +3260,7 @@ fn optimize_uses_only_an_explicit_or_configured_graph() {
     );
     assert!(String::from_utf8_lossy(&refused.stderr).contains("graph"));
     let home = tempdir().unwrap();
-    fs::write(home.path().join("config.yaml"), format!("target_config_version: 1\ntargets:\n  root:\n    kind: direct\n    scope: root\n    uri: {}\n    default_graph: knowledge\n", temp.path().display())).unwrap();
+    fs::write(home.path().join("config.yaml"), format!("version: 1\ntargets:\n  root:\n    kind: direct\n    scope: root\n    uri: file://{}\n    default_graph: knowledge\n", temp.path().display())).unwrap();
     let out = output_success(
         cli()
             .env("OMNIGRAPH_HOME", home.path())
@@ -3289,8 +3311,8 @@ fn optimize_on_multi_graph_cluster_requires_a_graph_without_discovery() {
     fs::write(
         operator_home.path().join("config.yaml"),
         serde_json::to_vec(&serde_json::json!({
-            "target_config_version": 1,
-            "targets": {"root": {"kind": "direct", "scope": "root", "uri": temp.path()}}
+            "version": 1,
+            "targets": {"root": {"kind": "direct", "scope": "root", "uri": url::Url::from_directory_path(temp.path()).unwrap().as_str()}}
         }))
         .unwrap(),
     )
@@ -3503,7 +3525,7 @@ fn managed_operation_rejects_retired_organization_override_before_authentication
         "foreign",
         "--json",
     ]));
-    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.status.code(), Some(64));
     assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
     assert!(api.requests().is_empty());
 }
@@ -3903,7 +3925,17 @@ fn managed_organization_refuses_invalid_targets_and_yaml_before_external_access(
             command.arg("https://other.example");
         }
         let output = command.output().unwrap();
-        assert_eq!(output.status.code(), Some(2));
+        let (exit, diagnostic) = if argument == "--direct" {
+            (64, "unexpected argument '--direct'")
+        } else {
+            (1, "this operation selects --profile, not --target")
+        };
+        assert_eq!(output.status.code(), Some(exit), "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(diagnostic),
+            "{output:?}"
+        );
     }
     let output = organization_cli(temp.path(), &api.origin)
         .args(["members", "list", "--organization", "foreign", "--json"])
@@ -4020,7 +4052,7 @@ fn managed_organization_requires_an_account_target_and_write_keys() {
     let api = lifecycle_fixture(vec![]);
     write_managed_target(temp.path(), &api.origin);
     let missing = output_failure(cli().args(["organization", "members", "list"]));
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("target"));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("profile_required"));
     for arguments in [
         vec!["invitations", "send", "member@example.com"],
         vec!["invitations", "resend", "inv_one"],

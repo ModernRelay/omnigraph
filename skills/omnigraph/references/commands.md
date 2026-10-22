@@ -26,6 +26,7 @@ prints the exact flags of the installed binary.
 
 | Command | Subcommands | Use |
 |---|---|---|
+| `catalogue` | — | Query this binary's engine registries with `-e` or `--query`, optionally `--json`; no store, operator config or credentials |
 | `query` | — | Run a read query: a served stored query by name, or ad-hoc `--query`/`-e` source; also the `branch list` and `explain` statements |
 | `mutate` | — | Run a mutation, or a `branch create`/`delete`/`merge` or `commit publish`/`drop` statement |
 | `alias` | — | Invoke an operator alias's stored read query |
@@ -46,15 +47,17 @@ prints the exact flags of the installed binary.
 | `repair` | — | Report foreign Lance history without adopting it |
 | `cleanup` | — | Delete table versions no retained graph commit pins (destructive) |
 | `lint` | — | Validate `.gq` source against a schema or a graph |
-| `queries` | `validate` `list` | Check or list a cluster's stored queries |
+| `queries` | `validate` `list` | Check a cluster's stored queries; list a cluster's or a served graph's |
 | `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `create` `list` `members list` `pull` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; the target kind selects the backend |
-| `organization` | `members list` `members apply` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | Manage the selected organization's members and invitations; requires a managed account target; `org` is an alias |
+| `organization` | `members list` `members apply` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | Manage the selected organization's members and invitations; requires a profile; `org` is an alias |
 | `policy` | `validate` `test` `explain` | Validate or evaluate a cluster's applied policy |
 | `embed` | — | Generate, clean or refresh seed embeddings |
-| `login` | — | Store a server's bearer token, or open a managed session |
-| `logout` | — | Remove a stored token or a managed session |
-| `target` | `list` `show` `add` `remove` `import` | Manage complete target bindings |
-| `credential` | `get` | Export a server target token to a pipe |
+| `login` | — | Register a profile or sign in to its `omnigraph` profile |
+| `logout` | — | Clear the selected platform session and report revocation |
+| `target` | `list` `inspect` `add` `refresh` `remove` | Manage resource bindings |
+| `credentials` | `set` `status` `remove` `export` | Explicit owner/profile custody and pipe-only access export |
+| `config` | `validate` `rename-profile` `rename-target` `recover-rename` `recover-operations` | Validate/edit operator bindings or preserve legacy operation evidence |
+| `access` | — | Say who you are at a target and which actions its policy grants, graph-wide and on a branch |
 | `skill` | `export` `show` | Export or print this skill as built into the CLI |
 | `version` | — | Print the CLI version, the HTTP contract it speaks and the storage formats it writes and serves; `--json` prints them as one object |
 
@@ -168,7 +171,7 @@ baseline recovery, see [`changes.md`](changes.md).
 ## Graphs (multi-graph servers)
 
 ```bash
-omnigraph graphs list --target <name-or-url> --json
+omnigraph graphs list --target <name> --json
 ```
 
 Lists the graphs a multi-graph server serves, with each graph's `state`. Remote
@@ -272,7 +275,7 @@ omnigraph mutate add_signal --query queries/mutations.gq --params '{"slug":"sig-
 With a read alias:
 
 ```bash
-omnigraph alias signal sig-foo
+omnigraph alias signal --params '{"slug":"sig-foo"}'
 ```
 
 Aliases are read-only. Invoke a served stored mutation with `omnigraph mutate
@@ -338,52 +341,89 @@ deletion and `optimize` leave this reclamation to `cleanup`.
 ```bash
 omnigraph queries validate --target .              # type-check every applied registry
 omnigraph queries list --target . --graph knowledge # list names and typed params
+omnigraph queries list --target prod --graph knowledge --json # a server's catalog
 ```
 
-`queries` operates on applied cluster state, not a graph URI. `validate`
-checks every registry against its applied schema; `list` may select one graph.
+`validate` operates on applied cluster state, not a graph URI, and checks every
+registry against its applied schema. `list` reads a direct cluster root, where
+`--graph` may select one graph, or one served graph, which a server target
+selects with `--graph` or its `default_graph`; there `--json` prints the body of
+`GET /graphs/{id}/queries`.
 Distinct from `lint`, which validates authoring source. See
 [`stored-queries.md`](stored-queries.md).
 
 ## Operator Config & Credentials
 
+Use the primary [operator reference](../../../docs/user/cli/targets.md).
+The format is `version: 1`; there is no legacy import or compatibility layer.
+`--operator-config FILE` replaces the default operator file without merging.
+Secrets never belong in YAML. Login/logout are platform-session operations;
+static tokens use explicit owner/profile commands:
+
 ```bash
-echo "$TOKEN" | omnigraph login --target production
-omnigraph logout --target production
+omnigraph credentials set --target production --stdin < /secure/token-input
+omnigraph credentials status --target production --json
+omnigraph credentials remove --target production
+omnigraph credentials export --target production | consumer
 omnigraph target list --json
-omnigraph target show production --json
+omnigraph target inspect production --resolved --json
+omnigraph config validate --json
+omnigraph access --target production --branch main --json
 ```
 
-`~/.omnigraph/config.yaml` requires `target_config_version: 1` and complete
-`targets` entries. `OMNIGRAPH_HOME` changes the operator directory. Server
-credentials use a target's explicit owner, bound to its endpoint; managed human
-sessions and data credentials use separate OS-keychain entries. Managed
-`control_auth: automation-env` instead requires the exact origin-bound
-`OMNIGRAPH_CONTROL_API` / `OMNIGRAPH_CONTROL_TOKEN` pair, without human fallback.
-A composed route that crosses a more specific endpoint's authentication boundary
-refuses before discovery; credentials never switch within an invocation.
-Never print credential values while inspecting configuration.
+`access` reports the server-resolved actor and allowed graph actions; it is the
+identity check, with no separate `whoami` command. Direct targets use `--as`
+or no actor. Managed targets refuse `access`. See
+[access scope and policy semantics](../../../docs/user/cli/targets.md#what-you-may-do-at-a-target).
+
+Set/remove require `token`/`store`; an existing entry needs `--replace`.
+Status never calls network/helpers or prompts; secure-store availability and
+identity remain unknown without reading secrets. Export requires a
+pipe, not terminal/file output, and never exports refresh credentials.
+`target add NAME` reads JSON on stdin; `target add NAME --profile work
+--cluster ID` uses authenticated discovery. `target refresh NAME` explicitly
+refreshes a managed endpoint without changing its incarnation. `target remove
+NAME` keeps credentials/journals and requires remaining references to be valid.
+Onboarding requires `login --create-profile NAME`, with optional `--organization ID`
+and `--api URL` (default `https://platform.omnigraph.dev`). Bare login uses
+`defaults.profile`; `login --profile NAME` selects an existing profile. Missing
+profiles never cause implicit creation, and creation refuses existing names.
+Managed target add uses `--profile NAME` or `defaults.profile`.
+`config recover-operations --source DIR --profile NAME [--json]`
+preserves matching legacy folder evidence; it neither converts config nor submits
+operations. See the [upgrade reference](../../../docs/user/cli/targets.md#upgrade-from-the-old-format).
+
+Rename commands preserve custody and update references/defaults:
+
+```bash
+omnigraph config rename-profile work company
+omnigraph config rename-target production live
+omnigraph config recover-rename --operator-config /path/to/config.yaml
+omnigraph login --profile company --replace-principal NEW_PRINCIPAL_ID
+```
+
+Rename/recover-rename have no `--json`. Recover an interrupted rename against the
+same operator file; a conflicting later edit refuses. Principal replacement
+requires an existing profile or managed target, verifies the
+**new** principal ID, and invalidates derived credentials. It conflicts with
+onboarding `--create-profile`, `--api` and `--organization`.
 
 ## Addressing a Graph
 
-Every backend command resolves one complete `--target NAME|ADDRESS`, otherwise
-`defaults.target`. Failure never selects another target. `--config DIR` only
-supplies declared source for cluster validation, plan/apply, observation or
-managed push; it cannot route a command. A local command rejects routing flags.
+Use `--target NAME` or `defaults.target` for resource operations and
+`--profile NAME` or `defaults.profile` for account operations; selectors
+are mutually exclusive. Managed targets use their pinned profile; global/default
+profiles cannot override it. Standalone targets own one auth provider; different
+identities use different targets. There is no `--auth` selector or last-used identity.
+`--config DIR` supplies deployment source and never routes a command.
 
-A registered target is `kind: direct` (`scope: graph`, `root`, or `catalogue`),
-`kind: server`, or `kind: managed` (`scope: account` or `cluster`). Root/server/
-managed cluster graph operations require `--graph ID` or that target's
-`default_graph`; discovery never chooses a graph. Direct graph targets reject
-`--graph`. Inline addresses use explicit path spelling (`./graph.omni`) or a URI;
-bare names refer to configured targets. `init --schema schema.pg ./graph.omni`
-is the sole positional address convenience. `--as` attributes supported direct
-operations; a served write sends it as the `Omnigraph-If-Actor` assertion.
-Every backend command prints its resolved target to stderr.
-
-Legacy routing flags, `use`, `profile`, ambient profile selection and folder
-routing are removed. Use `target import` to convert legacy configuration and
-validate existing lifecycle custody; no execution adapter runs the old grammar.
+Direct graph/root targets use local files only. Inline local paths and `file://`
+URIs are accepted; remote endpoints must be registered. Server targets own auth;
+managed targets reference a profile and pin cluster identity/incarnation.
+Graph operations need `--graph` or target `default_graph`; direct graphs reject
+`--graph`. `init --schema schema.pg ./graph.omni` retains its creation shorthand.
+Catalogue/cloud-direct/Unix targets are unsupported. `--as` attributes direct
+operations or asserts a served actor. Diagnostics use stderr.
 
 For query source (`query`/`mutate`):
 
@@ -393,7 +433,8 @@ For query source (`query`/`mutate`):
 For params:
 
 1. **Explicit `--params '{...}'`** wins on key conflict
-2. **Positional alias args** map to alias `args` list
+2. Alias `params` supplies defaults; no positional alias binding exists
+3. Alias `--params` and `--params-file` require a JSON object; arrays, scalars and null refuse before query execution
 
 ## Output Formats and Positions
 
@@ -411,7 +452,9 @@ fails with "has no text rendering". Do not use it, or set it as
 
 Mutations do not take `--format`; use `--json`. Successful `mutate --json` and
 `load --json` include the exact published `commit` (`null` for a no-op
-mutation). `query --json` includes `graph_commit_id` when the read snapshot has
+mutation). `load --json` prints the HTTP load route's body on direct, served and
+managed targets alike: `actor_id` is the write's actor and `base_branch` is `null`
+without `--from`; it carries no `uri`. `query --json` includes `graph_commit_id` when the read snapshot has
 an effective graph head (a fresh pre-commit graph can omit it). When returned,
 use that position with `mutate --if-commit`; see [`changes.md`](changes.md).
 
@@ -434,16 +477,16 @@ is healthy; authorized `graphs list --target <name|url> --json` returns one
 
 ## Organization Administration
 
-Use a managed account target for `organization` (`org`):
+Use a profile for `organization` (`org`):
 
 ```bash
-omnigraph organization members list --target account --json
-omnigraph organization invitations send person@example.com --target account --idempotency-key invite-person
-omnigraph organization members apply member.yaml --target account --idempotency-key enroll-person --json
-omnigraph organization members offboard USER_ID --target account --expected-version 4 --idempotency-key offboard-person --json
+omnigraph organization members list --profile work --json
+omnigraph organization invitations send person@example.com --profile work --idempotency-key invite-person
+omnigraph organization members apply member.yaml --profile work --idempotency-key enroll-person --json
+omnigraph organization members offboard USER_ID --profile work --expected-version 4 --idempotency-key offboard-person --json
 ```
 
-The caller needs `members_manage`. Patch organization IDs must match the target.
+The caller needs `members_manage`. Patch organization IDs must match the profile.
 Invitation/admission changes do not grant graph permissions. Deploy Cedar
 revocation before offboarding and verify denial with an existing data credential.
 Writes require exact idempotency keys and uncertain outcomes must be reconciled;
@@ -465,12 +508,12 @@ existing attempt. The final command is source-free recovery with an explicit
 writer-stop attestation. Only direct-root targets support it. Status and
 force-unlock take a target, never source configuration.
 
-Managed lifecycle uses account targets for create/list and complete cluster
-targets for the remaining operations:
+Managed lifecycle uses profiles for create/list and managed targets for
+resource operations:
 
 ```bash
-omnigraph cluster create demo --target account --no-wait --json
-omnigraph cluster list --target account --json
+omnigraph cluster create demo --profile work --no-wait --json
+omnigraph cluster list --profile work --json
 omnigraph cluster pull --target managed-production --out fresh-source --json
 omnigraph cluster push --target managed-production --config ./source --expected-revision COMMIT --message "Update schema" --json
 omnigraph cluster plan --target managed-production --rev COMMIT --json
@@ -479,7 +522,6 @@ omnigraph cluster apply --target managed-production --plan PREVIEW_ID --json
 
 Creation and pull never switch targets or bind folders. Managed plan/apply use
 pushed revisions and reject `--config`. Cluster identity and incarnation are
-pinned; data requests additionally require the target endpoint. Human-device and
-automation-env control authentication never fall back to each other. Retain
-operator-home lifecycle custody after an uncertain request, and import old
-folder evidence before submitting new lifecycle work. See [managed clusters](cluster.md#managed-clusters).
+pinned; data requests additionally require the target endpoint. Auth providers never fall back to each other. Retain
+operator-home lifecycle custody after an uncertain request; reconcile old work
+with compatible tooling before retiring its configuration. See [managed clusters](cluster.md#managed-clusters).

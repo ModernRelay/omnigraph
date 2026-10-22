@@ -1,8 +1,9 @@
 # CLI guide
 
-Select the destination with `--target NAME|ADDRESS`. If omitted, the CLI uses
-`defaults.target` from the operator configuration. Source files select what to
-run; they never choose where to run it.
+Select resources with `--target NAME|LOCAL_PATH`, or `defaults.target` when
+omitted. Account operations use `--profile NAME` or `defaults.profile`.
+These selectors are mutually exclusive. Source files select what to run; they
+never choose where to run it.
 
 ```bash
 # Open a graph directly; no registration needed.
@@ -13,8 +14,8 @@ omnigraph query sources_for_claim --query queries.gq \
 omnigraph query sources_for_claim --target prod --graph knowledge \
   --params '{"claim":"lower-latency"}'
 
-# An explicit URL is also a target.
-omnigraph graphs list --target https://graph.example.com
+# Remote endpoints require a registered target.
+omnigraph graphs list --target prod
 ```
 
 A bare word is a registered name. Write `./local` for a relative path named
@@ -29,8 +30,8 @@ credentials and discovery responses cannot change the destination.
 
 Run `omnigraph <command> --help` for available flags. The
 [CLI reference](reference.md) covers the complete command surface, and
-[operator targets](targets.md) covers registration,
-provider settings and migration.
+[operator configuration](targets.md) is the primary reference for profiles,
+targets, authentication providers and the breaking format change.
 
 ## Create, load, and query a graph
 
@@ -132,52 +133,29 @@ explicit destination refuse a default-only selection. Read the
 
 ## Use a server
 
-Register its endpoint and credential owner in the operator file:
-
-```yaml
-# ~/.omnigraph/config.yaml
-target_config_version: 1
-defaults:
-  target: prod
-targets:
-  prod:
-    kind: server
-    endpoint: https://graph.example.com
-    credential: prod-auth
-    default_graph: knowledge
-```
+Configure a server target with `auth: {provider: token, source: {store: {}}}` as shown
+in [operator configuration](targets.md), then install its token explicitly:
 
 ```bash
-printf '%s\n' "$SERVER_TOKEN" | omnigraph login --target prod
-omnigraph graphs list --target prod
-omnigraph query sources_for_claim --params '{"claim":"lower-latency"}'
-omnigraph logout --target prod
+printf '%s\n' "$SERVER_TOKEN" | omnigraph credentials set --target standalone --stdin
+omnigraph graphs list --target standalone
+omnigraph query sources_for_claim --target standalone --graph knowledge \
+  --params '{"claim":"lower-latency"}'
+omnigraph credentials status --target standalone --json
 ```
 
-`login` reads the first line of stdin unless `--token` is supplied. It stores
-the token and its endpoint binding in the captured operator home's
-`credentials` file with mode `0600`. `OMNIGRAPH_TOKEN_PROD_AUTH` overrides the
-stored token for owner `prod-auth`. Owners with colliding environment variable
-names are rejected.
-
-A token is sent only within its configured endpoint scope: the same scheme,
-host, port and path boundary. The deepest configured scope wins. Editing an
-endpoint does not move an existing saved token to the new endpoint. Inline
-server addresses use a matching configured owner, or send no credential.
-The server resolves the actor from the token; on a served write `--as` only
-asserts it.
-
+The profile's declared source is the only credential source. There is no
+implicit environment override or plaintext credential file. `login` and `logout`
+manage platform sessions; static tokens use `credentials set/remove`.
+The server resolves the actor from authentication; on a served write `--as`
+only asserts it. Register remote endpoints rather than passing inline URLs.
 ### Use a server through a Unix socket
 
-A Unix-domain socket is a server endpoint on Unix platforms:
-
-```bash
-omnigraph graphs list --target unix:///run/omnigraph/server.sock
-```
-
-The entire path names the socket; it has no host, URL path prefix, query or
-fragment. A named target can use the same endpoint and a credential owner.
-The CLI sends ordinary HTTP over the socket; proxy settings do not apply.
+Operator version 1 does not accept `unix://` targets. Register an HTTPS server
+endpoint instead; anonymous loopback HTTP is the only plain-HTTP exception.
+Other clients with Unix socket support may use a
+[TCP relay gateway](../deployment.md#unix-socket-access). This does not enable
+Unix socket access in the current CLI.
 
 ## Manage a cluster
 
@@ -211,14 +189,13 @@ Reusing an existing ID only observes its original invocation. It never executes
 it again. Recovery that needs proof of stopped writers additionally requires
 `--writers-stopped` and an explicit target.
 
-For managed operations, register a managed account target, sign in, and
-complete its organization binding from the login response. Register a managed
-cluster target with the exact ID and incarnation returned by cluster creation
-or listing. Then use the same targeting syntax:
+For managed operations, register a profile and then a target using
+service-attested cluster identity:
 
 ```bash
-omnigraph login --target account --json
-omnigraph cluster list --target account --json
+omnigraph login --create-profile work
+omnigraph cluster list --profile work --json
+omnigraph target add cloud --profile work --cluster CLUSTER_ID
 omnigraph cluster plan --target cloud --json > plan.json
 omnigraph cluster apply --target cloud --plan "$(jq -r .data.preview_id plan.json)" --json
 omnigraph cluster status --target cloud --json
@@ -232,7 +209,7 @@ and the [managed command reference](reference.md#managed-cluster-commands).
 ## Output and errors
 
 For `query` and `alias`, output selection follows `--json`, then `--format`,
-then the alias's `format`, then operator `defaults.output`, then `table`.
+then operator `defaults.output`, then `table`. Aliases have no format field.
 Structured execution errors use the selected JSON or JSONL format. Mutations
 require explicit `--json` for structured errors. Target diagnostics go to
 stderr and cannot be suppressed by a quiet flag.

@@ -13,7 +13,7 @@ use std::io::{self, Write};
 pub(crate) async fn run_commit(
     command: CommitCommand,
     scope: HistoryScope<'_>,
-    managed_client: Option<GraphClient>,
+
     input: &mut crate::input::Input<'_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -27,19 +27,9 @@ pub(crate) async fn run_commit(
             page_token,
             json,
         } => {
-            let client = match managed_client {
-                Some(client) => client,
-                None => {
-                    GraphClient::from_target(
-                        scope.operator,
-                        scope.target,
-                        scope.graph,
-                        None,
-                        stderr,
-                    )
-                    .await?
-                }
-            };
+            let client =
+                GraphClient::from_target(scope.operator, scope.target, scope.graph, None, stderr)
+                    .await?;
             let payload = match CommitListSelection::from_args(unpublished, unattached) {
                 CommitListSelection::Unattached => {
                     client.list_unattached_commits(branch.as_deref()).await?
@@ -105,19 +95,9 @@ pub(crate) async fn run_commit(
             }
         }
         CommitCommand::Show { commit_id, json } => {
-            let client = match managed_client {
-                Some(client) => client,
-                None => {
-                    GraphClient::from_target(
-                        scope.operator,
-                        scope.target,
-                        scope.graph,
-                        None,
-                        stderr,
-                    )
-                    .await?
-                }
-            };
+            let client =
+                GraphClient::from_target(scope.operator, scope.target, scope.graph, None, stderr)
+                    .await?;
             let commit = client.get_commit(&commit_id).await?;
             if json {
                 write_json(&commit, stdout)?;

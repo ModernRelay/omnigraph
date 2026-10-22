@@ -68,27 +68,19 @@ not fencing for older binaries or raw storage tools. Azure writers also require
 
 ## Live server deployment
 
-```yaml
-# ~/.omnigraph/config.yaml
-target_config_version: 1
-targets:
-  production:
-    kind: server
-    endpoint: https://graph.example.com
-    credential: production
-    default_graph: knowledge
-```
+Configure `production` as a server target with `auth: {provider: token, source: {store: {}}}`;
+see [operator configuration](../../../docs/user/cli/targets.md).
 
 ```bash
-printf '%s' "$TOKEN" | omnigraph login --target production
+printf '%s' "$TOKEN" | omnigraph credentials set --target production --stdin
 omnigraph cluster plan --target production --config . --json
 omnigraph cluster apply --target production --config . --timeout 1800 --json
 omnigraph cluster status --target production --deployment-id ID --wait --timeout 1800 --json
 omnigraph query find_person --target production --params '{"name":"Alice"}' --json
 ```
 
-A named server target sends only its endpoint-bound credential. Inline HTTP or
-Unix addresses use the deepest matching configured endpoint credential, or none.
+A named server target uses only its declared auth provider. Remote
+inline URLs and Unix socket targets are unsupported.
 The server derives the actor from authentication;
 `--as` on a server `plan` or `apply` only asserts it, and another actor is
 refused with `actor_mismatch` and exit 4 before anything is submitted. The
@@ -144,23 +136,22 @@ backup restoration; apply does not adopt or recreate them.
 
 ## Managed clusters
 
-A managed account target pins API, organization and control authentication. A
-managed cluster target additionally pins cluster ID and incarnation; graph work
-also uses a pinned data endpoint and explicit/default graph. Obtain organization
-identity from the service operator before first login. No `use` command or folder
-context participates in routing.
+A profile pins API, organization and one auth provider for one identity. A managed
+target references it and pins cluster ID/incarnation plus an optional endpoint.
+Graph work needs that endpoint and an explicit/default graph. See
+[registration](../../../docs/user/cli/targets.md#login-and-registration).
 
 ```bash
-omnigraph login --target account
-omnigraph cluster list --target account --json
-omnigraph cluster create demo --target account --no-wait --json
-# Register production using the returned exact identity and service endpoint.
+omnigraph login --profile work
+omnigraph cluster list --profile work --json
+omnigraph cluster create demo --profile work --no-wait --json
+omnigraph target add production --profile work --cluster CLUSTER_ID
 omnigraph cluster pull --target production --out source --json
 omnigraph cluster push --target production --config source --expected-revision REV --message 'Update schema'
 omnigraph cluster plan --target production --rev NEW_REV --json
 omnigraph cluster apply --target production --plan PREVIEW_ID --json
 omnigraph cluster status DELIVERY_ID --target production --json
-omnigraph cluster operation OPERATION_ID --target account --wait --json
+omnigraph cluster operation OPERATION_ID --profile work --wait --json
 ```
 
 Managed plan/apply use pushed source revisions/previews and reject local
@@ -172,10 +163,10 @@ changing any target or directory. Delete/undo require the selected cluster;
 Lifecycle pending and accepted identities live under the operator home's
 `lifecycle/`, partitioned by API and organization. Retry an uncertain request
 with the same principal, exact arguments and key. Accepted history is bounded;
-full custody refuses instead of evicting evidence. Legacy project pending or
-accepted records block new lifecycle submissions until `target import` copies
-validated evidence durably. Preserve the originals and isolate older binaries
-until migration/recovery is settled.
+full custody refuses instead of evicting evidence. Preserve old journals and
+preserve matching legacy folder evidence explicitly with `config recover-operations
+--source DIR --profile work`. This does not convert configuration or
+submit operations; resume with the original verified principal and original key.
 
 Managed graph commands acquire missing identity credentials without replaying
 submitted mutations. Credential issuance grants connectivity, not graph

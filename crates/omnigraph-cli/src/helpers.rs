@@ -90,6 +90,7 @@ pub(crate) fn remote_url(base: &str, segments: &[&str], query: &[(&str, &str)]) 
     Ok(url.to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn normalize_bearer_token(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
@@ -171,16 +172,17 @@ impl std::fmt::Display for MissingCredential {
         match self {
             Self::AnonymousTarget(name) => write!(
                 f,
-                "target `{name}` uses anonymous authentication: configure its credential owner, \
-                 then run `omnigraph login --target {name}`"
+                "target `{name}` uses anonymous authentication: configure a token or exec \
+                 provider; for a token provider with source: store, run \
+                 `omnigraph credentials set --target {name} --stdin`"
             ),
             Self::Unbound {
                 server_root,
                 config,
             } => write!(
                 f,
-                "no credential is bound to {server_root}: declare a target for it under `targets:` in {}, \
-                 then run `omnigraph login --target <target>` or set OMNIGRAPH_TOKEN_<NAME>",
+                "no credential is bound to {server_root}: declare a server target and explicit auth \
+                 provider under `targets:` in {}; select it with --target",
                 config.as_deref().map_or_else(
                     || "~/.omnigraph/config.yaml".to_string(),
                     |path| path.display().to_string()
@@ -209,17 +211,22 @@ pub(crate) fn with_missing_credential(
 
 /// A graph identifier is one unambiguous URL/storage path segment.
 pub(crate) fn require_graph_segment(graph: &str) -> Result<()> {
-    if graph.is_empty()
-        || !graph
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        color_eyre::eyre::bail!(
-            "invalid graph `{graph}`: a graph name is one path segment of ASCII letters, \
-             digits, `-` or `_`"
-        );
+    if graph != "og_catalog" {
+        omnigraph_server::GraphId::try_from(graph).map_err(|error| {
+            color_eyre::eyre::eyre!(
+                "invalid graph `{graph}`: a graph name is one path segment; {error}"
+            )
+        })?;
     }
     Ok(())
+}
+
+pub(crate) fn valid_managed_identifier(value: &str, max_len: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 pub(crate) fn apply_bearer_token(
@@ -282,6 +289,37 @@ pub(crate) struct RemoteRefusalOutput<'a> {
 }
 
 impl std::error::Error for RemoteErrorCli {}
+
+/// A refusal the CLI decides itself, under the registry code a server answers
+/// the same condition with. Its body carries that code, so a classified
+/// failure takes the code's action and a JSON caller reads the same `code`
+/// from either transport.
+#[derive(Debug)]
+pub(crate) struct CodedRefusal {
+    pub(crate) code: omnigraph_api_types::ErrorCode,
+    pub(crate) message: String,
+}
+
+impl CodedRefusal {
+    pub(crate) fn report(
+        code: omnigraph_api_types::ErrorCode,
+        message: impl Into<String>,
+    ) -> color_eyre::Report {
+        Self {
+            code,
+            message: message.into(),
+        }
+        .into()
+    }
+}
+
+impl std::fmt::Display for CodedRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CodedRefusal {}
 
 /// Build the typed CAS-lost error for the embedded transport, mirroring the
 /// structured body a server would have returned so `--json` output is
@@ -448,7 +486,10 @@ fn remote_refusal(
                 .precondition_failure
                 .as_ref()
                 .is_some_and(|details| Some(details.expected.as_str()) == expected_commit)
-            && error.code.is_none()
+            && matches!(
+                error.code,
+                None | Some(omnigraph_api_types::ErrorCode::PreconditionFailed)
+            )
             && crate::command_outcome::single_request()
             && {
                 let mut rest = error.clone();

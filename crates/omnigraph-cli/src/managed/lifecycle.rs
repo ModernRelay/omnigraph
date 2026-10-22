@@ -536,38 +536,41 @@ mod tests {
     async fn undelivered_operation_progress_retains_identity_without_polling() {
         for fault in [OutputFault::PartialWrite, OutputFault::Flush] {
             let server = IntentApiFixture::new(vec![]);
-            let api =
-                Api::new(server.origin.clone(), Some("automation-secret".to_owned())).unwrap();
-            let identity = Identity {
-                cluster_id: "cluster-original".to_owned(),
-                incarnation: "incarnation-original".to_owned(),
-                operation_id: "operation-original".to_owned(),
-                kind: "create".to_owned(),
-            };
-            let options = ClusterRunArgs {
-                no_wait: false,
-                timeout: Some(30),
-                idempotency_key: None,
-            };
-            let error = wait_operation(
-                &api,
-                json!({"data":{"state":"running"}}),
-                &identity,
-                &options,
-                Instant::now() + Duration::from_secs(30),
-                false,
-                &mut FailedOutput::new(fault, 0),
-            )
-            .await
-            .unwrap_err();
-            assert_eq!(error.body["type"], "output_delivery_failed");
-            assert_eq!(error.exit, 1);
-            assert_eq!(
-                error.body["accepted_operation"],
-                serde_json::to_value(&identity).unwrap()
-            );
-            assert!(server.requests().is_empty());
-            server.assert_complete();
+            crate::operator_routing::test_transport_scope(&[&server.origin], async {
+                let api =
+                    Api::new(server.origin.clone(), Some("automation-secret".to_owned())).unwrap();
+                let identity = Identity {
+                    cluster_id: "cluster-original".to_owned(),
+                    incarnation: "incarnation-original".to_owned(),
+                    operation_id: "operation-original".to_owned(),
+                    kind: "create".to_owned(),
+                };
+                let options = ClusterRunArgs {
+                    no_wait: false,
+                    timeout: Some(30),
+                    idempotency_key: None,
+                };
+                let error = wait_operation(
+                    &api,
+                    json!({"data":{"state":"running"}}),
+                    &identity,
+                    &options,
+                    Instant::now() + Duration::from_secs(30),
+                    false,
+                    &mut FailedOutput::new(fault, 0),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.body["type"], "output_delivery_failed");
+                assert_eq!(error.exit, 1);
+                assert_eq!(
+                    error.body["accepted_operation"],
+                    serde_json::to_value(&identity).unwrap()
+                );
+                assert!(server.requests().is_empty());
+                server.assert_complete();
+            })
+            .await;
         }
     }
 

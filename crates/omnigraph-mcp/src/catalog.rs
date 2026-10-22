@@ -459,19 +459,25 @@ pub(super) fn branch_merge_schema() -> Value {
     )
 }
 
-/// The `isError` envelope: an HTTP refusal (`status` and the route's `error`
-/// body) or an MCP-side refusal (`code` and `message`); a write whose
-/// completion is unknown adds `outcome_unknown`.
+/// The `isError` envelope: the error body an HTTP route answers under
+/// `error`, with the HTTP `status` the same failure answers with; a refusal
+/// only MCP makes carries no status.
 pub(super) fn error_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
             "status": {"type": "integer"},
-            "error": {"type": "object"},
-            "code": {"type": "string"},
-            "message": {"type": "string"},
-            "outcome_unknown": {"type": "boolean"},
+            "error": {
+                "type": "object",
+                "properties": {
+                    "error": {"type": "string"},
+                    "code": {"type": "string"},
+                    "disposition": {"type": "object"},
+                },
+                "required": ["error", "code", "disposition"],
+            },
         },
+        "required": ["error"],
         "additionalProperties": false,
     })
 }

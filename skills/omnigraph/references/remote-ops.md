@@ -1,5 +1,11 @@
 # Remote Graph Operations
 
+Managed env/file/exec profiles keep exchanged data credentials only in invocation
+memory; ordinary resource access and credential export need no OS store. They
+still verify identity with the control plane. Human/store profiles and explicit
+`cluster token` administration require secure custody; there is no plaintext or
+provider fallback.
+
 Remote commands address an `omnigraph-server`; the server executes the graph
 operation and the CLI only receives its HTTP response. Network failure can hide
 a successful publication, so retry decisions must use graph evidence rather
@@ -7,30 +13,20 @@ than the transport status alone.
 
 ## Address the graph
 
-Register a complete server target in the operator file and keep its token
-outside project configuration:
-
-```yaml
-target_config_version: 1
-targets:
-  production:
-    kind: server
-    endpoint: https://graph.example.com
-    credential: production
-```
+Add a server target with `auth: {provider: token, source: {store: {}}}` using
+[operator configuration](../../../docs/user/cli/targets.md), then install it:
 
 ```bash
-echo "$TOKEN" | omnigraph login --target production
+printf '%s\n' "$TOKEN" | omnigraph credentials set --target production --stdin
 omnigraph query get_person --target production --graph knowledge \
   --params '{"email":"ada@example.com"}' --json
 ```
 
-`--target NAME` selects one binding from `~/.omnigraph/config.yaml`; omitting it
-uses only `defaults.target`. `--graph` or the target's `default_graph` selects the
-graph. Inline HTTP/Unix targets use the deepest matching configured endpoint
-credential, otherwise none. A required missing credential refuses. Do not use the cluster
-source `--config` flag on data commands. Folder metadata never changes routing.
-The resolved target is printed on stderr before backend execution.
+`--target NAME` selects a registered resource; otherwise `defaults.target` applies.
+`--graph` or its `default_graph` selects the graph. Remote inline URLs and Unix
+socket targets are unsupported. The selected profile is the only credential
+source. Do not use deployment `--config` on data commands. Folder metadata never
+routes operations; diagnostics go to stderr.
 
 ## Successful write receipts
 
@@ -99,7 +95,7 @@ route.
 ## Typed failures and recovery
 
 - `429 Too Many Requests`: the write did not start. Honor `Retry-After`, then
-  retry. The CLI marks this case with exit `75` and a `command_outcome` whose
+  retry. The CLI marks this case with exit `75` and a `disposition` whose
   `action` is `retry`, only when no earlier step of the command took effect.
 - Structured `read_set_conflict` means an input changed before publication.
   Refresh and reconsider the operation, including schema/table identity changes;
@@ -118,10 +114,21 @@ route.
   do not replay.
 
 The effect-free conflict details are distinct from a lost response or a recovery
-requirement. Neither HTTP `409`/`503` nor the CLI's generic failure exit `1` is
-a universal retry signal; conditional precondition failure has its own exit `4`
-on data-plane commands (managed `cluster plan`/`apply` use exit `4` for
-recovery required instead).
+requirement. Neither HTTP `409`/`503` nor a CLI failure exit is a universal retry
+signal. On data-plane commands, exit `1` means nothing started, exit `2` that the
+effects are unknown, exit `4` a failed condition such as a precondition, and exit
+`75` a busy refusal that may be retried after `Retry-After` (managed
+`cluster plan`/`apply` use exit `4` for recovery required instead).
+
+## macOS credential-store failures
+
+If an upgrade triggers repeated Keychain prompts, stop automatic retries. Record
+the redacted operation/category/OSStatus and installed version; inspect signing
+metadata with `codesign -dv --verbose=4 "$(command -v omnigraph)"`, not credential
+exports. Ad-hoc builds lack upgrade-stable code identity, and distinct entries
+can share a service label. Do not reset the Keychain, loosen item ACLs, or switch
+credential sources implicitly. Stable release signing and access-error diagnosis
+are separate requirements; successful approval of one item proves neither.
 
 ## Read large output safely
 

@@ -2,60 +2,45 @@ use super::*;
 use crate::settings::validate_allowed_host;
 use serde_json::json;
 
-#[tokio::test]
-async fn a_write_whose_wait_ends_first_reports_an_unknown_outcome() {
-    // The server's answer must arrive before a client on a common default
-    // timeout gives up and never sees `outcome_unknown`.
+#[test]
+fn refusals_delegate_write_context_and_preserve_resource_error_data() {
     assert!(WRITE_DEADLINE < COMMON_CLIENT_TIMEOUT);
-    for refusal in [Refusal::Cancelled, Refusal::Deadline] {
-        let result = refusal.tool_result(true).await;
-        assert_eq!(result.is_error, Some(true));
-        assert_eq!(result.structured_content.unwrap()["outcome_unknown"], true);
-    }
-    let read = Refusal::Deadline.tool_result(false).await;
-    assert!(
-        read.structured_content
-            .unwrap()
-            .get("outcome_unknown")
-            .is_none()
-    );
-    // A handler failure the server cannot settle keeps that report, for a
-    // write only; a refusal before effects is a known outcome.
-    let uncertain = Refusal::Api(HostError::from_output(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        &json!({"error":"lost","code":"internal_error"}),
-        true,
-    ))
-    .tool_result(true)
-    .await
-    .structured_content
-    .unwrap();
-    assert_eq!(uncertain["status"], 500);
-    assert_eq!(uncertain["outcome_unknown"], true);
-    for (error, write) in [
-        (
-            HostError::from_output(
-                StatusCode::BAD_REQUEST,
-                &json!({"error":"refused","code":"bad_request"}),
-                false,
-            ),
-            true,
-        ),
-        (
-            HostError::from_output(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &json!({"error":"lost","code":"internal_error"}),
-                true,
-            ),
-            false,
-        ),
+    let host = HeldHost::default();
+    // The host owns the error registry. The fixture echoes protocol events
+    // and write context so this owner checks the boundary, not a second copy
+    // of the server's code/disposition rules.
+    for error in [
+        ProtocolError::Unauthenticated,
+        ProtocolError::MissingContext,
+        ProtocolError::Capacity,
+        ProtocolError::Cancelled,
+        ProtocolError::Deadline,
+        ProtocolError::ResultTooLarge,
+        ProtocolError::InvalidResult,
     ] {
-        let body = Refusal::Api(error)
-            .tool_result(write)
-            .await
-            .structured_content
-            .unwrap();
-        assert!(body.get("outcome_unknown").is_none(), "{body}");
+        for write in [false, true] {
+            let result = Refusal::Protocol(error).tool_result(&host, write);
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(
+                result.structured_content,
+                Some(json!({
+                    "error": {"event": format!("{error:?}"), "write": write}
+                }))
+            );
+        }
+        let resource = Refusal::Protocol(error).resource_error(&host);
+        assert_eq!(
+            resource.data,
+            Refusal::Protocol(error)
+                .tool_result(&host, false)
+                .structured_content
+        );
+        let code = if error == ProtocolError::Unauthenticated {
+            ErrorData::invalid_request("", None).code
+        } else {
+            ErrorData::internal_error("", None).code
+        };
+        assert_eq!(resource.code, code);
     }
 }
 
@@ -98,17 +83,38 @@ fn complete_tool_result_including_legacy_text_has_one_byte_bound() {
     let result = bounded_result(&small).unwrap();
     assert_eq!(result.is_error, Some(false));
     assert_eq!(result.structured_content, Some(small));
-    // The source JSON fits, but the SDK's structured + legacy text
-    // compatibility representation exceeds the complete result bound.
-    let duplicate = json!({"text":"x".repeat(RESULT_BYTES * 3 / 4)});
-    let result = bounded_result(&duplicate).unwrap();
-    assert_eq!(result.is_error, Some(true));
-    assert_eq!(
-        result.structured_content.unwrap()["code"],
-        "result_too_large"
-    );
-    let too_large = json!({"text":"x".repeat(RESULT_BYTES+1)});
-    assert_eq!(bounded_result(&too_large).unwrap().is_error, Some(true));
+    let service = GraphTools {
+        host: HeldHost::default(),
+        settings: McpSettings::default(),
+        version: "test".into(),
+        slots: Arc::new(Semaphore::new(1)),
+    };
+    // The first source fits but its structured + legacy text envelope does
+    // not. Both limits must return an error, not disguise a completed write
+    // as an ordinary successful handler return.
+    for value in [
+        json!({"text":"x".repeat(RESULT_BYTES * 3 / 4)}),
+        json!({"text":"x".repeat(RESULT_BYTES + 1)}),
+    ] {
+        assert_eq!(
+            bounded_result(&value).unwrap_err(),
+            ProtocolError::ResultTooLarge
+        );
+        assert!(matches!(
+            HostError::from_output(None, &value),
+            Err(ProtocolError::ResultTooLarge)
+        ));
+        for write in [false, true] {
+            let result = service.fit_result(CallToolResult::structured(value.clone()), write);
+            assert_eq!(
+                result.structured_content,
+                Some(json!({
+                    "error": {"event": "ResultTooLarge", "write": write}
+                }))
+            );
+            assert!(serde_json::to_vec(&result).unwrap().len() <= RESULT_BYTES);
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -120,6 +126,14 @@ struct HeldHost {
 
 impl Host for HeldHost {
     type Context = ();
+
+    fn error(&self, error: ProtocolError, write: bool) -> HostError {
+        HostError::from_output(
+            None,
+            &json!({"event": format!("{error:?}"), "write": write}),
+        )
+        .unwrap()
+    }
 
     fn admit(&self, _: Option<&Parts>) -> Result<(), AdmissionError> {
         Ok(())
@@ -186,7 +200,8 @@ async fn cancellation_and_deadline_keep_the_host_owned_permit_until_completion()
                 .await;
             assert!(matches!(
                 (&result, cancelled),
-                (Err(Refusal::Cancelled), true) | (Err(Refusal::Deadline), false)
+                (Err(Refusal::Protocol(ProtocolError::Cancelled)), true)
+                    | (Err(Refusal::Protocol(ProtocolError::Deadline)), false)
             ));
             assert_eq!(service.slots.available_permits(), 0);
             assert_eq!(host.started.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -200,7 +215,10 @@ async fn cancellation_and_deadline_keep_the_host_owned_permit_until_completion()
                     READ_DEADLINE,
                 )
                 .await;
-            assert!(matches!(refused, Err(Refusal::Capacity)));
+            assert!(matches!(
+                refused,
+                Err(Refusal::Protocol(ProtocolError::Capacity))
+            ));
             assert_eq!(host.started.load(std::sync::atomic::Ordering::SeqCst), 1);
             host.releases
                 .lock()
@@ -217,37 +235,43 @@ async fn cancellation_and_deadline_keep_the_host_owned_permit_until_completion()
     .expect("host-owned MCP call did not settle");
 }
 
-#[tokio::test]
-async fn host_error_projection_is_bounded_and_keeps_completion_evidence_separate() {
-    let error = HostError::from_output(
-        StatusCode::BAD_REQUEST,
-        &json!({"error":"uncertain execution","code":"bad_request"}),
-        true,
-    );
-    let output = Refusal::Api(error)
-        .tool_result(true)
-        .await
-        .structured_content
-        .unwrap();
-    assert_eq!(output["status"], 400);
-    assert_eq!(output["error"]["code"], "bad_request");
-    assert_eq!(output["outcome_unknown"], true);
-
-    let error = HostError::from_output(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        &json!({"error":"known refusal","code":"internal_error"}),
-        false,
-    );
-    let output = Refusal::Api(error)
-        .tool_result(true)
-        .await
-        .structured_content
-        .unwrap();
-    assert!(output.get("outcome_unknown").is_none());
-
-    let large = json!({"error":"x".repeat(RESULT_BYTES + 1)});
-    let error = HostError::from_output(StatusCode::NOT_FOUND, &large, false);
-    let output = Refusal::Api(error).resource_error().await;
-    assert_eq!(output.code, ErrorData::resource_not_found("", None).code);
-    assert_eq!(output.data.unwrap()["code"], "request_failed");
+#[test]
+fn host_error_projection_preserves_the_judged_body_and_optional_status() {
+    let body = json!({
+        "error": "uncertain execution", "code": "outcome_unknown",
+        "disposition": {"effects": "unknown", "action": "reconcile"},
+        "details": {"receipt": "host-owned"}
+    });
+    let host = HeldHost::default();
+    for status in [
+        None,
+        Some(StatusCode::NOT_FOUND),
+        Some(StatusCode::BAD_REQUEST),
+        Some(StatusCode::INTERNAL_SERVER_ERROR),
+    ] {
+        let projected = || HostError::from_output(status, &body).unwrap();
+        for write in [false, true] {
+            let output = Refusal::Api(projected()).tool_result(&host, write);
+            let output = output.structured_content.unwrap();
+            assert_eq!(output["error"], body);
+            assert_eq!(
+                output.get("status"),
+                status.map(|s| json!(s.as_u16())).as_ref()
+            );
+            assert!(output.get("outcome_unknown").is_none());
+        }
+        let resource = Refusal::Api(projected()).resource_error(&host);
+        assert_eq!(
+            resource.data,
+            Refusal::Api(projected())
+                .tool_result(&host, false)
+                .structured_content
+        );
+        let code = match status {
+            Some(StatusCode::NOT_FOUND) => ErrorData::resource_not_found("", None).code,
+            Some(status) if status.is_client_error() => ErrorData::invalid_request("", None).code,
+            _ => ErrorData::internal_error("", None).code,
+        };
+        assert_eq!(resource.code, code);
+    }
 }
