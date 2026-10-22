@@ -27,7 +27,7 @@
 
 Omnigraph is engineered for the new workload introduced by long-horizon agents: multiple agents sharing a typed world model to continuously retrieve and store context and coordinate work. Agents and UIs can become thin stateless consumers of durable state.
 
-Omnigraph Cloud, a hosted deployment of the same engine, is in private preview. [Join the waitlist](https://www.omnigraph.dev/cloud).
+Omnigraph Cloud is Omnigraph as a service: managed storage, servers, releases, backups, compaction and scaling, with access by token through the same CLI, SDKs and MCP server. Private preview; [join the waitlist](https://www.omnigraph.dev/cloud).
 
 ## Capabilities
 
