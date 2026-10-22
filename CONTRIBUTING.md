@@ -131,6 +131,9 @@ CI runs both.
     (`refactor(blob,schema)!: …`).
   - `!` marks a breaking change; the change also carries a
     `changelog.d/<slug>.breaking.md` note.
+  - a `feat`, `fix` or `perf` change adds a `changelog.d` note
+    ([release notes](docs/dev/documentation.md#release-notes)); a maintainer
+    adds the `skip-changelog` label when users can see nothing of it.
   - the description starts lowercase (a backtick or a digit is fine), has no
     trailing period, and the whole title stays within 100 characters.
   - an RFC PR is `rfc: <the RFC's subject>`, not `docs(rfc):`; RFC numbers

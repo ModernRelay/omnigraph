@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Release Note Gate: a user-visible pull request adds a release note.
+"""The `PR Title` check's release-note rule: a user-visible pull request adds a release note.
 
 `feat`, `fix` and `perf` add at least one `changelog.d/<slug>.<category>.md`
 note; a breaking title (`!`) adds a `.breaking.md` note. The title rule itself
-belongs to `scripts/check-pr-title.py` (the `PR Title` check); a title it
-refuses fails here too, so this gate never reads a type from a malformed
-title. The `skip-changelog` label waives the note requirement. The workflow
-runs this script from the base branch and passes the head only as a diff
-range. `--self-test` runs the in-memory cases.
+belongs to `scripts/check-pr-title.py`; a title it refuses fails here too,
+so this check never reads a type from a malformed title. The
+`skip-changelog` label waives the note requirement. `pr-title.yml` runs this
+script from the base branch and passes the head only as a diff range.
+`--self-test` runs the in-memory cases.
 """
 
 from __future__ import annotations
@@ -116,7 +116,7 @@ def main(argv: list[str] | None = None) -> int:
     for error in errors:
         print(f"::error::{error}")
     if not errors:
-        print("ok: the release notes satisfy the Release Note Gate")
+        print("ok: the pull request carries the release notes its title needs")
     return 1 if errors else 0
 
 

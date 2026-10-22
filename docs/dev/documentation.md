@@ -168,9 +168,9 @@ break. Code blocks and hard line breaks keep their lines.
 ### Pull request titles
 
 The `PR Title` check holds the title to `type(scope)!: description`
-([CONTRIBUTING.md](../../CONTRIBUTING.md), Pull Requests). The
-`Release Note Gate` check reads its type: a `feat`, `fix` or `perf` pull
-request adds a note, and a `!` title adds a `.breaking.md` note. A maintainer
+([CONTRIBUTING.md](../../CONTRIBUTING.md), Pull Requests) and also reads its
+type: a `feat`, `fix` or `perf` pull request adds a note, and a `!` title adds
+a `.breaking.md` note. A maintainer
 adds the `skip-changelog` label when a typed change has nothing users can see.
 The squash commit keeps the title and its `(#NNN)`, which is where the release
 page's pull request links come from.
