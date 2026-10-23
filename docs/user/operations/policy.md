@@ -2,8 +2,9 @@
 
 OmniGraph uses Cedar policy bundles to authorize graph, server, and cluster
 configuration actions.
-Policies are declared in `cluster.yaml` and installed during cluster bootstrap
-or graph creation. Servers load them at startup or when activating a new graph.
+Policies are declared in `cluster.yaml` and installed by `cluster apply`.
+Servers load applied policies at startup and activate policy changes during
+live deployment, including changes to existing graphs.
 
 ## Actions
 
@@ -157,8 +158,9 @@ omnigraph policy explain \
 ```
 
 Edit the policy file or its `applies_to` bindings, then run
-`cluster apply --target URL --config DIR`. The server finishes admitted requests
-before activating matching HTTP and engine permissions. Later requests use the
+`cluster apply --target NAME --config DIR` using a registered server target.
+The server finishes admitted requests before activating matching HTTP and
+engine permissions. Later requests use the
 new rules. Cluster management policy changes take effect in the same deployment;
 a newly granted administrator cannot authorize that grant.
 

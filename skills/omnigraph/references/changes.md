@@ -31,7 +31,7 @@ published, even when another writer has since advanced the target; an
 `already_up_to_date` merge publishes nothing and returns `commit: null`.
 `branch list`
 goes to canonical `POST /query` and returns sorted `name` rows; branch statements
-are refused on deprecated query/mutation routes and the conditional-write route.
+are refused on the conditional-write route.
 
 ## Inspect one commit
 

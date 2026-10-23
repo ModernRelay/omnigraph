@@ -287,6 +287,10 @@ the default allowance holds 671,088 IDs of 26 bytes, the length of a generated I
 delete and the edges it cascades to draw on the same allowance. An overwrite of
 entities loaded without a `@key` and without an explicit `id` removes every
 committed ID of that type, because those IDs are generated again on each load.
+An overwrite collects replaced IDs only when its plan's `removal` is `scan`, a
+node target with committed rows that an edge type references; an edge target,
+a node target no edge type references and an empty table collect none and draw
+nothing from this allowance.
 
 Oversized work returns a resource-limit error before its data is staged or
 published. These checks do not bound total engine memory. The setting can

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::aggregate::AggregateSpec;
-use crate::cost::{AccessPath, AntiJoinStrategy, ExpandMode, ExpandPolicy};
+use crate::cost::{AccessPath, AntiJoinStrategy, ExpandMode, ExpandPolicy, ValidateRemoval};
 use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
 use crate::logical::{
     ColumnRef, CsvSourceSpec, FragmentWriteSpec, KeyJoinKind, ScanSpec, ValidateSpec,
@@ -889,12 +889,13 @@ physical_nodes! {
         max_workers: u32,
     } => "CsvSource" [];
     /// The one validation over the whole delta, a pipeline breaker: every
-    /// check extracted in one pass per batch, each check's `access` saying
-    /// how its committed image is read after the last batch.
+    /// check extracted in one pass per batch, each check's `access` saying how
+    /// its committed image is read, `removal` whether removed ids are found.
     Validate {
         input: NodeId,
         table: String,
         checks: Vec<ValidateSpec>,
+        removal: ValidateRemoval,
         max_workers: u32,
     } => "Validate" [input: NodeId];
     /// The fragment sink: the validated delta, every input checked against
@@ -1524,10 +1525,12 @@ impl PhysicalPlan {
             PhysicalNode::Validate {
                 table,
                 checks,
+                removal,
                 max_workers,
                 ..
             } => {
                 let mut value = validate_json(table, checks);
+                value["removal"] = json!(removal);
                 value["max_workers"] = json!(max_workers);
                 value
             }

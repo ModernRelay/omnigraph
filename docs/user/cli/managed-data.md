@@ -50,7 +50,7 @@ The service can shorten the requested lifetime. Issuer clock tolerance is
 
 ## Discover graphs
 
-With a cached identity credential, `graphs list --target production`
+With a cached identity credential, `graphs list --target production --discovery`
 shows every graph ID and display name in the server's applied inventory,
 including graphs that failed to open. It does not reveal availability,
 storage locations, schema, stored queries, or graph contents. A display name

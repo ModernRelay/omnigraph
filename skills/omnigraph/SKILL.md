@@ -266,13 +266,16 @@ A graph's bytes live in one of three supported URI families:
 - **S3-compatible object storage** — AWS, Railway, Tigris, etc. (`s3://bucket/prefix`). Authenticate with the standard `AWS_*` environment contract.
 - **Azure Blob storage preview** — `az://container/prefix`. Reads and Azurite qualification are available, but Azure is not production-supported; every write or maintenance process must be launched through the root-scoped `omnigraph-azure-admission` wrapper.
 
-Keep development credentials in a git-ignored `.env.omni` and source it before CLI calls:
+The public CLI accepts only local direct targets. For cloud-backed graphs, use a
+registered server or managed target; the server or embedded host owns storage
+credentials. Keep development credentials in a git-ignored `.env.omni` and
+source it before starting the process that needs them:
 
 ```bash
 set -a && source .env.omni && set +a
 ```
 
-Direct `init`/`load` and **`cluster apply`** write storage without an HTTP server. A served `load` is different: the CLI sends it to `omnigraph-server`, which performs the graph write. A direct `cluster apply` reaches the cluster ledger and graph datasets directly, so its host needs storage credentials (`cluster apply --target managed --plan` is executed by the Intent API). A serving process also needs read-write access for served data-plane writes. Validate with `curl http://127.0.0.1:8080/readyz` (HTTP 200, `ready: true`; `/healthz` only proves the process is alive), then `omnigraph snapshot --target <name> --graph <id> --json`.
+Direct `init`/`load` and direct **`cluster apply`** write local storage without an HTTP server. A served `load` or `cluster apply` sends the request to `omnigraph-server`, which performs the writes with its storage credentials. A managed `cluster apply --target NAME --plan PREVIEW_ID` is submitted through the profile’s control plane. A serving process needs read-write storage access for served data-plane writes. Validate with `curl http://127.0.0.1:8080/readyz` (HTTP 200, `ready: true`; `/healthz` only proves the process is alive), then `omnigraph snapshot --target <name> --graph <id> --json`.
 
 ## Project Layout
 
@@ -285,7 +288,7 @@ Direct `init`/`load` and **`cluster apply`** write storage without an HTTP serve
   config-free) serves it. A direct apply keeps its admission lock: once its
   writes have settled, release that exact lock with
   `cluster force-unlock <LOCK_ID>` before starting the server, and send later
-  changes with `cluster apply --target <name|url>`.
+  changes with `cluster apply --target NAME --config DIR` using a registered server target.
   See `references/cluster.md`.
 - **Direct / embedded access — no server.** Address a graph's storage directly
   with a local path or `--target file:///absolute/path/graph.omni`; `init` also accepts its creation URI positionally.
@@ -408,7 +411,7 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | `defaults.output: arrow` | configuration refusal | Use `table`, `json`, `jsonl`, `csv` or `kv` |
 | `..` or a symlink in a `cluster.yaml` relative path | `config_path_escape` / `config_path_symlink` | Keep referenced files inside the config directory with plain relative paths |
 | Old operator format | configuration refusal | Replace it with `version: 1`; preserve journals and reconcile unresolved work before retiring old tooling |
-| Policy commands with both a graph and a `cluster` bundle applied | `matches 2 policy bundles` | Known 0.12.0 limitation of `policy validate/test/explain --graph`; inspect each bundle file directly |
+| Policy commands with both a graph and a `cluster` bundle applied | `matches 2 policy bundles` | Current limitation of `policy validate/test/explain --graph`; inspect each bundle file directly |
 
 ## Deep Dives
 

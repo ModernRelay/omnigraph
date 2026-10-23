@@ -1460,7 +1460,7 @@ pub(crate) async fn plan_load(
                     omnigraph_compiler::ir::ValidateCheck::EdgeRi { .. }
                 ) && check.consults.as_ref() == Some(key)
             });
-            if !endpoint {
+            if !endpoint && *key != table_key {
                 continue;
             }
             let Some(name) = key.strip_prefix("node:") else {
