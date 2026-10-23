@@ -245,8 +245,8 @@ target SHA documents where generation ran; squash merging may remove that
 commit. Validation compares the complete selected note set and digests,
 configuration, and regenerated document against the audited release tree. It
 requires ancestry only for the durable release base and legacy source. Any later
-note or configuration change requires regeneration. Format-2 snapshots, every release after
-v0.12.0, also record the release file's digest, the previous release tag and
+note or configuration change requires regeneration. Format-2 snapshots also
+record the release file's digest, the previous release tag and
 the pull request link of each note; a recorded link must still match history
 when the release is verified. Verify a prepared committed
 snapshot with the documentation environment active:
@@ -280,7 +280,8 @@ Advance the workspace package version too: edge builds are refused while it is
 not above the latest stable release ([release workflows](ci.md#release-workflows)).
 
 v0.12.0 through v0.14.0 are format 1, and each snapshot records its format, so
-their pages keep that shape. v0.12.0's hand-written document was converted
+their snapshots keep that shape. v0.14.0's GitHub release body was replaced
+by hand after publication with a format-2 page; its snapshot is unchanged. v0.12.0's hand-written document was converted
 into two notes, `changelog.d/a-release-highlights.added.md` and
 `changelog.d/a-compatibility-and-behavior-changes.changed.md`. The v0.14.1
 cycle is the first in format 2; a format-2 GitHub release body is the snapshot
@@ -296,6 +297,32 @@ do not edit the published snapshot or source notes to resolve contradictions.
 The overview is a maintained guide to that release, not a replacement for its
 recorded history. After adding it, regenerate the index with
 `python3 scripts/release_notes.py index --write`.
+
+### Release checklist
+
+Every release runs these steps in order. Post them in the team channel when
+the release starts, with an owner for each, and tick each one off there.
+
+1. Confirm the cycle: `changelog.d/release.json` names the version, its `base`
+   and `"format": 2`.
+2. Smoke-test the candidate: install the edge build of the commit to be
+   released ([release channels](../user/install.md#release-channels)) and run
+   the [quickstart](../user/quickstart.md) against a fresh local graph.
+3. Open the release-prep pull request. Read `preview --target HEAD` as one page
+   against the docs at that commit, fix each stale note in its own file, and
+   merge notes that repeat one upgrade step.
+4. Add `changelog.d/<version>.md` to that pull request: the intro, the why
+   when anything breaks, the highlights, the contributors and, if useful, the
+   note order. The highlights may come from another author in a later commit.
+5. Name one reviewer in the pull request. The reviewer reads the rendered
+   preview, not only the files.
+6. After the review, run `snapshot --target HEAD --date <release date>`,
+   commit the snapshot and the index to the same pull request, and merge it.
+7. Tag the merged commit `<version>` and push the tag. Tag CI audits it and
+   `release.yml` publishes the archives and the GitHub release from the
+   snapshot. Do not edit the published page; a correction is a new note.
+8. Open the next cycle: update `release.json` and the workspace package
+   version as described above.
 
 ## Review checklist
 

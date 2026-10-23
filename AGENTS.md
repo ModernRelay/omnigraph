@@ -86,6 +86,7 @@ authority model.
 | Propose or inspect a decision | [RFC registry](docs/rfcs/README.md) |
 | Write documentation | [Documentation guide](docs/dev/documentation.md) |
 | Review shipped history | [Release notes](docs/releases/) |
+| Cut a release | [Release checklist](docs/dev/documentation.md#release-checklist) |
 
 ## Engineering rules
 
@@ -222,6 +223,9 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
 - Add a permanent `changelog.d/<slug>.<category>.md` note for user-visible changes;
   follow [release-note authoring](docs/dev/documentation.md#release-notes).
   Keep private tickets and planning shorthand out of public history.
+- When a change alters or removes something an unreleased `changelog.d` note
+  describes, edit or delete that note in the same pull request; notes stay
+  editable until their release is tagged.
 - Title a pull request `type(scope)!: description` and read the title back
   after opening it; the `PR Title` check refuses every other shape, and the
   squash subject on `main` is that title
