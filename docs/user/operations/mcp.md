@@ -145,7 +145,10 @@ server that stays unreachable fails each request; the bridge keeps running
 until stdin closes. Managed resource credentials renew through the selected
 profile's normal cache before expiry. A refused managed credential is removed
 only if it is still the cached one, and renewed for later messages; the refused
-message is never replayed. Renewal never starts an interactive login.
+message is never replayed. If an expiring credential runs out before a message
+is sent, including during discovery, the bridge renews it once before sending.
+If the replacement also expires, the message fails without being sent. Renewal
+never starts an interactive login.
 
 ## Settings
 

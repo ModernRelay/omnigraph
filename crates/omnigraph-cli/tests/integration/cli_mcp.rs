@@ -774,6 +774,8 @@ struct EndpointState {
     slow: AtomicUsize,
     hung_up: AtomicUsize,
     held: AtomicUsize,
+    /// Hold successive public discovery probes until these credential expiries.
+    discovery_until: Mutex<std::collections::VecDeque<time::OffsetDateTime>>,
 }
 
 impl McpEndpoint {
@@ -877,6 +879,14 @@ fn answer_one(mut stream: TcpStream, state: &EndpointState) {
         );
     };
     if request_line.starts_with("HEAD ") && request_line.contains("/healthz ") {
+        let until = state.discovery_until.lock().unwrap().pop_front();
+        if let Some(until) = until {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while time::OffsetDateTime::now_utc() < until {
+                assert!(Instant::now() < deadline, "discovery expiry bound");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         let _ = write!(
             stream,
             "HTTP/1.1 200 OK\r\n{}: {}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
@@ -1172,6 +1182,98 @@ fn mcp_reads_a_refused_credential_again_for_later_requests_without_resending() {
     );
     assert_eq!(endpoint.received(9), [""]);
     bridge.finish().assert_success();
+}
+
+/// An exec credential can expire between messages or while public discovery
+/// is in flight. Renew it before the first operation POST, without sending the
+/// expired bearer, running the helper for valid credentials, or replaying calls.
+#[cfg(unix)]
+#[test]
+fn mcp_renews_expired_helper_credentials_before_dispatch() {
+    use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+
+    for (during_discovery, replacement_expires) in [(false, false), (true, false), (true, true)] {
+        let endpoint = McpEndpoint::start("initial-token");
+        let helper = tempdir().unwrap();
+        let script = helper.path().join("credential.sh");
+        // Leave startup headroom on contended CI workers. Held discovery probes
+        // stay below the transport's five-second deadline.
+        let expiry = OffsetDateTime::now_utc() + time::Duration::seconds(8);
+        std::fs::write(
+            helper.path().join("initial.json"),
+            json!({"version":1,"credential":{"type":"bearer","token":"initial-token"},
+                "expires_at":expiry.format(&Rfc3339).unwrap()})
+            .to_string(),
+        )
+        .unwrap();
+        let replacement_expiry = expiry + time::Duration::seconds(3);
+        let mut renewed =
+            json!({"version":1,"credential":{"type":"bearer","token":"renewed-token"}});
+        if replacement_expires {
+            renewed["expires_at"] = json!(replacement_expiry.format(&Rfc3339).unwrap());
+        }
+        std::fs::write(helper.path().join("renewed.json"), renewed.to_string()).unwrap();
+        std::fs::write(
+            &script,
+            r#"cat >/dev/null
+echo called >> "$1/calls"
+if mkdir "$1/initial" 2>/dev/null; then
+  cat "$1/initial.json"
+else
+  cat "$1/renewed.json"
+fi
+"#,
+        )
+        .unwrap();
+        let home = Home::new(&format!(
+            "targets:\n  staging:\n    kind: server\n    endpoint: '{}'\n    default_graph: knowledge\n    \
+             auth: {{provider: exec, command: ['/bin/sh', '{}', '{}'], timeout: 10s}}\n{}",
+            endpoint.url,
+            script.display(),
+            helper.path().display(),
+            fixture_transport()
+        ));
+        let mut bridge = home.bridge(&["--target", "staging"], &[]);
+        assert!(bridge.initialize()["result"].is_object());
+        // Drain the ordered initialized notification before rotating the
+        // fixture's token; otherwise its 401 could renew before the expiry.
+        assert!(
+            bridge.call(json!({"jsonrpc":"2.0","id":10,"method":"ping"}))["result"].is_object()
+        );
+        endpoint.accept("renewed-token");
+        let ready_at = if during_discovery {
+            expiry - time::Duration::seconds(2)
+        } else {
+            expiry
+        };
+        while OffsetDateTime::now_utc() < ready_at {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if during_discovery {
+            let mut probes = endpoint.state.discovery_until.lock().unwrap();
+            probes.push_back(expiry);
+            if replacement_expires {
+                probes.push_back(replacement_expiry);
+            }
+        }
+        for id in 1..=if replacement_expires { 1 } else { 2 } {
+            let answer = bridge.call(json!({"jsonrpc":"2.0","id":id,"method":"ping"}));
+            if replacement_expires {
+                assert_eq!(answer["error"]["message"], "credential has expired");
+                assert!(endpoint.received(id).is_empty());
+            } else {
+                assert!(answer.get("result").is_some(), "{answer}");
+                assert_eq!(endpoint.received(id), ["renewed-token"]);
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(helper.path().join("calls")).unwrap(),
+            "called\ncalled\n"
+        );
+        let finished = bridge.finish();
+        finished.assert_success();
+        finished.assert_never_shows(&["initial-token", "renewed-token"]);
+    }
 }
 
 /// Two refusals can renew concurrently. Completing the older helper last

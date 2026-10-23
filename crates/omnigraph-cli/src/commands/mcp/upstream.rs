@@ -4,9 +4,10 @@
 //! Requests go through the transport every served command uses: the
 //! target's captured credential scope and transport settings, the `--as`
 //! assertion, and a fresh discovery probe before each request. The token is
-//! one every served command acquires from the selected target, renewed for
-//! later messages after refusal. Managed credentials use the normal scoped
-//! cache and renewal path; control credentials never reach the graph endpoint.
+//! one every served command acquires from the selected target, renewed before
+//! dispatch on expiry or for later messages after refusal. Managed credentials
+//! use the normal scoped cache and renewal path; control credentials never
+//! reach the graph endpoint.
 
 use std::cell::RefCell;
 use std::time::Duration;
@@ -87,7 +88,7 @@ impl Lost {
     }
 }
 
-/// What reading the credential again after a 401 found.
+/// What reading an expired or refused credential again found.
 pub(super) enum Reread {
     /// A different token, which later requests carry.
     Renewed,
@@ -109,7 +110,7 @@ pub(super) struct Routing<'a> {
 
 pub(super) struct Upstream {
     source: CredentialSource,
-    /// The target's auth provider, which says how to replace a refused token.
+    /// The target's auth provider, which says how to replace its token.
     profile: Option<AuthProfile>,
     endpoint: String,
     /// The endpoint's `/mcp`.
@@ -127,8 +128,8 @@ enum CredentialSource {
 struct Credential {
     http: GraphHttpClient,
     token: Option<String>,
-    /// How many times the token was read; a 401 reads it again only when no
-    /// other refused request did since the refused one was sent.
+    /// How many times the token was read; renewal reads it again only when no
+    /// other request did since this message captured the credential.
     reads: u64,
 }
 
@@ -268,7 +269,6 @@ impl Upstream {
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "application/json, text/event-stream")
             .body(body);
-        request = crate::helpers::apply_bearer_token(request, token.as_deref());
         if let Some(method) = routing
             .method
             .and_then(|method| HeaderValue::from_str(method).ok())
@@ -281,8 +281,37 @@ impl Upstream {
         if let Some(version) = &routing.protocol_version {
             request = request.header("mcp-protocol-version", version);
         }
+        // The body is buffered, so a pre-dispatch expiry can rebuild this one
+        // request with a renewed credential. Clone before adding Authorization,
+        // because RequestBuilder::header appends rather than replaces values.
+        // No HTTP refusal or uncertain send enters this path, and expiry during
+        // the second discovery still refuses.
+        let unsent = request.try_clone();
+        let request = crate::helpers::apply_bearer_token(request, token.as_deref());
         let response = match http.send_mcp(request).await {
             Ok(response) => response,
+            Err(error)
+                if error.downcast_ref::<crate::credential_sources::CredentialError>()
+                    == Some(&crate::credential_sources::CredentialError::Expired) =>
+            {
+                let Some(unsent) = unsent else {
+                    return self.failed(&error);
+                };
+                if let Reread::Failed(cause) = self.reread(reads, token.as_deref()).await {
+                    return not_sent(ErrorCode::BadRequest, cause);
+                }
+                {
+                    let credential = self.credential.borrow();
+                    http = credential.http.clone();
+                    token = credential.token.clone();
+                    reads = credential.reads;
+                }
+                let request = crate::helpers::apply_bearer_token(unsent, token.as_deref());
+                match http.send_mcp(request).await {
+                    Ok(response) => response,
+                    Err(error) => return self.failed(&error),
+                }
+            }
             Err(error) => return self.failed(&error),
         };
         if response.status() == StatusCode::UNAUTHORIZED {
@@ -340,8 +369,8 @@ impl Upstream {
         }
     }
 
-    /// Read the credential from its source again after a request sent with
-    /// read `refused` was refused, once for every request that read refused.
+    /// Read the credential from its source again after read `refused` expired
+    /// before dispatch or was refused, once for every request that read refused.
     /// A request sent while it is read carries the token it had.
     async fn reread(&self, refused: u64, refused_token: Option<&str>) -> Reread {
         let _guard = if matches!(self.source, CredentialSource::Managed(_)) {

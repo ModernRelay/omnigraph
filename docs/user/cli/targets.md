@@ -209,10 +209,9 @@ credentials without rerouting existing operations.
 omnigraph access --target standalone --graph knowledge --branch main --json
 ```
 
-`access` reports your actor and permissions for direct graphs and registered
-server or managed targets. Use `--branch` for branch permissions and
-`--target-branch` for create/merge permissions. JSON uses `protocol: 2` and
-`actor_id`; see
+`access` reports your actor and permissions for direct, server and managed graphs.
+Use `--branch` for branch permissions and `--target-branch` for create/merge
+permissions. JSON uses `protocol: 2` and `actor_id`; see
 [access semantics](../operations/policy.md#learn-your-access) and [JSON protocols](../install.md#verify).
 
 ## Rename registrations and profiles
