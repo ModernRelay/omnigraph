@@ -84,10 +84,13 @@ binary. Check `omnigraph version` and the [release notes](../releases/).
 
 Upgrade the CLI, server, and HTTP integrations together. OmniGraph 0.14 requires
 HTTP contract `0.14`; the npm `0.13.0` clients are not compatible with it.
-At the 0.14 release, publication of `@modernrelay/omnigraph@0.14.0` and
-`@modernrelay/omnigraph-mcp@0.14.0` is pending. Check the
-[SDK repository](https://github.com/ModernRelay/omnigraph-ts) for publication
-status; its `v0.14.0` source tag is available for source builds.
+Both `@modernrelay/omnigraph@0.14.0` and
+`@modernrelay/omnigraph-mcp@0.14.0` are published on npm. Install the 0.14.0
+clients alongside the 0.14 server; see the
+[SDK release](https://github.com/ModernRelay/omnigraph-ts/releases/tag/v0.14.0).
+For an existing deployment, follow the
+[0.13 → 0.14 checklist](operations/upgrade-0.14.md), including configuration
+and command replacements.
 
 You can use the released CLI, the [HTTP API](operations/server.md), or the
 server's built-in [MCP endpoint and CLI stdio bridge](operations/mcp.md)

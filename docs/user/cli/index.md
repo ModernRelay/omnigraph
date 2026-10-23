@@ -1,5 +1,9 @@
 # CLI guide
 
+Upgrading an existing installation? Start with the
+[0.13 → 0.14 checklist](../operations/upgrade-0.14.md) for before/after YAML
+and command examples.
+
 Select resources with `--target NAME|LOCAL_PATH`, or `defaults.target` when
 omitted. Account operations use `--profile NAME` or `defaults.profile`.
 These selectors are mutually exclusive. Source files select what to run; they

@@ -5,16 +5,25 @@ publish, or by the [storage upgrade](#storage-upgrade)) and never migrates a gra
 graph at v8 or v9 (release 0.11.x) or at v13 is converted in place by that offline upgrade. A graph at any other
 format, and every cluster-managed graph below v14, is refused and takes the
 [export/import rebuild](#rebuild) with the binary that wrote the graph.
-Start with the [0.14 upgrade actions](../../releases/v0.14.0-overview.md) for fleet,
+Start with the [0.13 → 0.14 checklist](upgrade-0.14.md) for fleet,
 CLI configuration, HTTP/MCP, and client compatibility changes.
 
 ## Storage upgrade
 
-`omnigraph upgrade` converts a standalone v8, v9 or v13 graph to v16 in place, and stamps a v14 or v15 graph to v16 in place by the route `stamp-v14-to-v16`: one metadata-only commit per live branch still below v16, main first, and nothing else (no pending marker, nothing under `__history/legacy/`, no table row rewritten); stop every reader and writer and take the backup as for any upgrade, and a run that stops part-way is finished by running it again. That upgrade is required before `as commit`, `commit publish` or `commit drop`, which are refused on a branch still at v14, and before `as unattached branch`, which is refused on a branch still at v14 or v15.
+`omnigraph upgrade` converts a standalone v8, v9 or v13 graph to v16 in place, and stamps a v14 or v15 graph to v16 in place by the route `stamp-v14-to-v16`: one metadata-only commit per live branch still below v16, main first, and nothing else (no pending marker, nothing under `__history/legacy/`, no table row rewritten); stop every reader and writer and take the backup as for any upgrade, and a run that stops part-way is finished by running it again.
 Branches, commit ids, commit history and table data are kept; no table row is
 rewritten. Only main builds from 2026-10-01 to 2026-10-04 wrote v13.
 
-The upgrade is offline, and it cannot verify that itself:
+Graphs at v14 or v15 already open in 0.14; an offline stamp is not a prerequisite
+for ordinary reads and writes. The first ordinary 0.14 publication stamps that
+branch v16, including in a cluster. Opening the graph or running a no-op does not
+advance the stamp. `as commit`, `commit
+publish` and `commit drop` refuse a branch still at v14; `as unattached branch`
+refuses a branch still at v14 or v15. A standalone graph can use the offline
+command before using those features. Cluster graphs must first have an ordinary
+0.14 publication on the affected branch; `upgrade` cannot stamp cluster graphs.
+
+The explicit `omnigraph upgrade` command is offline, and it cannot verify that itself:
 
 1. Stop every server, embedded reader or writer and maintenance process that
    has the graph open, and keep them stopped until the upgrade reports
@@ -108,8 +117,9 @@ A graph written by 0.11.x (v8 or v9) has limits of its own. Its checks read ever
 
 Select a standalone local direct-graph target with `--target`. Server, managed and
 direct-root targets are refused, as is a direct graph inside a cluster layout.
-Cluster-managed graphs require [rebuild](#rebuild) with an export from their original
-build. Local paths, file URIs and symlinks resolve before the ownership check.
+Cluster-managed graphs below v14 require [rebuild](#rebuild) with an export from
+their original build. A 0.13 cluster's v14 graphs open directly in 0.14 and need no
+rebuild. Local paths, file URIs and symlinks resolve before the ownership check.
 
 ## Lance substrate upgrades (v0.10, v0.14)
 
@@ -227,6 +237,9 @@ cluster-managed graphs are refused.
 ## Rebuild
 
 Keep separate executables and target URIs so the source remains recoverable.
+Stop all source writers, including embedded and standalone CLI writers, before
+exporting schema and data, and keep them stopped through cutover. Take and verify
+a whole-root backup; use the old binary for the exports below.
 
 When an export already carries top-level `id`, the rewrite preserves it and any user property named `id`. For predecessor schemas, change endpoint constraint references from `src`/`dst` to `@src`/`@dst` before the new `init`. See [ingestion](../../dev/ingestion.md#strict-graph-batch) for the envelope contract.
 
@@ -288,16 +301,22 @@ graph declaration cannot point at an arbitrary replacement root. Choose one of
 these cutovers:
 
 - **New graph ID in the same cluster.** Add (for example)
-  `knowledge_next` with the desired schema, query, provider, and policy
-  bindings. Validate, plan, and submit `cluster apply --target` so the running
+  `knowledge-next` with the desired schema, query, provider, and policy
+  bindings. Validate, plan, and submit `cluster apply --target <server-target>
+  --config <bundle>` so the running
   owner creates and activates its derived root. Load through that server, verify
   the new ID, back up what you need, and move clients. Removing the old declaration
   and applying deletes its managed storage and all retained history.
-- **Same graph ID in a parallel cluster root.** Copy the source bundle, set a
-  new `storage` root, and keep the original cluster untouched. Validate, plan,
-  and apply the new bundle; load the export into its derived graph root; then
-  point the server fleet at the new cluster root and restart together. This
-  preserves the public graph ID while changing the whole deployment artifact.
+- **Same graph ID in a parallel cluster root.** Copy the source bundle and keep
+  the original cluster untouched. Bootstrap a separate root following
+  [cluster bootstrap and ownership transfer](../clusters/index.md#bootstrap-a-cluster).
+  Validate the bundle, then for a local root plan and apply with
+  `--target ./cluster-new --config ./new-bundle`; any `storage:` assertion must
+  match that selected root, and changing `storage:` alone never selects it. After direct apply, establish
+  that its owner and accepted I/O have settled, then release its exact retained
+  lock as that procedure requires. Start the new server against the new root,
+  load through its server target, verify, and move clients to it. This preserves
+  the public graph ID while changing the whole deployment artifact.
 
 In either case, quiesce writers before export and cutover. External Blob
 references must be loaded through a policy-aware server or embedded host after
