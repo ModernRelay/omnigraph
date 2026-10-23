@@ -34,7 +34,9 @@
   The four questions, in this order:
 
   1. What was wrong or missing, and what it cost; open with `Closes #N` or the
-     RFC path. A feature: what could not be done. A fix: what failed, on which
+     RFC path. A trivial change (typo, docs, comment, dependency bump,
+     one-line CI; CONTRIBUTING.md) has neither and deletes the `Closes #`
+     line. A feature: what could not be done. A fix: what failed, on which
      input. A refactor: what made the next change hard. Docs or CI: what a
      reader or contributor ran into.
   2. What changes, where, and the one guard that keeps it correct.
