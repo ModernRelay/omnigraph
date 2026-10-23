@@ -311,7 +311,8 @@ the release starts, with an owner for each, and tick each one off there.
    commit the snapshot and the index to the same pull request, and merge it.
 7. Tag the merged commit `<version>` and push the tag. Tag CI audits it and
    `release.yml` publishes the archives and the GitHub release from the
-   snapshot. Do not edit the published page; a correction is a new note.
+   snapshot. Do not edit the published page or its notes; correct a mistake
+   with a new note or in the release's overview.
 8. Open the next cycle: update `release.json` and the workspace package
    version as described above.
 
