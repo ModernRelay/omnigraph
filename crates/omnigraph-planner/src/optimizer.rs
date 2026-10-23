@@ -16,9 +16,10 @@ use omnigraph_compiler::types::Direction;
 use crate::cost::{
     AccessPath, AntiJoinStrategy, CoverageProvenance, ExpandCostInputs, ExpandMode, ExpandPolicy,
     HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, HYDRATE_ROW_RATIO, IndexCoverage,
-    SOURCE_PARTITION_BYTES, ValidateAccess, ValidateCostInputs, ValidateIndexCoverage, chain_rows,
-    choose_access_path, choose_anti_join_strategy, choose_expand_mode, choose_validate_access,
-    direction_probe_factor, estimate_rows, executed_hops, hydrate_chunk_bytes, scan_row_estimate,
+    SOURCE_PARTITION_BYTES, ValidateAccess, ValidateCostInputs, ValidateIndexCoverage,
+    ValidateRemoval, chain_rows, choose_access_path, choose_anti_join_strategy, choose_expand_mode,
+    choose_validate_access, direction_probe_factor, estimate_rows, executed_hops,
+    hydrate_chunk_bytes, scan_row_estimate,
 };
 use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
 use crate::key_set::{KeySetTree, key_set_tree};
@@ -3653,17 +3654,56 @@ impl Lowering<'_> {
             } => {
                 let estimated_rows = estimate_rows(self.logical, *input, self.source);
                 let lowered = self.lower(*input)?;
-                let checks = checks
+                let overwrite = self.load_overwrites();
+                let target_rows = table
+                    .strip_prefix("node:")
+                    .and_then(|name| self.source.node_type(name).ok())
+                    .and_then(|node| node.row_count);
+                let empty_target = overwrite && target_rows == Some(0);
+                let checks: Vec<ValidateSpec> = checks
                     .iter()
+                    .filter(|spec| {
+                        !(empty_target
+                            && matches!(
+                                spec.check,
+                                omnigraph_compiler::ir::ValidateCheck::RetainedEdges { .. }
+                            ))
+                    })
                     .map(|spec| ValidateSpec {
-                        access: Some(self.validate_access(spec, estimated_rows)),
+                        access: Some(self.validate_access(spec, estimated_rows, overwrite)),
                         ..spec.clone()
                     })
                     .collect();
+                let retained_edge_checks = checks
+                    .iter()
+                    .filter(|spec| {
+                        matches!(
+                            spec.check,
+                            omnigraph_compiler::ir::ValidateCheck::RetainedEdges { .. }
+                        )
+                    })
+                    .count();
+                let removal = if overwrite && retained_edge_checks > 0 {
+                    ValidateRemoval::Scan
+                } else {
+                    ValidateRemoval::None
+                };
+                self.decisions.push(StatisticSource {
+                    statistic: "validate_removal".to_string(),
+                    value: removal.as_str().to_string(),
+                    origin: serde_json::json!({
+                        "table": table,
+                        "overwrite": overwrite,
+                        "target_rows": target_rows,
+                        "retained_edge_checks": retained_edge_checks,
+                    })
+                    .to_string(),
+                });
                 Ok(self.physical.add(PhysicalNode::Validate {
                     input: lowered,
                     table: table.clone(),
                     checks,
+                    removal,
                     max_workers: self.bounds.load_workers_max.max(1),
                 }))
             }
@@ -3679,20 +3719,24 @@ impl Lowering<'_> {
         }
     }
 
+    /// Whether the load plan's write replaces its table.
+    fn load_overwrites(&self) -> bool {
+        self.logical
+            .live()
+            .any(|(_, node)| matches!(node, LogicalNode::FragmentWrite { spec, .. } if spec.mode == LoadStmtMode::Overwrite))
+    }
+
     /// Pass 9 costs the committed lookup from the accepted node count and
     /// index metadata. Append and merge retain their executor's Probe path.
     fn validate_access(
         &mut self,
         spec: &ValidateSpec,
         estimated_rows: Option<u64>,
+        overwrite: bool,
     ) -> ValidateAccess {
         let Some(image) = &spec.consults else {
             return ValidateAccess::Delta;
         };
-        let overwrite = self
-            .logical
-            .live()
-            .any(|(_, node)| matches!(node, LogicalNode::FragmentWrite { spec, .. } if spec.mode == LoadStmtMode::Overwrite));
         let node = image
             .table
             .strip_prefix("node:")

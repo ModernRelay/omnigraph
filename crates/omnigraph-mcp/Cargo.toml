@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-mcp"
-version = "0.14.0"
+version = "0.14.1"
 edition = "2024"
 description = "MCP protocol adapter for the Omnigraph graph database."
 license = "MIT"
@@ -9,7 +9,7 @@ homepage = "https://github.com/ModernRelay/omnigraph"
 documentation = "https://docs.rs/omnigraph-mcp"
 
 [dependencies]
-omnigraph-skill = { path = "../../skills", version = "0.14.0" }
+omnigraph-skill = { path = "../../skills", version = "0.14.1" }
 axum = { workspace = true }
 color-eyre = { workspace = true }
 serde = { workspace = true }

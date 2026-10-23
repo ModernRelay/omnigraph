@@ -211,6 +211,15 @@ publication regenerates from the pinned source with the baseline body ahead of
 the note sections. Generated snapshots require exact verification, and existing
 published documents and URLs stay unchanged.
 
+A release may also have a curated `docs/releases/vX.Y.Z-overview.md`, linked
+from the generated release index. Reconcile superseded fragments against the
+code at the release tag and explain the final shipped behavior and upgrade
+actions. Link the complete immutable `vX.Y.Z.md` snapshot from the overview;
+do not edit the published snapshot or source notes to resolve contradictions.
+The overview is a maintained guide to that release, not a replacement for its
+recorded history. After adding it, regenerate the index with
+`python3 scripts/release_notes.py index --write`.
+
 ## Review checklist
 
 Before merging documentation:

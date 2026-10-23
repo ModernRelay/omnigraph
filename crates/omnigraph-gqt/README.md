@@ -33,9 +33,10 @@ counts only cases under `cases/`.
 ## Explicit execution
 
 Every case starts with its issue header and a required runner section.
-Schema and seed sections are optional together; without them, the runner
-requires `--store <URI>`. A case may have zero steps, including a dataset
-containing only schema and seed. Configuration has no default target,
+Schema and seed sections are optional together; without them, embedded execution
+requires `--store <URI>` and served execution uses the selected server graph
+without schema validation or seed loading. A case may have zero steps, including
+a dataset containing only schema and seed. Configuration has no default target,
 storage, seed or timeout:
 
 ```yaml
@@ -417,8 +418,8 @@ The store places, their methods and the actions each honors are RFC 0066's
 table; a place-and-action pair outside it, or listed but not implemented, is
 refused at admission naming the table row. An old `--- fault` block
 converts by renaming the section and its `return_error` action to
-`action: fail`; `at`, `occurrence` and `scope` keep their names. Process crashes,
-server/CLI sessions and network simulation are future extensions.
+`action: fail`; `at`, `occurrence` and `scope` keep their names. The DST runner
+does not support process crashes, server/CLI sessions or network simulation.
 
 ## Concurrent block
 
@@ -670,6 +671,7 @@ load validate unique <table> key|unique [<cols>]: access delta|probe|scan
 load validate edge_ri <edge-table> from|to <node-type>: access probe|scan
 load validate cardinality <edge-table> from <node-type>
 load validate retained_edges <node-table> <edge-table> from|to: access delta|probe|scan
+load validate removal <table>: scan|none
 load write: overwrite fragments
 load write: append strict_insert
 load write: merge upsert
@@ -684,6 +686,10 @@ for `executor`.
 fallback.
 A `load validate` line claims one check of the `Validate` node with that
 identity, and its `access` suffix claims the check's access path.
+`load validate removal` claims the node's `removal`: `scan` when the plan
+finds the committed ids an overwrite removes, `none` when no planned check
+reads them (an empty committed table, a node target no edge type references,
+an edge target, append and merge).
 `load write` claims the `FragmentWrite` node's mode and adapter.
 `load pipeline` claims one entry of the document's `pipelines` by position:
 its source node, its streaming operators in run order, the sink it drains

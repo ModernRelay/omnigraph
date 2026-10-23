@@ -1057,7 +1057,10 @@ materialized batches are checked again before staging.
 
 Mutation delete, cascading delete and Overwrite replacement removal scan IDs
 incrementally under their own `write_max_bytes` allowance per operation,
-charging UTF-8 bytes plus one `String` slot before copying. These checks precede
+charging UTF-8 bytes plus one `String` slot before copying. An Overwrite scans
+for removed IDs only when its plan's `removal` is `scan`, a populated node
+target an edge type references; under `none` (an edge target, an unreferenced
+node target, an empty table) nothing is scanned or charged. These checks precede
 the operation's data fragments and publication. They do not bound JSON
 containers, simultaneous conversion copies, predicate/validation state or
 native scan buffers. Overwrite's bulk input retains its separate checks and is
