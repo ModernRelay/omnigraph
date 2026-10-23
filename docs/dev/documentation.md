@@ -316,6 +316,15 @@ the release starts, with an owner for each, and tick each one off there.
 8. Open the next cycle: update `release.json` and the workspace package
    version as described above.
 
+A release may also have a curated `docs/releases/vX.Y.Z-overview.md`, linked
+from the generated release index. Reconcile superseded fragments against the
+code at the release tag and explain the final shipped behavior and upgrade
+actions. Link the complete immutable `vX.Y.Z.md` snapshot from the overview;
+do not edit the published snapshot or source notes to resolve contradictions.
+The overview is a maintained guide to that release, not a replacement for its
+recorded history. After adding it, regenerate the index with
+`python3 scripts/release_notes.py index --write`.
+
 ## Review checklist
 
 Before merging documentation:

@@ -29,7 +29,7 @@ Tools that support `@` imports include these automatically:
 
 ## Repository snapshot
 
-- Version surveyed: 0.14.0
+- Version surveyed: 0.14.1
 - Rust stable, edition 2024; toolchain pinned in `rust-toolchain.toml`
 - Storage substrate: Lance 13.0.0
 - Workspace: compiler, planner (logical/physical plans and optimizer), storage,

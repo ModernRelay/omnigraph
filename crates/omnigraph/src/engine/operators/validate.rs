@@ -16,7 +16,7 @@ use datafusion::physical_plan::{
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_planner::ValidateSpec;
+use omnigraph_planner::{ValidateRemoval, ValidateSpec};
 
 use futures::StreamExt;
 
@@ -44,6 +44,7 @@ pub(crate) struct LoadJudge {
     pub(crate) db: Arc<Omnigraph>,
     pub(crate) table: String,
     pub(crate) checks: Vec<ValidateSpec>,
+    pub(crate) removal: ValidateRemoval,
     pub(crate) mode: LoadMode,
     pub(crate) write_budget: WriteBudget,
     pub(crate) snapshot: Snapshot,
@@ -209,6 +210,7 @@ impl ExecutionPlan for ValidateExec {
                     judge_load_swept(
                         &judge.table,
                         &judge.checks,
+                        judge.removal,
                         &judge.catalog,
                         &judge.snapshot,
                         judge.mode,
@@ -540,7 +542,7 @@ mod tests {
     use omnigraph_compiler::query::ast::{LoadStmt, LoadStmtMode, LoadTarget};
     use omnigraph_compiler::schema::parser::parse_schema;
     use omnigraph_compiler::settings::SessionSettings;
-    use omnigraph_planner::{ConsultedImage, ValidateAccess};
+    use omnigraph_planner::{ConsultedImage, ValidateAccess, ValidateRemoval};
 
     use super::super::csv_source::CSV_SLICE_METADATA;
     use super::super::fixtures;
@@ -640,6 +642,7 @@ mod tests {
             db: Arc::clone(db.db()),
             table: "node:Person".to_string(),
             checks,
+            removal: ValidateRemoval::Scan,
             mode: LoadMode::Overwrite,
             write_budget: WriteBudget::from_settings(db.settings()),
             snapshot: db.snapshot().await,

@@ -191,6 +191,10 @@ fn node_overwrite_resolves_to_source_validate_chain_and_write() {
         document["physical_plan"]["inputs"][0]["checks"][4]["access"],
         "probe"
     );
+    assert_eq!(
+        document["physical_plan"]["inputs"][0]["removal"], "scan",
+        "an unknown target count keeps the removal scan"
+    );
     let leaf = &validation["inputs"][0];
     assert_eq!(leaf["node"], "CsvSource");
     assert_eq!(leaf["source"], "s3://bucket/people.csv");
@@ -213,6 +217,108 @@ fn node_overwrite_resolves_to_source_validate_chain_and_write() {
     assert_eq!(pipelines[1]["operators"][0]["name"], "FragmentWrite");
     assert_eq!(pipelines[1]["sink"]["name"], "consumer");
     assert_eq!(pipelines[1]["depends_on"], serde_json::json!([0]));
+}
+
+/// A node target whose manifest count is zero removes nothing, so pass 9 plans
+/// neither the removal scan nor the retained-edge checks; a populated or
+/// uncounted target keeps both; an edge overwrite never scans.
+#[test]
+fn empty_overwrite_target_plans_no_removal_and_no_retained_edges() {
+    use omnigraph_planner::{NodeTypeSpec, ValidateRemoval};
+
+    let schema = parse_schema(
+        r#"
+node Person {
+    id: String @key
+    email: String @unique
+}
+edge Knows: Person -> Person {
+    w: I64
+}
+"#,
+    )
+    .unwrap();
+    let catalog = build_catalog(&schema).unwrap();
+    let node = catalog.node_types.get("Person").unwrap();
+    let person = |rows: Option<u64>| NodeTypeSpec {
+        table: side("node:Person", 7).table,
+        version: Some(7),
+        columns: SYSTEM_COLUMNS_V3,
+        schema: node.arrow_schema.clone(),
+        key: node.key.clone().unwrap_or_default(),
+        object_columns: node
+            .node_object_fields()
+            .map(|f| f.name().clone())
+            .collect(),
+        object_fields: node
+            .node_object_members()
+            .map(|(member, field)| {
+                Field::new(member, field.data_type().clone(), field.is_nullable())
+            })
+            .collect(),
+        row_count: rows,
+    };
+    let validation = |plan: &PhysicalPlan| -> (ValidateRemoval, usize) {
+        let validations: Vec<&PhysicalNode> = chain(plan)
+            .into_iter()
+            .filter(|node| matches!(node, PhysicalNode::Validate { .. }))
+            .collect();
+        let [
+            PhysicalNode::Validate {
+                removal, checks, ..
+            },
+        ] = &validations[..]
+        else {
+            panic!("one validation per load plan");
+        };
+        let retained = checks
+            .iter()
+            .filter(|spec| matches!(spec.check, ValidateCheck::RetainedEdges { .. }))
+            .count();
+        (*removal, retained)
+    };
+    let op = operation(
+        LoadTarget::Node("Person".into()),
+        LoadStmtMode::Overwrite,
+        4096,
+    );
+    for (rows, removal, retained) in [
+        (Some(0), ValidateRemoval::None, 0),
+        (Some(3), ValidateRemoval::Scan, 2),
+        (None, ValidateRemoval::Scan, 2),
+    ] {
+        let source = source().with_node_type("Person", person(rows));
+        let Decision::Engine { plan, explain, .. } =
+            route(&op, &source, RouteOverride::Registry, &BOUNDS)
+        else {
+            panic!("overwrite routes to the engine")
+        };
+        assert_eq!(validation(&plan), (removal, retained), "rows {rows:?}");
+        let document = explain.to_value();
+        assert_eq!(
+            document["physical_plan"]["inputs"][0]["removal"],
+            removal.as_str(),
+            "rows {rows:?}"
+        );
+        assert_eq!(
+            document["logical_plan"]["inputs"][0]["checks"]
+                .as_array()
+                .map(Vec::len),
+            Some(5),
+            "the logical validation keeps every check; pass 9 prunes"
+        );
+    }
+    let op = operation(
+        LoadTarget::Edge("Knows".into()),
+        LoadStmtMode::Overwrite,
+        4096,
+    );
+    let source = source().with_node_type("Person", person(Some(3)));
+    let Decision::Engine { plan, .. } = route(&op, &source, RouteOverride::Registry, &BOUNDS)
+    else {
+        panic!("overwrite routes to the engine")
+    };
+    assert_eq!(validation(&plan), (ValidateRemoval::None, 0));
 }
 
 /// One partition per `SOURCE_PARTITION_BYTES`, capped by the bounds' load

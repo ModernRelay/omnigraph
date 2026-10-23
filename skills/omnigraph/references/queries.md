@@ -29,10 +29,10 @@ Writing `.gq` query files in Omnigraph.
 omnigraph lint --schema schema.pg --query queries/signals.gq
 ```
 
-Or (lint against a live repo):
+Or lint against a local graph’s accepted schema:
 
 ```bash
-omnigraph lint --query queries/signals.gq s3://bucket/repo
+omnigraph lint --query queries/signals.gq --target ./graph.omni
 ```
 
 Lint returns:

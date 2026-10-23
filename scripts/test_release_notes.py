@@ -1084,6 +1084,20 @@ class ReleaseNotesTests(unittest.TestCase):
             index = (path.parent / "README.md").read_text()
             self.assertNotIn("unreleased", index)
             self.assertIn("released 2026-10-01", index)
+            self.assertNotIn("v0.12.0-overview.md", index)
+            snapshot = path.read_bytes()
+            overview = path.with_name("v0.12.0-overview.md")
+            overview.write_text("# OmniGraph v0.12.0 overview\n\nFinal upgrade actions.\n")
+            notes.write_index(self.repo)
+            index = (path.parent / "README.md").read_text()
+            self.assertIn("[v0.12.0](v0.12.0.md)", index)
+            self.assertIn("[Highlights and upgrade actions](v0.12.0-overview.md)", index)
+            self.assertEqual(path.read_bytes(), snapshot)
+            overview.unlink()
+            self.assertNotIn("v0.12.0-overview.md", notes.render_index(self.repo))
+            overview.symlink_to(path)
+            with self.assertRaisesRegex(notes.NotesError, "overviews must not be symlinks"):
+                notes.render_index(self.repo)
 
     def test_body_requires_release_tag_to_select_audited_source(self):
         self.repo.refs["refs/tags/v0.13.0"] = TARGET

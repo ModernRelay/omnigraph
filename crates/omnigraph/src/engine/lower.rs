@@ -1285,6 +1285,7 @@ impl Lower for Walk<'_, '_> {
             db: Arc::clone(&write.db),
             table,
             checks: fields.checks.to_vec(),
+            removal: fields.removal,
             mode: load.request.mode,
             write_budget: write.write_budget,
             snapshot: self.lowering.snapshot("load validation")?.clone(),

@@ -30,8 +30,8 @@ An applied empty cluster creates no default graph and serves an empty inventory.
 Missing or unapplied state, or a nonempty cluster whose graphs all fail, refuses
 startup. Authentication, policy and data-token root checks still apply.
 
-Use `cluster apply --target URL --config DIR` for schema, query, policy,
-provider and Blob-rule changes without restart. Graph additions and removals
+Use `cluster apply --target NAME --config DIR` with a registered server target
+for schema, query, policy, provider and Blob-rule changes without restart. Graph additions and removals
 use the same deployment; removal deletes the graph's managed storage and history. Direct apply requires stopped serving and a subsequent
 start; see [cluster deployments](../clusters/index.md).
 An unapplied resource edit does not activate it, although changing or breaking
@@ -59,7 +59,7 @@ its error class, never by its message; see
 
 ## HTTP contract
 
-Refresh the CLI, server and HTTP integrations together ([unreleased 0.14 changes](../../../changelog.d/http-contract-014.breaking.md)). Every protected
+Refresh the CLI, server and HTTP integrations together ([0.14 release notes](../../releases/v0.14.0.md)). Every protected
 request requires exactly one `Omnigraph-Http-Api: 0.14`: graph, registry and
 cluster-deployment calls, including `/graphs/discovery`, JSON, streams and Blob GET/HEAD. Missing,
 duplicate, combined or unsupported values return `400 api_contract_mismatch`
@@ -73,7 +73,10 @@ means unknown effects, never permission to replay. Proxies must preserve it both
 
 Server URLs name the service root, including its proxy prefix. Select a graph
 with `--graph`, `default_graph` or `alias.graph`. Migrate graph-qualified server
-URLs to that root plus graph selection; the CLI never guesses a root from a path. A `unix:///absolute/path.sock` URL names a Unix-domain socket instead: its whole path is the socket, so it has no proxy prefix, and requests carry `Host: localhost`; see [Unix-socket access](../deployment.md#unix-socket-access).
+URLs to that root plus graph selection; the CLI never guesses a root from a path.
+Register the endpoint under `targets:` and select its name with `--target`;
+inline remote URLs and Unix socket targets are unsupported. Other clients can
+use a [Unix-socket gateway](../deployment.md#unix-socket-access).
 
 Server targets bind a credential owner or anonymous access to an endpoint scope.
 Every composed route must retain that captured choice. A more specific target
@@ -88,8 +91,7 @@ trip; its existing deadline stays separate. Neither request follows redirects
 or retries automatically. Older clients/servers without this contract are unsupported.
 
 MCP/OAuth metadata neither require nor return this header; managed control-plane
-APIs keep their separate protocol. The accepted [HTTP admission decision](../../rfcs/2026-09-30-v012-http-admission.md)
-defines exact request/response and refusal rules.
+APIs keep their separate protocol.
 
 ## Authentication
 
@@ -219,6 +221,7 @@ describes sign-in, which resource identifier to choose, and the endpoint's tools
 | `GET /openapi.json` | Runtime copy of the OpenAPI document |
 | `GET /graphs` | Graph metadata catalog; requires `graph_list` policy |
 | `GET /graphs/discovery` | Graph IDs and display names only; requires an identity credential |
+| `POST /cluster/plan` | Preview source changes against the running cluster without applying them |
 | `POST /cluster/deployments` | Submit an exact-ID deployment: graph creation/deletion or schema, query, policy, provider and Blob-binding changes |
 | `GET /cluster/deployments`, `GET /cluster/deployments/{deployment_id}` | Authorized deployment status and current-process activation observation |
 | `GET /.well-known/oauth-protected-resource`, also at the resource's path suffix | Public OIDC resource metadata; only when OIDC trust is configured |
@@ -241,9 +244,6 @@ and `commit drop`. See [Branching](../branching/index.md).
 Each of `/query`, `/mutate`, `/mutate/if-graph-commit` and `/branches/merge`
 takes an optional `settings` field, and the two GET change routes a `set=`
 parameter; see [Session settings](../queries/index.md#session-settings).
-
-Change a managed graph's schema through `cluster apply --target URL --config DIR`; see
-[cluster deployments](../clusters/index.md#deploy-without-restarting).
 
 ## Run an inline query
 
