@@ -32,7 +32,10 @@ The SDK's `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` control sampling;
 the default follows the parent, or samples a root request.
 
 Only explicitly authored request and native-operation spans are exported.
-`RUST_LOG` controls logging (`info` by default), and the `rmcp`, `lance::dataset_events` and
+`RUST_LOG` controls stdout log events (`info` by default), independently of
+trace export and sampling. Setting it to `warn`, `error` or `off` does not
+disable traces; warnings and errors still retain trace correlation when INFO
+logs are suppressed. The `rmcp`, `lance::dataset_events` and
 `lance::file_audit` targets remain restricted to warnings/errors, even with
 debug overrides. These targets can include query arguments/results, full storage
 URIs and deletion predicates. `omnigraph_server::init_tracing()` also enforces

@@ -21,6 +21,7 @@ use opentelemetry_sdk::trace::{
 };
 use tracing::{Instrument, Span, Subscriber};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+use tracing_subscriber::filter::FilterExt;
 use tracing_subscriber::fmt::format::{JsonFields, Writer};
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, MakeWriter};
 use tracing_subscriber::layer::SubscriberExt;
@@ -192,8 +193,13 @@ where
                 metadata.target() == TARGET
             }))
     });
+    // Keep authored spans available to log formatting so warning/error events
+    // retain trace correlation even when their INFO parents are not logged.
+    // RUST_LOG controls events independently of OTLP sampling and export.
+    let log_filter = filter.or(tracing_subscriber::filter::filter_fn(|metadata| {
+        metadata.is_span() && metadata.target() == TARGET
+    }));
     let subscriber = tracing_subscriber::registry()
-        .with(filter)
         .with(tracing_subscriber::filter::filter_fn(
             super::safe_log_metadata,
         ))
@@ -204,11 +210,18 @@ where
                 tracing_subscriber::fmt::layer()
                     .fmt_fields(JsonFields::new())
                     .event_format(CorrelatedJson)
-                    .with_writer(writer),
+                    .with_writer(writer)
+                    .with_filter(log_filter),
             ),
         )
     } else {
-        Box::new(subscriber.with(tracing_subscriber::fmt::layer().with_writer(writer)))
+        Box::new(
+            subscriber.with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(writer)
+                    .with_filter(log_filter),
+            ),
+        )
     }
 }
 
@@ -414,6 +427,18 @@ mod tests {
 
     #[tokio::test]
     async fn http_and_owned_operations_preserve_parent_context_without_payloads() {
+        for (directives, json) in [
+            ("info", true),
+            ("warn", true),
+            ("error", true),
+            ("off", true),
+            ("warn", false),
+        ] {
+            http_and_owned_operations_case(directives, json).await;
+        }
+    }
+
+    async fn http_and_owned_operations_case(directives: &str, json: bool) {
         let exporter = InMemorySpanExporter::default();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
@@ -421,9 +446,9 @@ mod tests {
         let captured = Capture::default();
         let writer = captured.clone();
         let subscriber = subscriber(
-            EnvFilter::new("info"),
+            EnvFilter::new(directives),
             move || writer.clone(),
-            true,
+            json,
             Some(provider.tracer("test")),
         );
         async {
@@ -450,6 +475,8 @@ mod tests {
                             .result()
                             .await
                             .unwrap();
+                        tracing::warn!(target: TARGET, "request warning marker");
+                        tracing::error!(target: TARGET, "request error marker");
                         StatusCode::SERVICE_UNAVAILABLE
                     }),
                 )
@@ -487,50 +514,73 @@ mod tests {
         assert_eq!(http.parent_span_id.to_string(), "b7ad6b7169203331");
         assert!(matches!(http.status, Status::Error { .. }));
         let logs = captured.output();
-        let native_completions: Vec<serde_json::Value> = logs
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .filter(|line| line["message"] == "native operation completed")
-            .collect();
-        assert_eq!(native_completions.len(), 2, "{logs}");
         for native in spans.iter().filter(|span| span.name == "native.operation") {
             assert_eq!(native.parent_span_id, http.span_context.span_id());
             assert_eq!(native.span_context.trace_id(), http.span_context.trace_id());
-            let completion = native_completions
-                .iter()
-                .find(|line| line["span_id"] == native.span_context.span_id().to_string())
-                .expect("owned task completion uses its captured subscriber and span");
+        }
+        if directives == "info" {
+            let native_completions: Vec<serde_json::Value> = logs
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|line| line["message"] == "native operation completed")
+                .collect();
+            assert_eq!(native_completions.len(), 2, "{logs}");
+            for native in spans.iter().filter(|span| span.name == "native.operation") {
+                let completion = native_completions
+                    .iter()
+                    .find(|line| line["span_id"] == native.span_context.span_id().to_string())
+                    .expect("owned task completion uses its captured subscriber and span");
+                assert_eq!(
+                    completion["trace_id"],
+                    http.span_context.trace_id().to_string()
+                );
+                assert_eq!(completion["operation_outcome"], "succeeded");
+            }
+            assert!(
+                native_completions
+                    .iter()
+                    .any(|line| line["operation_kind"] == "write")
+            );
+            assert!(
+                native_completions
+                    .iter()
+                    .any(|line| line["operation_kind"] == "read")
+            );
+            let completion: serde_json::Value = logs
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .find(|line| line["message"] == "http request completed")
+                .unwrap();
             assert_eq!(
                 completion["trace_id"],
                 http.span_context.trace_id().to_string()
             );
-            assert_eq!(completion["operation_outcome"], "succeeded");
+            assert_eq!(
+                completion["span_id"],
+                http.span_context.span_id().to_string()
+            );
+            assert_eq!(completion["status_code"], 503);
+            assert!(completion["response_headers_ms"].is_number());
+        } else {
+            assert!(!logs.contains("http request completed"), "{logs}");
+            assert!(!logs.contains("native operation completed"), "{logs}");
+            if directives == "warn" || directives == "error" {
+                assert_eq!(
+                    logs.contains("request warning marker"),
+                    directives == "warn"
+                );
+                assert!(logs.contains("request error marker"), "{logs}");
+                if json {
+                    for line in logs.lines() {
+                        let record: serde_json::Value = serde_json::from_str(line).unwrap();
+                        assert_eq!(record["trace_id"], http.span_context.trace_id().to_string());
+                        assert_eq!(record["span_id"], http.span_context.span_id().to_string());
+                    }
+                }
+            } else {
+                assert!(logs.is_empty(), "{logs}");
+            }
         }
-        assert!(
-            native_completions
-                .iter()
-                .any(|line| line["operation_kind"] == "write")
-        );
-        assert!(
-            native_completions
-                .iter()
-                .any(|line| line["operation_kind"] == "read")
-        );
-        let completion: serde_json::Value = logs
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .find(|line| line["message"] == "http request completed")
-            .unwrap();
-        assert_eq!(
-            completion["trace_id"],
-            http.span_context.trace_id().to_string()
-        );
-        assert_eq!(
-            completion["span_id"],
-            http.span_context.span_id().to_string()
-        );
-        assert_eq!(completion["status_code"], 503);
-        assert!(completion["response_headers_ms"].is_number());
         for private in [
             "PRIVATE_GRAPH",
             "PRIVATE_QUERY",
