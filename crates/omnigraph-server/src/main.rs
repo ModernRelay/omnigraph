@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use color_eyre::eyre::Result;
 use omnigraph_server::{
-    McpSettings, init_tracing, load_server_settings, load_server_settings_with_bootstrap_handoff,
+    McpSettings, load_server_settings, load_server_settings_with_bootstrap_handoff,
     load_server_settings_with_identity_trust, resolve_shutdown_grace, serve_with_data_token_trust,
     serve_with_mcp_settings,
 };
@@ -76,9 +76,14 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
-    init_tracing();
-
     let cli = Cli::parse();
+    let telemetry = tokio::task::spawn_blocking(omnigraph_server::telemetry::init).await??;
+    let result = run(cli).await;
+    telemetry.shutdown_in_background();
+    result
+}
+
+async fn run(cli: Cli) -> Result<()> {
     let mcp = McpSettings::resolve(
         cli.mcp_allow_adhoc,
         cli.mcp_allow_writes,

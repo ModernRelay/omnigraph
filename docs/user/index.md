@@ -45,6 +45,7 @@ deployment.
 - [`cluster.yaml` reference](clusters/config.md)
 - [Deployment](deployment.md)
 - [Storage failures and restart](operations/storage-failures.md)
+- [Server logs and traces](operations/observability.md)
 - [Authorization and actors](operations/policy.md)
 - [Maintenance](operations/maintenance.md)
 - [Upgrade from 0.13 to 0.14](operations/upgrade-0.14.md): checklist, YAML and CLI replacements
