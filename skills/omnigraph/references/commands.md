@@ -59,7 +59,7 @@ prints the exact flags of the installed binary.
 | `credentials` | `set` `status` `remove` `export` | Explicit owner/profile custody and pipe-only access export |
 | `config` | `validate` `rename-profile` `rename-target` `recover-rename` `recover-operations` | Validate/edit operator bindings or preserve legacy operation evidence |
 | `access` | — | Say who you are at a target and which actions its policy grants, graph-wide and on a branch |
-| `mcp` | — | Relay an agent's stdio MCP to an existing server target's `/mcp`, bound to one graph; read-only tools unless `--write` |
+| `mcp` | — | Relay an agent's stdio MCP to an existing server or managed target's `/mcp`, bound to one graph; read-only tools unless `--write` |
 | `skill` | `export` `show` | Export or print this skill as built into the CLI |
 | `version` | — | Print the CLI version, the HTTP contract it speaks and the storage formats it writes and serves; `--json` prints them as one object |
 
@@ -376,7 +376,7 @@ omnigraph access --target production --branch main --json
 `access` reports the server-resolved actor and allowed graph actions; it is the
 identity check, with no separate `whoami` command. Direct targets use `--as`
 or no actor. JSON uses `protocol: 2` and `actor_id`, null without an actor;
-update scripts that read protocol 1's `actor`. Managed targets refuse `access`. See
+update scripts that read protocol 1's `actor`. Managed targets use their issued resource identity. See
 [access scope and policy semantics](../../../docs/user/cli/targets.md#what-you-may-do-at-a-target).
 
 Set/remove require `token`/`store`; an existing entry needs `--replace`.
@@ -418,13 +418,15 @@ onboarding `--create-profile`, `--api` and `--organization`.
 ```
 
 `omnigraph mcp` speaks MCP on stdio for an agent that starts its tools as a
-child process, relaying every message to an existing server target's `/mcp`
-with the token of the target's `auth`, which the agent never sees. It is bound to one
+child process, relaying every message to an existing server or managed target's `/mcp`
+with the target's credential, which the agent never sees. Managed targets
+exchange their pinned profile's credential for a resource identity. It is bound to one
 graph (`--graph` or `default_graph`): calls that omit `graph` get it, and calls
 or resource URIs naming another graph are refused. Without `--write` only tools
 the server annotates read-only are listed and admitted; the server lists write
-tools only with `--mcp-allow-writes`. `--as` asserts the actor on every
-request. Direct and managed targets refuse with `target_kind_unsupported`; the
+tools only with `--mcp-allow-writes`. On server targets, `--as` asserts the actor
+on every request; managed targets refuse `--as`. Direct targets refuse with
+`target_kind_unsupported`; the
 bridge never starts a server. A lost answer is never resent: an
 `outcome_unknown` error means read the target and reconcile before replaying.
 

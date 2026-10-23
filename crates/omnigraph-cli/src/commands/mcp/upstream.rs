@@ -1,12 +1,13 @@
-//! The one endpoint the bridge relays to, a server target's `/mcp`, and the
+//! The one endpoint the bridge relays to, a served target's `/mcp`, and the
 //! credential its requests carry.
 //!
 //! Requests go through the transport every served command uses: the
 //! target's captured credential scope and transport settings, the `--as`
 //! assertion, and a fresh discovery probe before each request. The token is
-//! the one every served command acquires from the target's `auth`, read
-//! from its source again once after the server refuses it, and never written
-//! anywhere.
+//! one every served command acquires from the selected target, renewed before
+//! dispatch on expiry or for later messages after refusal. Managed credentials
+//! use the normal scoped cache and renewal path; control credentials never
+//! reach the graph endpoint.
 
 use std::cell::RefCell;
 use std::time::Duration;
@@ -87,7 +88,7 @@ impl Lost {
     }
 }
 
-/// What reading the credential again after a 401 found.
+/// What reading an expired or refused credential again found.
 pub(super) enum Reread {
     /// A different token, which later requests carry.
     Renewed,
@@ -108,51 +109,87 @@ pub(super) struct Routing<'a> {
 }
 
 pub(super) struct Upstream {
-    auth: ServerAuth,
-    /// The target's auth provider, which says how to replace a refused token.
+    source: CredentialSource,
+    /// The target's auth provider, which says how to replace its token.
     profile: Option<AuthProfile>,
     endpoint: String,
     /// The endpoint's `/mcp`.
     url: String,
-    http: GraphHttpClient,
     credential: RefCell<Credential>,
+    // Serialize managed cache lookup, invalidation and issuance within this bridge.
+    managed_credential: tokio::sync::Mutex<()>,
+}
+
+enum CredentialSource {
+    Server(ServerAuth),
+    Managed(crate::managed::Binding),
 }
 
 struct Credential {
+    http: GraphHttpClient,
     token: Option<String>,
-    /// How many times the token was read; a 401 reads it again only when no
-    /// other refused request did since the refused one was sent.
+    /// How many times the token was read; renewal reads it again only when no
+    /// other request did since this message captured the credential.
     reads: u64,
 }
 
 impl Upstream {
-    /// The server target's `/mcp`, with the token the invocation acquired
-    /// from the target's `auth`. Fails before any request when it has
-    /// none to send.
-    pub(super) fn open(
+    /// The served target's `/mcp`, using its existing credential path.
+    /// Fails before graph requests when the selected identity cannot be acquired.
+    pub(super) async fn open(
         input: &InvocationConfig,
         target: &ResolvedTarget,
         actor: Option<&str>,
     ) -> Result<Self> {
-        let TargetBinding::Server { endpoint, auth, .. } = &target.binding else {
-            bail!("the MCP bridge relays only to a server target");
+        let (endpoint, source, http, token) = match &target.binding {
+            TargetBinding::Server { endpoint, auth, .. } => {
+                let url = crate::helpers::remote_url(endpoint, &["mcp"], &[])?;
+                let http =
+                    GraphHttpClient::server_target(input, target)?.with_expected_actor(actor);
+                // Admit the route before reading its credential.
+                let _ = http.request(Method::POST, url.clone())?;
+                let token = crate::targets::resolve_server_token_for(input, auth, endpoint, &url)?;
+                (
+                    endpoint.clone(),
+                    CredentialSource::Server(auth.clone()),
+                    http,
+                    token,
+                )
+            }
+            TargetBinding::Managed(binding) => {
+                let endpoint = binding
+                    .cluster
+                    .as_ref()
+                    .and_then(|cluster| cluster.endpoint.as_deref())
+                    .ok_or_else(|| {
+                        color_eyre::eyre::eyre!("managed MCP requires a resource endpoint")
+                    })?;
+                let (http, token) = managed_transport(binding).await?;
+                (
+                    endpoint.to_owned(),
+                    CredentialSource::Managed(binding.clone()),
+                    http,
+                    token,
+                )
+            }
+            _ => bail!("the MCP bridge relays only to a served target"),
         };
-        let url = crate::helpers::remote_url(endpoint, &["mcp"], &[])?;
-        let http = GraphHttpClient::server_target(input, target)?.with_expected_actor(actor);
-        // The captured credential scope admits the route before any token is read.
-        let _ = http.request(Method::POST, url.clone())?;
-        let token = crate::targets::resolve_server_token_for(input, auth, endpoint, &url)?;
+        let url = crate::helpers::remote_url(&endpoint, &["mcp"], &[])?;
         let profile = crate::operator_routing::AUTH
             .try_with(|selected| selected.as_ref().map(|selected| selected.profile.clone()))
             .ok()
             .flatten();
         Ok(Self {
-            auth: auth.clone(),
+            source,
             profile,
-            endpoint: endpoint.clone(),
+            endpoint,
             url,
-            http,
-            credential: RefCell::new(Credential { token, reads: 1 }),
+            managed_credential: tokio::sync::Mutex::new(()),
+            credential: RefCell::new(Credential {
+                http,
+                token,
+                reads: 1,
+            }),
         })
     }
 
@@ -162,12 +199,18 @@ impl Upstream {
 
     /// The target's `auth` is `provider: anonymous`.
     pub(super) fn anonymous(&self) -> bool {
-        matches!(self.auth, ServerAuth::Anonymous)
+        matches!(self.source, CredentialSource::Server(ServerAuth::Anonymous))
     }
 
     /// How to replace a token the server still refuses after it was read
     /// again, by where the target's `auth` reads it.
     pub(super) fn replacement(&self, target: &str) -> String {
+        if matches!(self.source, CredentialSource::Managed(_)) {
+            return format!(
+                "check the profile pinned by target '{target}' and its current cluster admission; \
+                 resource credential renewal never starts an interactive login"
+            );
+        }
         match &self.profile {
             Some(AuthProfile::Token {
                 source: TokenSource::Store { .. },
@@ -197,11 +240,25 @@ impl Upstream {
     /// POST one message and read its answer. Dropping the future drops the
     /// connection, which cancels the request at the server.
     pub(super) async fn post(&self, body: Vec<u8>, routing: &Routing<'_>) -> Delivery {
-        let (token, reads) = {
+        let (mut http, mut token, mut reads) = {
             let credential = self.credential.borrow();
-            (credential.token.clone(), credential.reads)
+            (
+                credential.http.clone(),
+                credential.token.clone(),
+                credential.reads,
+            )
         };
-        let request = match self.http.request(Method::POST, self.url.clone()) {
+        if let CredentialSource::Managed(binding) = &self.source {
+            // A bridge can outlive its issued token. Use the normal resource
+            // cache/renewal path before each request, never a control bearer.
+            let _guard = self.managed_credential.lock().await;
+            match managed_transport(binding).await {
+                Ok(current) => (http, token) = current,
+                Err(error) => return self.failed(&error),
+            }
+            reads = self.credential.borrow().reads;
+        }
+        let request = match http.request(Method::POST, self.url.clone()) {
             Ok(request) => request,
             Err(error) => {
                 return not_sent(ErrorCode::BadRequest, error.to_string());
@@ -212,7 +269,6 @@ impl Upstream {
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "application/json, text/event-stream")
             .body(body);
-        request = crate::helpers::apply_bearer_token(request, token.as_deref());
         if let Some(method) = routing
             .method
             .and_then(|method| HeaderValue::from_str(method).ok())
@@ -225,8 +281,37 @@ impl Upstream {
         if let Some(version) = &routing.protocol_version {
             request = request.header("mcp-protocol-version", version);
         }
-        let response = match self.http.send_mcp(request).await {
+        // The body is buffered, so a pre-dispatch expiry can rebuild this one
+        // request with a renewed credential. Clone before adding Authorization,
+        // because RequestBuilder::header appends rather than replaces values.
+        // No HTTP refusal or uncertain send enters this path, and expiry during
+        // the second discovery still refuses.
+        let unsent = request.try_clone();
+        let request = crate::helpers::apply_bearer_token(request, token.as_deref());
+        let response = match http.send_mcp(request).await {
             Ok(response) => response,
+            Err(error)
+                if error.downcast_ref::<crate::credential_sources::CredentialError>()
+                    == Some(&crate::credential_sources::CredentialError::Expired) =>
+            {
+                let Some(unsent) = unsent else {
+                    return self.failed(&error);
+                };
+                if let Reread::Failed(cause) = self.reread(reads, token.as_deref()).await {
+                    return not_sent(ErrorCode::BadRequest, cause);
+                }
+                {
+                    let credential = self.credential.borrow();
+                    http = credential.http.clone();
+                    token = credential.token.clone();
+                    reads = credential.reads;
+                }
+                let request = crate::helpers::apply_bearer_token(unsent, token.as_deref());
+                match http.send_mcp(request).await {
+                    Ok(response) => response,
+                    Err(error) => return self.failed(&error),
+                }
+            }
             Err(error) => return self.failed(&error),
         };
         if response.status() == StatusCode::UNAUTHORIZED {
@@ -238,7 +323,7 @@ impl Upstream {
             return Delivery::Unauthorized {
                 body,
                 challenge,
-                reread: self.reread(reads).await,
+                reread: self.reread(reads, token.as_deref()).await,
             };
         }
         read_answer(response).await
@@ -284,10 +369,15 @@ impl Upstream {
         }
     }
 
-    /// Read the credential from its source again after a request sent with
-    /// read `refused` was refused, once for every request that read refused.
+    /// Read the credential from its source again after read `refused` expired
+    /// before dispatch or was refused, once for every request that read refused.
     /// A request sent while it is read carries the token it had.
-    async fn reread(&self, refused: u64) -> Reread {
+    async fn reread(&self, refused: u64, refused_token: Option<&str>) -> Reread {
+        let _guard = if matches!(self.source, CredentialSource::Managed(_)) {
+            Some(self.managed_credential.lock().await)
+        } else {
+            None
+        };
         {
             let mut credential = self.credential.borrow_mut();
             if credential.reads != refused {
@@ -297,18 +387,69 @@ impl Upstream {
         }
         // No borrow is held across the read, which may run a helper: the
         // other relays keep sending meanwhile.
-        let read =
-            crate::targets::reread_server_token_for(&self.auth, &self.endpoint, &self.url).await;
+        let read: Result<(GraphHttpClient, Option<String>)> = async {
+            match &self.source {
+                CredentialSource::Managed(binding) => {
+                    if let Some(token) = refused_token {
+                        crate::managed::data::forget_refused(binding, token).await?;
+                    }
+                    managed_transport(binding).await
+                }
+                CredentialSource::Server(auth) => {
+                    let acquired = crate::targets::reread_server_credential_for(
+                        auth,
+                        &self.endpoint,
+                        &self.url,
+                    )
+                    .await?;
+                    let mut http = self.credential.borrow().http.clone();
+                    let token = if let Some(acquired) = acquired {
+                        let token = acquired
+                            .bearer_for(acquired.request(), time::OffsetDateTime::now_utc())?
+                            .expose()
+                            .to_owned();
+                        http = http.with_credential(acquired)?;
+                        Some(token)
+                    } else {
+                        None
+                    };
+                    Ok((http, token))
+                }
+            }
+        }
+        .await;
         let mut credential = self.credential.borrow_mut();
+        // A later refusal may finish its renewal first. Never replace that
+        // newer credential with the completion of an older helper/issuance.
+        if credential.reads != refused + 1 {
+            return Reread::Already;
+        }
         match read {
-            Ok(token) if token == credential.token => Reread::Unchanged,
-            Ok(token) => {
+            Ok((http, token)) => {
+                let changed = token != credential.token;
+                credential.http = http;
                 credential.token = token;
-                Reread::Renewed
+                if changed {
+                    Reread::Renewed
+                } else {
+                    Reread::Unchanged
+                }
             }
             Err(error) => Reread::Failed(error.to_string()),
         }
     }
+}
+
+/// Reuse the normal resource acquisition and its destination/expiry binding.
+async fn managed_transport(
+    binding: &crate::managed::Binding,
+) -> Result<(GraphHttpClient, Option<String>)> {
+    let crate::client::GraphClient::Remote { http, token, .. } =
+        crate::managed::data::resource(binding, None).await?
+    else {
+        bail!("managed resource did not provide a served transport");
+    };
+    Ok((*http, token))
 }
 
 fn not_sent(code: ErrorCode, message: String) -> Delivery {

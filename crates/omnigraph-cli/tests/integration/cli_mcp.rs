@@ -448,7 +448,7 @@ fn mcp_refuses_what_it_cannot_relay_to_before_any_request() {
     };
     let home = Home::new(&format!(
         "profiles:\n  work:\n    api: '{endpoint}'\n    organization_id: org\n    \
-         auth: {{provider: omnigraph}}\ntargets:\n  local:\n    kind: direct\n    scope: graph\n    \
+         auth: {{provider: token, source: {{env: OMNIGRAPH_MISSING_MANAGED_TOKEN}}}}\ntargets:\n  local:\n    kind: direct\n    scope: graph\n    \
          uri: 'file://{graph}'\n  root:\n    kind: direct\n    scope: root\n    uri: 'file://{root}'\n    \
          default_graph: knowledge\n  managed:\n    kind: managed\n    profile: work\n    \
          cluster_id: c\n    cluster_incarnation: i\n    endpoint: '{endpoint}/data'\n    \
@@ -469,7 +469,11 @@ fn mcp_refuses_what_it_cannot_relay_to_before_any_request() {
             vec!["--target", inline.to_str().unwrap()],
             "target_kind_unsupported",
         ),
-        (vec!["--target", "managed"], "target_kind_unsupported"),
+        (vec!["--target", "managed"], "credential_unavailable"),
+        (
+            vec!["--target", "managed", "--as", "wrong-actor"],
+            "--as is not available for a managed target",
+        ),
         (vec!["--target", "nograph"], "graph_required"),
         // The target's `auth` source has no token.
         (
@@ -499,8 +503,7 @@ fn mcp_refuses_what_it_cannot_relay_to_before_any_request() {
         assert!(!stderr.contains(AGENT_TOKEN), "{args:?}: {stderr}");
         if code == "target_kind_unsupported" {
             assert!(
-                stderr.contains("mcp connects to an existing server")
-                    || stderr.contains("does not relay to a managed target"),
+                stderr.contains("mcp connects to an existing server"),
                 "{args:?}: {stderr}"
             );
         }
@@ -771,6 +774,8 @@ struct EndpointState {
     slow: AtomicUsize,
     hung_up: AtomicUsize,
     held: AtomicUsize,
+    /// Hold successive public discovery probes until these credential expiries.
+    discovery_until: Mutex<std::collections::VecDeque<time::OffsetDateTime>>,
 }
 
 impl McpEndpoint {
@@ -874,6 +879,14 @@ fn answer_one(mut stream: TcpStream, state: &EndpointState) {
         );
     };
     if request_line.starts_with("HEAD ") && request_line.contains("/healthz ") {
+        let until = state.discovery_until.lock().unwrap().pop_front();
+        if let Some(until) = until {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while time::OffsetDateTime::now_utc() < until {
+                assert!(Instant::now() < deadline, "discovery expiry bound");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         let _ = write!(
             stream,
             "HTTP/1.1 200 OK\r\n{}: {}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
@@ -1169,6 +1182,276 @@ fn mcp_reads_a_refused_credential_again_for_later_requests_without_resending() {
     );
     assert_eq!(endpoint.received(9), [""]);
     bridge.finish().assert_success();
+}
+
+/// An exec credential can expire between messages or while public discovery
+/// is in flight. Renew it before the first operation POST, without sending the
+/// expired bearer, running the helper for valid credentials, or replaying calls.
+#[cfg(unix)]
+#[test]
+fn mcp_renews_expired_helper_credentials_before_dispatch() {
+    use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+
+    for (during_discovery, replacement_expires) in [(false, false), (true, false), (true, true)] {
+        let endpoint = McpEndpoint::start("initial-token");
+        let helper = tempdir().unwrap();
+        let script = helper.path().join("credential.sh");
+        // Leave startup headroom on contended CI workers. Held discovery probes
+        // stay below the transport's five-second deadline.
+        let expiry = OffsetDateTime::now_utc() + time::Duration::seconds(8);
+        std::fs::write(
+            helper.path().join("initial.json"),
+            json!({"version":1,"credential":{"type":"bearer","token":"initial-token"},
+                "expires_at":expiry.format(&Rfc3339).unwrap()})
+            .to_string(),
+        )
+        .unwrap();
+        let replacement_expiry = expiry + time::Duration::seconds(3);
+        let mut renewed =
+            json!({"version":1,"credential":{"type":"bearer","token":"renewed-token"}});
+        if replacement_expires {
+            renewed["expires_at"] = json!(replacement_expiry.format(&Rfc3339).unwrap());
+        }
+        std::fs::write(helper.path().join("renewed.json"), renewed.to_string()).unwrap();
+        std::fs::write(
+            &script,
+            r#"cat >/dev/null
+echo called >> "$1/calls"
+if mkdir "$1/initial" 2>/dev/null; then
+  cat "$1/initial.json"
+else
+  cat "$1/renewed.json"
+fi
+"#,
+        )
+        .unwrap();
+        let home = Home::new(&format!(
+            "targets:\n  staging:\n    kind: server\n    endpoint: '{}'\n    default_graph: knowledge\n    \
+             auth: {{provider: exec, command: ['/bin/sh', '{}', '{}'], timeout: 10s}}\n{}",
+            endpoint.url,
+            script.display(),
+            helper.path().display(),
+            fixture_transport()
+        ));
+        let mut bridge = home.bridge(&["--target", "staging"], &[]);
+        assert!(bridge.initialize()["result"].is_object());
+        // Drain the ordered initialized notification before rotating the
+        // fixture's token; otherwise its 401 could renew before the expiry.
+        assert!(
+            bridge.call(json!({"jsonrpc":"2.0","id":10,"method":"ping"}))["result"].is_object()
+        );
+        endpoint.accept("renewed-token");
+        let ready_at = if during_discovery {
+            expiry - time::Duration::seconds(2)
+        } else {
+            expiry
+        };
+        while OffsetDateTime::now_utc() < ready_at {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if during_discovery {
+            let mut probes = endpoint.state.discovery_until.lock().unwrap();
+            probes.push_back(expiry);
+            if replacement_expires {
+                probes.push_back(replacement_expiry);
+            }
+        }
+        for id in 1..=if replacement_expires { 1 } else { 2 } {
+            let answer = bridge.call(json!({"jsonrpc":"2.0","id":id,"method":"ping"}));
+            if replacement_expires {
+                assert_eq!(answer["error"]["message"], "credential has expired");
+                assert!(endpoint.received(id).is_empty());
+            } else {
+                assert!(answer.get("result").is_some(), "{answer}");
+                assert_eq!(endpoint.received(id), ["renewed-token"]);
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(helper.path().join("calls")).unwrap(),
+            "called\ncalled\n"
+        );
+        let finished = bridge.finish();
+        finished.assert_success();
+        finished.assert_never_shows(&["initial-token", "renewed-token"]);
+    }
+}
+
+/// Two refusals can renew concurrently. Completing the older helper last
+/// must not replace the newer credential used by subsequent messages.
+#[cfg(unix)]
+#[test]
+fn mcp_ignores_a_stale_overlapping_credential_renewal() {
+    let endpoint = McpEndpoint::start("initial-token");
+    let helper = tempdir().unwrap();
+    let script = helper.path().join("credential.sh");
+    std::fs::write(
+        &script,
+        r#"cat >/dev/null
+if mkdir "$1/initial" 2>/dev/null; then
+  token=initial-token
+elif mkdir "$1/slow" 2>/dev/null; then
+  count=0
+  while [ ! -f "$1/release" ]; do
+    count=$((count + 1))
+    [ "$count" -lt 1000 ] || exit 1
+    sleep 0.01
+  done
+  token=stale-token
+else
+  token=fresh-token
+fi
+printf '{"version":1,"credential":{"type":"bearer","token":"%s"}}\n' "$token"
+"#,
+    )
+    .unwrap();
+    let home = Home::new(&format!(
+        "targets:\n  staging:\n    kind: server\n    endpoint: '{}'\n    default_graph: knowledge\n    \
+         auth: {{provider: exec, command: ['/bin/sh', '{}', '{}'], timeout: 15s}}\n{}",
+        endpoint.url,
+        script.display(),
+        helper.path().display(),
+        fixture_transport()
+    ));
+    let mut bridge = home.bridge(&["--target", "staging"], &[]);
+    bridge.initialize();
+    bridge.call(tools_list(1));
+    endpoint.accept("fresh-token");
+    bridge.send(&tool_call(2, "fast", json!({})));
+    let deadline = Instant::now() + ANSWER_WAIT;
+    while !helper.path().join("slow").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "renewal did not start: {}",
+            bridge.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    bridge.send(&tool_call(3, "fast", json!({})));
+    let newer = bridge.answer();
+    assert_eq!(newer["id"], 3, "{newer}");
+    assert_eq!(newer["error"]["data"]["status"], 401, "{newer}");
+    std::fs::write(helper.path().join("release"), "").unwrap();
+    let older = bridge.answer();
+    assert_eq!(older["id"], 2, "{older}");
+    assert_eq!(older["error"]["data"]["status"], 401, "{older}");
+    let answer = bridge.tool(4, "fast", json!({}));
+    assert_eq!(answer["result"]["content"][0]["text"], "fast", "{answer}");
+    assert_eq!(endpoint.received(2), ["initial-token"]);
+    assert_eq!(endpoint.received(3), ["initial-token"]);
+    assert_eq!(endpoint.received(4), ["fresh-token"]);
+    let finished = bridge.finish();
+    finished.assert_success();
+    finished.assert_never_shows(&["initial-token", "stale-token", "fresh-token"]);
+}
+
+#[test]
+fn managed_mcp_uses_resource_credentials_and_renews_without_replay() {
+    use crate::support::managed_http::IntentApiFixture;
+    let endpoint = McpEndpoint::start("not-yet-issued");
+    let (api, tokens) = IntentApiFixture::identity_issuer_with_renewal_delay(
+        &endpoint.url,
+        2,
+        Duration::from_secs(2),
+    );
+    endpoint.accept(&tokens[0]);
+    let config = tempdir().unwrap();
+    write_managed_data_target(config.path(), &api.origin, &endpoint.url);
+    let mut command = cli_process();
+    command
+        .env("OMNIGRAPH_HOME", managed_home(config.path()))
+        .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+        .args(["mcp", "--target", "managed-test"]);
+    let mut bridge = Bridge::start(command);
+    assert!(bridge.initialize()["result"].is_object());
+    let listed = bridge.call(tools_list(1));
+    assert!(
+        !tool_names(&listed)
+            .iter()
+            .any(|name| name.ends_with("_write"))
+    );
+    let write = bridge.tool(2, "slow_write", json!({}));
+    assert!(write["error"].is_object());
+    assert!(endpoint.received(2).is_empty());
+    let foreign = bridge.call(json!({"jsonrpc":"2.0","id":3,"method":"resources/read",
+        "params":{"uri":"omnigraph://graphs/another/schema"}}));
+    assert!(foreign["error"].is_object());
+    assert!(endpoint.received(3).is_empty());
+    endpoint.accept(&tokens[1]);
+    bridge.send(&tool_call(4, "fast", json!({})));
+    let deadline = Instant::now() + ANSWER_WAIT;
+    while api
+        .requests()
+        .iter()
+        .filter(|request| request.path.ends_with("/tokens"))
+        .count()
+        < 2
+    {
+        assert!(
+            Instant::now() < deadline,
+            "managed renewal did not start: {}",
+            bridge.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Issuance is held while the fixture still answers sessions and further
+    // token requests. This request must wait for the same credential, not
+    // start another issuance against the temporarily empty cache.
+    bridge.send(&tool_call(5, "fast", json!({})));
+    let mut answers = [bridge.answer(), bridge.answer()];
+    answers.sort_by_key(|answer| answer["id"].as_u64());
+    let [denied, next] = answers;
+    assert_eq!(denied["id"], 4, "{denied}");
+    assert_eq!(denied["error"]["data"]["status"], 401, "{denied}");
+    assert_eq!(endpoint.received(4), [tokens[0].clone()]);
+    assert_eq!(next["id"], 5, "{next}");
+    assert_eq!(next["result"]["content"][0]["text"], "fast", "{next}");
+    assert_eq!(endpoint.received(5), [tokens[1].clone()]);
+    let cached = bridge.tool(6, "fast", json!({}));
+    assert_eq!(cached["result"]["content"][0]["text"], "fast", "{cached}");
+    assert_eq!(endpoint.received(6), [tokens[1].clone()]);
+    let finished = bridge.finish();
+    finished.assert_success();
+    finished.assert_never_shows(&["og_fixture_control", &tokens[0], &tokens[1]]);
+    assert!(
+        endpoint
+            .state
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, token)| tokens.contains(token))
+    );
+    api.assert_complete();
+}
+
+#[test]
+fn managed_mcp_refuses_wrong_incarnation_before_graph_requests() {
+    use crate::support::managed_http::IntentApiFixture;
+    let endpoint = McpEndpoint::start("unused");
+    let (api, _) = IntentApiFixture::identity_issuer(&endpoint.url, 1);
+    let config = tempdir().unwrap();
+    write_managed_data_target(config.path(), &api.origin, &endpoint.url);
+    let operator = managed_home(config.path()).join("config.yaml");
+    let source = std::fs::read_to_string(&operator).unwrap();
+    std::fs::write(
+        &operator,
+        source.replace(
+            "cluster_incarnation: inc-one",
+            "cluster_incarnation: inc-another",
+        ),
+    )
+    .unwrap();
+    let output = cli_process()
+        .env("OMNIGRAPH_HOME", managed_home(config.path()))
+        .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+        .args(["mcp", "--target", "managed-test"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(endpoint.state.received.lock().unwrap().is_empty());
+    api.assert_complete();
 }
 
 /// The server's `WWW-Authenticate` challenge on a 401 is relayed verbatim

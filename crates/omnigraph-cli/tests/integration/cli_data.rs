@@ -5451,8 +5451,8 @@ fn target_list_and_inspect_have_the_same_versioned_binding() {
 /// without a policy allows everything once it opens; a store that holds no
 /// graph refuses, a damaged one keeps its own failure; a server target
 /// answers through its access route with the target's token, `--as` riding
-/// as the actor assertion; and a catalogue or managed target refuses before
-/// any I/O.
+/// as the actor assertion; managed targets use the same route with an issued
+/// identity, and catalogue access refuses before any I/O.
 #[test]
 fn access_reports_what_the_caller_may_do_at_a_target() {
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
@@ -5737,20 +5737,65 @@ fn access_reports_what_the_caller_may_do_at_a_target() {
     );
     served.assert_complete();
 
-    // The catalogue carries no policy and managed data qualifies each
-    // operation separately: both refuse before any I/O.
-    for (target, code) in [
-        ("og_catalog", "target_unknown"),
-        ("cloud", "target_incompatible"),
-    ] {
-        let refused = output_failure(
-            cli()
-                .env("OMNIGRAPH_HOME", home)
-                .args(["access", "--target", target, "--json"]),
-        );
-        let refusal = parse_stdout_json(&refused);
-        assert_eq!(refusal["code"], code, "{target}: {refusal}");
-    }
+    // The catalogue carries no policy and refuses before any I/O.
+    let refused = output_failure(cli().env("OMNIGRAPH_HOME", home).args([
+        "access",
+        "--target",
+        "og_catalog",
+        "--json",
+    ]));
+    let refusal = parse_stdout_json(&refused);
+    assert_eq!(refusal["code"], "target_unknown", "{refusal}");
+}
+
+#[test]
+fn managed_access_uses_the_selected_identity_and_preserves_branch_scope() {
+    use crate::support::managed_http::{IntentApiFixture, IntentReply};
+    let data = IntentApiFixture::graph(vec![IntentReply::json(
+        200,
+        json!({
+            "actor_id":"principal:principal-one","graph_id":"knowledge","graph_wide":["read"],
+            "branch":"feature","target_branch":"main","actions":["read","branch_merge"]
+        }),
+    )]);
+    let (api, tokens) = IntentApiFixture::identity_issuer(&data.origin, 1);
+    let config = tempdir().unwrap();
+    write_managed_data_target(config.path(), &api.origin, &data.origin);
+    let output = output_success(
+        managed_command(config.path(), &api.origin, "managed-test").args([
+            "access",
+            "--branch",
+            "feature",
+            "--target-branch",
+            "main",
+            "--json",
+        ]),
+    );
+    let body = parse_stdout_json(&output);
+    assert_eq!(body["protocol"], 2);
+    assert_eq!(body["actor_id"], "principal:principal-one");
+    assert_eq!(body["target"], "managed-test");
+    assert_eq!(body["source"], "server");
+    let requests = data.workflow_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].path,
+        "/graphs/knowledge/access?branch=feature&target_branch=main"
+    );
+    assert_eq!(
+        requests[0].headers.get("authorization"),
+        Some(&format!("Bearer {}", tokens[0]))
+    );
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("omnigraph-http-api")
+            .map(String::as_str),
+        Some("0.14")
+    );
+    assert!(!stdout_string(&output).contains(&tokens[0]));
+    api.assert_complete();
+    data.assert_complete();
 }
 
 #[test]
