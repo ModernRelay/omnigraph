@@ -294,13 +294,22 @@ refusals, runtime type invariants and each output/CLI mode. When editing the
 checker, also run `python3 -m mypy --strict scripts/check-pr-title.py` in a
 development environment with mypy installed. The enum dispatches are exhaustive.
 
+On a pull request `PR Title` also checks its release notes with
+`scripts/check-release-note.py`, which reads the type and `!` from the title
+`scripts/check-pr-title.py` accepted: a `feat`, `fix` or `perf` pull request
+adds a `changelog.d` note and a `!` title adds a `.breaking.md` note, unless
+the pull request carries the `skip-changelog` label
+([release notes](documentation.md#release-notes)).
+
 It is a policy check on
 `pull_request_target` like the regression gate, re-run on every title edit,
-and the pull request head is never fetched. On the merge queue's branch it
+push and label change; the pull request head is fetched only as data for the
+release-note diff range, never checked out or executed. On the merge queue's branch it
 checks the first line of the group commit's message, minus the ` (#N)`
 suffix: the subject the queue lands, fixed when the group is built, so a
 title edit after queueing cannot change what lands unchecked
-([branch-protection.md](branch-protection.md), Merge queue).
+([branch-protection.md](branch-protection.md), Merge queue). The notes were
+checked on the pull request, so the merge-group run does not check them again.
 
 The `Check AGENTS.md Links` context also runs `scripts/check-docs.py`, which
 validates local documentation links, user/developer audience boundaries, RFC

@@ -83,10 +83,15 @@ environment on later runs; reinstall when the requirements change.
 ## Release notes
 
 Add one permanent `changelog.d/<descriptive-slug>.<category>.md` file with each
-user-visible change. No PR number or release number is needed. Internal-only
-changes need no note. Write the outcome in one to three sentences and link to
-the guide for detail; keep necessary migration instructions even when longer.
-Review the note with its code. There is no separate release-note approver.
+user-visible change. No PR number or release number is needed: the release
+page links each note to the pull request whose squash commit added it.
+Internal-only changes need no note. A note is one bullet with one sentence or
+two, at most 200 characters of visible text (code spans count, link
+destinations and definitions do not); move detail into the guide it links.
+A breaking note may use 400 characters, says who is affected and what to do,
+and links the guide that holds the steps, usually the
+[upgrade guide](../user/operations/upgrade.md). Review the note with its code.
+There is no separate release-note approver.
 
 | Suffix | Section |
 |---|---|
@@ -98,8 +103,9 @@ Review the note with its code. There is no separate release-note approver.
 | `deprecated` | Deprecations |
 | `removed` | Removals |
 
-Start the file with a Markdown bullet and end it with a newline. Examples,
-nested lists and code spans stay intact. Local links use reference definitions
+Start the file with a Markdown bullet and end it with a newline. Code spans
+stay intact; nested lists, fenced examples and second paragraphs are refused
+in new notes. Local links use reference definitions
 at column zero, with a relative destination and optional heading anchor:
 
 ```markdown
@@ -119,6 +125,72 @@ so they cannot consume the following note. The composer only rewrites link
 definitions outside code, preserving the rest of each fragment apart from
 normalizing CRLF line endings to LF. Do not add release headings to fragments.
 
+### The release file
+
+The release-prep pull request adds `changelog.d/<version>.md`, named for the
+`version` in `release.json`. It opens with an intro of at most 100 words that
+says what users get from the release and, when it breaks something, what
+they must do before they upgrade. Write the intro in
+[ASD-STE100](https://www.asd-ste100.org/) Simplified Technical English: short
+sentences (at most 25 words), active voice, simple present, one statement per
+sentence and no slogans. When the release has any breaking note, a
+`## Why these changes` section of at most 80 words says why the release asks
+users to act; it is printed at the top of the upgrade actions, and a release
+with no breaking note refuses it.
+
+A `## Highlights` section holds three to five `### ` highlights for a minor or
+major release, and up to five for a patch release, each at most 150 words.
+The heading names the change and what it gives users in a few words, with a
+measured number when there is one (`CSV import: 630 million rows in under
+five minutes`, not `CSV loads go through the planner`). The body is in
+database terms: it opens with the mechanism (projection pushdown,
+copy-on-write branches, compare-and-swap publication), names the benchmark
+behind any number and the machine and storage it ran on, and lists its pull
+requests:
+
+```markdown
+### Counting no longer loads every embedding
+
+Projection pushdown: a `Vector` or `Blob` column is read only when the query
+names it, so a `count` over embedding-heavy types reads no vectors. #760, #795
+```
+
+The release-prep pull request may leave `## Highlights` empty for someone else
+to write: the preview shows them as still to be written and CI passes, but the
+snapshot refuses a minor or major release until three to five are in.
+
+Before the snapshot, the release-prep pull request also reads the cycle's
+notes as one page. Notes stay editable until their release is tagged, so when
+several notes describe one upgrade step (a saved-plan version, a storage
+format), keep one that states the final value and delete the others, and say
+each fact once.
+
+Notes print as one list per section, in file-name order. To put the most
+important ones first, add a `## Note order` section listing note file names,
+one per `- ` line (`- storage-format-14.breaking.md`); listed notes lead their
+sections in that order, the rest follow by file name, and the section itself
+is not printed. A `## Contributors` section lists the GitHub handles to thank,
+one per `- @handle` line; the snapshot refuses a release file without it, and
+the page prints them as one thank-you line. List the pull request authors
+since the previous release with
+`gh api repos/ModernRelay/omnigraph/compare/<previous>...<target> --paginate --jq '.commits[].author.login' | sort -u`,
+drop bots, and add anyone else worth thanking. No other headings are allowed.
+Links follow the note rules. The file is immutable once its release is tagged.
+
+Wrap notes and the release file as you like: the page joins each paragraph
+into one line, because GitHub shows every newline in a release body as a line
+break. Code blocks and hard line breaks keep their lines.
+
+### Pull request titles
+
+The `PR Title` check holds the title to `type(scope)!: description`
+([CONTRIBUTING.md](../../CONTRIBUTING.md), Pull Requests) and also reads its
+type: a `feat`, `fix` or `perf` pull request adds a note, and a `!` title adds
+a `.breaking.md` note. A maintainer
+adds the `skip-changelog` label when a typed change has nothing users can see.
+The squash commit keeps the title and its `(#NNN)`, which is where the release
+page's pull request links come from.
+
 Preview local edits and untracked notes from the repository root after
 [activating the documentation environment](#documentation-tools):
 
@@ -135,7 +207,8 @@ CI job uploads this output as `release-notes-preview`; no generated preview is
 checked in and no bot comment is needed.
 
 `changelog.d/release.json` names the next `version`, the previous release `base`
-for that maintenance line, and an optional `legacy` baseline SHA. These are
+for that maintenance line, an optional `legacy` baseline SHA and the cycle's
+release `format` (`2`, or `1` when the field is absent). These are
 explicit inputs, not inferred from the newest tag. Set `base` to `null` only for
 an initial release without a predecessor. The base and optional legacy source
 must be available with enough history to prove ancestry. The selected notes are paths
@@ -149,8 +222,8 @@ release. CRLF and LF checkouts have the same identity; other content changes do
 not. The checker validates selected notes' links against the selected tree;
 historical raw notes are not checked against today's moving documentation.
 
-With the documentation environment active, release preparation creates a
-versioned snapshot and updates `docs/releases/README.md` from committed inputs
+With the documentation environment active and `changelog.d/<version>.md`
+written, release preparation creates a versioned snapshot and updates `docs/releases/README.md` from committed inputs
 and an explicit date:
 
 ```bash
@@ -172,7 +245,10 @@ target SHA documents where generation ran; squash merging may remove that
 commit. Validation compares the complete selected note set and digests,
 configuration, and regenerated document against the audited release tree. It
 requires ancestry only for the durable release base and legacy source. Any later
-note or configuration change requires regeneration. Verify a prepared committed
+note or configuration change requires regeneration. Format-2 snapshots also
+record the release file's digest, the previous release tag and
+the pull request link of each note; a recorded link must still match history
+when the release is verified. Verify a prepared committed
 snapshot with the documentation environment active:
 
 ```bash
@@ -198,18 +274,47 @@ backfills; v0.12.0 onward require a valid snapshot. Edge releases need no
 snapshot: each shows the unreleased preview at its commit
 ([release workflows](ci.md#release-workflows)).
 After publication, update the configuration for the next release: set its base
-to the release just published, advance the version and set `legacy` to `null`.
+to the release just published, advance the version, set `legacy` to `null` and
+keep `"format": 2`.
 Advance the workspace package version too: edge builds are refused while it is
 not above the latest stable release ([release workflows](ci.md#release-workflows)).
 
-The hand-written v0.12.0 document was converted into two notes before its
-snapshot, `changelog.d/a-release-highlights.added.md` and
-`changelog.d/a-compatibility-and-behavior-changes.changed.md`, so v0.12.0 is
-generated from notes alone and its `legacy` is `null`. A `legacy` baseline is
-frozen against its pin at snapshot preparation, any mismatch is refused, and
-publication regenerates from the pinned source with the baseline body ahead of
-the note sections. Generated snapshots require exact verification, and existing
-published documents and URLs stay unchanged.
+v0.12.0 through v0.14.0 are format 1, and each snapshot records its format, so
+their snapshots keep that shape. v0.14.0's GitHub release body was replaced
+by hand after publication with a format-2 page; its snapshot is unchanged. v0.12.0's hand-written document was converted
+into two notes, `changelog.d/a-release-highlights.added.md` and
+`changelog.d/a-compatibility-and-behavior-changes.changed.md`. The v0.14.1
+cycle is the first in format 2; a format-2 GitHub release body is the snapshot
+without its heading, status line and provenance comment. The length caps and
+the release file apply only to a format-2 cycle. Generated snapshots require
+exact verification, and existing published documents and URLs stay unchanged.
+
+### Release checklist
+
+Every release runs these steps in order. Post them in the team channel when
+the release starts, with an owner for each, and tick each one off there.
+
+1. Confirm the cycle: `changelog.d/release.json` names the version, its `base`
+   and `"format": 2`.
+2. Smoke-test the candidate: install the edge build of the commit to be
+   released ([release channels](../user/install.md#release-channels)) and run
+   the [quickstart](../user/quickstart.md) against a fresh local graph.
+3. Open the release-prep pull request. Read `preview --target HEAD` as one page
+   against the docs at that commit, fix each stale note in its own file, and
+   merge notes that repeat one upgrade step.
+4. Add `changelog.d/<version>.md` to that pull request: the intro, the why
+   when anything breaks, the highlights, the contributors and, if useful, the
+   note order. The highlights may come from another author in a later commit.
+5. Name one reviewer in the pull request. The reviewer reads the rendered
+   preview, not only the files.
+6. After the review, run `snapshot --target HEAD --date <release date>`,
+   commit the snapshot and the index to the same pull request, and merge it.
+7. Tag the merged commit `<version>` and push the tag. Tag CI audits it and
+   `release.yml` publishes the archives and the GitHub release from the
+   snapshot. Do not edit the published page or its notes; correct a mistake
+   with a new note or in the release's overview.
+8. Open the next cycle: update `release.json` and the workspace package
+   version as described above.
 
 A release may also have a curated `docs/releases/vX.Y.Z-overview.md`, linked
 from the generated release index. Reconcile superseded fragments against the
