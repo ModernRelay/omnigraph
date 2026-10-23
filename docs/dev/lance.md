@@ -236,11 +236,11 @@ rows; other fragments hold cold registry rows reused by the publisher.
 Generic `optimize` preserves this layout. A v14 or v15 branch is stamped v16
 by its first publication or by the stamp-only route of `omnigraph upgrade`,
 with no offline conversion.
-Normal open serves v14 to v16 only; a graph at any other stamp is refused and rebuilt
-by export and load, and the
-system-column respelling is a separate step on a served graph. Older binaries
-must not expose retired refs as live branches.
-See [versioning](versioning.md).
+Normal open serves v14 to v16 only and refuses other stamps. The qualified
+offline conversion and export/load rebuild routes are owned by
+[versioning](versioning.md#storage-upgrade-support-matrix). The system-column
+respelling is a separate step on a served graph. Older binaries must not
+expose retired refs as live branches.
 
 Stock `Branches::get` and `list` include every physical ref. OmniGraph's logical
 manifest helpers validate and filter `omnigraph.retired_manifest_branch`, a

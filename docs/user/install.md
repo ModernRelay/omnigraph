@@ -60,8 +60,10 @@ same tag, `modernrelay/omnigraph-server:edge-20261016-9c2b367` on Docker Hub
 and `ghcr.io/modernrelay/omnigraph-server:edge-20261016-9c2b367`, holding that
 build's Linux x86_64 binaries on Debian trixie. The `edge` image tag follows the
 rolling `edge` release; `latest` stays on the newest stable release. Pin a
-deployment to the image's digest, which the run's summary lists, and check it
-with `gh attestation verify oci://<image>@<digest> --repo ModernRelay/omnigraph`.
+deployment to the image's digest, which the run's summary lists. Provenance is
+attached to the GHCR digest; do not use a Docker Hub manifest digest to verify
+that attestation. GHCR access may require registry authentication; Docker Hub
+is the public pull channel. See [container verification](#verify).
 
 Read the build's release description before pointing it at a graph that a
 stable release must still read. It lists the storage format the build writes
@@ -71,12 +73,26 @@ refuses a format newer than its own, so test on a copy of the graph or back it
 up first ([upgrades](operations/upgrade.md)). A client and a server must speak
 the same HTTP contract.
 
-Install a specific stable tag with `VERSION=v0.12.0` on macOS/Linux or
-`-Version v0.12.0` on Windows. Set `INSTALL_DIR` or `-InstallDir` to choose a
+Install a specific stable tag with `VERSION=v0.14.0` on macOS/Linux or
+`-Version v0.14.0` on Windows. Set `INSTALL_DIR` or `-InstallDir` to choose a
 different destination.
 
 Documentation on `main` may describe behavior newer than the latest stable
 binary. Check `omnigraph version` and the [release notes](../releases/).
+
+## Client compatibility
+
+Upgrade the CLI, server, and HTTP integrations together. OmniGraph 0.14 requires
+HTTP contract `0.14`; the npm `0.13.0` clients are not compatible with it.
+At the 0.14 release, publication of `@modernrelay/omnigraph@0.14.0` and
+`@modernrelay/omnigraph-mcp@0.14.0` is pending. Check the
+[SDK repository](https://github.com/ModernRelay/omnigraph-ts) for publication
+status; its `v0.14.0` source tag is available for source builds.
+
+You can use the released CLI, the [HTTP API](operations/server.md), or the
+server's built-in [MCP endpoint and CLI stdio bridge](operations/mcp.md)
+without either npm package. The MCP protocol has its own negotiation; refresh
+cached tool schemas when upgrading a client.
 
 ## Build from source
 
@@ -121,7 +137,8 @@ omnigraph-azure-admission --help
 ```
 
 `omnigraph version` reports what the binary itself speaks, without opening a
-graph or contacting a server. For example, a plain source build prints:
+graph or contacting a server. For example, building the `v0.14.0` source tag
+without release metadata prints:
 
 ```text
 omnigraph 0.14.0
@@ -146,7 +163,7 @@ http-contract 0.14
 ```
 
 An edge build reports a SemVer pre-release of the package version, such as
-`0.14.0-edge+9c2b367`. Edge builds are published only while the package version
+`0.14.1-edge+9c2b367`. Edge builds are published only while the package version
 is above the latest stable release, so an edge version sorts after every
 published stable release and before the release it precedes. `channel` is `stable`
 or `edge` for a GitHub release archive and null for any other build. `commit`
@@ -188,7 +205,7 @@ v0.14.0, and its GHCR digest carries the attestation:
 
 ```bash
 docker run --rm --entrypoint /usr/local/bin/omnigraph \
-  ghcr.io/modernrelay/omnigraph-server:<tag> version
+  modernrelay/omnigraph-server:<tag> version
 gh attestation verify oci://ghcr.io/modernrelay/omnigraph-server:<tag> \
   --repo ModernRelay/omnigraph
 ```

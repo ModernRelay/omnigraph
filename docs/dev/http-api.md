@@ -83,11 +83,12 @@ facts; the OpenAPI owner tests their published description.
 ## Compatibility and coverage
 
 Changing an operationId or schema name changes generated SDK source even when
-the wire is unchanged. The finalized unreleased 0.14 contract uses `actor_id`
-in access results and the `listing` enum for commit lists. Refresh prerelease
-clients and servers together and regenerate SDKs: earlier 0.14 builds share
-the header, so admission cannot distinguish their older shapes. Retired
-`unpublished` and `unattached` query keys are refused even when false; they
+the wire is unchanged. The released 0.14 contract uses `actor_id` in access
+results and the `listing` enum for commit lists. When upgrading from a
+prerelease build, update clients and servers together and regenerate SDKs:
+earlier 0.14 builds share the header, so admission cannot distinguish their
+older shapes. Retired `unpublished` and `unattached` query keys are refused
+even when false; they
 cannot silently select history. MCP has its own tool-schema migration and
 does not require the HTTP contract header. See the
 [client migration](../../changelog.d/http-contract-014.breaking.md) and
