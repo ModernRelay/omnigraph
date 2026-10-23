@@ -321,7 +321,7 @@ are refused. Alias `args` and `format` fields and positional arguments are unsup
 
 For released **0.13 → 0.14**, follow the [upgrade checklist](../operations/upgrade-0.14.md)
 with paired YAML and commands. Old resource-binding `profiles` become `targets`;
-new profiles identify a control plane and identity. There is no config importer.
+new profiles hold managed sign-in settings. There is no config importer.
 
 For intermediate 0.14 formats, replace `connections`/account targets with profiles,
 target `connection` with `profile`, and `defaults.connection` with `defaults.profile`.
