@@ -300,8 +300,7 @@ recorded history. After adding it, regenerate the index with
 
 ### Release checklist
 
-Every release runs these steps in order. Post them in the team channel when
-the release starts, with an owner for each, and tick each one off there.
+Every release runs these steps in order.
 
 1. Confirm the cycle: `changelog.d/release.json` names the version, its `base`
    and `"format": 2`.
@@ -314,8 +313,8 @@ the release starts, with an owner for each, and tick each one off there.
 4. Add `changelog.d/<version>.md` to that pull request: the intro, the why
    when anything breaks, the highlights, the contributors and, if useful, the
    note order. The highlights may come from another author in a later commit.
-5. Name one reviewer in the pull request. The reviewer reads the rendered
-   preview, not only the files.
+5. Review the pull request against the rendered preview, not only the
+   files.
 6. After the review, run `snapshot --target HEAD --date <release date>`,
    commit the snapshot and the index to the same pull request, and merge it.
 7. Tag the merged commit `<version>` and push the tag. Tag CI audits it and
