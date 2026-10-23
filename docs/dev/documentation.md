@@ -145,7 +145,8 @@ measured number when there is one (`CSV import: 630 million rows in under
 five minutes`, not `CSV loads go through the planner`). The body is in
 database terms: it opens with the mechanism (projection pushdown,
 copy-on-write branches, compare-and-swap publication), names the benchmark
-behind any number, and lists its pull requests:
+behind any number and the machine and storage it ran on, and lists its pull
+requests:
 
 ```markdown
 ### Counting no longer loads every embedding
@@ -157,6 +158,12 @@ names it, so a `count` over embedding-heavy types reads no vectors. #760, #795
 The release-prep pull request may leave `## Highlights` empty for someone else
 to write: the preview shows them as still to be written and CI passes, but the
 snapshot refuses a minor or major release until three to five are in.
+
+Before the snapshot, the release-prep pull request also reads the cycle's
+notes as one page. Notes stay editable until their release is tagged, so when
+several notes describe one upgrade step (a saved-plan version, a storage
+format), keep one that states the final value and delete the others, and say
+each fact once.
 
 Notes print as one list per section, in file-name order. To put the most
 important ones first, add a `## Note order` section listing note file names,
