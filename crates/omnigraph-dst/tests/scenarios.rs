@@ -2003,12 +2003,13 @@ fn dst_setup_crash_waits_for_a_crossed_window() {
 }
 
 /// A recorded setup crash arms its target, so the setup window must be one
-/// that is crossed only once the aftermath exists. In hunt cell seed 2 an
-/// Optimize builds the missing indexes before the first EnsureIndices, which
-/// then has nothing to build: it still crosses the index build's
-/// pre-manifest window, but not `ensure_indices.post_table_effect`, the
-/// setup `setup_crash_for` names, so no setup is recorded and the
-/// dead-staging target stays unarmed.
+/// that is crossed only once the aftermath exists. In hunt cell seed 5 the
+/// first EnsureIndices has nothing to build: it still crosses the index
+/// build's pre-manifest window, but not `ensure_indices.post_table_effect`,
+/// the setup `setup_crash_for` names, so no setup is recorded and the
+/// dead-staging target stays unarmed. An index build also rebuilds an index
+/// whose coverage lags, so a cell whose rows reach an indexed table before
+/// that EnsureIndices has work and is no witness.
 #[cfg(feature = "failpoints")]
 #[test]
 #[serial]
@@ -2020,7 +2021,7 @@ fn dst_setup_crash_needs_its_aftermath() {
             omnigraph::seams::catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.name(),
             0,
         )),
-        ..hunt_window_scenario(2, window, 0)
+        ..hunt_window_scenario(5, window, 0)
     };
     let a = run_universe(
         "shared-memory://dst-setup-aftermath-pre-manifest",
@@ -2034,7 +2035,7 @@ fn dst_setup_crash_needs_its_aftermath() {
         a.reconcile_verdicts
     );
 
-    let named = hunt_window_scenario(2, window, 0);
+    let named = hunt_window_scenario(5, window, 0);
     let a = run_universe("shared-memory://dst-setup-aftermath-a", &named);
     assert_eq!(
         a.crashes, 0,
