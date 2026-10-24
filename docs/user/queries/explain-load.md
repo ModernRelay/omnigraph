@@ -20,7 +20,7 @@ root down:
 | `node` | `detail` fields |
 |---|---|
 | `FragmentWrite` | `table`, `version`, `mode`, `adapter`; the physical row adds `max_input_bytes`, `max_workers` |
-| `Validate` | `table` and `checks`, every check of the load in the order it runs, which is the refusal precedence |
+| `Validate` | `table` and `checks`, every check of the load in the order it runs, which is the refusal precedence; the physical row adds `removal` and `max_workers` |
 | `CsvSource` | `format`, `source`, `source_bytes`, `estimated_rows`, `delimiter`, `header`, `columns`, `table`, `version`; the physical row adds `max_partitions` (the streams that parse the source: one per 8 MiB of it, at most `stage_write_concurrency`), `max_workers`, `fallback` |
 
 Each entry of `checks` carries `check` (`value`, `unique`, `edge_ri`,
@@ -46,8 +46,21 @@ version. A probe first pays its key list, one entry per input row, so an
 unindexed endpoint check scans, and a partially or fully indexed table keeps
 `probe` only while the key list is small against it. Unknown counts and equal
 costs keep `probe`; statistics record `index_coverage` and both costs.
-`cardinality` and `retained_edges` always use `probe`. Node overwrite scans
-old node IDs to find removals; retained-edge access describes the filtered
+`cardinality` and `retained_edges` always use `probe`. An `edge_ri` check
+also carries `probe`, where it reads the committed ids: `swept` when both
+endpoint checks of the edge use `scan` and both node types carry one
+`I32`, `I64` or `U32` `@key`, so the committed sets load while the source
+parses and each parse partition probes its own rows; `judged` otherwise,
+after every row is in. Either way the first missing endpoint in row order, `from` before `to`
+within a row, is the refusal. The node's `removal`
+says whether the committed ids an overwrite removes are found at all: `scan`,
+one projected scan of the committed id column, when a `retained_edges` check
+reads them; `none` when no planned check does. A node target whose committed
+table holds no rows removes nothing, so its plan carries neither the
+`retained_edges` checks nor the scan; a node target no edge type references,
+an edge overwrite, an append and a merge carry `none` as well. Under `none`
+no removed id is found, so the removed-id allowance of `write_max_bytes`
+charges nothing. Retained-edge access describes the filtered
 lookup in the incident edge table. Append and merge always use `probe`.
 
 The `FragmentWrite` row's `mode` pairs with its `adapter`: an overwrite writes

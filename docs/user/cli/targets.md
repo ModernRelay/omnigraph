@@ -209,9 +209,9 @@ credentials without rerouting existing operations.
 omnigraph access --target standalone --graph knowledge --branch main --json
 ```
 
-`access` reports your actor and permissions for direct and standalone graphs.
-Use `--branch` for branch permissions and `--target-branch` for create/merge
-permissions. JSON uses `protocol: 2` and `actor_id`; see
+`access` reports your actor and permissions for direct graphs and registered
+server targets; managed targets do not support this command. Use `--branch`
+for branch permissions and `--target-branch` for create/merge permissions. JSON uses `protocol: 2` and `actor_id`; see
 [access semantics](../operations/policy.md#learn-your-access) and [JSON protocols](../install.md#verify).
 
 ## Rename registrations and profiles
@@ -319,32 +319,32 @@ are refused. Alias `args` and `format` fields and positional arguments are unsup
 
 ## Upgrade from the old format
 
-There is no backward compatibility or config importer. Replace `connections` with `profiles`, flatten every `auth`
-to one provider object and remove `default_auth`. Change target `connection` to `profile` and
-`defaults.connection` to `defaults.profile`. Split identities into separate profiles and pin each target to
-its intended profile. For standalone identities, create separate targets, then
-install stored tokens again with `credentials set --target NAME --stdin`; the
-CLI never guesses which old named auth entry to reuse. Existing managed credential
-ownership and unfinished-operation evidence are preserved. Old fields, `--connection`,
-`--auth`, `config rename-auth`, `target register` and `login --register` are rejected.
-Use `login --create-profile NAME` for new profile setup. For the
-older target-only format, replace account targets with profiles and static login with `credentials set
---stdin`. Remove alias `args`/`format`, use `--as` for direct actors, and register remote endpoints. Never put
-plaintext credentials in YAML. Preserve old operator homes and unresolved journals; config replacement changes
-no graph data.
+For released **0.13 → 0.14**, follow the [upgrade checklist](../operations/upgrade-0.14.md)
+with paired YAML and commands. Old resource-binding `profiles` become `targets`;
+new profiles hold managed sign-in settings. There is no config importer.
 
-Before converting a file with an interrupted old-format server rename, finish
-`config recover-rename` with the previous CLI. The new CLI preserves incompatible
-journals and refuses; compatible managed-profile rename journals can still recover.
+For intermediate 0.14 formats, replace `connections`/account targets with profiles,
+target `connection` with `profile`, and `defaults.connection` with `defaults.profile`.
+Flatten each `auth` to one provider and remove `default_auth`. Split identities into
+separate profiles or server targets; reinstall stored server tokens with
+`credentials set --target NAME --stdin`. Use `login --create-profile NAME` for setup.
+Old `--connection`, `--auth`, `config rename-auth`, `target register` and
+`login --register` refuse. Remove alias `args`/`format`; use explicit `--as` for direct actors.
 
-Recover legacy folder lifecycle evidence explicitly:
+Preserve old homes and journals; config replacement changes no graph data. Finish
+interrupted old server renames with the previous CLI's `config recover-rename`.
+The new CLI refuses incompatible journals; compatible profile renames can recover.
+
+For version-2 folder contexts carrying an organization ID, recover lifecycle evidence:
 ```bash
 omnigraph config recover-operations --source /path/to/old-workspace --profile work --json
 ```
 
-It checks the profile's API and organization against the source's `.omnigraph`
-evidence, durably copies matching pending/accepted records to the operator home,
-then retires the originals. Conflicts refuse; preserve both copies. This neither
-converts config nor submits operations or imports arbitrary operator histories.
-Resume with the original verified principal and explicit original idempotency
-key; observe accepted operations by their IDs. Exclude older CLIs after migration.
+It verifies API/organization against `.omnigraph` evidence, durably copies matching
+pending/accepted records, then retires originals. Conflicts refuse; preserve both
+copies. It neither converts config nor submits operations. Resume with the original
+verified principal/key; observe accepted IDs. Exclude older CLIs after migration.
+
+The version-1 context shipped in 0.13 lacks an organization ID and is unsupported.
+Settle its pending/accepted work with the originating build before cutover; preserve
+identity, keys and journals. Never edit versions or invent identity fields to import.
