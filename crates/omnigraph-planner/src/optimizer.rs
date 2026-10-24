@@ -257,7 +257,8 @@ pub fn write_count_schema() -> SchemaRef {
 /// `match_text` in any filter (correlated blocks included), and `bm25` in the
 /// leading order key or either arm of an `rrf()` there. Planning checks each
 /// one's coverage (`require_full_text_indexes`) and acceptance requires the
-/// plan to record it.
+/// plan to record it. Block-local bindings stay within their lexical scope;
+/// nested blocks inherit their parent's bindings, never a sibling's locals.
 pub fn full_text_targets(ir: &QueryIR) -> Vec<(String, String)> {
     fn bindings(ops: &[IROp], out: &mut HashMap<String, String>) {
         for op in ops {
@@ -274,12 +275,11 @@ pub fn full_text_targets(ir: &QueryIR) -> Vec<(String, String)> {
                 } => {
                     out.insert(dst_var.clone(), dst_type.clone());
                 }
-                IROp::AntiJoin { inner, .. } => bindings(inner, out),
-                IROp::Filter(_) => {}
+                IROp::AntiJoin { .. } | IROp::Filter(_) => {}
             }
         }
     }
-    fn calls(expr: &IRExpr, out: &mut Vec<(String, String)>) {
+    fn calls(expr: &IRExpr, types: &HashMap<String, String>, out: &mut Vec<(String, String)>) {
         match expr {
             IRExpr::Search { field, .. }
             | IRExpr::Fuzzy { field, .. }
@@ -289,22 +289,27 @@ pub fn full_text_targets(ir: &QueryIR) -> Vec<(String, String)> {
                     variable, property, ..
                 } = field.as_ref()
                 {
-                    out.push((variable.clone(), property.clone()));
+                    if let Some(type_name) = types.get(variable) {
+                        let target = (type_name.clone(), property.clone());
+                        if !out.contains(&target) {
+                            out.push(target);
+                        }
+                    }
                 }
             }
             IRExpr::Rrf {
                 primary, secondary, ..
             } => {
-                calls(primary, out);
-                calls(secondary, out);
+                calls(primary, types, out);
+                calls(secondary, types, out);
             }
             IRExpr::Binary { left, right, .. } => {
-                calls(left, out);
-                calls(right, out);
+                calls(left, types, out);
+                calls(right, types, out);
             }
             IRExpr::Not(inner, _)
             | IRExpr::Cast { expr: inner, .. }
-            | IRExpr::IsNull { expr: inner, .. } => calls(inner, out),
+            | IRExpr::IsNull { expr: inner, .. } => calls(inner, types, out),
             IRExpr::PropAccess { .. }
             | IRExpr::Nearest { .. }
             | IRExpr::Variable(..)
@@ -314,34 +319,33 @@ pub fn full_text_targets(ir: &QueryIR) -> Vec<(String, String)> {
             | IRExpr::AliasRef(..) => {}
         }
     }
-    fn filter_calls(ops: &[IROp], out: &mut Vec<(String, String)>) {
+    fn filter_calls(
+        ops: &[IROp],
+        types: &HashMap<String, String>,
+        out: &mut Vec<(String, String)>,
+    ) {
         for op in ops {
             match op {
                 IROp::NodeScan { filters, .. }
                 | IROp::Expand {
                     dst_filters: filters,
                     ..
-                } => filters.iter().for_each(|filter| calls(filter, out)),
-                IROp::Filter(filter) => calls(filter, out),
-                IROp::AntiJoin { inner, .. } => filter_calls(inner, out),
+                } => filters.iter().for_each(|filter| calls(filter, types, out)),
+                IROp::Filter(filter) => calls(filter, types, out),
+                IROp::AntiJoin { inner, .. } => {
+                    let mut inner_types = types.clone();
+                    bindings(inner, &mut inner_types);
+                    filter_calls(inner, &inner_types, out);
+                }
             }
         }
     }
     let mut types = HashMap::new();
     bindings(&ir.pipeline, &mut types);
-    let mut variables = Vec::new();
-    filter_calls(&ir.pipeline, &mut variables);
+    let mut targets = Vec::new();
+    filter_calls(&ir.pipeline, &types, &mut targets);
     if let Some(leading) = ir.order_by.first() {
-        calls(&leading.expr, &mut variables);
-    }
-    let mut targets: Vec<(String, String)> = Vec::new();
-    for (variable, property) in variables {
-        if let Some(type_name) = types.get(&variable) {
-            let target = (type_name.clone(), property);
-            if !targets.contains(&target) {
-                targets.push(target);
-            }
-        }
+        calls(&leading.expr, &types, &mut targets);
     }
     targets
 }
