@@ -46,7 +46,13 @@ version. A probe first pays its key list, one entry per input row, so an
 unindexed endpoint check scans, and a partially or fully indexed table keeps
 `probe` only while the key list is small against it. Unknown counts and equal
 costs keep `probe`; statistics record `index_coverage` and both costs.
-`cardinality` and `retained_edges` always use `probe`. The node's `removal`
+`cardinality` and `retained_edges` always use `probe`. An `edge_ri` check
+also carries `probe`, where it reads the committed ids: `swept` when both
+endpoint checks of the edge use `scan` and both node types carry one
+`I32`, `I64` or `U32` `@key`, so the committed sets load while the source
+parses and each parse partition probes its own rows; `judged` otherwise,
+after every row is in. Either way the first missing endpoint in row order, `from` before `to`
+within a row, is the refusal. The node's `removal`
 says whether the committed ids an overwrite removes are found at all: `scan`,
 one projected scan of the committed id column, when a `retained_edges` check
 reads them; `none` when no planned check does. A node target whose committed

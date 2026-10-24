@@ -19,6 +19,7 @@ use omnigraph_compiler::catalog::Catalog;
 use omnigraph_planner::{ValidateRemoval, ValidateSpec};
 
 use futures::StreamExt;
+use tokio::sync::watch;
 
 use super::csv_source::{CsvSourceExec, FailedSlice, slice_of};
 use super::external;
@@ -30,10 +31,15 @@ use crate::loader::LoadMode;
 use crate::loader::read_reuse::LoadReadReuse;
 use crate::storage_layer::{DeletedIdBudget, WriteBudget};
 use crate::validate::load::{
-    Extracted, LoadAdmission, LoadPhase, SweepPartial, SweepPlan, int_keyed, judge_load_swept,
-    position,
+    AdmittedSets, Extracted, LoadAdmission, LoadPhase, SweepPartial, SweepPlan, SweptSets,
+    admit_swept_sets, int_keyed, judge_load_swept, parse_scratch_bytes, position,
 };
+use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::ir::ValidateCheck;
+
+/// The swept endpoint checks' key sets as the partitions receive them:
+/// `None` until the loader publishes, the sets once it has.
+type PublishedSets = watch::Receiver<Option<Arc<SweptSets>>>;
 
 /// The `validated_rows` metric: the delta rows the operator judged.
 pub(crate) const VALIDATED_ROWS: &str = "validated_rows";
@@ -157,9 +163,23 @@ impl ExecutionPlan for ValidateExec {
             memory,
             &self.metrics,
             move |memory| async move {
-                let (batches, partials, facts) =
-                    drain_and_sweep(inputs, &memory, source.as_ref(), &schema, &plan, &judge)
-                        .await?;
+                let admitted = admit_sets(&memory, &judge, &plan).await?;
+                let (publish, published) = watch::channel(None::<Arc<SweptSets>>);
+                let (drained, set_guards) = futures::join!(
+                    drain_and_sweep(
+                        inputs,
+                        &memory,
+                        source.as_ref(),
+                        &schema,
+                        &plan,
+                        &judge,
+                        published
+                    ),
+                    load_sets(Arc::clone(&memory), Arc::clone(&judge), admitted, publish)
+                );
+                let (_retained_sets, transient) = set_guards?;
+                let (batches, partials, facts) = drained?;
+                drop(transient);
                 let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
                 let extracted = merge_partials(&memory, &plan, &judge.table, partials).await?;
                 {
@@ -251,11 +271,13 @@ async fn drain_and_sweep(
     schema: &arrow_schema::SchemaRef,
     plan: &Arc<SweepPlan>,
     judge: &Arc<LoadJudge>,
+    published: PublishedSets,
 ) -> DfResult<(Vec<RecordBatch>, Vec<SweepPartial>, Vec<WorkMemory>)> {
     let drained = futures::future::join_all(inputs.into_iter().map(|input| {
         let plan = Arc::clone(plan);
         let judge = Arc::clone(judge);
-        memory.blocking(move |memory| sweep_partition(input, memory, plan, judge))
+        let published = published.clone();
+        memory.blocking(move |memory| sweep_partition(input, memory, plan, judge, published))
     }))
     .await;
     let mut batches = Vec::new();
@@ -308,20 +330,81 @@ async fn drain_and_sweep(
     Ok((batches, partials, facts))
 }
 
+/// The swept endpoint checks' key sets admitted on a worker before the drain
+/// starts, so a refused set precedes every partition's charge.
+async fn admit_sets(
+    memory: &Arc<WorkMemory>,
+    judge: &Arc<LoadJudge>,
+    plan: &SweepPlan,
+) -> DfResult<Option<AdmittedSets>> {
+    if !plan.sweeps_endpoints() {
+        return Ok(None);
+    }
+    let judge = Arc::clone(judge);
+    memory
+        .blocking(move |memory| async move {
+            let mut admit = |bytes: usize| -> crate::error::Result<Box<dyn Send>> {
+                let allocation = memory
+                    .child("load integer endpoint keys")
+                    .map_err(|error| memory.error(error))?;
+                allocation
+                    .grow(bytes)
+                    .map_err(|error| memory.error(error))?;
+                Ok(Box::new(allocation))
+            };
+            admit_swept_sets(
+                &judge.table,
+                &judge.checks,
+                &judge.snapshot,
+                judge.mode == LoadMode::Overwrite,
+                &mut admit,
+            )
+            .await
+            .map(Some)
+            .map_err(external)
+        })
+        .await
+}
+
+/// The admitted sets read on a worker beside the drain and published to every
+/// partition; the retained guards hold the sets until the judgment, the transient
+/// ones the caller releases after the drain. A failed read drops the sender.
+async fn load_sets(
+    memory: Arc<WorkMemory>,
+    judge: Arc<LoadJudge>,
+    admitted: Option<AdmittedSets>,
+    publish: watch::Sender<Option<Arc<SweptSets>>>,
+) -> DfResult<(Vec<Box<dyn Send>>, Vec<Box<dyn Send>>)> {
+    let Some(admitted) = admitted else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let system_columns = judge.catalog.system_columns;
+    let (sets, retained, transient) = memory
+        .blocking(move |_| async move { admitted.load(system_columns).await.map_err(external) })
+        .await?;
+    publish.send_replace(Some(Arc::new(sets)));
+    Ok((retained, transient))
+}
+
 /// One partition's input held and swept as it arrives: every batch is held
-/// under `memory`, its facts admitted under the returned child and extracted
-/// into the partial at the batch's position in its slice.
+/// under `memory`, its facts extracted at its position, and under a swept
+/// plan probed against the sets on arrival, or once the sets arrive.
 async fn sweep_partition(
     mut input: SendableRecordBatchStream,
     memory: Arc<WorkMemory>,
     plan: Arc<SweepPlan>,
     judge: Arc<LoadJudge>,
+    mut published: PublishedSets,
 ) -> DfResult<(Vec<RecordBatch>, SweepPartial, WorkMemory)> {
     let facts = memory.child("load validation facts")?;
     let mut partial = SweepPartial::new(&plan);
     let mut held = Vec::new();
     let mut slice = usize::MAX;
     let mut offset = 0_u64;
+    let system_columns = judge.catalog.system_columns;
+    let mut sets: Option<Arc<SweptSets>> = None;
+    let mut unprobed = Vec::new();
+    let mut scratch_rows = 0usize;
     while let Some(batch) = input.next().await {
         let batch = batch?;
         memory.metric("input_rows", batch.num_rows());
@@ -332,20 +415,83 @@ async fn sweep_partition(
             slice = tagged;
             offset = 0;
         }
+        let base = position(slice, offset);
         admit_validation(&facts, &judge, std::slice::from_ref(&batch))?;
         partial
-            .observe(
-                &plan,
-                &judge.catalog,
-                &batch,
-                judge.catalog.system_columns,
-                position(slice, offset),
-            )
+            .observe(&plan, &judge.catalog, &batch, system_columns, base)
             .map_err(external)?;
+        if plan.sweeps_endpoints() {
+            if sets.is_none() {
+                sets = published.borrow().clone();
+            }
+            match &sets {
+                Some(sets) => probe_batch(
+                    &facts,
+                    &mut partial,
+                    &plan,
+                    &batch,
+                    system_columns,
+                    base,
+                    sets,
+                    &mut scratch_rows,
+                )?,
+                None => unprobed.push((held.len(), base)),
+            }
+        }
         offset += batch.num_rows() as u64;
         held.push(batch);
     }
+    if !unprobed.is_empty() {
+        let sets = match sets {
+            Some(sets) => sets,
+            None => loop {
+                if let Some(sets) = published.borrow_and_update().clone() {
+                    break sets;
+                }
+                published.changed().await.map_err(|_| {
+                    external(OmniError::manifest_internal(
+                        "the swept endpoint key sets were not published",
+                    ))
+                })?;
+            },
+        };
+        for (index, base) in unprobed {
+            probe_batch(
+                &facts,
+                &mut partial,
+                &plan,
+                &held[index],
+                system_columns,
+                base,
+                &sets,
+                &mut scratch_rows,
+            )?;
+        }
+    }
     Ok((held, partial, facts))
+}
+
+/// Probe one held batch; the partition's parse scratch grows under `facts`
+/// to the largest batch it has probed.
+#[allow(clippy::too_many_arguments)]
+fn probe_batch(
+    facts: &WorkMemory,
+    partial: &mut SweepPartial,
+    plan: &SweepPlan,
+    batch: &RecordBatch,
+    system_columns: SystemColumns,
+    base: u64,
+    sets: &SweptSets,
+    scratch_rows: &mut usize,
+) -> DfResult<()> {
+    let rows = batch.num_rows();
+    if rows > *scratch_rows {
+        facts.grow(parse_scratch_bytes(rows - *scratch_rows).map_err(external)?)?;
+        *scratch_rows = rows;
+    }
+    partial
+        .probe_endpoints(plan, batch, system_columns, base, sets)
+        .map_err(external)
 }
 
 /// The partitions' partials joined, each unique shard merged on its own
@@ -542,7 +688,7 @@ mod tests {
     use omnigraph_compiler::query::ast::{LoadStmt, LoadStmtMode, LoadTarget};
     use omnigraph_compiler::schema::parser::parse_schema;
     use omnigraph_compiler::settings::SessionSettings;
-    use omnigraph_planner::{ConsultedImage, ValidateAccess, ValidateRemoval};
+    use omnigraph_planner::{ConsultedImage, EndpointProbe, ValidateAccess, ValidateRemoval};
 
     use super::super::csv_source::CSV_SLICE_METADATA;
     use super::super::fixtures;
@@ -636,6 +782,7 @@ mod tests {
                     version: None,
                 }),
                 check: check.check,
+                probe: None,
             })
             .collect();
         let judge = LoadJudge {
@@ -827,5 +974,306 @@ mod tests {
                 "{partitions} partitions: {error}"
             );
         }
+    }
+
+    const KEYED_GRAPH: &str = "node Person {\n  key: I64 @key\n}\nedge Knows: Person -> Person\n";
+
+    /// An edge batch of `slice`, the three system columns only.
+    fn knows_batch(sc: SystemColumns, slice: usize, rows: &[(&str, &str, &str)]) -> RecordBatch {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(CSV_SLICE_METADATA.to_string(), slice.to_string());
+        let schema = Arc::new(
+            arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new(sc.id, arrow_schema::DataType::Utf8, false),
+                arrow_schema::Field::new(sc.src, arrow_schema::DataType::Utf8, false),
+                arrow_schema::Field::new(sc.dst, arrow_schema::DataType::Utf8, false),
+            ])
+            .with_metadata(metadata),
+        );
+        let column = |pick: fn(&(&str, &str, &str)) -> String| -> ArrayRef {
+            Arc::new(StringArray::from_iter_values(rows.iter().map(pick)))
+        };
+        RecordBatch::try_new(
+            schema,
+            vec![
+                column(|row| row.0.to_string()),
+                column(|row| row.1.to_string()),
+                column(|row| row.2.to_string()),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// A partition's input: `batches`, then `ended` fires as the stream
+    /// closes, so a test can publish the key sets only after every row of
+    /// the partition is held.
+    fn partition_input(
+        batches: Vec<RecordBatch>,
+        ended: tokio::sync::oneshot::Sender<()>,
+    ) -> SendableRecordBatchStream {
+        let schema = batches[0].schema();
+        let stream = futures::stream::iter(batches.into_iter().map(Ok)).chain(
+            futures::stream::once(async move {
+                let _ = ended.send(());
+            })
+            .flat_map(|()| futures::stream::empty()),
+        );
+        Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
+    }
+
+    /// A graph of `KEYED_GRAPH` holding Persons 1, 2 and 3.
+    async fn keyed_graph(dir: &tempfile::TempDir) -> crate::Session {
+        let db = crate::Session::from_defaults(
+            Arc::new(
+                Omnigraph::init(dir.path().to_str().unwrap(), KEYED_GRAPH)
+                    .await
+                    .unwrap(),
+            ),
+            SessionSettings::default(),
+        );
+        db.load_jsonl(
+            "{\"type\":\"Person\",\"data\":{\"key\":1}}\n{\"type\":\"Person\",\"data\":{\"key\":2}}\n{\"type\":\"Person\",\"data\":{\"key\":3}}\n",
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap();
+        db
+    }
+
+    fn knows_request() -> CsvLoadRequest {
+        CsvLoadRequest {
+            source: "file:///knows.csv".to_string(),
+            target: LoadTarget::Edge("Knows".to_string()),
+            mode: LoadMode::Overwrite,
+            delimiter: b',',
+            header: true,
+            columns: None,
+        }
+    }
+
+    /// A `Knows` overwrite's checks under `catalog`, both endpoint checks swept.
+    fn swept_checks(catalog: &Catalog) -> Vec<ValidateSpec> {
+        let stmt = LoadStmt {
+            source: "file:///knows.csv".to_string(),
+            target: LoadTarget::Edge("Knows".to_string()),
+            mode: LoadStmtMode::Overwrite,
+            delimiter: b',',
+            header: true,
+            columns: None,
+        };
+        lower_load(catalog, &stmt)
+            .checks
+            .into_iter()
+            .map(|check| {
+                let swept = matches!(check.check, ValidateCheck::EdgeRi { .. });
+                ValidateSpec {
+                    access: Some(if check.consults.is_some() {
+                        ValidateAccess::Scan
+                    } else {
+                        ValidateAccess::Delta
+                    }),
+                    consults: check.consults.map(|table| ConsultedImage {
+                        table,
+                        version: None,
+                    }),
+                    check: check.check,
+                    probe: swept.then_some(EndpointProbe::Swept),
+                }
+            })
+            .collect()
+    }
+
+    fn knows_judge(db: &crate::Session, checks: &[ValidateSpec], snapshot: &Snapshot) -> LoadJudge {
+        LoadJudge {
+            db: Arc::clone(db.db()),
+            table: "edge:Knows".to_string(),
+            checks: checks.to_vec(),
+            removal: ValidateRemoval::None,
+            mode: LoadMode::Overwrite,
+            write_budget: WriteBudget::from_settings(db.settings()),
+            snapshot: snapshot.clone(),
+            catalog: db.catalog(),
+        }
+    }
+
+    /// The sets arrive after both partitions hold every batch, then before
+    /// the first: either way the refusal is the earliest miss in source
+    /// order, src before dst; a `.gqt` case cannot order loader and parse.
+    #[tokio::test]
+    async fn held_batches_are_probed_once_the_sets_arrive() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = keyed_graph(&dir).await;
+        let catalog = db.catalog();
+        let sc = catalog.system_columns;
+        let checks = swept_checks(&catalog);
+        let snapshot = db.snapshot().await;
+        let (sets, _retained, _transient) =
+            admit_swept_sets("edge:Knows", &checks, &snapshot, true, &mut |_| {
+                Ok(Box::new(()))
+            })
+            .await
+            .unwrap()
+            .load(sc)
+            .await
+            .unwrap();
+        let sets = Arc::new(sets);
+        let judge = Arc::new(knows_judge(&db, &checks, &snapshot));
+        let plan = Arc::new(SweepPlan::new("edge:Knows", &checks, true, 2));
+        assert!(plan.sweeps_endpoints());
+        let later_slice_missing_dst_at_row_1 = vec![
+            knows_batch(sc, 1, &[("e4", "3", "1"), ("e5", "2", "9")]),
+            knows_batch(sc, 1, &[("e6", "1", "1")]),
+        ];
+        let earlier_slice_missing_src_and_dst_at_row_2 = vec![
+            knows_batch(sc, 0, &[("e1", "1", "2"), ("e2", "2", "3")]),
+            knows_batch(sc, 0, &[("e3", "7", "8")]),
+        ];
+        for publish_first in [false, true] {
+            let (publish, published) = watch::channel(None::<Arc<SweptSets>>);
+            if publish_first {
+                publish.send_replace(Some(Arc::clone(&sets)));
+            }
+            let (_pool, ctx) = fixtures::context(64 << 20, CSV_READ_BATCH_ROWS);
+            let metrics = ExecutionPlanMetricsSet::new();
+            let memory = work(ctx, "ValidateExec", &metrics).unwrap();
+            let (ended_a, a_ended) = tokio::sync::oneshot::channel();
+            let (ended_b, b_ended) = tokio::sync::oneshot::channel();
+            let sweep = |batches: Vec<RecordBatch>, ended| {
+                let plan = Arc::clone(&plan);
+                let judge = Arc::clone(&judge);
+                let published = published.clone();
+                let memory = Arc::clone(&memory);
+                async move {
+                    memory
+                        .blocking(move |memory| {
+                            sweep_partition(
+                                partition_input(batches, ended),
+                                memory,
+                                plan,
+                                judge,
+                                published,
+                            )
+                        })
+                        .await
+                }
+            };
+            let publisher = async {
+                a_ended.await.unwrap();
+                b_ended.await.unwrap();
+                if !publish_first {
+                    publish.send_replace(Some(Arc::clone(&sets)));
+                }
+            };
+            let (a, b, ()) = futures::join!(
+                sweep(later_slice_missing_dst_at_row_1.clone(), ended_a),
+                sweep(earlier_slice_missing_src_and_dst_at_row_2.clone(), ended_b),
+                publisher
+            );
+            let (held_a, partial_a, _facts_a) = a.unwrap();
+            let (held_b, partial_b, _facts_b) = b.unwrap();
+            let extracted =
+                merge_partials(&memory, &plan, "edge:Knows", vec![partial_a, partial_b])
+                    .await
+                    .unwrap();
+            let held: Vec<RecordBatch> = held_b.into_iter().chain(held_a).collect();
+            let refused = judge_load_swept(
+                "edge:Knows",
+                &checks,
+                ValidateRemoval::None,
+                &catalog,
+                &snapshot,
+                LoadMode::Overwrite,
+                &held,
+                extracted,
+                &mut LoadAdmission {
+                    phase: None,
+                    bytes: None,
+                    reuse: None,
+                    removed: &mut |_| Ok(()),
+                    retained: &mut |_| Ok(()),
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(
+                refused.contains("'7' not found in Person"),
+                "publish_first={publish_first}: {refused}"
+            );
+        }
+    }
+
+    /// A budget the sets do not fit is refused before any partition is polled,
+    /// and the scan input and build scratch stay charged until the operator
+    /// releases them after the drain: a `.gqt` case sees one `actual` per replay.
+    #[tokio::test]
+    async fn the_sets_are_admitted_before_the_drain_and_released_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = keyed_graph(&dir).await;
+        let catalog = db.catalog();
+        let checks = swept_checks(&catalog);
+        let snapshot = db.snapshot().await;
+        let plan = Arc::new(SweepPlan::new("edge:Knows", &checks, true, 2));
+        let three_keys_scan_input = 3 * 8;
+        let three_keys_in_four_slots_retained = (4 + 1) * 8 + 3 * 8;
+        let four_slots_build_scratch = 4 * 8;
+        let whole_set =
+            three_keys_scan_input + three_keys_in_four_slots_retained + four_slots_build_scratch;
+
+        let exec = Arc::new(CsvSourceExec::new(
+            knows_request(),
+            capture("from,to\n1,2\n2,3\n3,1\n"),
+            Arc::clone(&catalog),
+            target_arrow_schema(&catalog, &LoadTarget::Edge("Knows".to_string())).unwrap(),
+            2,
+            64,
+        ));
+        let validate = ValidateExec::new(
+            Arc::clone(&exec) as Arc<dyn ExecutionPlan>,
+            knows_judge(&db, &checks, &snapshot),
+        );
+        let (_pool, ctx) = fixtures::context(whole_set - 1, CSV_READ_BATCH_ROWS);
+        let refused = validate
+            .execute(0, ctx)
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<DfResult<Vec<_>>>()
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("query_memory_bytes"), "{refused}");
+        let drained = validate
+            .metrics()
+            .and_then(|metrics| metrics.sum_by_name("input_rows"))
+            .map(|metric| metric.as_usize());
+        assert_eq!(
+            drained,
+            Some(0),
+            "no partition was polled before the sets were refused"
+        );
+        assert!(exec.executed_slices().is_empty());
+
+        let (pool, ctx) = fixtures::context(64 << 20, CSV_READ_BATCH_ROWS);
+        let metrics = ExecutionPlanMetricsSet::new();
+        let memory = work(ctx, "ValidateExec", &metrics).unwrap();
+        let judge = Arc::new(knows_judge(&db, &checks, &snapshot));
+        let before = pool.reserved();
+        let admitted = admit_sets(&memory, &judge, &plan).await.unwrap();
+        assert_eq!(pool.reserved() - before, whole_set);
+        let (publish, published) = watch::channel(None::<Arc<SweptSets>>);
+        let (retained, transient) = load_sets(Arc::clone(&memory), judge, admitted, publish)
+            .await
+            .unwrap();
+        assert!(published.borrow().is_some());
+        assert_eq!(
+            pool.reserved() - before,
+            whole_set,
+            "the scan input and build scratch stay charged until the operator releases them"
+        );
+        drop(transient);
+        assert_eq!(pool.reserved() - before, three_keys_in_four_slots_retained);
+        drop(retained);
+        assert_eq!(pool.reserved(), before);
     }
 }

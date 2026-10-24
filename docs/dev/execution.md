@@ -1026,10 +1026,15 @@ captured source, each claiming the next record-aligned 8 MiB slice and tagging
 its batches with the slice index), `ValidateExec` (a pipeline breaker that
 drains every input partition and sorts the held batches back into slice
 order: one pass over the held delta extracts what
-the value, uniqueness and cardinality checks need, the endpoint check reads the
-held batches' endpoint columns in place against each endpoint table's committed
-key set, then the checks are judged in refusal order against the committed
-image under each check's access) and DataFusion's `DataSinkExec`
+the value, uniqueness and cardinality checks need; the endpoint checks probe
+the batches' endpoint columns against each endpoint table's committed key set,
+on the parse partitions as the batches arrive when the plan marks them
+`swept` (both endpoints `scan` over node types keyed by one `I32`, `I64` or
+`U32` `@key`; the sets
+load on a worker beside the parse, once per table, and the merge keeps the
+earliest miss), in place over the held delta after the drain when it marks
+them `judged`; then the checks are judged in refusal order against the
+committed image under each check's access) and DataFusion's `DataSinkExec`
 over `LanceFragmentSink`, which stages the fragments through the mutation
 staging and never commits. The attempt then commits the staged transaction
 detached and publishes once, the epilogue every write shares. Append, merge

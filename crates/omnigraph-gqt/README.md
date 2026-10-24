@@ -669,6 +669,7 @@ load route: plan|pipeline
 load scan: partitions <n> fallback single_scan
 load validate unique <table> key|unique [<cols>]: access delta|probe|scan
 load validate edge_ri <edge-table> from|to <node-type>: access probe|scan
+load validate edge_ri <edge-table> from|to <node-type>: probe swept|judged
 load validate cardinality <edge-table> from <node-type>
 load validate retained_edges <node-table> <edge-table> from|to: access delta|probe|scan
 load validate removal <table>: scan|none
@@ -685,7 +686,11 @@ for `executor`.
 `load scan` claims the `CsvSource` node's partition count and its `single_scan`
 fallback.
 A `load validate` line claims one check of the `Validate` node with that
-identity, and its `access` suffix claims the check's access path.
+identity, and its `access` suffix claims the check's access path. An
+`edge_ri` line with a `probe` suffix claims where the check probes the
+committed ids: `swept`, on the parse partitions as the delta arrives, when
+both endpoint checks read their set whole (`scan`) over node types keyed by
+one `I32`, `I64` or `U32` `@key`; `judged`, after the drain, otherwise.
 `load validate removal` claims the node's `removal`: `scan` when the plan
 finds the committed ids an overwrite removes, `none` when no planned check
 reads them (an empty committed table, a node target no edge type references,

@@ -3194,6 +3194,127 @@ fn overwrite_removal_cost_rows(replay: &str) -> String {
     )
 }
 
+/// An edge `load csv` overwrite on a reopened handle, one label per `probe`
+/// the planner decides: `swept` (one integer-keyed type at both endpoints,
+/// one set read beside the parse) and `judged` (a text key, after the drain).
+fn endpoint_probe_cost_rows(replay: &str) -> String {
+    struct EndpointProbeCost;
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for EndpointProbeCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            use omnigraph::loader::CsvLoadRequest;
+            use omnigraph_compiler::query::ast::LoadTarget;
+
+            omnigraph_dst::cost::set_label("_endpoint_probe_setup");
+            let schema = "node Account { id: I64 @key } \
+                          node Person { id: String @key } \
+                          edge Pays: Account -> Account \
+                          edge Knows: Person -> Person";
+            let seed = [
+                r#"{"type":"Account","data":{"id":1}}"#,
+                r#"{"type":"Account","data":{"id":2}}"#,
+                r#"{"type":"Account","data":{"id":3}}"#,
+                r#"{"type":"Person","data":{"id":"p1"}}"#,
+                r#"{"type":"Person","data":{"id":"p2"}}"#,
+            ]
+            .join("\n");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    schema,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
+            drop(db);
+
+            let slug: String = resources
+                .root
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect();
+            let dir = std::env::temp_dir().join(format!("omnigraph-dst-{slug}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let dir = dir.canonicalize().unwrap();
+            for (name, text) in [
+                ("pays.csv", "from,to\n1,2\n2,3\n"),
+                ("knows.csv", "from,to\np1,p2\n"),
+            ] {
+                std::fs::write(dir.join(name), text).unwrap();
+            }
+            let base_url = format!("file://{}/", dir.to_str().unwrap().trim_end_matches('/'));
+            let policy = omnigraph::ExternalBlobPolicy::allow(vec![
+                omnigraph::ExternalBlobBase::new(
+                    &base_url,
+                    omnigraph::ExternalBlobExecutionScope::EmbeddedOnly,
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+            let db = session(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap()
+                    .with_external_blob_policy(policy)
+                    .unwrap(),
+            );
+            let request = |file: &str, target: &str| CsvLoadRequest {
+                source: format!("{base_url}{file}"),
+                target: LoadTarget::Edge(target.to_string()),
+                mode: LoadMode::Overwrite,
+                delimiter: b',',
+                header: true,
+                columns: None,
+            };
+            let probes = |receipt: &omnigraph::loader::LoadReceipt| -> Vec<String> {
+                receipt.plan.as_ref().unwrap().to_value()["physical_plan"]["inputs"][0]["checks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|check| check["check"] == "edge_ri")
+                    .map(|check| check["probe"].as_str().unwrap().to_string())
+                    .collect()
+            };
+
+            omnigraph_dst::cost::set_label("EndpointProbeSwept");
+            let pays = db
+                .load_csv_as_with_receipt("main", &request("pays.csv", "Pays"), None)
+                .await;
+            omnigraph_dst::cost::set_label("_endpoint_probe_verify");
+            let pays = pays.unwrap();
+            assert_eq!(probes(&pays), ["swept", "swept"]);
+            assert_eq!(pays.result.edges_loaded["Pays"], 2);
+
+            omnigraph_dst::cost::set_label("EndpointProbeJudged");
+            let knows = db
+                .load_csv_as_with_receipt("main", &request("knows.csv", "Knows"), None)
+                .await;
+            omnigraph_dst::cost::set_label("_endpoint_probe_verify");
+            let knows = knows.unwrap();
+            assert_eq!(probes(&knows), ["judged", "judged"]);
+            assert_eq!(knows.result.edges_loaded["Knows"], 1);
+            assert_eq!(count_rows(&db, "edge:Pays").await, 2);
+            assert_eq!(count_rows(&db, "edge:Knows").await, 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    labeled_cost_rows_of(
+        format!("shared-memory://dst-endpoint-probe-cost-{replay}"),
+        &EndpointProbeCost,
+        &["EndpointProbeSwept", "EndpointProbeJudged"],
+    )
+}
+
 /// Storage calls per op kind plus reopened merge-history, branch-write, diff,
 /// commit-list and overwrite scenarios, replayed identically and compared with
 /// `cost_table.txt` (DST_REGEN_COSTS=1 to regen).
@@ -3217,6 +3338,7 @@ fn dst_bench_cost_count_golden() {
     table.push_str(&commit_list_cost_rows("a"));
     table.push_str(&writer_buffer_cost_rows("a"));
     table.push_str(&overwrite_removal_cost_rows("a"));
+    table.push_str(&endpoint_probe_cost_rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-b", &sc);
     let mut table2 = ledger2.render_calls();
@@ -3227,6 +3349,7 @@ fn dst_bench_cost_count_golden() {
     table2.push_str(&commit_list_cost_rows("b"));
     table2.push_str(&writer_buffer_cost_rows("b"));
     table2.push_str(&overwrite_removal_cost_rows("b"));
+    table2.push_str(&endpoint_probe_cost_rows("b"));
     assert_eq!(
         table, table2,
         "the counting pass must replay identically before any golden claim"

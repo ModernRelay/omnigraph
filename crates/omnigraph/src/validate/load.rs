@@ -8,21 +8,22 @@
 use std::collections::{HashMap, HashSet};
 
 use arrow_array::{Array, RecordBatch, StringArray};
+use lance::Dataset;
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::{Catalog, EdgeType};
 use omnigraph_compiler::ir::{Endpoint, ValidateCheck};
 use omnigraph_compiler::types::ScalarType;
-use omnigraph_planner::{ValidateAccess, ValidateRemoval, ValidateSpec};
+use omnigraph_planner::{EndpointProbe, ValidateAccess, ValidateRemoval, ValidateSpec};
 
 use super::kernels::{
     CardPlan, FinalKeys, FirstHolders, Position, UniqueImage, UniquePartial, card_affected,
     card_violations, merge_unique_image, merge_unique_shard, orphan_violation, orphans_retained,
     unique_coalesced_dups, unique_committed_collisions, unique_probe_keys,
 };
-use super::key_set::{IntKeySet, canonical_i64, key_bytes};
+use super::key_set::{IntKeySet, IntKeySetLayout, canonical_i64, key_bytes};
 use super::{
     AccessPath, CommittedState, TableChange, Violation, integer_capacity_error,
-    overwrite_removed_ids, string_col, value_violation,
+    overwrite_removed_ids, scan_int_ids, string_col, value_violation,
 };
 use crate::db::Snapshot;
 use crate::error::{OmniError, Result};
@@ -188,6 +189,10 @@ pub(crate) async fn judge_load_swept(
                     continue;
                 }
                 edge_ri_judged = true;
+                if spec.probe == Some(EndpointProbe::Swept) {
+                    first.refuse(extracted.orphan.take())?;
+                    continue;
+                }
                 let edge_type = edge_type_of(catalog, table)?;
                 let access_of = |wanted: Endpoint| -> Result<AccessPath> {
                     let spec = checks
@@ -313,7 +318,8 @@ pub(crate) fn position(slice: usize, row: u64) -> Position {
 }
 
 /// What the sweep extracts, read off the checks once: which facts a
-/// partition keeps and the shards its unique holders split into.
+/// partition keeps, the shards its unique holders split into, and the
+/// endpoints it probes when the plan sweeps the edge's endpoint checks.
 pub(crate) struct SweepPlan {
     table: String,
     needs_value: bool,
@@ -322,6 +328,14 @@ pub(crate) struct SweepPlan {
     unique: Vec<(usize, Vec<String>)>,
     input_only: bool,
     shards: usize,
+    /// The swept endpoint checks, `From` before `To`, so a row whose src and
+    /// dst both miss reports its src as [`first_orphan`] does.
+    endpoints: Vec<SweptEndpoint>,
+}
+
+struct SweptEndpoint {
+    endpoint: Endpoint,
+    node_type: String,
 }
 
 impl SweepPlan {
@@ -333,6 +347,21 @@ impl SweepPlan {
         overwrite: bool,
         shards: usize,
     ) -> Self {
+        let mut endpoints: Vec<SweptEndpoint> = checks
+            .iter()
+            .filter(|spec| spec.probe == Some(EndpointProbe::Swept))
+            .filter_map(|spec| match &spec.check {
+                ValidateCheck::EdgeRi {
+                    endpoint,
+                    node_type,
+                } => Some(SweptEndpoint {
+                    endpoint: *endpoint,
+                    node_type: node_type.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        endpoints.sort_by_key(|swept| swept.endpoint != Endpoint::From);
         Self {
             table: table.to_string(),
             needs_value: checks
@@ -354,7 +383,107 @@ impl SweepPlan {
                 .collect(),
             input_only: overwrite,
             shards: shards.max(1),
+            endpoints,
         }
+    }
+
+    /// Whether the partitions probe the endpoint checks as they sweep.
+    pub(crate) fn sweeps_endpoints(&self) -> bool {
+        !self.endpoints.is_empty()
+    }
+}
+
+/// The committed integer key sets the swept endpoint checks probe, one per
+/// node type, loaded beside the parse and shared by every partition.
+pub(crate) struct SweptSets {
+    sets: HashMap<String, IntKeySet>,
+}
+
+/// The bytes a partition's probe scratch grows by to parse `rows` more
+/// integer keys per batch than it has room for.
+pub(crate) fn parse_scratch_bytes(rows: usize) -> Result<usize> {
+    key_bytes(rows).ok_or_else(|| integer_capacity_error(rows))
+}
+
+/// The sets the plan's swept endpoint checks probe, admitted but not yet
+/// read: one committed table per distinct endpoint node type with its row
+/// count, the judged route's read (`CommittedState::existing_int_keys` under
+/// `Scan`) once per table instead of once per endpoint. Every byte of the
+/// read is admitted here, before the parse starts, and the scan and build
+/// scratch stay admitted in `transient` until the caller releases them after
+/// the parse, so the loader never moves the pool while a partition charges
+/// it: a refusal's `actual` replays the same under DST.
+pub(crate) struct AdmittedSets {
+    tables: Vec<(String, Option<Dataset>, usize)>,
+    retained: Vec<Box<dyn Send>>,
+    transient: Vec<Box<dyn Send>>,
+}
+
+/// Admit the swept endpoint key sets of `table`'s load: the input, retained
+/// and build scratch bytes of each distinct endpoint table's row count.
+pub(crate) async fn admit_swept_sets(
+    table: &str,
+    checks: &[ValidateSpec],
+    base: &Snapshot,
+    overwrite: bool,
+    admit: &mut ByteAdmission<'_>,
+) -> Result<AdmittedSets> {
+    let committed = CommittedState {
+        committed: Some(base),
+        overwritten: overwrite.then(|| table.to_string()).into_iter().collect(),
+        live: None,
+    };
+    let mut admitted = AdmittedSets {
+        tables: Vec::new(),
+        retained: Vec::new(),
+        transient: Vec::new(),
+    };
+    for spec in checks {
+        let ValidateCheck::EdgeRi { node_type, .. } = &spec.check else {
+            continue;
+        };
+        if spec.probe != Some(EndpointProbe::Swept)
+            || admitted
+                .tables
+                .iter()
+                .any(|(table, _, _)| table == node_type)
+        {
+            continue;
+        }
+        let ds = committed.open(&format!("node:{node_type}")).await?;
+        let rows = match &ds {
+            Some(ds) => ds.count_rows(None).await.map_err(OmniError::storage)?,
+            None => 0,
+        };
+        let layout = IntKeySetLayout::new(rows).ok_or_else(|| integer_capacity_error(rows))?;
+        admitted.transient.push(admit(
+            key_bytes(rows).ok_or_else(|| integer_capacity_error(rows))?,
+        )?);
+        admitted.retained.push(admit(layout.retained_bytes)?);
+        admitted.transient.push(admit(layout.scratch_bytes)?);
+        admitted.tables.push((node_type.clone(), ds, rows));
+    }
+    Ok(admitted)
+}
+
+impl AdmittedSets {
+    /// Read and build every admitted set; the retained guards hold the sets'
+    /// bytes, the transient ones the scan input and build scratch.
+    pub(crate) async fn load(
+        self,
+        system_columns: SystemColumns,
+    ) -> Result<(SweptSets, Vec<Box<dyn Send>>, Vec<Box<dyn Send>>)> {
+        let mut sets = HashMap::new();
+        for (node_type, ds, bound) in self.tables {
+            let mut keys = Vec::with_capacity(bound);
+            if let Some(ds) = ds.filter(|_| bound > 0) {
+                scan_int_ids(&ds, system_columns.id, &mut keys, bound).await?;
+            }
+            let layout = IntKeySetLayout::new(keys.len())
+                .ok_or_else(|| integer_capacity_error(keys.len()))?;
+            sets.insert(node_type, IntKeySet::build(&keys, layout));
+        }
+        Ok((SweptSets { sets }, self.retained, self.transient))
     }
 }
 
@@ -368,6 +497,10 @@ pub(crate) struct SweepPartial {
     ids: HashSet<String>,
     unique: Vec<UniquePartial>,
     card: HashMap<String, (Position, String)>,
+    /// The earliest endpoint miss among the partition's rows, when the plan
+    /// sweeps the endpoint checks.
+    orphan: Option<(Position, Violation)>,
+    parsed: Vec<i64>,
 }
 
 impl SweepPartial {
@@ -381,7 +514,59 @@ impl SweepPartial {
                 .map(|_| UniquePartial::new(plan.input_only, plan.shards))
                 .collect(),
             card: HashMap::new(),
+            orphan: None,
+            parsed: Vec::new(),
         }
+    }
+
+    /// Probe `batch`'s swept endpoints against `sets`, keeping the earliest
+    /// miss: row order, src before dst within a row, as [`first_orphan`]
+    /// reports it over the whole delta. `base` is the batch's first row.
+    pub(crate) fn probe_endpoints(
+        &mut self,
+        plan: &SweepPlan,
+        batch: &RecordBatch,
+        system_columns: SystemColumns,
+        base: Position,
+        sets: &SweptSets,
+    ) -> Result<()> {
+        let mut miss: Option<(Position, Violation)> = None;
+        for swept in &plan.endpoints {
+            let column = match swept.endpoint {
+                Endpoint::From => system_columns.src,
+                Endpoint::To => system_columns.dst,
+            };
+            let keys = sets.sets.get(&swept.node_type).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "swept endpoint check on {} has no loaded key set",
+                    swept.node_type
+                ))
+            })?;
+            let values = string_col(batch, column)?;
+            let Some(row) = first_int_miss(keys, values, &mut self.parsed) else {
+                continue;
+            };
+            let position = base.saturating_add(row as Position);
+            if miss.as_ref().is_none_or(|(at, _)| position < *at) {
+                let ids = string_col(batch, system_columns.id)?;
+                miss = Some((
+                    position,
+                    orphan_violation(
+                        &plan.table,
+                        ids.value(row),
+                        column,
+                        values.value(row),
+                        &swept.node_type,
+                    ),
+                ));
+            }
+        }
+        if let Some((position, violation)) = miss
+            && self.orphan.as_ref().is_none_or(|(at, _)| position < *at)
+        {
+            self.orphan = Some((position, violation));
+        }
+        Ok(())
     }
 
     /// Extract `batch`, whose first row sits at `base`; the partition's
@@ -460,6 +645,7 @@ pub(crate) struct Merging {
     ids: HashSet<String>,
     card: HashMap<String, String>,
     unique: Vec<UniqueMerge>,
+    orphan: Option<Violation>,
 }
 
 impl Merging {
@@ -485,6 +671,7 @@ impl Merging {
             ids: self.ids,
             unique,
             card: self.card,
+            orphan: self.orphan,
         }
     }
 }
@@ -502,6 +689,9 @@ pub(crate) struct Extracted {
     unique: HashMap<usize, (UniqueImage, Option<Violation>)>,
     /// Last-wins src per edge id, when a cardinality check reads it.
     card: HashMap<String, String>,
+    /// The first endpoint miss of the delta, when the plan swept the
+    /// endpoint checks on the partitions.
+    orphan: Option<Violation>,
 }
 
 impl Extracted {
@@ -552,7 +742,13 @@ impl Extracted {
             .iter()
             .map(|(check, _)| (*check, Vec::new(), None))
             .collect();
+        let mut orphan: Option<(Position, Violation)> = None;
         for partial in partials {
+            if let Some((position, violation)) = partial.orphan
+                && orphan.as_ref().is_none_or(|(at, _)| position < *at)
+            {
+                orphan = Some((position, violation));
+            }
             if partial.value.len() > value.len() {
                 value.resize(partial.value.len(), None);
             }
@@ -607,6 +803,7 @@ impl Extracted {
                 ids,
                 card: card.into_iter().map(|(id, (_, src))| (id, src)).collect(),
                 unique,
+                orphan: orphan.map(|(_, violation)| violation),
             },
             jobs,
         )
@@ -741,30 +938,35 @@ impl EndpointKeys {
     /// column into `parsed` first, so the probes run as independent loads.
     fn first_miss(&self, column: &StringArray, parsed: &mut Vec<i64>) -> Option<usize> {
         match self {
-            Self::Int { keys, .. } => {
-                parsed.clear();
-                let mut unparsed = None;
-                for row in 0..column.len() {
-                    let key = (!column.is_null(row))
-                        .then(|| canonical_i64(column.value(row)))
-                        .flatten();
-                    match key {
-                        Some(key) => parsed.push(key),
-                        None => {
-                            unparsed = Some(row);
-                            break;
-                        }
-                    }
-                }
-                parsed
-                    .iter()
-                    .position(|&key| !keys.contains(key))
-                    .or(unparsed)
-            }
+            Self::Int { keys, .. } => first_int_miss(keys, column, parsed),
             Self::Text(ids) => (0..column.len())
                 .find(|&row| column.is_null(row) || !ids.contains(column.value(row))),
         }
     }
+}
+
+/// The first row of `column` naming no committed integer key: a null or a
+/// non-canonical spelling misses. The column is parsed into `parsed` first,
+/// so the probes run as independent loads.
+fn first_int_miss(keys: &IntKeySet, column: &StringArray, parsed: &mut Vec<i64>) -> Option<usize> {
+    parsed.clear();
+    let mut unparsed = None;
+    for row in 0..column.len() {
+        let key = (!column.is_null(row))
+            .then(|| canonical_i64(column.value(row)))
+            .flatten();
+        match key {
+            Some(key) => parsed.push(key),
+            None => {
+                unparsed = Some(row);
+                break;
+            }
+        }
+    }
+    parsed
+        .iter()
+        .position(|&key| !keys.contains(key))
+        .or(unparsed)
 }
 
 pub(crate) fn int_keyed(catalog: &Catalog, node_type: &str) -> bool {
@@ -969,6 +1171,7 @@ mod tests {
                     version: None,
                 }),
                 check: check.check,
+                probe: None,
             })
             .collect()
     }

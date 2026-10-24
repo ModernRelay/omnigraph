@@ -565,3 +565,142 @@ fn endpoint_access_costs_the_consulted_table_and_index_coverage() {
         }
     }
 }
+
+/// The endpoint checks probe on the parse partitions only when both read
+/// their set whole over a one-integer `@key`; a probe access or a text key
+/// keeps the judged route, and the decision is recorded with its inputs.
+#[test]
+fn endpoint_probe_is_swept_only_for_scan_over_integer_keys() {
+    use omnigraph_planner::{EndpointProbe, FragmentCoverage, IndexFact, IndexKind, NodeTypeSpec};
+
+    let input_rows = 10_000;
+    let op = operation(
+        LoadTarget::Edge("Knows".into()),
+        LoadStmtMode::Overwrite,
+        input_rows * 6,
+    );
+    for (key, rows, expected_access, expected_probe) in [
+        (
+            "I64",
+            Some(1_000),
+            ValidateAccess::Scan,
+            EndpointProbe::Swept,
+        ),
+        (
+            "I32",
+            Some(1_000),
+            ValidateAccess::Scan,
+            EndpointProbe::Swept,
+        ),
+        (
+            "String",
+            Some(1_000),
+            ValidateAccess::Scan,
+            EndpointProbe::Judged,
+        ),
+        (
+            "I64",
+            Some(100_000_000),
+            ValidateAccess::Probe,
+            EndpointProbe::Judged,
+        ),
+    ] {
+        let schema = parse_schema(&format!("node Person {{ id: {key} @key }}")).unwrap();
+        let catalog = build_catalog(&schema).unwrap();
+        let node = catalog.node_types.get("Person").unwrap();
+        let source = source()
+            .with_node_type(
+                "Person",
+                NodeTypeSpec {
+                    table: side("node:Person", 7).table,
+                    version: Some(7),
+                    columns: SYSTEM_COLUMNS_V3,
+                    schema: node.arrow_schema.clone(),
+                    key: node.key.clone().unwrap_or_default(),
+                    object_columns: node
+                        .node_object_fields()
+                        .map(|f| f.name().clone())
+                        .collect(),
+                    object_fields: node
+                        .node_object_members()
+                        .map(|(member, field)| {
+                            Field::new(member, field.data_type().clone(), field.is_nullable())
+                        })
+                        .collect(),
+                    row_count: rows,
+                },
+            )
+            .with_index_facts(
+                "node:Person",
+                vec![IndexFact {
+                    name: "id_index".into(),
+                    column: SYSTEM_COLUMNS_V3.id.into(),
+                    kind: IndexKind::Btree { usable: true },
+                    coverage: Some(FragmentCoverage {
+                        covered: 1,
+                        total: 1,
+                    }),
+                }],
+            );
+        let Decision::Engine { plan, explain, .. } =
+            route(&op, &source, RouteOverride::Registry, &BOUNDS)
+        else {
+            panic!("overwrite routes to the engine")
+        };
+        let [PhysicalNode::Validate { checks, .. }] = chain(&plan)
+            .into_iter()
+            .filter(|node| matches!(node, PhysicalNode::Validate { .. }))
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("one validation per load plan");
+        };
+        let endpoints: Vec<(ValidateAccess, Option<EndpointProbe>)> = checks
+            .iter()
+            .filter(|spec| spec.check.name() == "edge_ri")
+            .map(|spec| (spec.access.unwrap(), spec.probe))
+            .collect();
+        assert_eq!(
+            endpoints,
+            [
+                (expected_access, Some(expected_probe)),
+                (expected_access, Some(expected_probe))
+            ],
+            "key={key}, rows={rows:?}"
+        );
+        assert!(
+            checks
+                .iter()
+                .filter(|spec| spec.check.name() != "edge_ri")
+                .all(|spec| spec.probe.is_none()),
+            "only edge_ri checks carry a probe"
+        );
+        let document = explain.to_value();
+        let validation = &document["physical_plan"]["inputs"][0];
+        let probes: Vec<&str> = validation["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|check| check["probe"].as_str())
+            .collect();
+        assert_eq!(
+            probes,
+            [expected_probe.as_str(), expected_probe.as_str()],
+            "key={key}, rows={rows:?}"
+        );
+        let decision = explain
+            .statistics
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|stat| stat.statistic == "endpoint_probe")
+            .expect("the probe decision is recorded");
+        assert_eq!(decision.value, expected_probe.as_str());
+        let origin: serde_json::Value = serde_json::from_str(&decision.origin).unwrap();
+        assert_eq!(origin["endpoints"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            origin["endpoints"][0]["integer_key"],
+            key != "String",
+            "key={key}"
+        );
+    }
+}
