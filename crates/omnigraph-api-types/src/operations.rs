@@ -216,7 +216,10 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         "/graphs",
         Capability::Read,
         Some("listGraphs"),
-        Surface::bound(&["graphs"]),
+        Surface::restricted(
+            &["graphs"],
+            "A static or signed bearer credential gets this listing.",
+        ),
         Surface::restricted(&["graphs list"], "Ordinary listing, without --discovery."),
     ),
     operation(
@@ -225,8 +228,9 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         "/graphs/discovery",
         Capability::Read,
         Some("discoverGraphs"),
-        Surface::absent(
-            "MCP graphs uses the ordinary authorized listing, not identity-only discovery.",
+        Surface::restricted(
+            &["graphs"],
+            "An identity credential gets this discovery shape.",
         ),
         Surface::restricted(
             &["graphs list"],
