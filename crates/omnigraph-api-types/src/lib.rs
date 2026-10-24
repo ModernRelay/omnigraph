@@ -2544,8 +2544,8 @@ pub struct FullTextIndexRebuildRequiredOutput {
 /// A full-text call read a declared full-text index that has no segment at
 /// the query's snapshot (HTTP 409), so no segment carries its analyzer. This
 /// is not a retryable conflict: an operator builds the branch's index
-/// (`omnigraph optimize` on main, `omnigraph rebuild-full-text-indexes
-/// --branch` elsewhere). Historical snapshots stay unchanged.
+/// (`omnigraph index build --branch <branch>`). Historical snapshots stay
+/// unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct FullTextIndexRequiredOutput {
     /// The index's property as `Type.property`.

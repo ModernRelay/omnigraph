@@ -133,7 +133,7 @@ exit follows from the disposition:
 | 75 | `effects: none` with `retry`: the server refused before starting, as when the actor is busy. Honor `Retry-After` and bound any caller retry. |
 | 64 | The argument parser refused the command line before anything ran (`EX_USAGE`); an addressing refusal inside a command, such as two scope flags, exits 1. |
 
-Maintenance commands (`init`, `upgrade`, `optimize`, `rebuild-full-text-indexes`,
+Maintenance commands (`init`, `upgrade`, `optimize`, `index build`, `index rebuild`,
 `repair`, `cleanup`, `schema upgrade-system-columns`), `cluster`, `policy`,
 `target`, `credential` and the managed commands keep their own exits for now:
 their exit 1 does not by itself say that nothing changed, so read their report.
@@ -191,8 +191,8 @@ A `409` is not one universal retry signal:
 - A full-text index with no part at the query's snapshot includes
   `full_text_index_required: { "index": "Type.property" }` with
   `code: "conflict"`. It persists until the branch's index is built
-  (`omnigraph optimize` on `main`, `omnigraph rebuild-full-text-indexes
-  --branch <branch>` elsewhere); do not retry the same query. See
+  (`omnigraph index build --target <target> --branch <branch>`); do not retry
+  the same query. See
   [Search indexes](../search/index.md#indexes).
 - “Already initialized” means the target already contains a graph. Choose a new
   root or deliberately use the command's destructive option when appropriate.
@@ -248,7 +248,7 @@ See [Operating a cluster](../clusters/index.md).
 
 ## Maintenance failures
 
-If `optimize`, `repair`, `cleanup`, `rebuild-full-text-indexes` or `upgrade` cannot
+If `optimize`, `index build`, `index rebuild`, `repair`, `cleanup` or `upgrade` cannot
 write or flush its output, the CLI returns a failure without repeating the
 operation. An output failure does not undo completed work. Inspect the graph's
 state before another attempt; for an interrupted upgrade, follow the

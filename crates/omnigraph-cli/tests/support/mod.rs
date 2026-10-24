@@ -1668,6 +1668,7 @@ pub fn parity_accepts_actor(args: &[&str]) -> bool {
         (args.first().copied(), args.get(1).copied()),
         (Some("branch"), Some("create" | "delete" | "merge"))
             | (Some("blob"), Some("put" | "clear"))
+            | (Some("index"), Some("build" | "rebuild"))
             | (Some("commit"), Some("publish" | "drop"))
             | (Some("schema"), Some("apply"))
             | (Some("cluster"), Some("plan" | "apply" | "upgrade-ledger"))

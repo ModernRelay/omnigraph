@@ -554,7 +554,7 @@ fn dst_sessions_agree_and_replay() {
 #[test]
 #[serial]
 fn dst_maintenance_commit_uses_execution_branch() {
-    for (seed, write, op) in [(228_301, 84, 13), (228_317, 84, 9)] {
+    for (seed, write, op) in [(228_301, 84, 13), (228_317, 95, 9)] {
         let report = run_universe(
             &format!("shared-memory://dst-maintenance-commit-{seed}"),
             &Scenario {

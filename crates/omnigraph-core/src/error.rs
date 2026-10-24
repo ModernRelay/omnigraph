@@ -265,6 +265,17 @@ fn format_merge_conflicts(conflicts: &[MergeConflict]) -> String {
         .join("; ")
 }
 
+/// The command that builds a branch's missing declared indexes, as errors and
+/// reports name it. `<target>` and `<branch>` are placeholders; the CLI
+/// parses every remedy command with them filled in.
+pub const INDEX_BUILD_COMMAND: &str = "omnigraph index build --target <target> --branch <branch>";
+
+/// The command that rebuilds a branch's full-text indexes from its rows with
+/// the engine's analyzer, as errors and reports name it; placeholders as in
+/// [`INDEX_BUILD_COMMAND`].
+pub const FULL_TEXT_REBUILD_COMMAND: &str =
+    "omnigraph index rebuild --kind full-text --target <target> --branch <branch>";
+
 #[derive(Debug, Error)]
 pub enum OmniError {
     /// Operation-local completion evidence. Composing callers must discard
@@ -287,7 +298,8 @@ pub enum OmniError {
     /// be proven compatible. Ordinary reads remain available; do not return a
     /// partial indexed result or infer provenance from the dataset writer.
     #[error(
-        "full-text index '{index}' requires rebuild: {reason}; run omnigraph rebuild-full-text-indexes <URI> --branch <branch> on the live branch (historical snapshots are unchanged)"
+        "full-text index '{index}' requires rebuild: {reason}; run {remedy} on the live branch (historical snapshots are unchanged)",
+        remedy = FULL_TEXT_REBUILD_COMMAND
     )]
     FullTextIndexRebuildRequired { index: String, reason: String },
     /// A full-text call reads a declared full-text index that has no segment
@@ -296,7 +308,8 @@ pub enum OmniError {
     /// before any scan rather than answered differently; `index` is
     /// `Type.property`.
     #[error(
-        "full-text index '{index}' has no segment at this snapshot; build it with omnigraph optimize <URI> on main or omnigraph rebuild-full-text-indexes <URI> --branch <branch> (historical snapshots are unchanged)"
+        "full-text index '{index}' has no segment at this snapshot; build it with {remedy} (historical snapshots are unchanged)",
+        remedy = INDEX_BUILD_COMMAND
     )]
     FullTextIndexRequired { index: String },
     /// The exact staged-commit adapter proved that Lance contention was

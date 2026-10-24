@@ -148,8 +148,8 @@ full-text queries until the selected indexes have been rebuilt.
 4. Use the new operator CLI to rebuild each branch on the inventory checklist:
 
    ```bash
-   omnigraph rebuild-full-text-indexes --target ./graph.omni --branch main --as operator --json
-   omnigraph rebuild-full-text-indexes --target ./graph.omni --branch review --as operator --json
+   omnigraph index rebuild --kind full-text --target ./graph.omni --branch main --as operator --json
+   omnigraph index rebuild --kind full-text --target ./graph.omni --branch review --as operator --json
    ```
 
    `--as` is optional actor attribution, not server-policy authorization. Inspect

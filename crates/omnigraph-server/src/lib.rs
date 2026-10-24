@@ -1981,7 +1981,11 @@ mod api_error_tests {
         let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
         assert_eq!(error.code, Some(ErrorCode::Conflict));
         assert!(error.error.contains("requires rebuild"));
-        assert!(error.error.contains("rebuild-full-text-indexes"));
+        assert!(
+            error
+                .error
+                .contains("omnigraph index rebuild --kind full-text")
+        );
         let details = error.full_text_index_rebuild_required.unwrap();
         assert_eq!(details.index, "title_idx");
         assert_eq!(details.reason, "analyzer certificate is missing");
@@ -2017,7 +2021,7 @@ mod api_error_tests {
         assert_eq!(error.code, Some(ErrorCode::Conflict));
         assert!(error.error.contains("has no segment"), "{}", error.error);
         assert!(
-            error.error.contains("rebuild-full-text-indexes"),
+            error.error.contains("omnigraph index build"),
             "{}",
             error.error
         );

@@ -193,7 +193,7 @@ destination line. Legacy `--server`, `--store`, `--cluster`,
 | Data | `query`, `mutate`, `load --mode overwrite\|append\|merge`, `branch`, `commit`, `snapshot`, `export`, `blob`, `diff`, `changes`; direct or served targets |
 | Managed data | `graphs list` and common served graph commands, subject to endpoint capabilities and policy; no direct maintenance fallback |
 | Direct schema | `schema plan`; `schema apply` and `schema upgrade-system-columns` require standalone graph targets |
-| Direct maintenance | `optimize`, `repair`, `cleanup`, `rebuild-full-text-indexes`; `upgrade --target ADDRESS` is standalone and offline |
+| Direct maintenance | `optimize`, `index build`, `index rebuild --kind full-text`, `repair`, `cleanup`; `upgrade --target ADDRESS` is standalone and offline |
 | Source-only | `lint --schema FILE --query FILE`, `cluster validate --config DIR`; no backend target |
 | Root control | `queries list/validate`, `policy validate/test/explain`, `cluster observe/force-unlock/upgrade-ledger`; direct root targets; `queries list` also reads one served graph |
 | Deployment | `cluster plan/apply --config DIR` on a direct root or server; `cluster status` uses only the target |
@@ -393,7 +393,7 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | `omnigraph schema apply` / `init` on a cluster-managed graph | refused — bypasses the cluster ledger | Evolve cluster graphs via `omnigraph cluster apply --target ROOT --config .`; `schema apply`/`init` are for a non-cluster store |
 | Assuming Blob-bearing data cannot compact | unnecessary skipped maintenance | Lance 13 Blob compaction is supported; `optimize` preserves null/empty/non-empty values |
 | `@unique`/`@index` on a Blob column | schema parse/validation rejection | Blob properties cannot be keys, unique, or indexed |
-| Full-text search on indexes built before Lance 11 (v0.9 era), including after `omnigraph upgrade` | `FullTextIndexRebuildRequired` | Stop mixed-version access and run `rebuild-full-text-indexes --branch <b>` on every live branch that needs text search; `upgrade` does not rebuild them |
+| Full-text search on indexes built before Lance 11 (v0.9 era), including after `omnigraph upgrade` | `FullTextIndexRebuildRequired` | Stop mixed-version access and run `index rebuild --kind full-text --branch <b>` on every live branch that needs text search; `upgrade` does not rebuild them |
 | Reopening a v0.10/v6 graph with v0.12 | `__manifest is stamped at internal schema v6, but this omnigraph reads only v14 to v14` | Stop the old fleet; take a standalone graph to v9 with the 0.11 `upgrade`, then to 14 with the 0.12 `upgrade`, or rebuild by export, `init` and `load --mode overwrite` |
 | Default `omnigraph upgrade` of the 0.11 binary on a branched graph or one with `_` properties | `the route ends at v9, which requires a graph with only main` (or `reserves property names starting with '_'`) | Delete branches / `@rename_from` first, or pass `--to-format 8` to both check and execution; the 0.12 `upgrade` converts v8 as well as v9 |
 | Opening a v8 or v9 graph with 0.12 | refused: 0.12 reads format 14 only and names `omnigraph upgrade` | Stop every process using the graph, back up the whole root, then run the 0.12 `upgrade --check` and `upgrade` on a standalone graph; a cluster-managed graph is exported with 0.11.x and rebuilt. See [upgrading past v0.11](references/migrations.md#upgrade-v011-to-storage-format-14) |

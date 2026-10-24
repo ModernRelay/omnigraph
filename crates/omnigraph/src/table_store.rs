@@ -732,6 +732,73 @@ pub struct StagedIndexFold {
     pub skipped: Vec<(String, String)>,
 }
 
+/// A staged index reconciliation: one `CreateIndex` holding the declared
+/// indexes a table lacked and a whole rebuild of every lagging foldable
+/// index, if either had work, the columns whose lagging index was rebuilt,
+/// and the columns whose vector index could not be trained.
+#[derive(Default)]
+pub struct StagedIndexReconciliation {
+    pub staged: Option<StagedWrite>,
+    pub refreshed: Vec<RefreshedIndex>,
+    pub skipped: Vec<(String, String)>,
+}
+
+/// A lagging index rebuilt whole over the current fragments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshedIndex {
+    pub column: String,
+    pub vector: bool,
+}
+
+/// The segments one index batch adds and the segments they replace, all
+/// built from one pinned version and wrapped in one `CreateIndex`.
+#[derive(Default)]
+struct IndexBatch {
+    new_indices: Vec<IndexMetadata>,
+    removed_indices: Vec<IndexMetadata>,
+}
+
+impl IndexBatch {
+    /// Add `other`, built from the same version. Two builders that produce
+    /// one name would publish two definitions of one index; a segment both
+    /// replace is removed once.
+    fn extend(&mut self, other: IndexBatch) -> Result<()> {
+        for index in &other.new_indices {
+            if self.new_indices.iter().any(|new| new.name == index.name) {
+                return Err(OmniError::manifest_internal(format!(
+                    "index batch produced duplicate index name '{}'",
+                    index.name
+                )));
+            }
+        }
+        self.new_indices.extend(other.new_indices);
+        for index in other.removed_indices {
+            if !self
+                .removed_indices
+                .iter()
+                .any(|removed| removed.uuid == index.uuid)
+            {
+                self.removed_indices.push(index);
+            }
+        }
+        Ok(())
+    }
+
+    fn stage(self, read_version: u64) -> Option<StagedWrite> {
+        (!self.new_indices.is_empty()).then(|| {
+            let transaction = TransactionBuilder::new(
+                read_version,
+                Operation::CreateIndex {
+                    new_indices: self.new_indices,
+                    removed_indices: self.removed_indices,
+                },
+            )
+            .build();
+            StagedWrite::new(transaction, Vec::new(), Vec::new())
+        })
+    }
+}
+
 /// A staged compaction: the `Rewrite` to commit detached and the metrics its
 /// tasks reported.
 pub struct StagedCompaction {
@@ -2800,14 +2867,58 @@ impl TableStore {
     /// Lance's merge would. A vector index the builder cannot train (a column
     /// with no non-null rows) is skipped and reported by column.
     pub async fn stage_index_fold(&self, ds: &Dataset) -> Result<StagedIndexFold> {
+        let (batch, _, skipped) = Self::index_fold_batch(ds).await?;
+        Ok(StagedIndexFold {
+            staged: batch.stage(ds.manifest.version),
+            skipped,
+        })
+    }
+
+    /// Stage, as one `CreateIndex` from `ds`, the declared indexes the table
+    /// lacks (`specs`, as [`Self::stage_create_indices`] builds them) and the
+    /// whole rebuild of every lagging foldable index (as
+    /// [`Self::stage_index_fold`] builds it): one detached commit leaves every
+    /// buildable declared index present and covering every current fragment.
+    /// Full-text coverage is not folded (`can_fold_index`).
+    pub async fn stage_index_reconciliation(
+        &self,
+        ds: &Dataset,
+        specs: &[IndexBuildSpec],
+    ) -> Result<StagedIndexReconciliation> {
+        let (mut batch, refreshed, skipped) = Self::index_fold_batch(ds).await?;
+        let mut vector_builds = 0;
+        if !specs.is_empty() {
+            let (created, builds) = Self::create_index_batch(ds, specs).await?;
+            batch.extend(created)?;
+            vector_builds = builds;
+        }
+        let staged = batch.stage(ds.manifest.version);
+        if staged.is_some() {
+            for _ in 0..vector_builds {
+                crate::instrumentation::record_stage_vector_index();
+            }
+        }
+        Ok(StagedIndexReconciliation {
+            staged,
+            refreshed,
+            skipped,
+        })
+    }
+
+    /// The fold batch: every lagging foldable index rebuilt whole under its
+    /// name, the columns rebuilt, and the vector columns that could not train.
+    async fn index_fold_batch(
+        ds: &Dataset,
+    ) -> Result<(IndexBatch, Vec<RefreshedIndex>, Vec<(String, String)>)> {
         let lag = Self::foldable_index_lag(ds).await?;
         if lag.is_empty() {
-            return Ok(StagedIndexFold::default());
+            return Ok((IndexBatch::default(), Vec::new(), Vec::new()));
         }
         let existing = ds.load_indices().await.map_err(OmniError::storage)?;
         let read_version = ds.manifest.version;
         let mut new_indices = Vec::new();
         let mut removed_indices = Vec::new();
+        let mut refreshed = Vec::new();
         let mut skipped = Vec::new();
         for item in lag {
             let Some(column) = item
@@ -2876,20 +2987,20 @@ impl TableStore {
             if item.vector {
                 crate::instrumentation::record_stage_vector_index();
             }
+            refreshed.push(RefreshedIndex {
+                column,
+                vector: item.vector,
+            });
             new_indices.push(new_idx);
         }
-        let staged = (!new_indices.is_empty()).then(|| {
-            let transaction = TransactionBuilder::new(
-                read_version,
-                Operation::CreateIndex {
-                    new_indices,
-                    removed_indices,
-                },
-            )
-            .build();
-            StagedWrite::new(transaction, Vec::new(), Vec::new())
-        });
-        Ok(StagedIndexFold { staged, skipped })
+        Ok((
+            IndexBatch {
+                new_indices,
+                removed_indices,
+            },
+            refreshed,
+            skipped,
+        ))
     }
 
     pub async fn count_rows(&self, ds: &Dataset, filter: Option<String>) -> Result<usize> {
@@ -4842,7 +4953,28 @@ impl TableStore {
                 "stage_create_indices requires at least one index specification",
             ));
         }
+        let (batch, vector_builds) = Self::create_index_batch(ds, specs).await?;
+        let staged = batch.stage(ds.manifest.version).ok_or_else(|| {
+            OmniError::manifest_internal(
+                "stage_create_indices built no index for its specifications",
+            )
+        })?;
+        // Preserve the existing build-count probe while moving the vector
+        // operation from inline commit to staged publication. Record only once
+        // the entire batch staged successfully.
+        for _ in 0..vector_builds {
+            crate::instrumentation::record_stage_vector_index();
+        }
+        Ok(staged)
+    }
 
+    /// The batch `specs` build from `ds`, with the number of vector indexes
+    /// in it. Each new index replaces any index of its name and, for full
+    /// text, every full-text segment on its column.
+    async fn create_index_batch(
+        ds: &Dataset,
+        specs: &[IndexBuildSpec],
+    ) -> Result<(IndexBatch, usize)> {
         let read_version = ds.manifest.version;
         let existing_indices = ds
             .load_indices()
@@ -4940,22 +5072,13 @@ impl TableStore {
             })
             .cloned()
             .collect();
-        let transaction = TransactionBuilder::new(
-            read_version,
-            Operation::CreateIndex {
+        Ok((
+            IndexBatch {
                 new_indices,
                 removed_indices,
             },
-        )
-        .build();
-
-        // Preserve the existing build-count probe while moving the vector
-        // operation from inline commit to staged publication. Record only once
-        // the entire batch staged successfully.
-        for _ in 0..vector_builds {
-            crate::instrumentation::record_stage_vector_index();
-        }
-        Ok(StagedWrite::new(transaction, Vec::new(), Vec::new()))
+            vector_builds,
+        ))
     }
 
     /// Run a scan with optional uncommitted staged writes visible

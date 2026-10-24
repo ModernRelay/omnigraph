@@ -840,6 +840,21 @@ async fn run_bound(
             )
             .await;
         }
+        Command::Index { command } => {
+            return commands::maintenance::run_index(
+                command,
+                commands::maintenance::MaintenanceScope {
+                    operator: &operator,
+                    target: required_target(),
+                    graph: cli.graph.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                    yes: cli.yes,
+                },
+                stdout,
+                stderr,
+            )
+            .await;
+        }
         Command::RebuildFullTextIndexes(args) => {
             return commands::maintenance::run_full_text_rebuild(
                 args,
