@@ -13,8 +13,8 @@ use color_eyre::Report;
 use color_eyre::eyre::{Result, eyre};
 use omnigraph::db::{ReadTarget, SnapshotId};
 use omnigraph::error::{ManifestErrorKind, OmniError};
-use omnigraph::{BlobCell, BlobPrecondition, EntityKind, ExternalBlobRef};
-use omnigraph_api_types::{BlobEntityKind, BlobReadQuery, BlobWriteQuery};
+use omnigraph::{BlobCell, BlobPrecondition, EntityKind as EngineEntityKind, ExternalBlobRef};
+use omnigraph_api_types::{BlobReadQuery, BlobWriteQuery, EntityKind};
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_LENGTH, ETAG, HeaderMap, HeaderName};
 
@@ -108,7 +108,7 @@ impl BlobRangeRequest {
 }
 
 pub(crate) fn blob_query(
-    entity: BlobEntityKind,
+    entity: EntityKind,
     type_name: String,
     id: String,
     property: String,
@@ -135,8 +135,8 @@ pub(crate) fn blob_read_target(query: &BlobReadQuery) -> ReadTarget {
 pub(crate) fn blob_cell(query: &BlobReadQuery) -> BlobCell {
     BlobCell {
         entity: match query.entity {
-            BlobEntityKind::Node => EntityKind::Node,
-            BlobEntityKind::Edge => EntityKind::Edge,
+            EntityKind::Node => EngineEntityKind::Node,
+            EntityKind::Edge => EngineEntityKind::Edge,
         },
         type_name: query.r#type.clone(),
         id: query.id.clone(),
@@ -146,8 +146,8 @@ pub(crate) fn blob_cell(query: &BlobReadQuery) -> BlobCell {
 
 pub(crate) fn blob_url(base_url: &str, query: &BlobReadQuery) -> Result<String> {
     let entity = match query.entity {
-        BlobEntityKind::Node => "node",
-        BlobEntityKind::Edge => "edge",
+        EntityKind::Node => "node",
+        EntityKind::Edge => "edge",
     };
     let mut params = vec![
         ("entity", entity),
@@ -165,7 +165,7 @@ pub(crate) fn blob_url(base_url: &str, query: &BlobReadQuery) -> Result<String> 
 }
 
 pub(crate) fn blob_write_query(
-    entity: BlobEntityKind,
+    entity: EntityKind,
     type_name: String,
     id: String,
     property: String,
@@ -183,8 +183,8 @@ pub(crate) fn blob_write_query(
 pub(crate) fn blob_write_cell(query: &BlobWriteQuery) -> BlobCell {
     BlobCell {
         entity: match query.entity {
-            BlobEntityKind::Node => EntityKind::Node,
-            BlobEntityKind::Edge => EntityKind::Edge,
+            EntityKind::Node => EngineEntityKind::Node,
+            EntityKind::Edge => EngineEntityKind::Edge,
         },
         type_name: query.r#type.clone(),
         id: query.id.clone(),
@@ -194,8 +194,8 @@ pub(crate) fn blob_write_cell(query: &BlobWriteQuery) -> BlobCell {
 
 pub(crate) fn blob_write_url(base_url: &str, query: &BlobWriteQuery) -> Result<String> {
     let entity = match query.entity {
-        BlobEntityKind::Node => "node",
-        BlobEntityKind::Edge => "edge",
+        EntityKind::Node => "node",
+        EntityKind::Edge => "edge",
     };
     let mut params = vec![
         ("entity", entity),

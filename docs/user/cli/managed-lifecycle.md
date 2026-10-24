@@ -84,7 +84,7 @@ omnigraph cluster operation OPERATION_ID --profile work --json
 omnigraph cluster operation OPERATION_ID --profile work --wait --timeout 600 --json
 ```
 
-Connections can observe creation before a cluster target exists. A cluster
+Profiles can observe creation before a cluster target exists. A cluster
 target can observe only an operation for its pinned cluster and incarnation.
 A `ready` cluster does not imply a reachable endpoint. The selected service must
 attest the route; this configuration rewrite does not qualify private/BYOC routes

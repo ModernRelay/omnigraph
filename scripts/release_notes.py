@@ -395,11 +395,20 @@ def render_index(repo: Repository, pending: dict[str, str] | None = None, direct
             unreleased_legacy_body(canonical(repo.read(config["legacy"], LEGACY_PATH)).decode("utf-8"))
             unreleased_legacy_body(content)
             status = ": unreleased migration baseline; new changes are collected\n  in the documentation CI job's `release-notes-preview` artifact."
-        entries.append(f"- [{version}]({version}.md){status}\n")
+        overview = directory / f"{version}-overview.md"
+        if overview.is_symlink():
+            raise NotesError(f"release overviews must not be symlinks: {overview}")
+        overview_link = (
+            f" · [Highlights and upgrade actions]({overview.name})"
+            if overview.is_file() else ""
+        )
+        entries.append(f"- [{version}]({version}.md){status}{overview_link}\n")
     return ("# Release notes\n\n"
             "Release documents describe user-visible changes and actions needed before\n"
             "upgrading. The [upgrade guide](../user/operations/upgrade.md) owns the current\n"
-            "upgrade procedure.\n\n" + "".join(entries) +
+            "upgrade procedure. Start with a release's highlights and upgrade actions\n"
+            "where available. The complete changelog preserves individual change notes,\n"
+            "including development decisions superseded before the final release.\n\n" + "".join(entries) +
             "\nContributors add individual notes using the\n"
             "[release-note authoring guide](../dev/documentation.md#release-notes).\n")
 

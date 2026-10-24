@@ -42,7 +42,7 @@ pub(crate) enum BlobEntityArg {
     Edge,
 }
 
-impl From<BlobEntityArg> for omnigraph_api_types::BlobEntityKind {
+impl From<BlobEntityArg> for omnigraph_api_types::EntityKind {
     fn from(entity: BlobEntityArg) -> Self {
         match entity {
             BlobEntityArg::Node => Self::Node,

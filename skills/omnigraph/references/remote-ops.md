@@ -87,8 +87,8 @@ race.
 
 Over HTTP, beside the `Omnigraph-Http-Api: 0.14` header every graph request
 needs, send the raw id in the `Omnigraph-If-Graph-Commit` header to
-`POST /graphs/{id}/mutate/if-graph-commit` or
-`POST /graphs/{id}/queries/{name}/if-graph-commit`. The plain routes reject that
+`POST /graphs/{graph_id}/mutate/if-graph-commit` or
+`POST /graphs/{graph_id}/queries/{query_name}/if-graph-commit`. The plain routes reject that
 header; an older server answers `404`, so never fall back to the unconditional
 route.
 
@@ -104,14 +104,13 @@ route.
 - `key_conflict`: an append or strict insert found an existing id. Decide
   whether that entity is the intended one; do not silently turn the operation
   into an upsert.
-- `recovery_required` (HTTP `503` with `recovery_required.operation_id`): no
-  0.12 mutation, load or branch merge returns it, because a write that fails
-  before its single publication leaves the graph unchanged. It remains for a
-  graph that still holds a `__recovery/` sidecar from a pre-0.12 build (open
-  it read-write with that build first) and for a schema apply or
-  system-column upgrade that fails after its commit was published; the named
-  commit already contains the change. Follow the error message's remedy and
-  do not replay.
+- `recovery_required` (HTTP `503` with `recovery_required.operation_id`):
+  when it identifies an already published schema apply or system-column upgrade,
+  the table pins and accepted schema contract are durable together; only the
+  process view may still need refresh. Reopen the graph read-write or restart
+  its server rather than replaying the change. A legacy `__recovery/` sidecar
+  requires the original build to open the graph read-write and finish its
+  recovery first. Follow the error message's remedy; do not replay the write.
 
 The effect-free conflict details are distinct from a lost response or a recovery
 requirement. Neither HTTP `409`/`503` nor a CLI failure exit is a universal retry

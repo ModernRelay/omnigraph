@@ -1,7 +1,8 @@
 # issue: none
 # notes: A `load csv` statement executes an accepted load plan that `--- expect plan` pins: an
 # notes: overwrite runs the plan route with every validate stage named by check, table and
-# notes: access path and the write stage as fragments; append and merge
+# notes: access path (a text-keyed endpoint probes after the drain, `probe judged`, even under
+# notes: `access scan`), the removal fact and the write stage as fragments; append and merge
 # notes: report the pipeline route with their keyed adapters; the executed report records
 # notes: the partitions and rows that ran.
 
@@ -47,6 +48,7 @@ load validate unique node:Person key [id]: access delta
 load validate unique node:Person unique [email]: access delta
 load validate retained_edges node:Person edge:Knows from: access probe
 load validate retained_edges node:Person edge:Knows to: access probe
+load validate removal node:Person: scan
 load write: overwrite fragments
 load pipeline 0: CsvSource => Validate
 load pipeline 1: Validate -> FragmentWrite => consumer after 0
@@ -70,6 +72,9 @@ load route: plan
 load scan: partitions 1 fallback single_scan
 load validate edge_ri edge:Knows from Person: access scan
 load validate edge_ri edge:Knows to Person: access scan
+load validate edge_ri edge:Knows from Person: probe judged
+load validate edge_ri edge:Knows to Person: probe judged
+load validate removal edge:Knows: none
 load write: overwrite fragments
 load pipeline 0: CsvSource => Validate
 load pipeline 1: Validate -> FragmentWrite => consumer after 0
@@ -90,6 +95,8 @@ load csv "knows_more.csv" into edge:Knows mode append header
 --- expect plan
 load route: pipeline
 load validate edge_ri edge:Knows from Person: access probe
+load validate edge_ri edge:Knows from Person: probe judged
+load validate removal edge:Knows: none
 load write: append strict_insert
 load executed: partitions 1 rows 1
 
@@ -105,6 +112,7 @@ load csv "people_more.csv" into node:Person mode merge header
 --- expect plan
 load route: pipeline
 load validate unique node:Person unique [email]: access probe
+load validate removal node:Person: none
 load write: merge upsert
 load executed: partitions 1 rows 1
 

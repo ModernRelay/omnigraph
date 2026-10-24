@@ -165,9 +165,11 @@ async fn supported_owner_and_profile_renames_preserve_custody_and_references() {
 }
 
 #[test]
-fn whole_document_validation_rejects_legacy_and_unselected_invalid_entries() {
+fn whole_document_validation_matches_discovery_protocols_issue_1127() {
     for text in [
         "target_config_version: 1",
+        "target_config_version: 1\ntargets: {server: {kind: server, endpoint: 'https://example.com', credential: standalone}}",
+        "version: 1\ntargets: {server: {kind: server, endpoint: 'https://example.com', auth: {operator: {provider: token, source: {store: {}}}}}}",
         "version: 2",
         "version: 1\noperator: {actor: me}",
         "version: 1\ndefaults: {target: missing}",
@@ -186,6 +188,33 @@ fn whole_document_validation_rejects_legacy_and_unselected_invalid_entries() {
         config.binding("local").unwrap(),
         TargetBinding::DirectGraph { .. }
     ));
+
+    // Published protocol-1 edge builds accepted the two incompatible server
+    // documents above. Discovery must distinguish this inline-auth grammar;
+    // its document version is independent of the cross-binary protocol.
+    let config = parse_operator_config(
+        "version: 1\ntargets: {server: {kind: server, endpoint: 'https://example.com', auth: {provider: token, source: {store: {}}}}}",
+    )
+    .unwrap();
+    let document = config.schema.as_ref().unwrap();
+    assert_eq!(document.version, 1);
+    assert!(matches!(
+        &document.targets["server"],
+        crate::operator_schema::Target::Server {
+            auth: crate::operator_schema::AuthProfile::Token {
+                source: crate::operator_schema::TokenSource::Store { .. },
+            },
+            ..
+        }
+    ));
+    let mut encoded = Vec::new();
+    crate::commands::local::run_version(true, &mut encoded).unwrap();
+    let discovery: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(
+        discovery["protocols"],
+        serde_json::json!({"target": 2, "credential": 2, "access": 2}),
+        "inline-auth configuration and credential sources require protocol 2"
+    );
 }
 
 #[test]

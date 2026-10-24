@@ -343,7 +343,7 @@ fn write_text(report: &AccessReport<'_>, stdout: &mut dyn Write) -> Result<()> {
     writeln!(
         stdout,
         "actor: {}",
-        access.actor.as_deref().unwrap_or("(none)")
+        access.actor_id.as_deref().unwrap_or("(none)")
     )?;
     writeln!(stdout, "graph: {} ({})", access.graph_id, report.source)?;
     let graph_wide: Vec<_> = access.graph_wide.iter().collect();

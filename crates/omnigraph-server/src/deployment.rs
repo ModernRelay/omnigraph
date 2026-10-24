@@ -137,7 +137,7 @@ pub(crate) struct PlanRequest {
 }
 
 #[derive(Serialize, ToSchema)]
-pub(crate) struct DeploymentResponse {
+pub(crate) struct DeploymentOutput {
     #[schema(value_type = Object)]
     deployment: DeploymentLookup,
     active: bool,
@@ -145,7 +145,7 @@ pub(crate) struct DeploymentResponse {
 }
 
 #[derive(Serialize, ToSchema)]
-pub(crate) struct DeploymentStatusResponse {
+pub(crate) struct DeploymentStatusOutput {
     #[schema(value_type = Object)]
     status: DeploymentStatus,
     active: bool,
@@ -320,22 +320,23 @@ fn active_result(
 
 #[utoipa::path(
     get, path = "/cluster/deployments", tag = "cluster", operation_id = "deployment_status",
-    responses((status = 200, body = DeploymentStatusResponse), (status = 403, body = crate::api::ErrorOutput),
+    responses((status = 200, body = DeploymentStatusOutput), (status = 403, body = crate::api::ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`) while evaluating deployment access", body = crate::api::ErrorOutput),
         (status = 503, description = "Deployment ownership changed during the bounded ledger observation; retry this GET within the caller deadline", body = crate::api::ErrorOutput)),
     security(("bearer_token" = []))
 )]
 pub(crate) async fn status(
     State(state): State<AppState>,
     actor: Actor,
-) -> Result<Json<DeploymentStatusResponse>, ApiError> {
+) -> Result<Json<DeploymentStatusOutput>, ApiError> {
     let actor = authenticated(actor)?;
     lookup_status(&state, &actor, None).await.map(Json)
 }
 
 #[utoipa::path(
-    get, path = "/cluster/deployments/{id}", tag = "cluster", operation_id = "deployment_lookup",
-    params(("id" = String, Path, description = "Original deployment identity")),
-    responses((status = 200, body = DeploymentResponse), (status = 403, body = crate::api::ErrorOutput),
+    get, path = "/cluster/deployments/{deployment_id}", tag = "cluster", operation_id = "deployment_lookup",
+    params(("deployment_id" = String, Path, description = "Original deployment identity")),
+    responses((status = 200, body = DeploymentOutput), (status = 403, body = crate::api::ErrorOutput),
         (status = 503, description = "Deployment ownership changed during the bounded ledger observation; retry this GET within the caller deadline", body = crate::api::ErrorOutput)),
     security(("bearer_token" = []))
 )]
@@ -343,7 +344,7 @@ pub(crate) async fn lookup(
     State(state): State<AppState>,
     actor: Actor,
     ApiPath(id): ApiPath<String>,
-) -> Result<Json<DeploymentResponse>, ApiError> {
+) -> Result<Json<DeploymentOutput>, ApiError> {
     let actor = authenticated(actor)?;
     let owner = admission(&state)?;
     let identity = IdentityAuthorization::authenticated(actor.actor_id_str()).map_err(refusal)?;
@@ -355,7 +356,7 @@ pub(crate) async fn lookup(
                 .map_err(refusal)
         })
         .await?;
-    Ok(Json(DeploymentResponse {
+    Ok(Json(DeploymentOutput {
         active: active_result(&state, Some(&deployment), revision),
         deployment,
         in_progress,
@@ -366,7 +367,7 @@ async fn lookup_status(
     state: &AppState,
     actor: &AuthenticatedActor,
     id: Option<&str>,
-) -> Result<DeploymentStatusResponse, ApiError> {
+) -> Result<DeploymentStatusOutput, ApiError> {
     let caller = caller(state, actor)?;
     let owner = admission(state)?;
     let (status, in_progress) = state
@@ -378,7 +379,7 @@ async fn lookup_status(
         })
         .await?;
     let active = active_result(state, status.lookup.as_ref(), status.result_revision);
-    Ok(DeploymentStatusResponse {
+    Ok(DeploymentStatusOutput {
         status,
         active,
         in_progress,
@@ -390,7 +391,8 @@ async fn lookup_status(
     request_body = PlanRequest,
     responses((status = 200, body = Object), (status = 400, body = crate::api::ErrorOutput),
         (status = 403, body = crate::api::ErrorOutput), (status = 409, body = crate::api::ErrorOutput),
-        (status = 413, body = crate::api::ErrorOutput), (status = 415, body = crate::api::ErrorOutput)),
+        (status = 413, body = crate::api::ErrorOutput), (status = 415, body = crate::api::ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`) while evaluating deployment access or planning", body = crate::api::ErrorOutput)),
     security(("bearer_token" = []))
 )]
 pub(crate) async fn plan(
@@ -426,9 +428,10 @@ pub(crate) async fn plan(
 #[utoipa::path(
     post, path = "/cluster/deployments", tag = "cluster", operation_id = "deployment_apply",
     request_body = DeploymentRequest,
-    responses((status = 200, body = DeploymentResponse), (status = 202, description = "Durably accepted; poll the exact receipt until in_progress is false and inspect active", body = DeploymentResponse), (status = 400, body = crate::api::ErrorOutput),
+    responses((status = 200, body = DeploymentOutput), (status = 202, description = "Durably accepted; poll the exact receipt until in_progress is false and inspect active", body = DeploymentOutput), (status = 400, body = crate::api::ErrorOutput),
         (status = 403, body = crate::api::ErrorOutput), (status = 409, body = crate::api::ErrorOutput),
         (status = 413, body = crate::api::ErrorOutput), (status = 415, body = crate::api::ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`), or unsettled deployment completion (code `outcome_unknown`); reconcile the original deployment identity before submitting another deployment", body = crate::api::ErrorOutput),
         (status = 503, body = crate::api::ErrorOutput)),
     security(("bearer_token" = []))
 )]
@@ -437,7 +440,7 @@ pub(crate) async fn apply(
     actor: Actor,
     Extension(ingress): Extension<IngressLease>,
     request: Result<ApiJson<DeploymentRequest>, ApiError>,
-) -> Result<(StatusCode, Json<DeploymentResponse>), ApiError> {
+) -> Result<(StatusCode, Json<DeploymentOutput>), ApiError> {
     // Authorization precedes the body's own refusals, which keep their status.
     let actor = authenticated(actor)?;
     let caller = caller(&state, &actor)?;
@@ -483,7 +486,7 @@ pub(crate) async fn apply(
         biased;
         result = &mut result => result.map(|response| (StatusCode::OK, Json(response))),
         accepted = acceptance => match accepted {
-            Ok(deployment) => Ok((StatusCode::ACCEPTED, Json(DeploymentResponse {
+            Ok(deployment) => Ok((StatusCode::ACCEPTED, Json(DeploymentOutput {
                 deployment, active: false, in_progress: true,
             }))),
             Err(_) => result.await.map(|response| (StatusCode::OK, Json(response))),
@@ -497,7 +500,7 @@ async fn execute(
     caller: DeploymentCaller,
     request: DeploymentRequest,
     accepted: oneshot::Sender<DeploymentLookup>,
-) -> Result<DeploymentResponse, ApiError> {
+) -> Result<DeploymentOutput, ApiError> {
     // An original identity is observation-only. Validate immutable input through
     // the shared executor before returning it, without closing graph admission.
     let status = omnigraph_cluster::deployment_status(
@@ -521,7 +524,7 @@ async fn execute(
         )
         .await
         .map_err(refusal)?;
-        return Ok(DeploymentResponse {
+        return Ok(DeploymentOutput {
             active: active_result(&state, Some(&deployment), status.result_revision),
             deployment,
             in_progress: false,
@@ -634,7 +637,7 @@ async fn execute(
         transition
             .resume_same_views()
             .map_err(|error| uncertain(error.to_string()))?;
-        return Ok(DeploymentResponse {
+        return Ok(DeploymentOutput {
             active: active_result(&state, Some(&applied), status.result_revision),
             deployment: applied,
             in_progress: false,
@@ -781,7 +784,7 @@ async fn execute(
             activation,
         )
         .map_err(|error| uncertain(format!("deployment applied; activation refused: {error}")))?;
-    Ok(DeploymentResponse {
+    Ok(DeploymentOutput {
         active: active_result(&state, Some(&applied), result.result_revision),
         deployment: applied,
         in_progress: false,

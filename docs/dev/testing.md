@@ -266,6 +266,11 @@ capability/refusal tests.
 
 Server suites are organized by public route: `auth_policy`, `data_routes`, `schema_routes`, `stored_queries`, `multi_graph`, `boot_settings`, object-store coverage in `s3`, and the generated contract in `openapi`.
 
+The OpenAPI owner checks the [HTTP conventions](http-api.md), their named
+exceptions, and required error responses. Its negative cases remove a required
+response or code from a spec copy and require rejection; a regenerated snapshot
+alone is not proof of complete response coverage.
+
 `omnigraph-mcp` owns protocol, catalog and formatting tests. Server
 `integration/mcp.rs` keeps the real HTTP fixture for authentication, policy,
 tool/route and error-disposition parity, limits and response lifetimes. The

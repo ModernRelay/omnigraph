@@ -61,7 +61,11 @@ struct Fixture {
 
 impl Fixture {
     fn new(query: &str, params: &[(&str, Literal)]) -> Self {
-        let catalog = build_catalog(&parse_schema(SCHEMA).unwrap()).unwrap();
+        Self::with_schema(SCHEMA, query, params)
+    }
+
+    fn with_schema(schema: &str, query: &str, params: &[(&str, Literal)]) -> Self {
+        let catalog = build_catalog(&parse_schema(schema).unwrap()).unwrap();
         let decl = omnigraph_compiler::find_named_query(query, "q").unwrap();
         let checked = CheckedRead::check(&catalog, &decl).unwrap();
         let ir = omnigraph_compiler::lower_query(&catalog, checked.query()).unwrap();
@@ -1409,7 +1413,21 @@ fn a_full_text_call_needs_a_recorded_index_segment() {
     match { $d: Doc search($d.title, $q) }
     return { $d.slug }
 }"#;
-    for query in [search, RANKED] {
+    let inherited = r#"query q($q: String) {
+    match { $d: Doc not { $d cites $x search($d.title, $q) } }
+    return { $d.slug }
+}"#;
+    let nested = r#"query q($q: String) {
+    match {
+        $p: Doc
+        not {
+            $p cites $d
+            not { $d cites $x search($d.title, $q) }
+        }
+    }
+    return { $p.slug }
+}"#;
+    for query in [search, RANKED, inherited, nested] {
         let mut fixture = Fixture::new(query, &[("q", Literal::String("graph".into()))]);
         fixture.source = std::mem::take(&mut fixture.source).with_full_text_coverage(
             "node:Doc",
@@ -1446,5 +1464,59 @@ fn a_full_text_call_needs_a_recorded_index_segment() {
         let (check, detail) = fixture.refused(edited);
         assert_eq!(check, "prerequisite", "{recorded:?}: {detail}");
         assert!(detail.contains("Doc.title"), "{detail}");
+    }
+
+    // Sibling blocks have independent local bindings. Each `$d.title`
+    // needs its own type's coverage, even when the other sibling has it.
+    let schema = format!(
+        "{SCHEMA}\nnode Note {{ slug: String @key title: String @index }}\nedge Annotates: Doc -> Note"
+    );
+    let query = r#"query q($q: String) {
+    match {
+        $p: Doc
+        not { $d: Doc $p cites $d search($d.title, $q) }
+        not { $d: Note $p annotates $d search($d.title, $q) }
+    }
+    return { $p.slug }
+}"#;
+    let mut fixture =
+        Fixture::with_schema(&schema, query, &[("q", Literal::String("graph".into()))]);
+    fixture.source = std::mem::take(&mut fixture.source).with_edge_version("Annotates", 1);
+    let plan = fixture.plan();
+    fixture
+        .accept(plan.clone())
+        .expect("both sibling blocks' recorded segments are accepted");
+    for type_name in ["Doc", "Note"] {
+        let type_key = format!("node:{type_name}");
+        let key = crate::physical::Assumptions::full_text_key(&type_key, "title");
+        let index = format!("{type_name}.title");
+        for recorded in [None, Some(FullTextCoverage::Absent)] {
+            let mut edited = plan.clone();
+            let mut assumptions = edited.assumptions().clone();
+            match recorded {
+                None => assumptions.full_text.remove(&key),
+                Some(coverage) => assumptions.full_text.insert(key.clone(), coverage),
+            };
+            edited.set_assumptions(assumptions);
+            let (check, detail) = fixture.refused(edited);
+            assert_eq!(check, "prerequisite", "{index}: {recorded:?}: {detail}");
+            assert!(detail.contains(&index), "{detail}");
+        }
+        fixture.source = std::mem::take(&mut fixture.source).with_full_text_coverage(
+            &type_key,
+            "title",
+            FullTextCoverage::Absent,
+        );
+        match crate::gate::plan_traced(&fixture.ir, &fixture.source, &BOUNDS, false).err() {
+            Some(crate::gate::Unrouted::FullTextIndexRequired { index: refused }) => {
+                assert_eq!(refused, index)
+            }
+            other => panic!("{index}: an absent sibling's index plans: {other:?}"),
+        }
+        fixture.source = std::mem::take(&mut fixture.source).with_full_text_coverage(
+            &type_key,
+            "title",
+            FullTextCoverage::Partial,
+        );
     }
 }

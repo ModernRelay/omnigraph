@@ -107,6 +107,10 @@ a standalone call or compare the call to literal `true` with `=`. Other
 comparisons, including `= false`, `!= true`, a Boolean parameter, and a
 call on the right side, are refused at type checking (`T38`).
 
+Separate `not` blocks may reuse a local variable name for different node
+types. Each full-text call uses the index on the type and property bound
+within its own block.
+
 ```gq
 query relevant($q: String) {
   match { $d: Document }

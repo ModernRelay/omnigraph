@@ -1,7 +1,7 @@
 # HTTP Server and Cedar Policy
 
 Use this reference for a cluster-served graph. The server is cluster-only; CLI
-commands can instead open graph storage directly when their help permits it.
+commands can instead open local graph storage directly when their help permits it.
 
 ## Start a server
 
@@ -12,7 +12,7 @@ omnigraph-server --cluster s3://bucket/prefix --bind 0.0.0.0:8080
 ```
 
 The server loads the cluster's applied revision and serves each graph under
-`/graphs/{id}`. `cluster apply --target` activates schema and stored-query
+`/graphs/{graph_id}`. `cluster apply --target` activates schema and stored-query
 changes and new graphs without a restart; a direct `cluster apply` needs the
 server stopped. There is no single-graph server mode. A stopped server, even
 after a clean exit, leaves the cluster lock: once its writes have settled,
@@ -32,19 +32,19 @@ termination grace. Check rollout readiness with `GET /readyz`, not `/healthz`.
 | `GET /healthz`, `/openapi.json` | Process metadata |
 | `GET /readyz` | Replica readiness, applied revision and served/ready/loading/blocked counts |
 | `GET /graphs` | List graphs with their availability (`graph_list`) |
-| `POST /cluster/deployments`, `GET /cluster/deployments[/{id}]` | Submit and inspect a `cluster apply --target` deployment (`config_manage`) |
-| `/graphs/{id}/query`, `/mutate` | Inline GQ reads and writes |
-| `/graphs/{id}/mutate/if-graph-commit` | Conditional inline mutation (header `Omnigraph-If-Graph-Commit`) |
-| `/graphs/{id}/queries` | List/invoke stored queries; `/queries/{name}/if-graph-commit` for conditional writes |
-| `/graphs/{id}/load`, `/load/ndjson` | Bounded atomic loads |
-| `/graphs/{id}/blob` | GET/HEAD one Blob cell |
-| `/graphs/{id}/branches` | Branch operations and merge |
-| `/graphs/{id}/snapshot`, `/commits` | Snapshot and history |
-| `/graphs/{id}/commits/{commit}/changes` | One first-parent commit diff |
-| `GET /graphs/{id}/changes`, `POST /graphs/{id}/changes/baseline` | Poll a feed or capture a baseline |
-| `/graphs/{id}/schema` | Read the accepted schema |
-| `/graphs/{id}/export` | Stream a branch snapshot |
-| `GET /graphs/{id}/access` | The caller's actor and allowed actions (`?branch=`, `&target_branch=`); check before a write instead of learning from a 403 |
+| `POST /cluster/plan`, `POST /cluster/deployments`, `GET /cluster/deployments[/{id}]` | Plan, submit and inspect a `cluster apply --target` deployment (`config_manage`) |
+| `/graphs/{graph_id}/query`, `/mutate` | Inline GQ reads and writes |
+| `/graphs/{graph_id}/mutate/if-graph-commit` | Conditional inline mutation (header `Omnigraph-If-Graph-Commit`) |
+| `/graphs/{graph_id}/queries` | List/invoke stored queries; `/queries/{query_name}/if-graph-commit` for conditional writes |
+| `/graphs/{graph_id}/load`, `/load/ndjson` | Bounded atomic loads |
+| `/graphs/{graph_id}/blob` | GET/HEAD one Blob cell |
+| `/graphs/{graph_id}/branches` | Branch operations and merge |
+| `/graphs/{graph_id}/snapshot`, `/commits` | Snapshot and history |
+| `/graphs/{graph_id}/commits/{commit}/changes` | One first-parent commit diff |
+| `GET /graphs/{graph_id}/changes`, `POST /graphs/{graph_id}/changes/baseline` | Poll a feed or capture a baseline |
+| `/graphs/{graph_id}/schema` | Read the accepted schema |
+| `/graphs/{graph_id}/export` | Stream a branch snapshot |
+| `GET /graphs/{graph_id}/access` | The caller's actor and allowed actions (`?branch=`, `&target_branch=`); check before a write instead of learning from a 403 |
 
 Every request to a graph, registry or deployment route must carry exactly one
 `Omnigraph-Http-Api: 0.14` header; a missing, repeated or other value is
@@ -52,16 +52,14 @@ refused with `400 api_contract_mismatch` before graph access. Responses carry
 the same header. `/healthz`, `/readyz` and `/openapi.json` need none. Upgrade
 the CLI, server and HTTP clients together.
 
-`/read`, `/change`, and `/ingest` are deprecated compatibility routes. A
-cluster-only server retains `POST /graphs/{id}/schema/apply` for wire
-compatibility but rejects it with `409`; use `cluster plan`/`cluster apply`.
+`/read`, `/change`, `/ingest` and `POST /graphs/{graph_id}/schema/apply`
+are removed. Use `/query`, `/mutate`, `/load` and `cluster plan`/`cluster apply`
+respectively.
 
 Canonical `/query` JSON includes the graph commit pinned with its rows when the
 read snapshot has an effective graph head; a fresh pre-commit graph can omit it. Exact
 write receipts and conditional semantics are summarized in
 [commit changes and feeds](changes.md). Blob delivery is in [Blob values](blobs.md).
-The deprecated `/read` response does not carry that commit position; consumers
-that need conditional writes must use `/query`.
 
 Canonical `/query` accepts `branch list`; `/mutate` accepts `branch create`,
 `branch delete` and `branch merge` with no request target, name or params. These
@@ -121,6 +119,7 @@ Graph-scoped actions are:
 | `change` | Mutations and loads |
 | `schema_apply` | Schema changes: `cluster apply --target` needs it on each existing graph whose schema changes |
 | `branch_create`, `branch_delete`, `branch_merge` | Corresponding branch operation |
+| `commit_publish`, `commit_drop` | Publish or drop an unpublished commit; drop an unattached commit |
 | `invoke_query` | Entry to a stored query |
 | `admin` | Reserved; no current public operation |
 
@@ -168,7 +167,7 @@ rules:
 
 `branch_scope` is valid only with `read`, `export`, and `change`;
 `target_branch_scope` only with `branch_create`, `branch_delete`,
-`branch_merge`, and `schema_apply`. Any other pairing, or both scopes on one
+`branch_merge`, `schema_apply`, `commit_publish`, and `commit_drop`. Any other pairing, or both scopes on one
 rule, is refused. Values are `any`, `protected`, or `unprotected`, where
 protected branches are the bundle's top-level `protected_branches: [main, …]`
 list. `invoke_query`, `graph_list` and `config_manage` take no branch scope.
@@ -181,10 +180,11 @@ omnigraph policy explain --target . --graph knowledge \
 ```
 
 The `policy` commands evaluate the cluster's **applied** bundles, not draft
-files: run `cluster validate` on the draft, then `cluster apply`. A bundle is
-installed when the cluster is first applied or when its graph is created; a
-later apply that edits an existing bundle, or changes its bindings other than
-by adding a newly created graph, is refused with `deployment_scope`.
+files: run `cluster validate` on the draft, then `cluster apply`. A live apply
+can update existing bundles and their bindings; the server drains affected
+requests before activating the new permissions. Current applied permissions
+authorize the deployment, so a newly granted administrator cannot authorize
+that grant.
 `--graph <id>` must match exactly one applied
 bundle; with both a graph bundle and a `cluster` bundle applied (as in the
 example above), the command refuses with "matches 2 policy bundles".

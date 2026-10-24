@@ -2149,10 +2149,10 @@ async fn branch_merge_conflict_response_includes_structured_conflicts() {
     assert_eq!(error.code, Some(omnigraph_server::api::ErrorCode::Conflict));
     assert!(error.error.contains("merge conflict"));
     assert!(error.merge_conflicts.iter().any(|conflict| {
-        conflict.entity_kind == omnigraph_server::api::EntityKindOutput::Node
+        conflict.entity_kind == omnigraph_server::api::EntityKind::Node
             && conflict.type_name == "Person"
             && conflict.entity_id.as_deref() == Some("Alice")
-            && conflict.kind == omnigraph_server::api::MergeConflictKindOutput::DivergentUpdate
+            && conflict.kind == omnigraph_server::api::MergeConflictKind::DivergentUpdate
     }));
 }
 
@@ -3253,7 +3253,7 @@ async fn parse_error_precedes_policy_denial_on_every_door() {
         let suggestion = diagnostic.suggestion.unwrap();
         assert_eq!(
             suggestion.applicability,
-            omnigraph_api_types::ApplicabilityOutput::MachineApplicable
+            omnigraph_api_types::Applicability::MachineApplicable
         );
         assert_eq!(
             suggestion.edits,
@@ -3304,17 +3304,53 @@ async fn propose_person(app: &axum::Router, name: &str) -> Value {
 async fn commit_routes_list_publish_and_drop_unpublished_commits() {
     let (_temp, app) = app_for_loaded_graph().await;
     let head_before = main_head_commit_id(&app).await;
+    // Retired selectors must refuse even when false or empty, never silently
+    // select history, and never become valid alongside the replacement.
+    for key in ["unpublished", "unattached"] {
+        for value in ["true", "false", ""] {
+            for suffix in [
+                "",
+                "&listing=history",
+                "&listing=unpublished",
+                "&listing=unattached",
+            ] {
+                let (status, body) =
+                    get_json(&app, g(&format!("/commits?{key}={value}{suffix}"))).await;
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_REQUEST,
+                    "{key}={value}{suffix}: {body}"
+                );
+                assert_eq!(body["code"], "bad_request", "{body}");
+            }
+        }
+    }
+    for query in ["listing=unknown", "listing=history&listing=unpublished"] {
+        let (status, body) = get_json(&app, g(&format!("/commits?{query}"))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert_eq!(body["code"], "bad_request", "{body}");
+    }
+    assert_eq!(main_head_commit_id(&app).await, head_before);
     let pia = propose_person(&app, "Pia").await;
     let pia_id = pia["graph_commit_id"].as_str().unwrap().to_string();
     assert_eq!(main_head_commit_id(&app).await, head_before);
 
-    let (status, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    let (status, listed) = get_json(&app, g("/commits?listing=unpublished")).await;
     assert_eq!(status, StatusCode::OK, "{listed}");
     assert_eq!(listed["commits"], json!([pia]));
-    let (status, listed) = get_json(&app, g("/commits?unpublished=true&branch=main")).await;
+    let (status, listed) = get_json(&app, g("/commits?listing=unpublished&branch=main")).await;
     assert_eq!(status, StatusCode::OK, "{listed}");
     assert_eq!(listed["commits"], json!([pia]));
     let (_, history) = get_json(&app, g("/commits")).await;
+    let (status, explicit_history) = get_json(&app, g("/commits?listing=history")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(explicit_history, history);
+    let (status, with_unknown) = get_json(&app, g("/commits?future_option=ignored")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        with_unknown, history,
+        "only the two retired keys change unknown-key handling"
+    );
     assert!(
         history["commits"]
             .as_array()
@@ -3339,7 +3375,7 @@ async fn commit_routes_list_publish_and_drop_unpublished_commits() {
         again, published,
         "a repeat publish answers the published commit"
     );
-    let (_, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    let (_, listed) = get_json(&app, g("/commits?listing=unpublished")).await;
     assert_eq!(listed["commits"], json!([]));
     let (_, history) = get_json(&app, g("/commits")).await;
     assert_eq!(history["commits"][0], published);
@@ -3369,7 +3405,7 @@ async fn commit_routes_list_publish_and_drop_unpublished_commits() {
         let (status, body) = json_response(&app, request).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     }
-    let (_, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    let (_, listed) = get_json(&app, g("/commits?listing=unpublished")).await;
     assert_eq!(listed["commits"], json!([]));
 
     // An ordinary write past a proposal's parent expires it: reads at its id
@@ -3393,7 +3429,7 @@ async fn commit_routes_list_publish_and_drop_unpublished_commits() {
         let (status, body) = get_json(&app, g(&path)).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
     }
-    let (_, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    let (_, listed) = get_json(&app, g("/commits?listing=unpublished")).await;
     assert_eq!(listed["commits"], json!([]));
     let (status, body) = json_response(
         &app,
@@ -3492,20 +3528,20 @@ async fn commit_routes_create_list_refuse_publish_and_drop_unattached_branches()
         "a child holds its ancestors' effects and its own"
     );
 
-    let (status, listed) = get_json(&app, g("/commits?unattached=true")).await;
+    let (status, listed) = get_json(&app, g("/commits?listing=unattached")).await;
     assert_eq!(status, StatusCode::OK, "{listed}");
     assert_eq!(listed["commits"], json!([child, root]), "newest first");
-    let (status, listed) = get_json(&app, g("/commits?unattached=true&branch=main")).await;
+    let (status, listed) = get_json(&app, g("/commits?listing=unattached&branch=main")).await;
     assert_eq!(status, StatusCode::OK, "{listed}");
     assert_eq!(listed["commits"], json!([child, root]));
-    let (status, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    let (status, listed) = get_json(&app, g("/commits?listing=unpublished")).await;
     assert_eq!(status, StatusCode::OK, "{listed}");
     assert_eq!(
         listed["commits"],
         json!([]),
         "unattached is not unpublished"
     );
-    let (status, body) = get_json(&app, g("/commits?unattached=true&unpublished=true")).await;
+    let (status, body) = get_json(&app, g("/commits?listing=unattached&listing=unpublished")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     let (_, history) = get_json(&app, g("/commits")).await;
     assert!(
@@ -3602,7 +3638,7 @@ async fn commit_routes_create_list_refuse_publish_and_drop_unattached_branches()
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {body}");
     }
-    let (_, listed) = get_json(&app, g("/commits?unattached=true")).await;
+    let (_, listed) = get_json(&app, g("/commits?listing=unattached")).await;
     assert_eq!(
         listed["commits"],
         json!([]),
@@ -3702,8 +3738,11 @@ async fn stored_unattached_mutation_keeps_its_clause_per_invocation() {
         StatusCode::BAD_REQUEST,
         "a missing base is 400: {body}"
     );
-    let (status, body) =
-        json_response(&app, get_request(&g("/commits?unattached=true"), "t-full")).await;
+    let (status, body) = json_response(
+        &app,
+        get_request(&g("/commits?listing=unattached"), "t-full"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["commits"].as_array().unwrap().len(), 3, "{body}");
 }
@@ -3772,7 +3811,7 @@ async fn commit_publish_refuses_a_moved_head_and_merge_as_commit_excludes_delete
     assert_eq!(merged["branch_deleted"], Value::Null);
     assert_eq!(main_head_commit_id(&app).await, head_before);
     let merge_id = merged["commit"]["graph_commit_id"].as_str().unwrap();
-    let (_, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    let (_, listed) = get_json(&app, g("/commits?listing=unpublished")).await;
     assert_eq!(listed["commits"], json!([merged["commit"]]));
     let (status, published) = json_response(
         &app,
@@ -7926,11 +7965,11 @@ async fn commit_list_pages_answer_for_the_head_their_first_page_named() {
         ),
         ("/commits?limit=0".to_string(), StatusCode::BAD_REQUEST),
         (
-            "/commits?limit=2&unpublished=true".to_string(),
+            "/commits?limit=2&listing=unpublished".to_string(),
             StatusCode::BAD_REQUEST,
         ),
         (
-            format!("/commits?page_token={token}&unattached=true"),
+            format!("/commits?page_token={token}&listing=unattached"),
             StatusCode::BAD_REQUEST,
         ),
         (

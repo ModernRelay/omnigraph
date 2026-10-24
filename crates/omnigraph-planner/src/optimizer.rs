@@ -14,11 +14,12 @@ use omnigraph_compiler::traversal::{EDGE_TYPE_COLUMN, EdgeSelection};
 use omnigraph_compiler::types::Direction;
 
 use crate::cost::{
-    AccessPath, AntiJoinStrategy, CoverageProvenance, ExpandCostInputs, ExpandMode, ExpandPolicy,
-    HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, HYDRATE_ROW_RATIO, IndexCoverage,
-    SOURCE_PARTITION_BYTES, ValidateAccess, ValidateCostInputs, ValidateIndexCoverage, chain_rows,
-    choose_access_path, choose_anti_join_strategy, choose_expand_mode, choose_validate_access,
-    direction_probe_factor, estimate_rows, executed_hops, hydrate_chunk_bytes, scan_row_estimate,
+    AccessPath, AntiJoinStrategy, CoverageProvenance, EndpointProbe, ExpandCostInputs, ExpandMode,
+    ExpandPolicy, HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, HYDRATE_ROW_RATIO, IndexCoverage,
+    SOURCE_PARTITION_BYTES, ValidateAccess, ValidateCostInputs, ValidateIndexCoverage,
+    ValidateRemoval, chain_rows, choose_access_path, choose_anti_join_strategy, choose_expand_mode,
+    choose_validate_access, direction_probe_factor, estimate_rows, executed_hops,
+    hydrate_chunk_bytes, scan_row_estimate,
 };
 use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
 use crate::key_set::{KeySetTree, key_set_tree};
@@ -215,6 +216,7 @@ fn resolve_load(
                 version: version_of(table),
             }),
             access: None,
+            probe: None,
         })
         .collect();
     let validated = plan.add(
@@ -257,7 +259,8 @@ pub fn write_count_schema() -> SchemaRef {
 /// `match_text` in any filter (correlated blocks included), and `bm25` in the
 /// leading order key or either arm of an `rrf()` there. Planning checks each
 /// one's coverage (`require_full_text_indexes`) and acceptance requires the
-/// plan to record it.
+/// plan to record it. Block-local bindings stay within their lexical scope;
+/// nested blocks inherit their parent's bindings, never a sibling's locals.
 pub fn full_text_targets(ir: &QueryIR) -> Vec<(String, String)> {
     fn bindings(ops: &[IROp], out: &mut HashMap<String, String>) {
         for op in ops {
@@ -274,12 +277,11 @@ pub fn full_text_targets(ir: &QueryIR) -> Vec<(String, String)> {
                 } => {
                     out.insert(dst_var.clone(), dst_type.clone());
                 }
-                IROp::AntiJoin { inner, .. } => bindings(inner, out),
-                IROp::Filter(_) => {}
+                IROp::AntiJoin { .. } | IROp::Filter(_) => {}
             }
         }
     }
-    fn calls(expr: &IRExpr, out: &mut Vec<(String, String)>) {
+    fn calls(expr: &IRExpr, types: &HashMap<String, String>, out: &mut Vec<(String, String)>) {
         match expr {
             IRExpr::Search { field, .. }
             | IRExpr::Fuzzy { field, .. }
@@ -289,22 +291,27 @@ pub fn full_text_targets(ir: &QueryIR) -> Vec<(String, String)> {
                     variable, property, ..
                 } = field.as_ref()
                 {
-                    out.push((variable.clone(), property.clone()));
+                    if let Some(type_name) = types.get(variable) {
+                        let target = (type_name.clone(), property.clone());
+                        if !out.contains(&target) {
+                            out.push(target);
+                        }
+                    }
                 }
             }
             IRExpr::Rrf {
                 primary, secondary, ..
             } => {
-                calls(primary, out);
-                calls(secondary, out);
+                calls(primary, types, out);
+                calls(secondary, types, out);
             }
             IRExpr::Binary { left, right, .. } => {
-                calls(left, out);
-                calls(right, out);
+                calls(left, types, out);
+                calls(right, types, out);
             }
             IRExpr::Not(inner, _)
             | IRExpr::Cast { expr: inner, .. }
-            | IRExpr::IsNull { expr: inner, .. } => calls(inner, out),
+            | IRExpr::IsNull { expr: inner, .. } => calls(inner, types, out),
             IRExpr::PropAccess { .. }
             | IRExpr::Nearest { .. }
             | IRExpr::Variable(..)
@@ -314,34 +321,33 @@ pub fn full_text_targets(ir: &QueryIR) -> Vec<(String, String)> {
             | IRExpr::AliasRef(..) => {}
         }
     }
-    fn filter_calls(ops: &[IROp], out: &mut Vec<(String, String)>) {
+    fn filter_calls(
+        ops: &[IROp],
+        types: &HashMap<String, String>,
+        out: &mut Vec<(String, String)>,
+    ) {
         for op in ops {
             match op {
                 IROp::NodeScan { filters, .. }
                 | IROp::Expand {
                     dst_filters: filters,
                     ..
-                } => filters.iter().for_each(|filter| calls(filter, out)),
-                IROp::Filter(filter) => calls(filter, out),
-                IROp::AntiJoin { inner, .. } => filter_calls(inner, out),
+                } => filters.iter().for_each(|filter| calls(filter, types, out)),
+                IROp::Filter(filter) => calls(filter, types, out),
+                IROp::AntiJoin { inner, .. } => {
+                    let mut inner_types = types.clone();
+                    bindings(inner, &mut inner_types);
+                    filter_calls(inner, &inner_types, out);
+                }
             }
         }
     }
     let mut types = HashMap::new();
     bindings(&ir.pipeline, &mut types);
-    let mut variables = Vec::new();
-    filter_calls(&ir.pipeline, &mut variables);
+    let mut targets = Vec::new();
+    filter_calls(&ir.pipeline, &types, &mut targets);
     if let Some(leading) = ir.order_by.first() {
-        calls(&leading.expr, &mut variables);
-    }
-    let mut targets: Vec<(String, String)> = Vec::new();
-    for (variable, property) in variables {
-        if let Some(type_name) = types.get(&variable) {
-            let target = (type_name.clone(), property);
-            if !targets.contains(&target) {
-                targets.push(target);
-            }
-        }
+        calls(&leading.expr, &types, &mut targets);
     }
     targets
 }
@@ -3649,17 +3655,65 @@ impl Lowering<'_> {
             } => {
                 let estimated_rows = estimate_rows(self.logical, *input, self.source);
                 let lowered = self.lower(*input)?;
-                let checks = checks
+                let overwrite = self.load_overwrites();
+                let target_rows = table
+                    .strip_prefix("node:")
+                    .and_then(|name| self.source.node_type(name).ok())
+                    .and_then(|node| node.row_count);
+                let empty_target = overwrite && target_rows == Some(0);
+                let mut checks: Vec<ValidateSpec> = checks
                     .iter()
+                    .filter(|spec| {
+                        !(empty_target
+                            && matches!(
+                                spec.check,
+                                omnigraph_compiler::ir::ValidateCheck::RetainedEdges { .. }
+                            ))
+                    })
                     .map(|spec| ValidateSpec {
-                        access: Some(self.validate_access(spec, estimated_rows)),
+                        access: Some(self.validate_access(spec, estimated_rows, overwrite)),
                         ..spec.clone()
                     })
                     .collect();
+                let probe = self.endpoint_probe(table, &checks);
+                for spec in &mut checks {
+                    if matches!(
+                        spec.check,
+                        omnigraph_compiler::ir::ValidateCheck::EdgeRi { .. }
+                    ) {
+                        spec.probe = probe;
+                    }
+                }
+                let retained_edge_checks = checks
+                    .iter()
+                    .filter(|spec| {
+                        matches!(
+                            spec.check,
+                            omnigraph_compiler::ir::ValidateCheck::RetainedEdges { .. }
+                        )
+                    })
+                    .count();
+                let removal = if overwrite && retained_edge_checks > 0 {
+                    ValidateRemoval::Scan
+                } else {
+                    ValidateRemoval::None
+                };
+                self.decisions.push(StatisticSource {
+                    statistic: "validate_removal".to_string(),
+                    value: removal.as_str().to_string(),
+                    origin: serde_json::json!({
+                        "table": table,
+                        "overwrite": overwrite,
+                        "target_rows": target_rows,
+                        "retained_edge_checks": retained_edge_checks,
+                    })
+                    .to_string(),
+                });
                 Ok(self.physical.add(PhysicalNode::Validate {
                     input: lowered,
                     table: table.clone(),
                     checks,
+                    removal,
                     max_workers: self.bounds.load_workers_max.max(1),
                 }))
             }
@@ -3675,20 +3729,80 @@ impl Lowering<'_> {
         }
     }
 
+    /// Where the `edge_ri` checks probe: `Swept` when every one reads its
+    /// set whole over a one-integer `@key` node type, `Judged` otherwise,
+    /// `None` when the load plans no endpoint check.
+    fn endpoint_probe(&mut self, table: &str, checks: &[ValidateSpec]) -> Option<EndpointProbe> {
+        let endpoints: Vec<(&str, Option<ValidateAccess>)> = checks
+            .iter()
+            .filter_map(|spec| match &spec.check {
+                omnigraph_compiler::ir::ValidateCheck::EdgeRi { node_type, .. } => {
+                    Some((node_type.as_str(), spec.access))
+                }
+                _ => None,
+            })
+            .collect();
+        if endpoints.is_empty() {
+            return None;
+        }
+        let integer_key = |node_type: &str| {
+            self.source.node_type(node_type).ok().is_some_and(|node| {
+                let [key] = node.key.as_slice() else {
+                    return false;
+                };
+                node.schema.field_with_name(key).is_ok_and(|field| {
+                    matches!(
+                        field.data_type(),
+                        DataType::Int32 | DataType::Int64 | DataType::UInt32
+                    )
+                })
+            })
+        };
+        let swept = endpoints.iter().all(|(node_type, access)| {
+            *access == Some(ValidateAccess::Scan) && integer_key(node_type)
+        });
+        let probe = if swept {
+            EndpointProbe::Swept
+        } else {
+            EndpointProbe::Judged
+        };
+        self.decisions.push(StatisticSource {
+            statistic: "endpoint_probe".to_string(),
+            value: probe.as_str().to_string(),
+            origin: serde_json::json!({
+                "table": table,
+                "endpoints": endpoints
+                    .iter()
+                    .map(|(node_type, access)| serde_json::json!({
+                        "node_type": node_type,
+                        "access": access.map(ValidateAccess::as_str),
+                        "integer_key": integer_key(node_type),
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+            .to_string(),
+        });
+        Some(probe)
+    }
+
+    /// Whether the load plan's write replaces its table.
+    fn load_overwrites(&self) -> bool {
+        self.logical
+            .live()
+            .any(|(_, node)| matches!(node, LogicalNode::FragmentWrite { spec, .. } if spec.mode == LoadStmtMode::Overwrite))
+    }
+
     /// Pass 9 costs the committed lookup from the accepted node count and
     /// index metadata. Append and merge retain their executor's Probe path.
     fn validate_access(
         &mut self,
         spec: &ValidateSpec,
         estimated_rows: Option<u64>,
+        overwrite: bool,
     ) -> ValidateAccess {
         let Some(image) = &spec.consults else {
             return ValidateAccess::Delta;
         };
-        let overwrite = self
-            .logical
-            .live()
-            .any(|(_, node)| matches!(node, LogicalNode::FragmentWrite { spec, .. } if spec.mode == LoadStmtMode::Overwrite));
         let node = image
             .table
             .strip_prefix("node:")

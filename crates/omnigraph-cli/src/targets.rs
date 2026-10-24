@@ -12,9 +12,11 @@ use serde::{Deserialize, Serialize};
 use crate::graph_http::RequestTarget;
 use crate::operator::OperatorConfig;
 
-pub(crate) const TARGET_PROTOCOL: u32 = 1;
-pub(crate) const CREDENTIAL_PROTOCOL: u32 = 1;
-pub(crate) const ACCESS_PROTOCOL: u32 = 1;
+// Compatibility generations across published binaries, independent of the YAML
+// document version. Incompatible configuration/command changes bump these.
+pub(crate) const TARGET_PROTOCOL: u32 = 2;
+pub(crate) const CREDENTIAL_PROTOCOL: u32 = 2;
+pub(crate) const ACCESS_PROTOCOL: u32 = 2;
 
 #[derive(Debug)]
 pub(crate) struct TargetError {

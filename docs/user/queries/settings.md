@@ -59,7 +59,7 @@ A setting reaches the engine through one of three doors:
 A `set` line in the text applies after the door's value, so the file wins.
 
 A stored query runs under the process defaults: `omnigraph query <name>`
-without `-e` or `--query` refuses `--set`, and `POST /queries/{name}` takes no
+without `-e` or `--query` refuses `--set`, and `POST /queries/{query_name}` takes no
 `settings` field.
 
 Each setting's environment variable is its process default: the server reads
@@ -73,7 +73,7 @@ refuses startup; no default is substituted.
 | `rrf_plan` | enum `auto`, `force_prefilter`, `force_postfilter` | `auto` | process | `OMNIGRAPH_RRF_PLAN` | the reciprocal rank fusion plan on a traversal-constrained `nearest`, for diagnosis |
 | `merge_lineage` | enum `off`, `on`, `verify` | `on` (a debug build defaults to `verify`) | request | `OMNIGRAPH_MERGE_LINEAGE` | how a merge finds the entities it classifies: the full-scan walk, the lineage path, or both compared |
 | `ann_nprobes` | integer, at least `0` | `20` | request | `OMNIGRAPH_ANN_NPROBES` | the partition cap per index delta of a `nearest` scan; `0` is no cap |
-| `stage_write_concurrency` | integer `1..=64` | `8` | process | `OMNIGRAPH_LOAD_CONCURRENCY` | the width of the staged-write fan-out for `load` and `mutate`: tables staged at once, and the Lance writers of one `load csv` overwrite |
+| `stage_write_concurrency` | integer `1..=64` | `8` | process | `OMNIGRAPH_LOAD_CONCURRENCY` | the width of the staged-write fan-out for `load` and `mutate`: tables staged at once, and in one `load csv` overwrite the Lance writers and the streams that parse the source (one per 8 MiB of it, at most this many) |
 | `traversal_work_limit` | integer `1..=9223372036854775807` | `1000000` | request | `OMNIGRAPH_TRAVERSAL_WORK_LIMIT` | shared traversal row-work cap for statements containing alternatives or wildcard |
 | `write_max_bytes` | integer, at least `1` | `33554432` (32 MiB) | request | `OMNIGRAPH_WRITE_MAX_BYTES` | independent row-data and Blob-payload allowances for bounded writes; changes the existing mutate, load and materializing branch-merge limits; a value raised above the default is held in memory as one typed batch at an overwrite load's commit; a `load csv` statement applies it to each staged-write input: an overwrite stages the reader's 8,192-row batches and refuses a batch over it as `staged_write_input_bytes`, while append and merge keep the keyed adapter's ceilings |
 | `load_source_max_bytes` | integer, at least `1` | `33554432` (32 MiB) | request | `OMNIGRAPH_LOAD_SOURCE_MAX_BYTES` | the largest object a `load csv` statement reads, checked before any payload byte is fetched; a served load is additionally bounded by the server's workload admission |

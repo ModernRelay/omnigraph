@@ -1892,9 +1892,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0"
 dependencies = [
  "cmov",
 ]
@@ -5552,7 +5552,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-api-types"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "arrow-schema",
  "omnigraph-compiler",
@@ -5565,7 +5565,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-azure-admission"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -5585,7 +5585,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-bench"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5615,7 +5615,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-catalog"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -5649,7 +5649,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-cli"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "assert_cmd",
  "async-trait",
@@ -5692,7 +5692,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-cluster"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "async-trait",
  "omnigraph-compiler",
@@ -5715,7 +5715,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-compiler"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -5736,7 +5736,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-core"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5776,7 +5776,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-dst"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "arrow-array",
  "async-trait",
@@ -5800,7 +5800,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-engine"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -5858,7 +5858,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-gqt"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "async-trait",
  "datatest-stable",
@@ -5880,7 +5880,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-gqt-core"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5903,7 +5903,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-gqt-served"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "axum",
  "datatest-stable",
@@ -5917,7 +5917,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-mcp"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "axum",
  "color-eyre",
@@ -5931,7 +5931,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-planner"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "arrow-schema",
  "futures",
@@ -5944,7 +5944,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-policy"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "cedar-policy",
  "clap",
@@ -5957,7 +5957,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-reference-engine"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -5981,7 +5981,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-seams"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "syn",
  "tempfile",
@@ -5991,7 +5991,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-server"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -6039,11 +6039,11 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-skill"
-version = "0.14.0"
+version = "0.14.1"
 
 [[package]]
 name = "omnigraph-storage"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6059,7 +6059,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-vocabulary-guard"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "clap",
  "proc-macro2",
@@ -8681,9 +8681,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.52.3"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",

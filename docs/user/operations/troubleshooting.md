@@ -135,7 +135,7 @@ exit follows from the disposition:
 
 Maintenance commands (`init`, `upgrade`, `optimize`, `rebuild-full-text-indexes`,
 `repair`, `cleanup`, `schema upgrade-system-columns`), `cluster`, `policy`,
-`target`, `credential`, `mcp` and the managed commands keep their own exits for now:
+`target`, `credentials`, `mcp` and the managed commands keep their own exits for now:
 their exit 1 does not by itself say that nothing changed, so read their report;
 `mcp` answers each relayed request with its own disposition.
 
@@ -144,10 +144,10 @@ A served write refused with `401` `unauthorized`, `403` `forbidden` or `400`
 the policy denial and `fix` for the others. The server answers these before it admits the write:
 bearer authentication, then the API contract header, then policy. Fix the
 credential, the policy grant or the client before running the command again.
-When the CLI sent no credential, the refusal also carries `missing_credential`:
-`server` names a declared server with no stored token, or `unbound` names an
-address under no declared server, and `hint` says how to bind one. The server's
-`error` text is unchanged.
+If a server target with `auth: {provider: anonymous}` receives a 401, the CLI
+adds `missing_credential` with `target`, `auth: "anonymous"` and a setup `hint`.
+A missing credential for a token or exec provider refuses locally before any
+HTTP request. The server's `error` text is unchanged.
 The status counts only with its matching `code` in a response that carries the
 server's API contract header: a bare `403` from a proxy stays `unknown` with
 `reconcile`, and a refusal that also reports recovery work stays `recover`.
@@ -199,9 +199,12 @@ A `409` is not one universal retry signal:
   root or deliberately use the command's destructive option when appropriate.
 
 Writes are atomic at the graph-commit boundary. A normal validation, conflict,
-or limit error does not mean that a subset became visible. A recovery-required
-error is different: a schema change is already published and only its schema
-files remain to be installed, so reopen read-write rather than retrying it.
+or limit error does not mean that a subset became visible. When
+`recovery_required` identifies an already published schema change, its table
+pins and accepted schema contract are durable together; only the process
+view may still need refresh. Reopen the graph read-write or restart its
+server rather than replaying the change. Legacy recovery sidecars require
+the original release, as described under [maintenance failures](#maintenance-failures).
 
 ## Storage-format mismatch
 

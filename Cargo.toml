@@ -80,7 +80,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 pest = "2"
 pest_derive = "2"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }
 clap = { version = "4.6", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }

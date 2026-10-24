@@ -1362,8 +1362,8 @@ async fn a_fusion_replays() {
 /// preorder, a fusion before its arms and the arms in query argument order,
 /// two arms over one property kept apart, and every returned score column
 /// naming its producer, including two columns that read one fused score and
-/// a `distinct` group key. An inspected run, an ordinary run and a replay
-/// describe one plan alike.
+/// a `distinct` group key, while a column computed from a score names none.
+/// An inspected run, an ordinary run and a replay describe one plan alike.
 #[tokio::test]
 async fn a_read_describes_its_retrievals_and_score_columns() {
     use omnigraph_compiler::result::{
@@ -1391,6 +1391,12 @@ query closest($q: Vector(4)) {
 query distinct_scores($a: String) {
     match { $d: Doc }
     return distinct { $d.slug, bm25($d.text, $a) as relevance }
+    order { bm25($d.text, $a) }
+    limit 3
+}
+query computed_score($a: String) {
+    match { $d: Doc }
+    return { $d.slug, bm25($d.text, $a) as relevance, bm25($d.text, $a) > 0.0 as hit }
     order { bm25($d.text, $a) }
     limit 3
 }
@@ -1481,6 +1487,16 @@ query unranked() {
         (
             DESCRIBED,
             "distinct_scores",
+            &needle,
+            ReadDescriptors {
+                retrievals: vec![ranked("r0", RetrievalKind::Bm25, "text")],
+                metrics: vec![metric("relevance", "r0")],
+            },
+        ),
+        // A column computed from a score is no metric; the score itself is.
+        (
+            DESCRIBED,
+            "computed_score",
             &needle,
             ReadDescriptors {
                 retrievals: vec![ranked("r0", RetrievalKind::Bm25, "text")],

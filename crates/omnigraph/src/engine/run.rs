@@ -4,7 +4,7 @@
 //! each operator's metrics into that pass's report rows.
 
 use super::operators::memory::WorkMemory;
-use super::operators::{Switch, was_drained, was_polled};
+use super::operators::{CsvSourceExec, Switch, was_drained, was_polled};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
 use futures::StreamExt;
@@ -153,6 +153,7 @@ pub(super) fn load_operator_rows(
             OmniError::manifest_internal(format!("plan node {id} built no operator"))
         })?;
         let metrics = op.metrics().unwrap_or_else(MetricsSet::new);
+        let source = op.downcast_ref::<CsvSourceExec>();
         rows.push(LoadOperatorExecuted {
             id: id as u64,
             node: node.name().to_string(),
@@ -160,6 +161,12 @@ pub(super) fn load_operator_rows(
             rows: metrics.output_rows().unwrap_or(0) as u64,
             elapsed_compute_ns: metrics.elapsed_compute().unwrap_or(0) as u64,
             wall_ns: wall_ns(&metrics),
+            partitions: source.map_or(1, |source| {
+                u32::try_from(source.partitions()).unwrap_or(u32::MAX)
+            }),
+            slices: source
+                .map(CsvSourceExec::executed_slices)
+                .unwrap_or_default(),
         });
     }
     Ok(rows)

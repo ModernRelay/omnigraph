@@ -103,9 +103,9 @@ This validates the schema **and** the queries against it. No running repo requir
 ### Plan before apply — always
 
 ```bash
-omnigraph schema plan --schema next.pg s3://bucket/repo --json
+omnigraph schema plan --schema next.pg --target ./graph.omni --json
 # inspect "supported": true|false and the step list
-omnigraph schema apply --schema next.pg s3://bucket/repo
+omnigraph schema apply --schema next.pg --target ./graph.omni
 ```
 
 If `supported: false`, fix the source before applying. Plan is free; run it as often as needed.
@@ -117,9 +117,8 @@ a code is present, match it rather than the free-form message text.
 the current schema; older commits still read the dropped data until
 `omnigraph cleanup` stops retaining them, and only then is it gone for good. No
 flag makes a drop destructive at apply: to reclaim the space, run `cleanup`
-with a retention that excludes the commits before the drop. A cluster-only
-server rejects
-`POST /graphs/{id}/schema/apply` with `409`; evolve a served graph through
+with a retention that excludes the commits before the drop. The HTTP server
+has no `POST /graphs/{id}/schema/apply` route; evolve a served graph through
 `cluster plan` and `cluster apply`.
 
 ### Apply is main-only
@@ -246,8 +245,9 @@ schema is declared (`graphs.<id>.schema:` in `cluster.yaml`) and converged:
 
 ```bash
 $EDITOR schema.pg
-omnigraph cluster plan --target ./cluster --config . --observe   # migration steps; takes no cluster lock
-omnigraph cluster apply --target <name|url> --config .
+# production is a registered server target
+omnigraph cluster plan --target production --config . --json
+omnigraph cluster apply --target production --config .
 # the running server publishes and activates the new shape; no restart
 ```
 
@@ -256,7 +256,7 @@ With a direct-root target, `cluster apply --target ./cluster --config . --as <yo
 
 Differences from direct `schema apply` (on a non-cluster store): out-of-band
 schema changes on the live graph are *drift* — the next `cluster apply`
-refuses with `applied_schema_drift`, and `--schema-correction` accepts a
-reviewed observed schema.
+refuses with `applied_schema_drift`. Apply does not adopt drift; restore
+authoritative state from verified evidence or a backup before proceeding.
 Everything else in this file (`@rename_from`, backfills,
 linting, enum discipline) applies unchanged to the `.pg` you edit.

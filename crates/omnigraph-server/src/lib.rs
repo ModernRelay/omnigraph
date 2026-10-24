@@ -9,6 +9,7 @@ mod export_transport;
 mod extract;
 mod handlers;
 mod http_contract;
+mod http_operations;
 mod ingress;
 mod mcp;
 pub mod operations;
@@ -53,9 +54,9 @@ use api::{
     BranchCreateRequest, BranchDeleteOutput, BranchListOutput, BranchMergeOutput,
     BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput, CommitListQuery, ErrorCode,
     ErrorOutput, ExportRequest, GraphBatchLoadOutput, GraphBatchLoadQuery, GraphDiscoveryEntry,
-    GraphDiscoveryResponse, GraphInfo, GraphListResponse, HealthOutput, IF_ACTOR_HEADER,
-    IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
-    QueriesCatalogOutput, QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput, SnapshotQuery,
+    GraphDiscoveryOutput, GraphInfo, GraphListOutput, HealthOutput, IF_ACTOR_HEADER, IngestOutput,
+    IngestRequest, InvokeStoredQueryOutput, InvokeStoredQueryRequest, QueriesCatalogOutput,
+    QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput, SnapshotQuery,
     graph_batch_load_receipt_output, ingest_receipt_output, snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
@@ -114,6 +115,20 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         title = "Omnigraph API",
         description = "HTTP API for the Omnigraph graph database",
     ),
+    tags(
+        (name = "access", description = "Actions available to the authenticated actor"),
+        (name = "blobs", description = "Graph Blob values and conditional byte delivery"),
+        (name = "branches", description = "Graph branches and merges"),
+        (name = "changes", description = "Bounded graph differences and change feeds"),
+        (name = "cluster", description = "Cluster deployment planning and execution"),
+        (name = "commits", description = "Graph commit history and publication"),
+        (name = "health", description = "Process health and readiness probes"),
+        (name = "management", description = "Server graph inventory and OAuth resource metadata"),
+        (name = "mutations", description = "Graph mutations and data loading"),
+        (name = "queries", description = "Inline and stored queries, and graph exports"),
+        (name = "schema", description = "Accepted graph schemas"),
+        (name = "snapshots", description = "Coherent graph snapshot metadata"),
+    ),
     paths(
         mcp::resource_metadata,
         mcp::resource_metadata_at_resource_path,
@@ -156,14 +171,14 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_changes_feed,
         handlers::server_changes_baseline,
     ),
-    components(schemas(api::BlobEntityKind, api::ChangeBaselineRecord, api::ChangeErrorOutput)),
+    components(schemas(api::EntityKind, api::CommitListing, api::ChangeBaselineRecord, api::ChangeErrorOutput)),
     modifiers(&SecurityAddon),
 )]
 pub struct ApiDoc;
 
 /// The canonical served OpenAPI shape (RFC-011 cluster-only): the static
 /// `ApiDoc` with every protected path nested under `/graphs/{graph_id}/…`
-/// and `cluster_`-prefixed operation ids. `/healthz` and `/graphs` stay
+/// and inventory-derived operation ids. `/healthz` and `/graphs` stay
 /// flat. This is the single source of nesting — both the runtime
 /// `server_openapi` handler and the committed `openapi.json` derive from
 /// it, so the published spec can never describe routes the server does
@@ -1837,15 +1852,15 @@ fn summarize_merge_conflicts(conflicts: &[api::MergeConflictOutput]) -> String {
     format!("merge conflicts: {}{}", preview.join("; "), suffix)
 }
 
-fn graph_type_subject(entity_kind: api::EntityKindOutput, type_name: &str) -> String {
+fn graph_type_subject(entity_kind: api::EntityKind, type_name: &str) -> String {
     match entity_kind {
-        api::EntityKindOutput::Node => format!("node type '{type_name}'"),
-        api::EntityKindOutput::Edge => format!("edge type '{type_name}'"),
+        api::EntityKind::Node => format!("node type '{type_name}'"),
+        api::EntityKind::Edge => format!("edge type '{type_name}'"),
     }
 }
 
 fn format_key_conflict(
-    entity_kind: api::EntityKindOutput,
+    entity_kind: api::EntityKind,
     type_name: &str,
     entity_id: Option<&str>,
 ) -> String {
@@ -2104,10 +2119,10 @@ mod api_error_tests {
     #[test]
     fn merge_summary_uses_type_and_entity_vocabulary() {
         let summary = summarize_merge_conflicts(&[api::MergeConflictOutput {
-            entity_kind: api::EntityKindOutput::Node,
+            entity_kind: api::EntityKind::Node,
             type_name: "Person".to_string(),
             entity_id: Some("p1".to_string()),
-            kind: api::MergeConflictKindOutput::DivergentUpdate,
+            kind: api::MergeConflictKind::DivergentUpdate,
             message: "divergent update for id 'p1'".to_string(),
         }]);
         assert_eq!(
@@ -2134,7 +2149,7 @@ mod api_error_tests {
         let details = error
             .published_dataset_version_conflict
             .expect("structured published dataset version conflict");
-        assert_eq!(details.entity_kind, api::EntityKindOutput::Edge);
+        assert_eq!(details.entity_kind, api::EntityKind::Edge);
         assert_eq!(details.type_name, "Knows");
         assert_eq!(details.expected_published_dataset_version, 7);
         assert_eq!(details.actual_published_dataset_version, 9);
@@ -3022,7 +3037,7 @@ mod api_error_tests {
             let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
             assert!(error.error.contains(expected_message));
             let details = error.key_conflict.expect("structured key conflict");
-            assert_eq!(details.entity_kind, api::EntityKindOutput::Node);
+            assert_eq!(details.entity_kind, api::EntityKind::Node);
             assert_eq!(details.type_name, "Person");
             assert_eq!(details.entity_id, entity_id);
             assert!(error.recovery_required.is_none());
@@ -3668,59 +3683,7 @@ pub fn build_app(state: AppState) -> Router {
     //   4. `resolve_graph_handle` — captures `serving::GraphRequest` based on
     //      the active mode (single: the only handle; multi: lookup by
     //      `{graph_id}` in the URI path).
-    let per_graph_routes = Router::new()
-        .route("/snapshot", get(server_snapshot))
-        .route("/access", get(server_access))
-        // Register HEAD explicitly. Axum's GET fallback would invoke the GET
-        // handler and could begin payload work before stripping the body; the
-        // dedicated handler makes the zero-payload-read contract structural.
-        .route(
-            "/blob",
-            get(server_blob_get)
-                .head(server_blob_head)
-                .put(server_blob_put)
-                .delete(server_blob_delete),
-        )
-        .route("/export", post(server_export))
-        .route("/query", post(server_query))
-        .route("/mutate", post(server_mutate))
-        .route(
-            "/mutate/if-graph-commit",
-            post(server_mutate_if_graph_commit),
-        )
-        .route("/queries", get(server_list_queries))
-        .route("/queries/{name}", post(server_invoke_query))
-        .route(
-            "/queries/{name}/if-graph-commit",
-            post(server_invoke_query_if_graph_commit),
-        )
-        .route("/schema", get(server_schema_get))
-        .route(
-            "/load",
-            post(server_load).layer(DefaultBodyLimit::max(INGEST_REQUEST_BODY_LIMIT_BYTES)),
-        )
-        .route("/load/ndjson", post(server_load_ndjson))
-        .route(
-            "/branches",
-            get(server_branch_list).post(server_branch_create),
-        )
-        // One route owns `/branches/{name}`: the branch actions `merge`,
-        // `diff` and `merge-base` share its shape, so it dispatches them by
-        // name and method, and DELETE of any name deletes that branch.
-        .route(
-            "/branches/{branch}",
-            axum::routing::delete(server_branch_delete).fallback(server_branch_action),
-        )
-        .route("/commits", get(server_commit_list))
-        .route(
-            "/commits/{commit_id}",
-            get(server_commit_show).delete(server_commit_drop),
-        )
-        .route("/commits/{commit_id}/publish", post(server_commit_publish))
-        .route("/commits/{commit_id}/changes", get(server_commit_changes))
-        .route("/diff", get(server_diff))
-        .route("/changes", get(server_changes_feed))
-        .route("/changes/baseline", post(server_changes_baseline));
+    let per_graph_routes = http_operations::graph().into_router();
     let per_graph_protected = guarded(&state, per_graph_routes, |routes| {
         routes.route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -3736,19 +3699,11 @@ pub fn build_app(state: AppState) -> Router {
     // exposed — inventory additions use the server-owned deployment route.
     let management = guarded(
         &state,
-        Router::new()
-            .route("/graphs", get(server_graphs_list))
-            .route("/graphs/discovery", get(server_graphs_discovery)),
+        http_operations::management().into_router(),
         |routes| routes,
     );
 
-    let deployment_routes = Router::new()
-        .route("/cluster/plan", post(deployment::plan))
-        .route(
-            "/cluster/deployments",
-            get(deployment::status).post(deployment::apply),
-        )
-        .route("/cluster/deployments/{id}", get(deployment::lookup));
+    let deployment_routes = http_operations::deployments().into_router();
     let deployments = guarded(&state, deployment_routes, |routes| {
         admitted(
             &state,
@@ -3767,13 +3722,12 @@ pub fn build_app(state: AppState) -> Router {
     // `/graphs/{graph_id}/...`; there are no flat single-graph routes.
     let protected: Router<AppState> = Router::new()
         .nest(CATALOGUE_ROUTE_PREFIX, catalogue)
-        .nest("/graphs/{graph_id}", per_graph_protected)
+        .nest(handlers::CLUSTER_PATH_PREFIX, per_graph_protected)
         .merge(management)
         .merge(deployments);
 
-    let mut app = Router::new()
-        .route("/healthz", get(server_health))
-        .route("/readyz", get(server_ready))
+    let mut app = http_operations::probes()
+        .into_router()
         .route("/openapi.json", get(server_openapi))
         .merge(protected);
     // MCP needs an authenticated caller; without a credential source there is
