@@ -14006,6 +14006,12 @@
           }
         }
       },
+      "CoverageUnknownReasonOutput": {
+        "type": "string",
+        "enum": [
+          "not_computed"
+        ]
+      },
       "DeploymentOutput": {
         "type": "object",
         "required": [
@@ -14186,6 +14192,29 @@
             "$ref": "#/components/schemas/DispositionEffects"
           }
         }
+      },
+      "EmbeddingCoverageOutput": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "state"
+            ],
+            "properties": {
+              "reason": {
+                "$ref": "#/components/schemas/CoverageUnknownReasonOutput"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "unknown"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "`{\"state\": \"unknown\", \"reason\": \"not_computed\"}`: a read establishes no\nembedding count."
       },
       "EntityChangeOutput": {
         "type": "object",
@@ -15186,6 +15215,59 @@
           }
         }
       },
+      "MetricKindOutput": {
+        "type": "string",
+        "description": "What a score column measures.",
+        "enum": [
+          "distance",
+          "score",
+          "rrf"
+        ]
+      },
+      "MetricOutput": {
+        "type": "object",
+        "description": "A returned column holding the score retrieval `retrieval_id` computed.\n`binding` and `property` repeat the retrieval's for a `nearest` or\n`bm25` source; a fused score names neither. `descending` is whether a\nlarger value ranks first. A column computed from a score is not a metric.",
+        "required": [
+          "column",
+          "kind",
+          "retrieval_id",
+          "source",
+          "descending",
+          "recall"
+        ],
+        "properties": {
+          "binding": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "column": {
+            "type": "string"
+          },
+          "descending": {
+            "type": "boolean"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/MetricKindOutput"
+          },
+          "property": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "recall": {
+            "$ref": "#/components/schemas/RecallOutput"
+          },
+          "retrieval_id": {
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/RetrievalKindOutput"
+          }
+        }
+      },
       "ParamDescriptor": {
         "type": "object",
         "description": "One declared parameter of a stored query, projected for the catalog.",
@@ -15456,6 +15538,13 @@
             ],
             "description": "Effective graph head commit id of the exact snapshot this read was\nserved from. On a fresh named branch this is the inherited source head,\nso it is immediately usable as `Omnigraph-If-Graph-Commit` (CLI:\n`--if-commit`) for the branch's first conditional write. The id and rows\ncome from one pinned version, so no separate id fetch is needed."
           },
+          "metrics": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MetricOutput"
+            },
+            "description": "One entry per returned column that holds a retrieval's score. Absent\nwhen no column does."
+          },
           "page": {
             "oneOf": [
               {
@@ -15469,6 +15558,13 @@
           },
           "query_name": {
             "type": "string"
+          },
+          "retrievals": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RetrievalOutput"
+            },
+            "description": "The retrievals the read ran, from the plan that ran: one per ranked\nscan, per `rrf()` fusion and per fusion arm. Absent when the read\nranked nothing."
           },
           "row_count": {
             "type": "integer",
@@ -15622,6 +15718,14 @@
           }
         }
       },
+      "RecallOutput": {
+        "type": "string",
+        "description": "A retrieval's contract, not what one execution did: `nearest` is\n`approximate` even when a run scored every row, `bm25` is `exact`, and\n`rrf` is `approximate` when either arm is.",
+        "enum": [
+          "exact",
+          "approximate"
+        ]
+      },
       "RecoveryRequiredOutput": {
         "type": "object",
         "required": [
@@ -15654,6 +15758,67 @@
           },
           "resource": {
             "type": "string"
+          }
+        }
+      },
+      "RetrievalKindOutput": {
+        "type": "string",
+        "description": "The search function behind a retrieval or a score column.",
+        "enum": [
+          "nearest",
+          "bm25",
+          "rrf"
+        ]
+      },
+      "RetrievalOutput": {
+        "type": "object",
+        "description": "One retrieval of the plan that ran. `id` is plan-local (`r0`, `r1`, …\nin plan preorder, a fusion's arms in query argument order); a ranked\nretrieval names its `binding` and `property`, a fusion its `arms` by id.\nParameter values are never included.",
+        "required": [
+          "id",
+          "kind",
+          "recall"
+        ],
+        "properties": {
+          "arms": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "binding": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "embedding_coverage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EmbeddingCoverageOutput",
+                "description": "Present on a `nearest` retrieval only: a read establishes no embedding\ncount, so it is always unknown."
+              }
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/RetrievalKindOutput"
+          },
+          "property": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "recall": {
+            "$ref": "#/components/schemas/RecallOutput"
           }
         }
       },

@@ -26,6 +26,7 @@
 pub mod aggregate;
 pub mod bound;
 pub mod cost;
+pub mod descriptors;
 pub mod error;
 pub mod explain;
 pub mod gate;
@@ -58,6 +59,7 @@ pub use cost::{
     choose_anti_join_strategy, choose_expand_mode, choose_validate_access, direction_probe_factor,
     estimate_rows, executed_hops, hydrate_chunk_bytes, scan_row_estimate, should_switch_to_csr,
 };
+pub use descriptors::read_descriptors;
 pub use error::PlanError;
 pub use explain::Explain;
 pub use gate::{Decision, Unrouted, accept_query, accept_query_explained, plan_query, route};

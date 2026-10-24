@@ -18,11 +18,111 @@ pub struct MutationExecResult {
 pub struct QueryResult {
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
+    descriptors: ReadDescriptors,
+}
+
+/// Which retrievals a read ran and what each projected score column
+/// measures (RFC 0047, "Read descriptors"), derived once from the plan that
+/// ran; both lists are empty for a read that ranked nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadDescriptors {
+    pub retrievals: Vec<Retrieval>,
+    pub metrics: Vec<Metric>,
+}
+
+/// The search function behind a retrieval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetrievalKind {
+    Nearest,
+    Bm25,
+    Rrf,
+}
+
+impl RetrievalKind {
+    /// Whether a larger value ranks first: a `nearest` distance ranks the
+    /// smallest first, a `bm25` or fused score the largest.
+    pub fn descending(self) -> bool {
+        self != Self::Nearest
+    }
+}
+
+/// A retrieval's contract, not what one execution did: `nearest` membership
+/// is approximate even when a run scores every row, `bm25` matching is
+/// exact, and a fusion is approximate when either arm is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recall {
+    Exact,
+    Approximate,
+}
+
+/// One retrieval of the plan that ran. Parameter values are not part of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Retrieval {
+    /// Plan-local: `r0`, `r1`, … in preorder of the accepted plan, a
+    /// fusion's arms in query argument order. Distinct producers keep
+    /// distinct ids even when every other field matches.
+    pub id: String,
+    pub kind: RetrievalKind,
+    pub target: RetrievalTarget,
+    pub recall: Recall,
+}
+
+/// What a retrieval ranks: one binding's property, or the arms a fusion
+/// combines, by their retrieval ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetrievalTarget {
+    Ranked {
+        binding: String,
+        property: String,
+        /// Set on a `nearest` retrieval only.
+        embedding_coverage: Option<EmbeddingCoverage>,
+    },
+    Fused {
+        arms: Vec<String>,
+    },
+}
+
+/// How many ranked rows hold an embedding. A run establishes no count, so
+/// the coverage is unknown; counts on request belong to RFC 0048's result
+/// metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingCoverage {
+    NotComputed,
+}
+
+/// A projected column holding the score a retrieval computed: the
+/// distance of a `nearest`, the score of a `bm25` or the fused score of an
+/// `rrf()`. A column computed from a score is not a metric.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Metric {
+    pub column: String,
+    pub retrieval_id: String,
+}
+
+impl ReadDescriptors {
+    /// The retrieval `id` names.
+    pub fn retrieval(&self, id: &str) -> Option<&Retrieval> {
+        self.retrievals.iter().find(|retrieval| retrieval.id == id)
+    }
 }
 
 impl QueryResult {
     pub fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
-        Self { schema, batches }
+        Self {
+            schema,
+            batches,
+            descriptors: ReadDescriptors::default(),
+        }
+    }
+
+    /// This result described by the plan that produced it.
+    pub fn with_descriptors(mut self, descriptors: ReadDescriptors) -> Self {
+        self.descriptors = descriptors;
+        self
+    }
+
+    pub fn descriptors(&self) -> &ReadDescriptors {
+        &self.descriptors
     }
 
     pub fn schema(&self) -> &SchemaRef {

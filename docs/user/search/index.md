@@ -186,6 +186,40 @@ directly or over several hops, is refused at type checking (`T59`): a ranking
 starts the traversal at the binding it ranks, and one traversal cannot start
 at both. Rank one binding in both arms, or bindings no traversal joins.
 
+## What a ranked read reports
+
+A read's JSON envelope (`POST /query`, a stored-query call, `omnigraph query
+--json`, and the metadata line of `--format jsonl`) says which retrievals
+produced its order and what each returned score column measures, in two
+arrays. Both come from the plan that ran. `retrievals` is absent when the
+read ranks nothing, and `metrics` when no returned column holds a score. For
+`hybrid` above, with `rrf(...) as score` in `return`:
+
+```json
+"retrievals": [
+  { "id": "r0", "kind": "rrf", "arms": ["r1", "r2"], "recall": "approximate" },
+  { "id": "r1", "kind": "nearest", "binding": "d", "property": "embedding",
+    "recall": "approximate",
+    "embedding_coverage": { "state": "unknown", "reason": "not_computed" } },
+  { "id": "r2", "kind": "bm25", "binding": "d", "property": "body", "recall": "exact" }
+],
+"metrics": [
+  { "column": "score", "kind": "rrf", "retrieval_id": "r0", "source": "rrf",
+    "descending": true, "recall": "approximate" }
+]
+```
+
+`id` is local to the plan: `r0`, `r1` and so on, a fusion before its arms and
+the arms in the order `rrf(...)` names them, so two arms over the same
+property keep separate ids. `recall` states the retrieval's contract, not what
+one run did: `nearest` is `approximate` even when a run scored every row,
+`bm25` is `exact`, and `rrf` is `approximate` when either arm is. A metric
+names the retrieval whose score the column holds; `kind` is `distance`
+(smaller ranks first), `score` or `rrf` (larger ranks first), as
+`descending` also says. Several columns that return one score name the same
+retrieval, and a column computed from a score is not a metric. No query text,
+vector or other parameter value appears in either array.
+
 ## Indexes
 
 `@index` and `@key` declare index intent. For a single-property node declaration,
