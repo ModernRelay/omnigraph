@@ -14006,7 +14006,7 @@
           }
         }
       },
-      "CoverageUnknownReasonOutput": {
+      "CoverageUnknownReason": {
         "type": "string",
         "enum": [
           "not_computed"
@@ -14203,7 +14203,7 @@
             ],
             "properties": {
               "reason": {
-                "$ref": "#/components/schemas/CoverageUnknownReasonOutput"
+                "$ref": "#/components/schemas/CoverageUnknownReason"
               },
               "state": {
                 "type": "string",
@@ -15215,7 +15215,7 @@
           }
         }
       },
-      "MetricKindOutput": {
+      "MetricKind": {
         "type": "string",
         "description": "What a score column measures.",
         "enum": [
@@ -15249,7 +15249,7 @@
             "type": "boolean"
           },
           "kind": {
-            "$ref": "#/components/schemas/MetricKindOutput"
+            "$ref": "#/components/schemas/MetricKind"
           },
           "property": {
             "type": [
@@ -15258,13 +15258,13 @@
             ]
           },
           "recall": {
-            "$ref": "#/components/schemas/RecallOutput"
+            "$ref": "#/components/schemas/Recall"
           },
           "retrieval_id": {
             "type": "string"
           },
           "source": {
-            "$ref": "#/components/schemas/RetrievalKindOutput"
+            "$ref": "#/components/schemas/RetrievalKind"
           }
         }
       },
@@ -15718,7 +15718,7 @@
           }
         }
       },
-      "RecallOutput": {
+      "Recall": {
         "type": "string",
         "description": "A retrieval's contract, not what one execution did: `nearest` is\n`approximate` even when a run scored every row, `bm25` is `exact`, and\n`rrf` is `approximate` when either arm is.",
         "enum": [
@@ -15761,7 +15761,7 @@
           }
         }
       },
-      "RetrievalKindOutput": {
+      "RetrievalKind": {
         "type": "string",
         "description": "The search function behind a retrieval or a score column.",
         "enum": [
@@ -15809,7 +15809,7 @@
             "type": "string"
           },
           "kind": {
-            "$ref": "#/components/schemas/RetrievalKindOutput"
+            "$ref": "#/components/schemas/RetrievalKind"
           },
           "property": {
             "type": [
@@ -15818,7 +15818,7 @@
             ]
           },
           "recall": {
-            "$ref": "#/components/schemas/RecallOutput"
+            "$ref": "#/components/schemas/Recall"
           }
         }
       },

@@ -13,7 +13,8 @@ use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::query::ast::Param;
 use omnigraph_compiler::result::{
-    EmbeddingCoverage, QueryResult, ReadDescriptors, Recall, RetrievalKind, RetrievalTarget,
+    EmbeddingCoverage, QueryResult, ReadDescriptors, Recall as ResultRecall,
+    RetrievalKind as ResultRetrievalKind, RetrievalTarget,
 };
 use omnigraph_compiler::settings::{
     Engine, MergeLineage, SettingId, SettingKind, SettingRow, SettingValue,
@@ -620,7 +621,7 @@ pub struct ReadOutput {
 /// The search function behind a retrieval or a score column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum RetrievalKindOutput {
+pub enum RetrievalKind {
     Nearest,
     Bm25,
     Rrf,
@@ -631,7 +632,7 @@ pub enum RetrievalKindOutput {
 /// `rrf` is `approximate` when either arm is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum RecallOutput {
+pub enum Recall {
     Exact,
     Approximate,
 }
@@ -643,14 +644,14 @@ pub enum RecallOutput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct RetrievalOutput {
     pub id: String,
-    pub kind: RetrievalKindOutput,
+    pub kind: RetrievalKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub property: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arms: Option<Vec<String>>,
-    pub recall: RecallOutput,
+    pub recall: Recall,
     /// Present on a `nearest` retrieval only: a read establishes no embedding
     /// count, so it is always unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -662,19 +663,19 @@ pub struct RetrievalOutput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum EmbeddingCoverageOutput {
-    Unknown { reason: CoverageUnknownReasonOutput },
+    Unknown { reason: CoverageUnknownReason },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum CoverageUnknownReasonOutput {
+pub enum CoverageUnknownReason {
     NotComputed,
 }
 
 /// What a score column measures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum MetricKindOutput {
+pub enum MetricKind {
     /// A `nearest` distance: smaller ranks first.
     Distance,
     /// A `bm25` relevance score: larger ranks first.
@@ -690,15 +691,15 @@ pub enum MetricKindOutput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct MetricOutput {
     pub column: String,
-    pub kind: MetricKindOutput,
+    pub kind: MetricKind,
     pub retrieval_id: String,
-    pub source: RetrievalKindOutput,
+    pub source: RetrievalKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub property: Option<String>,
     pub descending: bool,
-    pub recall: RecallOutput,
+    pub recall: Recall,
 }
 
 /// The page state a `branch diff` answer carries: the exact commits it
@@ -3283,18 +3284,18 @@ pub fn read_output(
     })
 }
 
-fn retrieval_kind_output(kind: RetrievalKind) -> RetrievalKindOutput {
+fn retrieval_kind_output(kind: ResultRetrievalKind) -> RetrievalKind {
     match kind {
-        RetrievalKind::Nearest => RetrievalKindOutput::Nearest,
-        RetrievalKind::Bm25 => RetrievalKindOutput::Bm25,
-        RetrievalKind::Rrf => RetrievalKindOutput::Rrf,
+        ResultRetrievalKind::Nearest => RetrievalKind::Nearest,
+        ResultRetrievalKind::Bm25 => RetrievalKind::Bm25,
+        ResultRetrievalKind::Rrf => RetrievalKind::Rrf,
     }
 }
 
-fn recall_output(recall: Recall) -> RecallOutput {
+fn recall_output(recall: ResultRecall) -> Recall {
     match recall {
-        Recall::Exact => RecallOutput::Exact,
-        Recall::Approximate => RecallOutput::Approximate,
+        ResultRecall::Exact => Recall::Exact,
+        ResultRecall::Approximate => Recall::Approximate,
     }
 }
 
@@ -3318,7 +3319,7 @@ fn descriptor_outputs(
                     None,
                     embedding_coverage.map(|EmbeddingCoverage::NotComputed| {
                         EmbeddingCoverageOutput::Unknown {
-                            reason: CoverageUnknownReasonOutput::NotComputed,
+                            reason: CoverageUnknownReason::NotComputed,
                         }
                     }),
                 ),
@@ -3354,9 +3355,9 @@ fn descriptor_outputs(
             Ok(MetricOutput {
                 column: metric.column.clone(),
                 kind: match retrieval.kind {
-                    RetrievalKind::Nearest => MetricKindOutput::Distance,
-                    RetrievalKind::Bm25 => MetricKindOutput::Score,
-                    RetrievalKind::Rrf => MetricKindOutput::Rrf,
+                    ResultRetrievalKind::Nearest => MetricKind::Distance,
+                    ResultRetrievalKind::Bm25 => MetricKind::Score,
+                    ResultRetrievalKind::Rrf => MetricKind::Rrf,
                 },
                 retrieval_id: retrieval.id.clone(),
                 source: retrieval_kind_output(retrieval.kind),

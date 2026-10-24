@@ -332,8 +332,8 @@ fn csv_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use omnigraph_server::api::{
-        MetricKindOutput, MetricOutput, ReadOutput, ReadTargetOutput, RecallOutput,
-        RetrievalKindOutput, RetrievalOutput,
+        MetricKind, MetricOutput, ReadOutput, ReadTargetOutput, Recall, RetrievalKind,
+        RetrievalOutput,
     };
 
     use super::*;
@@ -421,22 +421,22 @@ mod tests {
         let mut ranked = sample_output();
         ranked.retrievals = vec![RetrievalOutput {
             id: "r0".to_string(),
-            kind: RetrievalKindOutput::Bm25,
+            kind: RetrievalKind::Bm25,
             binding: Some("p".to_string()),
             property: Some("bio".to_string()),
             arms: None,
-            recall: RecallOutput::Exact,
+            recall: Recall::Exact,
             embedding_coverage: None,
         }];
         ranked.metrics = vec![MetricOutput {
             column: "score".to_string(),
-            kind: MetricKindOutput::Score,
+            kind: MetricKind::Score,
             retrieval_id: "r0".to_string(),
-            source: RetrievalKindOutput::Bm25,
+            source: RetrievalKind::Bm25,
             binding: Some("p".to_string()),
             property: Some("bio".to_string()),
             descending: true,
-            recall: RecallOutput::Exact,
+            recall: Recall::Exact,
         }];
         let rendered = render_read(
             &ranked,
