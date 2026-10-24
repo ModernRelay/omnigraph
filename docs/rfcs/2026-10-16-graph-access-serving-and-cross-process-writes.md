@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-16
-updated: 2026-10-21
+updated: 2026-10-25
 discussion: https://github.com/ModernRelay/omnigraph/pull/1017
 supersedes: []
 superseded_by: []
@@ -1273,10 +1273,11 @@ to RFC 0003.
 
 A client other than the CLI should reach an OIDC-enabled server, self-hosted or
 managed, as a standard OAuth public client rather than borrow the CLI's
-credentials. A managed data token is a bearer credential valid for up to 24
-hours that removing admission does not retract (the managed-data guide and
-RFC 0053 describe both), and credential families stay separate. The client
-flow:
+credentials, once the managed control plane supports one; until then Studio
+borrows them for managed clusters, as the interim below describes. A managed
+data token is a bearer credential valid for up to 24 hours that removing
+admission does not retract (the managed-data guide and RFC 0053 describe
+both), and credential families stay separate. The client flow:
 
 1. Discover the protected-resource metadata as A1 describes; take `resource` and
    `authorization_servers`; refuse an issuer the metadata does not name. The
@@ -1299,6 +1300,17 @@ URIs, expose the protected-resource metadata and `/mcp` on public data hosts,
 and start managed servers with OIDC identity trust, which also admits the
 resource's host for MCP. A client must not depend on `/openapi.json` being
 reachable through every deployment's proxy. Studio would implement the client.
+
+**Interim.** Until the client lands, Studio reaches a managed cluster with the
+data token that `omnigraph credentials export --target NAME` exchanges from the
+person's `omnigraph login`. Studio asks for it by export alone, keeps it in
+memory, asks again after a 401, and keeps it only while `target inspect` still
+names that managed target at that endpoint; it shows that the connection uses
+the CLI's login and names the profile. This accepts for now what the first
+paragraph rules out: the token is the CLI's (one hour at the exchange observed
+on 2026-10-25; up to 24 hours by policy), removing admission does not retract
+it, and Studio acts with the CLI's login, which the server cannot tell from the
+CLI or give less authority. The client replaces it.
 
 **Recommendation:** control-plane and Studio spec changes, tracked in
 [#1025](https://github.com/ModernRelay/omnigraph/issues/1025). No OmniGraph RFC is needed unless the server contract
@@ -1547,3 +1559,10 @@ proposal.
   otherwise" (a refused credential carries `error="invalid_token"` with or
   without OIDC), "The challenge would move into the authentication middleware
   every route shares", and A1's recommendation, now its disposition.
+- 2026-10-25: A2 gains an interim. Until Studio's OAuth client lands, Studio
+  reaches a managed cluster with the data token the CLI exchanges from the
+  person's login, kept in memory and asked for again after a 401. Superseded
+  sentence: "A client other than the CLI should reach an OIDC-enabled server,
+  self-hosted or managed, as a standard OAuth public client rather than borrow
+  the CLI's credentials" now holds once the managed control plane supports such
+  a client, with Studio's interim until then.
