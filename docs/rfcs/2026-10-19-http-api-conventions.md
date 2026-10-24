@@ -22,7 +22,7 @@ The HTTP API gets one written style, held by a test over the generated
 `openapi.json`. The style covers names, paths and parameters, headers, schemas,
 lists and the spec's coverage. It adds no second source beside the owners that
 already hold a contract: the `ErrorCode` registry owns codes and statuses, the
-operation table of [Graph access and cross-process writes][graph-access] owns
+operation table of [Graph access and client contracts][graph-access] owns
 operation names, and the existing code owns branch-action dispatch, the
 fail-closed graph-commit routes and the change-route error schema.
 

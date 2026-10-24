@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-19
-updated: 2026-10-21
+updated: 2026-10-24
 discussion: https://github.com/ModernRelay/omnigraph/issues/1067
 supersedes: []
 superseded_by: []
@@ -143,14 +143,11 @@ What remains needs a decision.
 An unknown publication is reported, not hidden. It answers 500
 `outcome_unknown` on HTTP and MCP, with the disposition `effects: unknown`
 and `action: reconcile`; the CLI exits 2. `/readyz` stays `serving`, and
-later writes to the branch proceed. The publication is logged with its
-publication id: the graph commit id, or a control fact's attempt id. Its
-outcome becomes definite when the branch moves past the write's base: if the
-branch's next publication finds the late commit, the write committed; if it
-takes the version first, the write can never land. A read made before then
-is not final. Its identity on the wire belongs to the later
-`disposition.check` of [graph access and cross-process
-writes](https://github.com/ModernRelay/omnigraph/pull/1017).
+later writes to the branch proceed. The publication is logged with its graph
+commit id. Settlement follows [§5](#5-unknown-publications-are-fenced-by-their-version-key),
+including its distinction between linear publications and detached proposals
+or snapshots. This RFC adds no client reconciliation endpoint and does not
+depend on a future engine control-fact or `disposition.check` protocol.
 
 Orchestrators should restart a failed server, for example Railway
 `ON_FAILURE`. On an S3 root, a restart that finds a held, renewed lock still refuses with
@@ -161,10 +158,10 @@ between 2 and 600 seconds, and the lock record carries it, so every successor
 uses the owner's value.
 
 This RFC adds no HTTP error code, CLI exit code or MCP field.
-[Graph access and cross-process
-writes](https://github.com/ModernRelay/omnigraph/pull/1017) carries the
-three-way outcome on the wire: `outcome_unknown`, the `disposition` object,
-its later `check` identity and exit 2.
+[Graph access and client
+contracts](2026-10-16-graph-access-serving-and-cross-process-writes.md) carries
+the three-way outcome on the wire: `outcome_unknown`, the `disposition` object
+and exit 2.
 [#1076](https://github.com/ModernRelay/omnigraph/pull/1076) implements the
 code and the disposition. This decision produces exactly the engine outcomes
 that model needs, so the two do not grow parallel shapes.
@@ -753,3 +750,8 @@ phase 3.
   carry disposition notes for the parts this replaces. §7 now says a claim
   proves nothing about its writer, and that the owner's timer, not the claim,
   is the fence.
+- 2026-10-24: Aligned with the scope amendment to graph access and client
+  contracts (#1017). Removed the promises of a control fact's attempt id and
+  a later `disposition.check` identity from User and operational behavior;
+  neither is a dependency of this RFC. Publication settlement remains owned by
+  §5, and the shared error code, disposition and exit contract is unchanged.

@@ -1,28 +1,28 @@
 ---
 rfc: "2026-10-16-graph-access-serving-and-cross-process-writes"
-title: "Graph access and cross-process writes"
+title: "Graph access and client contracts"
 track: maintainer
 status: accepted
 implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-16
-updated: 2026-10-21
+updated: 2026-10-24
 discussion: https://github.com/ModernRelay/omnigraph/pull/1017
 supersedes: []
 superseded_by: []
 blocked_on: []
 ---
 
-# RFC: Graph access and cross-process writes
+# RFC: Graph access and client contracts
 
 > A term set in ***bold italics*** is defined at that spot; it is plain text afterwards.
 
 ## Summary
 
 This RFC decides consistent graph access for people, agents and programs:
-named targets, explicit actor assertions, one operation and failure contract,
-and engine correctness across writer processes. It uses the accepted
+named targets, explicit actor assertions, a shared operation contract and a
+shared failure contract. It uses the accepted
 [RFC 0059](https://github.com/ModernRelay/omnigraph/blob/main/docs/rfcs/0059-config-cli-coherency.md)
 target model without extending its grammar or configuration.
 
@@ -33,28 +33,24 @@ local-server boot path, generated policy or token mode, process registry,
 automatic hosting, or replacement for the `omnigraph-server` binary. Direct CLI
 and embedded access remain independent of HTTP serving.
 
-The design has six rules:
+The design has five rules:
 
 1. **Name the target, never the transport.** CLI operations use RFC 0059's
    `--target` resolution and command applicability rules.
-2. **Correctness lives in the engine, across processes and machines.** Branch
-   creation and deletion, dropping a proposal and cleanup decide through the
-   `__manifest` version compare-and-swap. This is an engine phase with its own
-   evidence and storage-format gates, not a reason to add another server.
-3. **One set of operations, three surfaces.** CLI, HTTP and MCP share operation
+2. **One set of operations, three surfaces.** CLI, HTTP and MCP share operation
    contracts where applicable, with explicit exceptions.
-4. **Identity is fixed at the boundary.** `--as` declares the actor on direct
+3. **Identity is fixed at the boundary.** `--as` declares the actor on direct
    access and asserts the credential's actor on served access.
-5. **One failure model.** Servers and the CLI share error codes and a
+4. **One failure model.** Servers and the CLI share error codes and a
    `disposition` object; exit codes follow the disposition.
-6. **Introspection is a command.** RFC 0059's `target list` describes configured
+5. **Introspection is a command.** RFC 0059's `target list` describes configured
    destinations; `access` reports the caller's actor and allowed actions.
 
 A stdio MCP bridge may connect to an existing server's `/mcp`, and a Studio
 opener may select an existing server target. Neither starts a server. Static
 tokens remain available through RFC 0059's `credential get` client contract.
-The engine phase adds control facts under the next storage stamp; the client
-and HTTP phases change no graph storage format.
+This RFC changes no graph storage format or engine concurrency guarantee.
+The existing writer-process and cluster-admission boundaries remain in force.
 
 **2026-10-20 disposition:** the second serving model proposed in earlier
 revisions is discontinued, including the work in
@@ -67,6 +63,13 @@ planned. The independent access, identity, disposition, operation-parity,
 client-connection and engine work was accepted on 2026-10-20. Historical
 serving decisions in the decision log are superseded by this disposition; they
 are not implementation requirements.
+
+**2026-10-24 scope decision:** the engine redesign is removed from this RFC,
+including manifest control facts, a new storage stamp, cross-process
+qualification and the dependent `disposition.check` protocol. This supersedes
+the engine portion of the 2026-10-20 acceptance. Any change to engine writer
+boundaries needs its own RFC; it is not a prerequisite for the client work
+here.
 
 ## Motivation
 
@@ -82,19 +85,6 @@ replaces them with named targets in one breaking migration; its design was
 accepted in [#675](https://github.com/ModernRelay/omnigraph/pull/675), and
 [#1090](https://github.com/ModernRelay/omnigraph/pull/1090) implemented it on
 main.
-
-**Writers must stay in one process, and nothing enforces it.** The engine
-supports schema apply, branch creation and deletion, and cleanup from one writer
-process only ([support boundaries](../dev/invariants.md#current-support-boundaries)).
-Its process-local gates, chiefly `WriteQueueManager::for_root`, a process-wide
-registry, are what stop five cross-process races, and a second process neither
-sees them nor is told they exist. A branch deleted while another process
-publishes to it acknowledges a write no live branch shows. Two creates of one
-name leave two live incarnations and an unusable name. A branch created during
-schema apply keeps the old contract. Cleanup can remove the tree of a branch
-another process is creating. A proposal can be both dropped and published.
-Ordinary writes, merges and index maintenance are already safe across processes
-through the `__manifest` version CAS.
 
 **Clients need a consistent connection contract.** Studio and MCP clients use
 HTTP rather than opening storage. The existing cluster-backed server already
@@ -141,10 +131,10 @@ at the existing server.
 **Static tokens must stay first-class.** They are how people host their own
 graphs: no identity provider and no admission-snapshot publisher.
 
-This needs an RFC: it changes engine control protocols and the storage stamp,
-adds client commands and HTTP contracts, and proposes lifting the engine's
-single-writer-process control boundary. It does not change the cluster-only
-serving boundary or the server binary.
+This needs an RFC because it defines shared client commands, identity and
+failure contracts across the CLI, HTTP, MCP and Studio. It does not change
+engine publication or concurrency protocols, the cluster-only serving boundary
+or the server binary.
 
 ## User and operational behavior
 
@@ -246,23 +236,18 @@ Unsupported kinds refuse with `target_kind_unsupported`; the dedicated
 transport and credential refusals apply where the table names them. No refusal
 silently changes the target kind or starts a process that serves storage.
 
-### Cross-process writes
+### Existing writer boundaries
 
-Any number of processes, on one machine or many, may run any operation on one
-standalone graph. Each operation either publishes once or refuses with a typed
-outcome; an operation that lost to another reports it, and the caller retries
-from a fresh view. No command routes a write through a particular process and
-no client needs to know which processes are running.
+The engine's [current support boundaries](../dev/invariants.md#current-support-boundaries)
+remain unchanged: schema apply, branch creation and deletion, and cleanup are
+supported from one writer process. Client access and operation parity do not
+expand that support. Clients of a server continue to use its routes; direct
+storage access does not bypass the existing cluster admission and support
+boundaries.
 
-**Until the engine phase ships,** today's boundary applies unchanged: schema
-apply, branch creation and deletion, and cleanup are supported from one writer
-process. Clients of a server continue to use its routes; direct storage access
-does not bypass the existing cluster admission and support boundaries.
-
-Cluster admission is unchanged by this rule. It serializes a cluster's
-deployments and its serving owner; it was never the engine's correctness
-mechanism, and the engine changes below make a cluster's graphs correct
-whoever writes them.
+Any proposal to lift those restrictions belongs in a separate engine RFC with
+its own correctness, recovery and compatibility evidence. No client phase here
+waits for it.
 
 ### One set of operations
 
@@ -384,32 +369,11 @@ object.
   | Any other error after a write | `unknown` | `reconcile` |
   | An attempt the server could not settle (`outcome_unknown`) | `unknown` | `reconcile`, `recover` when recovery is required |
 
-  A later phase adds `disposition.check`, what a later read needs to settle an
-  unknown write: its branch and its publication id (a graph commit id, or a
-  control fact's attempt id), with the branch's head before the write. The
-  outcome is final once the attempted `__manifest` version is readable, by the
-  [read-back](#engine-control-facts-on-the-version-cas) rule:
-  the write landed if it holds the publication id, and lost if it holds
-  another, since a create-if-absent cannot land once its version is held. The
-  check cannot see whether the store acknowledged the attempt; the in-doubt
-  result of an acknowledged attempt stays on the publisher's read-back, which
-  holds the request record. While that version is absent the outcome stays
-  unknown, until some commit holds it. It
-  arrives with the attempt identity of [cross-process
-  writes](#cross-process-writes). Under an actor view that hides the commit
-  listing, the check answers for the caller's own publication id and returns
-  only the caller's own receipt. Until then a caller settles a row publication
-  from the branch it sent and that branch's head, and a control fact from the
-  registration, tombstone or drop record it names, since a control fact does
-  not move the head. Retrying one is safe: a create refuses with
-  `branch_exists`, and a delete or a drop converges. The body below is that
-  later phase's:
-
-  ```json
-  {"error":"the write may have published","code":"outcome_unknown",
-   "disposition":{"effects":"unknown","action":"reconcile",
-                  "check":{"branch":"main","head_before":"01JAC…","attempt":"01JAD…"}}}
-  ```
+  This RFC adds no `disposition.check` field, reconciliation endpoint or engine
+  attempt-identity protocol. Unknown outcomes still require reconciliation
+  before retrying; the client must not infer a definite result or replay the
+  unresolved operation. Storage settlement remains owned by the storage-outcomes RFC
+  above and the existing [recovery contract](../dev/recovery.md).
 
 - **Exit codes follow from the disposition**, the same for every command:
 
@@ -446,10 +410,6 @@ registry holds every code:
 | `target_unknown` | `target show`, `target remove` | No target has the name |
 | `target_is_default` | `target remove` | The target is `defaults.target` |
 | `config_not_editable` | `target add`, `target remove` | The entry cannot be changed while keeping the rest of the file's text |
-| `branch_exists` | `branch create` | Another process registered the name first |
-| `branch_deleted` | Every write to a branch | The branch was deleted while the write prepared |
-| `commit_dropped` | `commit publish` | The proposal was dropped first |
-| `commit_published` | `commit drop` | The proposal was published first |
 | `outcome_unknown` | Every write | The server could not settle whether the attempt published |
 
 ### Access
@@ -635,7 +595,7 @@ The bundled skill states one path per place an agent runs:
 An agent finds configured destinations and its own access through
 `omnigraph target list` and `omnigraph access`. These commands do not discover
 or start serving processes. The engine's existing writer-process boundary
-remains until the cross-process phase passes its qualification.
+remains unchanged.
 
 ### Static tokens for clients
 
@@ -679,235 +639,6 @@ server as a target. Four settings decide how complete a client's experience is:
 | Agents over MCP | `--mcp-allowed-host <public host>`, because `/mcp` admits only loopback `Host` values by default (OIDC identity trust admits its resource's host by itself), and `--mcp-allow-writes` for write tools. |
 
 ## Design
-
-### Engine: control facts on the version CAS
-
-Checked against main and Lance 13.0.0's source on 2026-10-19.
-
-**What already holds across processes.** Every `__manifest` publication is an
-`Operation::Overwrite` committed with zero retries. Lance writes the next
-version only if it is absent: a hard link that fails on an existing target on
-local disks, `If-None-Match: *` on S3 and Azure. A concurrent commit therefore
-loses with `CommitConflict` instead of being rebased. The publisher maps that to
-`RowLevelCasContention` and reloads. On every attempt,
-`check_publish_precondition` rechecks its precondition (`ExactGraphHead`,
-`ExactGraphVersion` or `ExactCandidate`) and its expected table versions, and
-the loop retries up to `PUBLISHER_RETRY_BUDGET`, five times, six attempts in
-all. A precondition that no longer holds ends the attempt with
-`ReadSetChanged`; nothing re-parents silently. Ordinary writes, loads, merges,
-optimize and index maintenance rest on this, and their in-process gates only
-save wasted staging. The module says so: "cross-process writers on one graph
-remain one-winner-CAS at publish". A loser's detached staging is unreachable and
-collectible, as invariant 5 requires. Schema apply against a writer or another
-apply is already decided the same way. Optimize's config commit that strips
-stale auto-cleanup configuration (`Dataset::update_config`) also moves
-`__manifest`'s version, so it can only make a concurrent schema apply refuse.
-
-Two facts of the publisher shape the fix. A publication that changes rows must
-record a graph commit (`publish_with_precondition` refuses one without a
-lineage intent), so the head commit is the state of the `table` rows. And the
-preconditions read the branch binding, its native branch identifier and the
-head commit id, nothing else: a version that keeps the head passes them.
-
-**What does not.** The rest of a branch's state lives in Lance refs, and Lance
-gives refs weaker guarantees. In Lance 13, `Branches::create` is put-if-absent,
-but `replace_metadata` reads the ref and puts it back with no version check,
-`delete` removes it unconditionally, no Lance commit reads a ref, and object
-stores offer no conditional delete. Local storage has no update-if-unchanged
-primitive at all (`PutMode::Update` returns `NotImplemented`), so the one
-compare-and-swap that works on every backend is the one manifests use: a
-numbered object written if absent. Five races depend on the process-local gates
-(`WriteQueueManager::for_root`, a process-wide registry, and the schema gate,
-whose exclusive side branch creation takes):
-
-| Race | What happens today across processes |
-|---|---|
-| Branch delete beside a publisher | The publisher passes its precondition, the delete retires, archives and unlinks the ref, then the publisher's commit lands in the retired tree. It acknowledges a write no live branch shows, and the branch's settled history lacks it. |
-| Two creates of one logical name | Each mints its own `{logical}.{ULID}` ref, so neither put-if-absent conflicts. Two live incarnations result, and every resolution of the name fails until someone intervenes. |
-| A create during schema apply | Apply checks that main is the only branch, a create in another process adds one without moving main, and apply's `ExactGraphVersion` still succeeds. The new branch keeps the old contract, and merging it fails. System-column upgrade has the same window. |
-| Cleanup during a two-phase create | Lance writes the new tree, then its ref. Cleanup can classify the tree as ref-less, and its forced Lance delete can remove the tree, and the ref if it has landed. `reclaim_ref_absent_tree` says the single-writer gate is what stops a create between its last ref read and the delete. |
-| Publish beside drop of one proposal | Drop releases the proposal's tags and deletes its tag object; publish's `ExactCandidate` never reads the tag. Both acknowledge, and a merge proposal's released source tag can let a third process's cleanup sweep a pin the publish then names. |
-
-Each fix moves the deciding step onto a `__manifest` chain's version CAS through
-one new kind of row.
-
-**Control facts.** A ***control fact*** is a `__manifest` row that changes no
-`table` row and no schema contract, and so records no graph commit: a branch's
-tombstone on its own chain, a branch's registration on main, and a proposal's
-drop record on its target branch's chain. The row-change rule becomes: a
-publication that changes `table` rows or the schema contract records a graph
-commit, and one that writes only control facts records none. The publisher
-loads a chain's control facts with its other rows on every attempt, and
-`check_publish_precondition` fails closed, whatever the precondition, when a
-fact names the attempt's branch, name or candidate:
-
-| Fact | Chain | An attempt refuses when | Refusal |
-|---|---|---|---|
-| Tombstone | The branch's own | Its chain tombstones its native branch | `branch_deleted` |
-| Registration | main | It registers a logical name main already registers | `branch_exists` |
-| Drop record | The target branch's | It publishes a candidate a drop record names | `commit_dropped` |
-
-A fact that does not name the attempt leaves it unaffected: a registration costs
-main's writers a reload within their retry budget, since their head did not
-move, and a drop record costs the branch's other writers the same. A check made
-only before the first attempt would leave open the window the facts close, so
-the check runs where the precondition already runs, on every attempt.
-
-**Each control fact carries its attempt id.** A control-fact operation mints one
-***attempt id***, a ULID, before its first publish attempt, and every fact it
-writes records it. The attempt id is a control fact's identity, as the graph
-commit id is a row publication's:
-
-- **Read-back.** After a lost acknowledgement, the publisher settles the
-  attempt as [#1092](https://github.com/ModernRelay/omnigraph/pull/1092) splits
-  a row publication's. A request its request record shows could not have
-  landed lost: one never sent, or one the store refused before it could apply.
-  Otherwise the publisher reads the attempted version, and a readable version
-  is final. It landed if the version holds a fact with the attempt id. It lost
-  if the version holds another fact and the store never acknowledged this
-  attempt; after an acknowledgement it stays unknown, as the publisher reports
-  an acknowledged attempt in doubt. An absent version stays unknown until some
-  commit holds it, and a failed read until a read succeeds. The row read-back
-  compares heads, which cannot tell two control facts apart, since neither
-  moves the head.
-- **The owner's retry.** A fact with the operation's own attempt id is its own
-  landed attempt, never a refusal: the operation goes on to its follow-ups,
-  the ref, the deregistration, the archive and unlink, or the tag release.
-- **Unknown outcomes.** Every control fact is a linear publication on its
-  chain, so one whose request stays ambiguous is fenced by its version key, as
-  a linear row publication is in [§5 of storage outcomes per operation](https://github.com/ModernRelay/omnigraph/pull/1093): the chain's next publication either
-  loads it or takes its version first. A read of the registration, tombstone
-  or drop record is final once the attempted version is readable, by the
-  read-back rule above, without waiting for a later version: a create's
-  follow-up writes the ref, not another manifest version, so the chain may stay
-  at the registration. The attempt id stays on the fact, in the log and in
-  `disposition.check`.
-
-The refusals in the table apply to facts with another attempt id, with two
-convergent exceptions: a delete that finds its branch tombstoned by another
-attempt completes the follow-ups and succeeds, and so does a drop that finds
-its candidate's drop record.
-
-1. **Retirement is a publication.** Branch delete first publishes a tombstone on
-   the branch's own chain. A concurrent publisher either loses that version,
-   reloads and refuses with `branch_deleted`, or wins it, and the delete
-   reloads into the new head and tombstones that. History settlement reads the
-   chain up to the tombstone, so it is complete. Delete then publishes the
-   deregistration on main, and the retirement marker, the `BranchContents`
-   archive and the unlink follow as today. A crash between them leaves a
-   tombstoned branch that refuses writes, which the next delete, cleanup or
-   `repair` finishes.
-2. **A branch exists when main registers it.** Create mints the native name
-   `{logical}.{ULID}` and first publishes its registration on main: the logical
-   name, that native name and the fork point it branches from. Only then does it
-   create the native ref and tree. The registration is the branch's visibility
-   point: list, resolve, schema apply, system-column upgrade and cleanup read
-   the logical branches from main's registrations, in the attempt that
-   publishes, and a ref no registration names is no branch. Two creates of one
-   name race on main's version, and the loser refuses with `branch_exists`
-   before it has written anything. A crash after the registration and before
-   the ref leaves a registered branch with no ref, which refuses reads and
-   writes as not ready. A create of that name refuses with `branch_exists`;
-   its delete removes it, and `repair` completes it from the recorded fork
-   point, which cleanup retains while the registration names it. Listings read
-   registrations too: `branch list`, with the details
-   [#1012](https://github.com/ModernRelay/omnigraph/pull/1012) adds, lists such
-   a branch as not ready. Its registration fills `name`, `from` and
-   `from_commit_id`; `head`, `created_at` and `updated_at` stay absent until its
-   ref exists, so #1012 makes them optional.
-
-   Until [schema apply with live branches](https://github.com/ModernRelay/omnigraph/pull/963)
-   lands, a registration also refuses, on any attempt, when main's schema
-   contract is no longer the one its fork point carries (`schema_changed`, the
-   branch-start refusal [#1016](https://github.com/ModernRelay/omnigraph/pull/1016)
-   defines), and schema apply's `ExactGraphVersion` refuses when a registration
-   moved main's version after its live-branch check. System-column upgrade pins
-   main's head, not its version (`ExactGraphHead`), so its attempts read main's
-   registrations in `check_publish_precondition`, every attempt, and refuse when
-   they name any branch but main. Whichever publishes second refuses, so no
-   branch outlives an apply or an upgrade with the old contract. Once PR 963
-   lands, its rule wins: a branch keeps its contract until a merge, a
-   registration no longer reads main's contract, and a registration is never
-   the reason an apply or an upgrade refuses. PR 963 then decides what they
-   pin in place of main's exact version and branch set.
-3. **Cleanup reclaims only what no registration names.** A create registers
-   before its ref and tree exist, so a ref or tree that no registration names
-   is no create in progress. The collector lists refs and trees before it reads
-   main's registrations, so any listed ref or tree whose create is in flight is
-   already registered in what it reads. Such a ref or tree, whether a tombstone
-   retired it, a late marker rewrite recreated its ref, or a create crashed
-   before it, is a candidate with no age threshold. The registration set decides
-   which refs and trees are candidates; it does not replace the collector's
-   keep set. `protected_manifest_branches` still keeps any tree a live branch
-   reads and any retired tree that supplies a live tag, a retention root or
-   imported merge-base lineage (`retained_merge_bases`), and a not-ready
-   registration's fork point stays while the registration names it. The
-   collector deletes the remaining candidates through a ref delete and a delete
-   of that tree alone, never Lance's forced branch delete. The deciding
-   authority is the registration set, never an age, as invariant 5 requires. Lance 13's stock
-   `cleanup_old_versions` now also reaches unreferenced data newer than the
-   retained manifests
-   ([lance#8944](https://github.com/lance-format/lance/pull/8944)), so the engine
-   keeps never calling it on a graph table.
-4. **Drop is a publication.** Dropping a proposal publishes a drop record on
-   its target branch's chain before it releases any tag. An attempt to publish
-   that candidate refuses with `commit_dropped`, and a drop that reloads into a
-   published candidate refuses with `commit_published`. Tags are released only
-   after the record is durable, so no published pin can lose its protection.
-5. **The gates stay as contention optimizations.** No correctness argument rests
-   on `for_root`, the schema gate or the branch gates any longer, and their
-   comments say so. The exclusive schema permit around branch creation becomes
-   shared.
-
-**Late requests are harmless by construction.** Every storage mutation in this
-design falls in one of the key classes
-[storage outcomes per operation](https://github.com/ModernRelay/omnigraph/pull/1093)
-defines:
-
-- a fresh key, such as a data, deletion, index or transaction file or a
-  detached manifest, which nothing names until a publication does;
-- a conditional key, a `__manifest` version written only if absent;
-- a mutable key written only as a follow-up of a publication, whose late or
-  repeated landing changes nothing logical: retirement's marker rewrite, the
-  archive, the unlink and a drop's tag release.
-
-The marker rewrite is unconditional in Lance 13: a late one can even recreate a
-ref the delete already unlinked. That ref is deregistered, so it names no
-logical branch, and cleanup's registration rule reclaims it with its tree. A guard against unconditional
-writes of mutable keys admits these only as follow-ups of a publication.
-
-**Format.** Control facts are new `__manifest` rows under the next storage
-stamp. Only `omnigraph upgrade`'s stamp-only route raises a graph to it, and
-that route's one publication on main registers every live branch from the
-census it already takes, with writers stopped as it already requires; an
-ordinary publication never raises the stamp, so no registration can hide a
-live branch. Once main carries the stamp, older binaries refuse the graph and
-each other branch takes the stamp with its next publication. Until a graph is
-upgraded, the new binary keeps today's branch protocol and its
-one-writer-process boundary. [Schema apply with live
-branches](https://github.com/ModernRelay/omnigraph/pull/963) also proposes a
-stamp; whichever lands second takes the next one, and the two are independent.
-Downgrade is export and load.
-
-**Cost.** Branch creation gains one zero-retry publication on main, deletion one
-on the branch and one on main, and drop one on the target branch. Each is one
-more version its chain's writers may reload past within their retry budget; a
-fact that does not name them never makes them refuse. Only schema apply,
-which pins main's exact version, and system-column upgrade, whose attempts read
-main's registrations, refuse instead, which is the point until PR 963. Row writes, loads and merges are otherwise unchanged.
-`integration/branch_control_cost.rs` measures the added requests per backend.
-
-**Recovery.** Every new durable step is a publication or a follow-up of one. A
-crash after a tombstone and before the unlink leaves a branch that refuses
-writes, which delete, cleanup and `repair` complete. A crash after a
-registration and before its ref leaves a branch that refuses as not ready until
-its delete removes it or `repair` completes it. A crash loses the attempt id
-with its process. Delete and drop need no id, because a later one completes
-the follow-ups. A create does not converge: a new create of the name refuses
-with `branch_exists`, and `repair` completes the branch or its delete removes
-it. A crash after a drop
-record and before the tag release leaves tags that expire with their captured
-authority, as a proposal's tags already do.
 
 ### Server boundary
 
@@ -980,14 +711,11 @@ A client that refuses unknown fields in error bodies must accept
   static token to a process running as that person. Clients introduce no
   generated policy or identity source. The engine enforces policy for writes.
 - **One publication door (2), one view (3), publish once (4).** HTTP and MCP
-  use the ordinary server routes and engine. Cross-process writes keep each
-  operation's publication contract and move control-operation authority checks
-  into the manifest CAS.
-- **Crash convergence (5).** Every new engine durable step is either a
-  zero-retry publication on a `__manifest` chain or a derived, idempotent
-  follow-up: retirement's marker, archive and unlink; a registered create's
-  ref; a drop's tag release. A crash leaves state the next attempt, cleanup or
-  `repair` completes. Cleanup decides from registration authority, not age.
+  use the ordinary server routes and engine, preserving each operation's
+  accepted snapshot and publication contract.
+- **Crash convergence (5).** Client error classification and retry behavior
+  preserve the existing durability and recovery contracts. An unknown outcome
+  is not permission to replay a write.
 - **Bounded and observable (11).** Server limits and operation lifecycle keep
   their owners. One code registry and disposition object describe failures;
   clients do not silently replay an uncertain operation.
@@ -996,16 +724,14 @@ A client that refuses unknown fields in error bodies must accept
   there is no local-server registry or second credential store.
 - **Deny-list.** No daemon, cooperative writer lock, process-local fencing,
   work queue, shadow authority or cloud-only correctness path is added.
-  Cross-process safety must come from the substrate CAS, not client routing.
 - **Support boundaries.** Cluster-only serving remains unchanged, including
-  on localhost. The engine phase proposes lifting the existing
-  single-writer-process boundary for schema apply, branch control and cleanup;
-  that boundary remains until its own evidence gates pass. Cluster admission
-  is not removed or bypassed.
+  on localhost. The existing writer-process boundaries for schema apply, branch
+  control and cleanup remain unchanged. Cluster admission is not removed or
+  bypassed.
 
 ## Compatibility and reversibility
 
-Storage changes only in the engine phase. The deliberate compatibility changes
+This RFC changes no graph storage format. The deliberate compatibility changes
 are:
 
 - **Addressing.** RFC 0059 owns the target migration and removal of legacy CLI
@@ -1029,10 +755,7 @@ that require HTTP; there is no automatic migration or implicit graph adoption.
 
 The `omnigraph-server` binary, its packaging and its boot contract remain.
 No server record format, local-server protocol or alternate serving API ships
-under this RFC. Reverting a client command needs no graph migration. The
-cross-process phase is irreversible for an upgraded graph: new `__manifest`
-rows use the next storage stamp, older binaries refuse it, and downgrade is
-export and load ([Engine](#engine-control-facts-on-the-version-cas)).
+under this RFC. Reverting a client command needs no graph migration.
 
 ## Alternatives
 
@@ -1041,8 +764,6 @@ export and load ([Engine](#engine-control-facts-on-the-version-cas)).
 | A separate local-serving model for standalone graphs or read-only cluster snapshots | Discontinued on 2026-10-20. Generated identities and policies, separate route availability, boot and shutdown paths, and process discovery create another contract to maintain. A local ordinary cluster already uses the accepted serving model. |
 | Fold the server binary into a new `serve` command | Not needed for target resolution or client access. This RFC preserves the existing binary and boot interface. |
 | Automatically turn a direct target into a server or adopt a graph into a cluster | A direct destination does not authorize a new deployment, policy or process lifetime. Clients requiring HTTP select an existing server target. |
-| A daemon through which every CLI command writes | Cross-machine correctness still belongs to the engine; a daemon adds lifecycle and version skew. [Unified access paths](0009-unified-access-paths.md) rejects a localhost funnel for embedded access. |
-| A cooperative machine-local writer lock | Protects only cooperating writers on one machine. The manifest CAS must protect every supported writer. |
 | A CLI-only refusal field beside the HTTP API's `code` | Two code namespaces for one failure; one registry keeps consumers consistent. |
 | Studio bundles an engine, or starts a local server | Adds storage ownership and lifecycle to a client whose connection contract can use the existing server. |
 | Studio parses or writes CLI configuration itself | Two resolvers have already drifted, and a second writer can collide with operator edits. |
@@ -1102,41 +823,6 @@ Extend the existing owners in [the testing map](../dev/testing.md):
 - **CLI, `skill.rs` drift tests:** command index and condensed reference stay
   aligned; the cluster-only serving statements remain intact.
 
-- **Engine, `tests/failpoints.rs`:** the child-process actions gain create
-  against create, delete against a publisher, cleanup against an in-flight
-  create, publish against drop, schema apply and system-column upgrade against
-  create, and cleanup against cleanup, each proving which side won and that the
-  loser left nothing visible. Each control fact is checked on a retry, not only
-  on a first attempt: a publisher whose first attempt loses the CAS to a
-  tombstone, or a candidate publish that loses it to a drop record, must
-  refuse on the attempt after.
-- **Catalog, publisher tests:**
-  - A publication of control facts alone records no graph commit and leaves
-    every `table` row and the head unchanged.
-  - Each precondition kind refuses on an attempt a fact names and passes one it
-    does not.
-  - With two control facts on one chain, a lost acknowledgement reads back as
-    landed only for the fact carrying the attempt's own id. A never-sent or
-    refused request reads back as lost. Another fact at a readable attempted
-    version reads back as lost without an acknowledgement and as unknown after
-    one. An absent or unreadable attempted version stays unknown, and a
-    readable one settles without a later publication.
-  - A delete and a drop that find another attempt's fact complete the
-    follow-ups and succeed.
-  - An operation retried with its attempt id goes on to its follow-ups.
-  - A system-column upgrade attempt refuses when main's registrations name
-    another branch.
-- **Engine, `tests/detached_commit_matrix.rs`:** the other-process actor runs by
-  default for the control operations, not only under `OMNIGRAPH_MATRIX=full`.
-- **DST:** actors that model separate processes get separate write-queue
-  registries, so a schedule can reach the interleavings the process-local
-  gates hid; today all actors share `for_root`.
-- **Engine, `integration/branch_control_cost.rs`:** the added publications per
-  create, delete and drop, per backend.
-- **Storage upgrade:** the stamp-only route registers every live branch in its
-  one publication, no ordinary publication raises the stamp, older binaries
-  refuse the new stamp, and the cross-version fences cover it.
-
 Run CLI integration tests with `RUST_MIN_STACK=16777216` and the existing
 `omnigraph-server` binary built for the served journeys. The documentation-only
 disposition removes design scope; it does not claim these runtime evidence
@@ -1151,12 +837,11 @@ repositories' changes are listed as dependencies, made and reviewed there.
 
 | Area | Change |
 |---|---|
-| Engine and catalog | The control-fact design above, including per-attempt checks, branch registration and retirement, proposal drops, cleanup authority, upgrade and cross-process qualification. |
 | `omnigraph-api-types` | Code registry, disposition and operation table; reuse the shipped access output. |
 | `omnigraph-server` | Actor assertions, disposition and operation parity on the ordinary cluster-backed server. Keep the binary, boot sources, policy, admission, deployment routes and lifecycle. |
 | `omnigraph-cli` | Access reporting, actor assertions, failure/exit consistency, server-only MCP bridge and Studio opener, operation parity and protocol discovery. Reuse RFC 0059 target and credential commands. |
 | Packaging | Keep the server binary and existing deployment entrypoint. Any existing entrypoint defect is an independent fix, not a reason to replace the binary. |
-| Docs and skill | Document retained commands and HTTP contracts. Preserve cluster-only serving; update the engine support boundary only when its phase qualifies. Amend RFC 0003 for the stdio client bridge it deferred. Add release notes with each user-visible implementation phase. |
+| Docs and skill | Document retained commands and HTTP contracts. Preserve cluster-only serving and existing engine support boundaries. Amend RFC 0003 for the stdio client bridge it deferred. Add release notes with each user-visible implementation phase. |
 
 ### ModernRelay/omnigraph-studio
 
@@ -1181,17 +866,16 @@ preserve the actor header. Control-plane problems should state their own
 disposition so the CLI need not classify every sent request as unknown.
 
 Its CLI procedures follow RFC 0059's target migration. The server executable,
-launch arguments and deployment lifecycle do not change under this RFC. The
-engine phase changes graph-internal state under its format gate, not the
-control plane's boot contract. OAuth and managed MCP remain the independent
-work in [A2](#a2-oauth-for-standard-clients-and-managed-access) and
+launch arguments and deployment lifecycle do not change under this RFC.
+OAuth and managed MCP remain the independent work in
+[A2](#a2-oauth-for-standard-clients-and-managed-access) and
 [A3](#a3-mcp-relay-for-managed-targets).
 
 ## Rollout
 
 Each phase is independently reviewable, and no phase requires the
-discontinued local-serving work. Implementation PRs link this RFC and carry
-their tests, user documentation and release note.
+discontinued local-serving work or an engine redesign. Implementation PRs link
+this RFC and carry their tests, user documentation and release note.
 
 1. **HTTP identity, access and failures.** Actor assertions, disposition, the
    code registry and exit consistency use the stated HTTP contract boundary.
@@ -1210,27 +894,19 @@ their tests, user documentation and release note.
    discontinued dependencies. Add the operation inventory and parity evidence
    with that work. This phase does not retire the
    server binary.
-4. **Cross-process writes.** Qualify the engine control-fact, recovery, cost
-   and upgrade design. Only then lift its single-writer-process boundary.
-   Until then the current boundary and cluster admission remain unchanged.
-5. **Installing Studio.** Independent of engine qualification, after the
-   existing-server opener and Studio's signed release prerequisites exist
+4. **Installing Studio.** After the existing-server opener and Studio's signed
+   release prerequisites exist
    ([omnigraph-studio#3](https://github.com/ModernRelay/omnigraph-studio/issues/3)).
 
-Implementation status advances for retained work only; no discontinued
-serving phase counts toward completion.
+Implementation status advances for retained work only; neither the discontinued
+serving model nor the removed engine redesign is part of completion.
 
 ## Unresolved questions
 
-1. **Schema carried by a merge.** Whether a merge that carries a newer schema
-   needs `branch_merge` or `schema_apply`, which
-   [schema apply with live branches](https://github.com/ModernRelay/omnigraph/pull/963)
-   leaves open. The answer applies to ordinary engine and server operations,
-   not a special local-serving mode.
-2. **Ordering storage-format work.** The cross-process phase and schema apply
-   with live branches both need a stamp. This RFC assumes separate, ordered
-   upgrades; the implementation must assign the actual next stamp against its
-   merge base.
+No engine concurrency or storage-format decision remains in scope. Removing
+that work does not mark the remaining client phases complete: the evidence and
+rollout gates above still apply. OAuth and managed MCP remain separate decisions
+in [Appendix A](#appendix-a-changes-for-separate-decisions).
 
 RFC 0059 owns target grammar, migration and headless managed configuration;
 its accepted decision is a dependency, not an unresolved request here.
@@ -1240,9 +916,10 @@ its accepted decision is a dependency, not an unresolved request here.
 These changes came out of the same analysis but have a wider blast radius than
 this RFC: they change every client of every server, another author's RFC, or
 another repository's security posture. Each needs its own decision. None is
-required for the scope above to ship. Cross-process writer safety (#1018) and
-credential introspection (#1019), which earlier revisions kept here, are now in
-scope as cross-process correctness and access reporting.
+required for the scope above to ship. Credential introspection (#1019), which
+earlier revisions kept here, remains in scope as access reporting. Cross-process
+writer safety ([#1018](https://github.com/ModernRelay/omnigraph/issues/1018))
+is outside this RFC and requires a separate engine decision.
 
 | | Change | Why it is separate | Recommendation |
 |---|---|---|---|
@@ -1339,7 +1016,8 @@ credential binding and `credential get`, and
 [#1090](https://github.com/ModernRelay/omnigraph/pull/1090) implemented it on
 main. This RFC consumes that contract without adding live-server fields or
 another selection state. Target-dependent client commands build on it;
-independent HTTP and engine changes do not depend on a second serving model.
+HTTP and client changes do not depend on a second serving model or an engine
+redesign.
 
 ### A6. Defects found
 
@@ -1355,8 +1033,10 @@ independent HTTP and engine changes do not depend on a second serving model.
 ## Decision log
 
 Entries before 2026-10-20 describe superseded iterations where they concern
-local serving. The current body and the final disposition own the retained
-proposal.
+local serving. The 2026-10-24 decision supersedes all earlier engine redesign,
+control-fact, storage-stamp and `disposition.check` decisions, including their
+acceptance on 2026-10-20. These entries preserve history, not implementation
+requirements; the current body owns the retained client scope.
 
 - 2026-10-15: First draft, "Studio launcher and local graph sessions", from
   Studio spec 012 (E1–E5) and issue #980, reconciled with PR #850.
@@ -1547,3 +1227,15 @@ proposal.
   otherwise" (a refused credential carries `error="invalid_token"` with or
   without OIDC), "The challenge would move into the authentication middleware
   every route shares", and A1's recommendation, now its disposition.
+- 2026-10-24: On maintainer instruction, removed the engine redesign and
+  retitled this RFC "Graph access and client contracts", keeping its canonical
+  filename. Superseded the rule "Correctness lives in the engine, across
+  processes and machines", the promise "Any number of processes ... may run
+  any operation", the "Engine: control facts on the version CAS" design and
+  its qualification, recovery, storage-stamp and rollout requirements. Removed
+  the dependent `disposition.check` protocol and proposed control-operation
+  refusal codes. This withdraws the engine portion of the 2026-10-20
+  acceptance from this RFC; a future change needs a separate engine RFC.
+  Existing writer-process restrictions and cluster admission remain unchanged.
+  Target consumption, access, actor assertions, failure contracts, operation
+  parity and existing-server MCP/Studio clients remain accepted and in progress.
