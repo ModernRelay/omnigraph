@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-16
-updated: 2026-10-21
+updated: 2026-10-22
 discussion: https://github.com/ModernRelay/omnigraph/pull/1017
 supersedes: []
 superseded_by: []
@@ -497,9 +497,13 @@ owns.
 
 - On macOS it opens Studio by bundle identifier (`open -b`). On Linux and
   Windows it opens the link only when the platform names a handler for the
-  scheme (`xdg-mime query default x-scheme-handler/omnigraph-studio`, or the
-  scheme's registry association), because `xdg-open`'s generic path hands an
-  unhandled scheme to a web browser. Without Studio or a handler it prints the
+  scheme. On Linux the CLI launches that handler itself: it finds the desktop
+  entry `xdg-mime query default x-scheme-handler/omnigraph-studio` names
+  under `$XDG_DATA_HOME` and `$XDG_DATA_DIRS`, and runs the entry's `Exec`,
+  without a shell, with the link in place of `%u`. It never runs `xdg-open`,
+  whose generic path, with no display set, skips the registered handler and
+  hands the link to a web browser. On Windows it requires the scheme's
+  registry association. Without Studio or a handler it prints the
   link and how to install Studio, and refuses (`studio_unavailable`), until
   [installing Studio](#installing-studio) ships. It never opens a browser.
 - With `--json` it prints
@@ -1547,3 +1551,4 @@ proposal.
   otherwise" (a refused credential carries `error="invalid_token"` with or
   without OIDC), "The challenge would move into the authentication middleware
   every route shares", and A1's recommendation, now its disposition.
+- 2026-10-22: The Linux opener launches the `Exec` of the desktop entry `xdg-mime` names instead of running `xdg-open`, which without a display hands the link to a browser.

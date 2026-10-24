@@ -215,6 +215,12 @@ pub(crate) async fn run_target(
                 .get(&name)
                 .ok_or_else(|| eyre!("unknown target '{name}'"))?;
             let mut output = serde_json::json!({"name":name,"target":target});
+            // The digests a Studio link carries, recomputed for this home, so
+            // a client resolving the target itself can compare them.
+            if let Some(binding) = crate::target_identity::binding_digest(target)? {
+                output["binding"] = binding.into();
+            }
+            output["home"] = crate::target_identity::home_digest(input)?.into();
             if resolved {
                 if let Target::Managed { profile, .. } = target {
                     output["profile"] = serde_json::to_value(&source.profiles[profile])?;

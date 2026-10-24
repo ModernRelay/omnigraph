@@ -116,6 +116,16 @@ impl InvocationConfig {
             .as_ref()
             .map(|dir| dir.join(OPERATOR_CONFIG_FILE))
     }
+    /// The selected operator file at its canonical location: directory aliases
+    /// resolved, the file name preserved, so a projected file's symlink
+    /// rotation keeps its location. Credential custody is keyed by it, and the
+    /// operator-home digest of Studio links is computed from it.
+    pub(crate) fn canonical_config_path(&self) -> Result<PathBuf> {
+        let config = self
+            .config_path()
+            .ok_or_else(|| eyre!("no operator configuration path"))?;
+        normalized_config_path(&config)
+    }
     /// Local custody is separate from the operator document, which may be mounted
     /// read-only. The path is only a namespace; UUIDs and request constraints still
     /// bind credentials. Resolve directory aliases but preserve the file name so
@@ -127,10 +137,7 @@ impl InvocationConfig {
                     let directory = self.directory().ok_or_else(|| {
                         eyre!("credential custody requires OMNIGRAPH_HOME or a user home directory")
                     })?;
-                    let config = self
-                        .config_path()
-                        .ok_or_else(|| eyre!("no operator configuration path"))?;
-                    let config = normalized_config_path(&config)?;
+                    let config = self.canonical_config_path()?;
                     let key = Sha256::digest(config.as_os_str().as_encoded_bytes());
                     Ok(std::path::absolute(directory)?
                         .join("auth-state")
