@@ -572,12 +572,7 @@ impl<'a> CommittedState<'a> {
                         push_int_ids(batch, system_columns.id, &mut keys, bound)?;
                     }
                 }
-                AccessPath::Scan => {
-                    let mut stream = scan_bounded(&ds, &[system_columns.id]).await?;
-                    while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
-                        push_int_ids(&batch, system_columns.id, &mut keys, bound)?;
-                    }
-                }
+                AccessPath::Scan => scan_int_ids(&ds, system_columns.id, &mut keys, bound).await?,
             }
         }
         let layout =
@@ -893,6 +888,15 @@ fn integer_capacity_error(keys: usize) -> OmniError {
         isize::MAX as u64,
         (keys as u64).saturating_mul(size_of::<i64>() as u64),
     )
+}
+
+/// Every committed id of `ds` that spells a canonical integer, at most `bound`.
+async fn scan_int_ids(ds: &Dataset, id: &str, keys: &mut Vec<i64>, bound: usize) -> Result<()> {
+    let mut stream = scan_bounded(ds, &[id]).await?;
+    while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+        push_int_ids(&batch, id, keys, bound)?;
+    }
+    Ok(())
 }
 
 /// Every non-null canonical-integer value of `batch`'s `name` column, appended

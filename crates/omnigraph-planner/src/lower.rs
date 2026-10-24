@@ -10,7 +10,7 @@ use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
 use omnigraph_compiler::traversal::EdgeSelection;
 
 use crate::aggregate::AggregateSpec;
-use crate::cost::{AccessPath, ExpandMode, ExpandPolicy};
+use crate::cost::{AccessPath, ExpandMode, ExpandPolicy, ValidateRemoval};
 use crate::error::PlanError;
 use crate::logical::{
     ColumnRef, CsvSourceSpec, FragmentWriteSpec, KeyJoinKind, ScanSpec, ValidateSpec,
@@ -103,6 +103,7 @@ pub struct CsvSourceFields<'p> {
 pub struct ValidateFields<'p> {
     pub table: &'p str,
     pub checks: &'p [ValidateSpec],
+    pub removal: ValidateRemoval,
     pub max_workers: u32,
 }
 
@@ -597,6 +598,7 @@ impl PhysicalPlan {
                 input,
                 table,
                 checks,
+                removal,
                 max_workers,
             } => {
                 let input = self.lower_node(*input, l)?;
@@ -605,6 +607,7 @@ impl PhysicalPlan {
                     ValidateFields {
                         table,
                         checks,
+                        removal: *removal,
                         max_workers: *max_workers,
                     },
                     input,

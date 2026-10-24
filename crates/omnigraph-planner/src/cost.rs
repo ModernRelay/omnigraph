@@ -532,6 +532,51 @@ impl ValidateAccess {
     }
 }
 
+/// Whether a load validation finds the ids an overwrite removes, committed
+/// ids absent from the delta: one projected scan of the committed id column,
+/// or none, when no planned check consumes them. An empty committed table
+/// removes nothing, so its retained-edge checks are not planned and the scan
+/// is not either; append and merge remove nothing by definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidateRemoval {
+    #[default]
+    Scan,
+    None,
+}
+
+impl ValidateRemoval {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scan => "scan",
+            Self::None => "none",
+        }
+    }
+}
+
+/// Where an edge load's endpoint checks probe the committed node ids: on the
+/// parse partitions as the delta arrives (`Swept`), when both endpoint checks
+/// read their committed set whole (`Scan`) and both node types carry one
+/// integer `@key`, so the sets load beside the parse and each partition keeps
+/// its earliest miss; or after the drain on one thread (`Judged`), the route a
+/// `Probe` needs, since it reads `id IN (delta values)`, and the route a text
+/// key set keeps, since the delta values bound it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointProbe {
+    Swept,
+    Judged,
+}
+
+impl EndpointProbe {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Swept => "swept",
+            Self::Judged => "judged",
+        }
+    }
+}
+
 /// Usable BTREE coverage of a validation's filter columns. Fragment counts
 /// cannot estimate row work for partially covered tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

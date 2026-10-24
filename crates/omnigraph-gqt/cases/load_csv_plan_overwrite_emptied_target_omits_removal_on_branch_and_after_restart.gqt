@@ -1,0 +1,103 @@
+# issue: none
+# notes: The committed count pass 9 reads is live and the statement's branch's: a Person table emptied by `delete` on branch `work` plans `removal none`
+# notes: there while main, still populated, plans `scan` with three retained-edge checks (two edge tables reference Person); main emptied the same way plans `none` after a restart.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    id: String @key
+    email: String @unique
+}
+node Company {
+    id: String @key
+}
+edge Knows: Person -> Person {
+    w: I64
+}
+edge WorksAt: Person -> Company {
+    w: I64
+}
+
+--- seed
+{"type":"Person","data":{"id":"p1","email":"p1@x"}}
+{"type":"Person","data":{"id":"p2","email":"p2@x"}}
+
+--- mutate
+branch create work
+
+--- expect ok
+
+--- mutate branch: work
+query empty_person_on_work() { delete Person where id = "p1" or id = "p2" }
+
+--- expect affected: nodes=2 edges=0
+
+--- csv stmt.csv
+id,email
+p1,a@x
+p2,b@x
+
+--- mutate branch: work
+load csv "stmt.csv" into node:Person mode overwrite header
+
+--- expect ok
+
+--- expect plan
+load route: plan
+load validate removal node:Person: none
+load write: overwrite fragments
+load executed: partitions 1 rows 2
+
+--- mutate
+load csv "stmt.csv" into node:Person mode overwrite header
+
+--- expect ok
+
+--- expect plan
+load route: plan
+load validate retained_edges node:Person edge:Knows from: access probe
+load validate retained_edges node:Person edge:Knows to: access probe
+load validate retained_edges node:Person edge:WorksAt from: access probe
+load validate removal node:Person: scan
+load write: overwrite fragments
+load executed: partitions 1 rows 2
+
+--- mutate
+query empty_person_on_main() { delete Person where id = "p1" or id = "p2" }
+
+--- expect affected: nodes=2 edges=0
+
+--- restart
+
+--- mutate
+load csv "stmt.csv" into node:Person mode overwrite header
+
+--- expect ok
+
+--- expect plan
+load route: plan
+load validate removal node:Person: none
+load write: overwrite fragments
+load executed: partitions 1 rows 2
+
+--- query
+query people() {
+    match { $p: Person }
+    return { $p.id, $p.email }
+}
+
+--- expect unordered
+{"p.id": "p1", "p.email": "a@x"}
+{"p.id": "p2", "p.email": "b@x"}
+
+--- expect shape
+p.id: String
+p.email: String

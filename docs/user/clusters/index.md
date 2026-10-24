@@ -120,7 +120,7 @@ omnigraph cluster apply \
   --target production --config ./company-brain --json
 ```
 
-`production` names a server target with an owner-local authentication profile.
+`production` names a server target with its own `auth` provider.
 Configure it and install a token or declare an external source using the
 [operator reference](../cli/targets.md). No implicit token environment override
 or static-token login remains.

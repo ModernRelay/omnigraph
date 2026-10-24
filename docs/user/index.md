@@ -47,12 +47,13 @@ deployment.
 - [Storage failures and restart](operations/storage-failures.md)
 - [Authorization and actors](operations/policy.md)
 - [Maintenance](operations/maintenance.md)
+- [Upgrade from 0.13 to 0.14](operations/upgrade-0.14.md): checklist, YAML and CLI replacements
 - [Storage-format upgrades](operations/upgrade.md)
 
 ## Releases and internals
 
 User-visible changes are recorded in the [release notes](../releases/).
-See [0.13 highlights and upgrade requirements](../releases/v0.13.0-overview.md)
+See [0.14 highlights and upgrade actions](../releases/v0.14.0-overview.md)
 for a short overview of the release.
 Contributors should start with the [developer guide](../dev/index.md). Design
 decisions and proposals live in [RFCs](../rfcs/).

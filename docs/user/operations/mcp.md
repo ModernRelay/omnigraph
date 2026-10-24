@@ -3,8 +3,7 @@
 `omnigraph-server` serves the Model Context Protocol at `/mcp`, so Claude,
 ChatGPT, Cursor and other MCP clients can work with a graph with a URL and the
 caller's own credential. MCP shares the server's listener and lifecycle; no
-separate service is needed. It replaces the `@modernrelay/omnigraph-mcp` npm
-package.
+separate service is needed.
 
 Every tool calls the same handler as its HTTP route, under the same actor and
 the same [policy](policy.md) action. A tool appearing in the list is not
@@ -45,8 +44,8 @@ Its output matches the [HTTP access report](policy.md#learn-your-access).
 `queries` now lists stored mutations too, marked `mutation: true`, and
 `mutate` no longer requires `query`.
 
-These changes finalize the unreleased 0.14 access output. MCP does not use the
-`Omnigraph-Http-Api` header, so an old MCP client is not automatically refused.
+MCP does not use the `Omnigraph-Http-Api` header, so an old MCP client is not
+automatically refused.
 MCP protocol negotiation is unchanged, and the old field has no alias.
 
 ### Sign-in and discovery

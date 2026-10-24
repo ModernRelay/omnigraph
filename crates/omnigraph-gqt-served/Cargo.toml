@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-gqt-served"
-version = "0.14.0"
+version = "0.14.1"
 edition = "2024"
 description = "Served GQT conformance: the corpus run against an in-process omnigraph-server."
 license = "MIT"
@@ -13,8 +13,8 @@ publish = false
 [dependencies]
 
 [dev-dependencies]
-omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.14.0" }
-omnigraph-server = { path = "../omnigraph-server", version = "0.14.0" }
+omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.14.1" }
+omnigraph-server = { path = "../omnigraph-server", version = "0.14.1" }
 omnigraph-gqt = { path = "../omnigraph-gqt" }
 omnigraph-gqt-core = { path = "../omnigraph-gqt-core" }
 axum = { workspace = true }

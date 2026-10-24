@@ -579,6 +579,10 @@ red fails the run; it is not a required context.
 
 ## Local pre-push checks
 
+Run the applicable commands before pushing. They report as checks on the pull
+request page (`actionlint` and `shellcheck` run only locally), so the pull
+request description mentions only what CI does not run.
+
 For Rust changes:
 
 ```bash
