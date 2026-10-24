@@ -245,6 +245,7 @@ async fn valid_data_credential_remains_usable_when_control_expires_during_discov
                 client.list_graphs().await.unwrap();
                 assert_eq!(data.requests().len(), 2);
                 assert_eq!(data.requests()[1].headers["authorization"], expected);
+                assert_eq!(std::fs::read_to_string(&calls).unwrap(), "called\n", "data authority remains independent from expired control authority");
                 assert_eq!(
                     authentication
                         .token()
@@ -253,7 +254,7 @@ async fn valid_data_credential_remains_usable_when_control_expires_during_discov
                         .downcast_ref::<crate::credential_sources::CredentialError>(),
                     Some(&crate::credential_sources::CredentialError::Expired)
                 );
-                assert_eq!(std::fs::read_to_string(&calls).unwrap(), "called\n");
+                assert_eq!(std::fs::read_to_string(&calls).unwrap(), "called\ncalled\n", "the subsequent control acquisition tries the helper once, then refuses its expired result");
                 data.assert_complete();
             })
             .await;
@@ -2134,4 +2135,88 @@ async fn token_bootstrap_reports_endpoint_without_configuring_a_data_destination
         issuer.assert_complete();
     })
     .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn workload_near_expiry_renews_once_only_before_native_issuance() {
+    for (status, problem, second_refusal, calls) in [
+        (409, "credential_near_expiry", false, 2),
+        (409, "credential_near_expiry", true, 2),
+        (401, "credential_near_expiry", false, 1),
+        (409, "other_refusal", false, 1),
+    ] {
+        let mut context = context();
+        context.control_auth = super::super::ControlAuth::AutomationEnv;
+        let cp = IntentApiFixture::with_origin(|origin| {
+            context.api = origin.to_owned();
+            let response_credential = credential(&context, "https://data.example");
+            let mut response = response_credential.metadata();
+            response["token"] = json!(response_credential.token);
+            let session = || crate::managed::auth::tests::metadata(120, "alice");
+            let refusal = || {
+                IntentReply::json(
+                    status,
+                    json!({"type":problem,"detail":"issuance preflight refused"}),
+                )
+            };
+            let mut replies = vec![session(), refusal()];
+            if calls == 2 {
+                replies.push(session());
+                replies.push(if second_refusal {refusal()} else {IntentReply::json(200, json!({"data":response,"meta":{"cluster_id":context.cluster,"incarnation":"incarnation-a"}}))});
+            }
+            replies
+        });
+        let home = tempfile::tempdir().unwrap();
+        let helper = home.path().join("helper.sh");
+        let count = home.path().join("calls");
+        std::fs::write(&helper, "IFS= read -r request\nprintf 'called\\n' >> \"$1\"\nprintf '%s\\n' '{\"version\":1,\"credential\":{\"type\":\"bearer\",\"token\":\"test-control-token\"}}'\n").unwrap();
+        std::fs::write(home.path().join("config.yaml"), json!({"version":1,"profiles":{"work":{"api":cp.origin,"organization_id":"org_test","auth":{"provider":"exec","command":["/bin/sh", helper, count]}}}}).to_string()).unwrap();
+        let input = crate::operator::InvocationConfig::at(Some(home.path().to_owned()), None);
+        let cli =
+            crate::invocation::parse_from(["omnigraph", "cluster", "list", "--profile", "work"])
+                .unwrap()
+                .cli;
+        let target = crate::scope::resolve(&cli, &input, home.path(), false, &mut Vec::new())
+            .unwrap()
+            .unwrap();
+        let auth = crate::operator_routing::authentication(&cli, &input, Some(&target)).unwrap();
+        crate::operator_routing::test_transport_scope(&[&cp.origin], async {
+            crate::operator_routing::AUTH
+                .scope(auth, async {
+                    let api = context.client().await.unwrap();
+                    let result = issue_for_principal(
+                        &MemoryStore::default(),
+                        &context,
+                        &api,
+                        3600,
+                        Some("alice"),
+                    )
+                    .await;
+                    assert_eq!(
+                        result.is_ok(),
+                        calls == 2 && !second_refusal,
+                        "{status}/{problem}"
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(&count).unwrap(),
+                        "called\n".repeat(calls)
+                    );
+                    let requests: Vec<_> = cp
+                        .requests()
+                        .into_iter()
+                        .filter(|request| request.path.ends_with("/tokens"))
+                        .collect();
+                    assert_eq!(requests.len(), calls, "token acquisition is bounded");
+                    assert!(
+                        requests
+                            .iter()
+                            .all(|request| request.body == json!({"version":2,"ttl_seconds":3600}))
+                    );
+                })
+                .await;
+        })
+        .await;
+        cp.assert_complete();
+    }
 }

@@ -506,6 +506,22 @@ pub(crate) async fn run_credential(
                     }
                 }
                 AuthProfile::Exec { .. } => "not executed",
+                AuthProfile::OauthClientCredentials { client_secret, .. } => match client_secret {
+                    crate::operator_schema::ClientSecretSource::Env { env } => {
+                        if std::env::var_os(env).is_some() {
+                            "present"
+                        } else {
+                            "absent"
+                        }
+                    }
+                    crate::operator_schema::ClientSecretSource::File { file } => {
+                        if std::fs::metadata(file).is_ok_and(|m| m.is_file()) {
+                            "present"
+                        } else {
+                            "unavailable"
+                        }
+                    }
+                },
                 AuthProfile::Omnigraph => "unknown",
                 AuthProfile::Anonymous => "anonymous",
             };

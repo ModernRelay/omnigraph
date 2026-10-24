@@ -72,7 +72,8 @@ impl<'a> ResourceStore<'a> {
             AuthProfile::Token {
                 source: TokenSource::Env { .. } | TokenSource::File { .. },
             }
-            | AuthProfile::Exec { .. } => Self::Invocation(invocation),
+            | AuthProfile::Exec { .. }
+            | AuthProfile::OauthClientCredentials { .. } => Self::Invocation(invocation),
             AuthProfile::Token {
                 source: TokenSource::Store { .. },
             } => Self::StoredToken(persistent),
@@ -335,14 +336,24 @@ async fn issue_for_principal(
     ttl: u64,
     expected_principal: Option<&str>,
 ) -> Result<Credential> {
-    let body = api
-        .request(
-            Method::POST,
-            &format!("/v1/clusters/{}/tokens", context.cluster),
-            Some(&json!({"version":2,"ttl_seconds":ttl})),
-            None,
-        )
-        .await?;
+    let path = format!("/v1/clusters/{}/tokens", context.cluster);
+    let request = json!({"version":2,"ttl_seconds":ttl});
+    let issued = api.request(Method::POST, &path, Some(&request), None).await;
+    let body = match issued {
+        // This exact refusal is an issuance preflight: no native credential or
+        // graph/configuration effect was sent. Renew once; never retry a transport
+        // failure, authentication refusal, or any graph operation.
+        Err(failure)
+            if failure.body["type"] == "credential_near_expiry"
+                && failure.response_status == Some(reqwest::StatusCode::CONFLICT) =>
+        {
+            let selected = api.selection.as_ref().ok_or_else(Failure::protocol)?;
+            selected.renew_before_issuance(&api.origin).await?;
+            api.request(Method::POST, &path, Some(&request), None)
+                .await?
+        }
+        other => other?,
+    };
     context.verify(&body)?;
     let data = &body["data"];
     if data["version"] != 2
@@ -421,6 +432,17 @@ pub(super) async fn token(
     ttl: Option<u64>,
     clear: bool,
 ) -> Result<Value> {
+    if let Some(auth) = crate::operator_routing::AUTH
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        && matches!(
+            auth.profile,
+            crate::operator_schema::AuthProfile::OauthClientCredentials { .. }
+        )
+    {
+        return token_with_store(cli, context, ttl, clear, &auth.derived_credentials).await;
+    }
     token_with_store(cli, context, ttl, clear, &auth::DATA_STORE).await
 }
 

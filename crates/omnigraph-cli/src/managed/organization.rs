@@ -12,6 +12,8 @@ const TEAM_TIMEOUT: Duration = Duration::from_secs(35);
 const MAX_PATCH: u64 = 256 * 1024;
 const CREDENTIAL_LIFETIME: u64 = 86400;
 
+mod workloads;
+
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
 struct Grant {
@@ -119,6 +121,19 @@ fn email(value: &str) -> bool {
         })
 }
 
+fn valid_control_grant(grant: &Grant, adding: bool) -> bool {
+    match grant.cluster.as_deref() {
+        None => matches!(grant.verb.as_str(), "create" | "members_manage"),
+        Some(cluster) => {
+            identity(cluster)
+                && (matches!(
+                    grant.verb.as_str(),
+                    "status" | "delete" | "source_read" | "source_write"
+                ) || (!adding && matches!(grant.verb.as_str(), "plan" | "apply" | "cancel")))
+        }
+    }
+}
+
 fn valid_changes(changes: &Changes, adding: bool) -> bool {
     changes.cluster_admissions.len() <= 4096
         && changes.cluster_admissions.iter().all(|id| identity(id))
@@ -134,30 +149,17 @@ fn valid_changes(changes: &Changes, adding: bool) -> bool {
         && changes
             .control_grants
             .iter()
-            .all(|grant| match grant.cluster.as_deref() {
-                None => matches!(grant.verb.as_str(), "create" | "members_manage"),
-                Some(cluster) => {
-                    identity(cluster)
-                        && (matches!(
-                            grant.verb.as_str(),
-                            "status" | "delete" | "source_read" | "source_write"
-                        ) || (!adding
-                            && matches!(grant.verb.as_str(), "plan" | "apply" | "cancel")))
-                }
-            })
+            .all(|grant| valid_control_grant(grant, adding))
 }
 
 fn empty(changes: &Changes) -> bool {
     changes.control_grants.is_empty() && changes.cluster_admissions.is_empty()
 }
 
-fn read_patch(path: &Path) -> Result<Patch> {
-    let invalid = || {
-        Failure::refused(
-            "member_patch_invalid",
-            "member patch must be a regular YAML file of at most 256 KiB with version 1, exact identities, action add/update/remove, a matching expected version and exact grant changes",
-        )
-    };
+fn read_patch_document<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    invalid: impl Fn() -> Failure,
+) -> Result<T> {
     let metadata = std::fs::symlink_metadata(path).map_err(|_| invalid())?;
     if !metadata.is_file() || metadata.len() > MAX_PATCH {
         return Err(invalid());
@@ -180,7 +182,17 @@ fn read_patch(path: &Path) -> Result<Patch> {
     if bytes.len() as u64 > MAX_PATCH {
         return Err(invalid());
     }
-    let patch: Patch = yaml_serde::from_slice(&bytes).map_err(|_| invalid())?;
+    yaml_serde::from_slice(&bytes).map_err(|_| invalid())
+}
+
+fn read_patch(path: &Path) -> Result<Patch> {
+    let invalid = || {
+        Failure::refused(
+            "member_patch_invalid",
+            "member patch must be a regular YAML file of at most 256 KiB with version 1, exact identities, action add/update/remove, a matching expected version and exact grant changes",
+        )
+    };
+    let patch: Patch = read_patch_document(path, invalid)?;
     if patch.version != 1
         || !identity(&patch.organization_id)
         || !identity(&patch.user_id)
@@ -569,6 +581,7 @@ pub(super) async fn dispatch(
     stderr: &mut dyn Write,
 ) -> Output {
     let key = match command {
+        OrganizationCommand::Workloads { command } => workloads::key(command),
         OrganizationCommand::Members {
             command:
                 Members::Apply {
@@ -605,6 +618,10 @@ pub(super) async fn dispatch(
         };
         // The selected target constrains the patch before credentials or HTTP.
         let organization = binding.organization()?;
+        let workload_patch = match command {
+            OrganizationCommand::Workloads { command } => workloads::prepare(command, organization)?,
+            _ => None,
+        };
         if patch.as_ref().is_some_and(|patch| patch.organization_id != organization) {
             return Err(Failure::refused("target_mismatch", "the member patch belongs to another organization"));
         }
@@ -614,6 +631,7 @@ pub(super) async fn dispatch(
             return Err(Failure::refused("context_mismatch", "the member patch belongs to another organization"));
         }
         let (body, human, exit) = match command {
+            OrganizationCommand::Workloads { command } => workloads::execute(&api, command, workload_patch, key).await?,
             OrganizationCommand::Members { command: Members::List } => {
                 let body = request(&api, Method::GET, "/v1/organization/members", None, None).await?;
                 let human = directory_human(&body["data"], organization)?;

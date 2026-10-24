@@ -160,3 +160,114 @@ and retained receipt before preparing a new versioned request for the remaining
 cleanup. Human progress and the key go to stderr; `--json` keeps one response on
 stdout. Ordinary permission refusals exit 2 and malformed/transport failures
 exit 1, with no storage fallback.
+
+## Enroll unattended workloads
+
+Create a client-credentials application and its secret with the identity
+provider's official administration tools. The CLI handles organization
+admission; it never creates applications, handles secret rotation or converts a
+human account into a workload.
+
+```sh
+omnigraph organization workloads list --profile work --json
+omnigraph organization workloads enroll workload.yaml --profile work \
+  --idempotency-key enroll-ops --json
+```
+
+An enrollment patch uses the provider client ID, the selected organization and
+only the intended local control grants and cluster admissions:
+
+```yaml
+version: 1
+organization_id: org_customer
+client_id: client_ops
+expected_grant_version: 0
+action: enroll
+add:
+  cluster_admissions: [CLUSTER_ID]
+  control_grants:
+    - {cluster: CLUSTER_ID, verb: status}
+    - {cluster: CLUSTER_ID, verb: source_read}
+```
+
+The human administrator needs `members_manage`; this grant cannot be delegated
+to a workload. The receipt returns the stable `principal_id`. Add
+`principal:PRINCIPAL_ID` to the intended Cedar policies through the normal
+configuration workflow. Provider scopes, application roles and cluster admission
+alone grant no graph or configuration effects. Configure the workload's
+[OAuth profile](#configure-the-workload-profile) separately.
+
+For changes, use `action: update`, the current grant version and precise `add`
+and `remove` entries:
+
+```sh
+omnigraph organization workloads update workload.yaml --profile work \
+  --idempotency-key update-ops --json
+omnigraph organization workloads revoke client_ops --profile work \
+  --expected-version 2 --idempotency-key revoke-ops --json
+```
+
+Revoke disables local access and clears local grants without deleting the
+provider application or changing graph policy. Retained revoked bindings remain
+listed. Re-enrollment uses `action: enroll` and their current version, preserving
+the same principal. Enrollment and update verify the provider application;
+revocation remains available if that application has disappeared.
+
+Already issued workload graph credentials may remain valid for up to 330
+seconds, including clock tolerance. For immediate graph denial, deploy the Cedar
+policy change first and verify it. Retain the exact patch/key for uncertain
+results; these commands use the same bounded, nonreplaying request contract as
+member administration.
+
+### Configure the workload profile
+
+Use a client-credentials application enrolled in the selected organization.
+Obtain and rotate its secret through your identity provider's administration
+tools. Add a profile to `~/.omnigraph/config.yaml` (or
+`$OMNIGRAPH_HOME/config.yaml`):
+
+```yaml
+version: 1
+profiles:
+  ops:
+    api: https://control.example.com
+    organization_id: org_example
+    auth:
+      provider: oauth_client_credentials
+      token_endpoint: https://auth.example.com/oauth2/token
+      client_id: client_example
+      client_secret: {env: OG_OPS_CLIENT_SECRET}
+      # Optional provider scope, not graph permissions:
+      scope: "read write"
+```
+
+The secret may instead use `{file: /var/run/secrets/ops-client-secret}`.
+Environment values are exact; files allow one final LF or CRLF and atomic
+symlink rotation. Sources are bounded to 64 KiB. Literal YAML secrets and
+secure-store client secrets are unsupported.
+
+```sh
+omnigraph cluster list --profile ops
+omnigraph target add ops-cluster --profile ops --cluster CLUSTER_ID
+omnigraph --target ops-cluster --graph knowledge query 'query q() { return { 1 as ok } }'
+omnigraph mcp --target ops-cluster
+```
+
+Acquisition makes one form-encoded `client_credentials` request using
+`client_secret_post` at the explicit HTTPS endpoint. It uses system trust,
+direct networking and a 25-second total bound, without endpoint discovery,
+redirects, browser login or refresh tokens. The verified service session must
+identify the configured client as an enrolled workload in the selected
+organization. Provider scopes never replace local admission or applied Cedar.
+
+Tokens stay in invocation memory. Long-running commands renew expired control
+credentials before their next request and keep the same verified organization,
+principal, kind, subject and client ID. A typed native-credential issuance
+preflight refusal may trigger one renewal and one new issuance request. A
+submitted operation, HTTP 401 or uncertain delivery is never replayed for
+authentication. Secret rotation takes effect on the next acquisition; a
+different client or identity needs a separate profile.
+
+OAuth `cluster token` reports issuance metadata without persisting the credential;
+its `--clear` option clears only invocation memory. Ordinary resource commands
+acquire their own credential.

@@ -4058,9 +4058,374 @@ fn managed_organization_requires_an_account_target_and_write_keys() {
         vec!["invitations", "resend", "inv_one"],
         vec!["invitations", "revoke", "inv_one"],
         vec!["members", "offboard", "user_one", "--expected-version", "1"],
+        vec!["workloads", "enroll", "workload.yaml"],
+        vec!["workloads", "update", "workload.yaml"],
+        vec![
+            "workloads",
+            "revoke",
+            "client_ops",
+            "--expected-version",
+            "1",
+        ],
     ] {
         let output = output_failure(organization_cli(temp.path(), &api.origin).args(arguments));
         assert!(String::from_utf8_lossy(&output.stderr).contains("--idempotency-key"));
     }
     assert!(api.requests().is_empty());
+}
+
+fn workload_patch(action: &str, version: i64) -> Value {
+    let mut patch = serde_json::json!({"version":1,"organization_id":"account-one","client_id":"client_ops","action":action,"expected_grant_version":version,"add":{"control_grants":[],"cluster_admissions":[]},"remove":{"control_grants":[],"cluster_admissions":[]}});
+    if action != "revoke" {
+        patch["add"] = serde_json::json!({"control_grants":[{"cluster":"managed-test","verb":"status"}],"cluster_admissions":["managed-test"]});
+    }
+    patch
+}
+
+fn workload_receipt(action: &str, version: i64) -> Value {
+    let mut scopes = team_scopes();
+    let patch = workload_patch(action, version);
+    scopes["control_grants"] = patch["add"]["control_grants"].clone();
+    scopes["cluster_admissions"] = patch["add"]["cluster_admissions"].clone();
+    serde_json::json!({"data":{"organization_id":"account-one","action":action,"previous_grant_version":version,"workload":{"issuer":"https://connect.example.test","client_id":"client_ops","application_id":"app_ops","principal_id":"principal-ops","name":"Operations agent","enabled":action!="revoke","grant_version":version+1,"scopes":scopes},"provider_changed":false,"graph_policy_changed":false,"maximum_existing_native_credential_lifetime_seconds":330},"meta":{"provenance":"service_db"}})
+}
+
+#[test]
+fn managed_organization_workloads_send_exact_versioned_patches_once() {
+    for (action, version) in [("enroll", 0), ("update", 1), ("revoke", 2), ("enroll", 3)] {
+        let temp = tempdir().unwrap();
+        let input = workload_patch(action, version);
+        fs::write(
+            temp.path().join("workload.yaml"),
+            yaml_serde::to_string(&input).unwrap(),
+        )
+        .unwrap();
+        let response = workload_receipt(action, version);
+        let api = lifecycle_fixture(vec![IntentReply::json(200, response.clone())]);
+        let mut command = organization_cli(temp.path(), &api.origin);
+        command.args(["workloads", action]);
+        if action == "revoke" {
+            command.args(["client_ops", "--expected-version", &version.to_string()]);
+        } else {
+            command.arg("workload.yaml");
+        }
+        command.args(["--idempotency-key", "workload-key", "--json"]);
+        let output = output_success(&mut command);
+        assert_eq!(parse_stdout_json(&output), response);
+        let sent = api.workflow_requests();
+        assert_eq!(sent.len(), 1);
+        assert_control_request(
+            &sent[0],
+            "POST",
+            "/v1/organization/workloads",
+            input,
+            Some("workload-key"),
+        );
+        api.assert_complete();
+        assert_no_core_effects(temp.path());
+    }
+    for json in [true, false] {
+        let temp = tempdir().unwrap();
+        let record = workload_receipt("revoke", 2)["data"]["workload"].clone();
+        let response = serde_json::json!({"data":{"organization_id":"account-one","workloads":[record]},"meta":{}});
+        let api = lifecycle_fixture(vec![IntentReply::json(200, response.clone())]);
+        let mut command = organization_cli(temp.path(), &api.origin);
+        command.args(["workloads", "list"]);
+        if json {
+            command.arg("--json");
+        }
+        let output = output_success(&mut command);
+        if json {
+            assert_eq!(parse_stdout_json(&output), response);
+        } else {
+            let human = String::from_utf8_lossy(&output.stdout);
+            for expected in [
+                "Operations agent",
+                "client_ops",
+                "principal-ops",
+                "revoked",
+                "grant version: 3",
+                "Cedar",
+            ] {
+                assert!(human.contains(expected), "{human}");
+            }
+        }
+        assert_control_request(
+            &api.workflow_requests()[0],
+            "GET",
+            "/v1/organization/workloads",
+            Value::Null,
+            None,
+        );
+        api.assert_complete();
+    }
+}
+
+#[test]
+fn managed_organization_workloads_refuse_invalid_patches_before_authentication() {
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![]);
+    for (pointer, value) in [
+        ("/version", serde_json::json!(2)),
+        ("/organization_id", serde_json::json!("account-other")),
+        ("/client_id", serde_json::json!("user_one")),
+        ("/action", serde_json::json!("update")),
+        ("/expected_grant_version", serde_json::json!(-1)),
+        (
+            "/add/control_grants",
+            serde_json::json!([{"cluster":null,"verb":"members_manage"}]),
+        ),
+        (
+            "/remove/cluster_admissions",
+            serde_json::json!(["managed-test"]),
+        ),
+    ] {
+        let mut patch = workload_patch("enroll", 0);
+        *patch.pointer_mut(pointer).unwrap() = value;
+        fs::write(
+            temp.path().join("workload.yaml"),
+            yaml_serde::to_string(&patch).unwrap(),
+        )
+        .unwrap();
+        let output = output_failure(organization_cli(temp.path(), &api.origin).args([
+            "workloads",
+            "enroll",
+            "workload.yaml",
+            "--idempotency-key",
+            "workload-key",
+            "--json",
+        ]));
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+    }
+    let mut patch = workload_patch("enroll", 0);
+    patch["client_secret"] = serde_json::json!("must-never-print");
+    fs::write(
+        temp.path().join("workload.yaml"),
+        yaml_serde::to_string(&patch).unwrap(),
+    )
+    .unwrap();
+    let output = output_failure(organization_cli(temp.path(), &api.origin).args([
+        "workloads",
+        "enroll",
+        "workload.yaml",
+        "--idempotency-key",
+        "workload-key",
+        "--json",
+    ]));
+    assert_eq!(parse_stdout_json(&output)["type"], "workload_patch_invalid");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("must-never-print"));
+    assert!(api.requests().is_empty());
+    api.assert_complete();
+    assert_no_core_effects(temp.path());
+}
+
+#[test]
+fn managed_organization_workloads_refuse_bad_or_uncertain_receipts_without_replay() {
+    for (pointer, value) in [
+        (
+            "/data/workload/issuer",
+            serde_json::json!("https://connect.example.test/other"),
+        ),
+        ("/data/organization_id", serde_json::json!("account-other")),
+        (
+            "/data/workload/client_id",
+            serde_json::json!("client_other"),
+        ),
+        ("/data/workload/grant_version", serde_json::json!(0)),
+        ("/data/workload/enabled", serde_json::json!(false)),
+        (
+            "/data/workload/scopes/control_grants",
+            serde_json::json!([]),
+        ),
+        ("/data/provider_changed", serde_json::json!(true)),
+        (
+            "/data/maximum_existing_native_credential_lifetime_seconds",
+            serde_json::json!(86400),
+        ),
+    ] {
+        let temp = tempdir().unwrap();
+        let mut response = workload_receipt("enroll", 0);
+        *response.pointer_mut(pointer).unwrap() = value;
+        let api = lifecycle_fixture(vec![IntentReply::json(200, response)]);
+        fs::write(
+            temp.path().join("workload.yaml"),
+            yaml_serde::to_string(&workload_patch("enroll", 0)).unwrap(),
+        )
+        .unwrap();
+        let output = output_failure(organization_cli(temp.path(), &api.origin).args([
+            "workloads",
+            "enroll",
+            "workload.yaml",
+            "--idempotency-key",
+            "workload-key",
+            "--json",
+        ]));
+        assert_eq!(
+            parse_stdout_json(&output)["idempotency_key"],
+            "workload-key"
+        );
+        assert!(parse_stdout_json(&output).get("data").is_none());
+        assert_eq!(api.workflow_requests().len(), 1);
+        api.assert_complete();
+    }
+    for reply in [
+        IntentReply::json(
+            409,
+            serde_json::json!({"type":"membership_changed","detail":"review current version"}),
+        ),
+        IntentReply {
+            status: 200,
+            headers: vec![],
+            body: b"{\"data\":".to_vec(),
+        },
+    ] {
+        let temp = tempdir().unwrap();
+        let api = lifecycle_fixture(vec![reply]);
+        let output = output_failure(organization_cli(temp.path(), &api.origin).args([
+            "workloads",
+            "revoke",
+            "client_ops",
+            "--expected-version",
+            "1",
+            "--idempotency-key",
+            "original-key",
+            "--json",
+        ]));
+        assert_eq!(
+            parse_stdout_json(&output)["idempotency_key"],
+            "original-key"
+        );
+        assert_eq!(api.workflow_requests().len(), 1);
+        api.assert_complete();
+    }
+}
+
+#[test]
+fn managed_workload_explicit_token_and_clear_use_only_invocation_custody() {
+    let temp = tempdir().unwrap();
+    let endpoint = "https://graph.example.invalid";
+    let (api, tokens) = IntentApiFixture::workload_identity_issuer(endpoint, 1);
+    let provider = IntentApiFixture::new(vec![IntentReply::json(
+        200,
+        serde_json::json!({"access_token":"oauth-initial","token_type":"Bearer","expires_in":600}),
+    )]);
+    write_managed_data_target(temp.path(), &api.origin, endpoint);
+    let home = managed_home(temp.path());
+    let config = home.join("config.yaml");
+    let mut document: Value = yaml_serde::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    document["profiles"]["managed-account"]["auth"] = serde_json::json!({
+        "provider":"oauth_client_credentials",
+        "token_endpoint":format!("{}/oauth2/token", provider.origin),
+        "client_id":"client-one","client_secret":{"env":"OG_FIXTURE_CLIENT_SECRET"}});
+    fs::write(&config, yaml_serde::to_string(&document).unwrap()).unwrap();
+    let output = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", &home)
+            .env("SSL_CERT_FILE", crate::support::tls_gateway::ca_path())
+            .env("OG_FIXTURE_CLIENT_SECRET", "fixture-private-secret")
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/nonexistent/omnigraph-no-keyring",
+            )
+            .current_dir(temp.path())
+            .timeout(std::time::Duration::from_secs(15))
+            .args(["cluster", "token", "--target", "managed-test", "--json"]),
+    );
+    let result = parse_stdout_json(&output);
+    assert_eq!(result["data"]["actor"], "principal:principal-one");
+    assert!(result["data"].get("token").is_none());
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for secret in ["fixture-private-secret", "oauth-initial", &tokens[0]] {
+        assert!(!printed.contains(secret));
+    }
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(api.workflow_requests().len(), 1);
+    assert_eq!(
+        api.workflow_requests()[0].path,
+        "/v1/clusters/managed-test/tokens"
+    );
+    provider.assert_complete();
+    api.assert_complete();
+
+    // Clear is local even when the provider is unreachable and no secret exists.
+    document["profiles"]["managed-account"]["auth"]["token_endpoint"] =
+        serde_json::json!("https://provider.example.invalid/oauth2/token");
+    fs::write(&config, yaml_serde::to_string(&document).unwrap()).unwrap();
+    let cleared = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", &home)
+            .env_remove("OG_FIXTURE_CLIENT_SECRET")
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/nonexistent/omnigraph-no-keyring",
+            )
+            .timeout(std::time::Duration::from_secs(5))
+            .args([
+                "cluster",
+                "token",
+                "--clear",
+                "--target",
+                "managed-test",
+                "--json",
+            ]),
+    );
+    assert_eq!(
+        parse_stdout_json(&cleared)["data"]["local_credential_removed"],
+        true
+    );
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(api.workflow_requests().len(), 1);
+}
+
+#[test]
+fn managed_workload_token_exchange_refuses_redirects_and_errors_without_secret_output() {
+    for status in [302, 401] {
+        let temp = tempdir().unwrap();
+        let api = lifecycle_fixture(vec![]);
+        let provider = IntentApiFixture::new(vec![IntentReply {
+            status,
+            headers: vec![(
+                "Location".into(),
+                "https://other.example.invalid/redirected".into(),
+            )],
+            body: br#"{"error":"fixture-provider-private-response"}"#.to_vec(),
+        }]);
+        write_managed_target(temp.path(), &api.origin);
+        let home = managed_home(temp.path());
+        let config = home.join("config.yaml");
+        let mut document: Value =
+            yaml_serde::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        document["profiles"]["managed-account"]["auth"] = serde_json::json!({
+            "provider":"oauth_client_credentials", "token_endpoint":format!("{}/oauth2/token", provider.origin),
+            "client_id":"client-one", "client_secret":{"env":"OG_FIXTURE_CLIENT_SECRET"}});
+        fs::write(&config, yaml_serde::to_string(&document).unwrap()).unwrap();
+        let output = output_failure(
+            cli()
+                .env("OMNIGRAPH_HOME", &home)
+                .env("SSL_CERT_FILE", crate::support::tls_gateway::ca_path())
+                .env("OG_FIXTURE_CLIENT_SECRET", "fixture-private-secret")
+                .timeout(std::time::Duration::from_secs(10))
+                .args(["cluster", "token", "--target", "managed-test", "--json"]),
+        );
+        let printed = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for secret in [
+            "fixture-private-secret",
+            "fixture-provider-private-response",
+        ] {
+            assert!(!printed.contains(secret));
+        }
+        assert_eq!(provider.requests().len(), 1);
+        assert!(api.requests().is_empty());
+        provider.assert_complete();
+        api.assert_complete();
+        assert_no_core_effects(temp.path());
+    }
 }

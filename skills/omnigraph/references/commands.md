@@ -15,7 +15,7 @@
 - MCP for agents (mcp)
 - Addressing a graph
 - Output formats and positions · health check
-- Organization administration (members and invitations)
+- Organization administration (members, invitations and workloads)
 - Cluster control plane (direct and managed)
 
 Commands you'll reach for but don't need best-practice rules around. Quick syntax reference.
@@ -50,7 +50,7 @@ prints the exact flags of the installed binary.
 | `lint` | — | Validate `.gq` source against a schema or a graph |
 | `queries` | `validate` `list` | Check a cluster's stored queries; list a cluster's or a served graph's |
 | `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `create` `list` `members list` `pull` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; the target kind selects the backend |
-| `organization` | `members list` `members apply` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | Manage the selected organization's members and invitations; requires a profile; `org` is an alias |
+| `organization` | `members list` `members apply` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` `workloads list` `workloads enroll` `workloads update` `workloads revoke` | Manage the selected organization's members, invitations and workload enrollment; requires a profile; `org` is an alias |
 | `policy` | `validate` `test` `explain` | Validate or evaluate a cluster's applied policy |
 | `embed` | — | Generate, clean or refresh seed embeddings |
 | `login` | — | Create a profile with `--create-profile`, or sign in to its `omnigraph` auth provider |
@@ -547,3 +547,14 @@ pushed revisions and reject `--config`. Cluster identity and incarnation are
 pinned; data requests additionally require the target endpoint. Auth providers never fall back to each other. Retain
 operator-home lifecycle custody after an uncertain request; reconcile old work
 with compatible tooling before retiring its configuration. See [managed clusters](cluster.md#managed-clusters).
+
+Workload administration uses `organization workloads list`,
+`enroll PATCH.yaml --idempotency-key KEY`,
+`update PATCH.yaml --idempotency-key KEY`, and
+`revoke CLIENT_ID --expected-version N --idempotency-key KEY`, each with the
+human administrator's `--profile NAME`. Patches pin organization/client/action
+and the current grant version. `members_manage` cannot be granted to workloads.
+This changes local admission only; applied Cedar owns graph/config permissions,
+and the provider owns application secrets. Workloads authenticate through an
+explicit `oauth_client_credentials` profile with a secret env/file reference,
+without browser login. See the CLI's managed-team and target documentation.

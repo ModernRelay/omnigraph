@@ -103,9 +103,10 @@ Each profile or server target chooses one provider:
 | Environment token | `{provider: token, source: {env: OG_SERVICE_TOKEN}}` |
 | Mounted token | `{provider: token, source: {file: /var/run/omnigraph/token}}` |
 | Credential helper | `{provider: exec, command: [/usr/local/bin/credential-helper, get], timeout: 30s}` |
+| Managed OAuth client credentials | `{provider: oauth_client_credentials, token_endpoint: https://auth.example.com/oauth2/token, client_id: client_example, client_secret: {env: OG_CLIENT_SECRET}}` |
 | Explicit anonymous server | `{provider: anonymous}` |
 
-`omnigraph` is managed-only; `anonymous` is standalone-only. Names grant no privileges,
+`omnigraph` and `oauth_client_credentials` are managed-only; `anonymous` is standalone-only. Names grant no privileges,
 and token/exec sources do not qualify arbitrary workload federation.
 
 Token profiles declare exactly one source. `store` uses secure local custody;
@@ -125,8 +126,8 @@ The helper receives one version-1 JSON request on stdin with purpose, endpoint,
 with `version: 1`, `credential: {type: bearer, token: ...}` and optional RFC 3339
 `expires_at`. Unknown fields, expired results and unsupported types refuse.
 Expiry is checked again immediately before an authenticated request is sent,
-including after discovery. An expired credential refuses before submission;
-the CLI does not replay a mutation to refresh credentials. Managed control and
+including after discovery. A renewable provider can be acquired once again
+before submission; the CLI does not replay a mutation to refresh credentials. Managed control and
 data credentials retain their independent expiry times.
 Without expiry the result is not cached across invocations. Timeout terminates
 the helper process group; stderr is not echoed in routine errors.
@@ -134,8 +135,7 @@ Output cannot change routing or prove identity. Helpers inherit the process
 environment and are trusted programs, not sandboxed plugins. Inspection and
 validation never execute them.
 
-The exec adapter currently requires Unix process-group support; other platforms
-refuse it rather than launch a helper without bounded cancellation.
+Exec requires Unix process-group support; other platforms refuse it.
 
 Never put tokens, refresh tokens or private keys in YAML. Persistent login fails
 if secure custody is unavailable; there is no plaintext fallback. Resource
@@ -144,11 +144,11 @@ profile credential for a cluster-bound data credential; control and refresh
 tokens never go to the graph endpoint. Service and graph policy still authorize
 operations independently of credential acquisition.
 
-For managed resource commands and managed-target credential export, env/file/exec
+For managed resource commands and managed-target credential export, env/file/exec/OAuth
 profiles keep exchanged credentials only in invocation memory, without requiring
 an OS store. This is explicit source-based custody, not a store-failure fallback.
-Human profiles, stored tokens and explicit `cluster token` administration retain
-secure-store requirements.
+Human profiles, stored tokens and existing providers' explicit `cluster token` administration retain secure-store requirements.
+OAuth profiles use invocation memory; see [workload setup](managed-team.md#configure-the-workload-profile).
 
 ## Login and registration
 

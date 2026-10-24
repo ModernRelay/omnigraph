@@ -1611,3 +1611,110 @@ fn stopped_with_calls_in_flight(mut bridge: Bridge, endpoint: &McpEndpoint) {
     );
     assert_eq!(endpoint.received(4).len(), 1);
 }
+
+#[test]
+fn managed_mcp_client_credentials_renew_without_browser_or_effect_replay() {
+    use crate::support::managed_http::{IntentApiFixture, IntentReply};
+    let endpoint = McpEndpoint::start("not-issued");
+    let (api, tokens) = IntentApiFixture::workload_identity_issuer(&endpoint.url, 2);
+    let provider = IntentApiFixture::new(vec![
+        IntentReply::json(
+            200,
+            json!({"access_token":"oauth-initial", "token_type":"Bearer", "expires_in":15}),
+        ),
+        IntentReply::json(
+            200,
+            json!({"access_token":"oauth-renewed", "token_type":"Bearer", "expires_in":600}),
+        ),
+    ]);
+    endpoint.accept(&tokens[0]);
+    let config = tempdir().unwrap();
+    write_managed_data_target(config.path(), &api.origin, &endpoint.url);
+    let home = managed_home(config.path());
+    let operator = home.join("config.yaml");
+    let mut document: Value =
+        yaml_serde::from_str(&std::fs::read_to_string(&operator).unwrap()).unwrap();
+    document["profiles"]["managed-account"]["auth"] = json!({"provider":"oauth_client_credentials", "token_endpoint":format!("{}/oauth2/token", provider.origin), "client_id":"client-one", "client_secret":{"file":home.join("client-secret")}, "scope":"read write:graph"});
+    std::fs::write(&operator, yaml_serde::to_string(&document).unwrap()).unwrap();
+    std::fs::write(home.join("client-secret"), "initial:&=+ secret\n").unwrap();
+    let mut command = cli_process();
+    command
+        .env("OMNIGRAPH_HOME", &home)
+        .env("SSL_CERT_FILE", tls_gateway::ca_path())
+        .env_remove("OMNIGRAPH_CONTROL_TOKEN")
+        .env_remove("OMNIGRAPH_BEARER_TOKEN")
+        .args(["mcp", "--target", "managed-test"]);
+    let mut bridge = Bridge::start(command);
+    assert!(bridge.initialize()["result"].is_object());
+    assert_eq!(
+        bridge.tool(1, "fast", json!({}))["result"]["content"][0]["text"],
+        "fast"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "valid credentials remain cached"
+    );
+    std::fs::write(home.join("client-secret"), "rotated:&=+ secret\n").unwrap();
+    std::thread::sleep(Duration::from_secs(16));
+    assert_eq!(
+        bridge.tool(2, "fast", json!({}))["result"]["content"][0]["text"],
+        "fast"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "one acquisition after local expiry"
+    );
+    endpoint.accept(&tokens[1]);
+    let refused = bridge.tool(3, "fast", json!({}));
+    assert_eq!(refused["error"]["data"]["status"], 401, "{refused}");
+    assert_eq!(
+        endpoint.received(3),
+        [tokens[0].clone()],
+        "sent requests are never replayed"
+    );
+    assert_eq!(
+        bridge.tool(4, "fast", json!({}))["result"]["content"][0]["text"],
+        "fast"
+    );
+    assert_eq!(endpoint.received(4), [tokens[1].clone()]);
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "native renewal reuses valid OAuth authority"
+    );
+    let finished = bridge.finish();
+    finished.assert_success();
+    finished.assert_never_shows(&[
+        "oauth-initial",
+        "oauth-renewed",
+        "initial:&=+ secret",
+        "rotated:&=+ secret",
+        &tokens[0],
+        &tokens[1],
+    ]);
+    for (request, secret) in provider
+        .requests()
+        .iter()
+        .zip(["initial:&=+ secret", "rotated:&=+ secret"])
+    {
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/oauth2/token");
+        let form: std::collections::BTreeMap<_, _> = url::form_urlencoded::parse(&request.raw_body)
+            .into_owned()
+            .collect();
+        assert_eq!(form.len(), 4);
+        assert_eq!(form["grant_type"], "client_credentials");
+        assert_eq!(form["client_id"], "client-one");
+        assert_eq!(form["client_secret"], secret);
+        assert_eq!(form["scope"], "read write:graph");
+        assert!(!request.headers.contains_key("authorization"));
+    }
+    assert!(api.requests().iter().all(|request| {
+        ["Bearer oauth-initial", "Bearer oauth-renewed"]
+            .contains(&request.headers.get("authorization").unwrap().as_str())
+    }));
+    provider.assert_complete();
+    api.assert_complete();
+}
