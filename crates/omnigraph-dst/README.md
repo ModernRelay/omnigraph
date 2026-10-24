@@ -89,7 +89,7 @@ The five GROUPS below are the reader's map; the enforced census counts
 3. **OCC invariant** — no two commits share a `graph_commit_id`.
 4. **Replay meta-test** — same scenario ⇒ byte-equal `UniverseReport`s,
    including commit ids and the raw row-ordered JSON of a full
-   compiler→DataFusion query.
+   compiler→engine query.
 5. **Conservation** — batched two-statement transfers preserve the balance
    sum (multi-statement atomicity).
 
@@ -133,7 +133,9 @@ and `tests/integration/lane_b.rs`.
   exercises the same constructors as the hunt and fleet, including the
   hunt's probe pass. Returned table errors are attributed; native-fork
   reconciliation failures reported only through tracing are outside this
-  deferral channel.
+  deferral channel. Windows no universe can cross are named with their
+  reasons in `harness::REACH_EXPECTED_DARK`: the reach census asserts that
+  list, and the hunt and the fleet do not schedule its windows.
 - **Injected storage faults**: `Scenario::faults` installs a seeded `FaultPlan`
   on the adapter and optionally Lance. Latency uses virtual time. Lance supports
   errors, latency and lost acknowledgements; adapter text corruption and

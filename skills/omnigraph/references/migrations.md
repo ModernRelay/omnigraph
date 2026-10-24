@@ -6,8 +6,31 @@ an older binary, rebuilding a graph, or translating earlier API examples.
 
 Current HTTP integrations must use exactly `Omnigraph-Http-Api: 0.14`, including
 the current routes, shapes and credentials. A `0.13` peer is refused before data
-dispatch or graph access; changing an old integration's header alone is not an
-upgrade. See [server policy](server-policy.md).
+dispatch or graph access. Earlier prerelease 0.14 builds share the header and
+header admission cannot distinguish their older shapes; refresh clients,
+server and integrations together. See [server policy](server-policy.md).
+
+## Upgrade to the 0.14 HTTP API
+
+Regenerate SDKs from the current OpenAPI document: graph operation IDs lose
+`cluster_`, path arguments become `branch_name`, `query_name` and
+`deployment_id`, response types use `Output`, and string enum types omit that
+suffix. Blob selectors and change results share `EntityKind`; URLs and enum
+values are unchanged.
+
+Read `actor_id` instead of `actor` from HTTP and MCP access results.
+`omnigraph access --json` carries `protocol: 2` for this shape; update scripts
+that expect protocol 1. For HTTP commit lists, use `listing=unpublished` or
+`listing=unattached`; omit `listing` or use `listing=history` for history.
+Both retired boolean keys are refused even when false or combined with
+`listing`. Non-history listings still refuse `limit` and `page_token`.
+
+After the server upgrade, reconnect MCP clients and refresh cached tool schemas
+through `tools/list`. Clients with fixed response types must update them to
+`actor_id` before reconnecting. The HTTP header does not fence `/mcp`, so old
+MCP clients are not automatically refused; protocol negotiation is unchanged.
+See the [migration note](https://github.com/ModernRelay/omnigraph/blob/main/changelog.d/http-contract-014.breaking.md)
+and [MCP guide](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/mcp.md#upgrade-tool-schemas).
 
 ## Upgrade v0.10 to v0.11
 
@@ -254,7 +277,7 @@ targets, output defaults and aliases into the versioned operator file.
 | Before | Current |
 |---|---|
 | `--server`, `--store`, `--cluster`, old resource `--profile` | `--target NAME\|LOCAL_PATH` for resources, `--profile NAME` for account operations; rebuild configuration without an importer |
-| positional backend URL or URI | `--target NAME\|ADDRESS` (only `init` retains its positional creation address) |
+| positional backend URL or URI | `--target NAME\|LOCAL_PATH` (only `init` retains its positional local creation address) |
 | `--cluster-graph <id>` | `--target ROOT --graph ID` |
 | query `--name <q>` | positional query name plus `--query`/`-e` for ad-hoc source |
 | `ingest` | `load --mode <append|merge|overwrite>` |
@@ -267,16 +290,15 @@ The server is cluster-only: start it with `omnigraph-server --cluster
 control-plane `--config` flag. `policy` and the stored-query registry use
 `--target ROOT` plus optional `--graph`.
 
-Direct `schema apply` remains available for a non-cluster store. A cluster-only
-server rejects the legacy schema-apply route with `409`; edit the declared `.pg`
-and submit it with `cluster apply --target NAME --config DIR`.
+Direct `schema apply` remains available for a standalone local graph. The
+server has no schema-apply route; edit the declared `.pg` and submit it with
+`cluster apply --target NAME --config DIR`.
 
-## HTTP compatibility aliases
+## Retired HTTP routes
 
-Canonical routes are `/query`, `/mutate`, and `/load`. `/read`, `/change`, and
-`/ingest` remain deprecated compatibility aliases and identify their successor
-in response headers. Per-graph routes are nested below `/graphs/{id}`; old flat
-single-graph routes are gone.
+Canonical routes are `/query`, `/mutate`, and `/load`. The old `/read`,
+`/change`, `/ingest` and `/schema/apply` routes are removed. Per-graph routes
+are nested below `/graphs/{id}`; old flat single-graph routes are gone.
 
 The pre-v0.4 transactional Run state machine, `/runs`, and the `run_publish` /
 `run_abort` policy actions are removed. Writes publish directly; use exact write

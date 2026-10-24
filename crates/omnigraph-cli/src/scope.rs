@@ -167,8 +167,15 @@ pub(crate) fn resolve(
             },
         )
     };
-    planes::validate_target(cli, &target, explicit_config)
-        .map_err(|e| targets::refusal("target_incompatible", e.to_string()))?;
+    // A refusal that names its own code, such as `target_kind_unsupported`,
+    // keeps it.
+    planes::validate_target(cli, &target, explicit_config).map_err(|error| {
+        if error.downcast_ref::<targets::TargetError>().is_some() {
+            error
+        } else {
+            targets::refusal("target_incompatible", error.to_string())
+        }
+    })?;
     if planes::selects_graph(&cli.command, &target) {
         graph_selection(&target, cli.graph.as_deref())
             .map_err(|error| targets::refusal("target_incompatible", error.to_string()))?;

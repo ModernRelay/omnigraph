@@ -12,15 +12,15 @@ use omnigraph_api_types::{
     BlobReadQuery, BlobStatOutput, BlobWriteOutput, BlobWriteQuery, BranchCreateOutput,
     BranchCreateRequest, BranchDeleteOutput, BranchListOutput, BranchMergeOutcome,
     BranchMergeOutput, BranchMergeRequest, BranchOutcomeOutput, ChangeBaselineOutput,
-    ChangeBaselineRecord, ChangeBaselineRequest, ChangeFeedOutput, ChangeOpOutput, ChangeOutput,
-    ChangeRequest, CommitChangesOutput, CommitListOutput, CommitOutput, DiffOutput,
-    EntityKindOutput, ExportRequest, GraphBatchLoadOutput, GraphDiscoveryResponse,
-    GraphListResponse, InvokeStoredQueryRequest, MergeBaseOutput, QueriesCatalogOutput,
-    QueryRequest, ReadOutput, SchemaApplyOutput, SchemaOutput, SettingsRequest, SnapshotOutput,
-    branch_list_read_output, branch_read_output, change_baseline_output, change_feed_output,
-    change_scope, commit_changes_output, commit_output, diff_output,
-    graph_batch_load_receipt_output, load_executed_output, merge_base_output, read_output,
-    schema_apply_output, show_read_output, snapshot_payload,
+    ChangeBaselineRecord, ChangeBaselineRequest, ChangeFeedOutput, ChangeOp, ChangeOutput,
+    ChangeRequest, CommitChangesOutput, CommitListOutput, CommitOutput, DiffOutput, EntityKind,
+    ExportRequest, GraphBatchLoadOutput, GraphDiscoveryOutput, GraphListOutput,
+    InvokeStoredQueryRequest, MergeBaseOutput, QueriesCatalogOutput, QueryRequest, ReadOutput,
+    SchemaApplyOutput, SchemaOutput, SettingsRequest, SnapshotOutput, branch_list_read_output,
+    branch_read_output, change_baseline_output, change_feed_output, change_scope,
+    commit_changes_output, commit_output, diff_output, graph_batch_load_receipt_output,
+    load_executed_output, merge_base_output, read_output, schema_apply_output, show_read_output,
+    snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::query::ast::{BranchCreateFrom, BranchRead, BranchWrite, CommitWrite};
@@ -771,7 +771,7 @@ impl GraphClient {
     }
 
     /// `commit list --unpublished`: the proposals whose recorded target is
-    /// `branch` (`None` = main), `GET /commits?unpublished=true` or the
+    /// `branch` (`None` = main), `GET /commits?listing=unpublished` or the
     /// engine's listing.
     pub(crate) async fn list_unpublished_commits(
         &self,
@@ -789,9 +789,9 @@ impl GraphClient {
                     Some(branch) => remote_url(
                         base_url,
                         &["commits"],
-                        &[("branch", branch), ("unpublished", "true")],
+                        &[("branch", branch), ("listing", "unpublished")],
                     )?,
-                    None => remote_url(base_url, &["commits"], &[("unpublished", "true")])?,
+                    None => remote_url(base_url, &["commits"], &[("listing", "unpublished")])?,
                 };
                 remote_json_bounded(
                     http,
@@ -824,7 +824,7 @@ impl GraphClient {
 
     /// `commit list --unattached`: the live unattached snapshots whose
     /// recorded target is `branch` (`None` = main),
-    /// `GET /commits?unattached=true` or the engine's listing.
+    /// `GET /commits?listing=unattached` or the engine's listing.
     pub(crate) async fn list_unattached_commits(
         &self,
         branch: Option<&str>,
@@ -841,9 +841,9 @@ impl GraphClient {
                     Some(branch) => remote_url(
                         base_url,
                         &["commits"],
-                        &[("branch", branch), ("unattached", "true")],
+                        &[("branch", branch), ("listing", "unattached")],
                     )?,
-                    None => remote_url(base_url, &["commits"], &[("unattached", "true")])?,
+                    None => remote_url(base_url, &["commits"], &[("listing", "unattached")])?,
                 };
                 remote_json_bounded(
                     http,
@@ -2636,7 +2636,7 @@ impl GraphClient {
     /// (`registry_from_target`), which always builds the Remote variant.
     /// The Embedded arm is unreachable by
     /// construction and kept as a defensive internal-invariant bail.
-    pub(crate) async fn list_graphs(&self) -> Result<GraphListResponse> {
+    pub(crate) async fn list_graphs(&self) -> Result<GraphListOutput> {
         match self {
             GraphClient::Remote {
                 http,
@@ -2662,7 +2662,7 @@ impl GraphClient {
     }
 
     /// Minimal existence inventory. No fallback to the metadata-bearing catalog.
-    pub(crate) async fn discover_graphs(&self) -> Result<GraphDiscoveryResponse> {
+    pub(crate) async fn discover_graphs(&self) -> Result<GraphDiscoveryOutput> {
         match self {
             Self::Remote {
                 http,
@@ -2773,9 +2773,9 @@ pub(crate) enum DiffSidesArg<'a> {
 /// Shared spelling of the change-surface filters across the three verbs; one
 /// translation (`change_scope`) is used by the embedded arm and the server.
 pub(crate) struct ChangeFilterArgs<'a> {
-    pub kinds: &'a [EntityKindOutput],
+    pub kinds: &'a [EntityKind],
     pub types: &'a [String],
-    pub ops: &'a [ChangeOpOutput],
+    pub ops: &'a [ChangeOp],
 }
 
 impl ChangeFilterArgs<'_> {
@@ -2943,6 +2943,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commit_listing_sends_the_enum_selector_on_both_http_transports() {
+        for managed in [false, true] {
+            let server = IntentApiFixture::graph(
+                (0..6)
+                    .map(|_| IntentReply::json(200, json!({"commits": []})))
+                    .collect(),
+            );
+            crate::operator_routing::test_transport_scope(&[&server.origin], async {
+                let client = if managed {
+                    GraphClient::managed(
+                        &server.origin,
+                        "knowledge",
+                        crate::credential_sources::test_credential(&server.origin, "credential"),
+                    )
+                    .unwrap()
+                } else {
+                    GraphClient::Remote {
+                        http: Box::new(GraphHttpClient::new(&server.origin).unwrap()),
+                        base_url: remote_url(&server.origin, &["graphs", "knowledge"], &[])
+                            .unwrap(),
+                        token: None,
+                        response_limit: None,
+                        catalogue: false,
+                    }
+                };
+                for branch in [None, Some("review")] {
+                    assert!(
+                        client
+                            .list_commits(branch)
+                            .await
+                            .unwrap()
+                            .commits
+                            .is_empty()
+                    );
+                    assert!(
+                        client
+                            .list_unpublished_commits(branch)
+                            .await
+                            .unwrap()
+                            .commits
+                            .is_empty()
+                    );
+                    assert!(
+                        client
+                            .list_unattached_commits(branch)
+                            .await
+                            .unwrap()
+                            .commits
+                            .is_empty()
+                    );
+                }
+                let requests = server.workflow_requests();
+                assert_eq!(requests.len(), 6);
+                for (request, expected) in requests.iter().zip([
+                    "/graphs/knowledge/commits",
+                    "/graphs/knowledge/commits?listing=unpublished",
+                    "/graphs/knowledge/commits?listing=unattached",
+                    "/graphs/knowledge/commits?branch=review",
+                    "/graphs/knowledge/commits?branch=review&listing=unpublished",
+                    "/graphs/knowledge/commits?branch=review&listing=unattached",
+                ]) {
+                    assert_eq!(request.method, "GET");
+                    assert_eq!(request.path, expected);
+                }
+                server.assert_complete();
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test]
     async fn graph_http_discovery_refuses_before_data_dispatch() {
         use omnigraph_api_types::{
             HTTP_API_CONTRACT as CONTRACT, HTTP_API_CONTRACT_HEADER as HEADER,
@@ -2950,11 +3021,12 @@ mod tests {
 
         let target = IntentApiFixture::new(vec![]);
         crate::operator_routing::test_transport_scope(&[&target.origin], async {
-            let cases: [(u16, Vec<(String, String)>); 9] = [
+            let cases: [(u16, Vec<(String, String)>); 10] = [
                 (200, vec![]),
                 (200, vec![(HEADER.into(), "0.11".into())]),
                 (200, vec![(HEADER.into(), "0.12".into())]),
                 (200, vec![(HEADER.into(), "0.13".into())]),
+                (200, vec![(HEADER.into(), "0.15".into())]),
                 (
                     200,
                     vec![(HEADER.into(), format!("{CONTRACT}, {CONTRACT}"))],
@@ -3260,7 +3332,7 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), "{}\n").unwrap();
         let blob = BlobReadQuery {
-            entity: omnigraph_api_types::BlobEntityKind::Node,
+            entity: omnigraph_api_types::EntityKind::Node,
             r#type: "Document".into(),
             id: "document-one".into(),
             property: "data".into(),

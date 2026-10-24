@@ -12,6 +12,7 @@
 - Maintenance (optimize, index build and rebuild, cleanup)
 - Stored queries
 - Operator config & credentials
+- MCP for agents (mcp)
 - Addressing a graph
 - Output formats and positions · health check
 - Organization administration (members and invitations)
@@ -52,12 +53,13 @@ prints the exact flags of the installed binary.
 | `organization` | `members list` `members apply` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | Manage the selected organization's members and invitations; requires a profile; `org` is an alias |
 | `policy` | `validate` `test` `explain` | Validate or evaluate a cluster's applied policy |
 | `embed` | — | Generate, clean or refresh seed embeddings |
-| `login` | — | Register a profile or sign in to its `omnigraph` profile |
+| `login` | — | Create a profile with `--create-profile`, or sign in to its `omnigraph` auth provider |
 | `logout` | — | Clear the selected platform session and report revocation |
 | `target` | `list` `inspect` `add` `refresh` `remove` | Manage resource bindings |
 | `credentials` | `set` `status` `remove` `export` | Explicit owner/profile custody and pipe-only access export |
 | `config` | `validate` `rename-profile` `rename-target` `recover-rename` `recover-operations` | Validate/edit operator bindings or preserve legacy operation evidence |
 | `access` | — | Say who you are at a target and which actions its policy grants, graph-wide and on a branch |
+| `mcp` | — | Relay an agent's stdio MCP to an existing server target's `/mcp`, bound to one graph; read-only tools unless `--write` |
 | `skill` | `export` `show` | Export or print this skill as built into the CLI |
 | `version` | — | Print the CLI version, the HTTP contract it speaks and the storage formats it writes and serves; `--json` prints them as one object |
 
@@ -365,7 +367,7 @@ omnigraph queries list --target prod --graph knowledge --json # a server's catal
 registry against its applied schema. `list` reads a direct cluster root, where
 `--graph` may select one graph, or one served graph, which a server target
 selects with `--graph` or its `default_graph`; there `--json` prints the body of
-`GET /graphs/{id}/queries`.
+`GET /graphs/{graph_id}/queries`.
 Distinct from `lint`, which validates authoring source. See
 [`stored-queries.md`](stored-queries.md).
 
@@ -390,7 +392,8 @@ omnigraph access --target production --branch main --json
 
 `access` reports the server-resolved actor and allowed graph actions; it is the
 identity check, with no separate `whoami` command. Direct targets use `--as`
-or no actor. Managed targets refuse `access`. See
+or no actor. JSON uses `protocol: 2` and `actor_id`, null without an actor;
+update scripts that read protocol 1's `actor`. Managed targets refuse `access`. See
 [access scope and policy semantics](../../../docs/user/cli/targets.md#what-you-may-do-at-a-target).
 
 Set/remove require `token`/`store`; an existing entry needs `--replace`.
@@ -424,6 +427,23 @@ same operator file; a conflicting later edit refuses. Principal replacement
 requires an existing profile or managed target, verifies the
 **new** principal ID, and invalidates derived credentials. It conflicts with
 onboarding `--create-profile`, `--api` and `--organization`.
+
+## MCP for Agents
+
+```json
+{"command": "omnigraph", "args": ["mcp", "--target", "staging", "--graph", "knowledge"]}
+```
+
+`omnigraph mcp` speaks MCP on stdio for an agent that starts its tools as a
+child process, relaying every message to an existing server target's `/mcp`
+with the token of the target's `auth`, which the agent never sees. It is bound to one
+graph (`--graph` or `default_graph`): calls that omit `graph` get it, and calls
+or resource URIs naming another graph are refused. Without `--write` only tools
+the server annotates read-only are listed and admitted; the server lists write
+tools only with `--mcp-allow-writes`. `--as` asserts the actor on every
+request. Direct and managed targets refuse with `target_kind_unsupported`; the
+bridge never starts a server. A lost answer is never resent: an
+`outcome_unknown` error means read the target and reconcile before replaying.
 
 ## Addressing a Graph
 
@@ -463,7 +483,7 @@ For params:
 - `jsonl` — NDJSON, one per line, with metadata line first
 - `json` — pretty `ReadOutput` envelope (metadata, columns, and rows); the `rows` array is printed compact and verbatim
 
-`--format arrow` appears in `--help` but 0.12.0 has no Arrow output: it always
+`--format arrow` appears in `--help` but the CLI has no Arrow output: it always
 fails with "has no text rendering". Do not use it, or set it as
 `defaults.output`.
 
@@ -489,7 +509,7 @@ its `status`, the booted applied digest, ledger revision/CAS, the registered,
 ready, loading and blocked graph counts and shutdown grace. It returns `503`
 while a graph is still loading, when a nonempty inventory has no ready graph,
 and once draining starts. Readiness is not proof that every configured graph
-is healthy; authorized `graphs list --target <name|url> --json` returns one
+is healthy; authorized `graphs list --target NAME --json` on a registered target returns one
 `graphs` list with each graph's `state` and `action`, blocked graphs included.
 
 ## Organization Administration

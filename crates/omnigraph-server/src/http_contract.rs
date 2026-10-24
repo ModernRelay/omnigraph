@@ -118,6 +118,9 @@ pub(crate) async fn identify_response(request: Request, next: Next) -> Response 
     response
 }
 
+/// What the `WWW-Authenticate` header of every protected 401 carries.
+const CHALLENGE_DESCRIPTION: &str = "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity.";
+
 pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
     let mut schema = Object::with_type(Type::String);
     schema.enum_values = Some(vec![HTTP_API_CONTRACT.into()]);
@@ -190,6 +193,18 @@ pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
                     let mut allow = Header::new(Object::with_type(Type::String));
                     allow.description = Some("The methods the path serves.".into());
                     response.headers.insert("Allow".into(), allow);
+                }
+                // Authentication guards every protected router, and every 401
+                // carries the challenge.
+                if let Some(response) = document_error(
+                    operation,
+                    path,
+                    "401",
+                    "unauthorized when no bearer credential is presented or the server refuses it",
+                ) {
+                    let mut header = Header::new(Object::with_type(Type::String));
+                    header.description = Some(CHALLENGE_DESCRIPTION.into());
+                    response.headers.insert("WWW-Authenticate".into(), header);
                 }
             }
             if per_graph || path.starts_with("/cluster/") {

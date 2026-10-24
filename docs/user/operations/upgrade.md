@@ -5,15 +5,25 @@ publish, or by the [storage upgrade](#storage-upgrade)) and never migrates a gra
 graph at v8 or v9 (release 0.11.x) or at v13 is converted in place by that offline upgrade. A graph at any other
 format, and every cluster-managed graph below v14, is refused and takes the
 [export/import rebuild](#rebuild) with the binary that wrote the graph.
-Check the [release notes](../../releases/) for storage and index compatibility.
+Start with the [0.13 → 0.14 checklist](upgrade-0.14.md) for fleet,
+CLI configuration, HTTP/MCP, and client compatibility changes.
 
 ## Storage upgrade
 
-`omnigraph upgrade` converts a standalone v8, v9 or v13 graph to v16 in place, and stamps a v14 or v15 graph to v16 in place by the route `stamp-v14-to-v16`: one metadata-only commit per live branch still below v16, main first, and nothing else (no pending marker, nothing under `__history/legacy/`, no table row rewritten); stop every reader and writer and take the backup as for any upgrade, and a run that stops part-way is finished by running it again. That upgrade is required before `as commit`, `commit publish` or `commit drop`, which are refused on a branch still at v14, and before `as unattached branch`, which is refused on a branch still at v14 or v15.
+`omnigraph upgrade` converts a standalone v8, v9 or v13 graph to v16 in place, and stamps a v14 or v15 graph to v16 in place by the route `stamp-v14-to-v16`: one metadata-only commit per live branch still below v16, main first, and nothing else (no pending marker, nothing under `__history/legacy/`, no table row rewritten); stop every reader and writer and take the backup as for any upgrade, and a run that stops part-way is finished by running it again.
 Branches, commit ids, commit history and table data are kept; no table row is
 rewritten. Only main builds from 2026-10-01 to 2026-10-04 wrote v13.
 
-The upgrade is offline, and it cannot verify that itself:
+Graphs at v14 or v15 already open in 0.14; an offline stamp is not a prerequisite
+for ordinary reads and writes. The first ordinary 0.14 publication stamps that
+branch v16, including in a cluster. Opening the graph or running a no-op does not
+advance the stamp. `as commit`, `commit
+publish` and `commit drop` refuse a branch still at v14; `as unattached branch`
+refuses a branch still at v14 or v15. A standalone graph can use the offline
+command before using those features. Cluster graphs must first have an ordinary
+0.14 publication on the affected branch; `upgrade` cannot stamp cluster graphs.
+
+The explicit `omnigraph upgrade` command is offline, and it cannot verify that itself:
 
 1. Stop every server, embedded reader or writer and maintenance process that
    has the graph open, and keep them stopped until the upgrade reports
@@ -29,12 +39,12 @@ omnigraph upgrade --target ./graph.omni --json
 omnigraph commit list --target ./graph.omni --json
 ```
 
-`--check` writes nothing. A run without `--check` first marks the graph as
-pending, which every normal open refuses, writes the pre-upgrade commits as
-immutable objects under `__history/legacy/`, converts each live branch,
-validates what it wrote and only then removes the marker. A run that stops
-after the marker is resumed by running the same command again with the same
-executable. Never delete the marker or anything under `__history/`.
+`--check` writes nothing. For a v8, v9 or v13 conversion, a run without `--check`
+first marks the graph as pending, which every normal open refuses. It writes the
+pre-upgrade commits under `__history/legacy/`, converts each live branch, validates
+the result and only then removes the marker. Resume an interrupted conversion by
+running the same command with the same executable. Never delete the marker or
+anything under `__history/`.
 
 | `outcome` | Meaning | Exit |
 |---|---|---|
@@ -105,9 +115,11 @@ A graph written by 0.11.x (v8 or v9) has limits of its own. Its checks read ever
 | Table versions above a commit | An interrupted 0.11.x write can leave them. The upgrade opens each table only at the version main's head pins and does not report them. Reads and writes ignore them, `repair` reports `foreign_drift` and `cleanup` lists them as foreign versions |
 | `cleanup` after a 0.11.x `cleanup` or `schema apply --allow-data-loss` | Both removed table versions that old catalog versions still name. `cleanup` deletes no catalog version of a live branch, so a catalog version can outlive the table versions it names, after these 0.11.x runs and after any earlier `cleanup` whose policy was narrower. A `cleanup` whose policy retains such a catalog version reports `is absent from the listing` for its tables, deletes nothing from them and still exits 0. `--older-than D` passes once those versions are older than `D`, and `--keep N` once they fall outside the newest `N`. A branch base, a merge base and a tag are retained under every policy: while one of them is such a version, every policy refuses its tables, and deleting that branch or tag releases it. `omnigraph cleanup --keep 1 --confirm` retains only those and each branch head, so it passes unless one of them is such a version. A read at a commit id whose table version 0.11.x removed fails as it did before |
 
-Server and cluster selectors, cluster profiles and cluster-layout roots are
-refused: a cluster-managed graph is exported with the build that wrote it and
-[rebuilt](#rebuild). Paths, file URIs and symlinks resolve before that check.
+Select a standalone local direct-graph target with `--target`. Server, managed and
+direct-root targets are refused, as is a direct graph inside a cluster layout.
+Cluster-managed graphs below v14 require [rebuild](#rebuild) with an export from
+their original build. A 0.13 cluster's v14 graphs open directly in 0.14 and need no
+rebuild. Local paths, file URIs and symlinks resolve before the ownership check.
 
 ## Lance substrate upgrades (v0.10, v0.14)
 
@@ -124,89 +136,45 @@ for the old reader ([Lance contract](../../dev/versioning.md#lance-contract), [v
 
 ## Full-text index upgrade
 
-The v0.9-to-v0.10 Lance 11 transition keeps graph storage format v6, entities,
-branches, and history. It changes the English stemmer used by full-text search.
-Old indexes cannot safely be searched by the new analyzer, so OmniGraph explicitly refuses
-full-text queries until the selected indexes have been rebuilt.
+The v0.9-to-v0.10 transition changed the English stemmer while keeping graph
+storage format v6. That historical procedure requires the matching old binaries;
+see the [v0.10 upgrade guide](https://github.com/ModernRelay/omnigraph/blob/v0.10.0/docs/user/operations/upgrade.md#full-text-index-upgrade)
+for its branch inventory, rebuild and rollback steps. The current CLI cannot open
+v6, so a graph still on that format needs an [export/import rebuild](#rebuild).
 
-1. Stop application readers and writers. Using the old CLI, inventory the live
-   branches and record which need full-text search, including `main`:
+In v0.14, certified full-text indexes from Lance 11 remain searchable with
+Lance 13 because the analyzer generation is unchanged. Missing or incompatible
+analyzer proofs still fail closed. For a graph that normal open accepts
+(formats 14–16), use the explicit maintenance command on each branch that needs
+new indexes:
 
-   ```bash
-   old-omnigraph branch list --store ./graph.omni --json
-   ```
+```bash
+omnigraph index rebuild --kind full-text --target ./graph.omni --branch main --as operator --json
+```
 
-2. Preserve and verify a backup of the **entire graph root**: metadata, branch
-   references, history, data, and indexes. A single branch's JSONL export is not
-   a rollback backup. For a cluster-managed graph, the root is
-   `<cluster-root>/graphs/<graph-id>.omni`; retain the deployment bundle and
-   configuration too. Keep any externally referenced storage available.
-3. Stop every old server, embedded writer, and maintenance process. Upgrade the
-   CLI and entire serving fleet together, leaving application traffic stopped.
-   Do not mix Lance 9/10 and Lance 11 readers or writers. Keep the server stopped
-   while the new direct-storage maintenance CLI rebuilds indexes.
-4. Use the new operator CLI to rebuild each branch on the inventory checklist:
+Follow the [full-text maintenance procedure](maintenance.md#rebuild-full-text-indexes)
+for authorization, tokenizer changes and result checks. Rebuilding a live branch
+publishes its indexes in one graph commit; it leaves earlier snapshots unchanged,
+so those snapshots may still refuse full-text search. `optimize` is not a
+replacement for an analyzer rebuild.
 
-   ```bash
-   omnigraph index rebuild --kind full-text --target ./graph.omni --branch main --as operator --json
-   omnigraph index rebuild --kind full-text --target ./graph.omni --branch review --as operator --json
-   ```
-
-   `--as` is optional actor attribution, not server-policy authorization. Inspect
-   `branch`, `graph_commit_id`, `rebuilt_indexes`, and `warnings`. A successful
-   non-empty rebuild publishes all planned indexes on that branch in one graph
-   commit. An empty index list with a null commit means no work was needed; it
-   does not mean other branches or historical snapshots were migrated.
-
-   Rebuilding replaces custom tokenizer settings with the default English
-   analyzer and reports that warning. See [maintenance](maintenance.md#rebuild-full-text-indexes).
-
-5. Verify representative searches and entity counts on **every rebuilt branch**.
-   Include words affected by stemming, such as `organism` and `university`.
-   Start only the new fleet, keeping application traffic stopped, and verify
-   CLI/API integrations against the new response fields before resuming traffic.
-6. Keep the backup for rollback. Old binaries can silently miss matches in newly
-   rebuilt indexes; roll back by restoring the whole pre-upgrade backup with
-   the old fleet, not by pointing an old binary at the upgraded store.
-
-Ordinary reads, traversal, and vector search remain available without the
-full-text rebuild. Historical snapshots are unchanged and may refuse full-text
-search; rebuilding a live branch does not upgrade its earlier snapshots.
-Branch creation from a pinned historical snapshot is not supported.
-The operation is explicit and can be expensive on large graphs; `optimize` is
-not a replacement for this migration.
+A retained published commit under the current schema can start a branch with
+`branch create --from-commit <id>`; pre-upgrade commits are refused. See the
+[branch-start restrictions](../branching/index.md#start-a-branch-at-a-commit).
 
 ### Unsupported index inventory
 
-Automatic full-text rebuilding supports engine-created v6 indexes from Lance
-9/10 with recorded index-kind metadata. If legacy or externally created
-inventory does not identify its physical index kind, the command refuses before
-publishing any index changes. It cannot safely guess whether an unknown index
-is full-text, scalar, or vector; repeating the command does not fix this.
-
-Use compatible old tooling for a controlled export/import into a new graph root,
-or restore a trusted backup with supported inventory. Export/import preserves
-entities but not shared branch ancestry or history, as described below. Keep the
-source intact until verification and cutover; do not drop unknown indexes or
-edit their metadata to bypass the refusal.
+A missing physical index kind or unsupported index format makes the rebuild
+refuse before publication. Use compatible old tooling for a controlled
+[export/import rebuild](#rebuild), or restore a trusted backup with supported
+inventory. Keep the source intact; do not guess an index kind or edit metadata
+to bypass the refusal.
 
 ### Cluster state and rollback
 
-Keep the pre-upgrade cluster deployment bundle, configuration, and state backup
-alongside the graph-root backups. A rollback restores that consistent set with
-the old executables; it does not point an old server at upgraded index files.
-
-If v0.10 applied an `external_blobs` policy and the cluster state itself is not
-being restored, v0.9 cannot read that new optional state field. While every
-writer is stopped, remove `external_blobs` from each graph's configuration,
-review `cluster plan`, and use the v0.10 `cluster apply` to converge the removal
-before starting v0.9. Editing only the YAML is insufficient; do not hand-edit
-the state ledger. This state-shape step does **not** replace restoring the
-pre-upgrade graph backup after full-text rebuilding.
-
-A downgrade also removes v0.10's default-deny external-URI enforcement: v0.9
-writers admitted arbitrary supported sources, including `file://`. Do not roll
-back to v0.9 if that ingress boundary is required.
+For the historical v0.10-to-v0.9 rollback, including `external_blobs` state,
+follow the [tagged rollback procedure](https://github.com/ModernRelay/omnigraph/blob/v0.10.0/docs/user/operations/upgrade.md#cluster-state-and-rollback)
+with those binaries. It is not a downgrade path from v0.14.
 
 ## What an export/import rebuild preserves
 
@@ -269,6 +237,9 @@ cluster-managed graphs are refused.
 ## Rebuild
 
 Keep separate executables and target URIs so the source remains recoverable.
+Stop all source writers, including embedded and standalone CLI writers, before
+exporting schema and data, and keep them stopped through cutover. Take and verify
+a whole-root backup; use the old binary for the exports below.
 
 When an export already carries top-level `id`, the rewrite preserves it and any user property named `id`. For predecessor schemas, change endpoint constraint references from `src`/`dst` to `@src`/`@dst` before the new `init`. See [ingestion](../../dev/ingestion.md#strict-graph-batch) for the envelope contract.
 
@@ -330,16 +301,22 @@ graph declaration cannot point at an arbitrary replacement root. Choose one of
 these cutovers:
 
 - **New graph ID in the same cluster.** Add (for example)
-  `knowledge_next` with the desired schema, query, provider, and policy
-  bindings. Validate, plan, and submit `cluster apply --target` so the running
+  `knowledge-next` with the desired schema, query, provider, and policy
+  bindings. Validate, plan, and submit `cluster apply --target <server-target>
+  --config <bundle>` so the running
   owner creates and activates its derived root. Load through that server, verify
   the new ID, back up what you need, and move clients. Removing the old declaration
   and applying deletes its managed storage and all retained history.
-- **Same graph ID in a parallel cluster root.** Copy the source bundle, set a
-  new `storage` root, and keep the original cluster untouched. Validate, plan,
-  and apply the new bundle; load the export into its derived graph root; then
-  point the server fleet at the new cluster root and restart together. This
-  preserves the public graph ID while changing the whole deployment artifact.
+- **Same graph ID in a parallel cluster root.** Copy the source bundle and keep
+  the original cluster untouched. Bootstrap a separate root following
+  [cluster bootstrap and ownership transfer](../clusters/index.md#bootstrap-a-cluster).
+  Validate the bundle, then for a local root plan and apply with
+  `--target ./cluster-new --config ./new-bundle`; any `storage:` assertion must
+  match that selected root, and changing `storage:` alone never selects it. After direct apply, establish
+  that its owner and accepted I/O have settled, then release its exact retained
+  lock as that procedure requires. Start the new server against the new root,
+  load through its server target, verify, and move clients to it. This preserves
+  the public graph ID while changing the whole deployment artifact.
 
 In either case, quiesce writers before export and cutover. External Blob
 references must be loaded through a policy-aware server or embedded host after

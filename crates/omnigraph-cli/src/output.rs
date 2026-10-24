@@ -923,8 +923,8 @@ pub(crate) fn write_blob_write_human(
     writer: &mut dyn Write,
 ) -> Result<()> {
     let entity = match output.selector.entity {
-        omnigraph_api_types::BlobEntityKind::Node => "node",
-        omnigraph_api_types::BlobEntityKind::Edge => "edge",
+        omnigraph_api_types::EntityKind::Node => "node",
+        omnigraph_api_types::EntityKind::Edge => "edge",
     };
     writeln!(writer, "entity: {entity}")?;
     writeln!(writer, "type: {}", output.selector.r#type)?;
@@ -932,7 +932,7 @@ pub(crate) fn write_blob_write_human(
     writeln!(writer, "property: {}", output.selector.property)?;
     writeln!(writer, "branch: {}", output.branch)?;
     match output.kind {
-        omnigraph_api_types::BlobWriteStateOutput::Managed => {
+        omnigraph_api_types::BlobWriteState::Managed => {
             writeln!(writer, "kind: managed")?;
             if let Some(size) = output.size {
                 writeln!(writer, "size: {size}")?;
@@ -941,7 +941,7 @@ pub(crate) fn write_blob_write_human(
                 writeln!(writer, "etag: {etag}")?;
             }
         }
-        omnigraph_api_types::BlobWriteStateOutput::Null => writeln!(writer, "kind: null")?,
+        omnigraph_api_types::BlobWriteState::Null => writeln!(writer, "kind: null")?,
     }
     if let Some(actor) = output.actor_id.as_deref() {
         writeln!(writer, "actor: {actor}")?;
@@ -955,8 +955,8 @@ pub(crate) fn write_blob_write_human(
 
 pub(crate) fn write_blob_stat_human(output: &BlobStatOutput, writer: &mut dyn Write) -> Result<()> {
     let entity = match output.selector.entity {
-        omnigraph_api_types::BlobEntityKind::Node => "node",
-        omnigraph_api_types::BlobEntityKind::Edge => "edge",
+        omnigraph_api_types::EntityKind::Node => "node",
+        omnigraph_api_types::EntityKind::Edge => "edge",
     };
     writeln!(writer, "entity: {entity}")?;
     writeln!(writer, "type: {}", output.selector.r#type)?;
@@ -1072,11 +1072,11 @@ pub(crate) fn write_commit_list_human(
 /// `published: false` alone does not say whether an id can publish.
 fn commit_kind_suffix(commit: &CommitOutput) -> String {
     match commit.kind {
-        CommitKindOutput::Unattached => format!(
+        CommitKind::Unattached => format!(
             " kind=unattached root={}",
             commit.root_commit_id.as_deref().unwrap_or("?")
         ),
-        CommitKindOutput::Published | CommitKindOutput::Unpublished => String::new(),
+        CommitKind::Published | CommitKind::Unpublished => String::new(),
     }
 }
 
@@ -1099,9 +1099,9 @@ pub(crate) fn write_commit_human(commit: &CommitOutput, writer: &mut dyn Write) 
         writer,
         "kind: {}",
         match commit.kind {
-            CommitKindOutput::Published => "published",
-            CommitKindOutput::Unpublished => "unpublished",
-            CommitKindOutput::Unattached => "unattached",
+            CommitKind::Published => "published",
+            CommitKind::Unpublished => "unpublished",
+            CommitKind::Unattached => "unattached",
         }
     )?;
     if let Some(root_commit_id) = &commit.root_commit_id {
@@ -1795,13 +1795,13 @@ mod tests {
 
     fn change(id: &str) -> omnigraph_api_types::EntityChangeOutput {
         omnigraph_api_types::EntityChangeOutput {
-            kind: omnigraph_api_types::EntityKindOutput::Node,
+            kind: omnigraph_api_types::EntityKind::Node,
             r#type: omnigraph_api_types::ChangeTypeOutput {
                 id: "type-public".to_string(),
                 name: "Person".to_string(),
             },
             id: id.to_string(),
-            op: omnigraph_api_types::ChangeOpOutput::Insert,
+            op: omnigraph_api_types::ChangeOp::Insert,
             before: None,
             after: Some(omnigraph_api_types::ChangeImageOutput {
                 properties: serde_json::json!({"name": id}),
@@ -2426,7 +2426,7 @@ mod tests {
     #[test]
     fn blob_stat_human_preserves_managed_external_and_read_target_fields() {
         let mut query = omnigraph_api_types::BlobReadQuery {
-            entity: omnigraph_api_types::BlobEntityKind::Node,
+            entity: omnigraph_api_types::EntityKind::Node,
             r#type: "Doc".to_string(),
             id: "one".to_string(),
             property: "body".to_string(),
@@ -2441,7 +2441,7 @@ mod tests {
             |writer| super::write_blob_stat_human(&output, writer),
         );
 
-        query.entity = omnigraph_api_types::BlobEntityKind::Edge;
+        query.entity = omnigraph_api_types::EntityKind::Edge;
         query.branch = None;
         query.snapshot = Some("requested".to_string());
         let output =
@@ -2457,13 +2457,13 @@ mod tests {
     fn blob_write_human_preserves_receipt_and_already_null_text() {
         let mut output = omnigraph_api_types::BlobWriteOutput {
             selector: omnigraph_api_types::BlobSelectorOutput {
-                entity: omnigraph_api_types::BlobEntityKind::Node,
+                entity: omnigraph_api_types::EntityKind::Node,
                 r#type: "Doc".to_string(),
                 id: "one".to_string(),
                 property: "body".to_string(),
             },
             branch: "work".to_string(),
-            kind: omnigraph_api_types::BlobWriteStateOutput::Managed,
+            kind: omnigraph_api_types::BlobWriteState::Managed,
             size: Some(0),
             etag: Some("\"etag\"".to_string()),
             actor_id: Some("actor".to_string()),
@@ -2476,7 +2476,7 @@ mod tests {
                 actor_id: Some("actor".to_string()),
                 created_at: 42,
                 published: true,
-                kind: omnigraph_api_types::CommitKindOutput::Published,
+                kind: omnigraph_api_types::CommitKind::Published,
                 root_commit_id: None,
             }),
         };
@@ -2486,8 +2486,8 @@ mod tests {
             |writer| super::write_blob_write_human(&output, writer),
         );
 
-        output.selector.entity = omnigraph_api_types::BlobEntityKind::Edge;
-        output.kind = omnigraph_api_types::BlobWriteStateOutput::Null;
+        output.selector.entity = omnigraph_api_types::EntityKind::Edge;
+        output.kind = omnigraph_api_types::BlobWriteState::Null;
         output.size = None;
         output.etag = None;
         output.actor_id = None;

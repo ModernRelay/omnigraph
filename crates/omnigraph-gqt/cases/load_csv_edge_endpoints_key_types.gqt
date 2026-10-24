@@ -1,0 +1,86 @@
+# issue: none
+# notes: The endpoint probe counts a one-field `U32 @key` as an integer key (`probe swept` under `access scan`)
+# notes: and a `U64 @key` as none (`probe judged`); both routes refuse the same absent id (`explain-load.md` §probe).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Small { id: U32 @key }
+node Wide { id: U64 @key }
+edge SmallLink: Small -> Small
+edge WideLink: Wide -> Wide
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Small
+    rows: 8
+    commits: 1
+    columns:
+      id: {kind: ordinal, start: 0, step: 1}
+  - kind: node
+    name: Wide
+    rows: 8
+    commits: 1
+    columns:
+      id: {kind: ordinal, start: 0, step: 1}
+
+--- csv links.csv
+from,to
+0,1
+7,6
+
+--- mutate
+load csv "links.csv" into edge:SmallLink mode overwrite header
+--- expect ok
+--- expect plan
+load validate edge_ri edge:SmallLink from Small: access scan
+load validate edge_ri edge:SmallLink to Small: access scan
+load validate edge_ri edge:SmallLink from Small: probe swept
+load validate edge_ri edge:SmallLink to Small: probe swept
+load executed: partitions 1 rows 2
+
+--- mutate
+load csv "links.csv" into edge:WideLink mode overwrite header
+--- expect ok
+--- expect plan
+load validate edge_ri edge:WideLink from Wide: access scan
+load validate edge_ri edge:WideLink to Wide: access scan
+load validate edge_ri edge:WideLink from Wide: probe judged
+load validate edge_ri edge:WideLink to Wide: probe judged
+load executed: partitions 1 rows 2
+
+--- query
+query small_rows() { match { $a: Small $a smallLink $b } return { $a.id, $b.id } }
+--- expect unordered
+{"a.id": 0, "b.id": 1}
+{"a.id": 7, "b.id": 6}
+--- expect shape
+a.id: U32
+b.id: U32
+
+--- query
+query wide_rows() { match { $a: Wide $a wideLink $b } return { $a.id, $b.id } }
+--- expect unordered
+{"a.id": 0, "b.id": 1}
+{"a.id": 7, "b.id": 6}
+--- expect shape
+a.id: U64
+b.id: U64
+
+--- csv absent_dst.csv
+from,to
+0,1
+7,8
+
+--- mutate
+load csv "absent_dst.csv" into edge:SmallLink mode overwrite header
+--- expect error: '8' not found in Small
+
+--- mutate
+load csv "absent_dst.csv" into edge:WideLink mode overwrite header
+--- expect error: '8' not found in Wide

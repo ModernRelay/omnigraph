@@ -30,57 +30,18 @@ pub enum PolicyAction {
     /// Drop an unpublished graph commit (`commit drop "<id>"`). Target-branch
     /// scoped: the branch the proposal would have landed on.
     CommitDrop,
-    /// Reserved for **policy-management** surfaces. Per MR-724 Option A,
-    /// this gates operator actions like hot-reloading policy / tokens
-    /// (MR-726), querying the audit log (MR-732), and listing /
-    /// approving pending two-person-rule requests (MR-734). None of
-    /// those endpoints exist yet, so today no engine or HTTP code
-    /// calls `enforce(Admin, ...)`. The variant is kept in the enum so
-    /// the action vocabulary is complete from chassis day one — when
-    /// the first consumer surface ships, it can just call
-    /// `enforce(Admin, ResourceScope::Graph, actor)` without needing
-    /// to add the enum variant + update policy.yaml schemas + redeploy.
-    ///
-    /// Operators can write Cedar rules referencing `admin` today; they
-    /// won't fire (no call site) but they're load-bearing for the
-    /// future shape. Avoid writing such rules until the first consumer
-    /// endpoint ships to prevent confusion.
+    /// Reserved action; no current engine or HTTP operation uses this grant.
     Admin,
-    /// MR-668: management action that operates on the server's graph
-    /// registry, not on a single graph's contents. The Cedar `appliesTo`
-    /// declaration binds it to `resource: Server` instead of the
-    /// per-graph `resource: Graph`. Operators authorize a group with:
-    /// ```yaml
-    /// rules:
-    ///   - id: admins-can-list-graphs
-    ///     allow:
-    ///       actors: { group: admins }
-    ///       actions: [graph_list]
-    /// ```
-    /// `branch_scope` and `target_branch_scope` are NOT supported for
-    /// this action — there's no branch context at the server level.
-    /// Runtime `graph_create` / `graph_delete` are intentionally omitted
-    /// from v0.6.0; operators add and remove graphs by editing
-    /// `omnigraph.yaml` and restarting.
+    /// List the server's graph registry. This is server-scoped, with no branch
+    /// scope. Add or remove graphs through `cluster apply` using `config_manage`.
     GraphList,
-    /// Gates invoking a server-side stored query by name. Per-graph and
-    /// **graph-scoped** (no branch dimension, like `Admin`): the per-branch
-    /// access of the query body is enforced by the inner `Read`/`Change`
-    /// gate, so branch-scoping this outer gate would be redundant (and was
-    /// wrong for snapshot reads). A rule that sets `branch_scope` on
-    /// `invoke_query` is rejected by `validate()`. In this release it is
-    /// **coarse**: an `invoke_query` allow rule permits *any* stored query
-    /// on the graph (no per-query dimension yet); a future, additive
-    /// refinement adds an optional query-name scope.
-    ///
-    /// This gate sits at the HTTP boundary. The engine `_as` writers still
-    /// enforce `Read`/`Change` per the query body, so a stored *mutation*
-    /// is double-gated: `invoke_query` to reach the tool, plus `change` for
-    /// the write itself.
+    /// Invoke a stored query by name. This graph-scoped grant covers every
+    /// stored query on that graph; the query's own read or change permission
+    /// is checked separately. Branch scopes are unsupported for this action.
     InvokeQuery,
     /// Change the cluster's configuration, including policy membership,
     /// graph creation, and the initial schema of a newly created graph.
-    /// Existing graph schema changes additionally require `schema_apply`.
+    /// Existing graph schema changes additionally require `read` and `schema_apply`.
     ConfigManage,
 }
 

@@ -2633,12 +2633,6 @@ const MUTABLE_KEY_REQUESTS: &[(&str, &str, usize, &str)] = &[
         "engine adapter forwards its caller's request to the storage crate; the caller is registered",
     ),
     (
-        "omnigraph-server/lib.rs",
-        ".delete(",
-        3,
-        "HTTP DELETE routes (axum), not storage requests",
-    ),
-    (
         "omnigraph-storage/lib.rs",
         ".delete(",
         4,
@@ -3383,6 +3377,7 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "instrumentation.rs: omnigraph_core::instrumentation::RrfGateVerdict",
     "instrumentation.rs: omnigraph_core::instrumentation::StageWriteProbes",
     "instrumentation.rs: omnigraph_core::instrumentation::StorageReadCounts",
+    "instrumentation.rs: omnigraph_core::instrumentation::with_csv_slice_bytes",
     "instrumentation.rs: omnigraph_core::instrumentation::with_external_payload_read_held",
     "instrumentation.rs: omnigraph_core::instrumentation::with_external_payload_read_stalled",
     "instrumentation.rs: omnigraph_core::instrumentation::with_merge_write_probes",

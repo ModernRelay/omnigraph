@@ -396,6 +396,26 @@ pub fn query_memory_limit() -> Option<u64> {
     QUERY_MEMORY_LIMIT.try_with(|bytes| *bytes).ok()
 }
 
+tokio::task_local! {
+    static CSV_SLICE_BYTES: usize;
+}
+
+/// Run `fut` with every `load csv` source it parses cut into slices of
+/// `bytes` instead of the planner's partition size. Test-only entry point;
+/// nothing in production sets it.
+pub async fn with_csv_slice_bytes<F>(bytes: usize, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    CSV_SLICE_BYTES.scope(bytes, fut).await
+}
+
+/// The slice size a test installed for this task, if any; `None` in
+/// production.
+pub fn csv_slice_bytes() -> Option<usize> {
+    CSV_SLICE_BYTES.try_with(|bytes| *bytes).ok()
+}
+
 /// Reservations and execution metrics observed by v2 acceptance tests.
 /// Holding a pool here keeps the observer alive without retaining reservations.
 #[derive(Clone, Debug, Default)]

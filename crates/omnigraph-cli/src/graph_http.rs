@@ -459,28 +459,7 @@ impl GraphHttpClient {
     }
 
     pub(crate) async fn send(&self, request: RequestBuilder) -> Result<Response> {
-        let mut request = request.header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT);
-        if let Some(actor) = &self.expected_actor {
-            request = request.header(IF_ACTOR_HEADER, actor);
-        }
-        let request = request.build()?;
-        // Validate the exact route before even public discovery. A nested endpoint
-        // declaration cannot silently replace the already captured credential owner.
-        self.validate_scope(request.url())?;
-        self.validate_scope(&self.health_url)?;
-        // No bearer and no body consumption. A fresh probe precedes each data
-        // request; it is discovery, not a fence against a changed backend.
-        let discovery = self
-            .client
-            .head(self.health_url.clone())
-            .timeout(DISCOVERY_TIMEOUT)
-            .send()
-            .await
-            .map_err(|error| ApiContractError::discovery_transport(error, &self.transport))?;
-        if !discovery.status().is_success() || !has_contract(&discovery) {
-            return Err(ApiContractError::discovery(Some(discovery.status())).into());
-        }
-        drop(discovery);
+        let request = self.discovered(request).await?;
         let bearer = request
             .headers()
             .get(reqwest::header::AUTHORIZATION)
@@ -515,6 +494,44 @@ impl GraphHttpClient {
                 .insert(MissingCredential::clone(missing));
         }
         Ok(response)
+    }
+
+    /// [`Self::send`] for `/mcp`, which follows the MCP transport instead of
+    /// the graph contract: the request is scoped, asserts its actor and is
+    /// preceded by discovery as every other is, but the server stamps no
+    /// contract header on an MCP answer, so none is required. Every answer,
+    /// a 401 included, is the caller's to read.
+    pub(crate) async fn send_mcp(&self, request: RequestBuilder) -> Result<Response> {
+        let request = self.discovered(request).await?;
+        Ok(self.client.execute(request).await?)
+    }
+
+    /// The request with its contract and actor headers, once its route lies
+    /// in the captured scope and a fresh discovery probe established the
+    /// contract. Nothing of the request has been sent when this fails.
+    async fn discovered(&self, request: RequestBuilder) -> Result<reqwest::Request> {
+        let mut request = request.header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT);
+        if let Some(actor) = &self.expected_actor {
+            request = request.header(IF_ACTOR_HEADER, actor);
+        }
+        let request = request.build()?;
+        // Validate the exact route before even public discovery. A nested endpoint
+        // declaration cannot silently replace the already captured credential owner.
+        self.validate_scope(request.url())?;
+        self.validate_scope(&self.health_url)?;
+        // No bearer and no body consumption. A fresh probe precedes each data
+        // request; it is discovery, not a fence against a changed backend.
+        let discovery = self
+            .client
+            .head(self.health_url.clone())
+            .timeout(DISCOVERY_TIMEOUT)
+            .send()
+            .await
+            .map_err(|error| ApiContractError::discovery_transport(error, &self.transport))?;
+        if !discovery.status().is_success() || !has_contract(&discovery) {
+            return Err(ApiContractError::discovery(Some(discovery.status())).into());
+        }
+        Ok(request)
     }
 }
 

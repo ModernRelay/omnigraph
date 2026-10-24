@@ -20,6 +20,13 @@ PREVIEW = (
 )
 EDGE = body.Facts("0.14.0-edge+9c2b367", 16, (14, 16), "0.13")
 STABLE_TEXT = "omnigraph 0.13.0\ninternal-schema 14 (serves v14 to v14)\n"
+# The lines of v0.13.0's crates/omnigraph-api-types/src/lib.rs that name the contract.
+STABLE_SOURCE = (
+    "/// The single request/response discriminator for the v0.13 HTTP contract.\n"
+    'pub const HTTP_API_CONTRACT_HEADER: &str = "omnigraph-http-api";\n'
+    "/// Exact header value; consumers must reject missing or repeated values.\n"
+    'pub const HTTP_API_CONTRACT: &str = "0.13";\n'
+)
 
 
 def compose(**overrides):
@@ -50,6 +57,45 @@ class EdgeReleaseBodyTests(unittest.TestCase):
         for raw in ("", "omnigraph 0.13.0\n", '{"version": "0.14.0"}'):
             with self.subTest(raw=raw), self.assertRaises(body.BodyError):
                 body.parse_facts(raw)
+
+    def test_reads_the_contract_of_a_release_that_does_not_report_it_from_its_source(self):
+        stable = body.parse_facts(STABLE_TEXT)
+        self.assertEqual(body.with_source_contract(stable, STABLE_SOURCE).http_contract, "0.13")
+        reported = body.Facts("0.14.0", 16, (14, 16), "0.14")
+        self.assertEqual(body.with_source_contract(reported, STABLE_SOURCE.replace('"0.13"', '"0.14"')), reported)
+        self.assertEqual(body.with_source_contract(stable, "pub const OTHER: &str = \"0.13\";\n"), stable)
+        with self.assertRaisesRegex(body.BodyError, "reports HTTP contract 0.14 but its source defines 0.13"):
+            body.with_source_contract(reported, STABLE_SOURCE)
+        with self.assertRaisesRegex(body.BodyError, "more than once"):
+            body.with_source_contract(stable, STABLE_SOURCE * 2)
+
+    def test_body_says_the_contract_changed_from_the_stable_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            files = {
+                "build.json": json.dumps({
+                    "version": "0.14.0-edge+9c2b367", "http_contract": "0.14",
+                    "internal_schema": {"writes": 16, "serves": [14, 16]},
+                }),
+                "stable.out": STABLE_TEXT,
+                "lib.rs": STABLE_SOURCE,
+                "notes.md": PREVIEW,
+            }
+            for name, text in files.items():
+                (root / name).write_text(text, encoding="utf-8")
+            arguments = [
+                "body", "--repository", "ModernRelay/omnigraph", "--commit", COMMIT, "--build-tag", TAG,
+                "--build-version", str(root / "build.json"), "--notes", str(root / "notes.md"),
+            ]
+            stable = ["--stable-tag", "v0.13.0", "--stable-version", str(root / "stable.out")]
+            with unittest.mock.patch("sys.stdout") as stdout:
+                code = body.main(arguments + stable + ["--stable-source", str(root / "lib.rs")])
+            self.assertEqual(code, 0)
+            text = "".join(call.args[0] for call in stdout.write.call_args_list)
+            self.assertIn("| HTTP contract | 0.14 | 0.13 |", text)
+            self.assertIn("This build speaks 0.14 and v0.13.0 speaks 0.13", text)
+            with unittest.mock.patch("sys.stderr"):
+                self.assertEqual(body.main(arguments + ["--stable-source", str(root / "lib.rs")]), 1)
 
     def test_warns_when_stable_cannot_open_what_the_build_writes(self):
         text = compose()

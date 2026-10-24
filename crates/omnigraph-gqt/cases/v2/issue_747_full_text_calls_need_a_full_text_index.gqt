@@ -1,6 +1,10 @@
 # issue: 747
 # red_on: 2026-10-17, this branch with the T27 check removed: step 1 failed with `FullTextIndexRequired` (the column has no segment) instead of T27; main 764fb422 has neither check and answers it case-sensitively (#747).
+# notes: Additional red run on 2026-10-22, main 9d92f397: step 7 falsely refused Note.title instead of searching the sibling block's Doc.title.
 # notes: A full-text call (`search`, `fuzzy`, `match_text`, `bm25`) reads its property's full-text index, whose analyzer folds case and stems. On a String property the schema does not index, Lance would scan with a bare, case-sensitive tokenizer, so `"deep"` matched only `"deep dive"`; the type checker now refuses each call there (T27), from the schema alone. On the indexed property both spellings match both rows.
+# notes: Sibling blocks may reuse a local name for different types. The sibling queries
+# notes: differ only in the second block's local name: both must check Doc.title and return
+# notes: the same people. Note has no title, so flattening the scopes falsely refuses Note.title.
 
 --- runner
 timeout_ms: 10000
@@ -14,10 +18,23 @@ node Doc {
     title: String @index
     notes: String
 }
+node Person { slug: String @key }
+node Note { slug: String @key }
+edge Reads: Person -> Doc
+edge Has: Person -> Note
 
 --- seed
 {"type":"Doc","data":{"slug":"d1","title":"Deep Learning","notes":"Deep Learning"}}
 {"type":"Doc","data":{"slug":"d2","title":"deep dive","notes":"deep dive"}}
+{"type":"Doc","data":{"slug":"d3","title":"Other topic","notes":"Other topic"}}
+{"type":"Person","data":{"slug":"unconnected"}}
+{"type":"Person","data":{"slug":"deep-reader"}}
+{"type":"Person","data":{"slug":"note-holder"}}
+{"type":"Person","data":{"slug":"other-reader"}}
+{"type":"Note","data":{"slug":"n1"}}
+{"edge":"Reads","from":"deep-reader","to":"d1","data":{}}
+{"edge":"Reads","from":"other-reader","to":"d3","data":{}}
+{"edge":"Has","from":"note-holder","to":"n1","data":{}}
 
 --- query
 query searched($q: String) {
@@ -82,3 +99,37 @@ query upper($q: String) {
 {"d.slug": "d2"}
 --- expect shape
 d.slug: String
+
+--- query
+query sibling_names_reused($q: String) {
+    match {
+        $p: Person
+        not { $d: Doc $p reads $d search($d.title, $q) }
+        not { $d: Note $p has $d }
+    }
+    return { $p.slug }
+}
+--- params
+{"q": "deep"}
+--- expect unordered
+{"p.slug": "unconnected"}
+{"p.slug": "other-reader"}
+--- expect shape
+p.slug: String
+
+--- query
+query sibling_names_distinct($q: String) {
+    match {
+        $p: Person
+        not { $d: Doc $p reads $d search($d.title, $q) }
+        not { $n: Note $p has $n }
+    }
+    return { $p.slug }
+}
+--- params
+{"q": "deep"}
+--- expect unordered
+{"p.slug": "unconnected"}
+{"p.slug": "other-reader"}
+--- expect shape
+p.slug: String

@@ -4,7 +4,7 @@ use std::io::Write;
 
 use color_eyre::eyre::Result;
 use omnigraph_api_types::{
-    GraphDiscoveryResponse, GraphListResponse, ParamDescriptor, ParamKind, QueriesCatalogOutput,
+    GraphDiscoveryOutput, GraphListOutput, ParamDescriptor, ParamKind, QueriesCatalogOutput,
 };
 use omnigraph_server::{PolicyDecision, PolicyRequest};
 
@@ -257,7 +257,7 @@ fn write_query_annotation(label: &str, value: &str, stdout: &mut dyn Write) -> R
 }
 
 pub(super) fn write_graphs_discovery(
-    payload: &GraphDiscoveryResponse,
+    payload: &GraphDiscoveryOutput,
     json: bool,
     stdout: &mut dyn Write,
 ) -> Result<()> {
@@ -276,7 +276,7 @@ pub(super) fn write_graphs_discovery(
 }
 
 pub(super) fn write_graphs_list(
-    payload: &GraphListResponse,
+    payload: &GraphListOutput,
     json: bool,
     stdout: &mut dyn Write,
 ) -> Result<()> {
@@ -500,7 +500,7 @@ mod tests {
 
     #[test]
     fn graph_inventory_keeps_discovery_and_operator_shapes() {
-        let discovery = GraphDiscoveryResponse {
+        let discovery = GraphDiscoveryOutput {
             graphs: vec![
                 GraphDiscoveryEntry {
                     graph_id: "a".into(),
@@ -512,7 +512,7 @@ mod tests {
                 },
             ],
         };
-        let registry = GraphListResponse {
+        let registry = GraphListOutput {
             graphs: vec![GraphInfo {
                 graph_id: "a".into(),
                 uri: "/graph.omni".into(),

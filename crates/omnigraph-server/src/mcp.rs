@@ -8,7 +8,6 @@ use axum::extract::{RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
 use axum::{Extension, Json, Router};
 use omnigraph_mcp::{
     AdmissionError, Host, HostError, Pending, ProtocolError, ResourceOutput, ResourceRequest,
@@ -38,8 +37,9 @@ pub(crate) fn is_resource_metadata_path(path: &str) -> bool {
 }
 
 /// The metadata URL a client derives from the resource identifier (RFC 9728
-/// §3.1): the well-known prefix inserted before the resource's path.
-fn advertised_metadata_url(resource: &str) -> Option<url::Url> {
+/// §3.1): the well-known prefix inserted before the resource's path. Every
+/// 401's challenge names it.
+pub(crate) fn advertised_metadata_url(resource: &str) -> Option<url::Url> {
     let mut url = url::Url::parse(resource).ok()?;
     let path = format!(
         "{RESOURCE_METADATA_PATH}{}",
@@ -56,8 +56,9 @@ fn advertised_metadata_url(resource: &str) -> Option<url::Url> {
 pub(crate) struct AdvertisedMetadataPath(Arc<str>);
 
 /// Mounted when the server has a bearer credential source. Discovery metadata
-/// and the OAuth challenge exist only with an OIDC resource. Every HTTP request
-/// authenticates again; no MCP session retains an actor.
+/// exists only with an OIDC resource; the 401 challenge is the server's own
+/// (`crate::challenge`). Every HTTP request authenticates again; no MCP session
+/// retains an actor.
 pub(crate) fn router(state: AppState) -> Router<AppState> {
     let resource_url = state.oidc_resource_url();
     let oidc = resource_url.is_some();
@@ -95,24 +96,37 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
         state.clone(),
         handlers::require_bearer_auth,
     ))
-    .route_layer(middleware::from_fn_with_state(
-        state.clone(),
-        resource_challenge,
-    ));
+    .route_layer(middleware::from_fn(no_store));
     // Computed once from the fixed binding. A wildcard route compared with the
     // raw request path keeps the configured path out of the router's syntax.
     let advertised = state
         .oidc_resource_url()
         .and_then(|resource| advertised_metadata_url(&resource))
         .map(|url| AdvertisedMetadataPath(Arc::from(url.path())));
-    let mut discovery = Router::new().route(RESOURCE_METADATA_PATH, get(resource_metadata));
+    metadata_routes(advertised).into_router().merge(protected)
+}
+
+/// The protocol-defined discovery routes keep their boot-time availability
+/// and layers while sharing registration with the operation inventory.
+fn metadata_routes(
+    advertised: Option<AdvertisedMetadataPath>,
+) -> crate::http_operations::HttpRoutes {
+    let mut discovery = crate::http_operations::HttpRoutes::new("")
+        .route("oauth protected resource metadata", resource_metadata);
     if let Some(advertised) = advertised {
-        discovery = discovery.route(
-            &format!("{RESOURCE_METADATA_PATH}/{{*resource_path}}"),
-            get(resource_metadata_at_resource_path).layer(Extension(advertised)),
-        );
+        discovery = discovery.resource_metadata(resource_metadata_at_resource_path, |route| {
+            route.layer(Extension(advertised))
+        });
     }
-    discovery.merge(protected)
+    discovery
+}
+
+#[cfg(test)]
+pub(crate) fn metadata_http_operations() -> Vec<(crate::api::operations::HttpMethod, String)> {
+    metadata_routes(Some(AdvertisedMetadataPath(Arc::from(
+        "/.well-known/oauth-protected-resource/mcp",
+    ))))
+    .registered()
 }
 
 #[utoipa::path(get, path = "/.well-known/oauth-protected-resource", tag = "management",
@@ -147,43 +161,9 @@ pub(crate) async fn resource_metadata_at_resource_path(
     }
 }
 
-async fn resource_challenge(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Response {
-    // RFC 6750 §3.1: `invalid_token` answers a presented bearer credential
-    // that was refused; a request without one gets no error code.
-    let presented = request
-        .headers()
-        .get_all(header::AUTHORIZATION)
-        .iter()
-        .any(|value| {
-            value
-                .as_bytes()
-                .get(..7)
-                .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"bearer "))
-        });
+/// MCP responses answer one credential's request; never cache them.
+async fn no_store(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
-    if response.status() == StatusCode::UNAUTHORIZED {
-        if let Some(url) = state
-            .oidc_resource_url()
-            .and_then(|resource| advertised_metadata_url(&resource))
-        {
-            let error = if presented {
-                "error=\"invalid_token\", "
-            } else {
-                ""
-            };
-            if let Ok(value) =
-                HeaderValue::from_str(&format!("Bearer {error}resource_metadata=\"{url}\""))
-            {
-                response
-                    .headers_mut()
-                    .insert(header::WWW_AUTHENTICATE, value);
-            }
-        }
-    }
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -331,9 +311,10 @@ fn protocol_error(error: ProtocolError, write: bool) -> ApiError {
         error
     };
     match error {
-        ProtocolError::Unauthenticated => {
-            ApiError::unauthorized("A verified bearer credential is required.")
-        }
+        ProtocolError::Unauthenticated => ApiError::unauthorized(
+            crate::challenge::Unauthenticated::NoCredential,
+            "A verified bearer credential is required.",
+        ),
         ProtocolError::MissingContext => ApiError::internal("MCP admission context is missing."),
         ProtocolError::Capacity => ApiError::too_many_requests(
             "The server is handling its maximum concurrent MCP tool calls.",
@@ -428,7 +409,9 @@ impl ServerHost {
                     Extension(handle),
                     Extension(input),
                     Some(Extension(actor)),
-                    ApiPath(QueryNamePath { name: args.name }),
+                    ApiPath(QueryNamePath {
+                        query_name: args.name,
+                    }),
                     HeaderMap::new(),
                     Bytes::from(body),
                 )
@@ -490,8 +473,7 @@ impl ServerHost {
                     Some(Extension(actor)),
                     ApiQuery(crate::api::CommitListQuery {
                         branch: args.branch,
-                        unpublished: false,
-                        unattached: false,
+                        listing: crate::api::CommitListing::History,
                         limit: args.limit,
                         page_token: args.page_token,
                     }),
@@ -629,7 +611,9 @@ impl ServerHost {
                     Extension(handle),
                     Extension(ingress),
                     Some(Extension(actor)),
-                    ApiPath(handlers::BranchPath { branch: args.name }),
+                    ApiPath(handlers::BranchPath {
+                        branch_name: args.name,
+                    }),
                 )
                 .await?;
                 bounded_result(&output.0)
@@ -687,7 +671,7 @@ impl ServerHost {
     async fn discover(
         &self,
         actor: AuthenticatedActor,
-    ) -> Result<crate::api::GraphDiscoveryResponse, ApiError> {
+    ) -> Result<crate::api::GraphDiscoveryOutput, ApiError> {
         let state = State(self.state.clone());
         if actor.is_identity() {
             return Ok(
@@ -699,7 +683,7 @@ impl ServerHost {
         let listed = handlers::server_graphs_list(state, Some(Extension(actor)))
             .await?
             .0;
-        Ok(crate::api::GraphDiscoveryResponse {
+        Ok(crate::api::GraphDiscoveryOutput {
             graphs: listed
                 .graphs
                 .into_iter()

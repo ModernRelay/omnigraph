@@ -214,7 +214,7 @@ pub(crate) enum ChangeKindArg {
     Edge,
 }
 
-impl From<ChangeKindArg> for omnigraph_api_types::EntityKindOutput {
+impl From<ChangeKindArg> for omnigraph_api_types::EntityKind {
     fn from(kind: ChangeKindArg) -> Self {
         match kind {
             ChangeKindArg::Node => Self::Node,
@@ -230,7 +230,7 @@ pub(crate) enum ChangeOpArg {
     Delete,
 }
 
-impl From<ChangeOpArg> for omnigraph_api_types::ChangeOpOutput {
+impl From<ChangeOpArg> for omnigraph_api_types::ChangeOp {
     fn from(op: ChangeOpArg) -> Self {
         match op {
             ChangeOpArg::Insert => Self::Insert,

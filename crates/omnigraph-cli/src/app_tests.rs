@@ -769,7 +769,7 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
     use crate::commands::transfer::blob::{BlobOperation, execute_blob};
     use crate::commands::transfer::load::{LoadOperation, execute_load};
     use crate::managed_http_fixture::{IntentApiFixture, IntentReply};
-    use omnigraph_api_types::{BlobEntityKind, BlobWriteQuery};
+    use omnigraph_api_types::{BlobWriteQuery, EntityKind};
 
     let temp = tempfile::tempdir().unwrap();
     let data = temp.path().join("data.jsonl");
@@ -835,7 +835,7 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
                                     &client,
                                     BlobOperation::Write {
                                         query: BlobWriteQuery {
-                                            entity: BlobEntityKind::Node,
+                                            entity: EntityKind::Node,
                                             r#type: "Document".into(),
                                             id: "manual".into(),
                                             property: "content".into(),
@@ -1072,7 +1072,7 @@ async fn transfer_reads_use_the_supplied_sink_and_propagate_delivery_errors() {
         execute_export,
     };
     use crate::managed_http_fixture::{IntentApiFixture, IntentReply};
-    use omnigraph_api_types::BlobEntityKind;
+    use omnigraph_api_types::EntityKind;
 
     for command in ["export", "get", "stat", "stat-json"] {
         for fault in [OutputFault::AfterPrefix, OutputFault::Flush] {
@@ -1101,7 +1101,7 @@ async fn transfer_reads_use_the_supplied_sink_and_propagate_delivery_errors() {
                     bytes: Vec::new(),
                 };
                 let query = blob_query(
-                    BlobEntityKind::Node,
+                    EntityKind::Node,
                     "Document".into(),
                     "manual".into(),
                     "content".into(),

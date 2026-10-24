@@ -4,6 +4,7 @@
 pub(crate) use crate::commands::cluster::{ClusterCommand, ClusterMembersCommand, ClusterRunArgs};
 pub(crate) use crate::commands::control::{GraphsCommand, PolicyCommand, QueriesCommand};
 pub(crate) use crate::commands::local::SkillCommand;
+pub(crate) use crate::commands::mcp::McpArgs;
 pub(crate) use crate::commands::targets::{AccessArgs, CredentialCommand, TargetCommand};
 pub(crate) use crate::managed::args::{
     OrganizationArgs, OrganizationCommand, OrganizationInvitationsCommand,
@@ -43,8 +44,8 @@ pub(crate) struct Cli {
     pub(crate) target: Option<String>,
 
     /// Actor id for direct-engine writes and actor-bound cluster operations;
-    /// On a served write it is an assertion: the
-    /// request carries `omnigraph-if-actor`, and the server refuses it
+    /// On a served write, and on every request `mcp` relays, it is an assertion:
+    /// the request carries `omnigraph-if-actor`, and the server refuses it
     /// before anything runs when the bearer token resolves to another actor.
     /// With a policy configured but no actor set, a direct operation is
     /// denied — see docs/user/operations/policy.md.
@@ -215,6 +216,15 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: CredentialCommand,
     },
+    /// Relay an agent's MCP over stdio to an existing server target's `/mcp`.
+    ///
+    /// For agents that start their tools as child processes. The bridge sends
+    /// the target's stored credential, which the agent never sees, and is
+    /// bound to one graph: `--graph`, else the target's `default_graph`.
+    /// It only connects: a direct target refuses, and it never starts,
+    /// discovers or hosts a server. stdout carries only MCP messages and
+    /// diagnostics go to stderr.
+    Mcp(McpArgs),
     #[command(
         about = "Validate operator configuration, rename bindings, or recover interrupted edits"
     )]

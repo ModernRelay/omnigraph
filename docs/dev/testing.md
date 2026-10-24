@@ -266,6 +266,11 @@ capability/refusal tests.
 
 Server suites are organized by public route: `auth_policy`, `data_routes`, `schema_routes`, `stored_queries`, `multi_graph`, `boot_settings`, object-store coverage in `s3`, and the generated contract in `openapi`.
 
+The OpenAPI owner checks the [HTTP conventions](http-api.md), their named
+exceptions, and required error responses. Its negative cases remove a required
+response or code from a spec copy and require rejection; a regenerated snapshot
+alone is not proof of complete response coverage.
+
 `omnigraph-mcp` owns protocol, catalog and formatting tests. Server
 `integration/mcp.rs` keeps the real HTTP fixture for authentication, policy,
 tool/route and error-disposition parity, limits and response lifetimes. The
@@ -317,6 +322,8 @@ share the transport-independent phases; local success does not qualify their
 storage-fault paths. CI requires the local journey to execute successfully.
 
 CLI suites own their named planes: cluster lifecycle, data commands, stored queries, schema/config, cross-version rebuild, embedded/remote parity, and local/remote system journeys. Keep `OMNIGRAPH_HOME` hermetic by using `tests/support::cli()` or `cli_process()`.
+
+CLI `integration/cli_mcp.rs` owns the stdio MCP bridge against a real served cluster and a stand-in endpoint: refusals before any I/O, tool listing under the server's write setting and `--write`, graph binding, reads equal to the server's own `/mcp` answers, a Unix-socket endpoint refused before it connects, `--as`, credential re-reading from the target's `auth` source after a 401 without resending, the server's `WWW-Authenticate` challenge relayed with a 401, cancellation, and unreachable servers or lost answers that start nothing and resend nothing. In-source `commands/mcp` tests own framing, binding and narrowing rules, and that the bridge names no server or MCP implementation crate.
 
 Deployment tests extend these owners: cluster `tests.rs` pins no-reset
 ledger conversion, captured source bytes, exact-ID lookup, bounded results and

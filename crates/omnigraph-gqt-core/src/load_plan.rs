@@ -10,8 +10,10 @@
 //! load validate unique node:Person key [id]: access delta
 //! load validate unique node:Person unique [email]: access scan
 //! load validate edge_ri edge:Knows from Person: access probe
+//! load validate edge_ri edge:Knows from Person: probe judged
 //! load validate cardinality edge:Knows from Person
 //! load validate retained_edges node:Person edge:Knows from: access probe
+//! load validate removal node:Person: scan
 //! load write: overwrite fragments
 //! load pipeline 0: CsvSource => Validate
 //! load pipeline 1: Validate -> FragmentWrite => consumer after 0
@@ -19,18 +21,23 @@
 //! ```
 //!
 //! `route: plan` is the document's `engine` route, `pipeline` its `executor`
-//! route; the validate lines are the one `Validate` node's checks in order;
+//! route; the validate lines are the one `Validate` node's checks in order
+//! (an `edge_ri` check has two lines, its access and where it probes),
+//! then its `removal`, whether an overwrite's removed ids are found at all;
 //! a `pipeline` line is one entry of the document's `pipelines`, its source,
-//! its operators, the sink it drains into and the pipelines drained before it;
+//! its operators, the sink it drains into, its partitions when above one and
+//! the pipelines drained before it;
 //! publication is the driver's epilogue, never a plan node, so no line names it.
 
 use omnigraph::loader::LoadExecuted;
 use serde::Serialize;
 use serde_json::Value;
 
-const FORMS: &str = "forms: `load route: <plan|pipeline>`, `load scan: partitions <n> fallback single_scan`, `load validate value <table> [a, b]`, `load validate unique <table> <key|unique> [a, b]: access <delta|probe|scan>`, `load validate edge_ri <edge> <from|to> <Node>: access <delta|probe|scan>`, `load validate cardinality <edge> <from|to> <Node>`, `load validate retained_edges <node> <edge> <from|to>: access <delta|probe|scan>`, `load write: <overwrite fragments|append strict_insert|merge upsert>`, `load pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]`, `load executed: partitions <n> rows <m>`, `load executed <Node>: rows <m>`";
+const FORMS: &str = "forms: `load route: <plan|pipeline>`, `load scan: partitions <n> fallback single_scan`, `load validate value <table> [a, b]`, `load validate unique <table> <key|unique> [a, b]: access <delta|probe|scan>`, `load validate edge_ri <edge> <from|to> <Node>: access <delta|probe|scan>`, `load validate edge_ri <edge> <from|to> <Node>: probe <swept|judged>`, `load validate cardinality <edge> <from|to> <Node>`, `load validate retained_edges <node> <edge> <from|to>: access <delta|probe|scan>`, `load validate removal <table>: <scan|none>`, `load write: <overwrite fragments|append strict_insert|merge upsert>`, `load pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ partitions <n>][ after <n>[, <m>]]`, `load executed: partitions <n> rows <m>`, `load executed <Node>: rows <m>`";
 
 const ACCESS: [&str; 3] = ["delta", "probe", "scan"];
+const REMOVALS: [&str; 2] = ["scan", "none"];
+const PROBES: [&str; 2] = ["swept", "judged"];
 const ENDPOINTS: [&str; 2] = ["from", "to"];
 const ROUTES: [&str; 2] = ["plan", "pipeline"];
 const WRITES: [&str; 3] = [
@@ -65,6 +72,14 @@ pub(crate) enum LoadFact {
         node: String,
         access: String,
     },
+    /// An `edge_ri` check's `probe`: where it probes the committed ids,
+    /// `swept` on the parse partitions or `judged` after the drain.
+    EdgeRiProbe {
+        edge: String,
+        endpoint: String,
+        node: String,
+        probe: String,
+    },
     Cardinality {
         edge: String,
         endpoint: String,
@@ -75,6 +90,12 @@ pub(crate) enum LoadFact {
         edge: String,
         endpoint: String,
         access: String,
+    },
+    /// The `Validate` node's `removal`: whether the ids an overwrite removes
+    /// are found by a scan of the committed table, or not at all.
+    Removal {
+        table: String,
+        removal: String,
     },
     Write(String),
     Pipeline(PipelineClaim),
@@ -90,16 +111,18 @@ pub(crate) enum LoadFact {
 }
 
 /// One entry of a planner document's `pipelines`, spelled
-/// `<n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]`: the
-/// pipeline's position, its source node, its operators in run order, the
-/// sink it drains into and the pipelines drained before it. A load section
-/// claims one as `load pipeline …`, a query section as `pipeline …`.
+/// `<n>: <Source>[ -> <Operator>]* => <sink>[ partitions <n>][ after <n>[, <m>]]`:
+/// the pipeline's position, its source node, its operators in run order, the
+/// sink it drains into, the partitions its source runs (spelled only above
+/// one) and the pipelines drained before it. A load section claims one as
+/// `load pipeline …`, a query section as `pipeline …`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct PipelineClaim {
     pub id: u64,
     pub source: String,
     pub operators: Vec<String>,
     pub sink: String,
+    pub partitions: u64,
     pub after: Vec<u64>,
 }
 
@@ -112,6 +135,10 @@ impl PipelineClaim {
         }
         line.push_str(" => ");
         line.push_str(&self.sink);
+        if self.partitions > 1 {
+            line.push_str(" partitions ");
+            line.push_str(&self.partitions.to_string());
+        }
         if !self.after.is_empty() {
             let after: Vec<String> = self.after.iter().map(u64::to_string).collect();
             line.push_str(" after ");
@@ -134,6 +161,10 @@ impl PipelineClaim {
             ),
             None => (sink, Vec::new()),
         };
+        let (sink, partitions) = match sink.split_once(" partitions ") {
+            Some((sink, partitions)) => (sink, partitions.trim().parse().ok().filter(|n| *n >= 1)?),
+            None => (sink, 1),
+        };
         let mut names = chain.split(" -> ").map(operator_name);
         let source = names.next()??;
         let operators = names.collect::<Option<Vec<String>>>()?;
@@ -142,6 +173,7 @@ impl PipelineClaim {
             source,
             operators,
             sink: operator_name(sink)?,
+            partitions,
             after,
         })
     }
@@ -163,6 +195,7 @@ impl PipelineClaim {
                     .map(|operator| text(&operator["name"]))
                     .collect(),
                 sink: text(&pipeline["sink"]["name"]),
+                partitions: pipeline["partitions"].as_u64().unwrap_or(1),
                 after: pipeline["depends_on"]
                     .as_array()
                     .into_iter()
@@ -200,6 +233,12 @@ impl LoadFact {
                 node,
                 access,
             } => format!("load validate edge_ri {edge} {endpoint} {node}: access {access}"),
+            LoadFact::EdgeRiProbe {
+                edge,
+                endpoint,
+                node,
+                probe,
+            } => format!("load validate edge_ri {edge} {endpoint} {node}: probe {probe}"),
             LoadFact::Cardinality {
                 edge,
                 endpoint,
@@ -211,6 +250,9 @@ impl LoadFact {
                 endpoint,
                 access,
             } => format!("load validate retained_edges {node} {edge} {endpoint}: access {access}"),
+            LoadFact::Removal { table, removal } => {
+                format!("load validate removal {table}: {removal}")
+            }
             LoadFact::Write(write) => format!("load write: {write}"),
             LoadFact::Pipeline(claim) => format!("load pipeline {}", claim.spell()),
             LoadFact::Executed { partitions, rows } => {
@@ -341,6 +383,22 @@ fn parse_validate_fact(text: &str) -> Option<LoadFact> {
         });
     }
     if let Some(edge_ri) = text.strip_prefix("edge_ri ") {
+        if let Some((identity, probe)) = edge_ri.rsplit_once(": probe ") {
+            let probe = probe.trim();
+            if !PROBES.contains(&probe) {
+                return None;
+            }
+            let words: Vec<&str> = identity.split_whitespace().collect();
+            let [edge, endpoint, node] = words.as_slice() else {
+                return None;
+            };
+            return Some(LoadFact::EdgeRiProbe {
+                edge: table_key(edge)?,
+                endpoint: endpoint_word(endpoint)?,
+                node: type_name(node)?,
+                probe: probe.to_string(),
+            });
+        }
         let (identity, access) = edge_ri.rsplit_once(": access ")?;
         let words: Vec<&str> = identity.split_whitespace().collect();
         let [edge, endpoint, node] = words.as_slice() else {
@@ -375,6 +433,17 @@ fn parse_validate_fact(text: &str) -> Option<LoadFact> {
             edge: table_key(edge)?,
             endpoint: endpoint_word(endpoint)?,
             access: access_word(access)?,
+        });
+    }
+    if let Some(removal) = text.strip_prefix("removal ") {
+        let (table, removal) = removal.rsplit_once(':')?;
+        let removal = removal.trim();
+        if !REMOVALS.contains(&removal) {
+            return None;
+        }
+        return Some(LoadFact::Removal {
+            table: table_key(table.trim())?,
+            removal: removal.to_string(),
         });
     }
     None
@@ -479,12 +548,22 @@ fn node_facts(node: &Value, facts: &mut Vec<LoadFact>) {
                         columns: columns(),
                         access,
                     },
-                    Some("edge_ri") => LoadFact::EdgeRi {
-                        edge: table.clone(),
-                        endpoint: text(&check["endpoint"]),
-                        node: text(&check["node_type"]),
-                        access,
-                    },
+                    Some("edge_ri") => {
+                        if let Some(probe) = check["probe"].as_str() {
+                            facts.push(LoadFact::EdgeRiProbe {
+                                edge: table.clone(),
+                                endpoint: text(&check["endpoint"]),
+                                node: text(&check["node_type"]),
+                                probe: probe.to_string(),
+                            });
+                        }
+                        LoadFact::EdgeRi {
+                            edge: table.clone(),
+                            endpoint: text(&check["endpoint"]),
+                            node: text(&check["node_type"]),
+                            access,
+                        }
+                    }
                     Some("cardinality") => LoadFact::Cardinality {
                         edge: table.clone(),
                         endpoint: text(&check["endpoint"]),
@@ -499,6 +578,12 @@ fn node_facts(node: &Value, facts: &mut Vec<LoadFact>) {
                     _ => continue,
                 };
                 facts.push(fact);
+            }
+            if let Some(removal) = node["removal"].as_str() {
+                facts.push(LoadFact::Removal {
+                    table,
+                    removal: removal.to_string(),
+                });
             }
         }
         Some("FragmentWrite") => facts.push(LoadFact::Write(format!(
@@ -548,13 +633,19 @@ mod tests {
             "load validate unique node:Person key [id]: access delta",
             "load validate unique node:Person unique [email, name]: access scan",
             "load validate edge_ri edge:Knows from Person: access probe",
+            "load validate edge_ri edge:Knows to Person: probe swept",
+            "load validate edge_ri edge:Knows from Person: probe judged",
             "load validate cardinality edge:Knows from Person",
             "load validate retained_edges node:Person edge:Knows to: access probe",
+            "load validate removal node:Person: scan",
+            "load validate removal edge:Knows: none",
             "load write: overwrite fragments",
             "load write: append strict_insert",
             "load pipeline 0: CsvSource => Validate",
             "load pipeline 1: Validate -> FragmentWrite => consumer after 0",
             "load pipeline 2: Scan -> HashJoin(probe) -> Projection => consumer after 0, 1",
+            "load pipeline 0: CsvSource => Validate partitions 2",
+            "load pipeline 1: Validate -> FragmentWrite => consumer partitions 3 after 0",
             "load executed: partitions 1 rows 3",
             "load executed FragmentWrite: rows 3",
         ];
@@ -580,6 +671,9 @@ mod tests {
             "load validate retained_edges node:Person edge:Knows",
             "load validate retained_edges node:Person edge:Knows from",
             "load validate retained_edges node:Person edge:Knows from: access index",
+            "load validate removal node:Person",
+            "load validate removal Person: scan",
+            "load validate removal node:Person: probe",
             "load write: overwrite batches",
             "load publish: 1",
             "load executed: partitions 1",
@@ -589,6 +683,10 @@ mod tests {
             "load pipeline 0: Csv Source => Validate",
             "load pipeline one: CsvSource => Validate",
             "load pipeline 1: Validate => consumer after one",
+            "load pipeline 0: CsvSource => Validate partitions two",
+            "load pipeline 0: CsvSource => Validate partitions 0",
+            "load pipeline 1: Validate => consumer after 0 partitions 2",
+            "load validate edge_ri edge:Knows from Person: probe later",
             "load executed CsvSource rows 3",
             "load executed CsvSource: rows three",
             "load executed Csv Source: rows 3",
@@ -611,15 +709,16 @@ mod tests {
                     "checks": [
                         {"check": "value", "columns": ["w"], "consults": null, "access": "delta"},
                         {"check": "unique", "role": "key", "columns": ["from", "to"], "access": "delta"},
-                        {"check": "edge_ri", "endpoint": "from", "node_type": "Person", "access": "scan"},
+                        {"check": "edge_ri", "endpoint": "from", "node_type": "Person", "access": "scan", "probe": "swept"},
                         {"check": "cardinality", "endpoint": "from", "node_type": "Person", "min": 0, "max": 2, "access": "probe"}
                     ],
-                    "inputs": [{"node": "CsvSource", "max_partitions": 1, "fallback": "single_scan"}]
+                    "removal": "none",
+                    "inputs": [{"node": "CsvSource", "max_partitions": 2, "fallback": "single_scan"}]
                 }]
             },
             "pipelines": [
-                {"id": 0, "source": {"id": 0, "node": "CsvSource"}, "operators": [], "sink": {"id": 1, "name": "Validate"}, "depends_on": []},
-                {"id": 1, "source": {"id": 1, "node": "Validate"}, "operators": [{"id": 2, "name": "FragmentWrite"}], "sink": {"name": "consumer"}, "depends_on": [0]}
+                {"id": 0, "source": {"id": 0, "node": "CsvSource"}, "partitions": 2, "operators": [], "sink": {"id": 1, "name": "Validate"}, "depends_on": []},
+                {"id": 1, "source": {"id": 1, "node": "Validate"}, "partitions": 1, "operators": [{"id": 2, "name": "FragmentWrite"}], "sink": {"name": "consumer"}, "depends_on": [0]}
             ]
         });
         let executed = LoadExecuted {
@@ -633,6 +732,8 @@ mod tests {
                 rows: 7,
                 elapsed_compute_ns: 12,
                 wall_ns: 34,
+                partitions: 1,
+                slices: Vec::new(),
             }],
         };
         let facts: Vec<String> = plan_facts(&document, &executed)
@@ -646,10 +747,12 @@ mod tests {
                 "load write: overwrite fragments",
                 "load validate value edge:Knows [w]",
                 "load validate unique edge:Knows key [from, to]: access delta",
+                "load validate edge_ri edge:Knows from Person: probe swept",
                 "load validate edge_ri edge:Knows from Person: access scan",
                 "load validate cardinality edge:Knows from Person",
-                "load scan: partitions 1 fallback single_scan",
-                "load pipeline 0: CsvSource => Validate",
+                "load validate removal edge:Knows: none",
+                "load scan: partitions 2 fallback single_scan",
+                "load pipeline 0: CsvSource => Validate partitions 2",
                 "load pipeline 1: Validate -> FragmentWrite => consumer after 0",
                 "load executed: partitions 1 rows 7",
                 "load executed CsvSource: rows 7",

@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-06
-updated: 2026-10-20
+updated: 2026-10-23
 discussion: https://github.com/ModernRelay/omnigraph/pull/675
 supersedes: []
 superseded_by: []
@@ -15,6 +15,14 @@ blocked_on: []
 ---
 
 # RFC 0059: Named targets and CLI coherency
+
+**Historical implementation record.** This RFC records the target resolver
+introduced by PR #1090. Its operator YAML, authentication, bootstrap and
+migration examples were subsequently revised before 0.14 shipped. Use the
+[0.13 → 0.14 checklist](../user/operations/upgrade-0.14.md) and
+[operator configuration guide](../user/cli/targets.md) for released commands
+and configuration; the examples below preserve the decision's implementation
+history.
 
 ## Summary
 
@@ -134,8 +142,9 @@ No `workspace`, `service` or `deployment` command group is introduced.
 
 ### Before and after
 
-The following comparisons show the legacy commands and accepted post-migration
-syntax. The latter ships with 0.14.0. Assume `defaults.target: staging`, with `staging` and `production` as
+The following comparisons record the target-resolver design at this
+implementation stage. The [0.13 → 0.14 checklist](../user/operations/upgrade-0.14.md)
+gives the final released equivalents. Assume `defaults.target: staging`, with `staging` and `production` as
 server targets and `cloud` as a managed cluster target. For the direct-access
 example, the working directory is `/data/project` and `local` has
 `uri: file:///data/project/graph.omni`, so it names the same graph as `./graph.omni`.

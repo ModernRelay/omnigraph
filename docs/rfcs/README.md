@@ -251,5 +251,6 @@ then dated RFCs by date.
 | [2026-10-15](2026-10-15-bulk-load-as-a-query-plan.md) | Bulk load as a query plan | maintainer | draft | partial |
 | [2026-10-16](2026-10-16-engine-catalogue.md) | Engine catalogue | maintainer | draft | in-progress |
 | [2026-10-16](2026-10-16-graph-access-serving-and-cross-process-writes.md) | Graph access and cross-process writes | maintainer | accepted | in-progress |
+| [2026-10-19](2026-10-19-http-api-conventions.md) | HTTP API conventions | maintainer | accepted | complete |
 | [2026-10-19](2026-10-19-storage-outcomes-and-restartable-ownership.md) | Storage outcomes per operation and restartable ownership | maintainer | accepted | in-progress |
 | [2026-10-20](2026-10-20-operator-connections-and-credential-providers.md) | Operator profiles and credential providers | maintainer | draft | in-progress |

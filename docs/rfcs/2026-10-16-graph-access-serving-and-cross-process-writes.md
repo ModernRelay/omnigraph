@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-16
-updated: 2026-10-20
+updated: 2026-10-21
 discussion: https://github.com/ModernRelay/omnigraph/pull/1017
 supersedes: []
 superseded_by: []
@@ -1246,7 +1246,7 @@ scope as cross-process correctness and access reporting.
 
 | | Change | Why it is separate | Recommendation |
 |---|---|---|---|
-| A1 | `WWW-Authenticate` on every 401 | Changes every protected route's 401 for every client | Issue [#1020](https://github.com/ModernRelay/omnigraph/issues/1020), as RFC 0003's named follow-up |
+| A1 | `WWW-Authenticate` on every 401 | Changes every protected route's 401 for every client | Implemented for issue [#1020](https://github.com/ModernRelay/omnigraph/issues/1020) with an amendment to RFC 0003 |
 | A2 | OAuth for standard clients and managed access | Security-sensitive and cross-repository, gated on the managed control plane's own qualification | Control-plane and Studio spec changes; tracking issue [#1025](https://github.com/ModernRelay/omnigraph/issues/1025) |
 | A3 | MCP relay for managed targets | Lends the CLI's native managed authority to local agents | Decided after A2, in [#1025](https://github.com/ModernRelay/omnigraph/issues/1025) |
 | A4 | Retire the test-shaped constructors | Public API removal with test churn across crates | Issue [#1021](https://github.com/ModernRelay/omnigraph/issues/1021), with ordinary cluster-backed replacements |
@@ -1255,19 +1255,19 @@ scope as cross-process correctness and access reporting.
 
 ### A1. `WWW-Authenticate` on every 401
 
-The server accepts OIDC resource tokens on every protected route but sends the
-OAuth challenge only from `/mcp`. Every 401 would carry
-`WWW-Authenticate: Bearer resource_metadata="<url>"` with OIDC configured (plus
-`error="invalid_token"` when a presented bearer was refused), and a bare
-`WWW-Authenticate: Bearer` otherwise, as RFC 9110 §15.5.2 asks. The challenge
-would move into the authentication middleware every route shares, so REST and
-`/mcp` cannot drift. A client should follow the challenge's metadata URL, or
-the path RFC 9728 derives from the resource's URL, and never assume the metadata
-sits at the host's root: a deployment may publish it only at
+Every 401 carries `WWW-Authenticate`, as RFC 9110 §15.5.2 asks: `Bearer`, plus
+`error="invalid_token"` when a presented bearer was refused, plus
+`resource_metadata="<url>"` with OIDC configured. Authentication, which every
+route shares, decides it, so REST and `/mcp` cannot drift; the
+[MCP server surface](0003-mcp-server-surface.md#challenge) RFC owns the
+contract. A client should follow the challenge's metadata URL, or the path
+RFC 9728 derives from the resource's URL, and never assume the metadata sits at
+the host's root: a deployment may publish it only at
 `/.well-known/oauth-protected-resource/<resource path>`.
 
-**Recommendation:** issue [#1020](https://github.com/ModernRelay/omnigraph/issues/1020), as the "server-wide follow-up"
-RFC 0003 names, with a short amendment to RFC 0003.
+**Disposition:** implemented for issue
+[#1020](https://github.com/ModernRelay/omnigraph/issues/1020), with an amendment
+to RFC 0003.
 
 ### A2. OAuth for standard clients and managed access
 
@@ -1541,3 +1541,9 @@ proposal.
 - 2026-10-21: `disposition.check`, a later read that cannot see the store's
   acknowledgement, reports a loss once the attempted version holds another
   commit; the acknowledged in-doubt result stays on the publisher's read-back.
+- 2026-10-21: A1 implemented for issue
+  [#1020](https://github.com/ModernRelay/omnigraph/issues/1020). Superseded
+  sentences: "Every 401 would carry … and a bare `WWW-Authenticate: Bearer`
+  otherwise" (a refused credential carries `error="invalid_token"` with or
+  without OIDC), "The challenge would move into the authentication middleware
+  every route shares", and A1's recommendation, now its disposition.
