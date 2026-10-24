@@ -21,37 +21,6 @@ pub(crate) enum OrganizationCommand {
         #[command(subcommand)]
         command: OrganizationInvitationsCommand,
     },
-    /// Manage organization-owned workload admission; graph policy stays in Cedar.
-    Workloads {
-        #[command(subcommand)]
-        command: OrganizationWorkloadsCommand,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum OrganizationWorkloadsCommand {
-    /// List enrolled and revoked workloads with their current grant versions.
-    List,
-    /// Enroll an organization-owned application using a versioned YAML patch.
-    Enroll {
-        file: PathBuf,
-        #[arg(long)]
-        idempotency_key: String,
-    },
-    /// Update an enabled workload's local grants using a versioned YAML patch.
-    Update {
-        file: PathBuf,
-        #[arg(long)]
-        idempotency_key: String,
-    },
-    /// Disable local access and clear grants; provider secrets and Cedar are unchanged.
-    Revoke {
-        client_id: String,
-        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
-        expected_version: i64,
-        #[arg(long)]
-        idempotency_key: String,
-    },
 }
 
 #[derive(Debug, Subcommand)]

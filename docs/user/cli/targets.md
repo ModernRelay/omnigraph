@@ -148,7 +148,7 @@ For managed resource commands and managed-target credential export, env/file/exe
 profiles keep exchanged credentials only in invocation memory, without requiring
 an OS store. This is explicit source-based custody, not a store-failure fallback.
 Human profiles, stored tokens and existing providers' explicit `cluster token` administration retain secure-store requirements.
-OAuth profiles use invocation memory; see [workload setup](managed-team.md#configure-the-workload-profile).
+OAuth profiles use invocation memory; see [workload setup](managed-team.md#configure-an-unattended-workload-profile).
 
 ## Login and registration
 
