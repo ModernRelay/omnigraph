@@ -25,6 +25,7 @@ unused-ignored-advisory = "deny"
 ignore = [
   { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; a proc-macro pulled by lance-bitpacking 13.0.0, cleared when Lance replaces it" },
   { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 Marvin timing side channel via reqsign (lance-io, opendal); RustSec lists no patched version" },
+  { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 non-constant-time arithmetic via elliptic-curve 0.13 (p256/p384 0.13: jsonwebtoken 10 and the server's data-token verifier); the fix is 0.7.6 and no 0.5.x release carries it, and the server only verifies signatures with public keys, so no secret integer reaches it; cleared when p256/p384 move to an elliptic-curve on crypto-bigint 0.7" },
 ]
 
 [licenses]
