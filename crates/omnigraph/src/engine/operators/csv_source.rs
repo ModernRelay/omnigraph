@@ -56,6 +56,9 @@ struct Parse {
     stop: AtomicBool,
     refused: Arc<AtomicBool>,
     started: OnceLock<Instant>,
+    /// The rows of the first slice any partition parsed, set before that
+    /// slice's batches leave the partition: the row estimate's sample.
+    first_slice_rows: OnceLock<u64>,
     slices: Mutex<Vec<LoadSliceExecuted>>,
     failed: Mutex<Vec<FailedSlice>>,
     bounds: Mutex<Vec<Option<(u64, u64)>>>,
@@ -202,6 +205,7 @@ impl CsvSourceExec {
                 stop: AtomicBool::new(false),
                 refused,
                 started: OnceLock::new(),
+                first_slice_rows: OnceLock::new(),
                 slices: Mutex::new(Vec::new()),
                 failed: Mutex::new(Vec::new()),
                 bounds: Mutex::new(vec![None; partitions]),
@@ -241,18 +245,14 @@ impl CsvSourceExec {
     }
 
     /// The source's rows, estimated from the first slice any partition
-    /// finished: its rows per slice byte over the records' bytes; `None`
-    /// until a slice finished. A short last slice under-estimates, which
-    /// only a source smaller than its partitions' slices can meet.
+    /// parsed: its rows per slice byte over the records' bytes; `None`
+    /// until a slice parsed. The sample is set before the slice's batches
+    /// leave the partition, so a consumer holding a batch reads `Some`. A
+    /// short last slice under-estimates, which only a source smaller than
+    /// its partitions' slices can meet.
     pub(crate) fn rows_estimate(&self) -> Option<u64> {
         let records_start = self.parse.resolved.get()?.records_start();
-        let rows = self
-            .parse
-            .slices
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .first()?
-            .rows;
+        let rows = *self.parse.first_slice_rows.get()?;
         let records_bytes = self.parse.bytes.size().saturating_sub(records_start);
         Some(rows.saturating_mul(records_bytes) / self.parse.slice_bytes as u64)
     }
@@ -423,6 +423,7 @@ impl ExecutionPlan for CsvSourceExec {
                     let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
                     memory.metric(CSV_SOURCE_ROWS, rows);
                     partition_rows = partition_rows.saturating_add(rows as u64);
+                    let _ = parse.first_slice_rows.set(rows as u64);
                     for batch in batches {
                         sender
                             .send(tag_slice(batch, key)?, Arc::clone(&memory))
@@ -617,6 +618,23 @@ mod tests {
             .map(|metric| metric.as_usize());
         assert_eq!(rows, Some(expected.rows));
         assert_eq!(exec.executed_slices().len(), 1);
+    }
+
+    /// A consumer holding a partition's first batch reads the row estimate:
+    /// its sample is set before the batches are sent, an order between two
+    /// threads that GQT cannot observe (a DST replay saw it both ways).
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_row_estimate_precedes_the_first_batch() {
+        let exec = exec("key,score\n1,1.5\n2,2.5\n", 1, usize::MAX);
+        let (_pool, ctx) = fixtures::context(64 << 20, CSV_READ_BATCH_ROWS);
+        let mut stream = exec.execute(0, ctx).unwrap();
+        let first = stream
+            .next()
+            .await
+            .expect("the source holds records")
+            .unwrap();
+        assert_eq!(first.num_rows(), 2);
+        assert!(exec.rows_estimate().is_some());
     }
 
     /// Every partition's output, each collected to its end.
