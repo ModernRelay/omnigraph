@@ -20,7 +20,6 @@ use datafusion::physical_plan::{
 use omnigraph_compiler::catalog::Catalog;
 
 use super::external;
-use super::memory::WorkMemory;
 use super::shape::{Source, work};
 use crate::error::OmniError;
 use crate::loader::LoadSliceExecuted;
@@ -111,18 +110,23 @@ impl Parse {
         external(error)
     }
 
-    /// The header resolved from the source's first bytes, read once.
-    async fn resolved(&self, memory: &WorkMemory) -> crate::error::Result<Arc<ResolvedCsv>> {
+    /// The source bytes one partition holds, the head range the header is
+    /// read from; admitted by `execute` before any partition is polled, so a
+    /// refusal lands on the statement's task, not in a racing worker.
+    fn source_admission(&self) -> usize {
+        let head_end = (self.slice_bytes as u64)
+            .max(CSV_HEAD_MIN_BYTES)
+            .min(self.bytes.size());
+        usize::try_from(head_end).unwrap_or(usize::MAX)
+    }
+
+    /// The header resolved from the source's first bytes, read once, within
+    /// the partition's source admission.
+    async fn resolved(&self) -> crate::error::Result<Arc<ResolvedCsv>> {
         self.resolved
             .get_or_try_init(|| async {
                 let size = self.bytes.size();
-                let head_end = (self.slice_bytes as u64).max(CSV_HEAD_MIN_BYTES).min(size);
-                let header = memory
-                    .child("CSV header")
-                    .map_err(|error| memory.error(error))?;
-                header
-                    .grow(usize::try_from(head_end).unwrap_or(usize::MAX))
-                    .map_err(|error| header.error(error))?;
+                let head_end = self.source_admission() as u64;
                 let head = self.bytes.read(&self.request, 0..head_end).await?;
                 Ok(Arc::new(ResolvedCsv::resolve(
                     &self.catalog,
@@ -324,6 +328,11 @@ impl ExecutionPlan for CsvSourceExec {
         let memory = work(ctx, "CsvSourceExec", &self.metrics)?;
         memory.metric(CSV_SOURCE_ROWS, 0);
         let parse = Arc::clone(&self.parse);
+        let source_bytes = memory.child("CSV source bytes")?;
+        let admitted = parse.source_admission();
+        source_bytes
+            .grow(admitted)
+            .map_err(|error| parse.fail(source_bytes.error(error)))?;
         Ok(self.shape.partition_stream(
             partition,
             memory,
@@ -333,7 +342,7 @@ impl ExecutionPlan for CsvSourceExec {
                 if parse.stop.load(Ordering::Acquire) {
                     return Ok(());
                 }
-                let resolved = match parse.resolved(&memory).await {
+                let resolved = match parse.resolved().await {
                     Ok(resolved) => resolved,
                     Err(error) => return Err(parse.fail(error)),
                 };
@@ -346,7 +355,6 @@ impl ExecutionPlan for CsvSourceExec {
                     parse.slice_bytes,
                     partition > 0,
                 );
-                let source_bytes = memory.child("CSV source bytes")?;
                 let mut failed: Option<(usize, NormalizeFailure)> = None;
                 let mut first_record = 1_usize;
                 let mut index = 0_usize;
@@ -356,9 +364,9 @@ impl ExecutionPlan for CsvSourceExec {
                         break;
                     }
                     let start_ns = elapsed_ns(started);
-                    let mut admit_piece = |bytes: usize| {
+                    let mut admit_piece = |held: usize| {
                         source_bytes
-                            .grow(bytes)
+                            .ensure(held)
                             .map_err(|error| source_bytes.error(error))
                     };
                     let slice = match scanner.next_slice(&parse.request, &mut admit_piece).await {
@@ -386,7 +394,7 @@ impl ExecutionPlan for CsvSourceExec {
                     first_record += slice.rows;
                     let read_ns = slice.read_ns;
                     drop(slice);
-                    source_bytes.shrink_to(scanner.buffered());
+                    source_bytes.shrink_to(scanner.buffered().max(admitted));
                     let batches = match parsed {
                         Ok(batches) => batches,
                         Err(SliceRefusal::Normalize(failure)) => {
@@ -829,6 +837,32 @@ mod tests {
                 .all(|slice| (slice.slice as usize) < failed[0].slice)
         );
         assert_eq!(outputs.len(), parsed.len() + 1, "{outputs:?}");
+    }
+
+    /// `execute` charges every partition's source admission before any poll,
+    /// refusing there and marking the single-partition rerun; GQT sees one
+    /// `actual` per replay but cannot observe a reservation before a poll.
+    #[tokio::test]
+    async fn partitions_admit_their_source_before_the_first_poll() {
+        let mut source = String::from("key,score\n");
+        for row in 0..3000 {
+            writeln!(&mut source, "{row},1.5").unwrap();
+        }
+        let admission = source.len().min(CSV_HEAD_MIN_BYTES as usize);
+        let exec = exec(&source, 3, 512);
+        let (pool, ctx) = fixtures::context(3 * admission - 1, CSV_READ_BATCH_ROWS);
+        let _first = exec.execute(0, Arc::clone(&ctx)).unwrap();
+        let _second = exec.execute(1, Arc::clone(&ctx)).unwrap();
+        assert!(pool.reserved() >= 2 * admission, "{}", pool.reserved());
+        let refused = exec
+            .execute(2, ctx)
+            .err()
+            .expect("the third admission exceeds the pool");
+        assert!(
+            refused.to_string().contains("query_memory_bytes"),
+            "{refused}"
+        );
+        assert!(exec.refused());
     }
 
     /// Drops the load caller while its blocking CSV producer is paused at a

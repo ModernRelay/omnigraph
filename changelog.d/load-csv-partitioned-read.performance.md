@@ -3,7 +3,7 @@
   object's version, instead of one capture of the whole source followed by a
   serial pass that cut it into slices: no whole-object buffer, no serial
   resolve pass, and the memory held for the source is one piece per
-  partition. An overwrite whose source's first record is longer than the head
+  partition, admitted before the first partition is polled. An overwrite whose source's first record is longer than the head
   range the header is read from (8 MiB) is refused. The receipt's source
   `slices` gain `read_ns`, the wait for the slice's bytes. The uniqueness
   check's first holders are one set of maps shared by every partition and

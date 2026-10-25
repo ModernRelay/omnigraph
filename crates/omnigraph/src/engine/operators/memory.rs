@@ -514,6 +514,17 @@ impl WorkMemory {
             .inspect_err(|_| self.resources.refused(&self.name))
     }
 
+    /// Raise this work's charge to `bytes` where it is lower; a charge already
+    /// at or above `bytes` grows nothing.
+    pub(in crate::engine) fn ensure(&self, bytes: usize) -> DfResult<()> {
+        let held = self.scratch.size();
+        if bytes > held {
+            self.grow(bytes - held)
+        } else {
+            self.check()
+        }
+    }
+
     /// `grow` for a charge the caller does without when the pool refuses it:
     /// `false` then, with no refusal recorded, since the query goes on.
     pub(in crate::engine) fn grow_if_free(&self, bytes: usize) -> DfResult<bool> {

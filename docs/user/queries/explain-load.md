@@ -84,10 +84,9 @@ the `rows` it emitted (the sink counts the rows it staged),
 `wall_ns`, the span from its first poll to its end with every wait included,
 and `partitions`, the streams it ran (1 for every operator but the source).
 The source's entry also lists `slices`, one per record-aligned 8 MiB slice of
-the source in slice order: `slice`, the `partition` that claimed it, its
-`rows`, `read_ns`, the wait for the slice's bytes, `elapsed_compute_ns`, and
+the source in source order: `slice`, the `partition` whose byte range held it,
+its `rows`, `read_ns`, the wait for the slice's bytes, `elapsed_compute_ns`, and
 `start_ns` and `end_ns` from the source's first poll. The statement's answer, the `ChangeOutput` of
 `omnigraph mutate --json` and of `POST /mutate`, carries the object as
-`executed` beside the counts and the commit. The compute and wall numbers
-and the claiming partition are measurements of one run; a GQT case pins only
-the rows and the partitions.
+`executed` beside the counts and the commit. The compute, wait and wall numbers
+are measurements of one run; a GQT case pins only the rows and the partitions.

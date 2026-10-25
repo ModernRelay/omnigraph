@@ -533,9 +533,10 @@ pub(crate) struct ScannedSlice {
 /// One partition's walk over its byte range of the source: pieces of
 /// `slice_bytes` read on demand, records cut on their ends, the partition
 /// owning every record that starts before `range_end`. A partition after
-/// the first begins at the first record end at or past its range start; the
-/// one before it stops at the same end, so the two agree unless the range
-/// start fell inside a quoted field, which the breaker detects.
+/// the first begins at the first line end at or past its range start; the
+/// one before it stops at the first record end there, so the two agree
+/// unless the range start fell inside a quoted field or right after an
+/// empty line (a line end the parser skips), which the breaker detects.
 pub(crate) struct RangeScanner {
     bytes: Arc<CsvBytes>,
     size: u64,
@@ -619,7 +620,7 @@ impl RangeScanner {
         let piece = self.bytes.read(request, from..to).await?;
         *read_ns =
             read_ns.saturating_add(u64::try_from(waited.elapsed().as_nanos()).unwrap_or(u64::MAX));
-        admit(piece.len())?;
+        admit(self.buf.len().saturating_add(piece.len()))?;
         self.buf.extend_from_slice(&piece);
         if to >= self.size {
             self.at_eof = true;
@@ -628,8 +629,8 @@ impl RangeScanner {
     }
 
     /// The partition's first record begins at the first line end at or past
-    /// the range start, read without regard to quotes; the partition before
-    /// stops at the same byte unless it lies inside a quoted field.
+    /// the range start, read without regard to quotes or empty lines; the
+    /// partition before stops there unless a quoted field or an empty line ends it.
     async fn align(
         &mut self,
         request: &CsvLoadRequest,
@@ -674,7 +675,8 @@ impl RangeScanner {
     }
 
     /// The next slice of the partition's records, or `None` once its range
-    /// is exhausted; `admit` is called with every piece of the source read.
+    /// is exhausted; `admit` is called before every piece of the source is
+    /// kept, with the bytes the scanner then holds.
     pub(crate) async fn next_slice(
         &mut self,
         request: &CsvLoadRequest,
