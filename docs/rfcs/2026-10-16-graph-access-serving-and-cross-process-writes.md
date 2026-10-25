@@ -1273,11 +1273,10 @@ to RFC 0003.
 
 A client other than the CLI should reach an OIDC-enabled server, self-hosted or
 managed, as a standard OAuth public client rather than borrow the CLI's
-credentials, once the managed control plane supports one; until then Studio
-borrows them for managed clusters, as the interim below describes. A managed
-data token is a bearer credential valid for up to 24 hours that removing
-admission does not retract (the managed-data guide and RFC 0053 describe
-both), and credential families stay separate. The client flow:
+credentials. A managed data token is a bearer credential valid for up to 24
+hours that removing admission does not retract (the managed-data guide and
+RFC 0053 describe both), and credential families stay separate. The client
+flow:
 
 1. Discover the protected-resource metadata as A1 describes; take `resource` and
    `authorization_servers`; refuse an issuer the metadata does not name. The
@@ -1301,16 +1300,29 @@ and start managed servers with OIDC identity trust, which also admits the
 resource's host for MCP. A client must not depend on `/openapi.json` being
 reachable through every deployment's proxy. Studio would implement the client.
 
-**Interim.** Until the client lands, Studio reaches a managed cluster with the
-data token that `omnigraph credentials export --target NAME` exchanges from the
-person's `omnigraph login`. Studio asks for it by export alone, keeps it in
-memory, asks again after a 401, and keeps it only while `target inspect` still
-names that managed target at that endpoint; it shows that the connection uses
-the CLI's login and names the profile. This accepts for now what the first
-paragraph rules out: the token is the CLI's (one hour at the exchange observed
-on 2026-10-25; up to 24 hours by policy), removing admission does not retract
-it, and Studio acts with the CLI's login, which the server cannot tell from the
-CLI or give less authority. The client replaces it.
+**Interim exception for Studio.** Until the managed control plane enables that
+resource profile and registers Studio, and Studio implements this client,
+Studio may reach a managed cluster with the CLI's data token for it. The
+launcher stays refused (the target table's "Deferred to A2" and Opening
+Studio): Studio uses the token only after a person selects a managed target
+inside Studio. It takes the token from `omnigraph credentials export --target
+NAME`, the one credential command that accepts a managed target, which writes
+only to a Unix FIFO and never starts an interactive login. Export returns the
+CLI's cached data token while it validates and asks the issuer for a new one
+only when the cache is missing, expired or for another principal. That request
+asks for 3600 seconds, which the issuer may shorten, and the CLI refuses an
+expiry later than that plus 30 seconds; a token stored by `cluster token --ttl`
+can last up to 86400 seconds. After a 401, a new export returns the same token
+while the cache validates, and a target whose endpoint pin no longer matches
+fails the export. Studio keeps the token in memory, and only while `target
+inspect` still names that managed target at that endpoint; that is Studio's
+obligation, since the pipe's reader could store it, and for an `omnigraph`
+profile the CLI's own copy stays in the OS keychain. The exception accepts
+what the first paragraph rules out: Studio and the CLI hold the same bearer as
+one Cedar principal, so the server cannot give Studio less authority; the
+token stays valid until it expires or its signing key retires, and removing
+the person's issuer membership does not cut that short, though a policy change
+denies both on their next request.
 
 **Recommendation:** control-plane and Studio spec changes, tracked in
 [#1025](https://github.com/ModernRelay/omnigraph/issues/1025). No OmniGraph RFC is needed unless the server contract
@@ -1559,10 +1571,12 @@ proposal.
   otherwise" (a refused credential carries `error="invalid_token"` with or
   without OIDC), "The challenge would move into the authentication middleware
   every route shares", and A1's recommendation, now its disposition.
-- 2026-10-25: A2 gains an interim. Until Studio's OAuth client lands, Studio
-  reaches a managed cluster with the data token the CLI exchanges from the
-  person's login, kept in memory and asked for again after a 401. Superseded
-  sentence: "A client other than the CLI should reach an OIDC-enabled server,
-  self-hosted or managed, as a standard OAuth public client rather than borrow
-  the CLI's credentials" now holds once the managed control plane supports such
-  a client, with Studio's interim until then.
+- 2026-10-25: A2 gains one exception. Until the managed control plane enables
+  the resource profile and registers Studio, and Studio implements the client,
+  Studio may reach a managed cluster that a person selects inside Studio with
+  the CLI's data token from `credentials export`. It qualifies the sentence "A
+  client other than the CLI should reach an OIDC-enabled server, self-hosted
+  or managed, as a standard OAuth public client rather than borrow the CLI's
+  credentials" for that case only: the rule stays in force for self-hosted
+  OIDC servers and every other client, and the launcher's refusal of a managed
+  target (the target table and Opening Studio) is unchanged.
