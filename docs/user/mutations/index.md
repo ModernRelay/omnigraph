@@ -163,7 +163,9 @@ load csv "s3://imports/knows.csv" into edge:Knows mode append delimiter "|" head
 - `delimiter "<c>"` is one printable ASCII character; `,` when unspelled.
 - `header` makes the first record name the columns: each name is the property
   it feeds, and an edge file's first two columns are its endpoints whatever
-  the header calls them (`Person.id|Person.id` in an LDBC file).
+  the header calls them (`Person.id|Person.id` in an LDBC file). In mode
+  `overwrite` the first record is read from the source's first 8 MiB, with or
+  without `header`; a first record longer than that is refused.
 - `columns (a, b, …)` names the property each column feeds, by position. It
   is required without `header` and overrides a header's names. `from` and
   `to` name an edge file's endpoint columns and are refused on a node file.
