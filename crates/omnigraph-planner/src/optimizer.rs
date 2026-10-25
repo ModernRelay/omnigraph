@@ -16,10 +16,9 @@ use omnigraph_compiler::types::Direction;
 use crate::cost::{
     AccessPath, AntiJoinStrategy, CoverageProvenance, EndpointProbe, ExpandCostInputs, ExpandMode,
     ExpandPolicy, HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, HYDRATE_ROW_RATIO, IndexCoverage,
-    SOURCE_PARTITION_BYTES, ValidateAccess, ValidateCostInputs, ValidateIndexCoverage,
-    ValidateRemoval, chain_rows, choose_access_path, choose_anti_join_strategy, choose_expand_mode,
-    choose_validate_access, direction_probe_factor, estimate_rows, executed_hops,
-    hydrate_chunk_bytes, scan_row_estimate,
+    ValidateAccess, ValidateCostInputs, ValidateIndexCoverage, ValidateRemoval, chain_rows,
+    choose_access_path, choose_anti_join_strategy, choose_expand_mode, choose_validate_access,
+    direction_probe_factor, estimate_rows, executed_hops, hydrate_chunk_bytes, scan_row_estimate,
 };
 use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
 use crate::key_set::{KeySetTree, key_set_tree};
@@ -68,6 +67,9 @@ pub struct Bounds {
     pub load_workers_max: u32,
     /// The bound every staged write input of a load is checked against.
     pub load_write_max_bytes: u64,
+    /// The source bytes one parse partition of a load owns,
+    /// `cost::SOURCE_PARTITION_BYTES` unless a test pins a smaller slice.
+    pub source_partition_bytes: u64,
 }
 
 pub const PASS_RESOLVE: &str = PassId::Resolve.name();
@@ -3639,7 +3641,8 @@ impl Lowering<'_> {
             }
             LogicalNode::CsvSource { spec } => {
                 let max_workers = self.bounds.load_workers_max.max(1);
-                let partitions_by_size = spec.source_bytes.div_ceil(SOURCE_PARTITION_BYTES).max(1);
+                let partition_bytes = self.bounds.source_partition_bytes.max(1);
+                let partitions_by_size = spec.source_bytes.div_ceil(partition_bytes).max(1);
                 let max_partitions =
                     u32::try_from(partitions_by_size.min(u64::from(max_workers))).unwrap_or(1);
                 Ok(self.physical.add(PhysicalNode::CsvSource {

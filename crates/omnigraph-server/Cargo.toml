@@ -42,8 +42,8 @@ headers = "0.4.1"
 http-body-util = "0.1"
 sha2 = { workspace = true }
 base64 = { workspace = true }
-p256 = { version = "0.13", features = ["ecdsa", "pem"] }
-jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
+p256 = { version = "0.14", features = ["ecdsa", "pem"] }
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 libc = "0.2"
 subtle = { workspace = true }
 async-trait = { workspace = true }

@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-16
-updated: 2026-10-22
+updated: 2026-10-25
 discussion: https://github.com/ModernRelay/omnigraph/pull/1017
 supersedes: []
 superseded_by: []
@@ -1300,6 +1300,30 @@ and start managed servers with OIDC identity trust, which also admits the
 resource's host for MCP. A client must not depend on `/openapi.json` being
 reachable through every deployment's proxy. Studio would implement the client.
 
+**Interim exception for Studio.** Until the managed control plane enables that
+resource profile and registers Studio, and Studio implements this client,
+Studio may reach a managed cluster with the CLI's data token for it. The
+launcher stays refused (the target table's "Deferred to A2" and Opening
+Studio): Studio uses the token only after a person selects a managed target
+inside Studio. It takes the token from `omnigraph credentials export --target
+NAME`, the one credential command that accepts a managed target, which writes
+only to a Unix FIFO and never starts an interactive login. Export returns the
+CLI's cached data token while it validates and asks the issuer for a new one
+only when the cache is missing, expired or for another principal. That request
+asks for 3600 seconds, which the issuer may shorten, and the CLI refuses an
+expiry later than that plus 30 seconds; a token stored by `cluster token --ttl`
+can last up to 86400 seconds. After a 401, a new export returns the same token
+while the cache validates, and a target whose endpoint pin no longer matches
+fails the export. Studio keeps the token in memory, and only while `target
+inspect` still names that managed target at that endpoint; that is Studio's
+obligation, since the pipe's reader could store it, and for an `omnigraph`
+profile the CLI's own copy stays in the OS keychain. The exception accepts
+what the first paragraph rules out: Studio and the CLI hold the same bearer as
+one Cedar principal, so the server cannot give Studio less authority; the
+token stays valid until it expires or its signing key retires, and removing
+the person's issuer membership does not cut that short, though a policy change
+denies both on their next request.
+
 **Recommendation:** control-plane and Studio spec changes, tracked in
 [#1025](https://github.com/ModernRelay/omnigraph/issues/1025). No OmniGraph RFC is needed unless the server contract
 changes beyond A1.
@@ -1558,3 +1582,12 @@ proposal.
   merge-base tool, and no `blob stat`", the exception "Blob payloads and
   export streams; `blob stat` is a tool", and the stored-mutation change "or
   declare the reason in the table".
+- 2026-10-25: A2 gains one exception. Until the managed control plane enables
+  the resource profile and registers Studio, and Studio implements the client,
+  Studio may reach a managed cluster that a person selects inside Studio with
+  the CLI's data token from `credentials export`. It qualifies the sentence "A
+  client other than the CLI should reach an OIDC-enabled server, self-hosted
+  or managed, as a standard OAuth public client rather than borrow the CLI's
+  credentials" for that case only: the rule stays in force for self-hosted
+  OIDC servers and every other client, and the launcher's refusal of a managed
+  target (the target table and Opening Studio) is unchanged.

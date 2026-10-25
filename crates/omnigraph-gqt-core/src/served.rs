@@ -67,6 +67,9 @@ pub fn admit_served(case: &Case) -> Result<(), String> {
     if case.traversal.is_some() {
         refused.push("the `# traversal:` pin".to_string());
     }
+    if case.csv_slice_bytes.is_some() {
+        refused.push("the `# csv_slice_bytes:` pin".to_string());
+    }
     if case.needs_indices {
         refused.push("queries that need indices (search, fuzzy, nearest, rrf)".to_string());
     }
