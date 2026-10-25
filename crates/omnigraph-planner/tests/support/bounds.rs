@@ -10,4 +10,5 @@ pub const BOUNDS: Bounds = Bounds {
     late_materialization_only: false,
     load_workers_max: 4,
     load_write_max_bytes: 256 * 1024 * 1024,
+    source_partition_bytes: 8 * 1024 * 1024,
 };
