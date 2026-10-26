@@ -17,6 +17,9 @@ use crate::operator::OperatorConfig;
 pub(crate) const TARGET_PROTOCOL: u32 = 2;
 pub(crate) const CREDENTIAL_PROTOCOL: u32 = 2;
 pub(crate) const ACCESS_PROTOCOL: u32 = 2;
+/// The `omnigraph-studio://open` link and `studio --json`, with the `home`
+/// and `binding` digests `target inspect --json` reports for recomputing them.
+pub(crate) const STUDIO_PROTOCOL: u32 = 1;
 
 #[derive(Debug)]
 pub(crate) struct TargetError {

@@ -34,6 +34,8 @@ pub struct CommitsListArguments {
     #[serde(default)]
     pub branch: Option<String>,
     #[serde(default)]
+    pub listing: Option<String>,
+    #[serde(default)]
     pub limit: Option<usize>,
     #[serde(default)]
     pub page_token: Option<String>,
@@ -107,9 +109,66 @@ pub struct ChangesPollArguments {
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct DiffArguments {
+    pub graph: String,
+    pub from: String,
+    pub to: String,
+    #[serde(flatten)]
+    pub filters: ChangeFilters,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BranchDiffArguments {
+    pub graph: String,
+    pub source: String,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(flatten)]
+    pub filters: ChangeFilters,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MergeBaseArguments {
+    pub graph: String,
+    pub source: String,
+    #[serde(default)]
+    pub target: Option<String>,
+}
+/// One Blob cell and its read target, as the Blob read routes' query names them.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobStatArguments {
+    pub graph: String,
+    pub entity: String,
+    pub r#type: String,
+    pub id: String,
+    pub property: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub snapshot: Option<String>,
+}
+/// One Blob cell and the branch to write, with the route's `If-Match` value.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobClearArguments {
+    pub graph: String,
+    pub entity: String,
+    pub r#type: String,
+    pub id: String,
+    pub property: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub if_match: Option<String>,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MutateArguments {
     pub graph: String,
-    pub query: String,
+    /// Ad-hoc GQ source. Without it, `name` names a stored mutation.
+    #[serde(default)]
+    pub query: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -210,11 +269,18 @@ impl ToolRequest {
             "commits_get" => Ok(ToolCall::CommitsGet(arguments_as(arguments)?)),
             "commits_changes" => Ok(ToolCall::CommitsChanges(arguments_as(arguments)?)),
             "changes_poll" => Ok(ToolCall::ChangesPoll(arguments_as(arguments)?)),
+            "diff" => Ok(ToolCall::Diff(arguments_as(arguments)?)),
+            "branches_diff" => Ok(ToolCall::BranchesDiff(arguments_as(arguments)?)),
+            "branches_merge_base" => Ok(ToolCall::BranchesMergeBase(arguments_as(arguments)?)),
+            "blobs_stat" => Ok(ToolCall::BlobsStat(arguments_as(arguments)?)),
             "mutate" => Ok(ToolCall::Mutate(arguments_as(arguments)?)),
             "load" => Ok(ToolCall::Load(arguments_as(arguments)?)),
+            "blobs_clear" => Ok(ToolCall::BlobsClear(arguments_as(arguments)?)),
             "branches_create" => Ok(ToolCall::BranchesCreate(arguments_as(arguments)?)),
             "branches_delete" => Ok(ToolCall::BranchesDelete(arguments_as(arguments)?)),
             "branches_merge" => Ok(ToolCall::BranchesMerge(arguments_as(arguments)?)),
+            "commits_publish" => Ok(ToolCall::CommitsPublish(arguments_as(arguments)?)),
+            "commits_drop" => Ok(ToolCall::CommitsDrop(arguments_as(arguments)?)),
             _ => Err(InvalidArguments),
         }
     }
@@ -249,11 +315,18 @@ pub enum ToolCall {
     CommitsGet(CommitArguments),
     CommitsChanges(CommitChangesArguments),
     ChangesPoll(ChangesPollArguments),
+    Diff(DiffArguments),
+    BranchesDiff(BranchDiffArguments),
+    BranchesMergeBase(MergeBaseArguments),
+    BlobsStat(BlobStatArguments),
     Mutate(MutateArguments),
     Load(LoadArguments),
+    BlobsClear(BlobClearArguments),
     BranchesCreate(BranchCreateArguments),
     BranchesDelete(BranchDeleteArguments),
     BranchesMerge(BranchMergeArguments),
+    CommitsPublish(CommitArguments),
+    CommitsDrop(CommitArguments),
 }
 
 fn arguments_as<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, InvalidArguments> {
