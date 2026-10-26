@@ -559,6 +559,60 @@ async fn append_only_fast_forward_merge_of_a_commit_chain_is_a_pointer_switch() 
     );
 }
 
+/// An index build on the source branch stages an index-only commit on top of
+/// its inserts. It moves no row, so the pure-insert proof walks through it and
+/// the fast-forward stays a pointer switch with no ordered scan of either side.
+#[tokio::test]
+async fn fast_forward_merge_proof_crosses_an_index_build_on_the_source_issue_840() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let main = init_and_load(&dir).await;
+    let base_count = count_rows(&main, "node:Person").await;
+    main.branch_create("feature").await.unwrap();
+
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
+    feature
+        .load(
+            "feature",
+            "{\"type\":\"Person\",\"data\":{\"name\":\"ff_indexed\",\"age\":30}}\n",
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    let built = feature.ensure_indices_on_as("feature", None).await.unwrap();
+    assert!(
+        built.graph_commit_id.is_some(),
+        "the insert leaves the identity index lagging, so the build publishes"
+    );
+
+    let base_pin = pinned_version(&main, "main", "node:Person").await;
+    let source_table = open_pinned_dataset_for_test(&main, "feature", "node:Person").await;
+    assert_eq!(
+        chain_links_to(&source_table, base_pin).await,
+        Some(2),
+        "fixture must be the insert and the index build, reaching the merge base"
+    );
+    let pins = source_pins(&main, "feature", &["node:Person"]).await;
+
+    let probes = MergeWriteProbes::default();
+    let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
+        .await
+        .unwrap();
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
+    assert_pointer_switch_onto_main(&main, &probes, pins).await;
+    assert_eq!(
+        probes.proven_insert_history_read_calls(),
+        2,
+        "the chain walk reads the index build and the insert once each"
+    );
+    assert_eq!(
+        probes.ordered_cursor_scan_calls(),
+        0,
+        "an index-only commit must not end the proof and force an ordered scan"
+    );
+    assert_eq!(count_rows(&main, "node:Person").await, base_count + 1);
+}
+
 /// A source two branch hops below the merge base is a two-link commit chain on
 /// the inherited dataset: valid history, not a table-incarnation conflict, so
 /// the merge onto main is a pointer switch.

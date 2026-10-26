@@ -70,7 +70,7 @@ use crate::blob::{
 };
 use crate::dataset_index::{
     has_btree_index_on, has_fts_index_on, has_fts_postings_on, has_vector_index_on,
-    is_full_text_index, is_untrained_full_text, validate_full_text_demand, validate_full_text_scan,
+    is_full_text_index, validate_full_text_demand, validate_full_text_scan,
 };
 use crate::db::manifest::{TableVersionMetadata, open_dataset_entry};
 use crate::db::{DatasetEntry, Snapshot};
@@ -570,22 +570,14 @@ fn stamp_no_by_source_delete(transaction: &mut Transaction) {
     );
 }
 
-/// Whether `transaction`, read at `expected_read_version`, only declares
-/// full-text indexes ([`TableStore::stage_full_text_declarations`]): a
-/// `CreateIndex` that adds untrained full-text segments (empty fragment
-/// bitmaps) and removes nothing. It moves no row.
-pub(crate) fn is_full_text_declaration(
-    transaction: &Transaction,
-    expected_read_version: u64,
-) -> bool {
+/// Whether `transaction`, read at `expected_read_version`, only changes
+/// indexes: a `CreateIndex`, such as a full-text declaration
+/// ([`TableStore::stage_full_text_declarations`]), an index build or a fold.
+/// Lance applies `CreateIndex` with every fragment of the version it read
+/// unchanged, so it moves no row.
+pub(crate) fn is_index_only_commit(transaction: &Transaction, expected_read_version: u64) -> bool {
     transaction.read_version == expected_read_version
-        && matches!(
-            &transaction.operation,
-            Operation::CreateIndex { new_indices, removed_indices }
-                if removed_indices.is_empty()
-                    && !new_indices.is_empty()
-                    && new_indices.iter().all(is_untrained_full_text)
-        )
+        && matches!(&transaction.operation, Operation::CreateIndex { .. })
 }
 
 /// Verify one persisted link of the insertion-absence proof chain and return

@@ -632,6 +632,15 @@ async fn maintain_indices_for_branch(
             pending.append(&mut table_pending);
         }
     }
+    // Edge tables declare no vector index, but a physical one that cannot
+    // train is still pending work and is reported after the node types.
+    let mut __dst_ek2: Vec<_> = catalog.edge_types.keys().collect();
+    __dst_ek2.sort();
+    for edge_name in __dst_ek2 {
+        if let Some(mut table_pending) = pending_by_table.remove(&format!("edge:{edge_name}")) {
+            pending.append(&mut table_pending);
+        }
+    }
     let mut rebuilt_indexes = Vec::new();
     if mode == IndexMaintenanceMode::RebuildFullText && graph_commit_id.is_some() {
         for target in &targets {

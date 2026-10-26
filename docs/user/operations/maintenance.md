@@ -32,9 +32,11 @@ omnigraph optimize --target ./graph.omni --json
 Optimize rewrites small fragments into fewer larger fragments, rewrites every
 fragment that still stores a dropped property's values, rebuilds each scalar or
 vector index whose coverage lags behind appended rows, and builds missing
-declared indexes that are ready to build. It works on `main`; `index build`
-does the index part of this on any other branch. It does not delete old
-versions or collect unused table forks. Use `cleanup` for storage reclamation.
+declared indexes that are ready to build. It works on `main`. `index build`
+does only the index part, on any branch including `main`; compaction, the
+dropped-value rewrite and the traversal artifact stay with optimize. Optimize
+does not delete old versions or collect unused table forks. Use `cleanup` for
+storage reclamation.
 
 Dropping a property removes it from the schema without rewriting its table
 (see [schema changes](../schema/index.md#schema-changes)), so its values stay
@@ -112,7 +114,8 @@ those of a type whose first rows were loaded there, and rebuilds whole each
 BTREE or vector index that leaves rows uncovered. Every table publishes in one
 graph commit on that branch; other branches and snapshots keep their indexes,
 and a branch with nothing to do publishes nothing. The default branch is `main`.
-A vector property with no vectors yet and full-text coverage stay pending: only
+As with optimize, a write that lands on a table while its batch is staged fails
+the run with a read-set conflict; run the command again. A vector property with no vectors yet and full-text coverage stay pending: only
 `index rebuild --kind full-text` refreshes a full-text index's coverage, and
 queries match uncovered rows with the index's analyzer meanwhile.
 
