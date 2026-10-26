@@ -2141,7 +2141,9 @@ rules:
                 "actions: [reclaim]",
                 &format!("actions: [reclaim]\n      {scope}: any"),
             );
-            let error = PolicyEngine::load_graph_from_source(&scoped, "graph").unwrap_err();
+            let Err(error) = PolicyEngine::load_graph_from_source(&scoped, "graph") else {
+                panic!("{scope} on reclaim must be refused");
+            };
             assert!(
                 error.to_string().contains("unsupported action 'reclaim'"),
                 "{scope}: {error}"
