@@ -12,8 +12,10 @@ use super::commit_graph::{
     CommitGraph, FirstParentPage, GraphCommit, HistoryCache, Lineage,
     graph_commit_from_manifest_row,
 };
+#[cfg(any(test, feature = "failpoints"))]
+use super::manifest::DatasetUpdate;
 use super::manifest::{
-    BranchRecords, CapturedManifestProbe, CommitBuffer, DatasetUpdate, ExpectedTableVersions,
+    BranchRecords, CapturedManifestProbe, CommitBuffer, ExpectedTableVersions,
     GenesisManifestAttempt, GraphHeadExpectation, HistoryRecord, HistoryReleaseBytes,
     LineageIntent, ManifestChange, ManifestCoordinator, ManifestIncarnation, ManifestInitError,
     PublishPrecondition, SchemaContractRow, UnattachedCommit, UnattachedIntent,
