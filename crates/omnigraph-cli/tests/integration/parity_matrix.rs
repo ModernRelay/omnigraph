@@ -263,10 +263,10 @@ fn parity_query() {
     assert_parity("query", &l, &r);
 }
 
-/// A ranked read describes its retrieval and score column alike on both
-/// arms: the remote arm prints the descriptors it decoded from the server.
+/// A ranked read reports its ranking alike on both arms: the remote arm
+/// prints the ranking it decoded from the server.
 #[test]
-fn parity_ranked_query_descriptors() {
+fn parity_ranked_query_ranking() {
     let p = parity();
     let queries = p._temp.path().join("ranked.gq");
     std::fs::write(
@@ -285,9 +285,12 @@ fn parity_ranked_query_descriptors() {
     ]);
     assert_parity("ranked query", &l, &r);
     let local: serde_json::Value = serde_json::from_slice(&l.stdout).unwrap();
-    assert_eq!(local["retrievals"][0]["kind"], "bm25", "{local}");
-    assert_eq!(local["metrics"][0]["column"], "relevance", "{local}");
-    assert_eq!(local["metrics"][0]["retrieval_id"], "r0", "{local}");
+    assert_eq!(local["ranking"]["by"], "bm25", "{local}");
+    assert_eq!(
+        local["ranking"]["score_columns"],
+        serde_json::json!(["relevance"]),
+        "{local}"
+    );
 }
 
 #[test]

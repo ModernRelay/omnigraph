@@ -188,37 +188,39 @@ at both. Rank one binding in both arms, or bindings no traversal joins.
 
 ## What a ranked read reports
 
-A read's JSON envelope (`POST /query`, a stored-query call, `omnigraph query
---json`, and the metadata line of `--format jsonl`) says which retrievals
-produced its order and what each returned score column measures, in two
-arrays. Both come from the plan that ran. `retrievals` is absent when the
-read ranks nothing, and `metrics` when no returned column holds a score. For
-`hybrid` above, with `rrf(...) as score` in `return`:
+A read whose order is a search carries a `ranking` object in its JSON
+envelope (`POST /query`, a stored-query call, `omnigraph query --json`, and
+the metadata line of `--format jsonl`). For `hybrid` above, with
+`rrf(...) as score` in `return`:
 
 ```json
-"retrievals": [
-  { "id": "r0", "kind": "rrf", "arms": ["r1", "r2"], "recall": "approximate" },
-  { "id": "r1", "kind": "nearest", "binding": "d", "property": "embedding",
-    "recall": "approximate",
-    "embedding_coverage": { "state": "unknown", "reason": "not_computed" } },
-  { "id": "r2", "kind": "bm25", "binding": "d", "property": "body", "recall": "exact" }
-],
-"metrics": [
-  { "column": "score", "kind": "rrf", "retrieval_id": "r0", "source": "rrf",
-    "descending": true, "recall": "approximate" }
-]
+"ranking": {
+  "by": "rrf",
+  "order": "descending",
+  "exhaustive": true,
+  "score_columns": ["score"]
+}
 ```
 
-`id` is local to the plan: `r0`, `r1` and so on, a fusion before its arms and
-the arms in the order `rrf(...)` names them, so two arms over the same
-property keep separate ids. `recall` states the retrieval's contract, not what
-one run did: `nearest` is `approximate` even when a run scored every row,
-`bm25` is `exact`, and `rrf` is `approximate` when either arm is. A metric
-names the retrieval whose score the column holds; `kind` is `distance`
-(smaller ranks first), `score` or `rrf` (larger ranks first), as
-`descending` also says. Several columns that return one score name the same
-retrieval, and a column computed from a score is not a metric. No query text,
-vector or other parameter value appears in either array.
+`by` is the search function the order names: `nearest`, `bm25` or `rrf`.
+`order` says which way the score ranks: `ascending` for a `nearest` distance,
+where smaller is nearer, and `descending` for a `bm25` or fused score, where
+larger is more relevant.
+
+`exhaustive` says what this run did. When it is `true`, no row the search
+admitted and did not return ranks above a returned row. `bm25` scores every
+match, so it is always exhaustive. A `nearest` search is exhaustive when it
+searched every partition of the vector index, scored every row without one,
+or returned every row it admitted. It is `false` when the `ann_nprobes` cap
+left partitions unsearched, so a nearer row may exist; raising the cap
+searches more. An `rrf(...)` is exhaustive when its `nearest` arm is.
+
+`score_columns` lists the returned columns that hold the ranking's own
+score, in return order. Two columns that return one score both appear; a
+column computed from the score, such as `bm25(...) > 0.0 as hit`, does not.
+It is empty when the read returns no score. The object never carries a query
+text, vector or other parameter value, and a read whose order is no search
+has no `ranking`.
 
 ## Indexes
 

@@ -731,9 +731,9 @@ async fn replayed(db: &Session, source: &str, name: &str, params: &ParamMap) -> 
             .unwrap();
         assert_eq!(rows_of(&replay.result), result);
         assert_eq!(
-            replay.result.descriptors(),
-            run.result.descriptors(),
-            "the replayed plan describes its retrievals with the run's ids"
+            replay.result.ranking(),
+            run.result.ranking(),
+            "the replayed plan reports the run's ranking"
         );
         assert_same_trace(&rows, &report_rows(&replay.report));
         assert_eq!(search_decisions(&replay.report), search);
@@ -1358,20 +1358,19 @@ async fn a_fusion_replays() {
     );
 }
 
-/// A read describes its retrievals from the plan that ran: ids in plan
-/// preorder, a fusion before its arms and the arms in query argument order,
-/// two arms over one property kept apart, and every returned score column
-/// naming its producer, including two columns that read one fused score and
-/// a `distinct` group key, while a column computed from a score names none.
-/// An inspected run, an ordinary run and a replay describe one plan alike.
+/// A read reports the ranking its order names: the search function, whether
+/// the run's search was exhaustive, and every returned column holding the
+/// ranking's own score, including two columns that read one fused score and
+/// a `distinct` group key, while a column computed from a score is none. The
+/// fixture's vectors carry no index, so Lance scores every row and each
+/// `nearest` is exhaustive; the partitioned-index cases in `search.rs` own
+/// the inexact run. An inspected run, an ordinary run and a replay report
+/// one ranking alike.
 #[tokio::test]
-async fn a_read_describes_its_retrievals_and_score_columns() {
-    use omnigraph_compiler::result::{
-        EmbeddingCoverage, Metric, ReadDescriptors, Recall, Retrieval, RetrievalKind,
-        RetrievalTarget,
-    };
+async fn a_read_reports_its_ranking() {
+    use omnigraph_compiler::result::{Ranking, SearchFunction};
 
-    const DESCRIBED: &str = r#"
+    const RANKED: &str = r#"
 query two_texts($a: String, $b: String) {
     match { $d: Doc }
     return {
@@ -1407,32 +1406,12 @@ query unranked() {
     limit 2
 }
 "#;
-    let ranked = |id: &str, kind, property: &str| Retrieval {
-        id: id.to_string(),
-        kind,
-        target: RetrievalTarget::Ranked {
-            binding: "d".to_string(),
-            property: property.to_string(),
-            embedding_coverage: (kind == RetrievalKind::Nearest)
-                .then_some(EmbeddingCoverage::NotComputed),
-        },
-        recall: if kind == RetrievalKind::Nearest {
-            Recall::Approximate
-        } else {
-            Recall::Exact
-        },
-    };
-    let fused = |recall| Retrieval {
-        id: "r0".to_string(),
-        kind: RetrievalKind::Rrf,
-        target: RetrievalTarget::Fused {
-            arms: vec!["r1".to_string(), "r2".to_string()],
-        },
-        recall,
-    };
-    let metric = |column: &str, retrieval: &str| Metric {
-        column: column.to_string(),
-        retrieval_id: retrieval.to_string(),
+    let ranking = |by, score_columns: &[&str]| {
+        Some(Ranking {
+            by,
+            exhaustive: true,
+            score_columns: score_columns.iter().map(ToString::to_string).collect(),
+        })
     };
 
     let dir = tempfile::tempdir().unwrap();
@@ -1450,78 +1429,50 @@ query unranked() {
     ]);
     for (source, name, params, expected) in [
         (
-            DESCRIBED,
+            RANKED,
             "two_texts",
             &texts,
-            ReadDescriptors {
-                retrievals: vec![
-                    fused(Recall::Exact),
-                    ranked("r1", RetrievalKind::Bm25, "text"),
-                    ranked("r2", RetrievalKind::Bm25, "text"),
-                ],
-                metrics: vec![metric("fused", "r0"), metric("again", "r0")],
-            },
+            ranking(SearchFunction::Rrf, &["fused", "again"]),
         ),
         (
-            DESCRIBED,
+            RANKED,
             "closest",
             &closest,
-            ReadDescriptors {
-                retrievals: vec![ranked("r0", RetrievalKind::Nearest, "embedding")],
-                metrics: vec![metric("d._distance", "r0")],
-            },
+            ranking(SearchFunction::Nearest, &["d._distance"]),
         ),
         (
             DOC_QUERIES,
             "fused",
             &mixed,
-            ReadDescriptors {
-                retrievals: vec![
-                    fused(Recall::Approximate),
-                    ranked("r1", RetrievalKind::Nearest, "embedding"),
-                    ranked("r2", RetrievalKind::Bm25, "text"),
-                ],
-                metrics: vec![],
-            },
+            ranking(SearchFunction::Rrf, &[]),
         ),
         (
-            DESCRIBED,
+            RANKED,
             "distinct_scores",
             &needle,
-            ReadDescriptors {
-                retrievals: vec![ranked("r0", RetrievalKind::Bm25, "text")],
-                metrics: vec![metric("relevance", "r0")],
-            },
+            ranking(SearchFunction::Bm25, &["relevance"]),
         ),
-        // A column computed from a score is no metric; the score itself is.
+        // A column computed from a score is no score column; the score is.
         (
-            DESCRIBED,
+            RANKED,
             "computed_score",
             &needle,
-            ReadDescriptors {
-                retrievals: vec![ranked("r0", RetrievalKind::Bm25, "text")],
-                metrics: vec![metric("relevance", "r0")],
-            },
+            ranking(SearchFunction::Bm25, &["relevance"]),
         ),
-        (
-            DESCRIBED,
-            "unranked",
-            &ParamMap::new(),
-            ReadDescriptors::default(),
-        ),
+        (RANKED, "unranked", &ParamMap::new(), None),
     ] {
         let run = db
             .query_inspected(ReadTarget::branch("main"), source, name, params)
             .await
             .unwrap();
-        assert_eq!(run.result.descriptors(), &expected, "{name}");
+        assert_eq!(run.result.ranking(), expected.as_ref(), "{name}");
         let ordinary = db
             .query(ReadTarget::branch("main"), source, name, params)
             .await
             .unwrap();
         assert_eq!(
-            ordinary.descriptors(),
-            &expected,
+            ordinary.ranking(),
+            expected.as_ref(),
             "{name}: the ordinary door"
         );
         replayed(&db, source, name, params).await;

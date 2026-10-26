@@ -483,14 +483,18 @@ pub(crate) async fn execute(
     // fusion row keys; only what depends on this run's admission is left.
     let (bound, evidence) = accepted.into_parts();
     let traversal_limit = validate_traversal_admission(&bound.plan)?;
-    let descriptors = omnigraph_planner::read_descriptors(&bound.plan)
+    let ranking = omnigraph_planner::planned_ranking(&bound.plan)
         .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
     let ctx =
         QueryContext::with_traversal_limit(bound.plan.assumptions().memory_limit, traversal_limit)?;
-    let mut run = ctx
+    let (mut run, scans) = ctx
         .run_owned(execute_with_context(bound, evidence, context, &ctx))
         .await?;
-    run.result = run.result.with_descriptors(descriptors);
+    // A nearest scan the run never reached reported nothing and is not
+    // exact; the ranking is exhaustive only on evidence.
+    run.result = run.result.with_ranking(ranking.map(|ranking| {
+        ranking.ranking(|scan| scans.get(&scan).is_some_and(|report| report.exact))
+    }));
     Ok(run)
 }
 
@@ -528,12 +532,14 @@ pub(crate) async fn execute_load(
     .await
 }
 
+/// The run, with what each nearest scan reported in the pass whose rows it
+/// returns.
 async fn execute_with_context(
     bound: BoundPlan,
     evidence: Evidence,
     context: &EngineContext<'_>,
     ctx: &QueryContext,
-) -> Result<PlanRun> {
+) -> Result<(PlanRun, ScanReports)> {
     let mut executed = ExecutionReport::default();
     let policy = bound.plan.assumptions().gate_policy;
     let lowering = Lowering::new(&bound, context);
@@ -562,15 +568,16 @@ async fn execute_with_context(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        for (scan, report) in reports {
-            executed.record_probes(scan, 0, &report);
+        for (scan, report) in &reports {
+            executed.record_probes(*scan, 0, report);
         }
-        return Ok(PlanRun {
+        let run = PlanRun {
             result: QueryResult::new(fused.schema(), vec![fused]),
             plan: bound,
             evidence,
             report: executed,
-        });
+        };
+        return Ok((run, reports));
     }
 
     let mut pass = Pass::default();
@@ -592,18 +599,20 @@ async fn execute_with_context(
 
     let (result_batch, reports, rows) = Box::pin(run_once(&lowering, ctx, &pass, 0)).await?;
     executed.record(rows);
-    let nearest_report = |mut reports: ScanReports| {
+    let nearest_report = |reports: &ScanReports| {
         nearest
             .as_ref()
-            .and_then(|scan| reports.remove(&scan.id))
+            .and_then(|scan| reports.get(&scan.id))
+            .cloned()
             .unwrap_or_default()
     };
-    let report = nearest_report(reports);
+    let report = nearest_report(&reports);
     if let Some(NearestScan { id, .. }) = &nearest {
         executed.record_probes(*id, 0, &report);
     }
     let mut result_batch = result_batch;
     let mut report = report;
+    let mut reports = reports;
     let aggregate = bound
         .plan
         .live()
@@ -667,10 +676,11 @@ async fn execute_with_context(
                 let (retried, retried_reports, rows) =
                     Box::pin(run_once(&lowering, ctx, &wider, rung)).await?;
                 executed.record(rows);
-                let retried_report = nearest_report(retried_reports);
+                let retried_report = nearest_report(&retried_reports);
                 executed.record_probes(id, rung, &retried_report);
                 result_batch = retried;
                 report = retried_report;
+                reports = retried_reports;
                 if let PassStep::Exact { k } = step {
                     if result_batch.num_rows() > rows_before {
                         tracing::warn!(
@@ -693,12 +703,13 @@ async fn execute_with_context(
         }
     }
 
-    Ok(PlanRun {
+    let run = PlanRun {
         result: QueryResult::new(result_batch.schema(), vec![result_batch]),
         plan: bound,
         evidence,
         report: executed,
-    })
+    };
+    Ok((run, reports))
 }
 
 #[cfg(test)]

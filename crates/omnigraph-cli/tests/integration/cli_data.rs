@@ -2187,11 +2187,10 @@ fn read_jsonl_format_outputs_metadata_header_first() {
     assert!(lines.next().unwrap().contains("\"p.name\":\"Alice\""));
 }
 
-/// A ranked read describes its retrieval and its score column in the
-/// `--json` envelope and in the `jsonl` metadata record alike, without the
-/// query text it searched for.
+/// A ranked read reports its ranking in the `--json` envelope and in the
+/// `jsonl` metadata record alike, without the query text it searched for.
 #[test]
-fn ranked_read_describes_its_retrieval_in_json_and_jsonl() {
+fn ranked_read_reports_its_ranking_in_json_and_jsonl() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     output_success(
@@ -2237,33 +2236,20 @@ query scored($q: String) {
             .args(format);
         stdout_string(&output_success(&mut command))
     };
-    let retrievals = serde_json::json!([{
-        "id": "r0",
-        "kind": "bm25",
-        "binding": "d",
-        "property": "title",
-        "recall": "exact"
-    }]);
-    let metrics = serde_json::json!([{
-        "column": "relevance",
-        "kind": "score",
-        "retrieval_id": "r0",
-        "source": "bm25",
-        "binding": "d",
-        "property": "title",
-        "descending": true,
-        "recall": "exact"
-    }]);
+    let ranking = serde_json::json!({
+        "by": "bm25",
+        "order": "descending",
+        "exhaustive": true,
+        "score_columns": ["relevance"]
+    });
 
     let envelope: Value = serde_json::from_str(&read(&["--json"])).unwrap();
-    assert_eq!(envelope["retrievals"], retrievals);
-    assert_eq!(envelope["metrics"], metrics);
+    assert_eq!(envelope["ranking"], ranking);
 
     let jsonl = read(&["--format", "jsonl"]);
     let metadata: Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
     assert_eq!(metadata["kind"], "metadata");
-    assert_eq!(metadata["retrievals"], retrievals);
-    assert_eq!(metadata["metrics"], metrics);
+    assert_eq!(metadata["ranking"], ranking);
     assert!(!jsonl.lines().next().unwrap().contains("learning"));
 }
 

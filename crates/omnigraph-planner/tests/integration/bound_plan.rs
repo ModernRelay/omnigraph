@@ -8,11 +8,11 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field, Schema};
 use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR};
 use omnigraph_compiler::query::ast::{CompOp, Literal};
-use omnigraph_compiler::result::{Recall, RetrievalKind, RetrievalTarget};
+use omnigraph_compiler::result::SearchFunction;
 use omnigraph_compiler::{ExprType, PropType, SYSTEM_COLUMNS_V3, ScalarType};
 use omnigraph_planner::{
     BOUND_PLAN_VERSION, BoundPlan, MemorySource, NodeTypeSpec, PhysicalNode, PhysicalPlan,
-    RankKind, RankScope, TableRef, ValueTable, plan_query, read_descriptors,
+    RankKind, RankScope, TableRef, ValueTable, plan_query, planned_ranking,
 };
 
 use crate::fixture_bounds;
@@ -365,43 +365,29 @@ fn a_fused_plan_reads_back_with_both_arms() {
     };
     assert_ne!(changed, bound, "the value table is part of equality");
 
-    // The plan read back describes itself as the plan did: the fusion first,
-    // then its arms in argument order, a nearest arm approximate.
-    let described = read_descriptors(&bound.plan).unwrap();
-    assert_eq!(read_descriptors(&back.plan).unwrap(), described);
-    let ids: Vec<(&str, RetrievalKind, Recall)> = described
-        .retrievals
-        .iter()
-        .map(|retrieval| (retrieval.id.as_str(), retrieval.kind, retrieval.recall))
-        .collect();
+    // The plan read back reports the ranking the plan does: a fusion whose
+    // nearest arm alone decides whether a run was exhaustive.
+    let planned = planned_ranking(&bound.plan).unwrap().expect("rrf ranks");
     assert_eq!(
-        ids,
-        [
-            ("r0", RetrievalKind::Rrf, Recall::Approximate),
-            ("r1", RetrievalKind::Nearest, Recall::Approximate),
-            ("r2", RetrievalKind::Bm25, Recall::Exact),
-        ]
+        planned_ranking(&back.plan).unwrap().as_ref(),
+        Some(&planned)
     );
-    assert_eq!(
-        described.retrievals[0].target,
-        RetrievalTarget::Fused {
-            arms: vec!["r1".to_string(), "r2".to_string()]
-        }
-    );
+    assert_eq!(planned.by(), SearchFunction::Rrf);
+    assert_eq!(planned.nearest_scans(), [primary]);
     assert!(
-        described.metrics.is_empty(),
+        planned.score_columns().is_empty(),
         "no column returns the fused score"
     );
 
     // An arm whose ranked scan lost its ranking is a plan acceptance refuses,
-    // never a fusion described with a missing arm.
+    // never a fusion reported over one arm.
     let mut broken = bound.plan.clone();
     let Some(PhysicalNode::Scan { ranked, .. }) = broken.node_mut(secondary) else {
         panic!("the secondary arm ranks a scan");
     };
     *ranked = None;
     assert!(matches!(
-        read_descriptors(&broken),
+        planned_ranking(&broken),
         Err(omnigraph_planner::PlanError::Internal(_))
     ));
 }

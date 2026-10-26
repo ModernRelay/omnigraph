@@ -26,7 +26,6 @@
 pub mod aggregate;
 pub mod bound;
 pub mod cost;
-pub mod descriptors;
 pub mod error;
 pub mod explain;
 pub mod gate;
@@ -39,6 +38,7 @@ pub mod optimizer;
 pub mod output;
 pub mod passes;
 pub mod physical;
+pub mod ranking;
 pub mod registry;
 pub mod route;
 pub mod scan_access;
@@ -59,7 +59,6 @@ pub use cost::{
     choose_anti_join_strategy, choose_expand_mode, choose_validate_access, direction_probe_factor,
     estimate_rows, executed_hops, hydrate_chunk_bytes, scan_row_estimate, should_switch_to_csr,
 };
-pub use descriptors::read_descriptors;
 pub use error::PlanError;
 pub use explain::Explain;
 pub use gate::{Decision, Unrouted, accept_query, accept_query_explained, plan_query, route};
@@ -83,6 +82,7 @@ pub use physical::{
     PipelineSpec, Prefilter, PrefilterMode, Properties, ROW_ADDRESS_PREFIX, RankArm, RankKind,
     RankScope, RankedAccess, ScanInput, SideChain, StatisticSource, operator_rows,
 };
+pub use ranking::{PlannedRanking, planned_ranking};
 pub use registry::{Coverage, Entry, Route, Shape};
 pub use route::RouteOverride;
 pub use source::{

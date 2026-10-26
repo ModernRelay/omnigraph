@@ -480,11 +480,11 @@ async fn invoke_stored_read_returns_rows() {
     );
     assert!(body["rows"].is_array(), "read envelope shape; body: {body}");
     assert!(
-        body.get("retrievals").is_none() && body.get("metrics").is_none(),
-        "an unranked read describes no retrieval; body: {body}"
+        body.get("ranking").is_none(),
+        "an unranked read reports no ranking; body: {body}"
     );
 
-    // A stored ranked read carries the same descriptors as an inline one.
+    // A stored ranked read reports its ranking as an inline one does.
     let (status, body) = json_response(
         &app,
         invoke_request(
@@ -496,15 +496,11 @@ async fn invoke_stored_read_returns_rows() {
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(
-        body["retrievals"],
-        json!([{"id": "r0", "kind": "bm25", "binding": "p", "property": "name", "recall": "exact"}])
-    );
-    assert_eq!(
-        body["metrics"],
-        json!([{
-            "column": "relevance", "kind": "score", "retrieval_id": "r0", "source": "bm25",
-            "binding": "p", "property": "name", "descending": true, "recall": "exact"
-        }])
+        body["ranking"],
+        json!({
+            "by": "bm25", "order": "descending", "exhaustive": true,
+            "score_columns": ["relevance"]
+        })
     );
 
     // The stored query name is a parameter, never an upload-route selector.

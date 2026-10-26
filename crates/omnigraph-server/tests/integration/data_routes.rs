@@ -6354,29 +6354,25 @@ query vector_search_string($q: String) {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["row_count"], 3);
     assert_eq!(body["rows"][0]["d.slug"], "alpha-doc");
-    // The retrieval is described without the text it embedded; no column
-    // returns its distance, so there is no metric.
+    // The ranking carries no trace of the text it embedded, and no column
+    // returns the distance. Three unindexed rows are scored flat.
     assert_eq!(
-        body["retrievals"],
-        json!([{
-            "id": "r0",
-            "kind": "nearest",
-            "binding": "d",
-            "property": "embedding",
-            "recall": "approximate",
-            "embedding_coverage": {"state": "unknown", "reason": "not_computed"}
-        }])
+        body["ranking"],
+        json!({
+            "by": "nearest",
+            "order": "ascending",
+            "exhaustive": true,
+            "score_columns": []
+        })
     );
-    assert!(body.get("metrics").is_none(), "{body}");
 }
 
-/// A ranked read's envelope says which retrievals ran and what each score
-/// column measures: a fusion names its arms by id in query argument order,
-/// two arms over one property stay distinct, two columns reading one fused
-/// score name one producer, and, since both arrays are compared whole, no
-/// parameter value appears. An unranked read carries neither array.
+/// A ranked read's envelope reports its ranking: the fusion, the direction
+/// its score orders, that two `bm25` arms score every match, and both
+/// columns that read the fused score; since the object is compared whole, no
+/// parameter value appears. An unranked read carries none.
 #[tokio::test(flavor = "multi_thread")]
-async fn query_envelope_describes_retrievals_and_score_columns() {
+async fn query_envelope_reports_its_ranking() {
     const SCHEMA: &str = "node Doc {\n    slug: String @key\n    title: String @index\n}\n";
     const QUERIES: &str = r#"
 query fused($a: String, $b: String) {
@@ -6423,24 +6419,14 @@ query unranked() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
-        body["retrievals"],
-        json!([
-            {"id": "r0", "kind": "rrf", "arms": ["r1", "r2"], "recall": "exact"},
-            {"id": "r1", "kind": "bm25", "binding": "d", "property": "title", "recall": "exact"},
-            {"id": "r2", "kind": "bm25", "binding": "d", "property": "title", "recall": "exact"}
-        ])
-    );
-    let fused = |column: &str| {
+        body["ranking"],
         json!({
-            "column": column,
-            "kind": "rrf",
-            "retrieval_id": "r0",
-            "source": "rrf",
-            "descending": true,
-            "recall": "exact"
+            "by": "rrf",
+            "order": "descending",
+            "exhaustive": true,
+            "score_columns": ["fused", "again"]
         })
-    };
-    assert_eq!(body["metrics"], json!([fused("fused"), fused("again")]));
+    );
 
     let (status, body) = json_response(
         &app,
@@ -6448,10 +6434,7 @@ query unranked() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(
-        body.get("retrievals").is_none() && body.get("metrics").is_none(),
-        "{body}"
-    );
+    assert!(body.get("ranking").is_none(), "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

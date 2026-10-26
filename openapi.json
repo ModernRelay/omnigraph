@@ -14006,12 +14006,6 @@
           }
         }
       },
-      "CoverageUnknownReason": {
-        "type": "string",
-        "enum": [
-          "not_computed"
-        ]
-      },
       "DeploymentOutput": {
         "type": "object",
         "required": [
@@ -14192,29 +14186,6 @@
             "$ref": "#/components/schemas/DispositionEffects"
           }
         }
-      },
-      "EmbeddingCoverageOutput": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "reason",
-              "state"
-            ],
-            "properties": {
-              "reason": {
-                "$ref": "#/components/schemas/CoverageUnknownReason"
-              },
-              "state": {
-                "type": "string",
-                "enum": [
-                  "unknown"
-                ]
-              }
-            }
-          }
-        ],
-        "description": "`{\"state\": \"unknown\", \"reason\": \"not_computed\"}`: a read establishes no\nembedding count."
       },
       "EntityChangeOutput": {
         "type": "object",
@@ -15215,59 +15186,6 @@
           }
         }
       },
-      "MetricKind": {
-        "type": "string",
-        "description": "What a score column measures.",
-        "enum": [
-          "distance",
-          "score",
-          "rrf"
-        ]
-      },
-      "MetricOutput": {
-        "type": "object",
-        "description": "A returned column holding the score retrieval `retrieval_id` computed.\n`binding` and `property` repeat the retrieval's for a `nearest` or\n`bm25` source; a fused score names neither. `descending` is whether a\nlarger value ranks first. A column computed from a score is not a metric.",
-        "required": [
-          "column",
-          "kind",
-          "retrieval_id",
-          "source",
-          "descending",
-          "recall"
-        ],
-        "properties": {
-          "binding": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "column": {
-            "type": "string"
-          },
-          "descending": {
-            "type": "boolean"
-          },
-          "kind": {
-            "$ref": "#/components/schemas/MetricKind"
-          },
-          "property": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "recall": {
-            "$ref": "#/components/schemas/Recall"
-          },
-          "retrieval_id": {
-            "type": "string"
-          },
-          "source": {
-            "$ref": "#/components/schemas/RetrievalKind"
-          }
-        }
-      },
       "ParamDescriptor": {
         "type": "object",
         "description": "One declared parameter of a stored query, projected for the catalog.",
@@ -15516,6 +15434,45 @@
         },
         "additionalProperties": false
       },
+      "RankOrder": {
+        "type": "string",
+        "description": "The direction a ranking's score orders rows.",
+        "enum": [
+          "ascending",
+          "descending"
+        ]
+      },
+      "RankingOutput": {
+        "type": "object",
+        "description": "The ranking a read ordered its rows by.",
+        "required": [
+          "by",
+          "order",
+          "exhaustive",
+          "score_columns"
+        ],
+        "properties": {
+          "by": {
+            "$ref": "#/components/schemas/SearchFunction",
+            "description": "The search function the leading `order` key names."
+          },
+          "exhaustive": {
+            "type": "boolean",
+            "description": "Whether no row the search admitted and did not return outranks a\nreturned one. `bm25` scores every match, so it is always exhaustive.\n`nearest` is exhaustive when the run searched every partition of the\nvector index, scored every row flat or returned every row it\nadmitted, and `false` when a probe cap left partitions unsearched, so\na nearer row may exist. `rrf` is exhaustive when its `nearest` arms\nare."
+          },
+          "order": {
+            "$ref": "#/components/schemas/RankOrder",
+            "description": "`ascending` for a `nearest` distance (smaller is nearer),\n`descending` for a `bm25` or `rrf` score (larger is more relevant)."
+          },
+          "score_columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The returned columns that hold the ranking's own score, in return\norder; empty when the read returns none. A column computed from the\nscore is not one."
+          }
+        }
+      },
       "ReadOutput": {
         "type": "object",
         "required": [
@@ -15538,13 +15495,6 @@
             ],
             "description": "Effective graph head commit id of the exact snapshot this read was\nserved from. On a fresh named branch this is the inherited source head,\nso it is immediately usable as `Omnigraph-If-Graph-Commit` (CLI:\n`--if-commit`) for the branch's first conditional write. The id and rows\ncome from one pinned version, so no separate id fetch is needed."
           },
-          "metrics": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/MetricOutput"
-            },
-            "description": "One entry per returned column that holds a retrieval's score. Absent\nwhen no column does."
-          },
           "page": {
             "oneOf": [
               {
@@ -15559,12 +15509,16 @@
           "query_name": {
             "type": "string"
           },
-          "retrievals": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/RetrievalOutput"
-            },
-            "description": "The retrievals the read ran, from the plan that ran: one per ranked\nscan, per `rrf()` fusion and per fusion arm. Absent when the read\nranked nothing."
+          "ranking": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RankingOutput",
+                "description": "How the read ordered its rows when its order is a search: the\nsearch function, the direction its score ranks, whether the run's\nsearch was exhaustive, and the returned columns holding the score.\nAbsent when the order is no search."
+              }
+            ]
           },
           "row_count": {
             "type": "integer",
@@ -15718,14 +15672,6 @@
           }
         }
       },
-      "Recall": {
-        "type": "string",
-        "description": "A retrieval's contract, not what one execution did: `nearest` is\n`approximate` even when a run scored every row, `bm25` is `exact`, and\n`rrf` is `approximate` when either arm is.",
-        "enum": [
-          "exact",
-          "approximate"
-        ]
-      },
       "RecoveryRequiredOutput": {
         "type": "object",
         "required": [
@@ -15761,67 +15707,6 @@
           }
         }
       },
-      "RetrievalKind": {
-        "type": "string",
-        "description": "The search function behind a retrieval or a score column.",
-        "enum": [
-          "nearest",
-          "bm25",
-          "rrf"
-        ]
-      },
-      "RetrievalOutput": {
-        "type": "object",
-        "description": "One retrieval of the plan that ran. `id` is plan-local (`r0`, `r1`, …\nin plan preorder, a fusion's arms in query argument order); a ranked\nretrieval names its `binding` and `property`, a fusion its `arms` by id.\nParameter values are never included.",
-        "required": [
-          "id",
-          "kind",
-          "recall"
-        ],
-        "properties": {
-          "arms": {
-            "type": [
-              "array",
-              "null"
-            ],
-            "items": {
-              "type": "string"
-            }
-          },
-          "binding": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "embedding_coverage": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/EmbeddingCoverageOutput",
-                "description": "Present on a `nearest` retrieval only: a read establishes no embedding\ncount, so it is always unknown."
-              }
-            ]
-          },
-          "id": {
-            "type": "string"
-          },
-          "kind": {
-            "$ref": "#/components/schemas/RetrievalKind"
-          },
-          "property": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "recall": {
-            "$ref": "#/components/schemas/Recall"
-          }
-        }
-      },
       "SchemaOutput": {
         "type": "object",
         "required": [
@@ -15850,6 +15735,15 @@
             ]
           }
         }
+      },
+      "SearchFunction": {
+        "type": "string",
+        "description": "The search function a ranked read orders by.",
+        "enum": [
+          "nearest",
+          "bm25",
+          "rrf"
+        ]
       },
       "SettingsRequest": {
         "type": "object",

@@ -131,8 +131,7 @@ mod tests {
                 .unwrap(),
             graph_commit_id: None,
             page: None,
-            retrievals: Vec::new(),
-            metrics: Vec::new(),
+            ranking: None,
         }
     }
 
