@@ -14821,6 +14821,11 @@ enum ManifestFault {
     /// remains pending. Its authority probe fails, and the test lands the
     /// earlier copy after the publisher has deleted the acknowledged tag.
     CandidateTagReplay,
+    /// The first native branch ref create is refused before it applies.
+    BranchRefRefused,
+    /// The first native branch ref create is answered as lost and held; it
+    /// lands when the test lands it.
+    BranchRefHeld,
 }
 
 /// A conditional create held back to land after its client gave up.
@@ -14839,6 +14844,8 @@ struct ManifestRequestFault {
     deferred: Arc<std::sync::Mutex<Option<DeferredCreate>>>,
     /// Set when the store answers manifest creates again.
     healed: Arc<std::sync::atomic::AtomicBool>,
+    /// The file name of every native branch ref create, in order.
+    branch_refs: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl ManifestRequestFault {
@@ -14849,7 +14856,18 @@ impl ManifestRequestFault {
             manifest_puts: Arc::default(),
             deferred: Arc::default(),
             healed: Arc::default(),
+            branch_refs: Arc::default(),
         }
+    }
+
+    /// The native names of the branch ref creates sent, in order.
+    fn branch_ref_names(&self) -> Vec<String> {
+        self.branch_refs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|file| file.trim_end_matches(".json").to_string())
+            .collect()
     }
 
     fn candidate_probe_unavailable(&self) -> bool {
@@ -14950,6 +14968,16 @@ impl object_store::ObjectStore for ManifestRequestFaultStore {
         if numbered_manifest {
             self.fault.manifest_puts.fetch_add(1, Ordering::SeqCst);
         }
+        let branch_ref = directory.as_ref() == "branches"
+            && name.as_ref().ends_with(".json")
+            && matches!(options.mode, object_store::PutMode::Create);
+        if branch_ref {
+            self.fault
+                .branch_refs
+                .lock()
+                .unwrap()
+                .push(name.as_ref().to_string());
+        }
         let first = |hit: bool| hit && !self.fault.fired.swap(true, Ordering::SeqCst);
         match self.fault.fault {
             ManifestFault::CandidateTagReplay if first(candidate_tag) => {
@@ -14967,6 +14995,21 @@ impl object_store::ObjectStore for ManifestRequestFaultStore {
                     options,
                 ));
                 Ok(result)
+            }
+            ManifestFault::BranchRefRefused if first(branch_ref) => {
+                Err(object_store::Error::NotFound {
+                    path: location.to_string(),
+                    source: Box::new(std::io::Error::other("no such bucket")),
+                })
+            }
+            ManifestFault::BranchRefHeld if first(branch_ref) => {
+                *self.fault.deferred.lock().unwrap() = Some((
+                    Arc::clone(&self.original),
+                    location.clone(),
+                    payload,
+                    options,
+                ));
+                Err(ambiguous_store_error("request timed out"))
             }
             ManifestFault::TransactionPut if first(transaction) => Err(ambiguous_store_error(
                 "<Code>SlowDown</Code><Message>Please reduce your request rate.</Message>",
@@ -15126,6 +15169,99 @@ async fn publish_through_in(
         .version()
         .version;
     (result, before, after, fault)
+}
+
+/// Create `feature` through `fault` on `__manifest`; returns the result and
+/// the fault.
+async fn create_branch_through(
+    uri: &str,
+    fault: ManifestFault,
+) -> (Result<()>, ManifestRequestFault) {
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let fault = ManifestRequestFault::new(fault);
+    let probes = crate::instrumentation::QueryIoProbes {
+        manifest_wrapper: Some(Arc::new(fault.clone())),
+        ..Default::default()
+    };
+    let result = crate::instrumentation::with_query_io_probes(probes, async {
+        let mut coordinator =
+            ManifestCoordinator::open_with_session(uri, &conditional_put_session()).await?;
+        coordinator.create_branch("feature", None).await
+    })
+    .await;
+    (result, fault)
+}
+
+/// A native branch create whose ref the store refused cannot have that ref
+/// land, so its clone is reclaimed and the create retries once, under a
+/// fresh native name: the branch has one live incarnation.
+#[tokio::test]
+async fn branch_create_retries_a_refused_ref_under_a_fresh_native_name_issue_1067() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let (result, fault) = create_branch_through(uri, ManifestFault::BranchRefRefused).await;
+    result.expect("the retry under a fresh native name creates the branch");
+    let natives = fault.branch_ref_names();
+    assert_eq!(natives.len(), 2, "{natives:?}");
+    assert_ne!(
+        natives[0], natives[1],
+        "each attempt mints its own native name"
+    );
+    assert!(
+        !dir.path()
+            .join("__manifest/tree")
+            .join(&natives[0])
+            .exists(),
+        "the refused attempt's clone is reclaimed"
+    );
+    let coordinator = ManifestCoordinator::open(uri).await.unwrap();
+    assert_eq!(
+        coordinator.list_graph_branches().await.unwrap(),
+        vec!["main".to_string(), "feature".to_string()]
+    );
+    let main = open_manifest_dataset(uri, None).await.unwrap();
+    let live = crate::branch_control::list_live_manifest_branch_contents(&main)
+        .await
+        .unwrap();
+    assert!(live.contains_key(&natives[1]), "{live:?}");
+}
+
+/// A native branch create whose ref put may still land stays in doubt: no
+/// retry, which could leave the branch a second incarnation, and the clone
+/// the ref would name is kept. When the ref lands later, the branch is
+/// whole.
+#[tokio::test]
+async fn branch_create_whose_ref_may_land_stays_in_doubt_issue_1067() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let (result, fault) = create_branch_through(uri, ManifestFault::BranchRefHeld).await;
+    let error = result.expect_err("no ref answer settled the create");
+    assert!(error.is_manifest_publish_in_doubt(), "{error:?}");
+    let natives = fault.branch_ref_names();
+    assert_eq!(natives.len(), 1, "no retry beside a ref that may land");
+    assert!(
+        dir.path()
+            .join("__manifest/tree")
+            .join(&natives[0])
+            .exists()
+    );
+    let coordinator = ManifestCoordinator::open(uri).await.unwrap();
+    assert_eq!(
+        coordinator.list_graph_branches().await.unwrap(),
+        vec!["main".to_string()]
+    );
+
+    assert!(fault.land().await, "the ref create was held");
+    let coordinator = ManifestCoordinator::open(uri).await.unwrap();
+    assert_eq!(
+        coordinator.list_graph_branches().await.unwrap(),
+        vec!["main".to_string(), "feature".to_string()]
+    );
+    ManifestCoordinator::open_at_branch(uri, "feature")
+        .await
+        .expect("the late ref names a whole clone");
 }
 
 /// A publication whose transaction file put fails never sent its manifest:
@@ -15353,6 +15489,16 @@ impl lance_io::object_store::ObjectStoreProvider for FileObjectStoreProvider {
     }
 }
 
+/// A session whose local roots write through `put_opts`, as a remote store
+/// does: Lance's local `put_if_absent` stages and renames instead, which a
+/// fault on conditional creates never sees.
+fn conditional_put_session() -> Arc<lance::session::Session> {
+    let registry = lance::io::ObjectStoreRegistry::default();
+    let provider = registry.get_provider("file-object-store").unwrap();
+    registry.insert("file", Arc::new(FileObjectStoreProvider(provider)));
+    Arc::new(lance::session::Session::new(0, 0, Arc::new(registry)))
+}
+
 /// A successful tag deletion does not fence an earlier conditional create
 /// that the remote client retried. The candidate can become addressable again
 /// after the failed authority probe, so that failure must stay uncertain.
@@ -15376,11 +15522,8 @@ async fn candidate_tag_reappearing_after_rollback_stays_uncertain_issue_1067() {
             lance::dataset::refs::BranchIdentifier::main(),
             mc.exact_graph_head(),
         );
-        let registry = lance::io::ObjectStoreRegistry::default();
-        let provider = registry.get_provider("file-object-store").unwrap();
-        registry.insert("file", Arc::new(FileObjectStoreProvider(provider)));
-        let session = Arc::new(lance::session::Session::new(0, 0, Arc::new(registry)));
-        let publisher = GraphNamespacePublisher::new_with_session(uri, None, session);
+        let publisher =
+            GraphNamespacePublisher::new_with_session(uri, None, conditional_put_session());
         let fault = ManifestRequestFault::new(ManifestFault::CandidateTagReplay);
         let probes = crate::instrumentation::QueryIoProbes {
             manifest_wrapper: Some(Arc::new(fault.clone())),

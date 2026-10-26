@@ -271,7 +271,12 @@ it can land.
   without reading the object. Its OmniGraph callers read the ref back:
   candidate tags compare branch and version, and native branch creation
   compares its own `BranchContents`. An ambiguous create whose ref is absent
-  on read-back stays in doubt. #1092 applies this to candidate tags.
+  on read-back stays in doubt. #1092 applies this to candidate tags, and
+  BRANCHPR to native branch creation. Lance's ref put cannot be re-issued
+  through its API, so the create reads the ref again with a re-issue's pauses
+  before it stays in doubt, and keeps the clone the ref would name. A create
+  whose ref cannot land, because the store refused it or the clone never
+  committed, reclaims its clone and retries once under a fresh native name.
 - **Control objects.** `write_text_if_absent` and `write_text_if_match`
   re-issue and compare the stored bytes with their payload. Equal bytes mean
   this request landed. An update that finds other bytes reports a

@@ -40,6 +40,17 @@ longer land. A read that does not show the write is therefore not proof that it
 failed until another commit follows its base; read the branch's commits before
 repeating it.
 
+Creating a branch writes its branch record after copying the source's state.
+If the store does not answer that record's write, the record is read again for
+about three seconds. If it is still absent, the create answers `outcome_unknown`
+and keeps the copied state, because the record may still land and name it. No
+later write fences that record: list branches before repeating the create, and
+leave time for a late record to land. A repeated create that runs beside a late
+record can leave two copies of the branch name, and branch listing then refuses
+until one is removed. A create whose record write the store refused, or that
+failed before the record was sent, cleans up and retries once under a new
+internal name.
+
 The same rule applies when creating a proposal or an unattached snapshot: if
 its final authority check fails, deleting its tag does not prove that an earlier
 create request cannot still complete. That outcome remains unknown unless the

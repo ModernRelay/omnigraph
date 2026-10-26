@@ -15,6 +15,9 @@ use lance::dataset::refs::{
 use object_store::{ObjectStoreExt, PutMode, PutOptions};
 
 use crate::error::{CompletionEvidence, OmniError, Result};
+use crate::manifest_request::{
+    FailedRequest, MANIFEST_REQUEST_REISSUES, classify_failed_request, reissue_pause,
+};
 use crate::seams::{decide_seam, fail};
 
 /// Result of a recoverable native create attempt.
@@ -819,14 +822,23 @@ async fn refuse_archived_path_ancestor(dataset: &Dataset, branch: &str) -> Resul
     Ok(())
 }
 
-/// Create a branch with a bounded recovery classifier.
+/// Create a branch in one native attempt, classified from fresh authority.
 ///
 /// The caller must already hold OmniGraph's schema → source/target branch →
 /// table gate envelope. A ref-absent tree without retirement history is derived
-/// garbage and is reclaimed before the first attempt. An ambiguous
-/// native error is then classified from fresh authority: matching contents are
-/// accepted as a lost acknowledgement, mismatching contents are never deleted,
-/// and a ref-less clone is reclaimed before one bounded retry.
+/// garbage and is reclaimed before the attempt. Lance commits the clone, then
+/// writes the ref put-if-absent, and its ref error says nothing about the
+/// object, so a failed attempt reads the ref back:
+///
+/// - matching contents are this attempt's, a lost acknowledgement;
+/// - mismatching contents are another's, never deleted;
+/// - an absent ref that may still land, because the clone committed and the
+///   failure was not a definite refusal, is read again with the pauses of a
+///   conditional re-issue, then stays in doubt: the clone it would name is
+///   kept, and the error is an in-doubt publication;
+/// - an absent ref that cannot land leaves a ref-less clone, which is
+///   reclaimed, and the error is `Unpublished`. Only then may a caller retry,
+///   under a fresh native name (`Catalog::create_branch_from` does).
 pub async fn create_branch_recoverably(
     source: &mut Dataset,
     branch: &str,
@@ -891,67 +903,105 @@ pub async fn create_branch_recoverably(
     }
     fail(&BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE)?;
 
-    for attempt in 0..2 {
-        let native_error =
-            match crate::lance_clone::create_branch(source, branch, source_version, binding)
-                .await
-                .map_err(OmniError::storage)
-            {
-                Ok(_) => match fail(&BRANCH_CREATE_POST_NATIVE) {
-                    Ok(()) => return Ok(BranchCreateOutcome::Created),
-                    Err(error) => error,
-                },
-                Err(error) => error,
-            };
-
-        let observed = branch_contents(source, branch).await.map_err(|classifier_error| {
-            OmniError::manifest_internal(format!(
-                "native create of branch '{branch}' returned an ambiguous error ({native_error}); \
-                 reading BranchContents to classify it also failed ({classifier_error})"
-            ))
-        })?;
-        if let Some(contents) = observed {
-            if !matches_create_expectation(
-                &contents,
-                parent_branch.as_deref(),
-                source_version,
-                &parent_identifier,
-            ) {
-                return Err(OmniError::manifest_read_set_changed(
-                    format!("branch_identifier:{branch}"),
-                    None,
-                    Some(encode_identifier(&contents.identifier)?),
-                ));
+    let (native_error, refused) =
+        match crate::lance_clone::create_branch(source, branch, source_version, binding).await {
+            Ok(_) => match fail(&BRANCH_CREATE_POST_NATIVE) {
+                Ok(()) => return Ok(BranchCreateOutcome::Created),
+                Err(error) => (error, false),
+            },
+            Err(error) => {
+                let refused = classify_failed_request(&error) == FailedRequest::Refused;
+                (OmniError::storage(error), refused)
             }
-            source.checkout_branch(branch).await.map_err(|error| {
-                OmniError::manifest_internal(format!(
-                    "branch '{}' has matching authoritative metadata after an ambiguous create, \
-                     but its branch dataset cannot be opened: {}; original native error: {}",
-                    branch, error, native_error
-                ))
-            })?;
-            return Ok(BranchCreateOutcome::Created);
-        }
+        };
 
-        match reclaim_ref_absent_tree(source, branch).await {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(authority_appeared_after_absence(source, branch).await?);
-            }
-            Err(cleanup_error) => {
-                return Err(OmniError::manifest_internal(format!(
-                    "native create of branch '{}' failed before authoritative metadata was visible \
-                     ({native_error}); clone-only cleanup also failed ({cleanup_error})",
-                    branch
-                )));
+    let read_back = |classifier_error: OmniError| {
+        OmniError::manifest_internal(format!(
+            "native create of branch '{branch}' returned an ambiguous error ({native_error}); \
+             reading BranchContents to classify it also failed ({classifier_error})"
+        ))
+    };
+    let mut observed = branch_contents(source, branch).await.map_err(read_back)?;
+    // Lance writes the ref only after its clone commit returned, and that
+    // commit's manifest is durable when it returns: a clone with no version
+    // proves the ref put was never sent. Otherwise the put may still be in
+    // flight (S3 answers 409 over it), so read again before calling it lost.
+    let may_land = observed.is_none()
+        && !refused
+        && branch_tree_has_version(source, branch)
+            .await
+            .map_err(read_back)?;
+    if may_land {
+        for reread in 1..=MANIFEST_REQUEST_REISSUES {
+            tokio::time::sleep(reissue_pause(reread)).await;
+            observed = branch_contents(source, branch).await.map_err(read_back)?;
+            if observed.is_some() {
+                break;
             }
         }
-        if attempt == 1 {
-            return Err(native_error);
+        if observed.is_none() {
+            return Err(OmniError::manifest_publish_in_doubt(format!(
+                "native create of branch '{branch}' committed its clone and may have sent its \
+                 ref, which is still absent ({native_error}); the ref may land later, so the \
+                 clone it would name is kept"
+            )));
         }
     }
+    if let Some(contents) = observed {
+        if !matches_create_expectation(
+            &contents,
+            parent_branch.as_deref(),
+            source_version,
+            &parent_identifier,
+        ) {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("branch_identifier:{branch}"),
+                None,
+                Some(encode_identifier(&contents.identifier)?),
+            ));
+        }
+        source.checkout_branch(branch).await.map_err(|error| {
+            OmniError::manifest_internal(format!(
+                "branch '{}' has matching authoritative metadata after an ambiguous create, \
+                 but its branch dataset cannot be opened: {}; original native error: {}",
+                branch, error, native_error
+            ))
+        })?;
+        return Ok(BranchCreateOutcome::Created);
+    }
 
-    unreachable!("bounded native branch-create loop returns from every attempt")
+    // No copy of the ref can land: the clone it would name is garbage.
+    match reclaim_ref_absent_tree(source, branch).await {
+        Ok(true) => Err(native_error.unpublished()),
+        Ok(false) => Err(authority_appeared_after_absence(source, branch).await?),
+        Err(cleanup_error) => Err(OmniError::manifest_internal(format!(
+            "native create of branch '{}' failed before its ref could be sent \
+             ({native_error}); clone-only cleanup also failed ({cleanup_error})",
+            branch
+        ))
+        .unpublished()),
+    }
+}
+
+/// Whether the native tree of `branch` holds a version manifest: Lance's
+/// clone commit, the first phase of a native create, landed.
+async fn branch_tree_has_version(dataset: &Dataset, branch: &str) -> Result<bool> {
+    let target = dataset
+        .branch_location()
+        .find_branch(Some(branch))
+        .map_err(OmniError::storage)?;
+    let store = dataset
+        .object_store(None)
+        .await
+        .map_err(OmniError::storage)?;
+    let mut versions = store.read_dir_all(&target.path.join("_versions"), None);
+    while let Some(file) = versions.next().await {
+        let file = file.map_err(OmniError::storage)?;
+        if file.location.extension() == Some("manifest") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -1187,6 +1237,196 @@ mod tests {
             if prefix.is_some_and(is_branch_ref_directory) {
                 self.fault.branch_lists.fetch_add(1, Ordering::SeqCst);
             }
+            self.target.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            self.target.copy_opts(from, to, options).await
+        }
+    }
+
+    /// What [`BranchCreatePutFault`] does to a native create's puts.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CreatePut {
+        /// The ref put applies, and its answer is lost.
+        RefAnswerLost,
+        /// The ref put is lost before it reaches the store.
+        RefLost,
+        /// The ref put is answered as lost and held; it lands when the test
+        /// lands it.
+        RefHeld,
+        /// The ref put is answered as lost and lands 100 ms later.
+        RefLandsSoon,
+        /// The store refuses the ref put before it applies.
+        RefRefused,
+        /// Every manifest put of the clone is lost before it reaches the store.
+        CloneLost,
+    }
+
+    type HeldPut = (Arc<dyn ObjectStore>, Path, PutPayload, PutOptions);
+
+    #[derive(Debug, Clone)]
+    struct BranchCreatePutFault {
+        put: CreatePut,
+        branch: Arc<str>,
+        held: Arc<std::sync::Mutex<Option<HeldPut>>>,
+        ref_puts: Arc<AtomicUsize>,
+    }
+
+    impl BranchCreatePutFault {
+        fn new(put: CreatePut, branch: &str) -> Self {
+            Self {
+                put,
+                branch: Arc::from(branch),
+                held: Arc::default(),
+                ref_puts: Arc::default(),
+            }
+        }
+
+        fn ref_puts(&self) -> usize {
+            self.ref_puts.load(Ordering::SeqCst)
+        }
+
+        /// Apply the held ref put now.
+        async fn land(&self) {
+            let (store, location, payload, options) =
+                self.held.lock().unwrap().take().expect("a held ref put");
+            store.put_opts(&location, payload, options).await.unwrap();
+        }
+    }
+
+    /// A remote store's failure whose request may or may not have applied.
+    fn lost_put() -> object_store::Error {
+        object_store::Error::Generic {
+            store: "S3",
+            source: Box::new(std::io::Error::other("connection reset")),
+        }
+    }
+
+    impl WrappingObjectStore for BranchCreatePutFault {
+        fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+            Arc::new(BranchCreatePutStore {
+                target,
+                fault: self.clone(),
+            })
+        }
+
+        fn wrap_paginated(
+            &self,
+            _store_prefix: &str,
+            _original: Arc<dyn object_store::list::PaginatedListStore>,
+        ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+            // Listings pass through the fault store, which forwards them.
+            None
+        }
+    }
+
+    #[derive(Debug)]
+    struct BranchCreatePutStore {
+        target: Arc<dyn ObjectStore>,
+        fault: BranchCreatePutFault,
+    }
+
+    impl fmt::Display for BranchCreatePutStore {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "BranchCreatePutStore({})", self.target)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for BranchCreatePutStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            let branch = self.fault.branch.as_ref();
+            let is_ref = is_target_branch_ref(location, &format!("{branch}.json"));
+            let parts: Vec<_> = location
+                .parts()
+                .map(|part| part.as_ref().to_string())
+                .collect();
+            let is_clone_manifest = parts
+                .windows(3)
+                .any(|window| window == ["tree", branch, "_versions"])
+                && location.extension() == Some("manifest");
+            if is_ref {
+                self.fault.ref_puts.fetch_add(1, Ordering::SeqCst);
+            }
+            match self.fault.put {
+                CreatePut::RefAnswerLost if is_ref => {
+                    self.target.put_opts(location, payload, options).await?;
+                    Err(lost_put())
+                }
+                CreatePut::RefLost if is_ref => Err(lost_put()),
+                CreatePut::RefHeld if is_ref => {
+                    *self.fault.held.lock().unwrap() =
+                        Some((Arc::clone(&self.target), location.clone(), payload, options));
+                    Err(lost_put())
+                }
+                CreatePut::RefLandsSoon if is_ref => {
+                    let target = Arc::clone(&self.target);
+                    let location = location.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        target.put_opts(&location, payload, options).await.unwrap();
+                    });
+                    Err(lost_put())
+                }
+                CreatePut::RefRefused if is_ref => Err(object_store::Error::NotFound {
+                    path: location.to_string(),
+                    source: Box::new(std::io::Error::other("no such bucket")),
+                }),
+                CreatePut::CloneLost if is_clone_manifest => Err(lost_put()),
+                _ => self.target.put_opts(location, payload, options).await,
+            }
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            options: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.target.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            self.target.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<Path>>,
+        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+            self.target.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.target.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.target.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> ObjectStoreResult<ListResult> {
             self.target.list_with_delimiter(prefix).await
         }
 
@@ -1704,6 +1944,85 @@ mod tests {
                 .exists(),
             "admission refusal must precede Lance's shallow-clone phase"
         );
+    }
+
+    /// What one native create's faulted put leaves.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CreateEnds {
+        /// The ref is this create's.
+        Created,
+        /// The ref may still land: the create is in doubt and its clone is
+        /// kept, so a late landing leaves a whole branch.
+        InDoubt,
+        /// No copy of the ref can land: the clone is reclaimed and the
+        /// failure is unpublished, which a caller may retry under a fresh
+        /// native name.
+        Unpublished,
+    }
+
+    /// A native create reads its ref back after a failed put. An applied put
+    /// whose answer was lost is this create's, as is one that lands while
+    /// the ref is read again. A put that may still land keeps the create in
+    /// doubt and its clone in place; landing it later leaves a branch that
+    /// opens. A refused ref put, or a clone that never committed, cannot
+    /// land: its clone is reclaimed and the failure is unpublished. No path
+    /// sends a second ref put.
+    #[tokio::test]
+    async fn native_create_reads_its_ref_back_before_deciding_issue_1067() {
+        use CreateEnds::*;
+        for (put, expected) in [
+            (CreatePut::RefAnswerLost, Created),
+            (CreatePut::RefLandsSoon, Created),
+            (CreatePut::RefLost, InDoubt),
+            (CreatePut::RefHeld, InDoubt),
+            (CreatePut::RefRefused, Unpublished),
+            (CreatePut::CloneLost, Unpublished),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let dataset = test_dataset(&dir).await;
+            let version = dataset.version().version;
+            let fault = Arc::new(BranchCreatePutFault::new(put, "feature"));
+            let mut wrapped = dataset.with_object_store_wrappers(vec![
+                Arc::clone(&fault) as Arc<dyn WrappingObjectStore>
+            ]);
+            let result = create_branch_recoverably(&mut wrapped, "feature", version, None).await;
+            let clone = dir.path().join("tree").join("feature");
+            match expected {
+                Created => {
+                    assert!(
+                        matches!(result, Ok(BranchCreateOutcome::Created)),
+                        "{put:?}: {:?}",
+                        result.err()
+                    );
+                    assert!(dataset.branches().get("feature").await.is_ok(), "{put:?}");
+                }
+                InDoubt => {
+                    let error = result.err().expect("a create in doubt is an error");
+                    assert!(error.is_manifest_publish_in_doubt(), "{put:?}: {error}");
+                    assert!(clone.exists(), "{put:?}: the clone a late ref names stays");
+                    assert!(dataset.branches().get("feature").await.is_err(), "{put:?}");
+                    if put == CreatePut::RefHeld {
+                        fault.land().await;
+                        dataset
+                            .checkout_branch("feature")
+                            .await
+                            .expect("a ref that lands late names a whole clone");
+                    }
+                }
+                Unpublished => {
+                    let error = result.err().expect("a failed create is an error");
+                    assert_eq!(
+                        error.completion_evidence(),
+                        Some(CompletionEvidence::Unpublished),
+                        "{put:?}: {error}"
+                    );
+                    assert!(!clone.exists(), "{put:?}: the clone is reclaimed");
+                    assert!(dataset.branches().get("feature").await.is_err(), "{put:?}");
+                }
+            }
+            let expected_ref_puts = usize::from(put != CreatePut::CloneLost);
+            assert_eq!(fault.ref_puts(), expected_ref_puts, "{put:?}");
+        }
     }
 
     #[tokio::test]
