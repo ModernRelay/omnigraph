@@ -888,9 +888,9 @@ physical_nodes! {
         max_partitions: u32,
         max_workers: u32,
     } => "CsvSource" [];
-    /// The one validation over the whole delta, a pipeline breaker: every
-    /// check extracted in one pass per batch, each check's `access` saying how
-    /// its committed image is read, `removal` whether removed ids are found.
+    /// The one validation of the delta, each check's `access` saying how its
+    /// committed image is read and `removal` whether removed ids are found;
+    /// a pipeline breaker only while [`validate_streams`] is false.
     Validate {
         input: NodeId,
         table: String,
@@ -922,20 +922,46 @@ pub enum PipelineShape {
     Breaker,
 }
 
+/// Whether a validation judges every row as it passes, so its operator
+/// streams: a value, unique or cardinality check reads only what the sweep
+/// extracted, a swept endpoint check probes each row against sets built before
+/// the drain. A judged endpoint check, a retained-edge check or a removal scan
+/// reads the whole delta after the drain and makes the operator a breaker.
+pub fn validate_streams(checks: &[ValidateSpec], removal: ValidateRemoval) -> bool {
+    use omnigraph_compiler::ir::ValidateCheck;
+    removal == ValidateRemoval::None
+        && checks.iter().all(|spec| match &spec.check {
+            ValidateCheck::Value { .. }
+            | ValidateCheck::Unique { .. }
+            | ValidateCheck::Cardinality { .. } => true,
+            ValidateCheck::EdgeRi { .. } => spec.probe == Some(crate::cost::EndpointProbe::Swept),
+            ValidateCheck::RetainedEdges { .. } => false,
+        })
+}
+
 impl PhysicalNode {
     /// The node's [`PipelineShape`] over its streamed input (the one
     /// [`Self::collected_sides`] does not name). A source has no input to
     /// hold and a `FragmentWrite` is the pipeline's end, whose emission is
     /// its input's; neither is a cut. An `Expand` holds its paths only as a
     /// costed multi-hop traversal: one hop streams its pairs and a budgeted
-    /// traversal streams its frontier.
+    /// traversal streams its frontier. A `Validate` holds the delta only
+    /// while a check reads it whole after the drain ([`validate_streams`]).
     pub fn shape(&self) -> PipelineShape {
         match self {
             Self::Sort { .. }
             | Self::Aggregate { .. }
             | Self::AntiJoin { .. }
-            | Self::RankFuse { .. }
-            | Self::Validate { .. } => PipelineShape::Breaker,
+            | Self::RankFuse { .. } => PipelineShape::Breaker,
+            Self::Validate {
+                checks, removal, ..
+            } => {
+                if validate_streams(checks, *removal) {
+                    PipelineShape::Streaming
+                } else {
+                    PipelineShape::Breaker
+                }
+            }
             Self::Expand {
                 max_hops, policy, ..
             } => {

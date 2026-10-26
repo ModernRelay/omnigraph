@@ -475,9 +475,9 @@ impl<'l, 'a> Walk<'l, 'a> {
             .into()
     }
 
-    /// The one operator of node `id`; DataFusion's `AggregateExec`, the one
-    /// operator not built through a shape, has its emission compared against
-    /// the plan's cut (`Final` while its input order mode is linear).
+    /// The one operator of node `id`; `AggregateExec` (not built through a
+    /// shape; `Final` while its input order mode is linear) and `ValidateExec`
+    /// (its shape chosen by the plan's checks) have their emission checked.
     fn built(&mut self, id: NodeId, operator: impl ExecutionPlan) -> Lowers<Plan> {
         let plan: Plan = Arc::new(operator);
         let node = self.lowering.node(id)?;
@@ -490,6 +490,21 @@ impl<'l, 'a> Walk<'l, 'a> {
                 plan.properties().emission_type,
             ))
             .into());
+        }
+        if matches!(node, PhysicalNode::Validate { .. }) {
+            let declared = match node.shape() {
+                omnigraph_planner::PipelineShape::Breaker => EmissionType::Final,
+                omnigraph_planner::PipelineShape::Streaming => EmissionType::Incremental,
+            };
+            if plan.properties().emission_type != declared {
+                return Err(OmniError::manifest_internal(format!(
+                    "node {id} `Validate` is {:?} in the plan's cut but `{}` emits {:?}",
+                    node.shape(),
+                    plan.name(),
+                    plan.properties().emission_type,
+                ))
+                .into());
+            }
         }
         if matches!(
             node,
@@ -1296,7 +1311,8 @@ impl Lower for Walk<'_, '_> {
             snapshot: self.lowering.snapshot("load validation")?.clone(),
             catalog: Arc::clone(self.lowering.catalog),
         };
-        self.built(id, ValidateExec::new(input, judge))
+        let streams = omnigraph_planner::validate_streams(fields.checks, fields.removal);
+        self.built(id, ValidateExec::new(input, judge, streams))
     }
 
     fn fragment_write(

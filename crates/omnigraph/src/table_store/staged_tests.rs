@@ -2748,6 +2748,69 @@ async fn stage_overwrite_batches_fans_out_writers_in_chunk_order() {
     assert_eq!(ids_in_order(&after), expected);
 }
 
+/// Chunks handed over out of source order, two writers in flight, are joined
+/// in `(partition, index)` order: one file per chunk, read back in source
+/// order before and after the commit.
+#[tokio::test]
+async fn stage_overwrite_stream_joins_chunks_in_partition_then_index_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    let pre_version = ds.version().version;
+    let chunk = |order: (u32, u64), ids: &[&str]| -> Result<super::OverwriteChunk, OmniError> {
+        let rows: Vec<(&str, Option<i32>)> = ids.iter().map(|id| (*id, Some(1))).collect();
+        Ok(super::OverwriteChunk {
+            order,
+            batches: vec![person_batch(&rows)],
+            lease: None,
+        })
+    };
+    let arrival = vec![
+        chunk((1, 0), &["d"]),
+        chunk((0, 1), &["c"]),
+        chunk((1, 1), &["e", "f"]),
+        chunk((0, 0), &["a", "b"]),
+    ];
+    let expected = ["a", "b", "c", "d", "e", "f"];
+
+    let staged = store
+        .stage_overwrite_stream(
+            &ds,
+            futures::stream::iter(arrival),
+            None,
+            WriteBudget::default(),
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        staged
+            .new_fragments()
+            .iter()
+            .map(|fragment| fragment.physical_rows.unwrap_or(0))
+            .collect::<Vec<_>>(),
+        vec![2, 1, 1, 2],
+        "one file per chunk, in (partition, index) order"
+    );
+    let before_commit = store
+        .scan_with_staged(&ds, std::slice::from_ref(&staged), None, None)
+        .await
+        .unwrap();
+    assert_eq!(ids_in_order(&before_commit), expected);
+    assert_eq!(ds.version().version, pre_version);
+
+    let new_ds = store
+        .commit_staged(Arc::new(ds.clone()), staged)
+        .await
+        .unwrap();
+    assert_eq!(new_ds.version().version, pre_version + 1);
+    let after = store.scan_batches(&new_ds).await.unwrap();
+    assert_eq!(ids_in_order(&after), expected);
+}
+
 /// Batches of two schemas are refused before any writer starts, as one Lance
 /// call refuses them (no data file written, HEAD stays), where Lance's own
 /// overwrite would publish a mixed table; a zero-row batch of another schema is dropped.

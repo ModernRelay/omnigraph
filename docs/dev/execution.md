@@ -1023,9 +1023,15 @@ A `load csv` overwrite is the first write plan: the planner routes
 `Operation::Load` to the engine, which lowers `CsvSource → Validate →
 FragmentWrite` to `CsvSourceExec` (up to `max_partitions` readers over the
 captured source, each claiming the next record-aligned 8 MiB slice and tagging
-its batches with the slice index), `ValidateExec` (a pipeline breaker that
-drains every input partition and sorts the held batches back into slice
-order: one pass over the held delta extracts what
+its batches with the slice index), `ValidateExec` (every input partition
+drained at once; a streaming operator when the planner's `validate_streams`
+says no check reads the whole delta after the rows are in, each batch sent on
+to the sink right after its sweep with its slice tag, the judgment after the
+drain the stream's last word and the refusal the statement reports even when
+the sink's keyed-write check met the same repeated key in a fragment first
+(the sink follows its input to that verdict before deleting what it wrote);
+otherwise a pipeline breaker that holds the batches and
+sorts them back into slice order: one pass over the delta extracts what
 the value, uniqueness and cardinality checks need; the endpoint checks probe
 the batches' endpoint columns against each endpoint table's committed key set,
 on the parse partitions as the batches arrive when the plan marks them
