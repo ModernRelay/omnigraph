@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - OmniGraph maintainers
 created: 2026-09-29
-updated: 2026-10-20
+updated: 2026-10-26
 discussion: https://github.com/ModernRelay/omnigraph/pull/799
 supersedes:
   - "0034"
@@ -1655,3 +1655,17 @@ Before enabling an affected increment, its owners must implement and qualify:
   The [HTTP admission decision](2026-09-30-v012-http-admission.md) owns the
   discriminator change and refusal rules; historical decision-log entries retain
   their original release scope. No storage-format change follows from the wire bump.
+
+- 2026-10-26: Pending amendment. [Served graph
+  maintenance](2026-10-26-served-graph-maintenance.md), a draft, delivers
+  increment C's owned maintenance and, in its last phase, adds a per-graph
+  maintenance reconciler that the server's own publications and a timer wake.
+  Its state is a derived hint, re-derived from the manifest before every
+  decision. Once it is accepted, it supersedes the Online deployment sentence
+  "No job queue, background poller or second durable operation record is
+  introduced." for graph maintenance only: the reconciler is a background
+  poller, but no job queue or second durable operation record is added, and a
+  run's status derives from the commits it published. The sentence still holds
+  for deployment, and the Summary's "No new transaction manager,
+  content-recovery log or job queue is added." is unchanged. The body stands
+  unchanged until acceptance, which rewrites the sentence.

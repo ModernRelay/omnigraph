@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - OmniGraph maintainers
 created: 2026-06-14
-updated: 2026-10-20
+updated: 2026-10-26
 discussion: null
 supersedes: ["0010"]
 superseded_by: []
@@ -790,3 +790,19 @@ duplicated here.
 - 2026-10-05: `schema apply` is direct-only; the unused served schema-apply
   route is removed. Served changes use cluster deployment. Decision 10 and
   the capability taxonomy now reflect that boundary.
+
+- 2026-10-26: Pending amendment. [Served graph
+  maintenance](2026-10-26-served-graph-maintenance.md), a draft, is the
+  follow-up RFC that Decision 11 calls for. It runs maintenance in the serving
+  process, under explicit budgets, the separate grants `maintain` and
+  `reclaim`, and cancellation; an out-of-band worker becomes an optional
+  stage-only offload that never publishes. Once it is accepted, it supersedes
+  Decision 11's clause "Runs out-of-band (a worker + async job routes, the
+  `POST …` / `GET …/{id}` shape of the bulk-data-plane RFC proposed in [closed
+  PR #219](https://github.com/ModernRelay/omnigraph/pull/219), which never
+  landed in `docs/rfcs/`), never inline in serving" and the implementation
+  note's "remains gated on bulk-data-plane work". Decision 11's direction
+  stands: server-managed, policy-gated, audited, single-coordinator
+  asynchronous jobs, with `direct` retained for break-glass, and `schema plan`
+  stays excluded. The body stands unchanged until acceptance, which rewrites
+  both sentences.
