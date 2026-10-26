@@ -263,8 +263,28 @@ error, and the scope logs its key and error. A later request to that key, or a
 recursive delete over it, is refused before it is sent; other keys are
 unaffected. The scope remembers at most `MAX_UNSETTLED_KEYS` (4096) keys and
 past that refuses every mutation. Rename also accounts for removal of its
-source. Single-attempt conditional conflicts and a delete answered "not found"
-are settled refusals. `forbidden_apis.rs`
+source. Single-attempt conditional conflicts, a delete answered "not found", and
+a request the store refused before applying it (permission, authentication,
+missing bucket, invalid path, unsupported operation) are settled refusals: every
+request that can leave a key unsettled goes to the single-attempt client, so no
+earlier copy of a refused one was sent.
+
+A key left unsettled by a conditional request records that request's
+precondition (absent, or the ETag an if-match names) and admits a request with
+the same precondition: its owner's re-issue. The re-issue's success settles the
+key, since the precondition fences the earlier copy. Its conflict does not: S3
+answers 409, which `object_store` reports as "already exists", while another
+conditional write to the key is in flight, and that write may be the earlier
+copy. The storage adapter's `write_text_if_absent` and `write_text_if_match`
+re-issue an ambiguous answer unchanged, up to four times with pauses doubling
+from 0.2 to 1.6 seconds, and return a refusal at once. After a conflict that an
+earlier copy may explain, after a refused re-issue, or after the last lost
+answer, they read the key back: equal bytes are this request's, a key that
+shows the precondition failed settles at the scope, and a key that still
+satisfies it leaves the write unresolved. An unscoped S3 or Azure client
+retries internally, so its first conflict is read back too. Local filesystem
+puts finish before they answer and publish last, so a local error is a refusal
+there. `forbidden_apis.rs`
 (`mutable_key_requests_are_registered_issue_1067`) registers every
 unconditional request to a reused key in the engine, core, catalog, storage,
 cluster, server and Azure admission crates with why its late landing is

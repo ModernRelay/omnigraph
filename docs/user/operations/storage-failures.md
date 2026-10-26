@@ -53,9 +53,23 @@ retries. A conditional request, such as a manifest create, and a write to a
 reused key make one attempt each, and their owner resolves an ambiguous answer
 itself. `OBJECT_STORE_CLIENT_MAX_RETRIES`, if set, must be `0`.
 
+On S3 and Azure, a conditional write of a control object (the cluster lock and
+state, a deployment resource, a lease heartbeat or claim) whose answer was lost,
+timed out or throttled is re-issued unchanged, as a manifest request is: up to
+four times with about three seconds of pauses in total. A request the store
+refused before applying it, such as a permission or authentication error or a
+missing bucket or container, fails at once. When an earlier copy of the request
+may be what the object holds, the object is read back, and holding this
+request's bytes makes it this write's. An object still absent, or still at the
+expected version, once no re-issue settles the request leaves the write failed
+with its outcome unknown.
+
 A write to a reused key whose outcome is unknown refuses later writes to that
 key only, until a clean shutdown; a clean shutdown with such a key retains
-admission.
+admission. Its owner's re-issue of a conditional write is still admitted. The
+key settles when that re-issue applies, or when a read of the key shows its
+condition no longer holds. A request the store refused before applying it
+leaves its key settled.
 
 ## When the server stops
 
@@ -112,6 +126,9 @@ paths; each records the failure's class.
 - `manifest request outcome unknown; re-issuing the identical conditional
   request`, for each re-issue, and
   `manifest request outcome unknown after every re-issue` when none settles.
+- `re-issuing a conditional storage write whose answer was lost`, with the
+  operation and the failure's class, for each re-issue of a control-object
+  write.
 - `took over a silent owner's cluster lock` when a restarted server takes over
   its predecessor's lock, and an error when an owner's lease lapses or another
   server claims it.
