@@ -804,5 +804,7 @@ duplicated here.
   note's "remains gated on bulk-data-plane work". Decision 11's direction
   stands: server-managed, policy-gated, audited, single-coordinator
   asynchronous jobs, with `direct` retained for break-glass, and `schema plan`
-  stays excluded. The body stands unchanged until acceptance, which rewrites
-  both sentences.
+  stays excluded. That break-glass exists only for local roots: since #1115 the
+  direct CLI accepts local storage only, so a stopped S3 or Azure cluster has
+  no direct maintenance path (#1163), and the draft does not add one. The body
+  stands unchanged until acceptance, which rewrites both sentences.

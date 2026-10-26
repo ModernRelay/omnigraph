@@ -1598,15 +1598,16 @@ proposal.
   target (the target table and Opening Studio) is unchanged.
 - 2026-10-26: Pending amendment. [Served graph
   maintenance](2026-10-26-served-graph-maintenance.md), a draft, runs a served
-  root's optimize, cleanup, index rebuild and repair in the server that holds
-  the cluster lock, through graph-scoped routes, and keeps direct execution for
-  standalone graphs and stopped local clusters. Once it is accepted, it
-  supersedes, for a served root, the commands comment "Physical upkeep, where
-  the storage is" and the declared-exception row "Runs where the storage is"
-  for `repair`, `optimize`, `cleanup` and `index rebuild` in "`init`,
+  root's optimize, cleanup, index rebuild and repair, and PR #1150's `index
+  build`, in the server that holds the cluster lock, through graph-scoped
+  routes, and keeps direct execution for standalone graphs and stopped local
+  clusters. Once it is accepted, it supersedes, for a served root, the
+  commands comment "Physical upkeep, where the storage is" and the
+  declared-exception row "Runs where the storage is" for `repair`, `optimize`,
+  `cleanup` and `index rebuild` in "`init`,
   `upgrade`, `repair`, `optimize`, `cleanup`, `index rebuild`, `schema plan`
   and `schema apply` on a direct target, and `cluster validate`, `observe`,
   `force-unlock` and `upgrade-ledger`". The other operations keep that row.
-  The four operations join the operation table, and `cleanup` keeps no MCP
-  tool, a declared exception because reclamation is irreversible. The body
+  These operations join the operation table, and `cleanup` keeps no MCP tool,
+  a declared exception because reclamation is irreversible. The body
   stands unchanged until acceptance, which rewrites both sentences.
