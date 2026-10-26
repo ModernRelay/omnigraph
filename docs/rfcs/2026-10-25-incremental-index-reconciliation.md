@@ -7,11 +7,12 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-10-25
-updated: 2026-10-25
+updated: 2026-10-26
 discussion: https://github.com/ModernRelay/omnigraph/pull/1156
 supersedes: []
 superseded_by: []
-blocked_on: []
+blocked_on:
+  - "PR #1150: the `index build` command and `TableStore::stage_index_reconciliation`"
 ---
 
 # RFC: Incremental index reconciliation
@@ -23,34 +24,45 @@ blocked_on: []
 
 Index maintenance today rebuilds every lagging index from the whole table, so
 one appended row costs a pass over every row, and full-text coverage is never
-refreshed by maintenance at all. This RFC makes the work proportional to what
-changed. An index gains a segment over just the fragments that hold only rows
-no segment of that index has indexed; segments are merged under a bounded
-policy; rows an update or compaction moved are folded in by a filtered merge
-(BTREE) or a whole rebuild (full text, vector).
-One rule keeps every answer equal to a full build's, and full text is
-maintained like the other kinds.
+refreshed by maintenance at all. This RFC makes the work for appended rows
+proportional to those rows. An index gains a segment over just the fragments
+that hold only rows no segment of that index has indexed; segments are merged
+under a bounded policy; rows an update or compaction moved are folded in by a
+filtered merge (BTREE) or a whole rebuild (full text, vector). One rule keeps
+every answer equal to a full build's.
 
-The observable contract does not change: `omnigraph index build` and
-`optimize` (PR #1150) still leave every buildable declared index present and
-covering every current fragment, publish once per run, and refuse uncertified
-full-text indexes. Only their cost, and the `action` they report per index,
-change. The storage format does not change; multi-segment indexes are native
-Lance.
+For BTREE and vector indexes the contract of `omnigraph index build` and
+`optimize` (PR #1150) does not change: they leave every buildable declared
+index present and covering every current fragment, and publish once per run.
+For full text it does: PR #1150 leaves full-text coverage pending, to be
+refreshed by `omnigraph index rebuild --kind full-text`, and this RFC has both
+commands maintain a certified full-text index like the other kinds. A
+full-text index without a certificate stays pending, as today. The storage
+format does not change; multi-segment indexes are native Lance.
+
+The moved-row half of the design is a fence for Lance 13.0.0. Lance's fixes
+for stale entries from segmented scalar and full-text indexes (lance#9785,
+lance#9872) merged upstream on 2026-10-23 but are in no release OmniGraph
+pins; the bump that contains them can index moved rows the way it indexes
+appended ones and delete the fence.
 
 ## Motivation
 
-The index reconciler (`maintain_indices_for_branch`, and optimize's index
-links after compaction) has three outcomes per index: build it if it is
-missing, rebuild it whole if its segments leave a current fragment uncovered
-(`TableStore::stage_index_fold`), or leave it alone. A table that receives a
-few rows between two runs therefore has each of its BTREE and vector indexes
-rebuilt from every row, every run. The cost of routine maintenance grows with
-table size, not with the rows written since the last run.
+Optimize's index links after compaction, and the `index build` command PR
+#1150 adds (through `TableStore::stage_index_reconciliation`), have three
+outcomes per index: build it if it is missing, rebuild it whole if its
+segments leave a current fragment uncovered (`TableStore::stage_index_fold`),
+or leave it alone. This includes the identity and endpoint BTREEs every node
+and edge table carries, not only schema `@index` declarations. A table that
+receives a few rows between two runs therefore has each of its BTREE and
+vector indexes rebuilt from every row, every run. The cost of routine
+maintenance grows with table size, not with the rows written since the last
+run.
 
 Full text is worse. `TableStore::can_fold_index` excludes it from the
 coverage refresh, so a full-text index's uncovered tail grows until an
-operator runs `omnigraph index rebuild --kind full-text`, which rebuilds every
+operator runs `omnigraph index rebuild --kind full-text` (`omnigraph
+rebuild-full-text-indexes` on shipped releases), which rebuilds every
 full-text index of the branch. The tail is still answered correctly (Lance
 scans it with the index's analyzer), but a bm25 scan over a partly covered
 index applies its filter after scoring (`Eligibility::AfterScoring`) and every
@@ -68,7 +80,9 @@ avoidable:
   BTREE equality returns it for its old value (lance#9817, pinned by
   `lance_surface_guards.rs::index_delta_segment_serves_stale_entries_of_an_updated_row`).
   Vector search filters each segment by its own coverage; scalar and
-  full-text search do not.
+  full-text search do not in 13.0.0. Upstream fixed both on 2026-10-23
+  (lance#9785 scalar, lance#9872 full text and the full-text merge), after
+  13.0.0 and outside v14.0.0-rc.2.
 - **Lance's own incremental fold commits linearly.** `optimize_indices`
   appends and merges segments inside its own commit, which a detached-only
   table (RFC 0067) cannot use, and it offers no point before publication to
@@ -84,7 +98,8 @@ as it already does for every index build.
 ## User and operational behavior
 
 No command, flag, route or error changes. `omnigraph index build` and
-`optimize` keep the contract PR #1150 states.
+`optimize` keep the contract PR #1150 states, except that a certified
+full-text index is maintained instead of reported pending.
 
 The `action` an index build reports per index gains two values: `extended`
 (a segment was added over new rows) and `merged` (segments were combined).
@@ -93,23 +108,28 @@ JSON output and in `BuiltIndex`.
 
 Full-text coverage stops being reported as pending: a certified full-text
 index is extended, merged or rebuilt like any other kind. A full-text index
-without a certificate is still refused by maintenance and still needs
-`omnigraph index rebuild --kind full-text`, which remains the analyzer
-migration and the way to replace an externally created tokenizer. A vector
-property with no non-null vectors stays pending.
+without a certificate is left as it is and reported pending, as today, while
+search refuses it (`FullTextIndexRebuildRequired`); `omnigraph index rebuild
+--kind full-text` remains the analyzer migration and the way to replace an
+externally created tokenizer. A vector property with no non-null vectors
+stays pending.
 
 Reads see more segments per index between merges. Each segment is searched
 on its own: a BTREE probe per segment, a full-text posting lookup per segment
 scored by one corpus-wide scorer, a nearest search per segment with its own
 probe budget (the per-delta `maximum_nprobes` the engine already sets). The
-merge policy bounds the number of segments.
+merge policy bounds the number of segments. A vector segment built over a
+fragment subset trains its own centroids, so approximate nearest results can
+differ from those of one index trained on the whole table; exact answers do
+not.
 
 ## Design
 
 ### Terms
 
 An index is a name with one or more ***segments***, each covering a set of
-fragments recorded in its `fragment_bitmap`. An index's ***covered
+fragments recorded in its `fragment_bitmap`. The indexes are the declared ones
+and the identity and endpoint BTREEs every table carries. An index's ***covered
 fragments*** are the current fragments some segment of it covers. A current
 fragment is ***fresh*** for an index when none of its row IDs appears in a
 fragment that index covers; a fragment that is not fresh is ***moved***.
@@ -164,7 +184,11 @@ The test is conservative. Inserts allocate row IDs above every existing one,
 so a fragment of new rows always passes; a fragment holding an updated or
 compacted row always fails. When a segment names a fragment the current
 manifest no longer holds, or a sequence cannot be read, every uncovered
-fragment counts as moved. A wrong "moved" costs the moved-fragment action (a
+fragment counts as moved. Graph compaction commits its `Rewrite` with no
+rewritten indexes (`TableStore::stage_compaction`), so segments keep the ids
+of the fragments it replaced, and the next build after a compaction takes the
+moved-fragment action for every index: the cost today's optimize already pays
+after compaction. A wrong "moved" costs the moved-fragment action (a
 merge for BTREE, a rebuild otherwise); a wrong "fresh" is impossible from the
 sequences alone. An index with a segment whose `fragment_bitmap` is absent
 (coverage unknown) is left to explicit handling, as today: Lance cannot merge
@@ -180,22 +204,27 @@ takes one of these actions, and stages every table's actions as one detached
 |---|---|---|
 | no segment with rows (missing, or full text with only the untrained declaration) | build | every row, once |
 | uncovered fragments, all fresh | extend: one segment over them | the new rows |
-| uncovered moved fragments, BTREE | build a segment over them, then merge it with every segment in one filtered merge; publish only the merged segment | the index's entries; no table scan |
-| uncovered moved fragments, full text or vector | rebuild whole | every row |
+| any uncovered fragment moved, BTREE | build one segment over every uncovered fragment, fresh and moved, then merge it with every segment in one filtered merge; publish only the merged segment | the uncovered rows, then every entry of the index; no scan of covered fragments |
+| any uncovered fragment moved, full text or vector | rebuild whole | every row |
 | more than the policy's segment count | merge (BTREE, full text) or rebuild (vector) | the merged segments' entries |
-| full text without a certificate | refuse, as today | none |
+| full text without a certificate | pending, as today | none |
 | vector property with no non-null vector | pending, as today | none |
 
-The BTREE moved-row action is safe although its intermediate segment breaks
-the rule, because that segment is never published: Lance's BTREE merge
-filters each source segment's entries to the live row IDs of that segment's
-own fragments (`lance-13.0.0/src/index/scalar/btree.rs:122`, through
-`index/append.rs:201` `build_per_segment_filters` and `:103` `live_row_ids`),
-which drops the old segment's entry for every moved row. The merged segment
-therefore satisfies the rule's conclusion directly. Lance's full-text merge
-applies no such filter (`index/scalar/inverted.rs:1002`, `None` as the old-data
-filter), and its vector merge needs shared model artifacts, so those kinds
-rebuild.
+The BTREE moved-row action covers every uncovered fragment in one input,
+because a fresh fragment left out would stay uncovered and a second published
+segment over the moved fragments is exactly the stale-entry case. It is safe
+although its intermediate segment breaks the rule, because that segment is
+never published: Lance's BTREE merge filters each source segment's entries to
+the live row IDs of that segment's own fragments
+(`lance-13.0.0/src/index/scalar/btree.rs:122`, through `index/append.rs:201`
+`build_per_segment_filters` and `:103` `live_row_ids`), which drops the old
+segment's entry for every moved row. The merged segment therefore satisfies
+the rule's conclusion directly. Lance's 13.0.0 full-text merge applies no such
+filter (`index/scalar/inverted.rs:1002`, `None` as the old-data filter), so full
+text rebuilds. Its vector merge does filter each source
+(`index/vector/ivf.rs:2473`), but it never joins segments trained with
+different centroids (`select_steady_state_rebalance`, `ivf.rs:407`), and
+subset builds train their own, so vector rebuilds too.
 
 Segments come from the public builder over a fragment subset,
 `create_index_builder(..).fragments(ids).replace(true).execute_uncommitted()`
@@ -222,12 +251,19 @@ is rewritten a bounded number of times as the index grows (a tiered policy: a
 row moves into a larger segment only when the segments of its size outnumber
 the bound). `K` bounds the per-query fan-out.
 Both are constants of the reconciler, named in its report, not hidden
-statistics. The constants are an unresolved question.
+statistics. The constants are an unresolved question. The planner's
+`IndexFact` records a name's union coverage but not its segment count, and
+`K` segments cost `K` probes; the implementation adds the count to that fact,
+so plan cost (request-aware plan cost, PR #996) prices the fan-out from the
+same index inventory.
 
 ### Full text
 
 `TableStore::can_fold_index` stops excluding full text for certified
-indexes. Two certificate rules change in RFC 0043:
+indexes. The reconciler verifies each segment's certificate before it extends
+or merges the index, with the same immutable, session-cached proof search
+uses; an index with any uncertified segment is left as it is and reported
+pending. Two certificate rules change in RFC 0043:
 
 - A segment built by the engine's builder from the rows of the fragments it
   covers is certified, as a whole-table build is today (`fts_compat.rs`
@@ -249,10 +285,24 @@ next merge or rebuild, as they do in a single segment today.
 
 ### One decision function
 
-Optimize applies the decision after its compaction link; `index build`
-applies it on any branch; read-only `index status`
-([RFC 0046](0046-index-status.md), draft) reports it without executing, so
-status and maintenance cannot disagree about what an index needs.
+Optimize applies the decision after its compaction link, as a second detached
+table commit under the same graph publication; `index build` applies it on any
+branch; read-only `index status` ([RFC 0046](0046-index-status.md), draft)
+reports it without executing, so status and maintenance cannot disagree about
+what an index needs. The publication stays index-only: it moves no row, so a
+schema apply that counts row changes on a branch is unaffected.
+
+### The Lance 13.0.0 fence
+
+The fresh test, the BTREE moved-row merge and the full-text whole rebuild for
+moved rows exist because 13.0.0's scalar and full-text search, and its
+full-text merge, do not restrict a segment to its own fragments. The bump that
+contains lance#9785 and lance#9872 removes them: segments over moved
+fragments become safe for every kind, so the reconciler extends over every
+uncovered fragment and merges under the same policy. That bump is the one
+that turns `index_delta_segment_serves_stale_entries_of_an_updated_row` red.
+Extension over appended rows, the merge policy and full-text certification
+are not part of the fence.
 
 ## Invariants
 
@@ -260,9 +310,11 @@ status and maintenance cannot disagree about what an index needs.
   snapshot plans every table, artifacts are built before the writer gates,
   authority is revalidated under them, and every table publishes in one
   manifest commit.
-- **Crash convergence (5).** New segments are staged index directories that
-  no manifest names until publication; the collector reclaims them as it
-  reclaims any staged index today.
+- **Crash convergence (5).** New segments, and the intermediate BTREE segment
+  of a moved-row merge, are index directories that no manifest names until
+  publication (the intermediate one never); the collector's orphan sweep
+  reclaims an unnamed `_indices/<uuid>` after its seven-day age, as it does
+  for any staged index today.
 - **Physical acceleration is derived state (7).** The rule is what makes a
   partly maintained index answer as a full build does. Coverage chooses
   maintenance work, never answers. Index work stays in explicit
@@ -270,9 +322,11 @@ status and maintenance cannot disagree about what an index needs.
 - **Integrity failures are loud (8).** An unknown fresh test takes the
   moved-fragment action, never a guess; a coverage overlap fails the run
   before staging.
-- **Bounded work (11).** Routine maintenance scales with rows written since
-  the last run, and the merge policy bounds both rewrites per row and query
-  fan-out.
+- **Bounded work (11).** Maintenance after appends scales with the rows
+  appended, and the merge policy bounds both rewrites per row and query
+  fan-out. Moved rows cost more until the fence is removed: a BTREE merge
+  reads every entry of the index, and full text and vector rebuild from every
+  row, which is what every lagging index costs today.
 - **One source of truth (12).** Freshness is derived from the pinned
   manifest's fragments and sequences; nothing new is persisted.
 
@@ -302,9 +356,11 @@ moved fragments.
 
 - **Keep whole rebuilds.** Correct and simple; cost grows with table size on
   every run, and full-text coverage stays manual.
-- **Wait for lance#9817.** Segment ownership in scalar and full-text search
-  would make segments over moved fragments safe. No fix is scheduled, and the
-  rule here needs nothing from upstream; it relaxes when the fix lands.
+- **Wait for the Lance bump that contains lance#9785 and lance#9872.** Segment
+  ownership in scalar and full-text search makes segments over moved
+  fragments safe. The fixes merged on 2026-10-23 but are in no release
+  OmniGraph pins. Extension over appended rows is the durable part and is
+  useful after the bump too; only the moved-row fence waits for it.
 - **Use Lance's `optimize_indices`.** It commits linearly and has no
   certificate hook; incompatible with detached-only tables.
 - **Defer rebuilds behind a threshold.** Leave a moved tail scanned until it
@@ -341,12 +397,14 @@ New `lance_surface_guards.rs` guards, each red when the fact changes:
 - the shared prefilter admits a row ID only through its current live copy
   (an updated row's old entry is masked while its new fragment is uncovered);
 - the BTREE merge drops a moved row's old entry; the full-text merge keeps it
-  (a negative guard, red when the filter lands);
+  (a negative guard, red at the bump that contains lance#9872);
 - a certificate written on a subset build and on a certified merge verifies.
 
 Engine owners (`integration/maintenance.rs`, `integration/branching.rs`):
-appends extend each index without a rebuild; an update merges the BTREE
-(equality on the old value returns nothing) and rebuilds full text and vector;
+appends extend each index, including the identity and endpoint BTREEs,
+without a rebuild; an append and an update in one run produce one merged
+BTREE segment covering both fragments (equality on the old value returns
+nothing) and rebuild full text and vector;
 a compaction followed by a build takes the moved-fragment action; an
 unreadable sequence does too; a segment without a coverage record is left
 alone and reported; the segment count stays within `K`. A
@@ -369,7 +427,8 @@ extends to the new actions.
    (with a disposition note on RFC 0043), extension and merge.
 4. Vector extension, with rebuild as its merge, replacing the fold rule that
    collapses every multi-segment vector index.
-5. `index status` through RFC 0046.
+5. `index status` through RFC 0046, amending its rows that name optimize as
+   the only reconciler and send full-text coverage to the rebuild command.
 
 Each phase keeps the rule and falls back to a whole rebuild for anything it
 does not handle, so each ships alone. `implementation` advances per phase.
@@ -384,5 +443,14 @@ does not handle, so each ships alone. `implementation` advances per phase.
 ## Decision log
 
 - 2026-10-25: drafted as the second step of #840. PR #1150 (open) puts the
-  `index build` contract on today's whole rebuilds; this RFC changes only
-  their cost.
+  `index build` contract on today's whole rebuilds; this RFC changes their
+  cost, and for certified full text their outcome.
+- 2026-10-26: review. The summary no longer claims an unchanged contract for
+  full text; an index without a certificate is reported pending, not refused.
+  The decision table gains the mixed case: when any uncovered fragment is
+  moved, one BTREE merge input covers every uncovered fragment. The identity
+  and endpoint BTREEs are named. The upstream fixes (lance#9785, lance#9872)
+  are recorded, and the moved-row half is marked as the 13.0.0 fence.
+  Invariant 11 states the moved-row costs. #1150 is in `blocked_on`; the
+  segment count joins `IndexFact`; the vector rebuild reason is the separate
+  IVF model, not a missing filter.
