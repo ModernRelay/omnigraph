@@ -22,10 +22,42 @@ pub const HERMETIC_OPERATOR_HOME: &str = "/nonexistent/omnigraph-test-home";
 /// Controlled diagnostics use the same explicit pool in fixture and SUT children.
 pub const HTTP_DIAGNOSTIC_LANCE_POOL_BYTES: &str = "104857600";
 
+/// Bootstrap storage owned by this fixture without relying on CLI direct-cloud
+/// selectors. The assertions mirror the deployment receipt checked by CLI setup.
+pub fn bootstrap_cluster_fixture(config: &Path, root: &str) {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let caller = omnigraph_cluster::DeploymentCaller::storage_owner(None);
+        let applied = omnigraph_cluster::apply_deployment(config, None, &caller, |_, _, _| {})
+            .await
+            .unwrap();
+        let omnigraph_cluster::DeploymentLookup::Complete { result } = applied else {
+            panic!("bootstrap did not complete: {applied:?}")
+        };
+        assert!(result.converged, "{result:?}");
+    });
+    unlock_storage_fixture(root);
+}
+
+/// Only call after the fixture's writer has stopped: completed direct owners
+/// retain admission and serving restarts need an explicit exact-ID handoff.
+pub fn unlock_storage_fixture(root: &str) {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let caller = omnigraph_cluster::DeploymentCaller::storage_owner(None);
+        let status = omnigraph_cluster::deployment_status(root, None, &caller)
+            .await
+            .unwrap();
+        let lock = status.lock_id.expect("fixture owner retains exact lock");
+        omnigraph_cluster::force_unlock_storage_root(root, &lock)
+            .await
+            .unwrap();
+    });
+}
+
 /// Direct HTTP assertions exercise the current graph contract. CLI journeys
 /// still use the production client and its independent discovery gate.
 pub fn graph_http_client() -> Client {
     Client::builder()
+        .add_root_certificate(tls_gateway::certificate())
         .default_headers(reqwest::header::HeaderMap::from_iter([(
             reqwest::header::HeaderName::from_static(omnigraph_api_types::HTTP_API_CONTRACT_HEADER),
             reqwest::header::HeaderValue::from_static(omnigraph_api_types::HTTP_API_CONTRACT),
@@ -37,6 +69,15 @@ pub fn graph_http_client() -> Client {
 pub fn cli() -> Command {
     let mut command = Command::cargo_bin("omnigraph").unwrap();
     command.env("OMNIGRAPH_HOME", HERMETIC_OPERATOR_HOME);
+    command.env_remove("SSL_CERT_FILE");
+    command.env_remove("SSL_CERT_DIR");
+    command.env_remove("OMNIGRAPH_TOKEN");
+    command.env_remove("OMNIGRAPH_BEARER_TOKEN");
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("OMNIGRAPH_TOKEN_") {
+            command.env_remove(name);
+        }
+    }
     command.env_remove("OMNIGRAPH_CONFIG");
     command.env_remove("OMNIGRAPH_CONTROL_TOKEN");
     command.env_remove("OMNIGRAPH_CONTROL_API");
@@ -48,6 +89,7 @@ pub fn cli() -> Command {
 pub fn cli_at(binary: &Path) -> Command {
     let mut command = Command::new(binary);
     command.env_clear();
+    command.env_remove("SSL_CERT_FILE");
     command.env("LANCE_MEM_POOL_SIZE", HTTP_DIAGNOSTIC_LANCE_POOL_BYTES);
     command.env("OMNIGRAPH_HOME", HERMETIC_OPERATOR_HOME);
     command.env("LANG", "C");
@@ -59,6 +101,15 @@ pub fn cli_at(binary: &Path) -> Command {
 pub fn cli_process() -> StdCommand {
     let mut command = StdCommand::new(assert_cmd::cargo::cargo_bin("omnigraph"));
     command.env("OMNIGRAPH_HOME", HERMETIC_OPERATOR_HOME);
+    command.env_remove("SSL_CERT_FILE");
+    command.env_remove("SSL_CERT_DIR");
+    command.env_remove("OMNIGRAPH_TOKEN");
+    command.env_remove("OMNIGRAPH_BEARER_TOKEN");
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("OMNIGRAPH_TOKEN_") {
+            command.env_remove(name);
+        }
+    }
     command.env_remove("OMNIGRAPH_CONFIG");
     command.env_remove("OMNIGRAPH_CONTROL_TOKEN");
     command.env_remove("OMNIGRAPH_CONTROL_API");
@@ -66,6 +117,7 @@ pub fn cli_process() -> StdCommand {
 }
 
 pub mod managed_http;
+pub mod tls_gateway;
 #[cfg(unix)]
 pub mod unix_gateway;
 
@@ -78,7 +130,7 @@ pub fn write_managed_target(config: &Path, origin: &str) {
     let home = managed_home(config);
     fs::create_dir_all(&home).unwrap();
     fs::write(home.join("config.yaml"), format!(
-        "target_config_version: 1\ntargets:\n  managed-test:\n    kind: managed\n    scope: cluster\n    api: {origin}\n    organization_id: account-one\n    cluster_id: managed-test\n    cluster_incarnation: inc-one\n    control_auth: automation-env\n  managed-account:\n    kind: managed\n    scope: account\n    api: {origin}\n    organization_id: account-one\n    control_auth: automation-env\n"
+        "version: 1\nprofiles:\n  managed-account:\n    api: {origin}\n    organization_id: account-one\n    auth:\n      provider: token\n      source: {{env: OMNIGRAPH_CONTROL_TOKEN}}\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{}'}}\ntargets:\n  managed-test:\n    kind: managed\n    profile: managed-account\n    cluster_id: managed-test\n    cluster_incarnation: inc-one\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{}'}}\n", tls_gateway::ca_path().display(), tls_gateway::ca_path().display()
     )).unwrap();
 }
 
@@ -90,7 +142,14 @@ pub fn managed_command(config: &Path, origin: &str, target: &str) -> Command {
         .env("OMNIGRAPH_CONTROL_API", origin)
         .env("OMNIGRAPH_TOKEN", "data-token-must-not-be-used")
         .current_dir(config)
-        .args(["--target", target])
+        .args([
+            if target == "managed-account" {
+                "--profile"
+            } else {
+                "--target"
+            },
+            target,
+        ])
         .timeout(Duration::from_secs(15));
     command
 }
@@ -200,7 +259,7 @@ pub fn stdout_string(output: &Output) -> String {
 pub fn only_target_report(output: &Output) -> bool {
     String::from_utf8_lossy(&output.stderr)
         .lines()
-        .all(|line| line.starts_with("target "))
+        .all(|line| line.starts_with("target ") || line.starts_with("profile "))
 }
 
 pub fn parse_stdout_json(output: &Output) -> Value {
@@ -287,6 +346,42 @@ policy: {{}}
 pub const KEYED_SERVER_NAME: &str = "test-server";
 pub const KEYED_SERVER_TOKEN_ENV: &str = "OMNIGRAPH_TOKEN_TEST_SERVER";
 
+/// Address a shared fixture by its registered name, never an inline URL.
+/// Credential tests first install their explicit operator home with `envs`;
+/// otherwise this installs the gateway's explicit anonymous profile. It does
+/// not invent a token source or repair a caller-supplied configuration.
+pub trait FixtureTarget {
+    fn fixture_target(&mut self, origin: &str) -> &mut Self;
+}
+
+impl FixtureTarget for Command {
+    fn fixture_target(&mut self, origin: &str) -> &mut Self {
+        let hermetic = self
+            .get_envs()
+            .find(|(key, _)| *key == "OMNIGRAPH_HOME")
+            .and_then(|(_, value)| value)
+            .is_none_or(|home| home == HERMETIC_OPERATOR_HOME);
+        if hermetic {
+            self.env("OMNIGRAPH_HOME", tls_gateway::anonymous_home(origin));
+        }
+        self.arg(KEYED_SERVER_NAME)
+    }
+}
+
+impl FixtureTarget for StdCommand {
+    fn fixture_target(&mut self, origin: &str) -> &mut Self {
+        let hermetic = self
+            .get_envs()
+            .find(|(key, _)| *key == "OMNIGRAPH_HOME")
+            .and_then(|(_, value)| value)
+            .is_none_or(|home| home == HERMETIC_OPERATOR_HOME);
+        if hermetic {
+            self.env("OMNIGRAPH_HOME", tls_gateway::anonymous_home(origin));
+        }
+        self.arg(KEYED_SERVER_NAME)
+    }
+}
+
 /// An operator home declaring one server at `url`. The CLI sends a bearer
 /// token only to the server it is keyed to, so a served command binds its
 /// token through [`KeyedServer::env`].
@@ -300,8 +395,8 @@ impl KeyedServer {
         fs::write(
             home.path().join("config.yaml"),
             format!(
-                "target_config_version: 1\ntargets:\n  {KEYED_SERVER_NAME}:\n    kind: server\n    endpoint: {}\n    credential: {KEYED_SERVER_NAME}\n",
-                yaml_string(url)
+                "version: 1\ntargets:\n  {KEYED_SERVER_NAME}:\n    kind: server\n    endpoint: {}\n    auth:\n      provider: token\n      source: {{env: {KEYED_SERVER_TOKEN_ENV}}}\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{}'}}\n",
+                yaml_string(url), tls_gateway::ca_path().display()
             ),
         )
         .unwrap();
@@ -322,6 +417,7 @@ impl KeyedServer {
 }
 
 pub struct TestServer {
+    _tls: tls_gateway::TlsGateway,
     child: Child,
     pub base_url: String,
     stderr_log: NamedTempFile,
@@ -347,7 +443,7 @@ impl TestServer {
             home.join("config.yaml"),
             format!(
                 "servers:\n  {KEYED_SERVER_NAME}:\n    url: {}\n",
-                yaml_string(&self.base_url)
+                yaml_string(&self.legacy_base_url())
             ),
         )
         .unwrap();
@@ -355,6 +451,12 @@ impl TestServer {
             ("OMNIGRAPH_HOME", home.into_os_string()),
             (KEYED_SERVER_TOKEN_ENV, token.into()),
         ]
+    }
+
+    /// The predecessor predates configured CA trust. Its historical HTTP
+    /// fixture stays behind the gateway; current binaries always use base_url.
+    pub fn legacy_base_url(&self) -> String {
+        tls_gateway::http_upstream(&self.base_url)
     }
 
     pub fn stop(mut self) -> String {
@@ -461,11 +563,14 @@ fn spawn_server_process(mut command: StdCommand) -> TestServer {
                 })
                 .unwrap_or(false)
         {
+            let tls = tls_gateway::TlsGateway::new(base_url);
+            let base_url = tls.origin.clone();
             return TestServer {
                 child,
                 base_url: base_url.clone(),
                 stderr_log,
-                operator: KeyedServer::new(base_url),
+                operator: KeyedServer::new(&base_url),
+                _tls: tls,
             };
         }
         if let Some(status) = child.try_wait().unwrap() {
@@ -1501,23 +1606,18 @@ policies:
     cluster_dir
 }
 
-/// An operator home whose configuration names [`PARITY_ACTOR`] for the direct
-/// arm of [`run_both`]. Reads ignore it; writes resolve it without a second
-/// read/write classifier in the harness.
+/// Hermetic version-1 home for the direct arm of [`run_both`]. Actor-bearing
+/// commands pass their identity explicitly; configuration cannot supply one.
 pub fn parity_operator_home(root: &Path) -> PathBuf {
     let home = root.join("parity-operator-home");
     fs::create_dir_all(&home).unwrap();
-    fs::write(
-        home.join("config.yaml"),
-        format!("target_config_version: 1\noperator:\n  actor: {PARITY_ACTOR}\n"),
-    )
-    .unwrap();
+    fs::write(home.join("config.yaml"), "version: 1\n").unwrap();
     home
 }
 
 /// Run one CLI invocation per arm with identical verb args: locally against
 /// `local_graph` and remotely against `server`. Actor-bearing operations resolve
-/// `operator.actor` from `local_operator_home` locally and an equivalent bearer
+/// `--as` locally and an equivalent bearer
 /// identity remotely. Returns raw outputs for parity comparison.
 pub fn run_both(
     local_graph: &Path,
@@ -1526,15 +1626,16 @@ pub fn run_both(
     args: &[&str],
 ) -> (std::process::Output, std::process::Output) {
     // The same global --target grammar addresses both direct and served arms.
-    // Direct writes carry no Cedar policy; the served parity policy permits
-    // act-parity, so both arms still agree. Explicit --as on an actorless read
-    // remains an error; the harness itself needs no list of actor-bearing verbs.
+    // Reads reject --as; the fixture passes it only to actor-bearing verbs.
     let mut local = cli();
     local
         .env("OMNIGRAPH_HOME", local_operator_home)
         .args(args)
         .arg("--target")
         .arg(local_graph);
+    if parity_accepts_actor(args) && !args.contains(&"--as") {
+        local.args(["--as", PARITY_ACTOR]);
+    }
     if args.first() == Some(&"blob") {
         local.env("NO_COLOR", "1");
     }
@@ -1544,7 +1645,7 @@ pub fn run_both(
         .envs(server.credential(PARITY_TOKEN))
         .args(args)
         .arg("--target")
-        .arg(&server.base_url)
+        .fixture_target(&server.base_url)
         // RFC-011: the parity server is cluster-only (multi-graph), so the
         // remote arm must name the graph it addresses.
         .arg("--graph")
@@ -1557,6 +1658,20 @@ pub fn run_both(
         let local_out = local.output().unwrap();
         (local_out, remote.join().unwrap())
     })
+}
+
+pub fn parity_accepts_actor(args: &[&str]) -> bool {
+    matches!(
+        args.first().copied(),
+        Some("mutate" | "load" | "rebuild-full-text-indexes")
+    ) || matches!(
+        (args.first().copied(), args.get(1).copied()),
+        (Some("branch"), Some("create" | "delete" | "merge"))
+            | (Some("blob"), Some("put" | "clear"))
+            | (Some("commit"), Some("publish" | "drop"))
+            | (Some("schema"), Some("apply"))
+            | (Some("cluster"), Some("plan" | "apply" | "upgrade-ledger"))
+    )
 }
 
 /// Parse, scrub, and pretty-print for diffable assertion messages.

@@ -147,6 +147,10 @@ impl Controlled {
     }
 }
 
+fn is_lease_key(uri: &str) -> bool {
+    uri.contains("/__cluster/lease/")
+}
+
 pub(super) fn memory_adapter() -> Arc<dyn StorageAdapter> {
     let mut adapter = Controlled::new();
     adapter.allow_fixture_setup = true;
@@ -235,11 +239,22 @@ impl StorageAdapter for Controlled {
     async fn rename_text(&self, _from: &str, _to: &str) -> StorageResult<()> {
         self.forbid("rename")
     }
-    async fn delete(&self, _uri: &str) -> StorageResult<()> {
-        self.forbid("DELETE")
+    // The lease deletes only its owner's own heartbeats, keys no other
+    // process writes; every other delete stays forbidden, so a delayed
+    // delete can never reach the lock key a successor holds.
+    async fn delete(&self, uri: &str) -> StorageResult<()> {
+        if is_lease_key(uri) {
+            self.inner.delete(self.key(uri)).await
+        } else {
+            self.forbid("DELETE")
+        }
     }
-    async fn delete_prefix(&self, _uri: &str) -> StorageResult<()> {
-        self.forbid("prefix DELETE")
+    async fn delete_prefix(&self, uri: &str) -> StorageResult<()> {
+        if is_lease_key(uri) {
+            self.inner.delete_prefix(self.key(uri)).await
+        } else {
+            self.forbid("prefix DELETE")
+        }
     }
 
     async fn write_text_if_absent(&self, uri: &str, contents: &str) -> StorageResult<bool> {
@@ -542,6 +557,20 @@ async fn clean_release_and_concurrent_reacquisition_keep_delayed_writes_harmless
                     .unwrap()
                     .is_none()
             );
+        } else if is_lease_key(&write.uri) {
+            // The old owner's beats left with its released lease, so a
+            // delayed beat can land again, but only under the old owner's own
+            // lease directory, which no successor watches.
+            assert!(
+                write.uri.contains(&format!("/__cluster/lease/{old_id}/")),
+                "{}",
+                write.uri
+            );
+            adapter
+                .inner
+                .write_text_if_absent(adapter.key(&write.uri), &write.payload)
+                .await
+                .unwrap();
         } else {
             assert!(
                 !adapter

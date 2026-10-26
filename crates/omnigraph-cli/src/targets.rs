@@ -1,5 +1,6 @@
 //! Complete target bindings and conservative operator-file administration.
 
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
@@ -7,17 +8,15 @@ use std::path::Path;
 use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::graph_http::RequestTarget;
-use crate::operator::{OperatorConfig, token_env_name};
+use crate::operator::OperatorConfig;
 
-#[path = "target_import.rs"]
-pub(crate) mod import;
-
-pub(crate) const TARGET_CONFIG_VERSION: u32 = 1;
-pub(crate) const TARGET_PROTOCOL: u32 = 1;
-pub(crate) const CREDENTIAL_PROTOCOL: u32 = 1;
+// Compatibility generations across published binaries, independent of the YAML
+// document version. Incompatible configuration/command changes bump these.
+pub(crate) const TARGET_PROTOCOL: u32 = 2;
+pub(crate) const CREDENTIAL_PROTOCOL: u32 = 2;
+pub(crate) const ACCESS_PROTOCOL: u32 = 2;
 
 #[derive(Debug)]
 pub(crate) struct TargetError {
@@ -135,12 +134,7 @@ impl StorageProvider {
             _ => bail!("provider kind does not match the storage URI"),
         }
     }
-    /// Inline cloud addresses deliberately capture ambient destination settings
-    /// once. Registered targets never call this function.
-    pub(crate) fn capture(uri: &str) -> Result<Self> {
-        Self::capture_from(uri, &std::env::vars().collect())
-    }
-
+    #[cfg(test)]
     fn capture_from(uri: &str, environment: &BTreeMap<String, String>) -> Result<Self> {
         let nonempty = |names: &[&str]| {
             names.iter().find_map(|name| {
@@ -381,14 +375,9 @@ pub(crate) enum CredentialOwner<'a> {
 }
 
 pub(crate) fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
-        && name != "."
-        && name != ".."
-        && name != "og_catalog"
+    let mut bytes = name.bytes();
+    bytes.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && bytes.all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
 }
 
 pub(crate) fn validate_http_endpoint(endpoint: &str) -> Result<()> {
@@ -463,10 +452,6 @@ pub(crate) fn normalize_storage_uri(uri: &str, base_dir: &Path) -> Result<String
 }
 
 impl TargetEntry {
-    #[cfg(test)]
-    pub(crate) fn binding(&self, name: &str) -> Result<TargetBinding> {
-        self.binding_at(name, Path::new("."))
-    }
     pub(crate) fn binding_at(&self, name: &str, base_dir: &Path) -> Result<TargetBinding> {
         let forbid = |field: &str, present: bool| {
             if present {
@@ -560,12 +545,6 @@ impl TargetEntry {
                     .ok_or_else(|| invalid(name, "managed targets require api"))?;
                 validate_http_endpoint(&api).map_err(|e| invalid(name, e))?;
                 let url = reqwest::Url::parse(&api)?;
-                if !matches!(url.path(), "" | "/") {
-                    return Err(invalid(
-                        name,
-                        "managed api must be an origin without a path",
-                    ));
-                }
                 let control_auth = self.control_auth.ok_or_else(|| {
                     invalid(
                         name,
@@ -628,7 +607,7 @@ impl TargetEntry {
                     }
                 };
                 Ok(TargetBinding::Managed(crate::managed::Binding {
-                    api: url.origin().ascii_serialization(),
+                    api: url.as_str().trim_end_matches('/').to_owned(),
                     organization_id: self.organization_id.clone(),
                     cluster,
                     control_auth,
@@ -638,61 +617,7 @@ impl TargetEntry {
     }
 }
 
-impl TargetBinding {
-    pub(crate) fn digest(&self) -> Result<String> {
-        let endpoint_identity = |endpoint: &str| -> Result<serde_json::Value> {
-            Ok(RequestTarget::of(endpoint, endpoint)?.binding_identity())
-        };
-        let identity = match self {
-            Self::DirectGraph { uri, provider } => {
-                serde_json::json!({"kind":"direct","scope":"graph","uri":uri,"provider":provider})
-            }
-            Self::DirectRoot { uri, provider, .. } => {
-                serde_json::json!({"kind":"direct","scope":"root","uri":uri,"provider":provider})
-            }
-            Self::DirectCatalogue => serde_json::json!({"kind":"direct","scope":"catalogue"}),
-            Self::Server { endpoint, auth, .. } => {
-                serde_json::json!({"kind":"server","endpoint":endpoint_identity(endpoint)?,"credential":match auth {ServerAuth::Token{owner}=>Some(owner),ServerAuth::Anonymous=>None}})
-            }
-            Self::Managed(binding) => {
-                let cluster = match &binding.cluster {
-                    Some(cluster) => Some(serde_json::json!({
-                        "id": cluster.cluster_id,
-                        "incarnation": cluster.cluster_incarnation,
-                        "endpoint": cluster.endpoint.as_deref().map(endpoint_identity).transpose()?,
-                    })),
-                    None => None,
-                };
-                serde_json::json!({"kind":"managed","api":endpoint_identity(&binding.api)?,"organization_id":binding.organization_id,"cluster":cluster,"control_auth":binding.control_auth})
-            }
-        };
-        Ok(format!(
-            "sha256:{:x}",
-            Sha256::digest(identity.to_string().as_bytes())
-        ))
-    }
-}
-
-pub(crate) fn validate_config(config: &OperatorConfig) -> Result<()> {
-    if config.target_config_version != Some(TARGET_CONFIG_VERSION) {
-        return Err(refusal(
-            "target_invalid",
-            "unsupported target_config_version; this CLI reads version 1",
-        ));
-    }
-    for name in config.targets.keys() {
-        if !valid_name(name) {
-            return Err(invalid(
-                name,
-                "name must be one ASCII word of letters, digits, -, _ and .; og_catalog is reserved",
-            ));
-        }
-    }
-    validate_credential_owners(config)
-}
-
 struct ServerBinding<'a> {
-    label: &'a str,
     owner: CredentialOwner<'a>,
     base: RequestTarget,
 }
@@ -715,7 +640,6 @@ fn server_bindings(config: &OperatorConfig) -> Vec<ServerBinding<'_>> {
                 _ => CredentialOwner::Anonymous { target: name },
             };
             Some(ServerBinding {
-                label: name,
                 owner,
                 base: RequestTarget::of(endpoint, endpoint).ok()?,
             })
@@ -756,64 +680,35 @@ pub(crate) fn capture_server_scope(
     auth: &ServerAuth,
     endpoint: &str,
 ) -> Result<ServerRequestScope> {
-    let config = input.get(&mut std::io::sink())?;
-    let scope = ServerRequestScope {
-        root: RequestTarget::of(endpoint, endpoint)?,
-        auth: auth.clone(),
-        boundaries: server_bindings(config)
+    let root = RequestTarget::of(endpoint, endpoint)?;
+    let mut boundaries = vec![(
+        root.clone(),
+        match auth {
+            ServerAuth::Token { owner } => Some(owner.clone()),
+            ServerAuth::Anonymous => None,
+        },
+    )];
+    boundaries.extend(
+        server_bindings(input.get(&mut std::io::sink())?)
             .into_iter()
+            .filter(|binding| binding.base.is_under(&root) && binding.base.depth() > root.depth())
             .map(|binding| {
                 let owner = match binding.owner {
                     CredentialOwner::Keyed(owner) => Some(owner.to_owned()),
                     CredentialOwner::Anonymous { .. } => None,
                 };
                 (binding.base, owner)
-            })
-            .collect(),
+            }),
+    );
+    let scope = ServerRequestScope {
+        root,
+        auth: auth.clone(),
+        boundaries,
     };
     scope.validate(&scope.root)?;
     Ok(scope)
 }
 
-fn validate_credential_owners(config: &OperatorConfig) -> Result<()> {
-    let bindings = server_bindings(config);
-    let mut variables = BTreeMap::new();
-    for binding in &bindings {
-        if let CredentialOwner::Keyed(owner) = binding.owner {
-            if let Some(other) = variables.insert(token_env_name(owner), owner) {
-                if other != owner {
-                    return Err(refusal(
-                        "target_invalid",
-                        format!(
-                            "credential owners '{owner}' and '{other}' share an environment token variable"
-                        ),
-                    ));
-                }
-            }
-        }
-        for other in &bindings {
-            let owner = |binding: &ServerBinding<'_>| match binding.owner {
-                CredentialOwner::Keyed(value) => Some(value.to_owned()),
-                CredentialOwner::Anonymous { .. } => None,
-            };
-            let same_owner = owner(binding) == owner(other);
-            if (binding.base == other.base && !same_owner)
-                || (matches!(binding.owner, CredentialOwner::Keyed(_))
-                    && same_owner
-                    && binding.base != other.base)
-            {
-                return Err(refusal(
-                    "target_invalid",
-                    format!(
-                        "targets '{}' and '{}' conflict: a credential owner binds exactly one endpoint scope",
-                        binding.label, other.label
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
 impl OperatorConfig {
     pub(crate) fn default_target(&self) -> Option<&str> {
         self.defaults.target.as_deref()
@@ -834,337 +729,6 @@ impl OperatorConfig {
             .max_by_key(|b| b.base.depth())
             .map(|b| b.owner)
     }
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct TargetListOutput {
-    pub(crate) protocol: u32,
-    pub(crate) default_target: Option<String>,
-    pub(crate) targets: Vec<TargetOutput>,
-}
-#[derive(Debug, Serialize)]
-pub(crate) struct TargetOutput {
-    pub(crate) name: String,
-    #[serde(flatten)]
-    pub(crate) entry: TargetEntry,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) binding: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) error: Option<String>,
-}
-impl TargetOutput {
-    pub(crate) fn of(name: &str, entry: &TargetEntry, base: &Path) -> Self {
-        let binding = entry
-            .binding_at(name, base)
-            .and_then(|binding| binding.digest());
-        let mut safe_entry = entry.clone();
-        for raw in [
-            &mut safe_entry.uri,
-            &mut safe_entry.endpoint,
-            &mut safe_entry.api,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            *raw = omnigraph::storage::redacted_storage_uri(raw);
-        }
-        if let Some(
-            StorageProvider::S3 { endpoint, .. } | StorageProvider::Azure { endpoint, .. },
-        ) = &mut safe_entry.provider
-        {
-            if let Some(raw) = endpoint {
-                *raw = omnigraph::storage::redacted_storage_uri(raw);
-            }
-        }
-        Self {
-            name: name.into(),
-            entry: safe_entry,
-            binding: binding.as_ref().ok().cloned(),
-            error: binding.err().map(|e| e.to_string()),
-        }
-    }
-}
-pub(crate) fn list_output(config: &OperatorConfig) -> TargetListOutput {
-    TargetListOutput {
-        protocol: TARGET_PROTOCOL,
-        default_target: config.defaults.target.clone(),
-        targets: config
-            .targets
-            .iter()
-            .map(|(name, entry)| TargetOutput::of(name, entry, &config.base_dir))
-            .collect(),
-    }
-}
-pub(crate) fn write_target_line(
-    target: &TargetOutput,
-    default: bool,
-    out: &mut dyn Write,
-) -> Result<()> {
-    write!(
-        out,
-        "{}{}  {:?}",
-        target.name,
-        if default { " (default)" } else { "" },
-        target.entry.kind
-    )?;
-    if let Some(scope) = target.entry.scope {
-        write!(out, " {scope:?}")?;
-    }
-    if let Some(address) = target
-        .entry
-        .uri
-        .as_ref()
-        .or(target.entry.endpoint.as_ref())
-        .or(target.entry.api.as_ref())
-    {
-        write!(out, "  {address}")?;
-    }
-    if let Some(error) = &target.error {
-        write!(out, "  invalid: {error}")?;
-    }
-    writeln!(out)?;
-    Ok(())
-}
-
-// ---- editing ----
-
-/// Why an edit cannot be made while keeping the rest of the file's text.
-fn not_editable(why: impl std::fmt::Display) -> color_eyre::Report {
-    refusal(
-        "config_not_editable",
-        format!("the operator config cannot be edited safely: {why}; edit it by hand"),
-    )
-}
-
-/// The `targets:` block of a block-style YAML document: the index of its key
-/// line and of the first line after the block, and the indentation of its
-/// entries.
-struct TargetsBlock {
-    key_line: usize,
-    end: usize,
-    indent: usize,
-    /// The key line was `targets: {}`, an empty flow mapping.
-    empty_flow: bool,
-}
-
-fn find_targets_block(lines: &[&str]) -> Result<Option<TargetsBlock>> {
-    let mut found = None;
-    for (index, line) in lines.iter().enumerate() {
-        if let Some(rest) = line.strip_prefix("targets:") {
-            if found.is_some() {
-                return Err(not_editable("`targets` appears twice"));
-            }
-            let rest = rest.trim();
-            // A trailing comment is not a value.
-            let rest = if rest.starts_with('#') {
-                ""
-            } else {
-                rest.split(" #").next().unwrap_or_default().trim()
-            };
-            let empty_flow = match rest {
-                "" => false,
-                "{}" => true,
-                _ => return Err(not_editable("`targets` is not a block mapping")),
-            };
-            found = Some((index, empty_flow));
-        }
-    }
-    let Some((key_line, empty_flow)) = found else {
-        return Ok(None);
-    };
-    let mut end = key_line + 1;
-    let mut indent = None;
-    while end < lines.len() {
-        let line = lines[end];
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() || (trimmed.starts_with('#') && line.starts_with(' ')) {
-            end += 1;
-            continue;
-        }
-        if !line.starts_with(' ') {
-            if line.starts_with('\t') {
-                return Err(not_editable("the file indents with tabs"));
-            }
-            break;
-        }
-        let width = line.len() - trimmed.len();
-        if indent.is_none() {
-            indent = Some(width);
-        }
-        end += 1;
-    }
-    // Trailing blank or comment lines belong after the block.
-    while end > key_line + 1 && lines[end - 1].trim().is_empty() {
-        end -= 1;
-    }
-    if empty_flow && indent.is_some() {
-        return Err(not_editable("`targets: {}` is followed by indented lines"));
-    }
-    Ok(Some(TargetsBlock {
-        key_line,
-        end,
-        indent: indent.unwrap_or(2),
-        empty_flow,
-    }))
-}
-
-/// The lines of one entry, `name:` at `indent` and its fields below it.
-fn render_entry(name: &str, entry: &TargetEntry, indent: usize) -> Result<Vec<String>> {
-    let body = yaml_serde::to_string(entry)?;
-    let pad = " ".repeat(indent);
-    let child = " ".repeat(indent * 2);
-    let mut lines = vec![format!("{pad}{name}:")];
-    for line in body.lines() {
-        if line.trim().is_empty() || line == "---" {
-            continue;
-        }
-        lines.push(format!("{child}{line}"));
-    }
-    Ok(lines)
-}
-
-/// The file's text with `name: entry` added under `targets:`.
-pub(crate) fn add_entry_text(text: &str, name: &str, entry: &TargetEntry) -> Result<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut out: Vec<String> = Vec::with_capacity(lines.len() + 8);
-    let has_version = lines
-        .iter()
-        .any(|line| line.starts_with("target_config_version:"));
-    match find_targets_block(&lines)? {
-        Some(block) => {
-            for (index, line) in lines.iter().enumerate() {
-                if index == block.key_line {
-                    if !has_version {
-                        out.push(format!("target_config_version: {TARGET_CONFIG_VERSION}"));
-                    }
-                    out.push(if block.empty_flow {
-                        "targets:".to_string()
-                    } else {
-                        (*line).to_string()
-                    });
-                    if block.empty_flow {
-                        out.extend(render_entry(name, entry, block.indent)?);
-                    }
-                    continue;
-                }
-                if index == block.end && !block.empty_flow {
-                    out.extend(render_entry(name, entry, block.indent)?);
-                }
-                out.push((*line).to_string());
-            }
-            if block.end == lines.len() && !block.empty_flow {
-                out.extend(render_entry(name, entry, block.indent)?);
-            }
-        }
-        None => {
-            out.extend(lines.iter().map(|line| (*line).to_string()));
-            if out.last().is_some_and(|line| !line.trim().is_empty()) {
-                out.push(String::new());
-            }
-            if !has_version {
-                out.push(format!("target_config_version: {TARGET_CONFIG_VERSION}"));
-            }
-            out.push("targets:".to_string());
-            out.extend(render_entry(name, entry, 2)?);
-        }
-    }
-    let mut text = out.join("\n");
-    text.push('\n');
-    Ok(text)
-}
-
-/// The file's text with `name`'s entry removed from `targets:`.
-pub(crate) fn remove_entry_text(text: &str, name: &str) -> Result<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    let block = find_targets_block(&lines)?
-        .ok_or_else(|| not_editable("no `targets:` block holds the entry"))?;
-    let key = format!("{}{name}:", " ".repeat(block.indent));
-    let start = (block.key_line + 1..block.end)
-        .find(|index| {
-            let line = lines[*index];
-            line == key || line.starts_with(&format!("{key} "))
-        })
-        .ok_or_else(|| not_editable(format!("`{name}` is not a plain key of `targets:`")))?;
-    let mut stop = start + 1;
-    while stop < block.end {
-        let line = lines[stop];
-        let trimmed = line.trim_start();
-        let width = line.len() - trimmed.len();
-        if !trimmed.is_empty() && width <= block.indent {
-            break;
-        }
-        stop += 1;
-    }
-    let remaining_entries = (block.key_line + 1..block.end)
-        .filter(|index| !(start..stop).contains(index))
-        .any(|index| {
-            let line = lines[index];
-            let trimmed = line.trim_start();
-            !trimmed.is_empty() && !trimmed.starts_with('#')
-        });
-    let mut out: Vec<String> = Vec::with_capacity(lines.len());
-    for (index, line) in lines.iter().enumerate() {
-        if (start..stop).contains(&index) {
-            continue;
-        }
-        if index == block.key_line && !remaining_entries {
-            out.push("targets: {}".to_string());
-            continue;
-        }
-        out.push((*line).to_string());
-    }
-    let mut text = out.join("\n");
-    text.push('\n');
-    Ok(text)
-}
-
-/// The parsed document without `targets` and `target_config_version`, to
-/// prove an edit changed nothing else.
-fn document_without_targets(text: &str) -> Result<yaml_serde::Value> {
-    let mut value: yaml_serde::Value = if text.trim().is_empty() {
-        yaml_serde::Value::Mapping(yaml_serde::Mapping::new())
-    } else {
-        yaml_serde::from_str(text)?
-    };
-    match &mut value {
-        yaml_serde::Value::Mapping(mapping) => {
-            mapping.remove("targets");
-            mapping.remove("target_config_version");
-        }
-        yaml_serde::Value::Null => {
-            value = yaml_serde::Value::Mapping(yaml_serde::Mapping::new());
-        }
-        _ => return Err(not_editable("the file is not a mapping")),
-    }
-    Ok(value)
-}
-
-/// Check an edit: the new text parses into a valid configuration whose
-/// targets are `expected` and whose every other key is unchanged.
-pub(crate) fn verify_edit(
-    before: &str,
-    after: &str,
-    expected: &BTreeMap<String, TargetEntry>,
-) -> Result<OperatorConfig> {
-    // A binding the configuration refuses is the entry's fault, not the edit's.
-    let config = match crate::operator::parse_operator_config(after) {
-        Ok(config) => config,
-        Err(error) if error.downcast_ref::<TargetError>().is_some() => return Err(error),
-        Err(error) => {
-            return Err(not_editable(format!(
-                "the edited file would not load: {error}"
-            )));
-        }
-    };
-    if &config.targets != expected {
-        return Err(not_editable(
-            "the edit did not produce the expected targets",
-        ));
-    }
-    if document_without_targets(before)? != document_without_targets(after)? {
-        return Err(not_editable("the edit would change other keys"));
-    }
-    Ok(config)
 }
 
 /// Replace the file by writing a sibling and renaming it over, keeping its
@@ -1194,42 +758,33 @@ pub(crate) fn replace_file(path: &Path, text: &str) -> Result<()> {
 
 /// An exclusive advisory lock on `config.yaml.lock`, held across one edit's
 /// read, check and replace, so two edits never lose each other's entry. The
-/// lock file is a stable sibling, never removed. Unix only; elsewhere an edit
-/// refuses rather than run without the lock.
-#[cfg_attr(not(unix), allow(dead_code))]
+/// lock file is a stable sibling, never removed. Unsupported file locking
+/// refuses rather than allowing an uncoordinated edit.
 pub(crate) struct ConfigEditLock {
-    #[cfg(unix)]
-    _file: std::fs::File,
+    file: std::fs::File,
+}
+
+impl Drop for ConfigEditLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
 }
 
 impl ConfigEditLock {
     pub(crate) fn acquire(config: &Path) -> Result<Self> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            if let Some(parent) = config.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut lock_path = config.as_os_str().to_os_string();
-            lock_path.push(".lock");
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(std::path::PathBuf::from(lock_path))?;
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            Ok(Self { _file: file })
+        if let Some(parent) = config.parent() {
+            std::fs::create_dir_all(parent)?;
         }
-        #[cfg(not(unix))]
-        {
-            let _ = config;
-            Err(refusal(
-                "config_not_editable",
-                "the operator config cannot be edited safely here: this platform has no file lock to hold across the edit; edit the file by hand on this platform",
-            ))
-        }
+        let mut lock_path = config.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(std::path::PathBuf::from(lock_path))?;
+        file.try_lock()
+            .map_err(|error| eyre!("could not lock operator configuration: {error}"))?;
+        Ok(Self { file })
     }
 }
 
@@ -1249,66 +804,52 @@ pub(crate) fn resolve_server_token(
 /// Resolve the deepest configured credential boundary for the actual request,
 /// keeping the transport root separate so Unix socket paths stay unambiguous.
 pub(crate) fn resolve_server_token_for(
-    input: &crate::operator::InvocationConfig,
+    _input: &crate::operator::InvocationConfig,
     auth: &ServerAuth,
     server_root: &str,
     request_url: &str,
 ) -> Result<Option<String>> {
-    let ServerAuth::Token { owner } = auth else {
+    match frozen_server_credential(auth, server_root, request_url)? {
+        Some(selected) => selected.cached_token(server_root),
+        None => Ok(None),
+    }
+}
+
+/// The credential of [`resolve_server_token_for`] read from its source
+/// again, for a long-lived client whose server refused it. Only the client
+/// holds the new token; the invocation's own credential is unchanged.
+pub(crate) async fn reread_server_token_for(
+    auth: &ServerAuth,
+    server_root: &str,
+    request_url: &str,
+) -> Result<Option<String>> {
+    match frozen_server_credential(auth, server_root, request_url)? {
+        Some(selected) => selected.reacquire(server_root).await,
+        None => Ok(None),
+    }
+}
+
+/// The invocation's frozen owner/profile binding for a request under the
+/// captured endpoint, or none for anonymous access.
+fn frozen_server_credential(
+    auth: &ServerAuth,
+    server_root: &str,
+    request_url: &str,
+) -> Result<Option<std::sync::Arc<crate::operator_routing::Authentication>>> {
+    let ServerAuth::Token { .. } = auth else {
         return Ok(None);
     };
-    let config = input.get(&mut std::io::sink())?;
     let request = RequestTarget::of(server_root, request_url)?;
-    if config.credential_owner_for(&request) != Some(CredentialOwner::Keyed(owner)) {
+    if !request.is_under(&RequestTarget::of(server_root, server_root)?) {
         return Err(refusal(
             "credential_scope_mismatch",
             "the credential owner is not bound to the selected endpoint",
         ));
     }
-    if let Ok(token) = std::env::var(token_env_name(owner)) {
-        if !token.trim().is_empty() {
-            return Ok(Some(token.trim().into()));
-        }
-    }
-    if let Some(path) = input.credentials_path() {
-        if let Some(saved) = crate::operator::read_bound_credential_at(&path, owner)? {
-            let saved_endpoint = saved.endpoint.as_deref().ok_or_else(|| refusal("credential_scope_missing", "saved credential has no endpoint binding; run target import or login for this target"))?;
-            let scope = RequestTarget::of(saved_endpoint, saved_endpoint)?;
-            if !request.is_under(&scope) {
-                return Err(refusal(
-                    "credential_scope_mismatch",
-                    "saved credential belongs to a different endpoint; log in for the selected target",
-                ));
-            }
-            return Ok(Some(saved.token));
-        }
-    }
-    Err(refusal(
-        "credential_missing",
-        format!(
-            "no token for credential '{owner}'; run login for this target or set {}",
-            token_env_name(owner)
-        ),
-    ))
-}
-
-pub(crate) fn write_server_credential(
-    input: &crate::operator::InvocationConfig,
-    owner: &str,
-    endpoint: &str,
-    token: Option<&str>,
-) -> Result<()> {
-    validate_server_endpoint(endpoint)?;
-    let config = input.get(&mut std::io::sink())?;
-    let target = RequestTarget::of(endpoint, endpoint)?;
-    if config.credential_owner_for(&target) != Some(CredentialOwner::Keyed(owner)) {
-        return Err(refusal(
-            "credential_scope_mismatch",
-            "credential owner is not bound to this endpoint",
-        ));
-    }
-    let path = input
-        .credentials_path()
-        .ok_or_else(|| eyre!("no operator home; set OMNIGRAPH_HOME"))?;
-    crate::operator::rewrite_bound_credentials_at(&path, owner, Some(endpoint), token)
+    crate::operator_routing::AUTH
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .map(Some)
+        .ok_or_else(|| refusal("credential_missing", "no frozen owner/profile binding"))
 }

@@ -7,14 +7,14 @@
 
 <p align="center">
   <strong>Object-storage native graph database with branching and typed ontology.</strong><br>
-  <sub>Unified retrieval engine (vector/bm25/graph) · Git-style workflows · Open data format (Lance)</sub>
+  <sub>Unified retrieval engine (vector/BM25/graph) · Git-style workflows · Open data format (Lance)</sub>
 </p>
 
 <p align="center">
   <a href="docs/user/quickstart.md">Quickstart</a> &nbsp;·&nbsp;
-  <a href="docs/user/clusters/index.md">Docs</a> &nbsp;·&nbsp;
+  <a href="docs/user/index.md">Docs</a> &nbsp;·&nbsp;
   <a href="https://github.com/ModernRelay/omnigraph-cookbooks">Cookbooks</a> &nbsp;·&nbsp;
-  <a href="docs/user/cli/reference.md">CLI</a>
+  <a href="docs/user/cli/reference.md">CLI</a> &nbsp;·&nbsp;
   <a href="https://www.omnigraph.dev/llms.txt">llms.txt</a>
 </p>
 
@@ -25,7 +25,9 @@
 
 <hr>
 
-Omnigraph is engineered for the new workload introduced by long-horizon agents: Multiple agents sharing a typed world model to continuously retrieve and store context and coordinate work. Agents and UIs can become thin stateless consumers of a durable state.
+Omnigraph is engineered for the new workload introduced by long-horizon agents: multiple agents sharing a typed world model to continuously retrieve and store context and coordinate work. Agents and UIs can become thin stateless consumers of durable state.
+
+Omnigraph Cloud is Omnigraph as a service: managed storage, servers, releases, backups, compaction and scaling, with access by token through the same CLI, SDKs and MCP server. Private preview; [join the waitlist](https://www.omnigraph.dev/cloud?utm_source=github&utm_medium=readme&utm_campaign=cloud-waitlist).
 
 ## Capabilities
 
@@ -36,7 +38,7 @@ Omnigraph is engineered for the new workload introduced by long-horizon agents: 
 | **Branching** | Agents propose reviewable changes instead of writing to main: a branch per agent or task, three-way merge, time travel across the whole graph. |
 | **Declared as code** | A `cluster.yaml` declares graphs, schemas, stored queries, embedding providers and policies. `cluster plan` previews, `cluster apply` converges, Terraform-style. |
 | **Security as code** | Cedar policy enforced **server-side on every mutation**, per graph or server-wide; bearer auth, server-resolved actors, audit tracking. |
-| **Object-storage native, open format** | Scales at the lowest cost on local disk or any S3-compatible store: RustFS / MinIO, AWS S3 / R2 / GCS, Azure preview. Data lives in open, versioned [Lance](https://github.com/lance-format/lance) with native blob-as-data, and never leaves your store. |
+| **Object-storage native, open format** | Store graphs on local disk or S3-compatible storage: RustFS / MinIO, AWS S3 / R2 / GCS, or Azure preview. Graph data uses open, versioned [Lance](https://github.com/lance-format/lance), including Blob values. |
 
 ## What you can build
 
@@ -102,13 +104,12 @@ is the fastest way to see Omnigraph shaped to a real domain.
 
 ## Deploy
 
-A deployment is a **cluster**: a **multigraph** config directory that declares
-its graphs, schemas, stored queries, and policies as code. You manage it
-**Terraform-style**: `cluster plan` previews the diff, `cluster apply` converges
-it. `omnigraph-server` then boots from the cluster and brings every graph online
-at `/graphs/{id}/…`, each behind its own policy.
+A **cluster** declares graphs, schemas, stored queries, and policies in a
+configuration bundle. `cluster plan` previews changes and `cluster apply`
+submits them to the selected destination. The cluster-only HTTP server exposes
+graphs at `/graphs/{id}/…` and activates applied changes without a restart.
 
-**1. Declare the cluster.**
+Keep desired configuration separate from its destination:
 
 ```
 company-brain/
@@ -116,7 +117,8 @@ company-brain/
 ├── people.pg          # schema for the "knowledge" graph
 ├── queries/           # stored queries: the .gq files ARE the declaration
 │   └── people.gq
-└── base.policy.yaml   # a Cedar policy bundle
+├── cluster.policy.yaml # deployment permissions
+└── graph.policy.yaml   # graph permissions
 ```
 
 ```yaml
@@ -124,43 +126,39 @@ company-brain/
 version: 1
 metadata:
   name: company-brain
-storage: s3://company/clusters/company-brain   # ledger, catalog, and graph data live here
 graphs:
   knowledge:
     schema: people.pg
     queries: queries/                          # every `query <name>` in queries/*.gq registers
 policies:
-  base:
-    file: base.policy.yaml
-    applies_to: [knowledge]                    # graph-bound; use [cluster] for server-level
+  cluster-access:
+    file: cluster.policy.yaml
+    applies_to: [cluster]
+  graph-access:
+    file: graph.policy.yaml
+    applies_to: [knowledge]
 ```
 
-**2. Stand up your object store.** On-prem, run RustFS (or MinIO); Omnigraph
-writes [Lance](https://github.com/lance-format/lance) over the standard S3 API.
-In the cloud, use S3 / R2 / GCS through `AWS_*`. Native `az://` roots are also
-available as a qualification preview. Every Azure writer, including
-`cluster apply` and the server, must use the checked-in admission wrapper;
-follow the [Azure deployment guide](docs/user/deployment.md#azure-blob-preview)
-instead of running the bare commands below.
+For first boot, follow the [cluster guide](docs/user/clusters/index.md#bootstrap-a-cluster),
+including writer ownership transfer and authentication. The
+[deployment guide](docs/user/deployment.md) covers containers and object stores;
+Azure writers require its admission wrapper.
 
-**3. Converge and run.** `apply` creates each graph, applies its schema, and
-publishes queries and policies into the content-addressed catalog. It is
-idempotent; re-running is always safe.
+The applied cluster policy must grant the authenticated operator `config_manage`.
+Schema changes also require `read` and `schema_apply` on the affected graphs.
+With those grants and a server target named `production`, deploy local edits:
 
 ```bash
-omnigraph cluster validate   # parse + typecheck everything
-omnigraph cluster plan --target ./company-brain    # preview
-omnigraph cluster apply --target ./company-brain   # converge
-
-# Boot the server from the cluster dir; storage resolves through cluster.yaml
-omnigraph-server --cluster company-brain --bind 0.0.0.0:8080
+omnigraph cluster validate --config ./company-brain
+omnigraph cluster plan --target production --config ./company-brain
+omnigraph cluster apply --target production --config ./company-brain
 ```
 
-The bare commands above describe local and S3 deployments. See the
-[cluster guide](docs/user/clusters/index.md) for the day-2 loop
-(edit → plan → apply → restart), approval gates for destructive changes, drift
-inspection, and recovery; the [deployment guide](docs/user/deployment.md) for
-containers, AWS/Railway/Azure, auth, and the object-store environment contracts.
+`--config` names the source bundle; `--target` names the destination. Omitting
+`storage` from the bundle uses the selected destination's root. If present,
+`storage` must match that root; it never selects or redirects the target.
+Apply prints a deployment ID. If delivery is interrupted, inspect that ID
+before submitting again; see [deployment recovery](docs/user/clusters/index.md).
 
 ## Query and mutate
 
@@ -178,16 +176,17 @@ omnigraph branch merge  agent/ingest-42 --into main
 ```
 
 An **alias** is shorter still: bind a target, graph, and stored query to one
-name, then `omnigraph alias triage` runs it. For an ad-hoc target, any command
-takes `--target NAME|ADDRESS`, plus `--graph ID` for a graph within a server
-or direct root. Use `--target ./graph.omni` for a standalone graph. See the [CLI reference](docs/user/cli/reference.md).
+name, then `omnigraph alias triage` runs it. Data commands use `--target NAME`
+for a configured server or managed resource, plus `--graph ID` when needed.
+Use `--target ./graph.omni` for a standalone local graph. Control-plane login
+and organization operations use `--profile`; see [operator configuration](docs/user/cli/targets.md).
 
 ## Security & governance
 
 - **Engine-wide enforcement:** every write path goes through the same Cedar gate, so the HTTP server, the CLI, and the embedded SDK obey identical rules.
 - **Declared in the cluster:** a policy bundle is bound to graphs (or the whole server) via `policies:` → `applies_to`.
 - **Scoped:** rules apply per graph, per branch, or server-wide.
-- **No plaintext tokens:** bearer tokens are hashed at startup and compared in constant time.
+- **Static server credentials:** static bearer tokens are hashed at startup and compared in constant time.
 - **Forge-proof identity:** the actor is resolved server-side from the token; clients can't set it.
 
 See the [policy guide](docs/user/operations/policy.md).
@@ -197,29 +196,31 @@ See the [policy guide](docs/user/operations/policy.md).
 | Client | Use it for | Where |
 |---|---|---|
 | **TypeScript SDK** | typed access from Node / TS | [`@modernrelay/omnigraph`](https://www.npmjs.com/package/@modernrelay/omnigraph) · [source](https://github.com/ModernRelay/omnigraph-ts) |
-| **MCP server** | bridge Omnigraph to LLM hosts (Claude, Codex, …) | [`@modernrelay/omnigraph-mcp`](https://www.npmjs.com/package/@modernrelay/omnigraph-mcp) |
-| **HTTP / OpenAPI** | any language, the wire contract | the server's OpenAPI spec |
-| **Python SDK** | typed access from Python | *coming soon* |
+| **Built-in MCP** | connect an agent to the server's `/mcp`, directly or through `omnigraph mcp --target NAME` | [MCP guide](docs/user/operations/mcp.md) |
+| **HTTP / OpenAPI** | use the wire contract from any language | [HTTP guide](docs/user/operations/server.md) · [OpenAPI](openapi.json) |
 
-Both npm packages are versioned in lockstep with `omnigraph-server`.
+Match the client's HTTP contract to the server's. The 0.14 server requires
+contract `0.14`; see [client availability](docs/user/install.md#client-compatibility)
+before selecting an npm package.
 
 ## Docs
 
+- [0.14 highlights and upgrade actions](docs/releases/v0.14.0-overview.md) · [User guide](docs/user/index.md)
 - [Cluster guide](docs/user/clusters/index.md) · [Deployment guide](docs/user/deployment.md) · [CLI reference](docs/user/cli/reference.md)
 - [Schema](docs/user/schema/index.md) · [Queries](docs/user/queries/index.md) · [Search](docs/user/search/index.md) · [Policy](docs/user/operations/policy.md)
 
-## Build And Test
+## Build and test
 
 ```bash
-cargo build --workspace
-cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst
+cargo build --workspace --locked
+cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked \
+  --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 ```
 
 Notes:
 
 - Rust stable toolchain, edition 2024
 - The GQT corpus (`cargo test -p omnigraph-gqt`) and the DST suite (`cargo test` from `crates/omnigraph-dst`, which supplies its process environment) run separately; a plain `cargo test --workspace` starts the DST binaries without that environment and they refuse. Commands and CI gates: [docs/dev/testing.md](docs/dev/testing.md)
-- CI runs the same excluded command with `--locked` and the failpoint features
 - Full CI and some local test flows require `protobuf-compiler`
 - S3 integration tests expect an S3-compatible endpoint such as RustFS
 

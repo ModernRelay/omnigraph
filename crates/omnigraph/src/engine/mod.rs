@@ -105,16 +105,28 @@ pub(crate) struct LoadFacts {
     pub(crate) request: crate::loader::csv::CsvLoadRequest,
     pub(crate) capture: Arc<crate::table_store::CapturedSource>,
     pub(crate) write: Option<LoadWrite>,
+    /// The bytes one slice of the source is cut at: the planner's partition
+    /// size, or what a test installed with `with_csv_slice_bytes`.
+    pub(crate) slice_bytes: usize,
+}
+
+/// The slice size this task's loads cut their sources at.
+pub(crate) fn csv_slice_bytes() -> usize {
+    crate::instrumentation::csv_slice_bytes().unwrap_or_else(|| {
+        usize::try_from(omnigraph_planner::SOURCE_PARTITION_BYTES).unwrap_or(usize::MAX)
+    })
 }
 
 /// The write verb's facts: the graph handle and the open transaction the
-/// sink stages under, the session's write allowance, and the slot the sink
-/// deposits its staged transaction in for the driver to commit.
+/// sink stages under, the session's write allowance, the Lance writers the
+/// sink runs at once (the session's `stage_write_concurrency`), and the slot
+/// the sink deposits its staged transaction in for the driver to commit.
 #[derive(Clone)]
 pub(crate) struct LoadWrite {
     pub(crate) db: Arc<crate::db::Omnigraph>,
     pub(crate) txn: Arc<crate::db::WriteTxn>,
     pub(crate) write_budget: crate::storage_layer::WriteBudget,
+    pub(crate) writers: usize,
     pub(crate) staged: Arc<std::sync::Mutex<Option<crate::exec::staging::StagedMutation>>>,
 }
 

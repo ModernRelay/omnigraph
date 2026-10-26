@@ -24,16 +24,26 @@ existing configuration-owned root selection.
 
 ## Managed CLI sessions
 
-A managed target supplies API, organization, authentication mechanism and optional
-cluster identity. Folder context cannot select a destination. The CLI validates
-operation applicability before credentials, HTTP or storage access. Legacy
-lifecycle evidence has a separate preservation guard: an explicit target cannot
-bypass pending/accepted custody migration.
+A profile owns API, organization and one auth provider for one identity. A managed
+target references it and pins cluster identity/incarnation plus an optional data
+endpoint. Whole-document structural validation precedes selected credential and
+runtime capability checks. Registration consumes authenticated endpoint attestation;
+refresh verifies unchanged incarnation and never synthesizes a route. This does
+not qualify BYOC private routing. See the [operator reference](../user/cli/targets.md)
+and [decision](../rfcs/2026-10-20-operator-connections-and-credential-providers.md).
+
+Pending/accepted lifecycle evidence remains separate from configuration and
+credential custody. Preserve it across removal, logout and upgrade. Retiring the
+old grammar does not authorize discarding unresolved work or replaying it under
+a new identity. `config recover-operations --source DIR --profile NAME`
+preserves matching legacy folder evidence without accepting old configuration
+or submitting remote operations; `managed/lifecycle/pending` owns that copy/retire
+protocol.
 
 The CLI's managed HTTP adapter obtains current access before each new request,
 including status polls. A rotating credential pair lives only in the OS
 keychain, independently of configuration directories and graph credentials.
-Local origin-scoped locking and a persisted pending marker prevent duplicate
+Profile-scoped coordination and a persisted pending marker prevent duplicate
 client exchanges; the provider owns credential rotation and session authority.
 The API verifies provider access and maps it to a stable principal. An uncertain
 exchange never authorizes a write replay.
@@ -248,10 +258,18 @@ served process's second line.
 
 Refs, version hints, cluster control objects, unknown paths, if-match
 replacements and recursive deletes remain conservative. A cancelled or
-ambiguous request sticks even if a higher layer consumes the error, and the
-scope logs its key and error. Rename also accounts for removal of its source.
-Single-attempt conditional conflicts and a delete answered "not found" are
-settled refusals.
+ambiguous request leaves its key unsettled even if a higher layer consumes the
+error, and the scope logs its key and error. A later request to that key, or a
+recursive delete over it, is refused before it is sent; other keys are
+unaffected. The scope remembers at most `MAX_UNSETTLED_KEYS` (4096) keys and
+past that refuses every mutation. Rename also accounts for removal of its
+source. Single-attempt conditional conflicts and a delete answered "not found"
+are settled refusals. `forbidden_apis.rs`
+(`mutable_key_requests_are_registered_issue_1067`) registers every
+unconditional request to a reused key in the engine, core, catalog, storage,
+cluster, server and Azure admission crates with why its late landing is
+harmless; a new one fails the guard until it is argued or made conditional or
+fresh.
 
 An unacknowledged manifest write may land after Lance reads it back as absent
 and attempts to delete its transaction file. One sticky flag therefore
@@ -265,12 +283,15 @@ replacing the scope is not permission to delete them. Definite conditional
 conflicts do not set the hold. A successful multipart abort does not clear a
 hold from an earlier unacknowledged completion.
 
-Scoped clients disable both transport and Lance AIMD retries, and local Lance
-uses its object-store file provider so direct file writes cannot bypass the
-scope. Embedded defaults and Azure serving clients are unchanged; the
+Scoped stores hold two clients. Reads and fresh immutable writes go to one
+with Lance's own bounded transport and AIMD retries; conditional requests and
+mutable keys go to one that makes a single attempt, so their owners see every
+attempt. Scoped control adapters keep three read retries within three minutes.
+Local Lance uses its object-store file provider so direct file writes cannot
+bypass the scope. Embedded defaults and Azure serving clients are unchanged; the
 automatic scoped shutdown path applies only to local and S3 roots.
 
-Only unique admission, successful startup and unpoisoned settlement permit final
+Only unique admission, successful startup and no unsettled key permit final
 release. Original adapters remain permanently closed; a private single-attempt
 client performs only exact-owner lock release under the same shutdown deadline.
 S3 release CAS writes a unique version-2 released marker at the existing key;
@@ -279,7 +300,50 @@ acknowledgement is an error, while its delayed CAS cannot affect a successor.
 Local release uses awaited exact-owner deletion; automatic Azure release remains
 unqualified and its prior retained-lock shutdown behavior is unchanged. Older
 tools refuse the new released record. This supplies neither
-distributed fencing, generic runtime reuse nor crash recovery.
+distributed fencing nor generic runtime reuse.
+
+On S3 roots a server's held lock is version 3 and carries `lease_seconds`
+(`lease.rs`, `state_lock.rs`); a CLI writer or deployment holds an unleased
+lock, because nothing would stop its writes when a lease fenced. Its owner
+creates `__cluster/lease/<lock_id>/beat-<seq>.json` put-if-absent every third
+of a lease, first before it admits work, and checks for
+`__cluster/lease/<lock_id>/superseded.json` before each beat. The lease's
+requests go through the root outside the owner's storage scope, on a client
+with the backend's retries (`ClusterStore::lease_adapter`): a failed beat
+neither unsettles the scope nor stops when the scope closes for a release.
+A beat already present is the owner's own earlier request and counts from
+the first send of that beat; an unanswered beat is sent again after a
+quarter of a beat interval. A timer of its own fences the owner two thirds
+of a lease after the first send of its last acknowledged beat, or at once on
+a claim. The first beat races the same deadline counted from the send of the
+lock's own write, because a successor may count silence from the moment the
+record is visible; when it lapses, or the claim read after beat 0 finds a
+claim, acquisition fails and the server does not serve. A fence fences the
+owner's storage scope (`StorageIoScope::fence`) before it is reported: every
+later request is refused, the parts and cleanup of an admitted multipart
+upload included, and every admitted request is cancelled, so the owner sends
+nothing after the fence however long its shutdown grace lasts. The server
+then closes admission and exits 2 without releasing. A
+serving acquisition that finds a version-3 lock watches the beat listing on
+its own monotonic clock. A new beat refuses it. An empty listing starts the
+silence and the first beat that appears restarts it, because the owner
+writes its lock before its first beat lands; an empty listing after a beat
+was seen refuses, like a new beat. A lease and a half of silence
+lets it make sure the claim exists (a claim already there, from any
+successor, only fences an owner that is somehow still running), then
+replace `lock.json` by if-match on the version it first read. That if-match
+alone decides the next owner: of two successors, or of a successor and the
+owner's clean release (if-match on the version it read), exactly one
+applies. A successor that stops between its claim and its if-match leaves
+`lock.json` unchanged, so the next start takes it over the same way. A clean release stops
+beating, deletes the lease directory, then releases as above. The lease
+coordinates liveness only; requests a dead owner sent before it fenced are
+fresh keys, conditional publications or audited mutable keys, which the
+storage-outcomes RFC (2026-10-19) argues cannot corrupt state. Local roots
+have no conditional update, so a successor could not replace `lock.json`
+without racing an exact-owner delete the old owner already sent; local
+locks, Azure locks and version-1 locks from older binaries carry no lease and
+keep exact-ID unlock.
 
 Do not bypass the cluster API with direct filesystem writes, edit `state.json`, or derive a second mutable inventory. Content digests and live observations are recomputed from the declared and durable authorities.
 
@@ -345,7 +409,7 @@ views with new epochs. Uncertain effects use existing process containment.
 Activation identity is installed in the same immutable registry snapshot as
 serving bindings: canonical root, process incarnation, original ID/input digest,
 achieved revision and config digest. The durable achieved receipt stays unchanged;
-there is no second ledger write after activation. `GET /cluster/deployments/{id}`
+there is no second ledger write after activation. `GET /cluster/deployments/{deployment_id}`
 reports active only for that exact current identity while its affected bindings
 are ready under their installed schema contracts, deleted entries are absent,
 and process admission remains open. An unrelated blocked graph does not invalidate
@@ -400,8 +464,8 @@ authorization still applies to ready graphs.
 The CLI's versioned keychain cache verifies endpoint and identity bindings before
 replacement. Unsupported caches refuse without automatic replacement. The provider-native client acquires missing/expired identity
 credentials before an operation using the selected managed target.
-A server target keeps the
-existing catalog unless `graphs list --discovery` is requested; the CLI never
+Both managed and standalone targets request the
+ordinary graph catalog unless `graphs list --discovery` is requested; the CLI never
 infers routing from an arbitrary bearer token's unverified shape.
 
 A replica reports what it booted from on `GET /readyz` (RFC 0049): the
@@ -434,10 +498,15 @@ results occupy one observed delivery slot until consumed or dropped. A known
 write retains its reservations in that slot: consuming it releases write
 capacity before the handler responds, while abandoning it destroys the output
 before releasing ownership. A read
-error or panic does not trigger write uncertainty. A write panic or explicitly
-indeterminate owned completion closes admission for every graph and signals the
-same bounded process shutdown, retaining
-unresolved reservations until exit. The engine's completion evidence decides:
+error or panic does not trigger write uncertainty. An owned write whose outcome is unknown for a storage reason the engine scopes,
+a publication in doubt (its version is created only if absent, so a late
+landing precedes the branch's next publication or never happens) or
+an opaque storage or I/O failure (whose mutable keys the scope holds unsettled),
+reports its outcome and releases its reservations; admission stays open. A
+write panic, a lost owner, `RecoveryRequired`, an opaque DataFusion failure or
+an uncertain deployment activation closes admission for every graph and
+signals the same bounded process shutdown, retaining unresolved reservations
+until exit. The engine's completion evidence decides:
 a failure it proves left the graph unchanged, before any effect or after
 detached effects no manifest names (`BeforeEffect`, `Unpublished`), is
 not itself a reason for logical containment, whatever status it maps to,
@@ -580,9 +649,19 @@ run every five seconds and access refuses at the original 300-second snapshot
 or token expiry. The exact format and limits are in
 [Identity credentials and applied policy authorization](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients).
 
-This profile enables `/.well-known/oauth-protected-resource` and `/mcp`. MCP
-uses the official Rust SDK and the existing stored-query/discovery handlers.
-The initial tools are read-only; invocation checks the stored query kind and
-the same Cedar policy as HTTP. A registered resource or listed tool is never
-a permission grant. Static-token deployments and the native signed-token
-profiles retain their existing behavior.
+The server mounts `/mcp` whenever it has a bearer credential source: static
+tokens, signed data tokens or OIDC. OIDC additionally enables
+`/.well-known/oauth-protected-resource` and the metadata path advertised in the
+authentication challenge. Ad-hoc reads and write tools require their separate
+boot opt-ins; every invocation uses the same handlers and policy as HTTP.
+A registered resource or listed tool is never a permission grant.
+
+`omnigraph-mcp` owns the SDK integration, tool/resource catalog, settings,
+argument decoding, result formatting and response deadlines. The server adapter
+owns authentication, OAuth metadata, handler dispatch and admission, retaining
+execution ownership when the caller stops waiting. It also supplies the canonical
+`ApiError` projection for protocol refusals and handler failures, including the
+unknown-effect disposition when an admitted write's result cannot be delivered.
+The protocol crate wraps these bodies without a second error-code registry.
+Both transports share one listener and serving lifecycle. The supported tools
+and limits live in the [MCP guide](../user/operations/mcp.md).

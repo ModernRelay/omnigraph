@@ -57,9 +57,17 @@ pub(super) fn work(
 }
 
 fn properties(schema: SchemaRef, emission: EmissionType) -> Arc<PlanProperties> {
+    partitioned_properties(schema, emission, 1)
+}
+
+fn partitioned_properties(
+    schema: SchemaRef,
+    emission: EmissionType,
+    partitions: usize,
+) -> Arc<PlanProperties> {
     Arc::new(PlanProperties::new(
         EquivalenceProperties::new(schema),
-        Partitioning::UnknownPartitioning(1),
+        Partitioning::UnknownPartitioning(partitions.max(1)),
         emission,
         Boundedness::Bounded,
     ))
@@ -341,8 +349,14 @@ pub(super) struct Source {
 
 impl Source {
     pub(super) fn new(schema: SchemaRef) -> Self {
+        Self::with_partitions(schema, 1)
+    }
+
+    /// A leaf of `partitions` output streams, each produced by its own call
+    /// of [`Self::stream`] on its own worker.
+    pub(super) fn with_partitions(schema: SchemaRef, partitions: usize) -> Self {
         Self {
-            properties: properties(schema, EmissionType::Incremental),
+            properties: partitioned_properties(schema, EmissionType::Incremental, partitions),
         }
     }
 
@@ -361,10 +375,25 @@ impl Source {
     where
         F: Future<Output = DfResult<()>> + Send + 'static,
     {
+        self.partition_stream(0, memory, metrics, body)
+    }
+
+    /// [`Self::stream`] for output partition `partition`, whose rows and
+    /// stamps the metrics keep under that partition.
+    pub(super) fn partition_stream<F>(
+        &self,
+        partition: usize,
+        memory: Arc<WorkMemory>,
+        metrics: &ExecutionPlanMetricsSet,
+        body: impl FnOnce(Arc<WorkMemory>, BatchSender) -> F + Send + 'static,
+    ) -> SendableRecordBatchStream
+    where
+        F: Future<Output = DfResult<()>> + Send + 'static,
+    {
         let schema = self.properties.eq_properties.schema().clone();
         polled(
             metrics,
-            producer_stream(schema, memory, Some(metrics), body),
+            produced_stream(schema, memory, Some((metrics, partition)), body),
         )
     }
 
@@ -544,6 +573,20 @@ fn producer_stream<F>(
 where
     F: Future<Output = DfResult<()>> + Send + 'static,
 {
+    produced_stream(schema, memory, metrics.map(|metrics| (metrics, 0)), body)
+}
+
+/// [`producer_stream`] counting its rows and stamps under the given output
+/// partition of `metrics`.
+fn produced_stream<F>(
+    schema: SchemaRef,
+    memory: Arc<WorkMemory>,
+    metrics: Option<(&ExecutionPlanMetricsSet, usize)>,
+    body: impl FnOnce(Arc<WorkMemory>, BatchSender) -> F + Send + 'static,
+) -> SendableRecordBatchStream
+where
+    F: Future<Output = DfResult<()>> + Send + 'static,
+{
     let owner = match memory.register_owned_work() {
         Ok(owner) => owner,
         Err(error) => {
@@ -580,9 +623,10 @@ where
             .in_current_span(),
         )),
     );
-    let baseline = metrics.map(|metrics| BaselineMetrics::new(metrics, 0));
-    let counts = metrics.map(|metrics| {
-        datafusion::physical_plan::metrics::MetricBuilder::new(metrics).counter("output_batches", 0)
+    let baseline = metrics.map(|(metrics, partition)| BaselineMetrics::new(metrics, partition));
+    let counts = metrics.map(|(metrics, partition)| {
+        datafusion::physical_plan::metrics::MetricBuilder::new(metrics)
+            .counter("output_batches", partition)
     });
     let stream = futures::stream::try_unfold(
         (builder.build(), receiver, None::<Arc<WorkMemory>>),

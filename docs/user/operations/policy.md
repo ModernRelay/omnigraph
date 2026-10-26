@@ -2,8 +2,9 @@
 
 OmniGraph uses Cedar policy bundles to authorize graph, server, and cluster
 configuration actions.
-Policies are declared in `cluster.yaml` and installed during cluster bootstrap
-or graph creation. Servers load them at startup or when activating a new graph.
+Policies are declared in `cluster.yaml` and installed by `cluster apply`.
+Servers load applied policies at startup and activate policy changes during
+live deployment, including changes to existing graphs.
 
 ## Actions
 
@@ -157,8 +158,9 @@ omnigraph policy explain \
 ```
 
 Edit the policy file or its `applies_to` bindings, then run
-`cluster apply --target URL --config DIR`. The server finishes admitted requests
-before activating matching HTTP and engine permissions. Later requests use the
+`cluster apply --target NAME --config DIR` using a registered server target.
+The server finishes admitted requests before activating matching HTTP and
+engine permissions. Later requests use the
 new rules. Cluster management policy changes take effect in the same deployment;
 a newly granted administrator cannot authorize that grant.
 
@@ -176,7 +178,7 @@ curl -H "Authorization: Bearer $TOKEN" -H "Omnigraph-Http-Api: 0.14" \
 With the example graph policy above, `act-alice` gets:
 
 ```json
-{"actor":"act-alice","graph_id":"knowledge","graph_wide":["read","invoke_query"],
+{"actor_id":"act-alice","graph_id":"knowledge","graph_wide":["read","invoke_query"],
  "branch":"feature","target_branch":"main","actions":["read"]}
 ```
 
@@ -204,8 +206,9 @@ judges branches by name without checking that they exist. It names actions,
 never the rules behind them, and reveals nothing about other actors. A static
 token on a graph without a policy gets `read` alone, and a signed data
 credential without one nothing, as those routes decide; a server without
-authentication allows every graph action and reports no `actor`. The MCP
-`access` tool returns the same body.
+authentication allows every graph action and reports `actor_id: null`. The MCP
+`access` tool returns the same body, and `omnigraph access` prints it for a
+server target ([what you may do at a target](../cli/targets.md#what-you-may-do-at-a-target)).
 
 It reports policy actions, not actor views, so a view can still refuse a
 `change` the policy allows.
@@ -221,8 +224,9 @@ graph/action grants. Version-1 restricted credentials are not accepted.
 For direct CLI writes, actor resolution is:
 
 1. `--as <ACTOR>`;
-2. `operator.actor` in `~/.omnigraph/config.yaml`;
-3. no actor.
+2. no actor.
+
+The version-1 operator document has no actor field.
 
 When a policy is installed, a missing actor is denied. Only the server
 resolves a served write's actor; there `--as` is an assertion the server checks

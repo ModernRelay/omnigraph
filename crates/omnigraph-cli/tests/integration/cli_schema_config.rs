@@ -62,7 +62,7 @@ fn version_command_prints_cli_version_http_contract_and_storage_formats_issue_97
             "channel": channel,
             "commit": commit,
             "http_contract": HTTP_API_CONTRACT,
-            "protocols": {"target": 1, "credential": 1},
+            "protocols": {"target": 2, "credential": 2, "access": 2},
             "internal_schema": { "writes": WRITES, "serves": [LOWEST, WRITES] },
         }),
     );
@@ -79,7 +79,7 @@ fn clap_exit_status_survives_closed_output() {
         (vec!["--help"], 0, false),
         (vec!["--version"], 0, false),
         (vec!["query", "--help"], 0, false),
-        (vec!["--unknown-option"], 2, true),
+        (vec!["--unknown-option"], 64, true),
     ] {
         // Close the reader before spawning, avoiding the race in `| head -n0`.
         let (reader, writer) = UnixStream::pair().unwrap();
@@ -96,6 +96,51 @@ fn clap_exit_status_survives_closed_output() {
         assert_eq!(output.status.code(), Some(expected), "{args:?}: {output:?}");
         assert!(output.stdout.is_empty(), "{args:?}");
         assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+    }
+}
+
+/// A failure the CLI cannot deliver keeps the exit its outcome chose: a write
+/// whose receipt meets a closed stdout may have committed, so it exits 2,
+/// never the 1 that says nothing changed; a read still exits 1.
+#[test]
+fn an_undelivered_failure_keeps_its_exit() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    let graph = graph.to_str().unwrap();
+    for (args, expected) in [
+        (
+            vec![
+                "mutate",
+                "--target",
+                graph,
+                "-e",
+                "query add() { insert Person { name: \"Undelivered\", age: 1 } }",
+                "--json",
+            ],
+            2,
+        ),
+        (vec!["snapshot", "--target", graph, "--json"], 1),
+    ] {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        let writer: OwnedFd = writer.into();
+        let output = cli_process()
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(writer))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(expected), "{args:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("could not deliver CLI diagnostic"),
+            "{args:?}: {stderr}"
+        );
     }
 }
 
@@ -298,10 +343,13 @@ fn help_groups_commands_by_capability() {
     assert!(output.stderr.is_empty(), "{output:?}");
 
     assert!(
-        stdout.contains("--target NAME|ADDRESS")
+        stdout.contains("--target <NAME|ADDRESS>")
             && stdout.contains("defaults.target")
-            && stdout.contains("Target kind determines command availability")
-            && stdout.contains("--config supplies source files only"),
+            && stdout
+                .contains("Select resources with --target and account operations with --profile")
+            && !stdout.contains("--auth")
+            && stdout.contains("--operator-config selects one operator file")
+            && stdout.contains("--config supplies deployment sources"),
         "target/capability guidance missing from --help:\n{stdout}"
     );
 
@@ -472,7 +520,8 @@ fn schema_plan_with_server_flag_errors_wrong_plane() {
                 cli()
                     .args(["schema", command, "--schema"])
                     .arg(&schema)
-                    .args(["--target", &server.origin]),
+                    .args(["--target"])
+                    .fixture_target(&server.origin),
             );
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
@@ -985,7 +1034,8 @@ fn explicit_graph_discovery_preserves_jwt_shaped_static_catalog_and_skips_contex
         command
             .current_dir(directory.path())
             .envs(operator.env(&token))
-            .args(["graphs", "list", "--target", &server.origin]);
+            .args(["graphs", "list", "--target"])
+            .fixture_target(&server.origin);
         if json_output {
             command.arg("--json");
         }
@@ -1037,7 +1087,7 @@ fn init_rejects_two_explicit_destinations() {
 }
 
 #[test]
-fn init_rejects_retired_profile_selection() {
+fn init_rejects_managed_profile_selection() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     let output = output_failure(
@@ -1047,7 +1097,12 @@ fn init_rejects_retired_profile_selection() {
             .args(["--profile", "localdev"])
             .arg(&graph),
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--profile'"));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("init does not accept --profile"),
+        "{output:?}"
+    );
     assert!(!graph.exists());
 }
 
@@ -1077,10 +1132,7 @@ fn graphs_list_rejects_graph_selector() {
 
 #[test]
 fn graphs_list_requires_a_target_and_rejects_legacy_ambient_selection() {
-    for (profile, expected) in [
-        ("", "target_required"),
-        ("prod", "OMNIGRAPH_PROFILE is retired"),
-    ] {
+    for (profile, expected) in [("", "target_required"), ("prod", "target_required")] {
         let output = output_failure(
             cli()
                 .env("OMNIGRAPH_PROFILE", profile)
@@ -1097,7 +1149,7 @@ fn graphs_list_requires_a_target_and_rejects_legacy_ambient_selection() {
 #[test]
 fn graphs_list_rejects_named_direct_targets() {
     let home = tempfile::tempdir().unwrap();
-    fs::write(home.path().join("config.yaml"), "target_config_version: 1\ntargets:\n  graph:\n    kind: direct\n    scope: graph\n    uri: file:///data/dev.omni\n  root:\n    kind: direct\n    scope: root\n    uri: .\n").unwrap();
+    fs::write(home.path().join("config.yaml"), "version: 1\ntargets:\n  graph:\n    kind: direct\n    scope: graph\n    uri: file:///data/dev.omni\n  root:\n    kind: direct\n    scope: root\n    uri: file:///data/root\n").unwrap();
     for target in ["graph", "root"] {
         let output = output_failure(
             cli()
@@ -1116,4 +1168,260 @@ fn graphs_list_rejects_named_direct_targets() {
 fn graphs_list_rejects_as_actor() {
     let output = output_failure(cli().args(["graphs", "list", "--as", "act-op"]));
     assert!(String::from_utf8_lossy(&output.stderr).contains("graphs list does not accept --as"));
+}
+
+#[test]
+fn operator_config_selection_validation_and_inspection_are_offline() {
+    let home = tempfile::tempdir().unwrap();
+    let selected = tempfile::tempdir().unwrap();
+    let trap = crate::support::managed_http::IntentApiFixture::new(vec![]);
+    // Explicit file selection replaces the home file; it does not merge it.
+    fs::write(home.path().join("config.yaml"), "invalid: [").unwrap();
+    let config = selected.path().join("operator.yaml");
+    fs::write(
+        &config,
+        format!(
+            r#"version: 1
+profiles:
+  account:
+    api: {}
+    organization_id: account-one
+    auth:
+      provider: token
+      source: {{env: CLI_TEST_ABSENT_TOKEN}}
+  other:
+    api: https://other.example.test
+    organization_id: account-two
+    auth: {{provider: omnigraph}}
+targets:
+  cluster:
+    kind: managed
+    profile: account
+    cluster_id: cluster-one
+    cluster_incarnation: inc-one
+    default_graph: knowledge
+defaults:
+  profile: other
+  target: cluster
+"#,
+            trap.origin
+        ),
+    )
+    .unwrap();
+    let before = fs::read(&config).unwrap();
+    let invoke = |args: &[&str]| {
+        let mut command = cli();
+        command
+            .env("OMNIGRAPH_HOME", home.path())
+            .env_remove("CLI_TEST_ABSENT_TOKEN")
+            .arg("--operator-config")
+            .arg(&config)
+            .args(args);
+        command
+    };
+    let valid = parse_stdout_json(&output_success(&mut invoke(&[
+        "config", "validate", "--json",
+    ])));
+    assert_eq!(valid, serde_json::json!({"valid": true, "version": 1}));
+    let inspected = parse_stdout_json(&output_success(&mut invoke(&[
+        "target",
+        "inspect",
+        "cluster",
+        "--resolved",
+        "--json",
+    ])));
+    assert_eq!(inspected["target"]["profile"], "account");
+    assert_eq!(inspected["profile"]["organization_id"], "account-one");
+    assert_eq!(inspected["identity"]["status"], "unknown");
+    let credential = parse_stdout_json(&output_success(&mut invoke(&[
+        "credentials",
+        "status",
+        "--profile",
+        "account",
+        "--json",
+    ])));
+    assert_eq!(credential["availability"], "absent");
+    assert_eq!(credential["profile"], "account");
+    assert_eq!(credential["owner"]["kind"], "profile");
+    for args in [
+        vec!["cluster", "list", "--target", "cluster"],
+        vec!["branch", "list", "--profile", "account"],
+        vec![
+            "cluster",
+            "list",
+            "--profile",
+            "account",
+            "--target",
+            "cluster",
+        ],
+        vec!["config", "validate", "--auth", "automation"],
+        vec![
+            "credentials",
+            "status",
+            "--profile",
+            "account",
+            "--auth",
+            "automation",
+        ],
+        vec!["credentials", "status", "--auth", "automation"],
+        vec![
+            "branch",
+            "list",
+            "--target",
+            "cluster",
+            "--profile",
+            "other",
+        ],
+        vec![
+            "branch",
+            "list",
+            "--target",
+            "cluster",
+            "--auth",
+            "automation",
+        ],
+        vec![
+            "cluster",
+            "status",
+            "--target",
+            "cluster",
+            "--profile",
+            "other",
+        ],
+        vec!["login", "--profile", "account", "--auth", "automation"],
+        vec![
+            "config",
+            "rename-auth",
+            "automation",
+            "renamed",
+            "--profile",
+            "account",
+        ],
+    ] {
+        output_failure(&mut invoke(&args));
+    }
+    for selector in ["--profile", "--operator-config", "--target"] {
+        let output = output_failure(
+            cli()
+                .env("OMNIGRAPH_HOME", home.path())
+                .args([selector, "one", "cluster", "status", selector, "two"]),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("cannot be used multiple times"),
+            "{output:?}"
+        );
+    }
+    for args in [
+        vec!["cluster", "list", "--connection", "account"],
+        vec!["query", "--target", "cluster", "--auth", "old", "-e", "q"],
+        vec!["config", "rename-auth", "server", "old", "first", "second"],
+        vec!["config", "rename-connection", "account", "renamed"],
+    ] {
+        let output = output_failure(&mut invoke(&args));
+        assert_eq!(output.status.code(), Some(64), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+    }
+    assert_eq!(fs::read(&config).unwrap(), before);
+    assert!(trap.requests().is_empty());
+    trap.assert_complete();
+}
+
+#[test]
+fn operator_config_clean_slate_refuses_legacy_and_ambiguous_documents() {
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("operator.yaml");
+    for source in [
+        "version: 1\nconnections: {}\n",
+        "version: 1\ndefaults: {connection: old}\n",
+        "version: 1\nprofiles:\n  old: {api: https://example.test, organization_id: org, auth: {human: {provider: omnigraph}}}\n",
+        "version: 1\nprofiles:\n  old: {api: https://example.test, organization_id: org, default_auth: human, auth: {provider: omnigraph}}\n",
+        "version: 1\nprofiles:\n  account: {api: https://example.test, organization_id: org, auth: {provider: omnigraph}}\ntargets:\n  old: {kind: managed, connection: account, cluster_id: cluster, cluster_incarnation: one}\n",
+        "version: 1\nprofiles:\n  account: {api: https://example.test, organization_id: org, auth: {provider: omnigraph}}\ntargets:\n  old: {kind: managed, profile: account, auth: human, cluster_id: cluster, cluster_incarnation: one}\n",
+        "target_config_version: 1\ntargets: {}\n",
+        "version: 2\n",
+        "version: 1\nversion: 1\n",
+        "version: 1\noperator: {actor: act-old}\n",
+        "version: 1\nservers: {}\n",
+        "version: 1\nunknown: value\n",
+        "version: 1\n---\nversion: 1\n",
+        "version: 1\ntargets:\n  old: {kind: server, endpoint: https://example.test, credential: old}\n",
+        "version: 1\ntargets:\n  old: {kind: server, endpoint: https://example.test, auth: anonymous}\n",
+        "version: 1\ntargets:\n  old: {kind: server, endpoint: https://example.test, auth: {named: {provider: anonymous}}}\n",
+        "version: 1\ntargets:\n  old: {kind: server, endpoint: https://example.test, auth: {provider: anonymous}, default_auth: named}\n",
+        "version: 1\nconnections:\n  old: {api: http://127.0.0.1:9, organization_id: org, auth: {token: {provider: token, source: {env: UNUSED}}}}\n",
+        "version: 1\ntargets:\n  old: {kind: server, endpoint: http://127.0.0.1:9, auth: {token: {provider: token, source: {env: UNUSED}}}}\n",
+    ] {
+        fs::write(&config, source).unwrap();
+        let before = fs::read(&config).unwrap();
+        output_failure(
+            cli()
+                .env("OMNIGRAPH_HOME", home.path())
+                .arg("--operator-config")
+                .arg(&config)
+                .args(["config", "validate", "--json"]),
+        );
+        assert_eq!(fs::read(&config).unwrap(), before);
+        assert!(!home.path().join("credentials").exists());
+    }
+    // Selecting a missing explicit file cannot fall back to a valid home file.
+    fs::write(home.path().join("config.yaml"), "version: 1\n").unwrap();
+    output_failure(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .arg("--operator-config")
+            .arg(home.path().join("missing.yaml"))
+            .args(["config", "validate"]),
+    );
+}
+
+#[test]
+fn server_target_uses_one_auth_source_without_fallback() {
+    let home = tempfile::tempdir().unwrap();
+    let server = crate::support::managed_http::IntentApiFixture::graph(vec![]);
+    let config = home.path().join("config.yaml");
+    fs::write(
+        &config,
+        format!(
+            r#"version: 1
+targets:
+  server:
+    kind: server
+    endpoint: {}
+    auth:
+      provider: token
+      source: {{env: CLI_TEST_SELECTED_TOKEN}}
+"#,
+            server.origin
+        ),
+    )
+    .unwrap();
+    let before = fs::read(&config).unwrap();
+    // The sole configured source cannot fall back to the retired keyed or
+    // unkeyed token variables when it is absent.
+    output_failure(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .env_remove("CLI_TEST_SELECTED_TOKEN")
+            .env("OMNIGRAPH_TOKEN_SERVER", "must-not-be-used")
+            .env("OMNIGRAPH_BEARER_TOKEN", "must-not-be-used")
+            .args([
+                "--target",
+                "server",
+                "--graph",
+                "knowledge",
+                "branch",
+                "list",
+            ]),
+    );
+    let status = parse_stdout_json(&output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .env("CLI_TEST_SELECTED_TOKEN", "present-but-not-read")
+            .args(["credentials", "status", "--target", "server", "--json"]),
+    ));
+    assert_eq!(status["availability"], "present");
+    assert_eq!(status["server_validity"], "unverified");
+    assert_eq!(fs::read(&config).unwrap(), before);
+    assert!(server.requests().is_empty());
+    server.assert_complete();
 }

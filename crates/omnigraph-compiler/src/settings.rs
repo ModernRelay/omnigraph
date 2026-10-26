@@ -99,7 +99,7 @@ pub const DEFINITIONS: &[SettingSpec] = &[
         default: "8",
         scope: SettingScope::Process,
         env: "OMNIGRAPH_LOAD_CONCURRENCY",
-        doc: "the width of the staged-write fan-out for `load` and `mutate`",
+        doc: "the width of the staged-write fan-out for `load` and `mutate`: tables staged at once, and in one `load csv` overwrite the Lance writers and the streams that parse the source (one per 8 MiB of it, at most this many)",
     },
     SettingSpec {
         name: "traversal_work_limit",

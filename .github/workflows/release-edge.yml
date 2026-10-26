@@ -236,6 +236,13 @@ jobs:
             # Releases before 0.14 print text only.
             "$RUNNER_TEMP/stable-bin/omnigraph" version --json > "$RUNNER_TEMP/stable-version.out" 2>/dev/null \
               || "$RUNNER_TEMP/stable-bin/omnigraph" version > "$RUNNER_TEMP/stable-version.out"
+            # Releases before 0.14 do not report their HTTP contract; the
+            # composer reads it from the source the tag built.
+            git rev-parse --verify --quiet "refs/tags/${stable_tag}^{commit}" > /dev/null
+            contract_source="${stable_tag}:crates/omnigraph-api-types/src/lib.rs"
+            if git cat-file -e "$contract_source" 2>/dev/null; then
+              git show "$contract_source" > "$RUNNER_TEMP/stable-api-types.rs"
+            fi
           fi
           echo "stable_tag=${stable_tag}" >> "$GITHUB_OUTPUT"
 
@@ -252,6 +259,9 @@ jobs:
           stable=()
           if [[ -n "$STABLE_TAG" ]]; then
             stable=(--stable-tag "$STABLE_TAG" --stable-version "$RUNNER_TEMP/stable-version.out")
+            if [[ -f "$RUNNER_TEMP/stable-api-types.rs" ]]; then
+              stable+=(--stable-source "$RUNNER_TEMP/stable-api-types.rs")
+            fi
           fi
           for kind in build rolling; do
             rolling=()

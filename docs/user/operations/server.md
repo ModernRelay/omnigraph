@@ -30,8 +30,8 @@ An applied empty cluster creates no default graph and serves an empty inventory.
 Missing or unapplied state, or a nonempty cluster whose graphs all fail, refuses
 startup. Authentication, policy and data-token root checks still apply.
 
-Use `cluster apply --target URL --config DIR` for schema, query, policy,
-provider and Blob-rule changes without restart. Graph additions and removals
+Use `cluster apply --target NAME --config DIR` with a registered server target
+for schema, query, policy, provider and Blob-rule changes without restart. Graph additions and removals
 use the same deployment; removal deletes the graph's managed storage and history. Direct apply requires stopped serving and a subsequent
 start; see [cluster deployments](../clusters/index.md).
 An unapplied resource edit does not activate it, although changing or breaking
@@ -59,13 +59,13 @@ its error class, never by its message; see
 
 ## HTTP contract
 
-Upgrade the CLI, server and HTTP integrations together. Every protected
+Refresh the CLI, server and HTTP integrations together ([0.14 release notes](../../releases/v0.14.0.md)). Every protected
 request requires exactly one `Omnigraph-Http-Api: 0.14`: graph, registry and
 cluster-deployment calls, including `/graphs/discovery`, JSON, streams and Blob GET/HEAD. Missing,
 duplicate, combined or unsupported values return `400 api_contract_mismatch`
 after authentication but before graph lookup, body decoding or execution. This HTTP identifier is
-separate from package/storage versions and grants no permission. The previous `0.13` value is
-refused; update integrations to the current routes, shapes and credentials before their header.
+separate from package/storage versions and grants no permission. Earlier prerelease builds also use `0.14`,
+so header admission cannot detect their older shapes; refresh components together and regenerate SDKs.
 
 Ordinary responses, including errors and streams, carry the same header. Check
 it before decoding or emitting the body. A missing/incompatible response header
@@ -73,7 +73,10 @@ means unknown effects, never permission to replay. Proxies must preserve it both
 
 Server URLs name the service root, including its proxy prefix. Select a graph
 with `--graph`, `default_graph` or `alias.graph`. Migrate graph-qualified server
-URLs to that root plus graph selection; the CLI never guesses a root from a path. A `unix:///absolute/path.sock` URL names a Unix-domain socket instead: its whole path is the socket, so it has no proxy prefix, and requests carry `Host: localhost`; see [Unix-socket access](../deployment.md#unix-socket-access).
+URLs to that root plus graph selection; the CLI never guesses a root from a path.
+Register the endpoint under `targets:` and select its name with `--target`;
+inline remote URLs and Unix socket targets are unsupported. Other clients can
+use a [Unix-socket gateway](../deployment.md#unix-socket-access).
 
 Server targets bind a credential owner or anonymous access to an endpoint scope.
 Every composed route must retain that captured choice. A more specific target
@@ -88,8 +91,7 @@ trip; its existing deadline stays separate. Neither request follows redirects
 or retries automatically. Older clients/servers without this contract are unsupported.
 
 MCP/OAuth metadata neither require nor return this header; managed control-plane
-APIs keep their separate protocol. The accepted [HTTP admission decision](../../rfcs/2026-09-30-v012-http-admission.md)
-defines exact request/response and refusal rules.
+APIs keep their separate protocol.
 
 ## Authentication
 
@@ -102,9 +104,10 @@ Choose one static token source:
 | `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` | Path to that JSON object |
 | `OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET` | Secrets Manager mapping; requires an AWS-enabled build: the container images, the release archives from v0.14.0 and every edge build, or a source build with `cargo build -p omnigraph-server --features aws` |
 
-Send `Authorization: Bearer secret-a`. The token selects the actor for
-authorization and commit attribution; clients cannot claim another actor.
-See [Authorization and actors](policy.md).
+Send `Authorization: Bearer secret-a` (the scheme is case-insensitive). The token selects the
+actor for authorization and commit attribution; clients cannot claim another actor. See
+[Authorization and actors](policy.md). Every 401 carries a `WWW-Authenticate: Bearer` challenge,
+with `error="invalid_token"` when the server refused the token sent.
 
 A server with neither static tokens, signed-token trust, nor policy refuses to start unless you explicitly
 pass `--unauthenticated` (or set `OMNIGRAPH_UNAUTHENTICATED=1`). Use that only
@@ -119,8 +122,8 @@ protected request, `/mcp` included. After authentication and the contract check 
 before admission), and before graph lookup or any effect, a match changes nothing and a mismatch
 is `412 actor_mismatch` with nothing run; a server without authentication resolves no actor. A
 repeated, padded or empty header is `400 bad_request`. The header never supplies the actor, and a
-server before contract `0.14` refuses the contract first. The CLI sends it for `--as` on served
-writes and on served `cluster plan` and `cluster apply`.
+server with an incompatible HTTP contract refuses that contract first. The CLI sends it for `--as` on served
+writes, served `cluster plan` and `apply`, and every [`mcp`](mcp.md#connect-a-stdio-agent) request.
 
 ### Signed data credentials
 
@@ -205,10 +208,9 @@ never fetch keys or call a control service, so publisher outages eventually
 prevent new OIDC access; accepted operations can finish. Admission refresh does
 not restart writers. Graph configuration retains its normal activation.
 
-With this profile configured, the server also serves public
-protected-resource metadata and an OAuth challenge on its [`/mcp`](mcp.md)
-endpoint, so standard OAuth clients such as Claude can sign in. The [MCP guide](mcp.md) describes the
-endpoint, its tools, settings and limits.
+With this profile configured, the server also serves public protected-resource metadata and names it
+in every 401's challenge, so standard OAuth clients such as Claude can sign in. The [MCP guide](mcp.md)
+describes sign-in, which resource identifier to choose, and the endpoint's tools, settings and limits.
 
 ## Route families
 
@@ -219,21 +221,22 @@ endpoint, its tools, settings and limits.
 | `GET /openapi.json` | Runtime copy of the OpenAPI document |
 | `GET /graphs` | Graph metadata catalog; requires `graph_list` policy |
 | `GET /graphs/discovery` | Graph IDs and display names only; requires an identity credential |
+| `POST /cluster/plan` | Preview source changes against the running cluster without applying them |
 | `POST /cluster/deployments` | Submit an exact-ID deployment: graph creation/deletion or schema, query, policy, provider and Blob-binding changes |
-| `GET /cluster/deployments`, `GET /cluster/deployments/{id}` | Authorized deployment status and current-process activation observation |
+| `GET /cluster/deployments`, `GET /cluster/deployments/{deployment_id}` | Authorized deployment status and current-process activation observation |
 | `GET /.well-known/oauth-protected-resource`, also at the resource's path suffix | Public OIDC resource metadata; only when OIDC trust is configured |
 | `/mcp` | The [MCP endpoint](mcp.md); when static tokens, signed data tokens or OIDC trust are configured |
-| `/graphs/{id}/query`, `/mutate` | Run inline GQ source |
-| `/graphs/{id}/mutate/if-graph-commit` | Run an inline conditional mutation |
-| `/graphs/{id}/queries` | List and invoke stored queries, including conditional mutations |
-| `/graphs/{id}/load`, `/load/ndjson` | Bounded batch loading |
-| `/graphs/{id}/blob` | GET/HEAD one Blob cell; PUT/DELETE to replace or clear it |
-| `/graphs/{id}/branches` | Branch management and merge, a detailed listing (`GET /branches?detailed=true`), a merge dry run (`dry_run: true`), a branch's diff against its merge base (`GET /branches/diff`) and that merge base (`GET /branches/merge-base`) |
-| `/graphs/{id}/snapshot`, `/commits` | Snapshot (`internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version), history (paged with `limit` and `page_token`), per-commit changes, and the unpublished commits of a branch (`GET /commits?unpublished=true`, `POST /commits/{commit_id}/publish`, `DELETE /commits/{commit_id}`) |
-| `/graphs/{id}/changes`, `/diff` | Poll a branch feed, establish a baseline, or diff two points (branches or commit ids) |
-| `/graphs/{id}/schema` | Show the accepted schema |
-| `GET /graphs/{id}/access` | The caller's own actor and the actions its credential allows; see [Learn your access](policy.md#learn-your-access) |
-| `/graphs/{id}/export` | Stream a branch snapshot as JSONL |
+| `/graphs/{graph_id}/query`, `/mutate` | Run inline GQ source |
+| `/graphs/{graph_id}/mutate/if-graph-commit` | Run an inline conditional mutation |
+| `/graphs/{graph_id}/queries` | List and invoke stored queries, including conditional mutations |
+| `/graphs/{graph_id}/load`, `/load/ndjson` | Bounded batch loading |
+| `/graphs/{graph_id}/blob` | GET/HEAD one Blob cell; PUT/DELETE to replace or clear it |
+| `/graphs/{graph_id}/branches` | Branch management and merge, a detailed listing (`GET /branches?detailed=true`), a merge dry run (`dry_run: true`), a branch's diff against its merge base (`GET /branches/diff`) and that merge base (`GET /branches/merge-base`) |
+| `/graphs/{graph_id}/snapshot`, `/commits` | Snapshot (`internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version), history (paged with `limit` and `page_token`), per-commit changes, and the unpublished commits of a branch (`GET /commits?listing=unpublished`, `POST /commits/{commit_id}/publish`, `DELETE /commits/{commit_id}`) |
+| `/graphs/{graph_id}/changes`, `/diff` | Poll a branch feed, establish a baseline, or diff two points (branches or commit ids) |
+| `/graphs/{graph_id}/schema` | Show the accepted schema |
+| `GET /graphs/{graph_id}/access` | The caller's own actor and the actions its credential allows; see [Learn your access](policy.md#learn-your-access) |
+| `/graphs/{graph_id}/export` | Stream a branch snapshot as JSONL |
 
 `/query` also serves `branch list`, the branch reads (`branch diff`, `branch merge-base`, `branch merge … dry run`), `show`, and [explain](../queries/explain.md).
 `/mutate` serves `branch create`, `branch delete`, `branch merge`, `commit publish`,
@@ -241,9 +244,6 @@ and `commit drop`. See [Branching](../branching/index.md).
 Each of `/query`, `/mutate`, `/mutate/if-graph-commit` and `/branches/merge`
 takes an optional `settings` field, and the two GET change routes a `set=`
 parameter; see [Session settings](../queries/index.md#session-settings).
-
-Change a managed graph's schema through `cluster apply --target URL --config DIR`; see
-[cluster deployments](../clusters/index.md#deploy-without-restarting).
 
 ## Run an inline query
 
@@ -292,8 +292,8 @@ curl -sS http://localhost:8080/graphs/knowledge/mutate/if-graph-commit \
   -d '{"query":"query rename($name: String) { update Person set { name: $name } where email = \"ada@example.com\" }","name":"rename","params":{"name":"Ada"}}'
 ```
 
-Stored mutations use `POST /graphs/{id}/queries/{name}/if-graph-commit` with
-that header. Ordinary `/mutate` and `/queries/{name}`
+Stored mutations use `POST /graphs/{graph_id}/queries/{query_name}/if-graph-commit` with
+that header. Ordinary `/mutate` and `/queries/{query_name}`
 reject it rather than ignore the condition. Never fall back to an unconditional
 route after a conditional request fails.
 
@@ -309,7 +309,7 @@ returns `"commit": null`.
 
 ## Load NDJSON
 
-`POST /graphs/{id}/load/ndjson` accepts logical node and edge records with
+`POST /graphs/{graph_id}/load/ndjson` accepts logical node and edge records with
 `Content-Type: application/x-ndjson`. The request is one bounded atomic graph
 batch; it is not a durable stream or an unbounded ingestion session. Split a
 larger feed into batches and wait for each response before acknowledging it
@@ -324,27 +324,27 @@ modes, including [CSV statements on `/mutate`](../mutations/index.md#csv-loading
 
 ## Deliver Blob values
 
-`GET`/`HEAD /graphs/{id}/blob` select a cell by `entity`, `type`, `id` and `property`,
+`GET`/`HEAD /graphs/{graph_id}/blob` select a cell by `entity`, `type`, `id` and `property`,
 support managed ranges/ETag conditions, and report external references without fetching
 them. `PUT` and `DELETE` replace or clear the cell; see [Blob values](../blobs.md),
 [Replacing one Blob value](../blobs.md#replacing-one-blob-value) and [Blob limits](../blobs.md#limits).
 
 ## Changes and baselines
 
-`GET /graphs/{id}/commits/{commit_id}/changes` compares a commit with its first
-parent, `GET /graphs/{id}/diff?from=&to=` any two points, and `/branches/diff`
-a branch with its merge base. `GET /graphs/{id}/changes` polls branch commits
+`GET /graphs/{graph_id}/commits/{commit_id}/changes` compares a commit with its first
+parent, `GET /graphs/{graph_id}/diff?from=&to=` any two points, and `/branches/diff`
+a branch with its merge base. `GET /graphs/{graph_id}/changes` polls branch commits
 and returns a durable cursor; unreadable history returns `410 change_feed_gap`.
-`POST /graphs/{id}/changes/baseline` streams entities, a snapshot commit and a
+`POST /graphs/{graph_id}/changes/baseline` streams entities, a snapshot commit and a
 resume cursor ([Changes, Diffs and Change Feeds](../branching/changes.md)).
 
 ## Errors and retries
 
-Application errors preserve structured details. Admission limits use `429` with
-`Retry-After`; size limits use `413`, and blocked graphs or closed admission use
-`503`. Admitted writes continue after disconnect. Only the
-CLI's qualified whole-command admission refusal permits exit 75 and caller retry;
-generic 409/503 and lost responses do not. See [failure outcomes](troubleshooting.md#failed-data-write-commands).
+Every error body, an unknown route's and a malformed request's included, carries
+a `code`, its details and a `disposition` (`effects`, `action`; see
+[failed writes](troubleshooting.md#failed-data-write-commands)); a write the
+server could not settle is `outcome_unknown`, with `500`. Admission limits use `429`, size limits `413`, blocked graphs or closed admission `503`, each refusal
+that asks for a retry with `Retry-After`. Admitted writes continue after disconnect.
 
 For TLS, secrets, storage credentials, container examples and Azure admission,
 see [Deployment](../deployment.md).

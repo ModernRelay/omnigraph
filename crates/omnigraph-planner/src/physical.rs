@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::aggregate::AggregateSpec;
-use crate::cost::{AccessPath, AntiJoinStrategy, ExpandMode, ExpandPolicy};
+use crate::cost::{AccessPath, AntiJoinStrategy, ExpandMode, ExpandPolicy, ValidateRemoval};
 use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
 use crate::logical::{
     ColumnRef, CsvSourceSpec, FragmentWriteSpec, KeyJoinKind, ScanSpec, ValidateSpec,
@@ -889,12 +889,13 @@ physical_nodes! {
         max_workers: u32,
     } => "CsvSource" [];
     /// The one validation over the whole delta, a pipeline breaker: every
-    /// check extracted in one pass per batch, each check's `access` saying
-    /// how its committed image is read after the last batch.
+    /// check extracted in one pass per batch, each check's `access` saying how
+    /// its committed image is read, `removal` whether removed ids are found.
     Validate {
         input: NodeId,
         table: String,
         checks: Vec<ValidateSpec>,
+        removal: ValidateRemoval,
         max_workers: u32,
     } => "Validate" [input: NodeId];
     /// The fragment sink: the validated delta, every input checked against
@@ -1524,10 +1525,12 @@ impl PhysicalPlan {
             PhysicalNode::Validate {
                 table,
                 checks,
+                removal,
                 max_workers,
                 ..
             } => {
                 let mut value = validate_json(table, checks);
+                value["removal"] = json!(removal);
                 value["max_workers"] = json!(max_workers);
                 value
             }
@@ -1580,12 +1583,24 @@ impl PhysicalPlan {
         let id = pipelines.len();
         pipelines.push(PipelineSpec {
             id,
+            partitions: self.source_partitions(&source),
             source,
             operators,
             sink: PipelineSink::Consumer,
             depends_on,
         });
         pipelines
+    }
+
+    /// The output partitions of a pipeline's source.
+    fn source_partitions(&self, source: &PipelineSource) -> u32 {
+        match source {
+            PipelineSource::Node(id) => match self.node(*id) {
+                Some(PhysicalNode::CsvSource { max_partitions, .. }) => (*max_partitions).max(1),
+                _ => 1,
+            },
+            PipelineSource::Streaming { .. } | PipelineSource::Tombstone(_) => 1,
+        }
     }
 
     /// [`Self::pipelines`] serialized for explain: per pipeline its `id`,
@@ -1610,6 +1625,7 @@ impl PhysicalPlan {
         json!({
             "id": pipeline.id,
             "source": self.source_json(&pipeline.source),
+            "partitions": pipeline.partitions,
             "operators": self.operators_json(&pipeline.operators),
             "sink": sink,
             "depends_on": pipeline.depends_on,
@@ -1793,6 +1809,7 @@ impl PhysicalPlan {
         let id = pipelines.len();
         pipelines.push(PipelineSpec {
             id,
+            partitions: self.source_partitions(&source),
             source,
             operators,
             sink: PipelineSink::Breaker(sink),
@@ -1817,6 +1834,7 @@ impl PhysicalPlan {
         let id = pipelines.len();
         pipelines.push(PipelineSpec {
             id,
+            partitions: self.source_partitions(&source),
             source,
             operators,
             sink: PipelineSink::Node(sink),
@@ -1854,6 +1872,10 @@ pub struct PipelineSpec {
     /// Position in [`PhysicalPlan::pipelines`], child pipelines first.
     pub id: usize,
     pub source: PipelineSource,
+    /// The output partitions of `source`, which every operator of the
+    /// pipeline keeps and its sink merges: a `CsvSource`'s `max_partitions`,
+    /// 1 for every other source.
+    pub partitions: u32,
     /// Operator node ids between `source` and `sink`, in run order.
     pub operators: Vec<NodeId>,
     pub sink: PipelineSink,

@@ -97,7 +97,7 @@ query insert_person($name: String, $age: I32) {
         cli()
             .arg("snapshot")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--json"),
@@ -121,7 +121,7 @@ query insert_person($name: String, $age: I32) {
         cli()
             .arg("query")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -145,7 +145,7 @@ query insert_person($name: String, $age: I32) {
         cli()
             .arg("mutate")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -202,7 +202,7 @@ query insert_person($name: String, $age: I32) {
         cli()
             .arg("query")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("-e")
@@ -218,7 +218,7 @@ query insert_person($name: String, $age: I32) {
         cli()
             .arg("mutate")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query-string")
@@ -268,7 +268,9 @@ fn assert_cluster_schema_apply_refused(server: &TestServer, schema: &std::path::
     let read = |arguments: &[&str]| {
         parse_stdout_json(&output_success(
             cli()
-                .args(["--target", &server.base_url, "--graph", GRAPH_ID])
+                .args(["--target"])
+                .fixture_target(&server.base_url)
+                .args(["--graph", GRAPH_ID])
                 .args(arguments)
                 .arg("--json"),
         ))
@@ -292,17 +294,15 @@ fn assert_cluster_schema_apply_refused(server: &TestServer, schema: &std::path::
     let before = state();
     let output = output_failure(
         cli()
-            .args(["--target", &server.base_url])
+            .args(["--target"])
+            .fixture_target(&server.base_url)
             .args(["schema", "apply", "--schema"])
             .arg(schema)
             .arg("--json"),
     );
     let refusal = parse_stdout_json(&output);
-    assert_eq!(
-        refusal["command_outcome"]["execution"], "not_started",
-        "{refusal}"
-    );
-    assert_eq!(refusal["command_outcome"]["effects"], "none", "{refusal}");
+    assert_eq!(refusal["disposition"]["effects"], "none", "{refusal}");
+    assert_eq!(refusal["disposition"]["effects"], "none", "{refusal}");
     assert!(refusal.get("http_status").is_none(), "{refusal}");
     assert!(
         refusal["error"]
@@ -364,7 +364,7 @@ fn remote_schema_apply_refuses_branched_cluster_backed_graph() {
             .arg("branch")
             .arg("create")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--from")
@@ -409,7 +409,7 @@ query ordered_person($name: String) {
         cli()
             .arg("query")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -431,7 +431,7 @@ query ordered_person($name: String) {
         cli()
             .arg("query")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -468,7 +468,7 @@ query insert_person($name: String, $age: I32) {
             .arg("branch")
             .arg("list")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--json"),
@@ -480,7 +480,7 @@ query insert_person($name: String, $age: I32) {
             .arg("branch")
             .arg("create")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--from")
@@ -496,7 +496,7 @@ query insert_person($name: String, $age: I32) {
             .arg("branch")
             .arg("list")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--json"),
@@ -507,7 +507,7 @@ query insert_person($name: String, $age: I32) {
         cli()
             .arg("mutate")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -526,7 +526,7 @@ query insert_person($name: String, $age: I32) {
             .arg("branch")
             .arg("merge")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("feature")
@@ -542,7 +542,7 @@ query insert_person($name: String, $age: I32) {
         cli()
             .arg("query")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -633,17 +633,11 @@ fn assert_merge_delivery_loss_never_replays_committed_effect(statement: bool) {
             vec!["branch".into(), "merge".into(), source.clone()]
         };
         args.extend(
-            [
-                "--target",
-                proxy.origin.as_str(),
-                "--graph",
-                GRAPH_ID,
-                "--json",
-            ]
-            .map(String::from),
+            ["--target", KEYED_SERVER_NAME, "--graph", GRAPH_ID, "--json"].map(String::from),
         );
         let output = if matches!(fault, MergeDeliveryFault::CallerWait) {
             let mut caller = cli_process()
+                .env("OMNIGRAPH_HOME", tls_gateway::anonymous_home(&proxy.origin))
                 .args(&args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -668,14 +662,20 @@ fn assert_merge_delivery_loss_never_replays_committed_effect(statement: bool) {
             caller.kill().unwrap();
             caller.wait_with_output().unwrap()
         } else {
-            output_failure(cli().args(&args).timeout(Duration::from_secs(15)))
+            output_failure(
+                cli()
+                    .env("OMNIGRAPH_HOME", tls_gateway::anonymous_home(&proxy.origin))
+                    .args(&args)
+                    .timeout(Duration::from_secs(15)),
+            )
         };
         assert!(
             !output.status.success(),
             "{statement}/{fault:?}: lost delivery must not report success"
         );
         if !matches!(fault, MergeDeliveryFault::CallerWait) {
-            assert_eq!(output.status.code(), Some(1), "{statement}/{fault:?}");
+            // A lost delivery leaves effects unknown.
+            assert_eq!(output.status.code(), Some(2), "{statement}/{fault:?}");
         }
         if !output.stdout.is_empty() {
             let error = parse_stdout_json(&output);
@@ -687,9 +687,12 @@ fn assert_merge_delivery_loss_never_replays_committed_effect(statement: bool) {
                 error.get("commit").is_none(),
                 "lost delivery is not success"
             );
-            assert!(
-                error.get("outcome").is_none(),
-                "lost delivery is not success"
+            // A merge's success body names its merge `outcome`; a failure's
+            // `disposition` is the whole command's, and a lost delivery's
+            // effects are unknown.
+            assert_eq!(
+                error["disposition"]["effects"], "unknown",
+                "lost delivery is not success: {error}"
             );
         }
 
@@ -833,7 +836,7 @@ fn remote_commit_delivery_loss_never_replays_committed_effect() {
                 operation,
                 commit_id,
                 "--target",
-                &proxy.origin,
+                KEYED_SERVER_NAME,
                 "--graph",
                 GRAPH_ID,
                 "--json",
@@ -841,6 +844,7 @@ fn remote_commit_delivery_loss_never_replays_committed_effect() {
             ];
             let output = if matches!(fault, MergeDeliveryFault::CallerWait) {
                 let mut caller = cli_process()
+                    .env("OMNIGRAPH_HOME", tls_gateway::anonymous_home(&proxy.origin))
                     .args(args)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -866,19 +870,25 @@ fn remote_commit_delivery_loss_never_replays_committed_effect() {
                 );
                 output
             } else {
-                output_failure(cli().args(args).timeout(Duration::from_secs(15)))
+                output_failure(
+                    cli()
+                        .env("OMNIGRAPH_HOME", tls_gateway::anonymous_home(&proxy.origin))
+                        .args(args)
+                        .timeout(Duration::from_secs(15)),
+                )
             };
             assert!(!output.status.success(), "{operation}/{fault:?}");
             if !matches!(fault, MergeDeliveryFault::CallerWait) {
-                assert_eq!(output.status.code(), Some(1), "{operation}/{fault:?}");
+                // A lost delivery leaves effects unknown.
+                assert_eq!(output.status.code(), Some(2), "{operation}/{fault:?}");
                 let error = parse_stdout_json(&output);
                 assert!(
                     error.get("error").is_some(),
                     "{operation}/{fault:?}: {error}"
                 );
                 assert_eq!(
-                    error["command_outcome"],
-                    json!({"execution":"unknown", "effects":"unknown", "action":"reconcile"}),
+                    error["disposition"],
+                    json!({"effects":"unknown", "action":"reconcile"}),
                     "{operation}/{fault:?}"
                 );
                 assert!(
@@ -922,7 +932,7 @@ fn remote_commit_delivery_loss_never_replays_committed_effect() {
                 );
             }
             assert_eq!(
-                get_json("commits?branch=main&unpublished=true")["commits"],
+                get_json("commits?branch=main&listing=unpublished")["commits"],
                 json!([])
             );
             let rows = client
@@ -1046,7 +1056,7 @@ fn remote_blob_write_delivery_loss_never_replays_committed_effect() {
             args.extend(
                 [
                     "--target",
-                    proxy.origin.as_str(),
+                    KEYED_SERVER_NAME,
                     "--graph",
                     PARITY_GRAPH_ID,
                     "--json",
@@ -1095,7 +1105,8 @@ fn remote_blob_write_delivery_loss_never_replays_committed_effect() {
                 "{put}/{fault:?}: lost delivery must not report success"
             );
             if !matches!(fault, MergeDeliveryFault::CallerWait) {
-                assert_eq!(output.status.code(), Some(1), "{put}/{fault:?}");
+                // A lost delivery leaves effects unknown.
+                assert_eq!(output.status.code(), Some(2), "{put}/{fault:?}");
             }
             if !output.stdout.is_empty() {
                 let error = parse_stdout_json(&output);
@@ -1222,7 +1233,7 @@ fn remote_deployment_delivery_loss_preserves_owned_completion() {
         // 100 Continue only when admission starts polling this incomplete body;
         // no sleep or production test hook decides when deployment may proceed.
         let held = before_acceptance.then(|| {
-            let url = url::Url::parse(&server.base_url).unwrap();
+            let url = url::Url::parse(&tls_gateway::http_upstream(&server.base_url)).unwrap();
             let mut socket = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap())).unwrap();
             socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
             socket.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
@@ -1243,9 +1254,9 @@ fn remote_deployment_delivery_loss_preserves_owned_completion() {
             .envs(operator.env(TOKEN))
             .args(["cluster", "apply", "--config"])
             .arg(cluster.path())
+            .args(["--target"])
+            .fixture_target(&proxy.origin)
             .args([
-                "--target",
-                &proxy.origin,
                 "--deployment-id",
                 &id,
                 "--timeout",
@@ -1339,11 +1350,9 @@ fn remote_deployment_delivery_loss_preserves_owned_completion() {
             parse_stdout_json(&output_success(
                 cli()
                     .envs(operator.env(TOKEN))
+                    .args(["cluster", "status", "--target"])
+                    .fixture_target(&proxy.origin)
                     .args([
-                        "cluster",
-                        "status",
-                        "--target",
-                        &proxy.origin,
                         "--deployment-id",
                         &id,
                         "--wait",
@@ -1429,7 +1438,7 @@ fn remote_branch_delete_removes_branch() {
             .arg("branch")
             .arg("create")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--from")
@@ -1443,7 +1452,7 @@ fn remote_branch_delete_removes_branch() {
             .arg("branch")
             .arg("delete")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("feature")
@@ -1458,7 +1467,7 @@ fn remote_branch_delete_removes_branch() {
             .arg("branch")
             .arg("list")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--json"),
@@ -1491,7 +1500,7 @@ query add_friend($from: String, $to: String) {
             .arg("branch")
             .arg("create")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--from")
@@ -1503,7 +1512,7 @@ query add_friend($from: String, $to: String) {
         cli()
             .arg("mutate")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -1519,7 +1528,7 @@ query add_friend($from: String, $to: String) {
         cli()
             .arg("mutate")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -1536,7 +1545,7 @@ query add_friend($from: String, $to: String) {
         cli()
             .arg("export")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--branch")
@@ -1627,7 +1636,7 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
             .arg("--mode")
             .arg("merge")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--data")
@@ -1652,7 +1661,7 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
         cli()
             .arg("snapshot")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--branch")
@@ -1665,7 +1674,7 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
         cli()
             .arg("query")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -1701,7 +1710,7 @@ fn remote_load_round_trips_and_requires_from_for_new_branches() {
         cli()
             .arg("load")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--mode")
@@ -1721,7 +1730,7 @@ fn remote_load_round_trips_and_requires_from_for_new_branches() {
         cli()
             .arg("load")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--mode")
@@ -1747,7 +1756,7 @@ fn remote_load_round_trips_and_requires_from_for_new_branches() {
         cli()
             .arg("snapshot")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--branch")
@@ -1767,7 +1776,7 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
             .arg("branch")
             .arg("create")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--from")
@@ -1790,7 +1799,7 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
             .arg("--mode")
             .arg("merge")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--data")
@@ -1813,7 +1822,7 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
         cli()
             .arg("query")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -1832,7 +1841,7 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
         cli()
             .arg("query")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -1880,7 +1889,7 @@ query insert_person($name: String, $age: I32) {
                 .envs(server.credential("team-token"))
                 .arg("snapshot")
                 .arg("--target")
-                .arg(&server.base_url)
+                .fixture_target(&server.base_url)
                 .arg("--graph")
                 .arg(GRAPH_ID)
                 .arg("--json"),
@@ -1890,14 +1899,16 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(snapshot["graph_branch"], "main");
 
     // Authentication and policy refuse before admission or staging, so the CLI
-    // reports a write that never started and leaves no reconciliation to do.
+    // reports a write that never started and leaves no reconciliation to do: a
+    // credential to fix, or a policy to read again.
     let refused_before_effects = |output: &std::process::Output, status: u16| {
         assert_eq!(output.status.code(), Some(1), "{output:?}");
         let body = parse_stdout_json(output);
         assert_eq!(body["http_status"], status, "{body}");
+        let action = if status == 401 { "fix" } else { "refresh" };
         assert_eq!(
-            body["command_outcome"],
-            serde_json::json!({"execution":"not_started","effects":"none","action":"refresh"}),
+            body["disposition"],
+            serde_json::json!({"effects":"none","action":action}),
             "{body}"
         );
         body
@@ -1909,7 +1920,7 @@ query insert_person($name: String, $age: I32) {
             .envs(server.credential("team-token"))
             .arg("mutate")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -1940,7 +1951,7 @@ query insert_person($name: String, $age: I32) {
             .envs(server.credential("team-token"))
             .arg("load")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--data")
@@ -1960,7 +1971,7 @@ query insert_person($name: String, $age: I32) {
             .envs(server.credential("unknown-token"))
             .arg("mutate")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -1982,7 +1993,7 @@ query insert_person($name: String, $age: I32) {
             .arg("branch")
             .arg("create")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--from")
@@ -1998,7 +2009,7 @@ query insert_person($name: String, $age: I32) {
             .envs(server.credential("team-token"))
             .arg("mutate")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -2020,7 +2031,7 @@ query insert_person($name: String, $age: I32) {
             .arg("branch")
             .arg("delete")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("feature")
@@ -2040,7 +2051,7 @@ query insert_person($name: String, $age: I32) {
             .arg("branch")
             .arg("merge")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("feature")
@@ -2065,7 +2076,7 @@ query insert_person($name: String, $age: I32) {
             .arg("branch")
             .arg("merge")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("feature")
@@ -2113,7 +2124,7 @@ query insert_person($name: String, $age: I32) {
             .envs(server.credential("team-token"))
             .arg("query")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -2173,7 +2184,7 @@ fn graphs_list_against_multi_graph_server() {
             .arg("graphs")
             .arg("list")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--json"),
     ));
     let ids: Vec<&str> = payload["graphs"]
@@ -2190,7 +2201,7 @@ fn graphs_list_against_multi_graph_server() {
         .envs(server.credential("admin-token"))
         .arg("query")
         .arg("--target")
-        .arg(&server.base_url)
+        .fixture_target(&server.base_url)
         .arg("-e")
         .arg("query q { match { $p: Person { name: \"x\" } } return { $p.name } }")
         .output()
@@ -2222,7 +2233,7 @@ fn mutate_if_commit_lost_cas_exits_4_issue_365() {
         let mut cmd = cli();
         cmd.arg("mutate")
             .arg("--target")
-            .arg(base_url)
+            .fixture_target(base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("-e")
@@ -2245,7 +2256,7 @@ fn mutate_if_commit_lost_cas_exits_4_issue_365() {
         cli()
             .arg("query")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("-e")
@@ -2280,8 +2291,8 @@ fn mutate_if_commit_lost_cas_exits_4_issue_365() {
     assert_eq!(body["precondition_failure"]["expected"], json!(stale_id));
     assert_eq!(body["http_status"], 412);
     assert_eq!(
-        body["command_outcome"],
-        json!({"execution":"not_started","effects":"none","action":"refresh"})
+        body["disposition"],
+        json!({"effects":"none","action":"refresh"})
     );
 
     // An id from a fresh read passes with exit 0.
@@ -2289,7 +2300,7 @@ fn mutate_if_commit_lost_cas_exits_4_issue_365() {
         cli()
             .arg("query")
             .arg("--target")
-            .arg(&server.base_url)
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("-e")
@@ -2312,10 +2323,9 @@ fn mutate_if_commit_lost_cas_exits_4_issue_365() {
     drop(server);
 }
 
-/// A Unix-domain socket in front of the server carries every CLI data path:
-/// a JSON read, a mutation, the raw NDJSON load body, the streamed export
-/// response and Blob delivery. Each command reaches the server through the
-/// socket, and reads over it match the same reads over TCP.
+/// Every credential-bearing data path refuses Unix transport before connecting;
+/// the same JSON read, mutation, NDJSON load, export and Blob delivery remain
+/// exercised through the supported TLS gateway.
 #[cfg(unix)]
 #[test]
 fn remote_unix_socket_serves_query_mutate_load_export_and_blob_get_issue_979() {
@@ -2331,7 +2341,9 @@ fn remote_unix_socket_serves_query_mutate_load_export_and_blob_get_issue_979() {
         )],
     );
     let gateway = UnixGateway::new(&server.base_url);
-    let socket = gateway.url();
+    // Keep the space-bearing socket fixture, but use a valid escaped URL so
+    // refusal exercises the transport rule rather than URL lexical validation.
+    let socket = gateway.url().replace(' ', "%20");
     let socket_operator = KeyedServer::new(&socket);
     let served = |server_url: &str, args: &[&str]| {
         let credential = if server_url == socket {
@@ -2342,21 +2354,24 @@ fn remote_unix_socket_serves_query_mutate_load_export_and_blob_get_issue_979() {
         let mut command = cli();
         command.envs(credential).args(args).args([
             "--target",
-            server_url,
+            KEYED_SERVER_NAME,
             "--graph",
             PARITY_GRAPH_ID,
         ]);
         command
     };
-    let mut connections = 0;
-    let mut over_socket = |args: &[&str]| {
-        let output = output_success(&mut served(&socket, args));
-        assert!(
-            gateway.connections() > connections,
-            "{args:?} did not reach the server through the socket"
+    let over_socket = |args: &[&str]| {
+        // Credential-bearing Unix routes are refused by the clean-slate grammar.
+        // Exercise every original body/stream path over the supported TLS route.
+        let refused = output_failure(&mut served(&socket, args));
+        let diagnostic = format!(
+            "{}{}",
+            stdout_string(&refused),
+            String::from_utf8_lossy(&refused.stderr)
         );
-        connections = gateway.connections();
-        output
+        assert!(diagnostic.contains("HTTPS"), "{args:?}: {diagnostic}");
+        assert_eq!(gateway.connections(), 0);
+        output_success(&mut served(&server.base_url, args))
     };
 
     let read = [

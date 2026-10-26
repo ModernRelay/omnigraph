@@ -2,10 +2,7 @@
 use crate::cli::{BlobCommand, BranchCommand, Cli, Command, CommitCommand, SchemaCommand};
 use crate::operator::InvocationConfig;
 use crate::planes::{self, Requirement};
-use crate::targets::{
-    self, CredentialOwner, ResolvedTarget, ServerAuth, StorageProvider, TargetBinding,
-    TargetProvenance,
-};
+use crate::targets::{self, ResolvedTarget, StorageProvider, TargetBinding, TargetProvenance};
 use color_eyre::eyre::{Result, bail};
 use std::io::Write;
 use std::path::Path;
@@ -24,6 +21,53 @@ pub(crate) fn resolve(
         return Ok(None);
     }
     let config = input.get(stderr)?;
+    let profile_class = matches!(need, Requirement::ManagedAccount)
+        || (need == Requirement::Authentication && cli.target.is_none())
+        || (cli.profile.is_some()
+            && matches!(
+                need,
+                Requirement::Authentication
+                    | Requirement::Credential
+                    | Requirement::ManagedOperation
+            ));
+    if profile_class {
+        let source = config
+            .schema
+            .as_ref()
+            .ok_or_else(|| color_eyre::eyre::eyre!("operator configuration requires version: 1"))?;
+        let name = cli
+            .profile
+            .as_deref()
+            .or(source.defaults.profile.as_deref())
+            .ok_or_else(|| {
+                targets::refusal(
+                    "profile_required",
+                    if matches!(cli.command, Command::Login { .. }) {
+                        "select --profile NAME or configure defaults.profile; create a profile with login --create-profile NAME"
+                    } else {
+                        "select --profile NAME or configure defaults.profile"
+                    },
+                )
+            })?;
+        let profile = source.profiles.get(name).ok_or_else(|| {
+            targets::refusal("profile_unknown", format!("unknown profile '{name}'"))
+        })?;
+        let target = ResolvedTarget::new(
+            TargetBinding::Managed(crate::managed::Binding {
+                api: profile.api.trim_end_matches('/').to_owned(),
+                organization_id: Some(profile.organization_id.clone()),
+                cluster: None,
+                control_auth: crate::managed::ControlAuth::HumanDevice,
+            }),
+            if cli.profile.is_some() {
+                TargetProvenance::Explicit { name: name.into() }
+            } else {
+                TargetProvenance::Default { name: name.into() }
+            },
+        );
+        planes::validate_target(cli, &target, explicit_config)?;
+        return Ok(Some(target));
+    }
     let init_uri = match &cli.command {
         Command::Init(args) => args.uri.as_deref(),
         _ => None,
@@ -40,48 +84,24 @@ pub(crate) fn resolve(
     };
     let explicit = init_uri
         .or(cli.target.as_deref())
+        .or(match &cli.command {
+            Command::Target {
+                command: crate::cli::TargetCommand::Refresh { name, .. },
+            } => Some(name.as_str()),
+            _ => None,
+        })
         .or(alias.map(|a| a.target.as_str()));
     let (selection, is_default) = match explicit {
         Some(value) => (value, false),
-        None => {
-            if input.has_profile() {
-                return Err(targets::refusal(
-                    "legacy_routing",
-                    "OMNIGRAPH_PROFILE is retired; unset it and select --target explicitly or configure defaults.target",
-                ));
-            }
-            // The old folder binding applied to managed data/control commands.
-            if matches!(
-                need,
-                Requirement::Graph { managed: true, .. }
-                    | Requirement::Registry
-                    | Requirement::Deployment
-                    | Requirement::ManagedAccount
-                    | Requirement::ManagedCluster
-                    | Requirement::ManagedOperation
-                    | Requirement::Authentication
-            ) {
-                match std::fs::symlink_metadata(cwd.join(".omnigraph/context")) {
-                    Ok(_) => {
-                        return Err(targets::refusal(
-                            "legacy_routing",
-                            "folder routing is retired; select --target explicitly, or import recovery custody with target import and archive .omnigraph/context before using defaults.target",
-                        ));
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            (
-                config.default_target().ok_or_else(|| {
-                    targets::refusal(
-                        "target_required",
-                        "select --target NAME|ADDRESS or configure defaults.target",
-                    )
-                })?,
-                true,
-            )
-        }
+        None => (
+            config.default_target().ok_or_else(|| {
+                targets::refusal(
+                    "target_required",
+                    "select --target NAME|ADDRESS or configure defaults.target",
+                )
+            })?,
+            true,
+        ),
     };
     if selection.is_empty() {
         return Err(targets::refusal(
@@ -104,34 +124,17 @@ pub(crate) fn resolve(
             "this selection requires a registered target name",
         ));
     }
-    let target = if selection == "og_catalog" && !is_default && alias.is_none() {
-        ResolvedTarget::new(
-            TargetBinding::DirectCatalogue,
-            TargetProvenance::Inline {
-                address: selection.into(),
-            },
-        )
-    } else if inline {
-        let binding = if crate::graph_http::server_scheme(selection).is_some() {
-            targets::validate_server_endpoint(selection)
-                .map_err(|error| targets::refusal("target_invalid", error.to_string()))?;
-            let request = crate::graph_http::RequestTarget::of(selection, selection)?;
-            let auth = match config.credential_owner_for(&request) {
-                Some(CredentialOwner::Keyed(owner)) => ServerAuth::Token {
-                    owner: owner.into(),
-                },
-                _ => ServerAuth::Anonymous,
-            };
-            TargetBinding::Server {
-                endpoint: selection.into(),
-                auth,
-                default_graph: None,
-            }
-        } else {
+    if inline
+        && (crate::graph_http::server_scheme(selection).is_some()
+            || selection.contains("://") && !selection.starts_with("file://"))
+    {
+        bail!("inline access supports local storage only; configure a server or managed target");
+    }
+    let target = if inline {
+        let binding = {
             let uri = targets::normalize_storage_uri(selection, cwd)
                 .map_err(|error| targets::refusal("target_invalid", error.to_string()))?;
-            let provider = StorageProvider::capture(&uri)
-                .map_err(|error| targets::refusal("target_invalid", error.to_string()))?;
+            let provider = StorageProvider::Local;
             if init_uri.is_none() && (planes::root_input(&cli.command) || cli.graph.is_some()) {
                 TargetBinding::DirectRoot {
                     uri,
@@ -162,9 +165,16 @@ pub(crate) fn resolve(
             },
         )
     };
-    planes::validate_target(cli, &target, explicit_config)
-        .map_err(|e| targets::refusal("target_incompatible", e.to_string()))?;
-    if matches!(need, Requirement::Graph { .. }) {
+    // A refusal that names its own code, such as `target_kind_unsupported`,
+    // keeps it.
+    planes::validate_target(cli, &target, explicit_config).map_err(|error| {
+        if error.downcast_ref::<targets::TargetError>().is_some() {
+            error
+        } else {
+            targets::refusal("target_incompatible", error.to_string())
+        }
+    })?;
+    if planes::selects_graph(&cli.command, &target) {
         graph_selection(&target, cli.graph.as_deref())
             .map_err(|error| targets::refusal("target_incompatible", error.to_string()))?;
     }
@@ -317,6 +327,11 @@ pub(crate) fn report(
         }
         TargetBinding::DirectCatalogue => "direct catalogue og_catalog".into(),
         TargetBinding::Server { endpoint, .. } => format!("server {endpoint}"),
+        TargetBinding::Managed(binding) if binding.cluster.is_none() => format!(
+            "api {}; organization={}",
+            binding.api,
+            binding.organization_id.as_deref().unwrap_or("unselected")
+        ),
         TargetBinding::Managed(binding) => format!(
             "managed {}; organization={}; cluster={}; incarnation={}; endpoint={}",
             binding.api,
@@ -346,9 +361,15 @@ pub(crate) fn report(
                 .map_or_else(|| "none".into(), |p| p.display().to_string())
         )
     };
+    let selection_kind = if matches!(&target.binding, TargetBinding::Managed(binding) if binding.cluster.is_none())
+    {
+        "profile"
+    } else {
+        "target"
+    };
     writeln!(
         stderr,
-        "target {} ({source}): {destination}{}{}{}",
+        "{selection_kind} {} ({source}): {destination}{}{}{}",
         target.label(),
         graph.map_or_else(String::new, |g| format!("; graph={g}")),
         write_scope.map_or_else(String::new, |scope| format!("; {scope}")),
@@ -370,18 +391,65 @@ mod tests {
     use super::*;
     use crate::invocation::parse_from;
 
-    fn fixture(yaml: &str) -> (tempfile::TempDir, InvocationConfig) {
+    #[test]
+    fn profile_report_does_not_present_an_account_as_a_resource_target() {
+        let input = InvocationConfig::at(None, None);
+        let selected = ResolvedTarget::new(
+            TargetBinding::Managed(crate::managed::Binding {
+                api: "https://control.example".into(),
+                organization_id: Some("org_one".into()),
+                cluster: None,
+                control_auth: crate::managed::ControlAuth::HumanDevice,
+            }),
+            TargetProvenance::Explicit {
+                name: "work".into(),
+            },
+        );
+        let mut output = Vec::new();
+        report(&input, &selected, None, None, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.starts_with(
+            "profile work (explicit): api https://control.example; organization=org_one"
+        ));
+        assert!(!output.contains("cluster="));
+        assert!(!output.contains("target work"));
+    }
+
+    fn fixture() -> (tempfile::TempDir, InvocationConfig) {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("config.yaml"), yaml).unwrap();
+        let source = r#"version: 1
+profiles:
+  work:
+    api: https://control.example/prefix
+    organization_id: org_one
+    auth: {provider: omnigraph}
+targets:
+  local: {kind: direct, scope: graph, uri: 'file:///tmp/graph'}
+  cluster:
+    kind: managed
+    profile: work
+    cluster_id: cluster-one
+    cluster_incarnation: inc-one
+    endpoint: https://data.example/
+    default_graph: knowledge
+  server:
+    kind: server
+    endpoint: https://example.test/
+    auth: {provider: anonymous}
+    default_graph: knowledge
+defaults: {target: local, profile: work}
+"#;
+        std::fs::write(dir.path().join("config.yaml"), source).unwrap();
         let input = InvocationConfig::at(Some(dir.path().to_owned()), None);
         (dir, input)
     }
+
     fn selected(
         args: &[&str],
         input: &InvocationConfig,
         cwd: &Path,
     ) -> Result<Option<ResolvedTarget>> {
-        let parsed = parse_from(std::iter::once("omnigraph").chain(args.iter().copied())).unwrap();
+        let parsed = parse_from(std::iter::once("omnigraph").chain(args.iter().copied()))?;
         resolve(
             &parsed.cli,
             input,
@@ -390,233 +458,128 @@ mod tests {
             &mut Vec::new(),
         )
     }
-    const CONFIG: &str = "target_config_version: 1\ndefaults:\n  target: missing\ntargets:\n  local:\n    kind: direct\n    scope: graph\n    uri: ./graph.omni\n    provider:\n      kind: local\n  server:\n    kind: server\n    endpoint: https://example.test/api\n    auth: anonymous\n    default_graph: knowledge\n";
 
     #[test]
-    fn explicit_target_never_falls_back_or_validates_an_unused_default() {
-        let (dir, input) = fixture(CONFIG);
-        let target = selected(
-            &["query", "-e", "query { return 1 }", "--target", "local"],
-            &input,
-            dir.path(),
-        )
-        .unwrap()
-        .unwrap();
-        assert!(matches!(target.binding, TargetBinding::DirectGraph { .. }));
-        for name in ["", "absent"] {
-            assert!(selected(&["query", "q", "--target", name], &input, dir.path()).is_err());
+    fn profile_and_resource_defaults_are_independent() {
+        let (dir, input) = fixture();
+        for args in [
+            vec!["credentials", "status", "--profile", "work"],
+            vec!["credentials", "export", "--target", "cluster"],
+            vec!["credentials", "status", "--target", "server"],
+            vec![
+                "login",
+                "--profile",
+                "work",
+                "--replace-principal",
+                "user-one",
+            ],
+            vec![
+                "login",
+                "--target",
+                "cluster",
+                "--replace-principal",
+                "user-one",
+            ],
+        ] {
+            assert!(selected(&args, &input, dir.path()).is_ok(), "{args:?}");
         }
+        for args in [
+            vec!["credentials", "status"],
+            vec!["credentials", "status", "--target", "cluster"],
+            vec!["credentials", "status", "--profile", "work", "--auth", "me"],
+            vec![
+                "credentials",
+                "export",
+                "--target",
+                "cluster",
+                "--auth",
+                "me",
+            ],
+            vec!["login", "--profile", "work", "--auth", "me"],
+            vec!["login", "--replace-principal", "user-one"],
+            vec![
+                "login",
+                "--target",
+                "server",
+                "--replace-principal",
+                "user-one",
+            ],
+            vec!["config", "recover-operations", "--source", "/tmp/evidence"],
+        ] {
+            assert!(selected(&args, &input, dir.path()).is_err(), "{args:?}");
+        }
+        let resource = selected(&["query", "-e", "q"], &input, dir.path())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            resource.binding,
+            TargetBinding::DirectGraph { .. }
+        ));
+        let control = selected(&["cluster", "list"], &input, dir.path())
+            .unwrap()
+            .unwrap();
         assert!(
-            selected(&["query", "q"], &input, dir.path())
-                .unwrap_err()
-                .to_string()
-                .contains("missing")
+            matches!(control.binding, TargetBinding::Managed(binding) if binding.cluster.is_none() && binding.api == "https://control.example/prefix")
+        );
+        assert!(
+            selected(
+                &["cluster", "list", "--target", "cluster"],
+                &input,
+                dir.path()
+            )
+            .is_err()
+        );
+        assert!(
+            selected(
+                &["query", "-e", "q", "--profile", "work"],
+                &input,
+                dir.path()
+            )
+            .is_err()
         );
     }
 
     #[test]
-    fn named_paths_use_operator_directory_and_inline_paths_use_invocation_directory() {
-        let (dir, input) = fixture(CONFIG);
-        let cwd = tempfile::tempdir().unwrap();
-        for (value, expected) in [("local", dir.path()), ("./graph.omni", cwd.path())] {
-            let target = selected(&["query", "-e", "q", "--target", value], &input, cwd.path())
-                .unwrap()
-                .unwrap();
-            let TargetBinding::DirectGraph { uri, .. } = target.binding else {
-                panic!("direct graph");
-            };
-            assert_eq!(uri, expected.join("graph.omni").to_string_lossy());
+    fn managed_resource_has_every_supported_served_command() {
+        let (dir, input) = fixture();
+        for args in [
+            vec!["query", "-e", "q"],
+            vec!["schema", "show"],
+            vec!["branch", "list"],
+            vec!["snapshot"],
+            vec!["export"],
+            vec!["commit", "show", "commit-one"],
+            vec!["graphs", "list"],
+            vec!["changes", "poll"],
+        ] {
+            for target in ["server", "cluster"] {
+                let mut args = args.clone();
+                args.extend(["--target", target]);
+                assert!(selected(&args, &input, dir.path()).is_ok(), "{args:?}");
+            }
         }
+        assert!(selected(&["optimize", "--target", "cluster"], &input, dir.path()).is_err());
+        assert!(
+            selected(
+                &["queries", "list", "--target", "cluster"],
+                &input,
+                dir.path()
+            )
+            .is_err()
+        );
     }
 
     #[test]
-    fn local_commands_ignore_bad_config_but_refuse_irrelevant_selectors() {
-        let (dir, input) = fixture("invalid: [");
+    fn local_commands_ignore_invalid_config_but_refuse_auth_and_routes() {
+        let (dir, _) = fixture();
+        std::fs::write(dir.path().join("config.yaml"), "invalid: [").unwrap();
+        let input = InvocationConfig::at(Some(dir.path().to_owned()), None);
         assert!(
             selected(&["version"], &input, dir.path())
                 .unwrap()
                 .is_none()
         );
-        assert!(selected(&["version", "--target", "anything"], &input, dir.path()).is_err());
-    }
-
-    #[test]
-    fn default_selection_refuses_retired_routing_and_explicit_selection_does_not() {
-        let (dir, _) = fixture(&CONFIG.replace("target: missing", "target: local"));
-        let input = InvocationConfig::at(Some(dir.path().to_owned()), Some("old".into()));
-        assert!(
-            selected(&["query", "q"], &input, dir.path())
-                .unwrap_err()
-                .to_string()
-                .contains("OMNIGRAPH_PROFILE")
-        );
-        assert!(
-            selected(
-                &["query", "-e", "q", "--target", "local"],
-                &input,
-                dir.path()
-            )
-            .is_ok()
-        );
-        let input = InvocationConfig::at(Some(dir.path().to_owned()), None);
-        std::fs::create_dir(dir.path().join(".omnigraph")).unwrap();
-        std::fs::write(dir.path().join(".omnigraph/context"), "unparsed evidence").unwrap();
-        assert!(
-            selected(&["query", "q"], &input, dir.path())
-                .unwrap_err()
-                .to_string()
-                .contains("folder routing")
-        );
-        assert!(
-            selected(
-                &["query", "-e", "q", "--target", "local"],
-                &input,
-                dir.path()
-            )
-            .is_ok()
-        );
-        #[cfg(unix)]
-        {
-            let context = dir.path().join(".omnigraph/context");
-            std::fs::remove_file(&context).unwrap();
-            std::os::unix::fs::symlink("missing-context", &context).unwrap();
-            assert!(
-                selected(&["query", "-e", "q"], &input, dir.path())
-                    .unwrap_err()
-                    .to_string()
-                    .contains("folder routing")
-            );
-            assert!(
-                selected(
-                    &["query", "-e", "q", "--target", "local"],
-                    &input,
-                    dir.path()
-                )
-                .is_ok()
-            );
-        }
-    }
-
-    #[test]
-    fn graph_selection_is_explicit_and_registry_ignores_graph_defaults() {
-        let (dir, input) = fixture(CONFIG);
-        assert!(
-            selected(
-                &["query", "q", "--target", "https://example.test"],
-                &input,
-                dir.path()
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("graph_required")
-        );
-        let target = selected(&["query", "q", "--target", "server"], &input, dir.path())
-            .unwrap()
-            .unwrap();
-        assert_eq!(graph_selection(&target, None).unwrap(), Some("knowledge"));
-        assert!(
-            selected(
-                &["graphs", "list", "--target", "server"],
-                &input,
-                dir.path()
-            )
-            .is_ok()
-        );
-        assert!(
-            selected(
-                &[
-                    "graphs",
-                    "list",
-                    "--target",
-                    "server",
-                    "--graph",
-                    "knowledge"
-                ],
-                &input,
-                dir.path()
-            )
-            .is_err()
-        );
-        assert!(
-            selected(
-                &[
-                    "query",
-                    "-e",
-                    "q",
-                    "--target",
-                    "local",
-                    "--graph",
-                    "knowledge"
-                ],
-                &input,
-                dir.path()
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn init_uri_is_explicit_inline_and_conflicts_with_target() {
-        let (dir, input) = fixture(CONFIG);
-        let target = selected(
-            &["init", "scratch.omni", "--schema", "unused.pg"],
-            &input,
-            dir.path(),
-        )
-        .unwrap()
-        .unwrap();
-        assert!(matches!(target.provenance, TargetProvenance::Inline { .. }));
-        assert!(
-            selected(
-                &[
-                    "init",
-                    "scratch.omni",
-                    "--schema",
-                    "unused.pg",
-                    "--target",
-                    "local"
-                ],
-                &input,
-                dir.path()
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn unsupported_kind_is_rejected_without_reading_credentials() {
-        let (dir, input) = fixture(CONFIG);
-        std::fs::write(dir.path().join("credentials"), "invalid credential bytes").unwrap();
-        let error = selected(&["cleanup", "--target", "server"], &input, dir.path()).unwrap_err();
-        assert!(error.to_string().contains("not available"), "{error}");
-        for args in [
-            vec!["query", "stored", "--target", "local"],
-            vec!["query", "stored", "--target", "og_catalog"],
-            vec![
-                "mutate",
-                "stored",
-                "--target",
-                "./unopened-root",
-                "--graph",
-                "knowledge",
-            ],
-            vec!["query", "--target", "server"],
-            vec!["mutate", "--target", "server"],
-        ] {
-            let error = selected(&args, &input, dir.path()).unwrap_err();
-            assert!(
-                error.to_string().contains("stored query"),
-                "{args:?}: {error}"
-            );
-        }
-        assert!(!dir.path().join("unopened-root").exists());
-        for args in [
-            vec!["query", "stored", "--target", "server"],
-            vec!["mutate", "stored", "--target", "server"],
-            vec!["query", "--query", "unread.gq", "--target", "local"],
-            vec!["mutate", "-e", "unparsed source", "--target", "local"],
-        ] {
-            assert!(selected(&args, &input, dir.path()).is_ok(), "{args:?}");
-        }
+        assert!(selected(&["version", "--target", "cluster"], &input, dir.path()).is_err());
+        assert!(selected(&["version", "--auth", "me"], &input, dir.path()).is_err());
     }
 }

@@ -1892,9 +1892,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0"
 dependencies = [
  "cmov",
 ]
@@ -5552,10 +5552,11 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-api-types"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "omnigraph-compiler",
  "omnigraph-engine",
+ "omnigraph-policy",
  "serde",
  "serde_json",
  "utoipa",
@@ -5563,7 +5564,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-azure-admission"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -5583,7 +5584,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-bench"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5613,7 +5614,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-catalog"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -5647,7 +5648,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-cli"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "assert_cmd",
  "async-trait",
@@ -5655,11 +5656,13 @@ dependencies = [
  "bytes",
  "clap",
  "color-eyre",
+ "core-foundation 0.10.1",
  "futures",
  "keyring",
  "lance",
  "lance-index",
  "libc",
+ "libyaml-rs",
  "omnigraph-api-types",
  "omnigraph-cluster",
  "omnigraph-compiler",
@@ -5669,13 +5672,17 @@ dependencies = [
  "omnigraph-skill",
  "percent-encoding",
  "predicates",
+ "rcgen",
  "reqwest 0.12.28",
+ "security-framework 3.7.0",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "time",
  "tokio",
+ "tokio-rustls",
  "url",
  "uuid",
  "workos",
@@ -5684,7 +5691,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-cluster"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "async-trait",
  "omnigraph-compiler",
@@ -5700,13 +5707,14 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tracing",
  "ulid",
  "yaml_serde",
 ]
 
 [[package]]
 name = "omnigraph-compiler"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -5727,7 +5735,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-core"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5767,7 +5775,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-dst"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "arrow-array",
  "async-trait",
@@ -5776,8 +5784,10 @@ dependencies = [
  "lance-core",
  "lance-io",
  "object_store 0.14.2",
+ "omnigraph-cluster",
  "omnigraph-compiler",
  "omnigraph-engine",
+ "omnigraph-storage",
  "rand 0.9.4",
  "serde_json",
  "serial_test",
@@ -5789,7 +5799,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-engine"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -5847,7 +5857,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-gqt"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "async-trait",
  "datatest-stable",
@@ -5869,7 +5879,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-gqt-core"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5892,7 +5902,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-gqt-served"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "axum",
  "datatest-stable",
@@ -5905,8 +5915,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnigraph-mcp"
+version = "0.14.1"
+dependencies = [
+ "axum",
+ "color-eyre",
+ "omnigraph-skill",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "omnigraph-planner"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "arrow-schema",
  "futures",
@@ -5919,7 +5943,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-policy"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "cedar-policy",
  "clap",
@@ -5932,7 +5956,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-reference-engine"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -5956,7 +5980,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-seams"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "syn",
  "tempfile",
@@ -5966,7 +5990,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-server"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -5989,12 +6013,11 @@ dependencies = [
  "omnigraph-cluster",
  "omnigraph-compiler",
  "omnigraph-engine",
+ "omnigraph-mcp",
  "omnigraph-policy",
- "omnigraph-skill",
  "p256",
  "regex",
  "reqwest 0.12.28",
- "rmcp",
  "rsa",
  "serde",
  "serde_json",
@@ -6015,11 +6038,11 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-skill"
-version = "0.14.0"
+version = "0.14.1"
 
 [[package]]
 name = "omnigraph-storage"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6035,7 +6058,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-vocabulary-guard"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "clap",
  "proc-macro2",
@@ -7213,6 +7236,19 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "rcgen"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
+dependencies = [
+ "pem 3.0.6",
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "yasna",
 ]
 
 [[package]]
@@ -8644,9 +8680,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.52.3"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",
@@ -9935,6 +9971,15 @@ dependencies = [
  "libyaml-rs",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "yasna"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
+dependencies = [
+ "time",
 ]
 
 [[package]]

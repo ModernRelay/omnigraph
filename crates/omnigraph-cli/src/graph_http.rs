@@ -146,25 +146,6 @@ impl RequestTarget {
         Self { endpoint, segments }
     }
 
-    /// Protocol-1 binding identity: exactly the endpoint and path used by
-    /// credential scope matching, never a URL's display spelling. Unix paths
-    /// retain their decoded bytes so distinct non-UTF-8 sockets cannot alias.
-    pub(crate) fn binding_identity(&self) -> serde_json::Value {
-        let endpoint = match &self.endpoint {
-            Endpoint::Tcp { scheme, host, port } => serde_json::json!({
-                "transport": "tcp", "scheme": scheme, "host": host, "port": port
-            }),
-            #[cfg(unix)]
-            Endpoint::Unix(socket) => {
-                use std::os::unix::ffi::OsStrExt;
-                serde_json::json!({
-                    "transport": "unix", "socket": socket.as_os_str().as_bytes()
-                })
-            }
-        };
-        serde_json::json!({"endpoint": endpoint, "segments": self.segments})
-    }
-
     /// Whether this target is `base` or lies under it: the same endpoint, and
     /// a path whose leading segments are all of `base`'s.
     pub(crate) fn is_under(&self, base: &Self) -> bool {
@@ -291,6 +272,7 @@ impl std::error::Error for ApiContractError {}
 /// The explicit server root owns discovery, including any proxy path prefix.
 /// Never derive it from a graph URL: a proxy prefix may itself contain `graphs`.
 pub(crate) struct GraphHttpClient {
+    operator_transport: Option<crate::operator_transport::CapturedTransport>,
     client: reqwest::Client,
     transport: ServerTransport,
     health_url: Url,
@@ -304,6 +286,9 @@ pub(crate) struct GraphHttpClient {
     /// Self-hosted requests retain the selected owner across every composed route.
     /// Managed authority is independent and never uses operator server declarations.
     request_scope: Option<crate::targets::ServerRequestScope>,
+    /// A bearer is a bound credential with a lifetime, not only a header value.
+    /// Public discovery may outlive its validity.
+    credential: Option<crate::credential_sources::AcquiredCredential>,
 }
 
 impl GraphHttpClient {
@@ -341,16 +326,40 @@ impl GraphHttpClient {
                 },
             };
             client = client.with_missing_credential(missing);
+        } else {
+            let credential = crate::operator_routing::AUTH
+                .try_with(|selected| {
+                    selected
+                        .as_ref()
+                        .ok_or_else(|| color_eyre::eyre::eyre!("no frozen credential binding"))?
+                        .cached_credential(endpoint)
+                })??
+                .ok_or_else(|| {
+                    color_eyre::eyre::eyre!("selected server credential is unavailable")
+                })?;
+            client = client.with_credential(credential)?;
         }
         Ok(client)
     }
 
     /// Every client of one root shares its transport; only the managed JSON
     /// deadlines differ.
-    fn build(transport: &ServerTransport, managed: bool) -> Result<reqwest::Client> {
+    fn build(
+        transport: &ServerTransport,
+        managed: bool,
+        captured: Option<&crate::operator_transport::CapturedTransport>,
+    ) -> Result<reqwest::Client> {
         let builder = reqwest::Client::builder()
+            .no_proxy()
+            .tls_built_in_webpki_certs(false)
+            .tls_built_in_native_certs(true)
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never());
+        let builder = if let Some(captured) = captured {
+            captured.apply(builder)?
+        } else {
+            builder
+        };
         let builder = match transport {
             ServerTransport::Tcp => builder,
             // Proxies and DNS do not apply to the socket.
@@ -368,6 +377,7 @@ impl GraphHttpClient {
     }
 
     fn with_deadline(server_root: &str, managed: bool) -> Result<Self> {
+        let operator_transport = crate::operator_routing::transport(server_root)?;
         let transport = ServerTransport::parse(server_root)?;
         let mut health_url =
             transport.http_url(&crate::helpers::remote_url(server_root, &["healthz"], &[])?)?;
@@ -375,13 +385,31 @@ impl GraphHttpClient {
         let _ = health_url.set_username("");
         let _ = health_url.set_password(None);
         Ok(Self {
-            client: Self::build(&transport, managed)?,
+            client: Self::build(&transport, managed, operator_transport.as_ref())?,
+            operator_transport,
             transport,
             health_url,
             missing_credential: None,
             expected_actor: None,
             request_scope: None,
+            credential: None,
         })
+    }
+
+    pub(crate) fn with_credential(
+        mut self,
+        credential: crate::credential_sources::AcquiredCredential,
+    ) -> Result<Self> {
+        use crate::credential_sources::{CredentialError, Purpose};
+        let binding = credential.request();
+        let endpoint = RequestTarget::of(binding.endpoint(), binding.endpoint())?;
+        if binding.purpose() != Purpose::Data
+            || !RequestTarget::from_sent(&self.transport, &self.health_url).is_under(&endpoint)
+        {
+            return Err(CredentialError::BindingMismatch.into());
+        }
+        self.credential = Some(credential);
+        Ok(self)
     }
 
     pub(crate) fn with_request_scope(mut self, scope: crate::targets::ServerRequestScope) -> Self {
@@ -411,12 +439,14 @@ impl GraphHttpClient {
     /// inheriting the managed JSON request's total thirty-second deadline.
     pub(crate) fn blob_delivery(&self) -> Result<Self> {
         Ok(Self {
-            client: Self::build(&self.transport, false)?,
+            client: Self::build(&self.transport, false, self.operator_transport.as_ref())?,
+            operator_transport: self.operator_transport.clone(),
             transport: self.transport.clone(),
             health_url: self.health_url.clone(),
             missing_credential: self.missing_credential.clone(),
             expected_actor: self.expected_actor.clone(),
             request_scope: self.request_scope.clone(),
+            credential: self.credential.clone(),
         })
     }
 
@@ -429,6 +459,57 @@ impl GraphHttpClient {
     }
 
     pub(crate) async fn send(&self, request: RequestBuilder) -> Result<Response> {
+        let request = self.discovered(request).await?;
+        let bearer = request
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::to_owned);
+        if let Some(credential) = &self.credential {
+            let binding = credential.request();
+            let endpoint = RequestTarget::of(binding.endpoint(), binding.endpoint())?;
+            if !RequestTarget::from_sent(&self.transport, request.url()).is_under(&endpoint)
+                || Some(
+                    credential
+                        .bearer_for(binding, time::OffsetDateTime::now_utc())?
+                        .expose(),
+                ) != bearer.as_deref()
+            {
+                return Err(crate::credential_sources::CredentialError::BindingMismatch.into());
+            }
+        }
+        crate::command_outcome::dispatched(request.method());
+        let mut response = self.client.execute(request).await?;
+        crate::command_outcome::response(response.status(), response.headers(), bearer.as_deref());
+        if !has_contract(&response) {
+            return Err(ApiContractError::response(response.status()).into());
+        }
+        if response.status() == StatusCode::UNAUTHORIZED
+            && bearer.is_none()
+            && let Some(missing) = &self.missing_credential
+        {
+            response
+                .extensions_mut()
+                .insert(MissingCredential::clone(missing));
+        }
+        Ok(response)
+    }
+
+    /// [`Self::send`] for `/mcp`, which follows the MCP transport instead of
+    /// the graph contract: the request is scoped, asserts its actor and is
+    /// preceded by discovery as every other is, but the server stamps no
+    /// contract header on an MCP answer, so none is required. Every answer,
+    /// a 401 included, is the caller's to read.
+    pub(crate) async fn send_mcp(&self, request: RequestBuilder) -> Result<Response> {
+        let request = self.discovered(request).await?;
+        Ok(self.client.execute(request).await?)
+    }
+
+    /// The request with its contract and actor headers, once its route lies
+    /// in the captured scope and a fresh discovery probe established the
+    /// contract. Nothing of the request has been sent when this fails.
+    async fn discovered(&self, request: RequestBuilder) -> Result<reqwest::Request> {
         let mut request = request.header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT);
         if let Some(actor) = &self.expected_actor {
             request = request.header(IF_ACTOR_HEADER, actor);
@@ -450,28 +531,7 @@ impl GraphHttpClient {
         if !discovery.status().is_success() || !has_contract(&discovery) {
             return Err(ApiContractError::discovery(Some(discovery.status())).into());
         }
-        drop(discovery);
-        let bearer = request
-            .headers()
-            .get(reqwest::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .map(str::to_owned);
-        crate::command_outcome::dispatched(request.method());
-        let mut response = self.client.execute(request).await?;
-        crate::command_outcome::response(response.status(), response.headers(), bearer.as_deref());
-        if !has_contract(&response) {
-            return Err(ApiContractError::response(response.status()).into());
-        }
-        if response.status() == StatusCode::UNAUTHORIZED
-            && bearer.is_none()
-            && let Some(missing) = &self.missing_credential
-        {
-            response
-                .extensions_mut()
-                .insert(MissingCredential::clone(missing));
-        }
-        Ok(response)
+        Ok(request)
     }
 }
 

@@ -106,6 +106,39 @@ pub struct LoadOperatorExecuted {
     /// Nanoseconds from the operator's first poll to its end: the phase's
     /// wall time, waits included; `0` where no end was recorded.
     pub wall_ns: u64,
+    /// The output partitions the operator ran, each its own stream: a
+    /// `CsvSource`'s parsers, 1 for every other operator.
+    #[serde(default = "one_partition")]
+    pub partitions: u32,
+    /// The slices of the source a `CsvSource` cut and parsed, in slice order;
+    /// empty for every other operator.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slices: Vec<LoadSliceExecuted>,
+}
+
+fn one_partition() -> u32 {
+    1
+}
+
+/// What one slice of a `CsvSource` measured: a byte range of the capture
+/// parsed whole by one partition.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadSliceExecuted {
+    /// The slice's position in the source, from 0; rows of a slice are the
+    /// same on every run.
+    pub slice: u32,
+    /// The partition that claimed the slice; which one varies between runs.
+    pub partition: u32,
+    /// The records the slice held.
+    pub rows: u64,
+    /// Nanoseconds the slice's parse and normalization took.
+    pub elapsed_compute_ns: u64,
+    /// Nanoseconds after the source's first poll at which the slice was
+    /// claimed.
+    pub start_ns: u64,
+    /// Nanoseconds after the source's first poll at which the slice's last
+    /// batch was sent.
+    pub end_ns: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -518,7 +551,8 @@ impl Omnigraph {
                 branch_created = true;
                 // DST window (loader walk D1 → D2): the implicit fork is
                 // durable, the load has not begun.
-                fail(&LOAD_POST_BRANCH_CREATE_PRE_STAGE)?;
+                fail(&LOAD_POST_BRANCH_CREATE_PRE_STAGE)
+                    .map_err(OmniError::after_earlier_publication)?;
             }
         }
         // Direct-to-target writes: no Run state machine, no `__run__` staging
@@ -538,8 +572,10 @@ impl Omnigraph {
             )
             .await
             .map_err(|error| {
+                // The fork published on its own, so every failure of the rows
+                // follows it.
                 if branch_created {
-                    error.without_pre_effect_evidence()
+                    error.after_earlier_publication()
                 } else {
                     error
                 }
@@ -793,6 +829,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
             capture.size,
             memory.limit(),
             write_budget.bytes(),
+            stage_write_concurrency,
         )
         .await?;
         if mode == LoadMode::Overwrite {
@@ -807,6 +844,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
                 actor_id,
                 history_release_bytes,
                 write_budget,
+                stage_write_concurrency,
                 memory,
                 executed,
             ))
@@ -1261,6 +1299,7 @@ async fn load_csv_overwrite_plan(
     actor_id: Option<&str>,
     history_release_bytes: HistoryReleaseBytes,
     write_budget: WriteBudget,
+    stage_write_concurrency: usize,
     memory: &crate::engine::LoadMemory,
     mut executed: LoadExecuted,
 ) -> Result<LoadReceipt> {
@@ -1293,8 +1332,10 @@ async fn load_csv_overwrite_plan(
             db: Arc::clone(db),
             txn: Arc::new(txn.clone()),
             write_budget,
+            writers: stage_write_concurrency,
             staged: Arc::clone(&staged),
         }),
+        slice_bytes: crate::engine::csv_slice_bytes(),
     };
     let context = EngineContext {
         snapshot: Some(snapshot),
@@ -1305,6 +1346,12 @@ async fn load_csv_overwrite_plan(
     let run = crate::engine::execute_load(&bound, &context, memory).await?;
     let rows = run.rows;
     executed.operators = run.operators;
+    executed.partitions = executed
+        .operators
+        .iter()
+        .map(|operator| operator.partitions)
+        .max()
+        .unwrap_or(1);
     let staged = staged
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1383,6 +1430,7 @@ pub(crate) async fn plan_load(
     source_bytes: u64,
     memory_limit: u64,
     write_max_bytes: u64,
+    load_workers_max: usize,
 ) -> Result<Decision> {
     let stmt = LoadStmt {
         source: request.source.clone(),
@@ -1412,7 +1460,7 @@ pub(crate) async fn plan_load(
                     omnigraph_compiler::ir::ValidateCheck::EdgeRi { .. }
                 ) && check.consults.as_ref() == Some(key)
             });
-            if !endpoint {
+            if !endpoint && *key != table_key {
                 continue;
             }
             let Some(name) = key.strip_prefix("node:") else {
@@ -1461,7 +1509,7 @@ pub(crate) async fn plan_load(
         tables,
         source_bytes,
     };
-    let bounds = crate::engine::engine_bounds(memory_limit, write_max_bytes);
+    let bounds = crate::engine::engine_bounds(memory_limit, write_max_bytes, load_workers_max);
     Ok(route(&operation, &source, RouteOverride::Registry, &bounds))
 }
 
@@ -3680,187 +3728,247 @@ pub(crate) fn parse_date64_literal(value: &str) -> Result<i64> {
 
 // ─── Value constraint validation ─────────────────────────────────────────────
 
+/// The first value constraint `batch` violates, in declaration order.
 pub(crate) fn validate_value_constraints(
     batch: &RecordBatch,
     node_type: &omnigraph_compiler::catalog::NodeType,
 ) -> Result<()> {
+    match value_constraint_failures(batch, node_type)
+        .into_iter()
+        .next()
+    {
+        Some((_, _, error)) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Every `@range` and `@check` constraint of `node_type` that `batch`
+/// violates: one entry per constraint in declaration order (the range
+/// constraints, then the check constraints), the constraint's index, its
+/// first violating row and the refusal; a constraint the batch cannot be
+/// checked against (an unchecked type, an invalid pattern, a NaN bound)
+/// refuses at row 0.
+pub(crate) fn value_constraint_failures(
+    batch: &RecordBatch,
+    node_type: &omnigraph_compiler::catalog::NodeType,
+) -> Vec<(usize, usize, OmniError)> {
+    let ranges = node_type
+        .range_constraints
+        .iter()
+        .map(|rc| range_constraint_failure(batch, node_type, rc));
+    let checks = node_type
+        .check_constraints
+        .iter()
+        .map(|cc| check_constraint_failure(batch, node_type, cc));
+    ranges
+        .chain(checks)
+        .enumerate()
+        .filter_map(|(index, failure)| failure.map(|(row, error)| (index, row, error)))
+        .collect()
+}
+
+/// The first row of `batch` outside `rc`'s bounds; a list property bounds
+/// each element, and nulls are never bounded, so an all-null column passes
+/// whatever its physical type.
+fn range_constraint_failure(
+    batch: &RecordBatch,
+    node_type: &omnigraph_compiler::catalog::NodeType,
+    rc: &omnigraph_compiler::catalog::RangeConstraint,
+) -> Option<(usize, OmniError)> {
     use arrow_array::Array;
     use arrow_array::cast::AsArray;
 
-    // Range constraints. A list property bounds each element.
-    for rc in &node_type.range_constraints {
-        let Some(col) = batch.column_by_name(&rc.property) else {
-            continue;
-        };
-        // Nulls are never bounded, so an all-null column has nothing to check
-        // whatever its physical type.
-        if col.logical_null_count() == col.len() {
-            continue;
+    let col = batch.column_by_name(&rc.property)?;
+    if col.logical_null_count() == col.len() {
+        return None;
+    }
+    let bounds = [
+        (rc.min.as_ref(), Ordering::Less, "<", "min"),
+        (rc.max.as_ref(), Ordering::Greater, ">", "max"),
+    ]
+    .map(|(bound, refused, relation, name)| {
+        (bound.map(RangeOperand::bound), refused, relation, name)
+    });
+    let check = |value: RangeOperand| -> Result<()> {
+        if value.is_nan() {
+            return Err(OmniError::manifest(format!(
+                "@range violation on {}.{}: value is NaN",
+                node_type.name, rc.property
+            )));
         }
-        let bounds = [
-            (rc.min.as_ref(), Ordering::Less, "<", "min"),
-            (rc.max.as_ref(), Ordering::Greater, ">", "max"),
-        ]
-        .map(|(bound, refused, relation, name)| {
-            (bound.map(RangeOperand::bound), refused, relation, name)
-        });
-        let check = |value: RangeOperand| -> Result<()> {
-            if value.is_nan() {
+        for (bound, refused, relation, name) in bounds {
+            let Some(bound) = bound else {
+                continue;
+            };
+            let order = value.compare(bound).ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "@range on {}.{} has a NaN {name} bound",
+                    node_type.name, rc.property
+                ))
+            })?;
+            if order == refused {
                 return Err(OmniError::manifest(format!(
-                    "@range violation on {}.{}: value is NaN",
+                    "@range violation on {}.{}: value {value} {relation} {name} {bound}",
                     node_type.name, rc.property
                 )));
             }
-            for (bound, refused, relation, name) in bounds {
-                let Some(bound) = bound else {
-                    continue;
-                };
-                let order = value.compare(bound).ok_or_else(|| {
-                    OmniError::manifest(format!(
-                        "@range on {}.{} has a NaN {name} bound",
-                        node_type.name, rc.property
-                    ))
-                })?;
-                if order == refused {
-                    return Err(OmniError::manifest(format!(
-                        "@range violation on {}.{}: value {value} {relation} {name} {bound}",
-                        node_type.name, rc.property
-                    )));
-                }
+        }
+        Ok(())
+    };
+    let unchecked = |data_type: &DataType| {
+        OmniError::manifest(format!(
+            "@range on {}.{} cannot check values of type {data_type}",
+            node_type.name, rc.property
+        ))
+    };
+    if let DataType::List(_) = col.data_type() {
+        let list = col.as_list::<i32>();
+        let elements = list.values();
+        let Some(values) = RangeColumn::new(elements) else {
+            return Some((0, unchecked(elements.data_type())));
+        };
+        for (row, span) in list.value_offsets().windows(2).enumerate() {
+            if list.is_null(row) {
+                continue;
             }
-            Ok(())
-        };
-        let unchecked = |data_type: &DataType| {
-            OmniError::manifest(format!(
-                "@range on {}.{} cannot check values of type {data_type}",
-                node_type.name, rc.property
-            ))
-        };
-        if let DataType::List(_) = col.data_type() {
-            let list = col.as_list::<i32>();
-            let elements = list.values();
-            let values =
-                RangeColumn::new(elements).ok_or_else(|| unchecked(elements.data_type()))?;
-            for (row, span) in list.value_offsets().windows(2).enumerate() {
-                if list.is_null(row) {
-                    continue;
-                }
-                for index in span[0] as usize..span[1] as usize {
-                    if !elements.is_null(index) {
-                        check(values.value(index))?;
+            for index in span[0] as usize..span[1] as usize {
+                if !elements.is_null(index) {
+                    if let Err(error) = check(values.value(index)) {
+                        return Some((row, error));
                     }
                 }
             }
-        } else {
-            let values = RangeColumn::new(col).ok_or_else(|| unchecked(col.data_type()))?;
-            for row in 0..col.len() {
-                if !col.is_null(row) {
-                    check(values.value(row))?;
-                }
-            }
         }
-    }
-
-    // Check constraints (regex)
-    for cc in &node_type.check_constraints {
-        let re = regex::Regex::new(&cc.pattern).map_err(|e| {
-            OmniError::manifest(format!(
-                "@check on {}.{} has invalid regex '{}': {}",
-                node_type.name, cc.property, cc.pattern, e
-            ))
-        })?;
-        let Some(col) = batch.column_by_name(&cc.property) else {
-            continue;
+    } else {
+        let Some(values) = RangeColumn::new(col) else {
+            return Some((0, unchecked(col.data_type())));
         };
-        let str_col = col.as_any().downcast_ref::<StringArray>();
-        if let Some(str_col) = str_col {
-            for row in 0..str_col.len() {
-                if str_col.is_null(row) {
-                    continue;
-                }
-                let val = str_col.value(row);
-                if !re.is_match(val) {
-                    return Err(OmniError::manifest(format!(
-                        "@check violation on {}.{}: value '{}' does not match pattern '{}'",
-                        node_type.name, cc.property, val, cc.pattern
-                    )));
+        for row in 0..col.len() {
+            if !col.is_null(row) {
+                if let Err(error) = check(values.value(row)) {
+                    return Some((row, error));
                 }
             }
         }
     }
+    None
+}
 
-    Ok(())
+/// The first row of `batch` whose text leaves `cc`'s pattern.
+fn check_constraint_failure(
+    batch: &RecordBatch,
+    node_type: &omnigraph_compiler::catalog::NodeType,
+    cc: &omnigraph_compiler::catalog::CheckConstraint,
+) -> Option<(usize, OmniError)> {
+    use arrow_array::Array;
+
+    let re = match regex::Regex::new(&cc.pattern) {
+        Ok(re) => re,
+        Err(e) => {
+            return Some((
+                0,
+                OmniError::manifest(format!(
+                    "@check on {}.{} has invalid regex '{}': {}",
+                    node_type.name, cc.property, cc.pattern, e
+                )),
+            ));
+        }
+    };
+    let col = batch.column_by_name(&cc.property)?;
+    let str_col = col.as_any().downcast_ref::<StringArray>()?;
+    (0..str_col.len())
+        .filter(|&row| !str_col.is_null(row))
+        .find(|&row| !re.is_match(str_col.value(row)))
+        .map(|row| {
+            (
+                row,
+                OmniError::manifest(format!(
+                    "@check violation on {}.{}: value '{}' does not match pattern '{}'",
+                    node_type.name,
+                    cc.property,
+                    str_col.value(row),
+                    cc.pattern
+                )),
+            )
+        })
 }
 
 /// Validate that every enum-typed property in `properties` only contains values
 /// from its declared enum value set. Operates on a single `RecordBatch` so it
 /// can be called from any write path that already holds a batch.
-///
-/// Scalar string enums are checked directly. List-of-enum properties are
-/// checked element-by-element across the underlying string values.
 pub(crate) fn validate_enum_constraints(
     batch: &RecordBatch,
     properties: &HashMap<String, omnigraph_compiler::types::PropType>,
     type_name: &str,
 ) -> Result<()> {
+    match enum_constraint_failures(batch, properties, type_name)
+        .into_iter()
+        .next()
+    {
+        Some((_, _, error)) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Every enum-typed property of `properties` with a value of `batch` outside
+/// its declared set: one entry per property, the properties ordered by name,
+/// the property's index in that order, its first offending row and the
+/// refusal. Scalar string enums are checked directly; a list-of-enum property
+/// is checked element by element, the row being the list's.
+pub(crate) fn enum_constraint_failures(
+    batch: &RecordBatch,
+    properties: &HashMap<String, omnigraph_compiler::types::PropType>,
+    type_name: &str,
+) -> Vec<(usize, usize, OmniError)> {
     use arrow_array::{Array, ListArray};
 
-    let mut __dst_pp: Vec<_> = properties.iter().collect();
+    let mut __dst_pp: Vec<_> = properties
+        .iter()
+        .filter_map(|(name, prop_type)| {
+            prop_type
+                .enum_values
+                .as_ref()
+                .map(|allowed| (name, prop_type.list, allowed))
+        })
+        .collect();
     __dst_pp.sort_by(|a, b| a.0.cmp(b.0));
-    for (prop_name, prop_type) in __dst_pp {
-        let Some(allowed) = prop_type.enum_values.as_ref() else {
-            continue;
-        };
-        let Some(col) = batch.column_by_name(prop_name) else {
-            continue;
-        };
-        if prop_type.list {
-            let Some(list_col) = col.as_any().downcast_ref::<ListArray>() else {
-                continue;
+    __dst_pp
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, (prop_name, list, allowed))| {
+            let col = batch.column_by_name(prop_name)?;
+            let invalid = |val: &str| {
+                OmniError::manifest(format!(
+                    "invalid enum value '{}' for {}.{} (expected: {})",
+                    val,
+                    type_name,
+                    prop_name,
+                    allowed.join(", ")
+                ))
             };
-            for row in 0..list_col.len() {
-                if list_col.is_null(row) {
-                    continue;
-                }
-                let item_arr = list_col.value(row);
-                let Some(str_arr) = item_arr.as_any().downcast_ref::<StringArray>() else {
-                    continue;
-                };
-                for i in 0..str_arr.len() {
-                    if str_arr.is_null(i) {
-                        continue;
-                    }
-                    let val = str_arr.value(i);
-                    if !allowed.iter().any(|a| a.as_str() == val) {
-                        return Err(OmniError::manifest(format!(
-                            "invalid enum value '{}' for {}.{} (expected: {})",
-                            val,
-                            type_name,
-                            prop_name,
-                            allowed.join(", ")
-                        )));
-                    }
-                }
-            }
-        } else if let Some(str_col) = col.as_any().downcast_ref::<StringArray>() {
-            for row in 0..str_col.len() {
-                if str_col.is_null(row) {
-                    continue;
-                }
-                let val = str_col.value(row);
-                if !allowed.iter().any(|a| a.as_str() == val) {
-                    return Err(OmniError::manifest(format!(
-                        "invalid enum value '{}' for {}.{} (expected: {})",
-                        val,
-                        type_name,
-                        prop_name,
-                        allowed.join(", ")
-                    )));
-                }
-            }
-        }
-    }
-    Ok(())
+            let found = if list {
+                let list_col = col.as_any().downcast_ref::<ListArray>()?;
+                (0..list_col.len())
+                    .filter(|&row| !list_col.is_null(row))
+                    .find_map(|row| {
+                        let item_arr = list_col.value(row);
+                        let str_arr = item_arr.as_any().downcast_ref::<StringArray>()?;
+                        str_arr
+                            .iter()
+                            .flatten()
+                            .find(|val| !allowed.iter().any(|a| a == val))
+                            .map(|val| (row, invalid(val)))
+                    })
+            } else {
+                let str_col = col.as_any().downcast_ref::<StringArray>()?;
+                (0..str_col.len())
+                    .filter(|&row| !str_col.is_null(row))
+                    .find(|&row| !allowed.iter().any(|a| a == str_col.value(row)))
+                    .map(|row| (row, invalid(str_col.value(row))))
+            };
+            found.map(|(row, error)| (index, row, error))
+        })
+        .collect()
 }
 
 /// Build the composite uniqueness key for `row` over a constraint group's

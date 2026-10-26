@@ -12,8 +12,8 @@ An effectful data `mutate --json` or `load --json` returns `commit` with the exa
 commit published by that attempt; a no-op mutation returns `"commit": null`.
 
 Protect a mutation derived from a read with `--if-commit <graph_commit_id>`.
-Any intervening branch commit fails without effects (HTTP `412`; CLI exit `4`
-through a server, exit `1` on a direct `--target` open).
+Any intervening branch commit fails without effects (HTTP `412`; CLI exit `4`,
+through a server or a direct `--target` open).
 Re-read and decide again rather than retrying the stale mutation.
 
 ## Branch statements
@@ -31,7 +31,7 @@ published, even when another writer has since advanced the target; an
 `already_up_to_date` merge publishes nothing and returns `commit: null`.
 `branch list`
 goes to canonical `POST /query` and returns sorted `name` rows; branch statements
-are refused on deprecated query/mutation routes and the conditional-write route.
+are refused on the conditional-write route.
 
 ## Inspect one commit
 

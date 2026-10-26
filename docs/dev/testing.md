@@ -35,6 +35,7 @@ export budget and must not share a binary with the other export tests.
 | `omnigraph-engine` | `crates/omnigraph/tests/` plus focused in-source tests | `tests/helpers/` and `tests/fixtures/` |
 | `omnigraph-policy` | In-source Cedar policy parsing and evaluation tests | Module-local fixtures |
 | `omnigraph-cluster` | In-source lifecycle, deployment and admission tests; `tests/failpoints.rs`; `tests/identity_recovery.rs`; `tests/s3_cluster.rs` | Module-local fixtures |
+| `omnigraph-mcp` | In-source protocol, settings, catalog and bounded-result tests | Module-local fixtures |
 | `omnigraph-server` | `crates/omnigraph-server/tests/` | `tests/support/mod.rs` |
 | `omnigraph-cli` | In-source application, runtime, parsing, output and transport tests plus `crates/omnigraph-cli/tests/` | `tests/support/mod.rs` |
 | `omnigraph-skill` | In-source `src/lib.rs`: the embedded table is sorted and `file` finds every path. The CLI owns the rest. In-source `src/skill.rs` holds the skill's command index (`references/commands.md`) and condensed reference (`SKILL.md`) to the clap tree and its storage-format line to `omnigraph version`; `integration/cli_schema_config.rs` owns `skill export` and `skill show`, including byte identity with `skills/omnigraph`; `scripts/check-docs.py` holds `metadata.version` and the declared HTTP contract to the CLI | None |
@@ -217,13 +218,26 @@ filtering and wrong-plane refusal before configuration or HTTP access. The exist
 `system_remote` deployment matrix owns real server completion after delivery loss;
 these CLI changes require no additional query-semantic GQT cases.
 
-Local command tests in `commands/local` own supplied login input, credential
-changes after report failure, captured target configuration, and completed skill
-or embedding files after output loss. `skill.rs` owns exact file delivery and its
-existing broken-pipe exception. Extend `cli_schema_config` for version and skill
-process behavior and `cli_data` for target/embedding output. Its existing
-discovery-swap fixture also replaces the credential file, requiring registry
-probing and the subsequent command to retain the original token. Application and
+Operator schema/routing owners cover whole-document validity, independent
+profile/target defaults, single-identity managed profiles, standalone auth
+selection and immutable target-to-profile bindings.
+Credential-source owners cover bounded stdin/env/file/exec acquisition, absence
+of fallback, helper failures and secret redaction. Target/application tests own
+static set/remove, no-network/no-helper/noninteractive status and pipe-only export
+before secret acquisition. Managed authentication tests own independent profile
+sessions, principal/session collision refusal, refresh coordination and logout
+cache clearing; lifecycle fixtures retain original-identity recovery checks.
+Transport owners cover prefix boundaries, no redirects, explicit proxy selection,
+CA capture and unsupported trust combinations. Extend the shared served-client
+fixtures across managed and standalone graph commands instead of adding an
+allowlist-specific test setup.
+
+`commands/local` retains version, skill and embedding output ownership.
+`skill.rs` owns exact file delivery and its broken-pipe exception; extend
+`cli_schema_config` for process behavior. Credential replacement during discovery
+must not change the token used by an already captured invocation.
+
+Application and
 managed-output tests own completion, partial-write and flush failures; managed
 authentication/lifecycle fixtures own the pre-dispatch diagnostic gates and
 accepted-identity recovery output when stderr fails. Application tests keep
@@ -233,22 +247,43 @@ barrier test proves reported failures do not wait for blocked runtime work;
 `cli_schema_config` owns help/version/refusal statuses with closed streams.
 These are CLI boundary contracts; query-semantic GQT cases remain unchanged.
 
+The operator-config owners also cover read-only YAML and parent directories with
+writable private credential state, preservation/conflict checks when relocating
+legacy state, and explicit profile creation versus default-profile login.
+The existing client and managed-auth fixtures delay discovery or a later request
+past credential expiry and assert that no authenticated operation is dispatched.
+Standalone flat-auth fixtures retain distinct-target identity isolation, including
+two targets sharing an endpoint; no auth-name fallback remains.
+
 The `system_remote` deployment matrix holds a real
 admitted request through drain, disconnects or times out the caller before
 durable acceptance, and loses replies after acceptance. Exact-ID observation
 must finish with one ledger result, one schema publication and the same server
-PID; neither apply nor recovery polling may resubmit. The `unix://` server
-transport goes through `tests/support/unix_gateway.rs`, a byte-for-byte
-Unix-socket relay to the server's TCP address: `system_remote` runs the CLI's
-data verbs through it, and the in-source `client.rs` tests own the request
-target, discovery and refusals over the socket.
+PID; neither apply nor recovery polling may resubmit. The old Unix-gateway
+fixture does not qualify a version-1 operator transport: Unix socket targets are
+unsupported. Keep lower-level transport coverage distinct from public resolver
+capability/refusal tests.
 
 Server suites are organized by public route: `auth_policy`, `data_routes`, `schema_routes`, `stored_queries`, `multi_graph`, `boot_settings`, object-store coverage in `s3`, and the generated contract in `openapi`.
+
+The OpenAPI owner checks the [HTTP conventions](http-api.md), their named
+exceptions, and required error responses. Its negative cases remove a required
+response or code from a spec copy and require rejection; a regenerated snapshot
+alone is not proof of complete response coverage.
+
+`omnigraph-mcp` owns protocol, catalog and formatting tests. Server
+`integration/mcp.rs` keeps the real HTTP fixture for authentication, policy,
+tool/route and error-disposition parity, limits and response lifetimes. The
+server adapter's in-source tests own canonical protocol-refusal projection,
+including lost and oversized write results; `boot_settings` covers MCP across
+shutdown and restart. Extend these owners instead of adding a second server
+fixture to the MCP crate.
 
 Per-graph serving transitions extend these owners: in-source `registry` tests
 own capture/close ordering, drain-only deployment deadlines, affected activation
 scope, schema identity and candidate bounds;
-`operations`, `ingress` and `mcp` own detached execution and output lifetimes.
+`operations`, `ingress` and the server's MCP adapter own detached execution and
+output lifetimes.
 `stored_queries` parks a request before engine capture, `data_routes` retains
 disconnected writes and stream bytes, and `boot_settings`/`mcp` check authorized
 availability. The same owners cover coherent schema/query batch activation; these assertions
@@ -287,6 +322,8 @@ share the transport-independent phases; local success does not qualify their
 storage-fault paths. CI requires the local journey to execute successfully.
 
 CLI suites own their named planes: cluster lifecycle, data commands, stored queries, schema/config, cross-version rebuild, embedded/remote parity, and local/remote system journeys. Keep `OMNIGRAPH_HOME` hermetic by using `tests/support::cli()` or `cli_process()`.
+
+CLI `integration/cli_mcp.rs` owns the stdio MCP bridge against a real served cluster and a stand-in endpoint: refusals before any I/O, tool listing under the server's write setting and `--write`, graph binding, reads equal to the server's own `/mcp` answers, a Unix-socket endpoint refused before it connects, `--as`, credential re-reading from the target's `auth` source after a 401 without resending, the server's `WWW-Authenticate` challenge relayed with a 401, cancellation, and unreachable servers or lost answers that start nothing and resend nothing. In-source `commands/mcp` tests own framing, binding and narrowing rules, and that the bridge names no server or MCP implementation crate.
 
 Deployment tests extend these owners: cluster `tests.rs` pins no-reset
 ledger conversion, captured source bytes, exact-ID lookup, bounded results and

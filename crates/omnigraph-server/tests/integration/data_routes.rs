@@ -224,7 +224,7 @@ async fn blob_get_head_ranges_and_conditionals_follow_http_contract() {
     );
     let output: ErrorOutput =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(output.code, Some(ErrorCode::Conflict));
+    assert_eq!(output.code, Some(ErrorCode::PreconditionFailed));
 
     for (range, expected_range, expected) in [
         ("bytes=1-4", "bytes 1-4/11", &b"ello"[..]),
@@ -486,7 +486,7 @@ async fn blob_get_preserves_empty_null_edge_and_target_semantics() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(
         error.code,
-        Some(omnigraph_server::api::ErrorCode::BadRequest)
+        Some(omnigraph_server::api::ErrorCode::RangeNotSatisfiable)
     );
     let range = error
         .blob_range
@@ -664,12 +664,7 @@ async fn blob_get_preserves_empty_null_edge_and_target_semantics() {
                 Some(omnigraph_server::api::ErrorCode::BadRequest),
                 "{case}"
             );
-            assert!(
-                output
-                    .error
-                    .starts_with("invalid Blob selector query parameters:"),
-                "{case}"
-            );
+            assert!(output.error.starts_with("invalid query string:"), "{case}");
         }
     }
 }
@@ -684,7 +679,7 @@ async fn blob_put_and_delete_return_exact_receipts_and_blob_preconditions() {
     let (_temp, app) = app_for_blob_http_data(BLOB_HTTP_DATA).await;
     let precondition_failure = |body: &[u8]| {
         let output: Value = serde_json::from_slice(body).unwrap();
-        assert_eq!(output["code"], "conflict", "{output}");
+        assert_eq!(output["code"], "precondition_failed", "{output}");
         assert!(output.get("precondition_failure").is_none(), "{output}");
         output["blob_precondition_failure"].clone()
     };
@@ -1721,6 +1716,151 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
         .unwrap();
     assert_eq!(head.graph_commit_id, receipt_commit_id);
     assert_eq!(head.actor_id.as_deref(), Some("act-andrew"));
+
+    // The fork publishes before the rows, so a typed refusal of the rows
+    // follows effects: the body says so, and the branch is there.
+    let refused = IngestRequest {
+        branch: Some("feature-refused".to_string()),
+        from: Some("main".to_string()),
+        mode: Some(LoadMode::Append),
+        data: r#"{"type":"Person","data":{"name":"Bob","age":26}}"#.to_string(),
+    };
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/load"))
+            .method(Method::POST)
+            .header("authorization", "Bearer token-one")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&refused).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["key_conflict"].is_object(), "{body}");
+    assert_eq!(
+        body["disposition"],
+        json!({"effects": "partial", "action": "refresh"}),
+        "{body}"
+    );
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    assert!(
+        db.branch_list()
+            .await
+            .unwrap()
+            .contains(&"feature-refused".to_string())
+    );
+
+    // Onto a branch that exists, `from` forks nothing: the refused rows were
+    // the load's one publication, and it did not happen.
+    let unforked = IngestRequest {
+        branch: Some("feature-ingest".to_string()),
+        ..refused
+    };
+    let commits = db.list_commits(Some("feature-ingest")).await.unwrap().len();
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/load"))
+            .method(Method::POST)
+            .header("authorization", "Bearer token-one")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&unforked).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["key_conflict"].is_object(), "{body}");
+    assert_eq!(
+        body["disposition"],
+        json!({"effects": "none", "action": "refresh"}),
+        "{body}"
+    );
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    assert_eq!(
+        db.list_commits(Some("feature-ingest")).await.unwrap().len(),
+        commits
+    );
+}
+
+/// Whether a load forked its branch is the engine's fact, not the route's. A
+/// branch deleted after the route authorized the load, while its body is still
+/// arriving, is forked by the load itself, and a refusal of the rows then
+/// follows that publication.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_load_that_forks_a_branch_deleted_during_its_body_reports_the_fork() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let db = Arc::new(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
+    db.branch_create("feature").await.unwrap();
+    let state = AppState::new_multi(
+        vec![Arc::new(omnigraph_server::registry::GraphHandle {
+            key: omnigraph_server::identity::GraphKey::cluster(
+                omnigraph_server::graph_id::GraphId::try_from("default").unwrap(),
+            ),
+            uri: graph.to_string_lossy().to_string(),
+            engine: Arc::clone(&db),
+            policy: None,
+            queries: None,
+        })],
+        Vec::new(),
+        None,
+        omnigraph_server::workload::WorkloadController::new(1, 1_000_000),
+        None,
+    )
+    .unwrap();
+    let app = build_app(state);
+
+    // The route authorizes before it polls the body, so the first poll says
+    // the route has listed `feature`; the rows wait for the deletion.
+    let (polled, route_listed) = tokio::sync::oneshot::channel::<()>();
+    let (send_rows, rows) = tokio::sync::oneshot::channel::<Bytes>();
+    let body = Body::from_stream(futures::stream::unfold(
+        Some((polled, rows)),
+        |state| async move {
+            let (polled, rows) = state?;
+            let _ = polled.send(());
+            let rows = rows.await.ok()?;
+            Some((Ok::<_, Infallible>(rows), None))
+        },
+    ));
+    let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+        .method(Method::POST)
+        .uri(g("/load/ndjson?branch=feature&from=main&mode=append"))
+        .header("content-type", "application/x-ndjson")
+        .body(body)
+        .unwrap();
+    let load = tokio::spawn(async move { json_response(&app, request).await });
+    tokio::time::timeout(Duration::from_secs(10), route_listed)
+        .await
+        .expect("the route reads the body after authorizing")
+        .unwrap();
+    db.branch_delete("feature").await.unwrap();
+    // Bob is on main, so appending him to a fork of main is refused.
+    send_rows
+        .send(Bytes::from_static(
+            b"{\"type\":\"Person\",\"data\":{\"name\":\"Bob\",\"age\":26}}\n",
+        ))
+        .unwrap();
+    let (status, body) = load.await.unwrap();
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["key_conflict"].is_object(), "{body}");
+    assert_eq!(
+        body["disposition"],
+        json!({"effects": "partial", "action": "refresh"}),
+        "the fork published before the rows: {body}"
+    );
+    assert!(
+        db.branch_list()
+            .await
+            .unwrap()
+            .contains(&"feature".to_string()),
+        "the load forked `feature` again"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2009,10 +2149,10 @@ async fn branch_merge_conflict_response_includes_structured_conflicts() {
     assert_eq!(error.code, Some(omnigraph_server::api::ErrorCode::Conflict));
     assert!(error.error.contains("merge conflict"));
     assert!(error.merge_conflicts.iter().any(|conflict| {
-        conflict.entity_kind == omnigraph_server::api::EntityKindOutput::Node
+        conflict.entity_kind == omnigraph_server::api::EntityKind::Node
             && conflict.type_name == "Person"
             && conflict.entity_id.as_deref() == Some("Alice")
-            && conflict.kind == omnigraph_server::api::MergeConflictKindOutput::DivergentUpdate
+            && conflict.kind == omnigraph_server::api::MergeConflictKind::DivergentUpdate
     }));
 }
 
@@ -3113,7 +3253,7 @@ async fn parse_error_precedes_policy_denial_on_every_door() {
         let suggestion = diagnostic.suggestion.unwrap();
         assert_eq!(
             suggestion.applicability,
-            omnigraph_api_types::ApplicabilityOutput::MachineApplicable
+            omnigraph_api_types::Applicability::MachineApplicable
         );
         assert_eq!(
             suggestion.edits,
@@ -3164,17 +3304,53 @@ async fn propose_person(app: &axum::Router, name: &str) -> Value {
 async fn commit_routes_list_publish_and_drop_unpublished_commits() {
     let (_temp, app) = app_for_loaded_graph().await;
     let head_before = main_head_commit_id(&app).await;
+    // Retired selectors must refuse even when false or empty, never silently
+    // select history, and never become valid alongside the replacement.
+    for key in ["unpublished", "unattached"] {
+        for value in ["true", "false", ""] {
+            for suffix in [
+                "",
+                "&listing=history",
+                "&listing=unpublished",
+                "&listing=unattached",
+            ] {
+                let (status, body) =
+                    get_json(&app, g(&format!("/commits?{key}={value}{suffix}"))).await;
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_REQUEST,
+                    "{key}={value}{suffix}: {body}"
+                );
+                assert_eq!(body["code"], "bad_request", "{body}");
+            }
+        }
+    }
+    for query in ["listing=unknown", "listing=history&listing=unpublished"] {
+        let (status, body) = get_json(&app, g(&format!("/commits?{query}"))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert_eq!(body["code"], "bad_request", "{body}");
+    }
+    assert_eq!(main_head_commit_id(&app).await, head_before);
     let pia = propose_person(&app, "Pia").await;
     let pia_id = pia["graph_commit_id"].as_str().unwrap().to_string();
     assert_eq!(main_head_commit_id(&app).await, head_before);
 
-    let (status, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    let (status, listed) = get_json(&app, g("/commits?listing=unpublished")).await;
     assert_eq!(status, StatusCode::OK, "{listed}");
     assert_eq!(listed["commits"], json!([pia]));
-    let (status, listed) = get_json(&app, g("/commits?unpublished=true&branch=main")).await;
+    let (status, listed) = get_json(&app, g("/commits?listing=unpublished&branch=main")).await;
     assert_eq!(status, StatusCode::OK, "{listed}");
     assert_eq!(listed["commits"], json!([pia]));
     let (_, history) = get_json(&app, g("/commits")).await;
+    let (status, explicit_history) = get_json(&app, g("/commits?listing=history")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(explicit_history, history);
+    let (status, with_unknown) = get_json(&app, g("/commits?future_option=ignored")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        with_unknown, history,
+        "only the two retired keys change unknown-key handling"
+    );
     assert!(
         history["commits"]
             .as_array()
@@ -3199,7 +3375,7 @@ async fn commit_routes_list_publish_and_drop_unpublished_commits() {
         again, published,
         "a repeat publish answers the published commit"
     );
-    let (_, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    let (_, listed) = get_json(&app, g("/commits?listing=unpublished")).await;
     assert_eq!(listed["commits"], json!([]));
     let (_, history) = get_json(&app, g("/commits")).await;
     assert_eq!(history["commits"][0], published);
@@ -3229,7 +3405,7 @@ async fn commit_routes_list_publish_and_drop_unpublished_commits() {
         let (status, body) = json_response(&app, request).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     }
-    let (_, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    let (_, listed) = get_json(&app, g("/commits?listing=unpublished")).await;
     assert_eq!(listed["commits"], json!([]));
 
     // An ordinary write past a proposal's parent expires it: reads at its id
@@ -3253,7 +3429,7 @@ async fn commit_routes_list_publish_and_drop_unpublished_commits() {
         let (status, body) = get_json(&app, g(&path)).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
     }
-    let (_, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    let (_, listed) = get_json(&app, g("/commits?listing=unpublished")).await;
     assert_eq!(listed["commits"], json!([]));
     let (status, body) = json_response(
         &app,
@@ -3352,20 +3528,20 @@ async fn commit_routes_create_list_refuse_publish_and_drop_unattached_branches()
         "a child holds its ancestors' effects and its own"
     );
 
-    let (status, listed) = get_json(&app, g("/commits?unattached=true")).await;
+    let (status, listed) = get_json(&app, g("/commits?listing=unattached")).await;
     assert_eq!(status, StatusCode::OK, "{listed}");
     assert_eq!(listed["commits"], json!([child, root]), "newest first");
-    let (status, listed) = get_json(&app, g("/commits?unattached=true&branch=main")).await;
+    let (status, listed) = get_json(&app, g("/commits?listing=unattached&branch=main")).await;
     assert_eq!(status, StatusCode::OK, "{listed}");
     assert_eq!(listed["commits"], json!([child, root]));
-    let (status, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    let (status, listed) = get_json(&app, g("/commits?listing=unpublished")).await;
     assert_eq!(status, StatusCode::OK, "{listed}");
     assert_eq!(
         listed["commits"],
         json!([]),
         "unattached is not unpublished"
     );
-    let (status, body) = get_json(&app, g("/commits?unattached=true&unpublished=true")).await;
+    let (status, body) = get_json(&app, g("/commits?listing=unattached&listing=unpublished")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     let (_, history) = get_json(&app, g("/commits")).await;
     assert!(
@@ -3419,6 +3595,12 @@ async fn commit_routes_create_list_refuse_publish_and_drop_unattached_branches()
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "branch_start_refusal", "{body}");
+        assert_eq!(
+            body["disposition"],
+            json!({"effects": "none", "action": "fix"}),
+            "{body}"
+        );
         assert_eq!(
             body["branch_start_refusal"],
             json!({"reason": "unattached_snapshot", "graph_commit_id": id}),
@@ -3456,7 +3638,7 @@ async fn commit_routes_create_list_refuse_publish_and_drop_unattached_branches()
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {body}");
     }
-    let (_, listed) = get_json(&app, g("/commits?unattached=true")).await;
+    let (_, listed) = get_json(&app, g("/commits?listing=unattached")).await;
     assert_eq!(
         listed["commits"],
         json!([]),
@@ -3556,8 +3738,11 @@ async fn stored_unattached_mutation_keeps_its_clause_per_invocation() {
         StatusCode::BAD_REQUEST,
         "a missing base is 400: {body}"
     );
-    let (status, body) =
-        json_response(&app, get_request(&g("/commits?unattached=true"), "t-full")).await;
+    let (status, body) = json_response(
+        &app,
+        get_request(&g("/commits?listing=unattached"), "t-full"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["commits"].as_array().unwrap().len(), 3, "{body}");
 }
@@ -3626,7 +3811,7 @@ async fn commit_publish_refuses_a_moved_head_and_merge_as_commit_excludes_delete
     assert_eq!(merged["branch_deleted"], Value::Null);
     assert_eq!(main_head_commit_id(&app).await, head_before);
     let merge_id = merged["commit"]["graph_commit_id"].as_str().unwrap();
-    let (_, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    let (_, listed) = get_json(&app, g("/commits?listing=unpublished")).await;
     assert_eq!(listed["commits"], json!([merged["commit"]]));
     let (status, published) = json_response(
         &app,
@@ -3697,10 +3882,17 @@ const SHOW_AT_WRITE_DOOR: &str = "statement 'show merge_lineage' is a read; use 
 const SHOW_COLUMNS: [&str; 5] = ["name", "value", "default", "source", "scope"];
 
 /// Every settings refusal is `ApiError::bad_request`: the message, the code,
-/// and nothing else in the body.
+/// the disposition of a refusal, and nothing else in the body.
 fn assert_settings_refusal(status: StatusCode, body: &Value, error: &str) {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body, &json!({"error": error, "code": "bad_request"}));
+    assert_eq!(
+        body,
+        &json!({
+            "error": error,
+            "code": "bad_request",
+            "disposition": {"effects": "none", "action": "fix"},
+        })
+    );
 }
 
 /// A refusal whose sentence the settings definition owns: the 400 and the
@@ -3730,7 +3922,8 @@ async fn assert_unknown_settings_field(app: &axum::Router, request: Request<Body
     assert_eq!(body["code"], "bad_request", "{body}");
     let error = body["error"].as_str().unwrap_or_default();
     assert!(error.contains("unknown field"), "{error}");
-    assert_eq!(body.as_object().unwrap().len(), 2, "{body}");
+    assert_eq!(body.as_object().unwrap().len(), 3, "{body}");
+    assert_eq!(body["disposition"]["effects"], "none", "{body}");
 }
 
 fn show_row(name: &str, value: &str, default: &str, source: &str, scope: &str) -> Value {
@@ -5739,6 +5932,18 @@ async fn remote_branch_delete_flow_works() {
             "{method} {name}"
         );
         assert_eq!(response.headers()["allow"], allow, "{method} {name}");
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body["code"], "method_not_allowed",
+            "{method} {name}: {body}"
+        );
+        assert_eq!(
+            body["disposition"],
+            json!({"effects": "none", "action": "fix"}),
+            "{method} {name}"
+        );
     }
 
     let (list_status, list_body) = json_response(
@@ -7078,8 +7283,10 @@ async fn mutate_graph_commit_precondition_issue_365() {
         "stale graph-commit precondition must be rejected with 412, got {status}: {body}"
     );
     let error: ErrorOutput = serde_json::from_value(body).unwrap();
-    // code stays None: closed wire contract (`recovery_required` precedent).
-    assert_eq!(error.code, None);
+    assert_eq!(
+        error.code,
+        Some(omnigraph_server::api::ErrorCode::PreconditionFailed)
+    );
     let failure = error
         .precondition_failure
         .expect("412 body must carry structured precondition_failure details");
@@ -7685,11 +7892,11 @@ async fn commit_list_pages_answer_for_the_head_their_first_page_named() {
         ),
         ("/commits?limit=0".to_string(), StatusCode::BAD_REQUEST),
         (
-            "/commits?limit=2&unpublished=true".to_string(),
+            "/commits?limit=2&listing=unpublished".to_string(),
             StatusCode::BAD_REQUEST,
         ),
         (
-            format!("/commits?page_token={token}&unattached=true"),
+            format!("/commits?page_token={token}&listing=unattached"),
             StatusCode::BAD_REQUEST,
         ),
         (

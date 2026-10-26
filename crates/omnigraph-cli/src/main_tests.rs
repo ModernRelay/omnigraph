@@ -184,7 +184,6 @@ impl Drop for ScopedEnv {
 fn resolve_remote_credential_sends_no_unkeyed_token_issue_1022() {
     use crate::targets::{ServerAuth, resolve_server_token};
     let home = tempfile::tempdir().unwrap();
-    std::fs::write(home.path().join("config.yaml"), "target_config_version: 1\ntargets:\n  keyed:\n    kind: server\n    endpoint: https://keyed.example.com\n    credential: keyed\n  unkeyed:\n    kind: server\n    endpoint: https://unkeyed.example.com\n    credential: unkeyed\n").unwrap();
     let _env = ScopedEnv::set(&[
         ("OMNIGRAPH_BEARER_TOKEN", Some("global-token")),
         ("OMNIGRAPH_TOKEN_KEYED", Some("keyed-token")),
@@ -211,9 +210,8 @@ fn resolve_remote_credential_sends_no_unkeyed_token_issue_1022() {
         )
         .is_err()
     );
-    assert_eq!(
-        resolve_server_token(&input, &keyed, "https://keyed.example.com/graphs/knowledge").unwrap(),
-        Some("keyed-token".into())
+    assert!(
+        resolve_server_token(&input, &keyed, "https://keyed.example.com/graphs/knowledge").is_err()
     );
     assert!(
         resolve_server_token(

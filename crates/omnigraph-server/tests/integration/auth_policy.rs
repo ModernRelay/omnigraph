@@ -7,7 +7,7 @@ use std::fs;
 use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
 use axum::http::{HeaderValue, Method, Request, StatusCode};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
@@ -373,7 +373,8 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
     // nothing with no branch named or on `main`.
     let (status, body) = json_response(&app, get_request(&g("/access?branch=main"), &token)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(body["actor"].is_string(), "{body}");
+    assert!(body["actor_id"].is_string(), "{body}");
+    assert!(body.get("actor").is_none(), "{body}");
     assert_eq!(body["graph_wide"], json!([]), "{body}");
     assert_eq!(body["actions"], json!([]), "{body}");
     let (status, _) = json_response(
@@ -641,14 +642,14 @@ async fn api_contract_refuses_before_graph_resolution_body_or_mutation() {
         "params": {"name": "contract-write", "age": 27}
     })
     .to_string();
-    let expected_message = format!(
-        "exactly one {HTTP_API_CONTRACT_HEADER} header with value {HTTP_API_CONTRACT} is required"
-    );
+    let expected_message =
+        format!("exactly one Omnigraph-Http-Api header with value {HTTP_API_CONTRACT} is required");
     let cases = [
         Vec::new(),
         vec![HeaderValue::from_static("0.11")],
         vec![HeaderValue::from_static("0.12")],
         vec![HeaderValue::from_static("0.13")],
+        vec![HeaderValue::from_static("0.15")],
         vec![HeaderValue::from_str(&format!("{HTTP_API_CONTRACT}, {HTTP_API_CONTRACT}")).unwrap()],
         vec![
             HeaderValue::from_static(HTTP_API_CONTRACT),
@@ -789,6 +790,215 @@ async fn api_contract_refuses_before_graph_resolution_body_or_mutation() {
     }
 }
 
+/// A request refused before any handler runs, because no route or method
+/// matches or its body, query string or path parameter does not decode,
+/// answers the error body every other refusal does.
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_and_unrouted_requests_answer_the_error_body() {
+    use omnigraph_server::api::{
+        DispositionAction, DispositionEffects, DispositionOutput, ErrorCode,
+    };
+
+    let (temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
+    let graph = graph_path(temp.path());
+    let before = manifest_dataset_version(&graph).await;
+    let request = |method: Method, path: &str, body: &'static str| {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header("authorization", "Bearer demo-token")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let cases = [
+        // A body that is not JSON, and JSON of the wrong shape.
+        (
+            request(Method::POST, &g("/load"), "{"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::POST, &g("/load"), r#"{"data":5}"#),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::POST, &g("/branches"), r#"{"name":5}"#),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::POST, &g("/changes/baseline"), "{"),
+            StatusCode::BAD_REQUEST,
+        ),
+        // Query strings that do not decode.
+        (
+            request(Method::GET, &g("/snapshot?branch=a&branch=b"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::POST, &g("/load/ndjson?mode=sideways"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::GET, &g("/commits?limit=many"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        // Path parameters that are not UTF-8.
+        (
+            request(Method::DELETE, &g("/branches/%FF"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::GET, &g("/commits/%FF"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::DELETE, &g("/commits/%FF"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::POST, &g("/commits/%FF/publish"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::GET, &g("/commits/%FF/changes"), ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            request(Method::GET, "/cluster/deployments/%FF", ""),
+            StatusCode::BAD_REQUEST,
+        ),
+        // No route, inside and outside a graph, and a method a route does
+        // not serve.
+        (
+            Request::get("/no-such-route").body(Body::empty()).unwrap(),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            request(Method::GET, &g("/no-such-route"), ""),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            request(Method::PUT, &g("/snapshot"), ""),
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+        (
+            request(Method::POST, "/healthz", ""),
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+    ];
+    for (request, status) in cases {
+        let what = format!("{} {}", request.method(), request.uri());
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), status, "{what}");
+        assert_eq!(
+            response.headers()[HTTP_API_CONTRACT_HEADER],
+            HTTP_API_CONTRACT,
+            "{what}"
+        );
+        if status == StatusCode::METHOD_NOT_ALLOWED {
+            assert_eq!(response.headers()["allow"], "GET,HEAD", "{what}");
+        }
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body)
+            .unwrap_or_else(|_| panic!("{what}: {}", String::from_utf8_lossy(&body)));
+        let code = match status {
+            StatusCode::NOT_FOUND => ErrorCode::NotFound,
+            StatusCode::METHOD_NOT_ALLOWED => ErrorCode::MethodNotAllowed,
+            _ => ErrorCode::BadRequest,
+        };
+        assert_eq!(error.code, Some(code), "{what}: {}", error.error);
+        assert_eq!(
+            error.disposition,
+            Some(DispositionOutput {
+                effects: DispositionEffects::None,
+                action: DispositionAction::Fix,
+            }),
+            "{what}"
+        );
+    }
+    assert_eq!(manifest_dataset_version(&graph).await, before);
+}
+
+/// A method a protected route does not serve is answered by the same guards
+/// as one it serves: authentication, the contract and the actor assertion
+/// refuse first, and only a request they admit learns which methods the path
+/// serves. One route of each protected router; MCP serves its own methods
+/// behind its own guards.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unserved_method_on_a_protected_route_answers_after_every_guard() {
+    use omnigraph_server::api::{
+        DispositionAction, DispositionEffects, DispositionOutput, ErrorCode,
+    };
+
+    let (_temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
+    let routes = [
+        (Method::PUT, g("/snapshot"), "GET,HEAD"),
+        (Method::POST, g("/blob"), "GET,HEAD,PUT,DELETE"),
+        (Method::PUT, g("/branches/feature"), "DELETE"),
+        (Method::PUT, "/graphs".to_string(), "GET,HEAD"),
+        (Method::PUT, "/cluster/plan".to_string(), "POST"),
+        (Method::GET, "/graphs/og_catalog/query".to_string(), "POST"),
+    ];
+    for (method, path, allow) in routes {
+        let what = format!("{method} {path}");
+
+        let (status, body) =
+            json_response(&app, expecting(method.clone(), &path, None, &[], None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{what}: {body}");
+        assert_code(body, ErrorCode::Unauthorized, &what);
+
+        let mut request = expecting(method.clone(), &path, Some("demo-token"), &[], None);
+        request
+            .headers_mut()
+            .insert(HTTP_API_CONTRACT_HEADER, HeaderValue::from_static("0.11"));
+        let (status, body) = json_response(&app, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {body}");
+        assert_code(body, ErrorCode::ApiContractMismatch, &what);
+
+        let (status, body) = json_response(
+            &app,
+            expecting(
+                method.clone(),
+                &path,
+                Some("demo-token"),
+                &["act-someone-else"],
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{what}: {body}");
+        assert_code(body, ErrorCode::ActorMismatch, &what);
+
+        let response = app
+            .clone()
+            .oneshot(expecting(method, &path, Some("demo-token"), &[], None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED, "{what}");
+        assert_eq!(response.headers()["allow"], allow, "{what}");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body)
+            .unwrap_or_else(|_| panic!("{what}: {}", String::from_utf8_lossy(&body)));
+        assert_eq!(error.code, Some(ErrorCode::MethodNotAllowed), "{what}");
+        assert_eq!(
+            error.disposition,
+            Some(DispositionOutput {
+                effects: DispositionEffects::None,
+                action: DispositionAction::Fix,
+            }),
+            "{what}"
+        );
+    }
+
+    let response = app
+        .clone()
+        .oneshot(expecting(Method::PUT, "/mcp", None, &[], None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "PUT /mcp");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn protected_routes_require_bearer_token() {
     let (_temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
@@ -809,6 +1019,199 @@ async fn protected_routes_require_bearer_token() {
         error.code,
         Some(omnigraph_server::api::ErrorCode::Unauthorized)
     );
+}
+
+/// A concrete request path for a documented operation: `default` for the
+/// graph, any value for another parameter (authentication precedes lookup).
+fn concrete_path(path: &str) -> String {
+    path.split('/')
+        .map(|segment| match segment {
+            "{graph_id}" => "default",
+            segment if segment.starts_with('{') => "x",
+            segment => segment,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Every protected operation the served OpenAPI document declares answers a
+/// request without a usable credential with 401 and the server's one bearer
+/// challenge, and the document records that header on the 401. `/mcp` and the
+/// engine catalogue, outside the document, answer the same. The operations
+/// come from the document, so a newly declared route is covered as declared.
+#[tokio::test(flavor = "multi_thread")]
+async fn issue_1020_every_401_carries_the_one_bearer_challenge() {
+    let doc = serde_json::to_value(omnigraph_server::served_openapi()).unwrap();
+    let mut routes = Vec::new();
+    for (path, item) in doc["paths"].as_object().unwrap() {
+        for (method, operation) in item.as_object().unwrap() {
+            if operation["security"].as_array().is_none_or(Vec::is_empty) {
+                continue;
+            }
+            assert_eq!(
+                operation["responses"]["401"]["headers"]["WWW-Authenticate"]["schema"]["type"],
+                "string",
+                "{method} {path} documents no challenge on its 401"
+            );
+            routes.push((method.to_uppercase(), concrete_path(path)));
+        }
+    }
+    // The document reaches every router that authenticates.
+    for (method, path) in [
+        ("GET", "/graphs"),
+        ("GET", "/graphs/discovery"),
+        ("POST", "/cluster/plan"),
+        ("GET", "/cluster/deployments"),
+        ("GET", "/graphs/default/snapshot"),
+        ("HEAD", "/graphs/default/blob"),
+    ] {
+        assert!(
+            routes.iter().any(|(m, p)| m == method && p == path),
+            "{method} {path} missing from the protected operations"
+        );
+    }
+    routes.push(("POST".into(), "/graphs/og_catalog/query".into()));
+    routes.push(("POST".into(), "/mcp".into()));
+
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path()).to_string_lossy().to_string();
+    let policy = temp.path().join("policy.yaml");
+    fs::write(&policy, permit_all_policy_yaml(&["default"])).unwrap();
+    let open = || async {
+        AppState::open_with_bearer_tokens_and_policy(
+            graph.clone(),
+            vec![("default".into(), "secret".into())],
+            Some(&policy),
+        )
+        .await
+        .unwrap()
+    };
+    let signed = data_tokens::DataTokens::new();
+    let servers = [
+        ("static", build_app(open().await), None),
+        (
+            "signed",
+            build_app(open().await.with_data_token_trust(signed.trust.clone())),
+            None,
+        ),
+        (
+            "oidc",
+            build_app(
+                open()
+                    .await
+                    .with_oidc_identity_trust(oidc::trust(temp.path())),
+            ),
+            Some(oidc::RESOURCE_METADATA),
+        ),
+    ];
+    let wrong_audience = format!(
+        "Bearer {}",
+        oidc::token("alice", "https://data.example/clusters/B/incarnations/one")
+    );
+    // (Authorization values, whether a bearer credential was presented)
+    let credentials: [(Vec<&str>, bool); 6] = [
+        (vec![], false),
+        (vec!["Basic YWxpY2U6eA=="], false),
+        (vec!["Bearer wrong"], true),
+        (vec!["bearer wrong"], true),
+        (vec![wrong_audience.as_str()], true),
+        // Several values are not a single credential: asked for one, not refused.
+        (vec!["Bearer secret", "Bearer secret"], false),
+    ];
+
+    let mut mismatched = Vec::new();
+    for (server, app, metadata) in &servers {
+        for (method, uri) in &routes {
+            for (values, presented) in &credentials {
+                let mut request = Request::builder()
+                    .method(Method::from_bytes(method.as_bytes()).unwrap())
+                    .uri(uri)
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                    .header("content-type", "application/json");
+                for value in values {
+                    request = request.header(AUTHORIZATION, *value);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::from("{}")).unwrap())
+                    .await
+                    .unwrap();
+                let error = if *presented {
+                    "error=\"invalid_token\""
+                } else {
+                    ""
+                };
+                let expected = match metadata {
+                    None if error.is_empty() => "Bearer".to_string(),
+                    None => format!("Bearer {error}"),
+                    Some(url) if error.is_empty() => format!("Bearer resource_metadata=\"{url}\""),
+                    Some(url) => format!("Bearer {error}, resource_metadata=\"{url}\""),
+                };
+                let challenge = response.headers().get(WWW_AUTHENTICATE);
+                if response.status() != StatusCode::UNAUTHORIZED
+                    || challenge.map(HeaderValue::as_bytes) != Some(expected.as_bytes())
+                {
+                    mismatched.push(format!(
+                        "{server} {method} {uri} {values:?}: {} {challenge:?}, expected {expected}",
+                        response.status()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(mismatched.is_empty(), "{mismatched:#?}");
+
+    // The scheme is case-insensitive and spaces separate it from the token, on
+    // every credential source: the same reading accepts what it would refuse.
+    let identity = format!("bearer {}", signed.identity_token());
+    for (server, app, _) in &servers {
+        for value in [
+            "bearer secret",
+            "BEARER secret",
+            "Bearer   secret",
+            identity.as_str(),
+        ] {
+            let request = Request::builder()
+                .uri("/graphs/default/branches")
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .header(AUTHORIZATION, value)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            // The signed identity has no policy grant; it authenticates where
+            // its trust is installed and is refused elsewhere.
+            let expected = if value == identity {
+                if *server == "signed" {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::UNAUTHORIZED
+                }
+            } else {
+                StatusCode::OK
+            };
+            assert_eq!(response.status(), expected, "{server} {value}");
+            assert_eq!(
+                response.headers().contains_key(WWW_AUTHENTICATE),
+                expected == StatusCode::UNAUTHORIZED,
+                "{server} {value}"
+            );
+        }
+    }
+
+    // A server without authentication answers discovery, which needs an
+    // identity it can never resolve, with 401 and a challenge too.
+    let (_open_temp, open_app) = app_for_loaded_graph().await;
+    let response = open_app
+        .oneshot(
+            Request::get("/graphs/discovery")
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.headers()[WWW_AUTHENTICATE], "Bearer");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1343,7 +1746,7 @@ async fn policy_commit_publish_and_drop_denials_are_indistinguishable_from_unkno
         .to_string();
     let (status, body) = json_response(
         &app,
-        get_request(&g("/commits?unpublished=true"), "writer-token"),
+        get_request(&g("/commits?listing=unpublished"), "writer-token"),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -1404,7 +1807,7 @@ async fn policy_commit_publish_and_drop_denials_are_indistinguishable_from_unkno
     }
     let (status, body) = json_response(
         &app,
-        get_request(&g("/commits?unpublished=true"), "writer-token"),
+        get_request(&g("/commits?listing=unpublished"), "writer-token"),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -3863,32 +4266,32 @@ async fn access_reports_the_callers_own_actions_as_routes_decide_them() {
         (
             "bruno-token",
             "",
-            json!({"actor":"act-bruno","graph_id":"default","graph_wide":["read"],
+            json!({"actor_id":"act-bruno","graph_id":"default","graph_wide":["read"],
                    "branch":null,"target_branch":null,"actions":[]}),
         ),
         (
             "bruno-token",
             "?branch=main",
-            json!({"actor":"act-bruno","graph_id":"default","graph_wide":["read"],
+            json!({"actor_id":"act-bruno","graph_id":"default","graph_wide":["read"],
                    "branch":"main","target_branch":null,"actions":["read"]}),
         ),
         (
             "bruno-token",
             "?branch=feature&target_branch=main",
-            json!({"actor":"act-bruno","graph_id":"default","graph_wide":["read"],
+            json!({"actor_id":"act-bruno","graph_id":"default","graph_wide":["read"],
                    "branch":"feature","target_branch":"main","actions":["read","change"]}),
         ),
         (
             "ragnor-token",
             "?branch=main",
-            json!({"actor":"act-ragnor","graph_id":"default","graph_wide":["read","export"],
+            json!({"actor_id":"act-ragnor","graph_id":"default","graph_wide":["read","export"],
                    "branch":"main","target_branch":null,
                    "actions":["read","export","branch_delete"]}),
         ),
         (
             "ragnor-token",
             "?branch=feature&target_branch=main",
-            json!({"actor":"act-ragnor","graph_id":"default","graph_wide":["read","export"],
+            json!({"actor_id":"act-ragnor","graph_id":"default","graph_wide":["read","export"],
                    "branch":"feature","target_branch":"main",
                    "actions":["read","export","change","branch_merge"]}),
         ),
@@ -3996,7 +4399,7 @@ rules:
     let app = build_app(AppState::open(graph).await.unwrap());
     let (status, body) = access(&app, "?branch=main&target_branch=feature", None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["actor"], Value::Null);
+    assert_eq!(body["actor_id"], Value::Null);
     assert_eq!(
         body["graph_wide"],
         json!([
