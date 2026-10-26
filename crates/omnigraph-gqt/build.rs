@@ -50,14 +50,40 @@ fn main() {
         hash.update(contents);
         println!("cargo::rerun-if-changed={}", path.display());
     }
-    println!(
-        "cargo::rerun-if-changed={}",
-        root.join(".git/index").display()
-    );
-    println!(
-        "cargo::rerun-if-changed={}",
-        root.join(".git/HEAD").display()
-    );
+    // The Git control files that move the revision without touching source
+    // bytes. Git names them, because a worktree's `.git` is a file and its
+    // index and HEAD live under the common directory's `worktrees/`. Only an
+    // existing file is watched: Cargo reruns a script whose watched path is
+    // missing on every build, which relinks this crate's binaries each time.
+    let mut controls = vec![
+        "HEAD".to_string(),
+        "index".to_string(),
+        "packed-refs".to_string(),
+    ];
+    if let Some(reference) = git(&root, &["symbolic-ref", "-q", "HEAD"]) {
+        controls.push(reference);
+    }
+    for control in controls {
+        if let Some(path) = git(&root, &["rev-parse", "--git-path", &control])
+            .map(|path| root.join(path))
+            .filter(|path| path.is_file())
+        {
+            println!("cargo::rerun-if-changed={}", path.display());
+        }
+    }
     println!("cargo::rustc-env=GQT_SOURCE_REVISION={}", revision.trim());
     println!("cargo::rustc-env=GQT_SOURCE_DIGEST={:x}", hash.finalize());
+}
+
+/// One line of `git <args>` run at `root`, or `None` when it fails or prints
+/// nothing.
+fn git(root: &std::path::Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .ok()?;
+    let line = String::from_utf8(output.stdout).ok()?;
+    let line = line.trim();
+    (output.status.success() && !line.is_empty()).then(|| line.to_string())
 }
