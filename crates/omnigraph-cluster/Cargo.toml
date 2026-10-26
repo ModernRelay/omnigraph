@@ -42,6 +42,7 @@ serial_test = "3"
 tempfile = { workspace = true }
 # Paused time for the lease tests, so the crate's own test build runs them.
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

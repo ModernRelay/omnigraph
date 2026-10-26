@@ -115,3 +115,8 @@ paths; each records the failure's class.
 - `took over a silent owner's cluster lock` when a restarted server takes over
   its predecessor's lock, and an error when an owner's lease lapses or another
   server claims it.
+- `cluster lease beat failed; it is sent again` for each heartbeat request that
+  fails, `cluster lease claim read failed; the beat is sent anyway` for a failed
+  check for a successor's claim, and `cluster lease beat got no answer before the
+  owner's deadline` before the lapse it causes. Each carries the beat's `seq`
+  and the failure's `class` and storage `kind`, and comes before the fence.

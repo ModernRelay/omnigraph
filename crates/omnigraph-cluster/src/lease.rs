@@ -56,7 +56,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use omnigraph_storage::{StorageAdapter, StorageIoScope};
+use omnigraph_storage::{StorageAdapter, StorageError, StorageFailureKind, StorageIoScope};
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 
@@ -217,6 +217,7 @@ impl LeaseKeeper {
             biased;
             fence = beat.first(seconds) => fence,
             () = tokio::time::sleep_until(lock_sent + owner_deadline(seconds)) => {
+                log_unanswered_beat(0);
                 Some(LeaseFenced::Lapsed)
             }
         };
@@ -232,6 +233,7 @@ impl LeaseKeeper {
                     // hangs must not postpone the owner's fence. A beat that
                     // completes at the same moment is counted first.
                     let deadline = beat.acknowledged + owner_deadline(seconds);
+                    let seq = beat.seq;
                     let pause = if beat.answered {
                         beat_interval(seconds)
                     } else {
@@ -247,7 +249,10 @@ impl LeaseKeeper {
                         fence = next => if let Some(fence) = fence {
                             break fence;
                         },
-                        () = tokio::time::sleep_until(deadline) => break LeaseFenced::Lapsed,
+                        () = tokio::time::sleep_until(deadline) => {
+                            log_unanswered_beat(seq);
+                            break LeaseFenced::Lapsed;
+                        }
                     }
                 };
                 fence_holder(scope.as_ref(), fence);
@@ -302,6 +307,28 @@ struct Beat {
     answered: bool,
 }
 
+/// The class of a failed lease request, which a log may carry: its error's
+/// variant and storage failure kind, never its message, which can name the
+/// root's object URIs.
+fn failure_class(error: &StorageError) -> (&'static str, Option<StorageFailureKind>) {
+    match error {
+        StorageError::Internal(_) => ("internal", None),
+        StorageError::Backend(failure) => ("backend", Some(failure.kind)),
+        StorageError::Io { failure, .. } => ("io", Some(failure.kind)),
+        StorageError::ResourceLimit { .. } => ("resource_limit", None),
+    }
+}
+
+/// Log a beat that got no answer before the owner's deadline, before the
+/// fence that follows it.
+fn log_unanswered_beat(seq: u64) {
+    tracing::warn!(
+        seq,
+        class = "unanswered",
+        "cluster lease beat got no answer before the owner's deadline"
+    );
+}
+
 /// Stop the holder's storage sends, then report the fence. A successor may
 /// claim the lock five sixths of a lease after the owner's deadline, which
 /// can be sooner than the holder's process exits. Fencing the scope here
@@ -341,7 +368,17 @@ impl Beat {
             .await
         {
             Ok(Some(_)) => Some(LeaseFenced::Superseded),
-            _ => None,
+            Ok(None) => None,
+            Err(error) => {
+                let (class, kind) = failure_class(&error);
+                tracing::warn!(
+                    seq = self.seq,
+                    class,
+                    ?kind,
+                    "cluster lease claim read failed; the beat is sent anyway"
+                );
+                None
+            }
         }
     }
 
@@ -371,7 +408,16 @@ impl Beat {
                 self.seq += 1;
                 self.first_sent = None;
             }
-            Err(_) => self.answered = false,
+            Err(error) => {
+                let (class, kind) = failure_class(&error);
+                tracing::warn!(
+                    seq = self.seq,
+                    class,
+                    ?kind,
+                    "cluster lease beat failed; it is sent again"
+                );
+                self.answered = false;
+            }
         }
         None
     }
@@ -599,6 +645,35 @@ mod tests {
         }
     }
 
+    /// The text a test's log lines were written as.
+    #[derive(Clone, Default)]
+    struct Logged(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Logged {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for Logged {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logged {
+        type Writer = Logged;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
     async fn fenced_within(keeper: &LeaseKeeper, limit: Duration) -> Option<LeaseFenced> {
         tokio::time::timeout(limit, LeaseFence(Some(keeper.fenced())).fenced())
             .await
@@ -685,6 +760,54 @@ mod tests {
         store.failures.store(3, Ordering::SeqCst);
         assert_eq!(fenced_within(&keeper, lease(SECONDS) * 2).await, None);
         assert_eq!(store.failures.load(Ordering::SeqCst), 0);
+    }
+
+    /// Every failed beat logs its class, and a beat left unanswered at the
+    /// owner's deadline logs before the fence it causes. No line carries a
+    /// failure's message, which can name the root's object URIs.
+    #[tokio::test(start_paused = true)]
+    async fn failed_and_unanswered_beats_log_their_class_before_the_fence() {
+        let logged = Logged::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logged.clone())
+            .with_ansi(false)
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
+        let store = Beats::new();
+        let keeper = start(&store, "owner").await;
+
+        store.failures.store(1, Ordering::SeqCst);
+        assert_eq!(fenced_within(&keeper, lease(SECONDS) * 2).await, None);
+        let text = logged.text();
+        let failed = text
+            .lines()
+            .find(|line| line.contains("cluster lease beat failed; it is sent again"))
+            .unwrap_or_else(|| panic!("a failed beat is logged: {text}"));
+        assert!(
+            failed.contains("backend") && failed.contains("Transient"),
+            "the line names the failure's class and kind: {failed}"
+        );
+        assert!(
+            !text.contains("beat request unanswered"),
+            "no line carries the failure's message: {text}"
+        );
+
+        store.hang.store(true, Ordering::SeqCst);
+        assert_eq!(
+            fenced_within(&keeper, lease(SECONDS) * 2).await,
+            Some(LeaseFenced::Lapsed)
+        );
+        let text = logged.text();
+        let unanswered = text
+            .find("cluster lease beat got no answer before the owner's deadline")
+            .unwrap_or_else(|| panic!("an unanswered beat is logged: {text}"));
+        let fenced = text
+            .find("cluster admission lease fenced")
+            .unwrap_or_else(|| panic!("the fence is logged: {text}"));
+        assert!(
+            unanswered < fenced,
+            "the beat is logged before the fence: {text}"
+        );
     }
 
     /// A beat the store applied but whose answer was lost is the owner's own:
