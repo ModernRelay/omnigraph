@@ -51,6 +51,7 @@ mod presentation;
 mod schema_upgrade;
 mod scope;
 mod skill;
+mod target_identity;
 mod targets;
 #[cfg(test)]
 #[path = "../tests/support/tls_gateway.rs"]

@@ -601,6 +601,12 @@ selection to the cost model. Without a traversal header or another index
 requirement, a fixture does not build indexes. `indexed` and `csr` prepare
 indexes and force their respective paths.
 
+The optional `# csv_slice_bytes: <n>` header sets the source bytes one
+`load csv` parse partition owns and the slice it reads at once, 8 MiB without
+the header, so a case of a few KiB cuts two or three partitions and pins what
+happens at their boundaries; the header's head range keeps its 64 KiB floor.
+An in-process pin: a server target refuses it.
+
 An `expand $src <Edge> $dst:` line selects every matching named-edge physical `Expand` between
 those bindings over that edge type and claims `mode csr` or `mode
 indexed_scan`, the traversal mode the planner recorded (pass `expand_mode`

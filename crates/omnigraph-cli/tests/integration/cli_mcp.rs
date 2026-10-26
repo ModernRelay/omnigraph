@@ -303,12 +303,15 @@ fn tool_names(list: &Value) -> Vec<String> {
         .collect()
 }
 
-const WRITE_TOOLS: [&str; 5] = [
+const WRITE_TOOLS: [&str; 8] = [
     "mutate",
     "load",
+    "blobs_clear",
     "branches_create",
     "branches_delete",
     "branches_merge",
+    "commits_publish",
+    "commits_drop",
 ];
 
 /// A served two-graph cluster, `knowledge` loaded with the standard fixture

@@ -12,9 +12,10 @@ mod result;
 mod settings;
 
 pub use arguments::{
-    AccessArguments, BranchArguments, BranchCreateArguments, BranchDeleteArguments,
-    BranchMergeArguments, ChangeFilters, ChangesPollArguments, CommitArguments,
-    CommitChangesArguments, CommitsListArguments, GraphArguments, InvalidArguments, LoadArguments,
+    AccessArguments, BlobClearArguments, BlobStatArguments, BranchArguments, BranchCreateArguments,
+    BranchDeleteArguments, BranchDiffArguments, BranchMergeArguments, ChangeFilters,
+    ChangesPollArguments, CommitArguments, CommitChangesArguments, CommitsListArguments,
+    DiffArguments, GraphArguments, InvalidArguments, LoadArguments, MergeBaseArguments,
     MutateArguments, QueryArguments, ReadArguments, ToolCall, ToolRequest, change_query,
 };
 pub use resources::{ResourceOutput, ResourceRequest};

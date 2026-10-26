@@ -44,6 +44,76 @@ fn refusals_delegate_write_context_and_preserve_resource_error_data() {
     }
 }
 
+/// Every tool, with every opt-in on: a write tool is annotated as one and is
+/// absent without `allow_writes`; the arguments its schema requires parse,
+/// and an argument it does not declare is refused.
+#[test]
+fn every_tool_parses_its_required_arguments_and_writes_need_the_write_gate() {
+    let adhoc = McpSettings {
+        allow_adhoc: true,
+        ..McpSettings::default()
+    };
+    let open = McpSettings {
+        allow_writes: true,
+        ..adhoc.clone()
+    };
+    let without_writes: Vec<_> = tools(&adhoc).into_iter().map(|tool| tool.name).collect();
+    let mut writes = Vec::new();
+    for tool in tools(&open) {
+        let spec = spec(&open, &tool.name).unwrap();
+        let write = spec.gate == Gate::Writes;
+        let hints = tool.annotations.as_ref().unwrap();
+        assert_eq!(hints.read_only_hint, Some(!write), "{}", tool.name);
+        assert_eq!(without_writes.contains(&tool.name), !write, "{}", tool.name);
+        if write {
+            writes.push(spec.name);
+        }
+        let schema = &tool.input_schema;
+        let mut arguments = serde_json::Map::new();
+        let required = schema.get("required").and_then(Value::as_array);
+        for name in required.into_iter().flatten() {
+            let name = name.as_str().unwrap();
+            let property = &schema["properties"][name];
+            let value = match property.get("enum") {
+                Some(values) => values[0].clone(),
+                None => json!("x"),
+            };
+            arguments.insert(name.to_owned(), value);
+        }
+        let request = |arguments| ToolRequest::new(spec.name, Value::Object(arguments), write);
+        assert!(
+            request(arguments.clone()).parse().is_ok(),
+            "{}: {arguments:?}",
+            tool.name
+        );
+        arguments.insert("undeclared".into(), json!(true));
+        assert!(request(arguments).parse().is_err(), "{}", tool.name);
+    }
+    assert_eq!(
+        writes,
+        [
+            "mutate",
+            "load",
+            "blobs_clear",
+            "branches_create",
+            "branches_delete",
+            "branches_merge",
+            "commits_publish",
+            "commits_drop",
+        ]
+    );
+    // `mutate` without `query` names a stored mutation; the host requires
+    // one of the two.
+    assert!(matches!(
+        ToolRequest::new("mutate", json!({"graph": "g", "name": "add"}), true).parse(),
+        Ok(ToolCall::Mutate(MutateArguments {
+            query: None,
+            name: Some(_),
+            ..
+        }))
+    ));
+}
+
 #[test]
 fn every_best_practice_resource_is_an_embedded_skill_reference() {
     for topic in BEST_PRACTICES {

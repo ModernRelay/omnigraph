@@ -803,6 +803,68 @@ pub async fn external_payload_read_stall() {
     }
 }
 
+/// The task-local seams an external object payload read answers to: the
+/// stall, the hold and the merge-write probes. A load plan's source
+/// partitions read on blocking workers under tasks DataFusion spawns, none of
+/// which inherits a task local, so the statement's task captures these when
+/// it builds its query resources and the worker reinstalls them with
+/// [`with_external_read_seams`]. Production captures three unset lookups.
+#[derive(Clone, Default)]
+pub struct ExternalReadSeams {
+    stalled: bool,
+    hold: Option<ExternalPayloadReadHold>,
+    probes: Option<MergeWriteProbes>,
+}
+
+impl std::fmt::Debug for ExternalReadSeams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalReadSeams")
+            .field("stalled", &self.stalled)
+            .field("hold", &self.hold.is_some())
+            .field("probes", &self.probes.is_some())
+            .finish()
+    }
+}
+
+/// Capture the external read seams of the current task.
+pub fn capture_external_read_seams() -> ExternalReadSeams {
+    ExternalReadSeams {
+        stalled: EXTERNAL_PAYLOAD_READ_STALL.try_with(|_| ()).is_ok(),
+        hold: EXTERNAL_PAYLOAD_READ_HOLD.try_with(Clone::clone).ok(),
+        probes: MERGE_WRITE_PROBES.try_with(Clone::clone).ok(),
+    }
+}
+
+/// Run `fut` under the seams `capture_external_read_seams` took on another
+/// task; an unset seam installs nothing.
+pub async fn with_external_read_seams<F>(seams: ExternalReadSeams, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    let ExternalReadSeams {
+        stalled,
+        hold,
+        probes,
+    } = seams;
+    let probed = async move {
+        match probes {
+            Some(probes) => MERGE_WRITE_PROBES.scope(probes, fut).await,
+            None => fut.await,
+        }
+    };
+    let held = async move {
+        match hold {
+            Some(hold) => EXTERNAL_PAYLOAD_READ_HOLD.scope(hold, probed).await,
+            None => probed.await,
+        }
+    };
+    if stalled {
+        EXTERNAL_PAYLOAD_READ_STALL.scope((), held).await
+    } else {
+        held.await
+    }
+}
+
 /// Deterministic probe for the number of table-fragment staging futures that
 /// are inside their storage call at once.
 ///
