@@ -8,7 +8,7 @@ authors:
   - Ragnor Comerford
 created: 2026-10-26
 updated: 2026-10-26
-discussion: null
+discussion: https://github.com/ModernRelay/omnigraph/pull/1171
 supersedes: []
 superseded_by: []
 blocked_on: []
