@@ -6,6 +6,7 @@
 //! route and the mutation evaluator cannot judge the same rows differently.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch, StringArray};
 use lance::Dataset;
@@ -16,9 +17,9 @@ use omnigraph_compiler::types::ScalarType;
 use omnigraph_planner::{EndpointProbe, ValidateAccess, ValidateRemoval, ValidateSpec};
 
 use super::kernels::{
-    CardPlan, FinalKeys, FirstHolders, Position, UniqueImage, UniquePartial, card_affected,
-    card_violations, merge_unique_image, merge_unique_shard, orphan_violation, orphans_retained,
-    unique_coalesced_dups, unique_committed_collisions, unique_probe_keys,
+    CardPlan, FinalKeys, Position, SharedFirstHolders, UniqueImage, UniquePartial, card_affected,
+    card_violations, merge_unique_image, orphan_violation, orphans_retained, unique_coalesced_dups,
+    unique_committed_collisions, unique_probe_keys,
 };
 use super::key_set::{IntKeySet, IntKeySetLayout, canonical_i64, key_bytes};
 use super::{
@@ -312,9 +313,13 @@ pub(crate) async fn judge_load_swept(
     Ok(())
 }
 
-/// The position of a row: slice `slice` of the source, row `row` inside it.
+/// The position of a row: the slice key `partition << 32 | index` the
+/// source tagged its batch with, and row `row` inside the slice, packed
+/// `partition << 48 | index << 24 | row` so positions sort in source order.
 pub(crate) fn position(slice: usize, row: u64) -> Position {
-    ((slice as Position) << 32) | (row & 0xffff_ffff)
+    let partition = (slice >> 32) as Position;
+    let index = (slice & 0xff_ffff) as Position;
+    (partition << 48) | (index << 24) | (row & 0xff_ffff)
 }
 
 /// What the sweep extracts, read off the checks once: which facts a
@@ -326,8 +331,10 @@ pub(crate) struct SweepPlan {
     needs_ids: bool,
     needs_card: bool,
     unique: Vec<(usize, Vec<String>)>,
+    /// Per uniqueness check, in `unique`'s order: the first holders every
+    /// partition inserts into as it sweeps.
+    unique_holders: Vec<Arc<SharedFirstHolders>>,
     input_only: bool,
-    shards: usize,
     /// The swept endpoint checks, `From` before `To`, so a row whose src and
     /// dst both miss reports its src as [`first_orphan`] does.
     endpoints: Vec<SweptEndpoint>,
@@ -339,14 +346,23 @@ struct SweptEndpoint {
 }
 
 impl SweepPlan {
-    /// `shards` is the partitions that sweep at once; each partition's unique
-    /// holders split into that many maps so the merge runs shard by shard.
+    /// `shards` is the partitions that sweep at once; each uniqueness check's
+    /// shared holders split into that many locked maps, so the partitions
+    /// rarely wait on one another.
     pub(crate) fn new(
         table: &str,
         checks: &[ValidateSpec],
         overwrite: bool,
         shards: usize,
     ) -> Self {
+        let unique: Vec<(usize, Vec<String>)> = checks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, spec)| match &spec.check {
+                ValidateCheck::Unique { columns, .. } => Some((index, columns.clone())),
+                _ => None,
+            })
+            .collect();
         let mut endpoints: Vec<SweptEndpoint> = checks
             .iter()
             .filter(|spec| spec.probe == Some(EndpointProbe::Swept))
@@ -373,16 +389,12 @@ impl SweepPlan {
             needs_card: checks
                 .iter()
                 .any(|spec| matches!(spec.check, ValidateCheck::Cardinality { .. })),
-            unique: checks
+            unique_holders: unique
                 .iter()
-                .enumerate()
-                .filter_map(|(index, spec)| match &spec.check {
-                    ValidateCheck::Unique { columns, .. } => Some((index, columns.clone())),
-                    _ => None,
-                })
+                .map(|_| Arc::new(SharedFirstHolders::new(shards)))
                 .collect(),
+            unique,
             input_only: overwrite,
-            shards: shards.max(1),
             endpoints,
         }
     }
@@ -390,6 +402,31 @@ impl SweepPlan {
     /// Whether the partitions probe the endpoint checks as they sweep.
     pub(crate) fn sweeps_endpoints(&self) -> bool {
         !self.endpoints.is_empty()
+    }
+
+    /// Every uniqueness check's holders sized for `rows` once, the first time
+    /// a partition has the source's estimate; `admit` charges one check's
+    /// table bytes and returns the charge, or `None` to let that table grow;
+    /// `per_row_charged` is what the drain charges per row for the check,
+    /// which carries the table from some row on.
+    pub(crate) fn size_unique_holders(
+        &self,
+        rows: usize,
+        per_row_charged: usize,
+        admit: &mut dyn FnMut(usize) -> Option<Box<dyn Send>>,
+    ) {
+        for holders in &self.unique_holders {
+            holders.size(rows, per_row_charged, &mut *admit);
+        }
+    }
+
+    /// Every uniqueness check's holders taken out of their shards, one box per
+    /// shard, for the caller to free on workers; the judgment has read them.
+    pub(crate) fn release_unique_holders(&self) -> Vec<Box<dyn Send>> {
+        self.unique_holders
+            .iter()
+            .flat_map(|holders| holders.take_maps())
+            .collect()
     }
 }
 
@@ -509,9 +546,9 @@ impl SweepPartial {
             value: Vec::new(),
             ids: HashSet::new(),
             unique: plan
-                .unique
+                .unique_holders
                 .iter()
-                .map(|_| UniquePartial::new(plan.input_only, plan.shards))
+                .map(|holders| UniquePartial::new(plan.input_only, Arc::clone(holders)))
                 .collect(),
             card: HashMap::new(),
             orphan: None,
@@ -620,62 +657,6 @@ impl SweepPartial {
     }
 }
 
-/// One shard of every partition's unique holders, merged by the engine
-/// beside the other shards; `check` is the uniqueness check's list index.
-pub(crate) struct UniqueShardJob {
-    pub(crate) check: usize,
-    columns: Vec<String>,
-    maps: Vec<FirstHolders>,
-}
-
-impl UniqueShardJob {
-    pub(crate) fn run(self, table: &str) -> Option<(Position, Violation)> {
-        merge_unique_shard(table, &self.columns, self.maps)
-    }
-}
-
-/// One uniqueness check's merge input: its list index, every partition's
-/// final keys, and the earliest repeat a partition saw among its own rows.
-type UniqueMerge = (usize, Vec<FinalKeys>, Option<(Position, Violation)>);
-
-/// The partitions' facts taken apart: everything but the unique shards
-/// already merged, the shards left to [`UniqueShardJob::run`].
-pub(crate) struct Merging {
-    value: Option<Violation>,
-    ids: HashSet<String>,
-    card: HashMap<String, String>,
-    unique: Vec<UniqueMerge>,
-    orphan: Option<Violation>,
-}
-
-impl Merging {
-    /// `shards` are the jobs' results with each job's `check`.
-    pub(crate) fn finish(self, shards: Vec<(usize, Option<(Position, Violation)>)>) -> Extracted {
-        let unique = self
-            .unique
-            .into_iter()
-            .map(|(check, finals, own)| {
-                let repeat = shards
-                    .iter()
-                    .filter(|(shard_check, _)| *shard_check == check)
-                    .filter_map(|(_, repeat)| repeat.clone())
-                    .chain(own)
-                    .min_by_key(|(position, _)| *position)
-                    .map(|(_, violation)| violation);
-                let image = merge_unique_image(finals, repeat.is_some());
-                (check, (image, repeat))
-            })
-            .collect();
-        Extracted {
-            value: self.value,
-            ids: self.ids,
-            unique,
-            card: self.card,
-            orphan: self.orphan,
-        }
-    }
-}
-
 /// What one sweep over the delta extracts for every check at once.
 #[derive(Default)]
 pub(crate) struct Extracted {
@@ -712,36 +693,19 @@ impl Extracted {
             partial.observe(&plan, catalog, batch, system_columns, base)?;
             base += batch.num_rows() as Position;
         }
-        let (merging, jobs) = Self::prepare(&plan, vec![partial]);
-        let shards = jobs
-            .into_iter()
-            .map(|job| (job.check, job.run(table)))
-            .collect();
-        Ok(merging.finish(shards))
+        Ok(Self::prepare(&plan, vec![partial]))
     }
 
     /// Join the partitions' partials: the first value violation (the earliest
     /// row per constraint, then the first constraint in declaration order),
-    /// the union of ids, the last src per edge id, each check's own repeats
-    /// and final keys; the unique holders come back as one job per shard and
-    /// check.
-    pub(crate) fn prepare(
-        plan: &SweepPlan,
-        partials: Vec<SweepPartial>,
-    ) -> (Merging, Vec<UniqueShardJob>) {
+    /// the union of ids, the last src per edge id, each check's final keys
+    /// merged into its image and its earliest repeat read from the shared
+    /// holders, which the partitions judged as they swept.
+    pub(crate) fn prepare(plan: &SweepPlan, partials: Vec<SweepPartial>) -> Self {
         let mut value: Vec<Option<(Position, Violation)>> = Vec::new();
         let mut ids = HashSet::new();
         let mut card: HashMap<String, (Position, String)> = HashMap::new();
-        let mut shards: Vec<Vec<Vec<FirstHolders>>> = plan
-            .unique
-            .iter()
-            .map(|_| (0..plan.shards).map(|_| Vec::new()).collect())
-            .collect();
-        let mut unique: Vec<UniqueMerge> = plan
-            .unique
-            .iter()
-            .map(|(check, _)| (*check, Vec::new(), None))
-            .collect();
+        let mut finals: Vec<Vec<FinalKeys>> = plan.unique.iter().map(|_| Vec::new()).collect();
         let mut orphan: Option<(Position, Violation)> = None;
         for partial in partials {
             if let Some((position, violation)) = partial.orphan
@@ -769,44 +733,31 @@ impl Extracted {
                 }
             }
             for (index, unique_partial) in partial.unique.into_iter().enumerate() {
-                let (holders, finals, own) = unique_partial.into_parts();
-                for (shard, map) in holders.into_iter().enumerate() {
-                    shards[index][shard].push(map);
-                }
-                let (_, all_finals, first_own) = &mut unique[index];
-                all_finals.push(finals);
-                if let Some(own) = own {
-                    if first_own.as_ref().is_none_or(|(at, _)| own.0 < *at) {
-                        *first_own = Some(own);
-                    }
-                }
+                finals[index].push(unique_partial.into_final_keys());
             }
         }
-        let jobs = shards
-            .into_iter()
-            .zip(&plan.unique)
-            .flat_map(|(by_shard, (check, columns))| {
-                by_shard.into_iter().map(move |maps| UniqueShardJob {
-                    check: *check,
-                    columns: columns.clone(),
-                    maps,
-                })
+        let unique = plan
+            .unique
+            .iter()
+            .zip(finals)
+            .zip(&plan.unique_holders)
+            .map(|(((check, _), finals), holders)| {
+                let repeat = holders.first_repeat().map(|(_, violation)| violation);
+                let image = merge_unique_image(finals, repeat.is_some());
+                (*check, (image, repeat))
             })
             .collect();
-        (
-            Merging {
-                value: value
-                    .into_iter()
-                    .flatten()
-                    .next()
-                    .map(|(_, violation)| violation),
-                ids,
-                card: card.into_iter().map(|(id, (_, src))| (id, src)).collect(),
-                unique,
-                orphan: orphan.map(|(_, violation)| violation),
-            },
-            jobs,
-        )
+        Self {
+            value: value
+                .into_iter()
+                .flatten()
+                .next()
+                .map(|(_, violation)| violation),
+            ids,
+            unique,
+            card: card.into_iter().map(|(id, (_, src))| (id, src)).collect(),
+            orphan: orphan.map(|(_, violation)| violation),
+        }
     }
 }
 
@@ -1120,6 +1071,25 @@ mod tests {
     use crate::db::Omnigraph;
 
     const GRAPH_SCHEMA: &str = "node Person {\n  name: String @key\n  email: String @unique\n}\nedge Knows: Person -> Person @card(0..2)\n";
+
+    /// The slice key the source tags its batches with (`csv_source.rs`).
+    fn slice_key(partition: usize, index: usize) -> usize {
+        (partition << 32) | index
+    }
+
+    #[test]
+    fn positions_order_partitions_before_slices_before_rows() {
+        let p0_last_slice = position(slice_key(0, 7), 1_000_000);
+        let p1_first_slice = position(slice_key(1, 0), 0);
+        assert!(position(slice_key(0, 0), 5) < position(slice_key(0, 1), 0));
+        assert!(p0_last_slice < p1_first_slice);
+        assert!(p1_first_slice < position(slice_key(1, 0), 1));
+        assert!(position(slice_key(1, 6), 9) < position(slice_key(2, 0), 0));
+        assert_eq!(
+            p1_first_slice.saturating_add(3),
+            position(slice_key(1, 0), 3)
+        );
+    }
 
     const COMMITTED: &str = r#"{"type": "Person", "data": {"name": "Alice", "email": "alice@x"}}
 {"type": "Person", "data": {"name": "Bob", "email": "bob@x"}}

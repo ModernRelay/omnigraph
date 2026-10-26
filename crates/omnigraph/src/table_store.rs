@@ -1043,6 +1043,52 @@ fn external_object_changed(uri: &str) -> OmniError {
     )
 }
 
+/// One external object a `load csv` statement reads from: the probe's handle
+/// (store, path, size, validators), so every read of a byte range is bound
+/// to the incarnation the probe saw and a changed object refuses.
+#[derive(Clone)]
+pub(crate) struct ExternalSource {
+    blob: Arc<PreflightedExternalBlob>,
+}
+
+impl std::fmt::Debug for ExternalSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalSource")
+            .field("uri", &self.blob.normalized_uri.as_str())
+            .field("size", &self.blob.object_size)
+            .field("e_tag", &self.blob.e_tag)
+            .finish()
+    }
+}
+
+impl ExternalSource {
+    pub(crate) fn size(&self) -> u64 {
+        self.blob.object_size
+    }
+
+    pub(crate) fn uri(&self) -> &str {
+        self.blob.normalized_uri.as_str()
+    }
+
+    /// `range` of the object as one response pinned to the probe's validators.
+    pub(crate) async fn read_range(&self, range: std::ops::Range<u64>) -> Result<Arc<[u8]>> {
+        self.blob.read_range_pinned(range).await
+    }
+
+    /// The whole object as one response pinned to the probe's validators,
+    /// `admit` called with its size before the first payload byte.
+    pub(crate) async fn read_whole(
+        &self,
+        max_bytes: u64,
+        resource: &str,
+        admit: impl FnOnce(u64) -> Result<()>,
+    ) -> Result<CapturedSource> {
+        self.blob
+            .read_full_bounded(max_bytes, resource, admit)
+            .await
+    }
+}
+
 impl PreflightedExternalBlob {
     fn range_size(&self, offset: u64, length: Option<u64>) -> Result<u64> {
         let payload_size = match length {
@@ -1174,6 +1220,73 @@ impl PreflightedExternalBlob {
             .read_one_range(&self.path, 0..end)
             .await
             .map_err(|error| OmniError::external_blob_source(&uri, error.to_string()))?;
+        crate::instrumentation::record_blob_payload_read();
+        crate::instrumentation::record_external_blob_payload_read();
+        Ok(Arc::<[u8]>::from(bytes.as_ref()))
+    }
+
+    /// `range` as one `get_opts` response under the probe's `If-Match` and
+    /// version, its size, validator and range checked against the probe; a
+    /// local object's range is one blocking read, never the 8 KiB chunk stream.
+    async fn read_range_pinned(&self, range: std::ops::Range<u64>) -> Result<Arc<[u8]>> {
+        let uri = self.normalized_uri.as_str();
+        let length = range.end.checked_sub(range.start).ok_or_else(|| {
+            OmniError::external_blob_source(
+                uri,
+                format!("external Blob range {range:?} is reversed"),
+            )
+        })?;
+        self.range_size(range.start, Some(length))?;
+        if length == 0 {
+            return Ok(Arc::<[u8]>::from([]));
+        }
+        let capacity = usize::try_from(length).map_err(|_| {
+            OmniError::external_blob_source(uri, "external Blob range does not fit usize")
+        })?;
+        crate::instrumentation::external_payload_read_stall().await;
+        let options = object_store::GetOptions {
+            if_match: self.e_tag.clone(),
+            version: self.version.clone(),
+            range: Some(object_store::GetRange::Bounded(range.clone())),
+            ..Default::default()
+        };
+        let response = self
+            .store
+            .inner
+            .get_opts(&self.path, options)
+            .await
+            .map_err(|error| match error {
+                object_store::Error::Precondition { .. }
+                | object_store::Error::NotModified { .. } => external_object_changed(uri),
+                other => OmniError::external_blob_source(uri, other.to_string()),
+            })?;
+        if response.meta.size != self.object_size
+            || (self.e_tag.is_some() && response.meta.e_tag != self.e_tag)
+        {
+            return Err(external_object_changed(uri));
+        }
+        if response.range != range {
+            return Err(OmniError::external_blob_source(
+                uri,
+                format!(
+                    "external object response covered {:?} of the {range:?} requested",
+                    response.range
+                ),
+            ));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| OmniError::external_blob_source(uri, error.to_string()))?;
+        if bytes.len() != capacity {
+            return Err(OmniError::external_blob_source(
+                uri,
+                format!(
+                    "external object response held {} bytes of the {capacity} requested",
+                    bytes.len()
+                ),
+            ));
+        }
         crate::instrumentation::record_blob_payload_read();
         crate::instrumentation::record_external_blob_payload_read();
         Ok(Arc::<[u8]>::from(bytes.as_ref()))
@@ -1645,37 +1758,21 @@ impl TableStore {
         })
     }
 
-    /// One whole external object for a `load csv` statement: authorized by
-    /// the graph's external Blob policy, its size checked against `max_bytes`
-    /// before any payload byte is read, then read in full as one response
-    /// bound to the version the probe reported (`If-Match` on its validator);
-    /// an object that changed in between refuses as an external-source error.
-    /// Shares the preflight the Blob ingress path runs, so every refusal the
-    /// policy knows (`Deny`, a URI outside every base, a `file://` target
-    /// escaping its base) is the same refusal here.
-    pub(crate) async fn read_external_object(
+    /// One external object for a `load csv` statement, probed and not read:
+    /// authorized by the graph's external Blob policy, its size from the
+    /// `HEAD` checked against `max_bytes` before any payload byte is read.
+    /// Every read through the handle is bound to the version the probe
+    /// reported (`If-Match` on its validator); an object that changed in
+    /// between refuses as an external-source error. Shares the preflight the
+    /// Blob ingress path runs, so every refusal the policy knows (`Deny`, a
+    /// URI outside every base, a `file://` target escaping its base) is the
+    /// same refusal here.
+    pub(crate) async fn external_source(
         &self,
         uri: &str,
         max_bytes: u64,
         resource: &'static str,
-        admit: impl FnOnce(u64) -> Result<()>,
-    ) -> Result<CapturedSource> {
-        let preflight = self.preflight_external_blob_uri_iter(1, [uri]).await?;
-        let entry = preflight.by_input.get(uri).ok_or_else(|| {
-            OmniError::manifest_internal("external object preflight dropped its one input")
-        })?;
-        entry.read_full_bounded(max_bytes, resource, admit).await
-    }
-
-    /// The size of one external object from its metadata probe alone, for
-    /// `explain load csv`: the policy authorization, `HEAD` and `max_bytes`
-    /// refusal of [`Self::read_external_object`], and no payload byte read.
-    pub(crate) async fn external_object_size(
-        &self,
-        uri: &str,
-        max_bytes: u64,
-        resource: &'static str,
-    ) -> Result<u64> {
+    ) -> Result<ExternalSource> {
         let preflight = self.preflight_external_blob_uri_iter(1, [uri]).await?;
         let entry = preflight.by_input.get(uri).ok_or_else(|| {
             OmniError::manifest_internal("external object preflight dropped its one input")
@@ -1687,7 +1784,9 @@ impl TableStore {
                 entry.object_size,
             ));
         }
-        Ok(entry.object_size)
+        Ok(ExternalSource {
+            blob: Arc::clone(entry),
+        })
     }
 
     // Sealed storage surface, pinned by name in tests/forbidden_apis.rs; no

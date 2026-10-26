@@ -92,6 +92,14 @@ impl QueryWorkScope {
         self.0.changed.notify_waiters();
     }
 
+    /// Admit work again once a run settled: `run_owned` closes the scope
+    /// at its end, and a load's rerun runs under the same pool.
+    fn reopen(&self) {
+        let mut state = locked(&self.0.state);
+        debug_assert_eq!(state.active, 0, "query work reopened before it settled");
+        state.closed = false;
+    }
+
     fn settlement(&self) -> QueryWorkSettlement {
         QueryWorkSettlement(Arc::clone(&self.0))
     }
@@ -364,6 +372,12 @@ impl LoadMemory {
     /// The context a load plan runs under: this statement's pool.
     pub(super) fn context(&self) -> &QueryContext {
         &self.context
+    }
+
+    /// Admit the plan's workers again for a rerun: `execute_load` closes
+    /// admission when its run settles; the pool and its charges stay.
+    pub(crate) fn reopen(&self) {
+        self.context.work.reopen();
     }
 
     /// Admit optional caches from the pool's currently unreserved bytes.
