@@ -82,9 +82,8 @@ including when the variable is smaller. When a fragment being compacted holds
 a Blob descriptor the engine's decoder rejects, sizing can refuse the
 compaction with a Blob integrity error before that table is rewritten, and
 nothing is committed; a table with nothing to compact is not scanned.
-Optimize works on up to
-`OMNIGRAPH_MAINTENANCE_CONCURRENCY` tables at once (default 8), so budget for
-that many Blob tables compacting together.
+Optimize rewrites one table at a time by default, and two at most (see
+[budgets](#budgets)), so budget for that many Blob tables compacting together.
 
 Optimize also persists the traversal-adjacency artifact
 (`__graph_index/csr-current.bin`), which cold traversal builds load instead of
@@ -311,6 +310,31 @@ number; nothing defers a table, so the row has no `deferred` field.
 Exit 0 means every table was visited and that nothing a retained graph
 commit pins, and no file such a commit references, was removed. It does not mean every table was collected: read the result rows
 for tables with an `error`.
+
+## Budgets
+
+Optimize, cleanup, index builds and the full-text rebuild share one budget,
+read from the environment at the start of each run by the direct CLI, a
+server or an embedding process. A value that is not a positive integer keeps
+its default, and the run logs the variable it ignored.
+
+| Variable | Default | Bounds |
+|---|---|---|
+| `OMNIGRAPH_MAINTENANCE_CONCURRENCY` | `1` | The tables whose compaction or index work runs at once. At most `2`; a larger value runs `2` and is logged. Planning and cleanup's sweep read up to eight tables at once regardless. |
+| `OMNIGRAPH_MAINTENANCE_SCAN_IO_BUFFER_BYTES` | `67108864` (64 MiB) | The bytes a compaction scan may queue in Lance's I/O buffer. |
+| `OMNIGRAPH_MAINTENANCE_FULL_TEXT_MEMORY_MB` | `512` | The memory one full-text index build splits across its workers. |
+| `OMNIGRAPH_MAINTENANCE_FULL_TEXT_WORKERS` | `2` | The workers a full-text index build tokenizes with. |
+
+Compaction scans in batches of 8,192 rows, Lance's own fallback, set
+explicitly so `LANCE_DEFAULT_BATCH_SIZE` does not size it; Blob tables use the
+smaller batches above. The caps bound Lance's buffers, not the process, and
+Lance's process-wide `LANCE_*` thread and memory variables are left alone.
+
+One graph runs one maintenance operation at a time in a process: an optimize,
+cleanup or index build that starts while another runs on the same graph waits
+for it. Lance's CPU-heavy maintenance work (decoding and re-encoding a
+compaction's rows, building an index) runs on two threads of its own, so a
+process that also serves requests keeps its request threads.
 
 ## Suggested cadence
 

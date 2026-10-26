@@ -393,6 +393,9 @@ pub(crate) struct WriteQueueManager {
     /// The graph-global shared/exclusive schema gate; see
     /// [`SchemaGateSlot`].
     schema_gate: Arc<SchemaGateSlot>,
+    /// The root's maintenance lane: one maintenance run at a time in this
+    /// process. Taken before any gate here and released after them.
+    maintenance_lane: Arc<crate::db::maintenance::MaintenanceLane>,
 }
 
 impl WriteQueueManager {
@@ -416,6 +419,10 @@ impl WriteQueueManager {
         let manager = Arc::new(Self::new());
         roots.insert(root_identity.to_string(), Arc::downgrade(&manager));
         manager
+    }
+
+    pub(crate) fn maintenance_lane(&self) -> &Arc<crate::db::maintenance::MaintenanceLane> {
+        &self.maintenance_lane
     }
 
     /// Get-or-create the per-key queue and clone its Arc.

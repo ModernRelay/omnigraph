@@ -1788,6 +1788,12 @@ impl ApiError {
             err @ OmniError::InitializationClaimed { .. } => Self::conflict(err.to_string()),
             err @ (OmniError::InitializationCommitted { .. }
             | OmniError::InitializationIndeterminate { .. }) => Self::internal(err.to_string()),
+            // A maintenance run stopped at a cancel point because its lane was
+            // cancelled for shutdown or a drain; the run's completion evidence
+            // says where it stopped.
+            err @ OmniError::MaintenanceCancelled { .. } => {
+                Self::new(ErrorCode::ServiceUnavailable, err.to_string())
+            }
             OmniError::Completion { .. } => unreachable!("completion evidence was unwrapped"),
         };
         response.completion_uncertain |= uncertain;

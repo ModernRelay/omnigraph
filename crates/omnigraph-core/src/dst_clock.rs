@@ -62,6 +62,21 @@ fn next_logical_ms() -> Option<u64> {
     CLOCK.with(|clock| clock.now_ms())
 }
 
+/// Whether this thread reads an installed logical clock, as a harness
+/// actor thread does. Without the `dst` feature: never.
+#[cfg(not(feature = "dst"))]
+#[inline(always)]
+pub fn installed() -> bool {
+    false
+}
+
+/// Whether this thread reads an installed logical clock, as a harness
+/// actor thread does.
+#[cfg(feature = "dst")]
+pub fn installed() -> bool {
+    CLOCK.with(|_| ()).is_some()
+}
+
 /// Seam for `chrono::Utc::now()` call sites. Without the `dst` feature:
 /// the real clock, directly.
 #[cfg(not(feature = "dst"))]

@@ -510,6 +510,14 @@ pub enum OmniError {
         "graph initialization at '{uri}' is claimed by '__init_claim.json'; another initializer may still be running or a prior initializer may have stopped; quiesce all initializers before manually removing the claim, then retry init (use --force only when orphan schema files remain)"
     )]
     InitializationClaimed { uri: String },
+    /// A maintenance run (optimize, cleanup, an index build or the full-text
+    /// rebuild) stopped at a cancel point because its graph's maintenance
+    /// lane was cancelled, as a server does on shutdown or a deployment
+    /// drain. The run carries completion evidence for where it stopped: a run
+    /// cancelled before its publication left only unreachable staging, which
+    /// a later cleanup reclaims.
+    #[error("maintenance {operation} was cancelled")]
+    MaintenanceCancelled { operation: &'static str },
 }
 
 /// Cloneable, closed payload for engine-domain failures that may cross a
@@ -674,6 +682,18 @@ impl OmniError {
     }
 
     pub fn before_effect(self) -> Self {
+        self.with_completion_evidence(CompletionEvidence::BeforeEffect)
+    }
+
+    /// Mark a failure before the owning operation's first durable effect
+    /// when, as for [`Self::unpublished`], its type alone leaves open
+    /// whether the graph moved. A typed outcome stays as it is, so callers
+    /// matching on it see the same shape, and an error that already carries
+    /// evidence keeps it.
+    pub fn before_effect_if_opaque(self) -> Self {
+        if !self.outcome_opaque() || self.completion_evidence().is_some() {
+            return self;
+        }
         self.with_completion_evidence(CompletionEvidence::BeforeEffect)
     }
 
@@ -1582,6 +1602,60 @@ mod tests {
                 .completion_evidence(),
             None,
             "composition after earlier published work drops the definite proof"
+        );
+    }
+
+    /// The pre-effect mark a maintenance run puts on its failures before its
+    /// first durable effect: opaque failures get `BeforeEffect`, a typed
+    /// outcome keeps its shape, and existing evidence, uncertainty included,
+    /// is never replaced.
+    #[test]
+    fn before_effect_if_opaque_marks_only_opaque_failures() {
+        for opaque in [
+            OmniError::Storage(StorageFailure::new(
+                StorageFailureKind::Transient,
+                "storage: manifest read failed",
+            )),
+            OmniError::Io(std::io::Error::other("listing failed")),
+            OmniError::DataFusion("execution failure".into()),
+            OmniError::manifest_internal("coordinator view is stale"),
+        ] {
+            let message = opaque.to_string();
+            let marked = opaque.before_effect_if_opaque();
+            assert_eq!(
+                marked.completion_evidence(),
+                Some(CompletionEvidence::BeforeEffect),
+                "{message}"
+            );
+            assert_eq!(marked.to_string(), message, "the mark is transparent");
+        }
+        for typed in [
+            OmniError::manifest("bad request"),
+            OmniError::manifest_conflict("authority conflict"),
+            OmniError::Policy("denied".into()),
+            OmniError::MaintenanceCancelled {
+                operation: "optimize",
+            },
+        ] {
+            let message = typed.to_string();
+            let marked = typed.before_effect_if_opaque();
+            assert_eq!(marked.completion_evidence(), None, "{message}");
+            assert!(!matches!(marked, OmniError::Completion { .. }), "{message}");
+        }
+        assert_eq!(
+            OmniError::Io(std::io::Error::other("staged"))
+                .unpublished()
+                .before_effect_if_opaque()
+                .completion_evidence(),
+            Some(CompletionEvidence::Unpublished),
+            "an inner mark stays"
+        );
+        assert_eq!(
+            OmniError::manifest_publish_in_doubt("acknowledgement lost")
+                .before_effect_if_opaque()
+                .completion_evidence(),
+            Some(CompletionEvidence::Uncertain),
+            "a publication in doubt stays uncertain"
         );
     }
 

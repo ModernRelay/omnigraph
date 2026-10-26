@@ -2918,7 +2918,6 @@ impl TableStore {
                 continue;
             };
             let mut ds_clone = ds.clone();
-            let columns = [column.as_str()];
             let built = if item.vector {
                 // Keep the index's partition count: the engine builds one
                 // partition, but a partitioned index (Lance's split, or an
@@ -2926,20 +2925,28 @@ impl TableStore {
                 let partitions = Self::vector_partition_count(ds, &item.name).await;
                 let params =
                     lance::index::vector::VectorIndexParams::ivf_flat(partitions, MetricType::L2);
-                ds_clone
-                    .create_index_builder(&columns, IndexType::Vector, &params)
-                    .name(item.name.clone())
-                    .replace(true)
-                    .execute_uncommitted()
-                    .await
+                let (name, column) = (item.name.clone(), column.clone());
+                crate::db::maintenance::off_serving_runtime(async move {
+                    ds_clone
+                        .create_index_builder(&[column.as_str()], IndexType::Vector, &params)
+                        .name(name)
+                        .replace(true)
+                        .execute_uncommitted()
+                        .await
+                })
+                .await
             } else {
                 let params = ScalarIndexParams::default();
-                ds_clone
-                    .create_index_builder(&columns, IndexType::BTree, &params)
-                    .name(item.name.clone())
-                    .replace(true)
-                    .execute_uncommitted()
-                    .await
+                let (name, column) = (item.name.clone(), column.clone());
+                crate::db::maintenance::off_serving_runtime(async move {
+                    ds_clone
+                        .create_index_builder(&[column.as_str()], IndexType::BTree, &params)
+                        .name(name)
+                        .replace(true)
+                        .execute_uncommitted()
+                        .await
+                })
+                .await
             };
             let new_idx = match built {
                 Ok(index) => index,
@@ -4348,7 +4355,15 @@ impl TableStore {
             if let (true, Some(rows)) = (has_blob_columns, task.options.batch_size) {
                 crate::instrumentation::record_compaction_blob_batch(rows);
             }
-            results.push(task.execute(ds).await.map_err(OmniError::storage)?);
+            // Lance decodes and re-encodes the task's rows in tasks it spawns
+            // on the runtime that polls it.
+            let dataset = ds.clone();
+            let result =
+                crate::db::maintenance::off_serving_runtime(
+                    async move { task.execute(&dataset).await },
+                )
+                .await;
+            results.push(result.map_err(OmniError::storage)?);
         }
         if results.iter().any(|result| result.row_addrs.is_some()) {
             return Err(OmniError::manifest_internal(format!(
@@ -4931,10 +4946,14 @@ impl TableStore {
     /// This intentionally covers OmniGraph's current one-segment full-table
     /// vector shape. Lance's generic multi-segment commit helper remains an
     /// inline-commit API and is not used here.
+    /// Each build runs on the maintenance runtime
+    /// ([`crate::db::maintenance::off_serving_runtime`]), and a full-text
+    /// build takes its memory and workers from `budget`.
     pub async fn stage_create_indices(
         &self,
         ds: &Dataset,
         specs: &[IndexBuildSpec],
+        budget: &crate::db::maintenance::MaintenanceBudget,
     ) -> Result<StagedWrite> {
         if specs.is_empty() {
             return Err(OmniError::manifest_internal(
@@ -4968,33 +4987,46 @@ impl TableStore {
             let mut new_idx = match spec {
                 IndexBuildSpec::BTree { column, name } => {
                     let params = ScalarIndexParams::default();
-                    let columns = [column.as_str()];
-                    let mut builder =
-                        ds_clone.create_index_builder(&columns, IndexType::BTree, &params);
-                    // Same-snapshot builders cannot see each other's new
-                    // default names; companions need explicit distinct names
-                    // even with Lance 11's sequential collision avoidance.
-                    if let Some(name) = name {
-                        builder = builder.name(name.clone());
-                    }
-                    builder.replace(true).execute_uncommitted().await
+                    let (column, name) = (column.clone(), name.clone());
+                    crate::db::maintenance::off_serving_runtime(async move {
+                        let columns = [column.as_str()];
+                        let mut builder =
+                            ds_clone.create_index_builder(&columns, IndexType::BTree, &params);
+                        // Same-snapshot builders cannot see each other's new
+                        // default names; companions need explicit distinct
+                        // names even with Lance 11's sequential collision
+                        // avoidance.
+                        if let Some(name) = name {
+                            builder = builder.name(name);
+                        }
+                        builder.replace(true).execute_uncommitted().await
+                    })
+                    .await
                 }
                 IndexBuildSpec::FullText { column } => {
-                    let params = InvertedIndexParams::default();
-                    ds_clone
-                        .create_index_builder(&[column.as_str()], IndexType::Inverted, &params)
-                        .replace(true)
-                        .execute_uncommitted()
-                        .await
+                    let params = budget.full_text_params();
+                    let column = column.clone();
+                    crate::db::maintenance::off_serving_runtime(async move {
+                        ds_clone
+                            .create_index_builder(&[column.as_str()], IndexType::Inverted, &params)
+                            .replace(true)
+                            .execute_uncommitted()
+                            .await
+                    })
+                    .await
                 }
                 IndexBuildSpec::Vector { column } => {
                     let params =
                         lance::index::vector::VectorIndexParams::ivf_flat(1, MetricType::L2);
-                    let new_idx = ds_clone
-                        .create_index_builder(&[column.as_str()], IndexType::Vector, &params)
-                        .replace(true)
-                        .execute_uncommitted()
-                        .await;
+                    let column = column.clone();
+                    let new_idx = crate::db::maintenance::off_serving_runtime(async move {
+                        ds_clone
+                            .create_index_builder(&[column.as_str()], IndexType::Vector, &params)
+                            .replace(true)
+                            .execute_uncommitted()
+                            .await
+                    })
+                    .await;
                     if new_idx.is_ok() {
                         vector_builds += 1;
                     }

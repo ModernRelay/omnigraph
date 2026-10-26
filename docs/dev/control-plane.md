@@ -514,8 +514,12 @@ including a 500. Mutation, load, Blob write and merge mark opaque errors (storag
 steps, alongside the table store's staged-write and detached-commit sites,
 and the publisher marks every failure whose manifest request cannot land.
 A contained write logs the failure's redacted class before admission closes.
-A typed refusal keeps its shape. Other opaque schema and maintenance
-preparation errors without completion evidence still fail closed as uncertain. Proven publication followed by
+A typed refusal keeps its shape. Optimize, cleanup, the index writers and
+the repair report carry evidence for every failure before their publication
+([write path](writes.md#policy-and-attribution)), so a failed maintenance run
+does not contain the server; other opaque schema preparation errors without
+completion evidence still fail closed as uncertain. A maintenance run stopped by
+`cancel_maintenance` answers `service_unavailable` with its evidence. Proven publication followed by
 `RecoveryRequired`, and uncertain publication itself, are never downgraded.
 Read/write body and response lanes have independent capacity; bodyless reads
 consume only read observers. Once HTTP connections and the remaining known

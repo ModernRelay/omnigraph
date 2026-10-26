@@ -4808,6 +4808,206 @@ async fn seed_optimize_race_graph(dir: &tempfile::TempDir) {
     helpers::commit_many(&seed, 4).await;
 }
 
+/// Detached manifests per table of the test schema on main.
+async fn detached_versions_by_table(
+    db: &Omnigraph,
+) -> std::collections::BTreeMap<&'static str, std::collections::BTreeSet<u64>> {
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let mut versions = std::collections::BTreeMap::new();
+    for table_key in ["edge:Knows", "edge:WorksAt", "node:Company", "node:Person"] {
+        let Some(entry) = snapshot.dataset(table_key) else {
+            continue;
+        };
+        let uri = format!(
+            "{}/{}",
+            db.uri().trim_end_matches('/'),
+            entry.dataset_path.trim_start_matches('/')
+        );
+        versions.insert(table_key, detached_versions(&uri).await);
+    }
+    versions
+}
+
+/// A cancel of the graph's maintenance lane stops optimize at its next cancel
+/// point, here after a table's first detached commit and before the batch
+/// publishes. The run fails with the typed cancellation carrying
+/// `Unpublished`; the graph head and every pin are unchanged; what the run
+/// staged is detached commits no `__manifest` version names, and once the
+/// head moves a cleanup reclaims them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn optimize_cancelled_mid_table_leaves_only_staging_cleanup_reclaims() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    seed_optimize_race_graph(&dir).await;
+    let db = Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
+    let head_before = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    let pins_before = pinned_version(&db, "main", "node:Person").await;
+    let staged_before = detached_versions_by_table(&db).await;
+
+    let parked = helpers::failpoint::Rendezvous::park_first(&catalog::OPTIMIZE_POST_TABLE_EFFECT);
+    let optimizer = Arc::clone(&db);
+    let optimize = tokio::spawn(async move { optimizer.optimize_as(None).await });
+    parked.wait_until_reached().await;
+    assert_eq!(
+        db.maintenance_in_progress(),
+        Some(omnigraph::db::MaintenanceInProgress {
+            operation: omnigraph::db::MaintenanceOperation::Optimize,
+            branch: Some("main".to_string()),
+        }),
+        "optimize holds the graph's maintenance lane"
+    );
+    db.cancel_maintenance();
+    parked.release();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(30), optimize)
+        .await
+        .expect("a cancelled optimize stops at its next cancel point")
+        .unwrap()
+        .expect_err("a cancelled optimize publishes nothing");
+    drop(parked);
+    assert_eq!(
+        error.completion_evidence(),
+        Some(CompletionEvidence::Unpublished),
+        "{error}"
+    );
+    assert!(
+        matches!(
+            error.into_completion_evidence().0,
+            OmniError::MaintenanceCancelled {
+                operation: "optimize"
+            }
+        ),
+        "the cancellation is typed"
+    );
+    assert_eq!(db.maintenance_in_progress(), None, "the lane is released");
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "main").await.unwrap(),
+        head_before,
+        "the graph head did not move"
+    );
+    assert_eq!(
+        pinned_version(&db, "main", "node:Person").await,
+        pins_before
+    );
+    let staged_after = detached_versions_by_table(&db).await;
+    let stranded = staged_after
+        .iter()
+        .map(|(table, versions)| (*table, versions - &staged_before[table]))
+        .filter(|(_, versions)| !versions.is_empty())
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert!(
+        !stranded.is_empty(),
+        "the cancelled table's detached commit is left as staging"
+    );
+
+    // The staging recorded the head it was planned on; once the head moves
+    // it is dead, and cleanup reclaims it by its publication authority.
+    insert_person(&db, "main", "after-cancel").await;
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
+    assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
+    let reclaimed = detached_versions_by_table(&db).await;
+    for (table, versions) in &stranded {
+        assert!(
+            versions.is_disjoint(&reclaimed[table]),
+            "{table}: the cancelled run's staging {versions:?} is reclaimed: {:?}",
+            reclaimed[table]
+        );
+    }
+    db.optimize_as(None)
+        .await
+        .expect("a run after the cancel optimizes");
+}
+
+/// The graph's maintenance lane runs one maintenance operation at a time in
+/// this process: a cleanup on another handle for the same root waits behind
+/// an optimize instead of running beside it. A cancel stops both: the
+/// waiting cleanup before any effect, the optimize at its next cancel point,
+/// still before any effect. A run that starts after the cancel is not
+/// affected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn maintenance_runs_on_one_root_take_turns_and_a_cancel_stops_the_waiter() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    seed_optimize_race_graph(&dir).await;
+    let optimizing = Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
+    let cleaning = Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
+    let head_before = branch_head_commit_id(dir.path(), "main").await.unwrap();
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES,
+    );
+    let optimize = tokio::spawn({
+        let db = Arc::clone(&optimizing);
+        async move { db.optimize_as(None).await.map(|_| ()) }
+    });
+    parked.wait_until_reached().await;
+    let mut cleanup = tokio::spawn({
+        let db = Arc::clone(&cleaning);
+        async move { db.cleanup_as(keep_one(), None).await.map(|_| ()) }
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut cleanup)
+            .await
+            .is_err(),
+        "the cleanup waits for the lane the optimize holds"
+    );
+    assert_eq!(
+        cleaning.maintenance_in_progress(),
+        Some(omnigraph::db::MaintenanceInProgress {
+            operation: omnigraph::db::MaintenanceOperation::Optimize,
+            branch: Some("main".to_string()),
+        }),
+        "every handle on the root sees the one lane"
+    );
+
+    cleaning.cancel_maintenance();
+    let waited = tokio::time::timeout(std::time::Duration::from_secs(30), cleanup)
+        .await
+        .expect("a cancel releases a waiting run")
+        .unwrap()
+        .expect_err("a cancelled waiter does not run");
+    assert_eq!(
+        waited.completion_evidence(),
+        Some(CompletionEvidence::BeforeEffect),
+        "{waited}"
+    );
+    assert!(matches!(
+        waited.into_completion_evidence().0,
+        OmniError::MaintenanceCancelled {
+            operation: "cleanup"
+        }
+    ));
+
+    parked.release();
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(30), optimize)
+        .await
+        .expect("the parked optimize stops at its next cancel point")
+        .unwrap()
+        .expect_err("a cancelled optimize publishes nothing");
+    drop(parked);
+    assert_eq!(
+        stopped.completion_evidence(),
+        Some(CompletionEvidence::BeforeEffect),
+        "the optimize had staged nothing yet: {stopped}"
+    );
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "main").await.unwrap(),
+        head_before
+    );
+
+    cleaning
+        .cleanup_as(keep_one(), None)
+        .await
+        .expect("a cleanup that starts after the cancel runs");
+    optimizing
+        .optimize_as(None)
+        .await
+        .expect("an optimize that starts after the cancel runs");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 #[serial(optimize)]

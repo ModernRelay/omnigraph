@@ -476,6 +476,7 @@ async fn keyed_upsert_forces_filter_route_and_preserves_conflict_metadata() {
                 column: "id".to_string(),
                 name: None,
             }],
+            &crate::db::MaintenanceBudget::DEFAULT,
         )
         .await
         .unwrap();
@@ -536,6 +537,7 @@ async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
                 column: "id".to_string(),
                 name: None,
             }],
+            &crate::db::MaintenanceBudget::DEFAULT,
         )
         .await
         .unwrap();
@@ -960,6 +962,7 @@ async fn proven_strict_insert_pins_update_shape_and_leaves_new_fragments_unindex
                 column: "id".to_string(),
                 name: None,
             }],
+            &crate::db::MaintenanceBudget::DEFAULT,
         )
         .await
         .unwrap();
@@ -2908,6 +2911,7 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
                     column: "embedding".to_string(),
                 },
             ],
+            &crate::db::MaintenanceBudget::DEFAULT,
         )
         .await
         .unwrap();
@@ -3067,6 +3071,7 @@ async fn saved_lance10_full_text_index_requires_rebuild_and_preserves_history() 
             &[IndexBuildSpec::FullText {
                 column: "text".into(),
             }],
+            &crate::db::MaintenanceBudget::DEFAULT,
         )
         .await
         .unwrap();

@@ -59,6 +59,146 @@ async fn person_pin_and_head(db: &Omnigraph, root: &str) -> (u64, u64, String) {
     (pin, head, full)
 }
 
+/// Make every directory in `dirs` read-only, or report that this host does
+/// not enforce directory permissions for the test's user (a root user), in
+/// which case the fault cannot be planted.
+fn refuse_writes_under(dirs: &[std::path::PathBuf]) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    for dir in dirs {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    }
+    let probe = dirs[0].join("permission-probe");
+    if std::fs::write(&probe, b"x").is_ok() {
+        std::fs::remove_file(&probe).unwrap();
+        allow_writes_under(dirs);
+        eprintln!("skipping: this host does not enforce directory permissions");
+        return false;
+    }
+    true
+}
+
+fn allow_writes_under(dirs: &[std::path::PathBuf]) {
+    use std::os::unix::fs::PermissionsExt;
+    for dir in dirs {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// `dir` under every table of the test schema on main.
+async fn table_dirs(db: &Omnigraph, dir: &str) -> Vec<std::path::PathBuf> {
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    ["edge:Knows", "edge:WorksAt", "node:Company", "node:Person"]
+        .into_iter()
+        .filter_map(|table_key| snapshot.dataset(table_key))
+        .map(|entry| {
+            std::path::Path::new(db.uri())
+                .join(entry.dataset_path.trim_start_matches('/'))
+                .join(dir)
+        })
+        .collect()
+}
+
+/// A storage failure while optimize stages its compaction is definite: the
+/// error keeps its storage cause and carries `Unpublished`, so a server
+/// keeps serving instead of treating the run as uncertain. The graph head is
+/// unchanged and the next run on the same handle publishes. The fault is
+/// real backend I/O: the table's `data/` directory refuses new files.
+#[cfg(unix)]
+#[tokio::test]
+async fn optimize_storage_failure_before_publication_is_unpublished() {
+    use omnigraph::error::CompletionEvidence;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    for name in ["frag-1", "frag-2", "frag-3"] {
+        insert_person(&db, "main", name).await;
+    }
+    let commits_before = db.list_commits(Some("main")).await.unwrap().len();
+    let person = node_table_uri(&db, "Person").await;
+    let data = vec![std::path::Path::new(&person).join("data")];
+    if !refuse_writes_under(&data) {
+        return;
+    }
+    let error = db.optimize_as(None).await;
+    allow_writes_under(&data);
+    let error = error.expect_err("the compaction cannot write its files");
+    assert!(
+        error.storage_failure().is_some(),
+        "the compaction's data-file write fails in storage: {error:?}"
+    );
+    assert_eq!(
+        error.completion_evidence(),
+        Some(CompletionEvidence::Unpublished),
+        "a storage failure before publication is definite: {error:?}"
+    );
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        commits_before,
+        "nothing was published"
+    );
+    assert_eq!(db.maintenance_in_progress(), None, "the lane is released");
+
+    let stats = db.optimize_as(None).await.expect("the next run optimizes");
+    assert!(
+        stats
+            .iter()
+            .any(|row| row.type_key == "node:Person" && row.committed),
+        "{stats:?}"
+    );
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        commits_before + 1
+    );
+}
+
+/// The index writer marks its failures the same way: a storage failure
+/// while an index build writes its segment files carries `Unpublished`, and
+/// the graph is unchanged. The fault is real backend I/O: every table's
+/// `_indices/` directory refuses new segments.
+#[cfg(unix)]
+#[tokio::test]
+async fn index_build_storage_failure_before_publication_is_unpublished() {
+    use omnigraph::error::CompletionEvidence;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    // Schema apply records a new index's intent and leaves its build to the
+    // index writer.
+    db.apply_schema(&TEST_SCHEMA.replace("age: I32?", "age: I32? @index"))
+        .await
+        .unwrap();
+    let commits_before = db.list_commits(Some("main")).await.unwrap().len();
+    let indices = table_dirs(&db, "_indices").await;
+    if !refuse_writes_under(&indices) {
+        return;
+    }
+    let error = db.ensure_indices_as(None).await;
+    allow_writes_under(&indices);
+    let error = error.expect_err("the index build cannot write its segments");
+    assert!(
+        error.storage_failure().is_some(),
+        "the segment write fails in storage: {error:?}"
+    );
+    assert_eq!(
+        error.completion_evidence(),
+        Some(CompletionEvidence::Unpublished),
+        "a storage failure before publication is definite: {error:?}"
+    );
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        commits_before
+    );
+
+    db.ensure_indices_as(None)
+        .await
+        .expect("the next build publishes");
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        commits_before + 1
+    );
+}
+
 fn assert_same_dataset_entry(
     before: &omnigraph::db::DatasetEntry,
     after: &omnigraph::db::DatasetEntry,

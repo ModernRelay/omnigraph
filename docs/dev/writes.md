@@ -564,9 +564,10 @@ carried stored external reference the policy refuses fails as
 | A proposal tag's creation or deletion reports an ambiguous result | The tag is read back: a matching tag is success, a differing tag an integrity error, an unavailable readback `manifest_publish_in_doubt`. After a proposal or unattached snapshot tag is created, a failed authority probe remains in doubt even if rollback deletes the tag: an earlier conditional create may recreate it. Only proven expiry of the captured authority makes that refusal definite |
 
 The `Unpublished` annotations cover the named writer envelopes, the table
-store's staged-write and detached-commit sites, and every publisher failure
-whose manifest request cannot land. Other opaque schema and maintenance
-preparation errors without completion evidence remain uncertain. A
+store's staged-write and detached-commit sites, every publisher failure
+whose manifest request cannot land, and the maintenance runs (below). Other
+opaque schema preparation errors without completion evidence remain
+uncertain. A
 post-publication `RecoveryRequired` or an uncertain publication is never
 changed into definite non-publication by these annotations.
 
@@ -590,6 +591,29 @@ admits `change`, its grant before `maintain` existed (`Omnigraph::enforce_any`,
 the read-only `repair_report_as` checks `maintain` on `main`.
 `forbidden_apis.rs::maintenance_entry_points_take_an_actor` keeps every
 registered maintenance surface an `_as` form with an `actor` parameter.
+
+Optimize, cleanup, the index writer and the full-text rebuild each run in
+their graph's maintenance lane (`db/maintenance.rs`), entered after the
+policy check: one maintenance run per root at a time in a process, the others
+waiting in memory in arrival order. The lane is process-local derived state
+held by the root's write-queue manager, never writer fencing; the
+publication's exact CAS still decides between processes. A run records how
+far it has gone, and every failure it returns carries the matching
+completion evidence: an opaque failure before its first durable effect is
+`BeforeEffect`, after detached commits, staged index files or cleanup
+deletions it is `Unpublished`, a publisher failure keeps the publisher's own
+evidence (a publication in doubt stays uncertain), and a failure after the
+publication is `PartlyPublished`; a typed refusal before the publication
+keeps its shape. The read-only repair report marks every opaque failure
+`BeforeEffect`. `Omnigraph::cancel_maintenance` cancels the run holding the
+lane and every run waiting for it. A run stops at its next cancel point with
+`OmniError::MaintenanceCancelled`: before every publication, between tables
+and between the links of a table's chain, and, for work whose effects stay
+unreachable (planning, a table's detached chain, an index build), at once,
+by dropping that work. A publication in progress and a cleanup deletion in
+progress always finish. A cancelled run leaves only staging the collector
+reclaims by its recorded authority, and segment files a dropped index build
+wrote, which no manifest names, under the collector's orphan age rule.
 
 Bearer authentication (`401 unauthorized`), the HTTP contract check
 (`400 api_contract_mismatch`) and policy (`403 forbidden`) refuse a served

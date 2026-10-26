@@ -58,6 +58,7 @@ impl RedactedCause {
             OmniError::InitializationCommitted { .. } => "InitializationCommitted",
             OmniError::InitializationIndeterminate { .. } => "InitializationIndeterminate",
             OmniError::InitializationClaimed { .. } => "InitializationClaimed",
+            OmniError::MaintenanceCancelled { .. } => "MaintenanceCancelled",
         };
         let manifest_kind = match error {
             OmniError::Manifest(manifest) => Some(manifest.kind),

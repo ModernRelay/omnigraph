@@ -874,6 +874,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         snapshot: &SnapshotHandle,
         specs: &[IndexBuildSpec],
+        budget: &crate::db::maintenance::MaintenanceBudget,
     ) -> Result<StagedHandle>;
 
     // ── Index presence (reads, no HEAD advance) ──────────────────────
@@ -1461,8 +1462,9 @@ impl TableStorage for TableStore {
         &self,
         snapshot: &SnapshotHandle,
         specs: &[IndexBuildSpec],
+        budget: &crate::db::maintenance::MaintenanceBudget,
     ) -> Result<StagedHandle> {
-        TableStore::stage_create_indices(self, snapshot.dataset(), specs)
+        TableStore::stage_create_indices(self, snapshot.dataset(), specs, budget)
             .await
             .map(StagedHandle::new)
     }

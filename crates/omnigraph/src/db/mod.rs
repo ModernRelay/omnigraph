@@ -3,6 +3,7 @@ mod catalog_tests;
 pub mod commit_graph;
 pub(crate) mod graph_coordinator;
 pub(crate) mod legacy_sidecars;
+pub(crate) mod maintenance;
 pub mod manifest;
 pub(crate) mod omnigraph;
 mod schema_state;
@@ -14,6 +15,11 @@ pub(crate) mod write_queue;
 
 pub use commit_graph::{GraphCommit, GraphCommitKind};
 pub use graph_coordinator::{ReadTarget, ResolvedTarget, SnapshotId};
+pub use maintenance::{
+    MAINTENANCE_CONCURRENCY_ENV, MAINTENANCE_FULL_TEXT_MEMORY_ENV,
+    MAINTENANCE_FULL_TEXT_WORKERS_ENV, MAINTENANCE_SCAN_IO_BUFFER_ENV, MaintenanceBudget,
+    MaintenanceInProgress, MaintenanceOperation,
+};
 pub use manifest::{DatasetEntry, DatasetUpdate};
 pub use omnigraph::{
     BranchCreated, COMMIT_LIST_DEFAULT_PAGE_COMMITS, COMMIT_LIST_MAX_PAGE_COMMITS,

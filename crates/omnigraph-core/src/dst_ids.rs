@@ -75,6 +75,21 @@ omnigraph_seams::thread_local_seam! {
     pub static IDS: dyn IdSource = ("ids", Op::Unreachable);
 }
 
+/// Whether this thread mints from installed seeded identities, as a
+/// harness actor thread does. Without the `dst` feature: never.
+#[cfg(not(feature = "dst"))]
+#[inline(always)]
+pub fn installed() -> bool {
+    false
+}
+
+/// Whether this thread mints from installed seeded identities, as a
+/// harness actor thread does.
+#[cfg(feature = "dst")]
+pub fn installed() -> bool {
+    IDS.with(|_| ()).is_some()
+}
+
 /// Every production identity mint in this crate comes through here.
 /// Without the `dst` feature this is a direct `Ulid::new()`: no
 /// thread-local probe, no override authority anywhere in the build.

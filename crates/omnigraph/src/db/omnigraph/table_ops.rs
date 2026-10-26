@@ -1,5 +1,6 @@
 use super::*;
 use crate::dataset_index::is_full_text_index;
+use crate::db::maintenance::{MaintenanceOperation, MaintenanceRun};
 use crate::error::missing_graph_type_at_snapshot;
 use crate::seams::{decide_seam, fail};
 use lance::index::DatasetIndexExt;
@@ -103,13 +104,18 @@ pub(super) async fn rebuild_full_text_indices_on_as(
         &omnigraph_policy::ResourceScope::Branch(public_branch.to_string()),
         actor,
     )?;
+    let run = db
+        .enter_maintenance(MaintenanceOperation::FullTextRebuild, Some(public_branch))
+        .await?;
     let outcome = maintain_indices_for_branch(
         db,
         branch.as_deref(),
         IndexMaintenanceMode::RebuildFullText,
         actor,
+        &run,
     )
-    .await?;
+    .await
+    .map_err(|error| run.classify(error))?;
     Ok(FullTextIndexRebuildResult {
         branch: public_branch.to_string(),
         graph_commit_id: outcome.graph_commit_id,
@@ -204,14 +210,19 @@ async fn ensure_indices_for_branch(
     branch: Option<&str>,
     actor: Option<&str>,
 ) -> Result<Vec<PendingIndex>> {
+    let public_branch = branch.unwrap_or("main");
     db.enforce(
         omnigraph_policy::PolicyAction::Maintain,
-        &omnigraph_policy::ResourceScope::Branch(branch.unwrap_or("main").to_string()),
+        &omnigraph_policy::ResourceScope::Branch(public_branch.to_string()),
         actor,
     )?;
+    let run = db
+        .enter_maintenance(MaintenanceOperation::IndexBuild, Some(public_branch))
+        .await?;
     Ok(
-        maintain_indices_for_branch(db, branch, IndexMaintenanceMode::Ensure, actor)
-            .await?
+        maintain_indices_for_branch(db, branch, IndexMaintenanceMode::Ensure, actor, &run)
+            .await
+            .map_err(|error| run.classify(error))?
             .pending,
     )
 }
@@ -243,12 +254,18 @@ struct IndexTarget {
     table_branch: Option<String>,
 }
 
+/// The index writer holding the graph's maintenance lane. Its cancel points
+/// come between tables and before the publication; a cancel drops an index
+/// build in flight, whose segment files no manifest names, so the collector
+/// reclaims them as orphans under its age rule.
 async fn maintain_indices_for_branch(
     db: &Omnigraph,
     branch: Option<&str>,
     mode: IndexMaintenanceMode,
     actor: Option<&str>,
+    run: &MaintenanceRun,
 ) -> Result<IndexMaintenanceOutcome> {
+    let budget = db.maintenance_budget();
     // Install this handle's pending schema contract, if any, before capturing
     // the index plan's base. The under-gate revalidation below closes the race
     // between this capture and the first table effect.
@@ -283,6 +300,7 @@ async fn maintain_indices_for_branch(
     let mut __dst_nk1: Vec<_> = catalog.node_types.keys().collect();
     __dst_nk1.sort();
     for type_name in __dst_nk1 {
+        run.check()?;
         let table_key = format!("node:{}", type_name);
         let Some(entry) = snapshot.dataset(&table_key) else {
             continue;
@@ -317,6 +335,7 @@ async fn maintain_indices_for_branch(
     let mut __dst_ek1: Vec<_> = catalog.edge_types.keys().collect();
     __dst_ek1.sort();
     for edge_name in __dst_ek1 {
+        run.check()?;
         let table_key = format!("edge:{}", edge_name);
         let Some(entry) = snapshot.dataset(&table_key) else {
             continue;
@@ -355,11 +374,14 @@ async fn maintain_indices_for_branch(
     // for the fork.
     for target in &targets {
         if let Some(ds) = existing_targets.get(&target.table_key) {
+            run.check()?;
+            // Index builds write segment files: durable, and named by no
+            // manifest until the batch publishes.
+            run.staged();
             let work = &work_by_table[&target.table_key];
-            let staged = db
-                .storage()
-                .stage_create_indices(ds, &work.specs)
-                .await
+            let staged = run
+                .unless_cancelled(db.storage().stage_create_indices(ds, &work.specs, &budget))
+                .await?
                 .map_err(|error| {
                     error.with_context(format!(
                         "stage index batch on {} ({:?})",
@@ -458,6 +480,7 @@ async fn maintain_indices_for_branch(
 
         let mut updates = Vec::with_capacity(targets.len());
         for target in &targets {
+            run.check()?;
             let ds = existing_targets.remove(&target.table_key).ok_or_else(|| {
                 OmniError::manifest_internal(format!(
                     "missing index target for table '{}'",
@@ -505,6 +528,9 @@ async fn maintain_indices_for_branch(
         }
 
         fail(&ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT)?;
+        // The last cancel point: past it the batch publishes or fails.
+        run.check()?;
+        run.publishing();
         let published = commit_updates_on_branch_with_expected(
             db,
             active_branch.as_deref(),
@@ -516,6 +542,7 @@ async fn maintain_indices_for_branch(
             Publication::Publish,
         )
         .await?;
+        run.published();
         Some(published.graph_commit_id)
     };
 
@@ -1082,7 +1109,7 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
 
     let staged = db
         .storage()
-        .stage_create_indices(ds, &work.specs)
+        .stage_create_indices(ds, &work.specs, &db.maintenance_budget())
         .await
         .map_err(|error| {
             error.with_context(format!(

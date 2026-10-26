@@ -31,20 +31,15 @@ use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 
 use super::*;
 use crate::dataset_index::is_full_text_index;
+use crate::db::maintenance::{MaintenanceBudget, MaintenanceOperation, MaintenanceRun};
 use crate::seams::{decide_seam, fail};
 
-/// How many datasets to optimize/cleanup concurrently. Each has separate
-/// Lance dataset so there is no shared state; the bound is there to avoid
-/// flooding the runtime and the S3 connection pool.
-const DEFAULT_MAINT_CONCURRENCY: usize = 8;
-
-fn maint_concurrency() -> usize {
-    std::env::var("OMNIGRAPH_MAINTENANCE_CONCURRENCY")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(DEFAULT_MAINT_CONCURRENCY)
-}
+/// How many tables optimize plans, and cleanup sweeps, at once. Planning
+/// reads manifests and index metadata and a sweep lists and deletes objects,
+/// so the bound is on concurrent requests, not on Lance's buffers; the work
+/// that rewrites a table or builds its indexes runs at the budget's unit
+/// concurrency instead ([`MaintenanceBudget::unit_concurrency`]).
+const MAINTENANCE_IO_FANOUT: usize = 8;
 
 /// Retention knobs for [`cleanup_all_datasets`]. At least one must be set or
 /// nothing is cleaned. If both are set, Lance applies them as AND (a manifest
@@ -225,6 +220,25 @@ pub async fn optimize_all_datasets(
         &omnigraph_policy::ResourceScope::Branch("main".to_string()),
         actor,
     )?;
+    let run = db
+        .enter_maintenance(MaintenanceOperation::Optimize, Some("main"))
+        .await?;
+    let budget = db.maintenance_budget();
+    optimize_in_lane(db, actor, &run, &budget)
+        .await
+        .map_err(|error| run.classify(error))
+}
+
+/// [`optimize_all_datasets`] holding the graph's maintenance lane. Its cancel
+/// points come before the run's publication and between its tables; a cancel
+/// drops the table work in flight, which leaves only detached commits no
+/// `__manifest` version names.
+async fn optimize_in_lane(
+    db: &Omnigraph,
+    actor: Option<&str>,
+    run: &MaintenanceRun,
+    budget: &MaintenanceBudget,
+) -> Result<Vec<DatasetOptimizeStats>> {
     let _export_exclusion = db.reserve_export_destructive_control()?;
     db.ensure_schema_state_valid().await?;
 
@@ -275,16 +289,21 @@ pub async fn optimize_all_datasets(
         })
         .collect::<Vec<_>>();
 
-    let concurrency = maint_concurrency().min(table_tasks.len()).max(1);
+    let concurrency = MAINTENANCE_IO_FANOUT.min(table_tasks.len()).max(1);
+    let options = budget.compaction_options();
 
-    let preparations: Vec<Result<OptimizePreparation>> = futures::stream::iter(table_tasks)
-        .map(|task| {
-            let catalog = std::sync::Arc::clone(&catalog);
-            async move { prepare_optimize_table(db, catalog.as_ref(), task).await }
-        })
-        .buffer_unordered(concurrency)
-        .collect()
-        .await;
+    let preparations: Vec<Result<OptimizePreparation>> = run
+        .unless_cancelled(
+            futures::stream::iter(table_tasks)
+                .map(|task| {
+                    let catalog = std::sync::Arc::clone(&catalog);
+                    let options = &options;
+                    async move { prepare_optimize_table(db, catalog.as_ref(), task, options).await }
+                })
+                .buffer_unordered(concurrency)
+                .collect(),
+        )
+        .await?;
 
     let mut prepared = Vec::new();
     let mut stats = Vec::new();
@@ -297,20 +316,30 @@ pub async fn optimize_all_datasets(
     prepared.sort_by(|left, right| left.table_key.cmp(&right.table_key));
 
     if !prepared.is_empty() {
-        let effect_concurrency = maint_concurrency().min(prepared.len()).max(1);
-        let effect_results: Vec<Result<OptimizeEffectOutcome>> = futures::stream::iter(prepared)
-            .map(|work| {
-                let catalog = std::sync::Arc::clone(&catalog);
-                async move { apply_optimize_table_effects(db, catalog.as_ref(), work).await }
-            })
-            .buffer_unordered(effect_concurrency)
-            .collect()
-            .await;
+        run.check()?;
+        run.staged();
+        let effect_concurrency = budget.unit_concurrency().min(prepared.len()).max(1);
+        let effect_results: Vec<Result<OptimizeEffectOutcome>> = run
+            .unless_cancelled(
+                futures::stream::iter(prepared)
+                    .map(|work| {
+                        let catalog = std::sync::Arc::clone(&catalog);
+                        async move {
+                            apply_optimize_table_effects(db, catalog.as_ref(), work, run, budget)
+                                .await
+                        }
+                    })
+                    .buffer_unordered(effect_concurrency)
+                    .collect(),
+            )
+            .await?;
         let mut outcomes = Vec::new();
         for result in effect_results {
             outcomes.push(result?);
         }
         fail(&OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT)?;
+        // The last cancel point: past it the batch publishes or fails.
+        run.check()?;
         let mut updates = Vec::new();
         let mut expected_versions = crate::db::manifest::ExpectedTableVersions::new();
         for outcome in &mut outcomes {
@@ -334,6 +363,7 @@ pub async fn optimize_all_datasets(
             let lineage = db
                 .new_lineage_intent_for_branch(None, actor, HistoryReleaseBytes::PRODUCTION)
                 .await?;
+            run.publishing();
             super::table_ops::commit_updates_on_branch_with_expected(
                 db,
                 None,
@@ -345,6 +375,7 @@ pub async fn optimize_all_datasets(
                 super::table_ops::Publication::Publish,
             )
             .await?;
+            run.published();
         }
         edge_tables_committed = edge_committed;
         stats.extend(outcomes.into_iter().map(|outcome| outcome.stat));
@@ -360,15 +391,33 @@ pub async fn optimize_all_datasets(
     drop(table_guards);
     drop(schema_permit);
 
+    // Removing stale automatic-cleanup configuration commits a `__manifest`
+    // version that changes no table pin and no graph lineage: an effect,
+    // never a publication.
+    run.staged();
     let mut all = stats.into_iter().map(Ok).collect::<Vec<Result<_>>>();
     all.push(clear_manifest_auto_cleanup(db).await);
 
-    if let Err(error) = persist_graph_index_artifact(db, &catalog, edge_tables_committed).await {
-        tracing::warn!(
+    // The artifact is derived and regenerable, so a cancel skips it and the
+    // run keeps what it published.
+    match run
+        .unless_cancelled(persist_graph_index_artifact(
+            db,
+            &catalog,
+            edge_tables_committed,
+        ))
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(
             target: "omnigraph::optimize",
             error = %error,
             "graph index artifact persist failed; traversals keep building in memory"
-        );
+        ),
+        Err(_) => tracing::info!(
+            target: "omnigraph::optimize",
+            "graph index artifact persist skipped: the maintenance run was cancelled"
+        ),
     }
 
     all.into_iter().collect()
@@ -451,6 +500,7 @@ async fn prepare_optimize_table(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
     task: OptimizeTableTask,
+    options: &CompactionOptions,
 ) -> Result<OptimizePreparation> {
     let snapshot = db
         .open_pinned_for_write(&task.full_path, &task.entry)
@@ -459,8 +509,7 @@ async fn prepare_optimize_table(
     // The same plan `stage_compaction` executes: a fragment still holding a
     // dropped property's values is compaction work even when Lance's planner
     // would leave the table alone.
-    let options = CompactionOptions::default();
-    let will_compact = TableStore::plan_table_compaction(snapshot.dataset(), &options)
+    let will_compact = TableStore::plan_table_compaction(snapshot.dataset(), options)
         .await?
         .num_tasks()
         > 0;
@@ -558,14 +607,20 @@ async fn apply_optimize_table_effects(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
     work: PreparedOptimizeTable,
+    run: &MaintenanceRun,
+    budget: &MaintenanceBudget,
 ) -> Result<OptimizeEffectOutcome> {
     let table_key = work.table_key;
     let full_path = work.full_path;
     let base = work.initial_snapshot;
     let witness = work.witness;
     let declared_full_text = super::table_ops::declared_full_text_columns(catalog, &table_key);
+    // A cancel point between tables, and below one between the links of a
+    // table's chain: every link is a detached commit no `__manifest` version
+    // names until the batch publishes.
+    run.check()?;
     fail(&OPTIMIZE_BEFORE_COMPACT)?;
-    let options = CompactionOptions::default();
+    let options = budget.compaction_options();
     let mut chain = Vec::new();
     let mut tip = base.clone();
     let mut tip_identity = None;
@@ -581,6 +636,7 @@ async fn apply_optimize_table_effects(
         tip = rewrite;
         tip_identity = Some(identity);
         fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
+        run.check()?;
     }
     // Fold every index whose coverage lags (appended fragments, or a vector
     // index that keeps row addresses and dropped the compacted fragments)
@@ -597,6 +653,7 @@ async fn apply_optimize_table_effects(
         tip = folded;
         tip_identity = Some(identity);
         fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
+        run.check()?;
     }
     let mut index_work =
         super::table_ops::plan_index_work_on_dataset_for_catalog(db, catalog, &table_key, &tip)
@@ -613,7 +670,7 @@ async fn apply_optimize_table_effects(
     if !index_work.specs.is_empty() {
         let staged = db
             .storage()
-            .stage_create_indices(&tip, &index_work.specs)
+            .stage_create_indices(&tip, &index_work.specs, budget)
             .await
             .map_err(|error| {
                 error.with_context(format!(
@@ -631,6 +688,7 @@ async fn apply_optimize_table_effects(
         tip = indexed;
         tip_identity = Some(identity);
         fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
+        run.check()?;
     }
     let Some(identity) = tip_identity else {
         let mut stat = DatasetOptimizeStats::compacted(table_key, &metrics, false);
@@ -765,7 +823,22 @@ pub async fn cleanup_all_datasets(
             "cleanup requires at least one of keep_versions or older_than",
         ));
     }
+    let run = db
+        .enter_maintenance(MaintenanceOperation::Cleanup, None)
+        .await?;
+    cleanup_in_lane(db, options, &run)
+        .await
+        .map_err(|error| run.classify(error))
+}
 
+/// [`cleanup_all_datasets`] holding the graph's maintenance lane. Cleanup
+/// publishes nothing; a cancel stops it before its first deletion, between
+/// tables and before each later step, never inside a deletion.
+async fn cleanup_in_lane(
+    db: &Omnigraph,
+    options: CleanupPolicyOptions,
+    run: &MaintenanceRun,
+) -> Result<Vec<DatasetCleanupStats>> {
     let _export_exclusion = db.reserve_export_destructive_control()?;
     db.ensure_schema_state_valid().await?;
     fail(&CLEANUP_PRE_GATES)?;
@@ -796,7 +869,7 @@ pub async fn cleanup_all_datasets(
 
     db.revalidate_write_txn(&authority_txn).await?;
 
-    cleanup_detached_only(db, &options, &graph_branches, &table_tasks).await
+    cleanup_detached_only(db, &options, &graph_branches, &table_tasks, run).await
 }
 
 /// The detached-only `cleanup` (RFC "Detached-only tables"): plan the collector
@@ -807,12 +880,24 @@ async fn cleanup_detached_only(
     options: &CleanupPolicyOptions,
     graph_branches: &[Option<String>],
     table_tasks: &[(String, String)],
+    run: &MaintenanceRun,
 ) -> Result<Vec<DatasetCleanupStats>> {
     let before_timestamp = options
         .older_than
         .map(|duration| crate::dst_clock::now_utc() - duration);
-    let native_plan = prepare_native_fork_reconciliation(db, before_timestamp).await?;
-    let plan = super::collector::plan_collection(db, options, graph_branches).await?;
+    // Planning reads and deletes nothing, so a cancel drops it where it stands.
+    let native_plan = run
+        .unless_cancelled(prepare_native_fork_reconciliation(db, before_timestamp))
+        .await??;
+    let plan = run
+        .unless_cancelled(super::collector::plan_collection(
+            db,
+            options,
+            graph_branches,
+        ))
+        .await??;
+    run.check()?;
+    run.staged();
     let mut table_tasks = table_tasks.to_vec();
     let mut scheduled_paths = table_tasks
         .iter()
@@ -823,10 +908,15 @@ async fn cleanup_detached_only(
             table_tasks.push((planned.table_key.clone(), planned.full_path.clone()));
         }
     }
-    let concurrency = maint_concurrency().min(table_tasks.len()).max(1);
+    let concurrency = MAINTENANCE_IO_FANOUT.min(table_tasks.len()).max(1);
     let plan = &plan;
     let results: Vec<DatasetCleanupStats> = futures::stream::iter(table_tasks)
         .map(|(table_key, full_path)| async move {
+            // A cancel point between tables: a sweep that started finishes,
+            // so no deletion is abandoned mid-request.
+            if run.is_cancelled() {
+                return None;
+            }
             let summary = plan.row_summary(&full_path);
             let mut swept = super::collector::SweepStats::default();
             let outcome: Result<()> = async {
@@ -862,7 +952,7 @@ async fn cleanup_detached_only(
                 );
                 err.to_string()
             });
-            DatasetCleanupStats {
+            Some(DatasetCleanupStats {
                 type_key: table_key,
                 bytes_removed: swept.bytes_removed,
                 old_versions_removed: swept.manifests_removed,
@@ -871,11 +961,13 @@ async fn cleanup_detached_only(
                 unpublished_manifests: summary.unpublished_manifests,
                 unpublished_bytes: summary.unpublished_bytes,
                 foreign_versions: summary.foreign_versions,
-            }
+            })
         })
         .buffer_unordered(concurrency)
+        .filter_map(std::future::ready)
         .collect()
         .await;
+    run.check()?;
     let unattached_release = super::collector::unattached_release_order(
         &plan.expired_unattached_tags,
         &plan.retained_unattached_tags,
@@ -897,11 +989,13 @@ async fn cleanup_detached_only(
         )
         .await?;
         for name in &plan.expired_unpublished_tags {
+            run.check()?;
             crate::db::manifest::unpublished::release_unpublished_tag(manifest.dataset(), name)
                 .await?;
         }
         let mut unattached_tags_released: u64 = 0;
         for record in &unattached_release {
+            run.check()?;
             crate::db::manifest::unattached::release_unattached_tag_confirmed(
                 manifest.dataset(),
                 &record.name,
@@ -918,6 +1012,7 @@ async fn cleanup_detached_only(
             "cleanup released the expired unattached branch tags"
         );
     }
+    run.check()?;
     let reconciled = reconcile_frozen_native_forks(db, native_plan, plan).await?;
     if !reconciled.reclaimed.is_empty() {
         tracing::info!(

@@ -126,6 +126,13 @@ pub(super) async fn repair_report(db: &Omnigraph, actor: Option<&str>) -> Result
         &omnigraph_policy::ResourceScope::Branch("main".to_string()),
         actor,
     )?;
+    // The report only reads, so every failure is one before any effect.
+    report_under_gates(db)
+        .await
+        .map_err(OmniError::before_effect_if_opaque)
+}
+
+async fn report_under_gates(db: &Omnigraph) -> Result<RepairStats> {
     db.ensure_schema_state_valid().await?;
 
     // Bind the whole report to one accepted view, revalidated after the

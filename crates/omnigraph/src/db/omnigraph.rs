@@ -469,6 +469,9 @@ pub struct Omnigraph {
     /// When set, the embedding cell builds its client from this instead of
     /// `EmbeddingClient::from_env()`; `None` keeps the env fallback.
     embedding_config: Option<Arc<crate::embedding::EmbeddingConfig>>,
+    /// The maintenance budget installed with [`Omnigraph::with_maintenance_budget`];
+    /// `None` reads `MaintenanceBudget::from_env` at the start of each run.
+    maintenance_budget: Option<crate::db::maintenance::MaintenanceBudget>,
 }
 
 /// Whether open checks write capability and refuses legacy recovery sidecars.
@@ -743,6 +746,7 @@ impl Omnigraph {
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
             embedding_config: None,
+            maintenance_budget: None,
         })
     }
 
@@ -936,6 +940,7 @@ impl Omnigraph {
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
             embedding_config: None,
+            maintenance_budget: None,
         };
         // The returned handle now owns one coherent schema source/catalog view.
         // Release only after both have been installed in the new object.
@@ -1060,6 +1065,53 @@ impl Omnigraph {
         self
     }
 
+    /// Install the maintenance budget this handle's maintenance runs use, in
+    /// place of the one [`MaintenanceBudget::from_env`] reads at the start of
+    /// each run. Builder-style, like [`Omnigraph::with_embedding_config`].
+    ///
+    /// [`MaintenanceBudget::from_env`]: crate::db::MaintenanceBudget::from_env
+    pub fn with_maintenance_budget(
+        mut self,
+        budget: crate::db::maintenance::MaintenanceBudget,
+    ) -> Self {
+        self.maintenance_budget = Some(budget);
+        self
+    }
+
+    /// The budget a maintenance run starting now uses.
+    pub(crate) fn maintenance_budget(&self) -> crate::db::maintenance::MaintenanceBudget {
+        self.maintenance_budget
+            .unwrap_or_else(crate::db::maintenance::MaintenanceBudget::from_env)
+    }
+
+    /// Wait for this graph's maintenance lane and hold it for one run of
+    /// `operation` on `branch` (`None` for a run that covers every branch).
+    pub(crate) async fn enter_maintenance(
+        &self,
+        operation: crate::db::maintenance::MaintenanceOperation,
+        branch: Option<&str>,
+    ) -> Result<crate::db::maintenance::MaintenanceRun> {
+        self.write_queue
+            .maintenance_lane()
+            .enter(operation, branch)
+            .await
+    }
+
+    /// Cancel the maintenance run this graph's lane holds in this process,
+    /// and every run waiting for it. Each stops at its next cancel point
+    /// with [`OmniError::MaintenanceCancelled`] and the completion evidence
+    /// of where it stopped; a publication already in progress finishes.
+    /// Runs that start after the call are not affected. Every handle on the
+    /// same root shares the lane.
+    pub fn cancel_maintenance(&self) {
+        self.write_queue.maintenance_lane().cancel();
+    }
+
+    /// The maintenance run this graph's lane holds in this process, if any.
+    pub fn maintenance_in_progress(&self) -> Option<crate::db::maintenance::MaintenanceInProgress> {
+        self.write_queue.maintenance_lane().in_progress()
+    }
+
     /// Prepare an immutable runtime view over this handle's existing owner.
     ///
     /// No storage is opened or written. The coordinator, schema authority,
@@ -1093,6 +1145,7 @@ impl Omnigraph {
             policy,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
             embedding_config,
+            maintenance_budget: self.maintenance_budget,
         })
     }
 
