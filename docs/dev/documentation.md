@@ -307,15 +307,18 @@ Every release runs these steps in order.
 2. Smoke-test the candidate: install the edge build of the commit to be
    released ([release channels](../user/install.md#release-channels)) and run
    the [quickstart](../user/quickstart.md) against a fresh local graph.
-3. Open the release-prep pull request. Read `preview --target HEAD` as one page
+3. Open the release-prep pull request. Run
+   `python3 scripts/release_notes.py preview --working-tree`, read the page
    against the docs at that commit, fix each stale note in its own file, and
    merge notes that repeat one upgrade step.
 4. Add `changelog.d/<version>.md` to that pull request: the intro, the why
    when anything breaks, the highlights, the contributors and, if useful, the
-   note order. The highlights may come from another author in a later commit.
+   note order. An agent can draft the highlights from the cycle's notes; run
+   `preview` again and read the rendered page.
 5. Review the pull request against the rendered preview, not only the
    files.
-6. After the review, run `snapshot --target HEAD --date <release date>`,
+6. After the review, run
+   `python3 scripts/release_notes.py snapshot --target HEAD --date <release date>`,
    commit the snapshot and the index to the same pull request, and merge it.
 7. Tag the merged commit `<version>` and push the tag. Tag CI audits it and
    `release.yml` publishes the archives and the GitHub release from the
