@@ -207,7 +207,7 @@ async fn init_search_db(dir: &tempfile::TempDir) -> Session {
     db.load_jsonl(SEARCH_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     db
 }
 
@@ -226,7 +226,7 @@ async fn init_mock_embedding_search_db(dir: &tempfile::TempDir) -> Session {
     db.load_jsonl(&mock_embedding_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     db
 }
 
@@ -236,7 +236,7 @@ async fn init_model_recorded_search_db(dir: &tempfile::TempDir) -> Session {
     db.load_jsonl(&mock_embedding_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     db
 }
 
@@ -561,7 +561,7 @@ query delete_middle() {
 "#;
     let db = session(Omnigraph::init(uri, schema).await.unwrap());
     db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     helpers::forge_linear_head_from_pin(&db, "main", "node:Doc", 0).await;
     {
         use lance::index::DatasetIndexExt;
@@ -1225,7 +1225,7 @@ query nearest_all($q: Vector(4)) {
     let uri = dir.path().to_str().unwrap();
     let db = session(Omnigraph::init(uri, schema).await.unwrap());
     db.load_jsonl(&rows, LoadMode::Overwrite).await.unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     let db = with_setting(&db, "ann_nprobes", "100000");
 
     use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
@@ -1306,7 +1306,7 @@ query nearest_all($q: Vector(4)) {
     let uri = dir.path().to_str().unwrap();
     let db = session(Omnigraph::init(uri, schema).await.unwrap());
     db.load_jsonl(&rows, LoadMode::Overwrite).await.unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
 
     let probes = QueryIoProbes::default();
     let result = with_query_io_probes(probes.clone(), async {
@@ -1413,7 +1413,7 @@ async fn issue_567_line_docs(uri: &str, rows: usize, edge_every: Option<usize>) 
     db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     db
 }
 
@@ -2069,7 +2069,7 @@ async fn injected_embedding_config_is_used_instead_of_env() {
     db.load_jsonl(&mock_embedding_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
 
     let result = query_main(
         &db,
@@ -2160,7 +2160,7 @@ async fn bm25_ordered_aggregate_counts_all_matches_not_the_capped_scan() {
     db.load_jsonl(&underfill_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     let db = db;
 
     use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
@@ -2209,7 +2209,7 @@ async fn rrf_arms_scan_uncapped_in_one_pass() {
     db.load_jsonl(&underfill_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
 
     use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
     // This test pins the POSTFILTER plan's invariants (uncapped one-pass
@@ -2281,7 +2281,7 @@ query uncapped_all($q: String) {
     db.load_jsonl(&underfill_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     // Appended AFTER the index build: their fragment is uncovered, and their
     // term frequency (40 > the seed's max 20) puts them at the top of any
     // correct ranking.
@@ -2426,7 +2426,7 @@ async fn mutation_with_deferred_index_coverage_remains_searchable() {
     // Ordinary optimize must preserve certified postings, not silently replace
     // them with an uncertified incremental fold. Both old and tail rows remain
     // searchable after data compaction and unrelated index maintenance.
-    db.optimize().await.unwrap();
+    db.optimize_as(None).await.unwrap();
     for (term, slug) in [("Quasar", "quasar-notes"), ("Learning", "ml-intro")] {
         let result = query_main(&db, SEARCH_QUERIES, "text_search", &params(&[("$q", term)]))
             .await
@@ -2587,7 +2587,10 @@ async fn uncertified_full_text_refuses_all_search_routes_but_not_ordinary_reads(
         Err(OmniError::FullTextIndexRebuildRequired { .. })
     ));
 
-    let rebuilt = db.rebuild_full_text_indices_on("main").await.unwrap();
+    let rebuilt = db
+        .rebuild_full_text_indices_on_as("main", None)
+        .await
+        .unwrap();
     assert!(!rebuilt.rebuilt_indexes.is_empty());
     assert!(
         query_main(
@@ -2690,7 +2693,7 @@ node Doc {
         0,
         "load publishes exact data effects and leaves physical indexes pending"
     );
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
 
     let ds = snapshot_main(&db)
         .await
@@ -2788,7 +2791,7 @@ async fn full_text_analyzer_holds_after_first_rows_and_overwrites_issue_904() {
         .unwrap();
     assert_eq!(hits("main", "docs").await, ["d1", "d2"], "first rows");
 
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     db.load("main", &rows("Doc", "d"), LoadMode::Overwrite)
         .await
         .unwrap();
@@ -2880,7 +2883,7 @@ async fn a_full_text_index_with_no_segment_refuses_the_call_issue_747() {
             .unwrap_err(),
     );
 
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     assert_eq!(
         first_column_sorted(
             &query_branch(&db, "main", ANALYZER_QUERIES, "docs", &deep)

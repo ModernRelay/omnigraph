@@ -308,7 +308,7 @@ query insert_project($name: String) {
     );
     let detached_before_indices = helpers::collector::detached_versions(&project_uri).await;
     stale_handle
-        .ensure_indices_on("source")
+        .ensure_indices_on_as("source", None)
         .await
         .expect("index planning must use the same token-bound post-apply catalog");
     let project_after_indices = project_published(
@@ -372,7 +372,7 @@ async fn stale_handle_branch_delete_gates_tables_added_by_schema_apply() {
 
     let index_handle = Arc::clone(&index_reconciler);
     let mut index_task =
-        tokio::spawn(async move { index_handle.ensure_indices_on("target").await });
+        tokio::spawn(async move { index_handle.ensure_indices_on_as("target", None).await });
     let index_blocked =
         tokio::time::timeout(std::time::Duration::from_millis(250), &mut index_task)
             .await
@@ -1821,7 +1821,7 @@ node Tag {
     .collect::<Vec<_>>()
     .join("\n");
     db.load_jsonl(&rows, LoadMode::Overwrite).await.unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
 
     let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     let before_snapshot = db.resolve_snapshot("main").await.unwrap();
@@ -1937,7 +1937,7 @@ node Tag {
     }
     // Reconciliation builds from the desired declarations, so nothing indexes
     // a dropped column again.
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     for (table, dropped_id) in dropped_ids {
         assert!(
             coverage(&db, table)
@@ -2124,7 +2124,7 @@ query strong($min: I32) {
         "an update carries the untouched Blob of an evolved row"
     );
 
-    db.optimize().await.unwrap();
+    db.optimize_as(None).await.unwrap();
     assert_eq!(
         read_managed_blob_bytes(
             &db,
@@ -2479,7 +2479,7 @@ async fn apply_schema_pure_type_rename_preserves_identity_path_and_version() {
     );
     let db = helpers::session(Omnigraph::init(uri, &initial).await.unwrap());
     db.load_jsonl(&data, LoadMode::Overwrite).await.unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     let before_snapshot_id = db.resolve_snapshot("main").await.unwrap();
     let before_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     let before_version = before_snapshot.graph_manifest_version();
@@ -2675,10 +2675,13 @@ edge WorksAt: Human -> Company
 /// prunes the `__manifest` version naming it.
 async fn reclaim_dropped_history(db: &Session) {
     let stats = db
-        .cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        })
+        .cleanup_as(
+            omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            },
+            None,
+        )
         .await
         .unwrap();
     for row in &stats {
@@ -3110,7 +3113,7 @@ async fn apply_schema_defers_vector_index_on_empty_table() {
     db.load_jsonl(r#"{"type":"Doc","data":{"slug":"d1","body":"hello","embedding":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]}}"#, LoadMode::Merge, )
     .await
     .expect("loading a Doc with an embedding must succeed");
-    db.ensure_indices()
+    db.ensure_indices_as(None)
         .await
         .expect("the deferred vector index must build once the table has a trainable vector");
 }
@@ -3261,7 +3264,7 @@ async fn full_text_analyzer_survives_schema_evolution_issue_904() {
     assert_eq!(search("summary").await, ["d3"]);
 
     // The reconciler builds the postings over the declarations.
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     assert_eq!(segments("text").await, [Some(2)]);
     assert_eq!(search("text").await, ["d1", "d2"]);
     assert_eq!(search("summary").await, ["d3"]);

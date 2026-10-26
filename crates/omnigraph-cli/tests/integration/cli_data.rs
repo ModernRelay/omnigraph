@@ -1211,7 +1211,8 @@ fn repair_json_reports_noop_on_clean_graph() {
 
     assert!(payload.get("confirm").is_none());
     assert!(payload.get("force").is_none());
-    assert_eq!(payload["graph_manifest_version"], Value::Null);
+    // The report publishes nothing, so it names no graph manifest version.
+    assert!(payload.get("graph_manifest_version").is_none());
     assert!(payload.get("manifest_version").is_none());
     assert!(payload.get("tables").is_none());
     let datasets = payload["datasets"].as_array().unwrap();
@@ -1282,7 +1283,7 @@ fn repair_reports_foreign_drift_and_refuses_removed_flags() {
             .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(payload["graph_manifest_version"], Value::Null);
+    assert!(payload.get("graph_manifest_version").is_none());
     let person = payload["datasets"]
         .as_array()
         .unwrap()

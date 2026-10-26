@@ -21,6 +21,14 @@ accepts local-file direct targets only; cloud-direct maintenance is not exposed
 by this CLI. Engine/server cloud support does not change that client boundary.
 See [operator configuration](../cli/targets.md#transport-and-capability-boundaries).
 
+Each command acts as the operator configuration's `operator.actor`;
+`rebuild-full-text-indexes` also accepts `--as` in its place. A commit the
+command publishes records that actor. Direct CLI access, including `--target`,
+does not load the server's Cedar policy; storage permissions are its trust
+boundary. An embedded host that installs a policy checker enforces the
+[policy actions](policy.md#actions) before any effect: `maintain` for optimize,
+index builds, the full-text rebuild and repair, and `reclaim` for cleanup.
+
 ## Optimize
 
 ```bash
@@ -118,10 +126,9 @@ Success means the selected branch's planned rebuild was published, or an explici
 no-op with an empty index list, null commit, and empty `warnings` array. The default
 branch is `main`.
 
-`--as` supplies actor attribution for this command. Direct CLI access, including
-`--target`, does not load the server's Cedar policy; storage permissions are its
-trust boundary. An embedded host that installs a policy checker also enforces
-the Change permission before rebuilding.
+`--as` supplies actor attribution for this command. An embedded host that
+installs a policy checker admits the rebuild under `maintain` or `change` on the
+selected branch; a later release admits it under `maintain` only.
 
 Other branches and historical snapshots are not rewritten. Rebuild every live
 branch that needs full-text search; restoring an older snapshot may require

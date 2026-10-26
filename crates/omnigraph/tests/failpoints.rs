@@ -322,7 +322,7 @@ fn rfc023_external_writer_process() {
                 }
                 "collector_advance_merge_source" => {
                     db.load("source", &payload, mode).await.unwrap();
-                    let rows = db.cleanup(keep_one()).await.unwrap();
+                    let rows = db.cleanup_as(keep_one(), None).await.unwrap();
                     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
                 }
                 "collector_retired" => {
@@ -514,7 +514,7 @@ async fn branch_start_refuses_a_commit_an_interrupted_cleanup_emptied() {
 
     {
         let _fp = catalog::CLEANUP_SWEEP_PRE_MANIFEST_DELETE.fire_always();
-        let _ = db.cleanup(keep_one()).await;
+        let _ = db.cleanup_as(keep_one(), None).await;
     }
     assert!(
         detached_versions(&person_uri).await.contains(&eve_person),
@@ -546,7 +546,7 @@ async fn branch_start_refuses_a_commit_an_interrupted_cleanup_emptied() {
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
     assert_eq!(version_main(&db).await.unwrap(), main_version);
 
-    let stats = db.cleanup(keep_one()).await.unwrap();
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
     let person = stats
         .iter()
         .find(|row| row.type_key == "node:Person")
@@ -623,7 +623,7 @@ async fn branch_delete_cleanup_failure_converges_on_retry() {
     );
     {
         let _fp = catalog::CLEANUP_TABLE_GC.fire_always();
-        main.cleanup(keep_one()).await.unwrap();
+        main.cleanup_as(keep_one(), None).await.unwrap();
     }
     assert!(
         detached_versions(&person_uri)
@@ -631,7 +631,7 @@ async fn branch_delete_cleanup_failure_converges_on_retry() {
             .contains(&former_staging),
         "failed cleanup preserves the deleted branch's staging"
     );
-    main.cleanup(keep_one()).await.unwrap();
+    main.cleanup_as(keep_one(), None).await.unwrap();
     assert!(
         !detached_versions(&person_uri)
             .await
@@ -723,7 +723,7 @@ async fn recreate_over_a_deleted_branch_writes_without_cleanup() {
         "writes do not collect the former staging"
     );
     assert!(remaining.contains(&second_staging));
-    main.cleanup(keep_one()).await.unwrap();
+    main.cleanup_as(keep_one(), None).await.unwrap();
     let remaining = detached_versions(&person_uri).await;
     assert!(!remaining.contains(&first_staging));
     assert!(
@@ -780,7 +780,7 @@ async fn branch_delete_acknowledges_with_staging_awaiting_cleanup() {
             .contains(&former_staging),
         "delete and reopen defer collection of the branch's staging"
     );
-    main.cleanup(keep_one()).await.unwrap();
+    main.cleanup_as(keep_one(), None).await.unwrap();
     assert!(
         !detached_versions(&person_uri)
             .await
@@ -850,7 +850,7 @@ async fn branch_recreate_completes_while_old_staging_awaits_cleanup() {
     let remaining = detached_versions(&person_uri).await;
     assert!(remaining.contains(&first_staging));
     assert!(remaining.contains(&second_staging));
-    main.cleanup(keep_one()).await.unwrap();
+    main.cleanup_as(keep_one(), None).await.unwrap();
     let remaining = detached_versions(&person_uri).await;
     assert!(!remaining.contains(&first_staging));
     assert!(remaining.contains(&second_staging));
@@ -923,10 +923,13 @@ async fn branch_write_ignores_unavailable_cleanup_classifier() {
         helpers::count_rows_branch(&db, "feature", "node:Person").await,
         5
     );
-    db.cleanup(omnigraph::db::CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    db.cleanup_as(
+        omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
     let branches = lance::Dataset::open(&person_uri)
@@ -970,10 +973,13 @@ async fn cleanup_isolates_single_table_failure() {
     // One table's version GC fails once; the sweep must isolate it.
     let _fp = catalog::CLEANUP_TABLE_GC.fire_once_at(1);
     let stats = db
-        .cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        })
+        .cleanup_as(
+            omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            },
+            None,
+        )
         .await
         .expect("a single table's GC failure must not abort cleanup");
 
@@ -1024,10 +1030,13 @@ async fn cleanup_isolates_reconcile_failure() {
     // not abort.
     {
         let _fp = catalog::CLEANUP_RECONCILE_FORK.fire_once_at(1);
-        db.cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        })
+        db.cleanup_as(
+            omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            },
+            None,
+        )
         .await
         .expect("a reconcile force-delete failure must not abort cleanup");
     }
@@ -1044,10 +1053,13 @@ async fn cleanup_isolates_reconcile_failure() {
         );
     }
     // A second cleanup with no injected failure converges.
-    db.cleanup(omnigraph::db::CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    db.cleanup_as(
+        omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
     {
@@ -1096,10 +1108,13 @@ async fn reconcile_skips_fork_when_fresh_recheck_is_unavailable_then_converges()
     // branch is live but unreadable) → cleanup must SKIP it, not delete.
     {
         let _fp = catalog::CLASSIFY_FRESH_READ.fire_always();
-        db.cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        })
+        db.cleanup_as(
+            omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            },
+            None,
+        )
         .await
         .unwrap();
         let ds = lance::Dataset::open(&person_uri).await.unwrap();
@@ -1114,10 +1129,13 @@ async fn reconcile_skips_fork_when_fresh_recheck_is_unavailable_then_converges()
     }
 
     // Read succeeds now → cleanup confirms the orphan and reclaims it (converges).
-    db.cleanup(omnigraph::db::CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    db.cleanup_as(
+        omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
     {
@@ -2666,7 +2684,7 @@ async fn merge_target_delete_waits_and_source_delete_does_not_issue_643() {
                 .unwrap()
                 .unwrap_or_else(|error| panic!("deleting the target after the merge: {error}"));
         } else {
-            let rows = db.cleanup(keep_one()).await.unwrap();
+            let rows = db.cleanup_as(keep_one(), None).await.unwrap();
             assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
             assert_eq!(
                 helpers::count_rows_branch(&db, "t", "node:Person").await,
@@ -3059,7 +3077,7 @@ async fn cancelled_merge_leaves_the_target_whole_issue_643() {
         )
         .await
         .unwrap_or_else(|error| panic!("{seam}: a later write on the target: {error}"));
-        let rows = db.cleanup(keep_one()).await.unwrap();
+        let rows = db.cleanup_as(keep_one(), None).await.unwrap();
         assert!(
             rows.iter().all(|row| row.error.is_none()),
             "{seam}: {rows:?}"
@@ -3705,7 +3723,7 @@ async fn ensure_indices_stage_btree_failure_leaves_existing_tables_writable() {
         &catalog::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE,
     );
     let writer_a_db = std::sync::Arc::clone(&db);
-    let writer_a = tokio::spawn(async move { writer_a_db.ensure_indices().await });
+    let writer_a = tokio::spawn(async move { writer_a_db.ensure_indices_as(None).await });
     rendezvous.wait_until_reached().await;
 
     db.load(
@@ -4043,15 +4061,9 @@ async fn schema_apply_retry_preserves_the_original_empty_create() {
         assert_eq!(entry.published_dataset_version, if changed { 2 } else { 1 });
         assert_eq!(entry.version_metadata.staged_version().is_some(), changed);
         assert_eq!(entry.version_metadata.last_linear_version(), Some(1));
-        recovered
-            .repair(omnigraph::db::RepairOptions {
-                confirm: true,
-                force: false,
-            })
-            .await
-            .unwrap();
-        recovered.ensure_indices().await.unwrap();
-        let cleaned = recovered.cleanup(keep_one()).await.unwrap();
+        recovered.repair_report_as(None).await.unwrap();
+        recovered.ensure_indices_as(None).await.unwrap();
+        let cleaned = recovered.cleanup_as(keep_one(), None).await.unwrap();
         assert!(cleaned.iter().all(|row| row.error.is_none()), "{cleaned:?}");
         drop(recovered);
         let reopened = helpers::session(Omnigraph::open(&uri).await.unwrap());
@@ -4475,7 +4487,7 @@ async fn optimize_pre_publish_failure_leaves_no_residue() {
         .version;
     {
         let _failpoint = catalog::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
-        let err = db.optimize().await.unwrap_err();
+        let err = db.optimize_as(None).await.unwrap_err();
         assert!(
             err.to_string().contains(
                 "injected failpoint triggered: optimize.post_phase_b_pre_manifest_commit"
@@ -4502,7 +4514,7 @@ async fn optimize_pre_publish_failure_leaves_no_residue() {
     assert_eq!(helpers::count_rows(&db, "node:Person").await, 4);
     assert_eq!(helpers::count_rows(&db, "node:Company").await, 4);
     let stats = db
-        .optimize()
+        .optimize_as(None)
         .await
         .expect("the retry re-plans from the pins");
     assert!(
@@ -4533,7 +4545,7 @@ async fn optimize_lost_publish_acknowledgement_leaves_published_detached_pins() 
         let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
         let before = person_head_and_published(&db, "main").await;
         let _failpoint = catalog::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT.fire_once_at(1);
-        db.optimize()
+        db.optimize_as(None)
             .await
             .expect_err("a lost publish acknowledgement surfaces as an error");
         before
@@ -4549,7 +4561,7 @@ async fn optimize_lost_publish_acknowledgement_leaves_published_detached_pins() 
         before.1
     );
     assert_person_pin_detached(&recovered, "main", before.0).await;
-    let stats = recovered.optimize().await.unwrap();
+    let stats = recovered.optimize_as(None).await.unwrap();
     assert!(
         stats
             .iter()
@@ -4585,7 +4597,7 @@ node Embedding {
     )
     .await
     .unwrap();
-    let pending = db.ensure_indices().await.unwrap();
+    let pending = db.ensure_indices_as(None).await.unwrap();
     assert!(
         pending
             .iter()
@@ -4598,7 +4610,7 @@ node Embedding {
     )
     .await
     .unwrap();
-    db.optimize().await.unwrap();
+    db.optimize_as(None).await.unwrap();
     let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     let embedding = snapshot.open_dataset("node:Embedding").await.unwrap();
     assert!(embedding.has_unindexed_fragments().await.unwrap());
@@ -4635,7 +4647,7 @@ node Embedding {
         .version;
     {
         let _failpoint = catalog::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_once_at(1);
-        let error = db.optimize().await.unwrap_err();
+        let error = db.optimize_as(None).await.unwrap_err();
         assert!(
             !matches!(error, OmniError::RecoveryRequired { .. }),
             "{error}"
@@ -4663,7 +4675,7 @@ node Embedding {
     );
     drop(db);
     let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
-    let stats = db.optimize().await.unwrap();
+    let stats = db.optimize_as(None).await.unwrap();
     let work = stats
         .iter()
         .find(|stat| stat.type_key == "node:Work")
@@ -4724,7 +4736,7 @@ async fn optimize_partial_table_effect_leaves_no_residue() {
         .version()
         .version;
     let _failpoint = catalog::OPTIMIZE_POST_TABLE_EFFECT.fire_once_at(1);
-    let error = db.optimize().await.unwrap_err();
+    let error = db.optimize_as(None).await.unwrap_err();
     assert!(
         !matches!(error, OmniError::RecoveryRequired { .. }),
         "a partial batch before publication needs no recovery: {error}"
@@ -4768,7 +4780,7 @@ async fn optimize_partial_table_effect_leaves_no_residue() {
         recovered.list_commits(Some("main")).await.unwrap().len(),
         commits_before
     );
-    let stats = recovered.optimize().await.unwrap();
+    let stats = recovered.optimize_as(None).await.unwrap();
     assert_eq!(
         stats
             .iter()
@@ -4816,7 +4828,7 @@ async fn optimize_refuses_when_graph_authority_moves_before_its_gates() {
         &catalog::OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES,
     );
     let optimize_task_db = std::sync::Arc::clone(&optimize_db);
-    let optimize = tokio::spawn(async move { optimize_task_db.optimize().await });
+    let optimize = tokio::spawn(async move { optimize_task_db.optimize_as(None).await });
     rendezvous.wait_until_reached().await;
 
     // Advance the graph head underneath it with an ordinary committed write, so
@@ -4912,7 +4924,7 @@ async fn optimize_holds_main_gate_through_disjoint_table_effects() {
     let uri_opt = uri.clone();
     let optimize = tokio::spawn(async move {
         let db = helpers::session(Omnigraph::open(&uri_opt).await.unwrap());
-        db.optimize().await
+        db.optimize_as(None).await
     });
     rendezvous.wait_until_reached().await;
 
@@ -4956,7 +4968,7 @@ async fn optimize_holds_main_gate_through_disjoint_table_effects() {
         1,
         "queued table-disjoint Company insert must persist",
     );
-    db.optimize()
+    db.optimize_as(None)
         .await
         .expect("graph must remain healthy / re-optimizable");
 }
@@ -4996,7 +5008,7 @@ async fn optimize_serializes_concurrent_delete_across_handles() {
     let uri_opt = uri.clone();
     let optimize = tokio::spawn(async move {
         let db = helpers::session(Omnigraph::open(&uri_opt).await.unwrap());
-        db.optimize().await
+        db.optimize_as(None).await
     });
     rendezvous.wait_until_reached().await;
 
@@ -5056,7 +5068,7 @@ async fn optimize_serializes_concurrent_delete_across_handles() {
         3,
         "the concurrent delete must persist (alice removed)",
     );
-    db.optimize()
+    db.optimize_as(None)
         .await
         .expect("graph must remain healthy / re-optimizable");
 }
@@ -5410,7 +5422,7 @@ async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_neede
         )
         .await
         .unwrap();
-        db.ensure_indices().await.unwrap();
+        db.ensure_indices_as(None).await.unwrap();
     }
 
     // Setup: trigger the failpoint. Steady-state ensure_indices
@@ -5420,7 +5432,7 @@ async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_neede
     {
         let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
         let _failpoint = catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
-        let err = db.ensure_indices().await.unwrap_err();
+        let err = db.ensure_indices_as(None).await.unwrap_err();
         assert!(
             err.to_string().contains(
                 "injected failpoint triggered: ensure_indices.post_phase_b_pre_manifest_commit"
@@ -7337,7 +7349,7 @@ async fn ensure_indices_failure_before_publish_leaves_no_residue() {
     let version = helpers::version_main(&db).await.unwrap();
     {
         let _failpoint = catalog::ENSURE_INDICES_POST_TABLE_EFFECT.fire_always();
-        let err = db.ensure_indices().await.unwrap_err();
+        let err = db.ensure_indices_as(None).await.unwrap_err();
         assert!(
             err.to_string()
                 .contains("injected failpoint triggered: ensure_indices.post_table_effect"),
@@ -7348,7 +7360,7 @@ async fn ensure_indices_failure_before_publish_leaves_no_residue() {
     assert_eq!(person_head_and_published(&db, "main").await, before);
     assert_eq!(helpers::version_main(&db).await.unwrap(), version);
 
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     assert_person_pin_detached(&db, "main", before.0).await;
     assert_eq!(
         person_head_and_published(&db, "main").await.1,
@@ -7409,7 +7421,7 @@ async fn full_text_rebuild_on_a_branch_stages_on_the_inherited_table() {
     db.load_jsonl(SEARCH_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     db.branch_create("rebuild").await.unwrap();
     let main_before = doc_head_and_published(&db, "main").await;
     let main_entry = helpers::snapshot_main(&db)
@@ -7421,7 +7433,7 @@ async fn full_text_rebuild_on_a_branch_stages_on_the_inherited_table() {
     let main_pin = pinned_version(&db, "main", "node:Doc").await;
     let branch_version = helpers::version_branch(&db, "rebuild").await.unwrap();
 
-    db.rebuild_full_text_indices_on("rebuild")
+    db.rebuild_full_text_indices_on_as("rebuild", None)
         .await
         .expect("a branch rebuild stages on the inherited table and never forks");
     assert!(sidecar_operation_ids(dir.path()).is_empty());
@@ -7518,7 +7530,7 @@ async fn assert_optimize_detached_pin_survives_next_write(uri: &str) {
     {
         let _failpoint = catalog::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT.fire_once_at(1);
         let error = db
-            .optimize()
+            .optimize_as(None)
             .await
             .expect_err("compaction published before its acknowledgement was lost");
         assert!(
@@ -8604,10 +8616,13 @@ async fn rfc_0067_cleanup_reaps_aged_surplus_detached_manifests() {
         }
     }
     for _ in 0..2 {
-        db.cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: Some(std::time::Duration::ZERO),
-        })
+        db.cleanup_as(
+            omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: Some(std::time::Duration::ZERO),
+            },
+            None,
+        )
         .await
         .unwrap();
     }
@@ -8672,10 +8687,13 @@ async fn rfc_0067_zero_age_cleanup_keeps_a_fresh_unpublished_detached_manifest()
         "the interrupted write must strand at least one detached manifest"
     );
 
-    db.cleanup(omnigraph::db::CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: Some(std::time::Duration::ZERO),
-    })
+    db.cleanup_as(
+        omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: Some(std::time::Duration::ZERO),
+        },
+        None,
+    )
     .await
     .unwrap();
     let after = detached_files();
@@ -8691,10 +8709,13 @@ async fn rfc_0067_zero_age_cleanup_keeps_a_fresh_unpublished_detached_manifest()
             .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
             .unwrap();
     }
-    db.cleanup(omnigraph::db::CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: Some(std::time::Duration::ZERO),
-    })
+    db.cleanup_as(
+        omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: Some(std::time::Duration::ZERO),
+        },
+        None,
+    )
     .await
     .unwrap();
     let aged = detached_files();
@@ -8716,10 +8737,13 @@ fn rfc_0067_external_cleanup_process() {
         .unwrap()
         .block_on(async {
             let db = Omnigraph::open(&uri).await.unwrap();
-            db.cleanup(omnigraph::db::CleanupPolicyOptions {
-                keep_versions: Some(1),
-                older_than: Some(std::time::Duration::ZERO),
-            })
+            db.cleanup_as(
+                omnigraph::db::CleanupPolicyOptions {
+                    keep_versions: Some(1),
+                    older_than: Some(std::time::Duration::ZERO),
+                },
+                None,
+            )
             .await
             .unwrap();
         });
@@ -9330,20 +9354,20 @@ async fn live_handle_writes_after_every_write_family_seam_failure() {
                 db.apply_schema(&render_schema(&schema_props, age_indexed))
                     .await
                     .expect("ensure-row schema setup");
-                db.ensure_indices()
+                db.ensure_indices_as(None)
                     .await
                     .map(|_| ())
                     .map_err(|error| error.to_string())
             }
             Driver::Optimize => db
-                .optimize()
+                .optimize_as(None)
                 .await
                 .map(|_| ())
                 .map_err(|error| error.to_string()),
-            Driver::Cleanup => Box::pin(db.cleanup(omnigraph::db::CleanupPolicyOptions {
+            Driver::Cleanup => Box::pin(db.cleanup_as(omnigraph::db::CleanupPolicyOptions {
                 keep_versions: Some(1),
                 older_than: None,
-            }))
+            }, None))
             .await
             .map(|_| ())
             .map_err(|error| error.to_string()),
@@ -9419,10 +9443,13 @@ async fn rfc_0067_merge_diff_keeps_every_chunk() {
         after_rows - before_rows
     );
     db.branch_delete("feature").await.unwrap();
-    db.cleanup(omnigraph::db::CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: Some(std::time::Duration::ZERO),
-    })
+    db.cleanup_as(
+        omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: Some(std::time::Duration::ZERO),
+        },
+        None,
+    )
     .await
     .unwrap();
     let person_uri = node_table_uri(&db, "Person").await;
@@ -9462,10 +9489,13 @@ async fn rfc_0067_cleanup_window_keeps_version_gc_on_a_written_table() {
 
     for pass in 0..2 {
         let stats = db
-            .cleanup(omnigraph::db::CleanupPolicyOptions {
-                keep_versions: Some(1),
-                older_than: Some(std::time::Duration::from_secs(7 * 24 * 60 * 60)),
-            })
+            .cleanup_as(
+                omnigraph::db::CleanupPolicyOptions {
+                    keep_versions: Some(1),
+                    older_than: Some(std::time::Duration::from_secs(7 * 24 * 60 * 60)),
+                },
+                None,
+            )
             .await
             .unwrap();
         let person = stats
@@ -9543,7 +9573,7 @@ async fn collector_keeps_live_staging_and_reclaims_it_once_the_head_moves() {
         );
         assert!(staging.bytes > 0);
     }
-    let stats = db.cleanup(keep_one()).await.unwrap();
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
     let row = stats
         .iter()
         .find(|row| row.type_key == "node:Person")
@@ -9570,7 +9600,7 @@ async fn collector_keeps_live_staging_and_reclaims_it_once_the_head_moves() {
             staging.verdict
         );
     }
-    let stats = db.cleanup(keep_one()).await.unwrap();
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
     let row = stats
         .iter()
         .find(|row| row.type_key == "node:Person")
@@ -9662,7 +9692,7 @@ async fn collector_keeps_pins_published_by_a_late_branch_in_another_process() {
         let expected_rows = count_rows(&db, "node:Person").await + 1;
         let cleaner = helpers::session(Omnigraph::open(db.uri()).await.unwrap());
         let (guard, hold) = catalog::CLEANUP_COLLECTOR_POST_SNAPSHOT.hold();
-        let cleanup = tokio::spawn(async move { cleaner.cleanup(keep_one()).await });
+        let cleanup = tokio::spawn(async move { cleaner.cleanup_as(keep_one(), None).await });
         let reached = hold.clone();
         tokio::task::spawn_blocking(move || reached.wait_until_reached())
             .await
@@ -9705,7 +9735,7 @@ async fn collector_keeps_pins_published_by_a_late_branch_in_another_process() {
                     path.display()
                 );
             }
-            let retry = reader.cleanup(keep_one()).await.unwrap();
+            let retry = reader.cleanup_as(keep_one(), None).await.unwrap();
             assert!(retry.iter().all(|row| row.error.is_none()), "{retry:?}");
             assert_eq!(count_rows(&reader, "node:Person").await, expected_rows - 1);
             continue;
@@ -9752,7 +9782,7 @@ async fn collector_refuses_mixed_branch_captures_before_deleting() {
             count_rows(&db, "node:Person").await + usize::from(action == "collector_mixed");
         let cleaner = helpers::session(Omnigraph::open(db.uri()).await.unwrap());
         let (guard, hold) = catalog::CLEANUP_COLLECTOR_MID_BRANCH_READ.hold();
-        let cleanup = tokio::spawn(async move { cleaner.cleanup(keep_one()).await });
+        let cleanup = tokio::spawn(async move { cleaner.cleanup_as(keep_one(), None).await });
         let reached = hold.clone();
         tokio::task::spawn_blocking(move || reached.wait_until_reached())
             .await
@@ -9790,7 +9820,7 @@ async fn collector_refuses_mixed_branch_captures_before_deleting() {
         let pin = pinned_version(&reader, "main", "node:Person").await;
         assert!(detached_versions(&person_uri).await.contains(&pin));
         assert_eq!(count_rows(&reader, "node:Person").await, expected_rows);
-        let retry = reader.cleanup(keep_one()).await.unwrap();
+        let retry = reader.cleanup_as(keep_one(), None).await.unwrap();
         assert!(retry.iter().all(|row| row.error.is_none()), "{retry:?}");
         assert!(detached_versions(&person_uri).await.contains(&pin));
     }
@@ -9808,7 +9838,7 @@ async fn collector_pass_interrupted_mid_sweep_counts_nothing_and_retries_whole()
 
     let stats = {
         let _fp = catalog::CLEANUP_SWEEP_BETWEEN_MANIFESTS.fail_once_at(1);
-        db.cleanup(keep_one()).await.unwrap()
+        db.cleanup_as(keep_one(), None).await.unwrap()
     };
     let row = stats
         .iter()
@@ -9824,7 +9854,7 @@ async fn collector_pass_interrupted_mid_sweep_counts_nothing_and_retries_whole()
         row.manifests_removed, 1,
         "the pass stopped after its first manifest: {row:?}"
     );
-    let stats = db.cleanup(keep_one()).await.unwrap();
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
     let row = stats
         .iter()
         .find(|row| row.type_key == "node:Person")
@@ -9891,7 +9921,7 @@ async fn assert_collector_retry_treats_an_index_directory_an_interrupted_pass_re
 
     let stats = {
         let _fp = catalog::CLEANUP_SWEEP_PRE_FILE_DELETE.fire_always();
-        db.cleanup(keep_one()).await.unwrap()
+        db.cleanup_as(keep_one(), None).await.unwrap()
     };
     let row = stats
         .iter()
@@ -9924,7 +9954,7 @@ async fn assert_collector_retry_treats_an_index_directory_an_interrupted_pass_re
 
     let stats = {
         let _fp = catalog::CLEANUP_SWEEP_PRE_MANIFEST_DELETE.fire_always();
-        db.cleanup(keep_one()).await.unwrap()
+        db.cleanup_as(keep_one(), None).await.unwrap()
     };
     let row = stats
         .iter()
@@ -9945,7 +9975,7 @@ async fn assert_collector_retry_treats_an_index_directory_an_interrupted_pass_re
         );
     }
 
-    let stats = db.cleanup(keep_one()).await.unwrap();
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
     assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
     let row = stats
         .iter()
@@ -10031,7 +10061,7 @@ async fn assert_collector_retry_after_a_pass_stopped_between_manifests_finishes_
 
     let stats = {
         let _fp = catalog::CLEANUP_SWEEP_BETWEEN_MANIFESTS.fire_always();
-        db.cleanup(keep_one()).await.unwrap()
+        db.cleanup_as(keep_one(), None).await.unwrap()
     };
     let row = stats
         .iter()
@@ -10079,7 +10109,7 @@ async fn assert_collector_retry_after_a_pass_stopped_between_manifests_finishes_
         plan.sweep_paths
     );
 
-    let stats = db.cleanup(keep_one()).await.unwrap();
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
     assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
     let row = stats
         .iter()
@@ -10134,7 +10164,7 @@ async fn assert_collector_retry_after_a_pass_stopped_before_the_dead_manifests_r
     let before = detached_versions(&person_uri).await;
     {
         let _fp = catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
-        let outcome = db.ensure_indices().await;
+        let outcome = db.ensure_indices_as(None).await;
         assert!(
             outcome.is_err(),
             "the seam fails the index build before publish"
@@ -10172,7 +10202,7 @@ async fn assert_collector_retry_after_a_pass_stopped_before_the_dead_manifests_r
 
     let stats = {
         let _fp = catalog::CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE.fire_always();
-        db.cleanup(keep_one()).await.unwrap()
+        db.cleanup_as(keep_one(), None).await.unwrap()
     };
     let row = stats
         .iter()
@@ -10213,7 +10243,7 @@ async fn assert_collector_retry_after_a_pass_stopped_before_the_dead_manifests_r
         plan.dead_paths
     );
 
-    let stats = db.cleanup(keep_one()).await.unwrap();
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
     assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
     let row = stats
         .iter()
@@ -10358,7 +10388,7 @@ async fn branch_merge_in_doubt_keeps_input_tags_until_cleanup() {
         "the acknowledged source and target guards must survive an in-doubt fast-forward"
     );
 
-    let rows = db.cleanup(keep_one()).await.unwrap();
+    let rows = db.cleanup_as(keep_one(), None).await.unwrap();
     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
     assert!(
         !native
@@ -10892,7 +10922,7 @@ async fn unattached_live_chain_pins_are_rooted_and_survive_cleanup() {
         report.retained_unattached_tags
     );
 
-    let rows = db.cleanup(keep_one_at_any_age()).await.unwrap();
+    let rows = db.cleanup_as(keep_one_at_any_age(), None).await.unwrap();
     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
     let remaining = detached_versions(&person_uri).await;
     assert!(
@@ -10937,7 +10967,7 @@ async fn unattached_live_chain_pins_are_rooted_and_survive_cleanup() {
     let plan = main_plan(&report, "node:Person");
     assert!(plan.roots.contains(&grandchild_pin));
     assert!(plan.roots.contains(&root_pin));
-    let rows = db.cleanup(keep_one_at_any_age()).await.unwrap();
+    let rows = db.cleanup_as(keep_one_at_any_age(), None).await.unwrap();
     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
     let remaining = detached_versions(&person_uri).await;
     assert!(remaining.contains(&grandchild_pin));
@@ -11013,7 +11043,9 @@ async fn cleanup_releases_expired_unattached_tags_descendants_first() {
 
     let interrupted = {
         let _fp = catalog::CLEANUP_POST_UNATTACHED_RELEASE.fail_once_at(1);
-        db.cleanup(keep_one_at_any_age()).await.unwrap_err()
+        db.cleanup_as(keep_one_at_any_age(), None)
+            .await
+            .unwrap_err()
     };
     assert!(
         interrupted
@@ -11027,7 +11059,7 @@ async fn cleanup_releases_expired_unattached_tags_descendants_first() {
         "the child's tag went first; the root's stays for the retry"
     );
 
-    let rows = db.cleanup(keep_one_at_any_age()).await.unwrap();
+    let rows = db.cleanup_as(keep_one_at_any_age(), None).await.unwrap();
     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
     assert!(unattached_tags(&uri).await.is_empty());
     let at = |id: &str| ReadTarget::snapshot(SnapshotId::new(id.to_string()));
@@ -11045,7 +11077,7 @@ async fn cleanup_releases_expired_unattached_tags_descendants_first() {
         person_count_at(&db, ReadTarget::branch("main")).await,
         main_before + 1
     );
-    let rows = db.cleanup(keep_one_at_any_age()).await.unwrap();
+    let rows = db.cleanup_as(keep_one_at_any_age(), None).await.unwrap();
     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
 }
 
@@ -11109,7 +11141,7 @@ async fn abandoned_merge_input_tags_expire_after_target_advances() {
     )
     .await
     .unwrap();
-    let rows = db.cleanup(keep_one()).await.unwrap();
+    let rows = db.cleanup_as(keep_one(), None).await.unwrap();
     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
     assert!(
         captured_path.is_file(),
@@ -11122,7 +11154,7 @@ async fn abandoned_merge_input_tags_expire_after_target_advances() {
     )
     .await
     .unwrap();
-    let rows = db.cleanup(keep_one()).await.unwrap();
+    let rows = db.cleanup_as(keep_one(), None).await.unwrap();
     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
     assert!(
         !captured_path.exists(),
@@ -11174,7 +11206,7 @@ async fn cleanup_keeps_a_late_retired_merge_base_provider() {
     db.branch_create("target").await.unwrap();
     let cleaner = helpers::session(Omnigraph::open(&uri).await.unwrap());
     let parked = helpers::failpoint::Rendezvous::park_first(&catalog::CLEANUP_TABLE_GC);
-    let cleanup = tokio::spawn(async move { cleaner.cleanup(keep_one()).await });
+    let cleanup = tokio::spawn(async move { cleaner.cleanup_as(keep_one(), None).await });
     parked.wait_until_reached().await;
     let child_uri = uri.clone();
     let child = tokio::task::spawn_blocking(move || {
@@ -11238,7 +11270,7 @@ async fn planning_source_failures_keep_their_error_class() {
     )
     .await
     .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     let lookup = params(&[("$name", "Planned")]);
     for seam in [
         &catalog::QUERY_INDEX_FACTS_PRE_LOAD,

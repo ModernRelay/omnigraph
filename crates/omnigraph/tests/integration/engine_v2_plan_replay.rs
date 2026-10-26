@@ -65,7 +65,7 @@ async fn incomplete_rank_fuse_row_tiebreak_refuses_replay_issue_659() {
     .collect::<Vec<_>>()
     .join("\n");
     db.load_jsonl(&edges, LoadMode::Append).await.unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     let query = r#"query selected_page() {
         match { $p: Person $p $e:(knows | likes) $q }
         return { $e.@type as edge_type, $e.@id as edge_id, $q.name as target }
@@ -305,7 +305,7 @@ async fn selected_cold_indexed_route_uses_persisted_members_without_building_csr
     )
     .await
     .unwrap();
-    db.optimize().await.unwrap();
+    db.optimize_as(None).await.unwrap();
     drop(db);
     let db = with_traversal(
         &session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap()),
@@ -2123,7 +2123,7 @@ async fn a_replay_rechecks_recorded_full_text_coverage() {
     )
     .await
     .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     db.load_jsonl(
         r#"{"type":"Doc","data":{"slug":"t1","text":"graph","year":2022}}
 {"type":"Doc","data":{"slug":"t2","text":"graph graph graph graph","year":1990}}"#,

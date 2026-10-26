@@ -35,19 +35,26 @@ pub(super) async fn graph_index_for_resolved(
         .await
 }
 
-pub(super) async fn ensure_indices(db: &Omnigraph) -> Result<Vec<PendingIndex>> {
+pub(super) async fn ensure_indices_as(
+    db: &Omnigraph,
+    actor: Option<&str>,
+) -> Result<Vec<PendingIndex>> {
     let current_branch = db
         .coordinator
         .read()
         .await
         .current_branch()
         .map(str::to_string);
-    ensure_indices_for_branch(db, current_branch.as_deref()).await
+    ensure_indices_for_branch(db, current_branch.as_deref(), actor).await
 }
 
-pub(super) async fn ensure_indices_on(db: &Omnigraph, branch: &str) -> Result<Vec<PendingIndex>> {
+pub(super) async fn ensure_indices_on_as(
+    db: &Omnigraph,
+    branch: &str,
+    actor: Option<&str>,
+) -> Result<Vec<PendingIndex>> {
     let branch = normalize_branch_name(branch)?;
-    ensure_indices_for_branch(db, branch.as_deref()).await
+    ensure_indices_for_branch(db, branch.as_deref(), actor).await
 }
 
 /// The indexes replaced by one successfully published full-text rebuild.
@@ -86,8 +93,13 @@ pub(super) async fn rebuild_full_text_indices_on_as(
 ) -> Result<FullTextIndexRebuildResult> {
     let branch = normalize_branch_name(branch)?;
     let public_branch = branch.as_deref().unwrap_or("main");
-    db.enforce(
-        omnigraph_policy::PolicyAction::Change,
+    // `maintain` is the rebuild's grant; `change`, its grant before
+    // `maintain` existed, still admits it so existing policies keep working.
+    db.enforce_any(
+        &[
+            omnigraph_policy::PolicyAction::Maintain,
+            omnigraph_policy::PolicyAction::Change,
+        ],
         &omnigraph_policy::ResourceScope::Branch(public_branch.to_string()),
         actor,
     )?;
@@ -186,12 +198,19 @@ pub(super) async fn failpoint_publish_table_head_without_index_rebuild_for_test(
     .await
 }
 
-pub(super) async fn ensure_indices_for_branch(
+/// The index writer on `branch` (`None` is main), under `maintain` on it.
+async fn ensure_indices_for_branch(
     db: &Omnigraph,
     branch: Option<&str>,
+    actor: Option<&str>,
 ) -> Result<Vec<PendingIndex>> {
+    db.enforce(
+        omnigraph_policy::PolicyAction::Maintain,
+        &omnigraph_policy::ResourceScope::Branch(branch.unwrap_or("main").to_string()),
+        actor,
+    )?;
     Ok(
-        maintain_indices_for_branch(db, branch, IndexMaintenanceMode::Ensure, None)
+        maintain_indices_for_branch(db, branch, IndexMaintenanceMode::Ensure, actor)
             .await?
             .pending,
     )

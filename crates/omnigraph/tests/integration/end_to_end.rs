@@ -2989,9 +2989,9 @@ async fn ensure_indices_does_not_error_on_repeated_call() {
 
     // load commits now enforce required indices; repeated ensure_indices calls
     // should be a no-op at the manifest level.
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     let version_after_first = version_main(&db).await.unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     let version_after_second = version_main(&db).await.unwrap();
 
     assert_eq!(version_after_first, version_after_load);
@@ -3093,7 +3093,7 @@ async fn full_flow_optimize_then_query_update_and_reopen() {
         .unwrap();
     }
 
-    let stats = db.optimize().await.unwrap();
+    let stats = db.optimize_as(None).await.unwrap();
     assert!(
         stats.iter().any(|s| s.committed),
         "a multi-fragment table should have compacted in this flow"

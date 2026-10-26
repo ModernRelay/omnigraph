@@ -303,11 +303,14 @@ async fn bound_handle_workload_child() {
             .contains("Feature")
     );
 
-    db.optimize().await.unwrap();
-    db.cleanup(CleanupPolicyOptions {
-        keep_versions: Some(2),
-        older_than: None,
-    })
+    db.optimize_as(None).await.unwrap();
+    db.cleanup_as(
+        CleanupPolicyOptions {
+            keep_versions: Some(2),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
     let reopened = session(Omnigraph::open_with_storage(&uri, storage()).await.unwrap());

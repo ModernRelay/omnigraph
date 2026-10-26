@@ -2262,7 +2262,7 @@ mod borrowed_origin_tests {
         load_company(&db, "initial-company").await;
         db.branch_create("legacy").await.unwrap();
         load_person(&db, "borrowed", 41).await;
-        db.ensure_indices().await.unwrap();
+        db.ensure_indices_as(None).await.unwrap();
         let source_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
         let entry = source_snapshot.dataset("node:Person").unwrap().clone();
         let mut source = source_snapshot
@@ -2376,7 +2376,7 @@ mod borrowed_origin_tests {
         assert!(!company_old.is_empty());
         load_company(&db, "unrelated-current").await;
         load_person(&db, "main-current", 99).await;
-        db.ensure_indices().await.unwrap();
+        db.ensure_indices_as(None).await.unwrap();
         let options = super::super::optimize::CleanupPolicyOptions {
             keep_versions: Some(1),
             older_than: None,
@@ -2391,7 +2391,7 @@ mod borrowed_origin_tests {
             source_plan.would_remove().contains(&source_version),
             "borrowed source manifest is reclaimable"
         );
-        let rows = db.cleanup(options).await.unwrap();
+        let rows = db.cleanup_as(options, None).await.unwrap();
         assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
         let source_store = source.object_store(None).await.unwrap();
         for path in source_data.iter().chain(&source_indices) {
@@ -2504,7 +2504,7 @@ mod borrowed_origin_tests {
                 .any(|table| table.would_remove().contains(&version)),
             "old source pin must be reclaimable without the native tag's borrowed files"
         );
-        let rows = db.cleanup(options).await.unwrap();
+        let rows = db.cleanup_as(options, None).await.unwrap();
         assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
         drop(db);
         // forbidden-api-allow: test-only cold native read of a tagged fork absent from graph registrations
@@ -2745,7 +2745,7 @@ mod overlay_retention_tests {
                     .any(|object| object.path == overlay_path)
             );
             assert!(expected.missing_paths().await.unwrap().is_empty());
-            let rows = db.cleanup(options).await.unwrap();
+            let rows = db.cleanup_as(options, None).await.unwrap();
             let row = rows
                 .iter()
                 .find(|row| row.type_key == entry.type_key)
@@ -2793,7 +2793,7 @@ mod overlay_retention_tests {
                 .any(|object| object.path == overlay_path),
             "the independent pre-cleanup probe must include overlays"
         );
-        let rows = db.cleanup(options.clone()).await.unwrap();
+        let rows = db.cleanup_as(options.clone(), None).await.unwrap();
         assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
         let store = overlay.object_store(None).await.unwrap();
         assert!(store.exists(&overlay_path).await.unwrap());
@@ -2842,7 +2842,7 @@ mod overlay_retention_tests {
         } else {
             load_person(&db, 99).await;
         }
-        let rows = db.cleanup(options).await.unwrap();
+        let rows = db.cleanup_as(options, None).await.unwrap();
         assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
         assert!(
             !store.exists(&overlay_path).await.unwrap(),
@@ -3020,7 +3020,7 @@ mod native_table_tag_tests {
             !plan.would_remove().contains(&version),
             "an exact native table tag must exclude its version from cleanup: {plan:?}",
         );
-        let rows = db.cleanup(options.clone()).await.unwrap();
+        let rows = db.cleanup_as(options.clone(), None).await.unwrap();
         assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
         assert!(store.exists(&manifest_path).await.unwrap());
         // forbidden-api-allow: test-only cold native tag read after the graph collector ran
@@ -3056,7 +3056,7 @@ mod native_table_tag_tests {
                 .any(|plan| plan.location == location && plan.would_remove().contains(&version)),
             "removing the tag must make the old version reclaimable"
         );
-        let rows = db.cleanup(options).await.unwrap();
+        let rows = db.cleanup_as(options, None).await.unwrap();
         assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
         assert!(
             !store.exists(&manifest_path).await.unwrap(),

@@ -133,7 +133,6 @@ pub(crate) fn write_repair(
     if json {
         let value = serde_json::json!({
             "uri": uri,
-            "graph_manifest_version": stats.graph_manifest_version,
             "datasets": stats.datasets.iter().map(|s| serde_json::json!({
                 "type_key": s.type_key,
                 "published_dataset_version": s.published_dataset_version,
@@ -1867,7 +1866,7 @@ mod tests {
     #[tokio::test]
     async fn maintenance_optimize_and_repair_reports_preserve_all_result_fields() {
         use omnigraph::db::{
-            Omnigraph, PendingIndex, RepairAction, RepairClassification, RepairOptions, SkipReason,
+            Omnigraph, PendingIndex, RepairAction, RepairClassification, SkipReason,
         };
         // These engine result types are non_exhaustive. Obtain one valid value
         // from a tiny graph, then set its public presentation fields; no engine
@@ -1881,7 +1880,7 @@ mod tests {
         let db = Omnigraph::init(&uri, "node Person {\n    slug: String @key\n}\n")
             .await
             .unwrap();
-        let mut compacted = db.optimize().await.unwrap().pop().unwrap();
+        let mut compacted = db.optimize_as(None).await.unwrap().pop().unwrap();
         compacted.type_key = "node:Person".into();
         compacted.fragments_removed = 3;
         compacted.fragments_added = 1;
@@ -1933,7 +1932,7 @@ mod tests {
             |json, writer| super::write_optimize("graph", &[], json, writer),
         );
 
-        let mut repair = db.repair(RepairOptions::default()).await.unwrap();
+        let mut repair = db.repair_report_as(None).await.unwrap();
         let mut clean = repair.datasets.pop().unwrap();
         clean.type_key = "node:Person".into();
         clean.published_dataset_version = 4;
@@ -1950,7 +1949,6 @@ mod tests {
         refused.operations = vec!["Append".into(), "Delete".into()];
         refused.error = Some("foreign write".into());
         repair.datasets = vec![clean, refused];
-        repair.graph_manifest_version = Some(9);
         assert_maintenance_report(
             concat!(
                 "repair graph — 2 datasets\n",
@@ -1958,7 +1956,7 @@ mod tests {
                 "  edge type 'Knows'                        refused      foreign_drift          4 → 6 [Append, Delete] (foreign write)\n",
             ),
             serde_json::json!({
-                "uri":"graph", "graph_manifest_version":9,
+                "uri":"graph",
                 "datasets":[
                     {"type_key":"node:Person","published_dataset_version":4,"lance_head_version":4,"classification":"no_drift","action":"no_op","operations":[],"error":null},
                     {"type_key":"edge:Knows","published_dataset_version":4,"lance_head_version":6,"classification":"foreign_drift","action":"refused","operations":["Append","Delete"],"error":"foreign write"},
@@ -1967,10 +1965,9 @@ mod tests {
             |json, writer| super::write_repair("graph", &repair, json, writer),
         );
         repair.datasets.clear();
-        repair.graph_manifest_version = None;
         assert_maintenance_report(
             "repair graph — 0 datasets\n",
-            serde_json::json!({"uri":"graph","graph_manifest_version":null,"datasets":[]}),
+            serde_json::json!({"uri":"graph","datasets":[]}),
             |json, writer| super::write_repair("graph", &repair, json, writer),
         );
     }

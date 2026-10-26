@@ -4294,7 +4294,7 @@ pub async fn seed_case(session: &Session, seed: &Seed, needs_indices: bool) -> R
     seed.load(session).await?;
     if needs_indices {
         session
-            .ensure_indices()
+            .ensure_indices_as(None)
             .await
             .map_err(|e| format!("ensure_indices failed: {e}"))?;
     }

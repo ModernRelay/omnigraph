@@ -1,26 +1,16 @@
-//! Explicit repair for uncovered published-dataset/Lance-HEAD drift.
+//! The repair report: uncovered published-dataset/Lance-HEAD drift.
 //!
 //! Pending pins converge automatically: the next writer or `cleanup` promotes
 //! them. This module is for the different case: a dataset's Lance HEAD is
 //! ahead of the version recorded in `__manifest` and no published pin explains
-//! the movement. `repair` classifies that uncovered drift from Lance
-//! transactions and only auto-publishes maintenance-only drift when the
-//! operator confirms.
+//! the movement. The report classifies that drift from Lance transactions. It
+//! publishes nothing: no read or write resolves a table's linear HEAD, so
+//! drift never needs adopting.
 
 use lance::Dataset;
 use lance::dataset::transaction::Operation;
 
 use super::*;
-
-/// Options for [`Omnigraph::repair`].
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RepairOptions {
-    /// Preview by default. With `confirm`, verified maintenance drift is
-    /// published to `__manifest`.
-    pub confirm: bool,
-    /// Also publish suspicious/unverifiable drift. Requires `confirm`.
-    pub force: bool,
-}
 
 /// Classification of a dataset's graph-manifest/Lance-HEAD state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,20 +55,15 @@ impl std::fmt::Display for RepairClassification {
     }
 }
 
-/// What repair did for a backing dataset.
+/// What the repair report says about a backing dataset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RepairAction {
-    /// Nothing to do.
+    /// Nothing to report: no drift, or foreign drift no read or write resolves.
     NoOp,
-    /// Drift was reported but not published because this was a preview.
+    /// Drift the report classified and left in place.
     Preview,
-    /// Verified maintenance drift was published to `__manifest`.
-    Healed,
-    /// Suspicious/unverifiable drift was published because `force` was set.
-    Forced,
-    /// Drift was left untouched because it was not safe to publish without
-    /// `force`.
+    /// The table could not be judged; its `error` says why.
     Refused,
 }
 
@@ -88,8 +73,6 @@ impl RepairAction {
         match self {
             Self::NoOp => "no_op",
             Self::Preview => "preview",
-            Self::Healed => "healed",
-            Self::Forced => "forced",
             Self::Refused => "refused",
         }
     }
@@ -101,13 +84,13 @@ impl std::fmt::Display for RepairAction {
     }
 }
 
-/// Per-dataset repair outcome.
+/// One dataset's row of the repair report.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct DatasetRepairStats {
     /// Qualified graph type key, or `__manifest` for the system dataset.
     pub type_key: String,
-    /// Published dataset version before repair.
+    /// The published dataset version the registration pins.
     pub published_dataset_version: u64,
     pub lance_head_version: u64,
     pub classification: RepairClassification,
@@ -116,13 +99,11 @@ pub struct DatasetRepairStats {
     pub error: Option<String>,
 }
 
-/// Whole-graph repair outcome.
+/// The repair report for the whole graph.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct RepairStats {
     pub datasets: Vec<DatasetRepairStats>,
-    /// New graph-manifest version if repair published any dataset pins.
-    pub graph_manifest_version: Option<u64>,
 }
 
 struct ClassificationResult {
@@ -132,31 +113,27 @@ struct ClassificationResult {
 }
 
 struct RepairTableTask {
-    identity: crate::db::manifest::TableIdentity,
     table_key: String,
     full_path: String,
     pinned_data_version: u64,
-    pinned_native_ref: Option<String>,
     entry: crate::db::manifest::DatasetEntry,
 }
 
-pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Result<RepairStats> {
-    if options.force && !options.confirm {
-        return Err(OmniError::manifest("repair --force requires --confirm"));
-    }
-
+/// The repair report on `main`, under `maintain` on `main`.
+pub(super) async fn repair_report(db: &Omnigraph, actor: Option<&str>) -> Result<RepairStats> {
+    db.enforce(
+        omnigraph_policy::PolicyAction::Maintain,
+        &omnigraph_policy::ResourceScope::Branch("main".to_string()),
+        actor,
+    )?;
     db.ensure_schema_state_valid().await?;
 
-    // Repair may adopt physical HEADs into graph authority. Bind the entire
-    // attempt to one accepted view and revalidate after schema -> main -> table
-    // gates so concurrent graph movement refuses before publication.
+    // Bind the whole report to one accepted view, revalidated after the
+    // schema -> main -> table gates. The accepted catalog, the identity/path
+    // pairs and every raw Lance read stay under those gates, so a concurrent
+    // schema apply cannot pair an old dataset path with a replacement's alias,
+    // and a cleanup cannot remove a version the report is reading.
     let authority_txn = db.open_write_txn(None).await?;
-
-    // Repair publishes manifest authority, so it joins the canonical writer
-    // envelope. The accepted catalog, identity/path pairs, raw Lance reads, and
-    // final publish all remain under schema -> main -> sorted-table gates. This
-    // prevents a concurrent drop/re-add from pairing the old dataset path with
-    // the replacement's same public alias and new identity.
     let _schema_permit = db.write_queue().acquire_schema_shared().await;
     db.refresh_coordinator_only().await?;
     let catalog = db.load_accepted_catalog_with_schema_gate_held().await?;
@@ -175,41 +152,26 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
         .filter_map(|table_key| {
             let entry = snapshot.dataset(&table_key)?;
             Some(RepairTableTask {
-                identity: entry.identity,
                 table_key,
                 full_path: format!("{}/{}", db.root_uri, entry.dataset_path),
                 pinned_data_version: entry.published_dataset_version,
-                pinned_native_ref: entry.native_dataset_branch.clone(),
                 entry: entry.clone(),
             })
         })
         .collect::<Vec<_>>();
 
-    if table_tasks.is_empty() {
-        return Ok(RepairStats {
-            datasets: Vec::new(),
-            graph_manifest_version: None,
-        });
-    }
-
     let mut tables = Vec::with_capacity(table_tasks.len());
-    let mut updates = Vec::new();
-    let mut expected = crate::db::manifest::ExpectedTableVersions::new();
-    let mut any_forced = false;
-
     for task in table_tasks {
         let RepairTableTask {
-            identity,
             table_key,
             full_path,
             pinned_data_version,
-            pinned_native_ref,
             entry,
         } = task;
         // `classify_drift` inspects raw Lance transaction history
         // (`read_transaction_by_version`), a Lance-only maintenance read the
         // staged-write trait does not surface. The raw borrow is an enumerated,
-        // read-only escape; repair never takes ownership or moves Lance HEAD.
+        // read-only escape; the report never takes ownership or moves Lance HEAD.
         let handle = db.storage().open_dataset_head(&full_path, None).await?;
         if let Some(row) = judge_against_last_linear_version(&table_key, &entry, &handle)? {
             tables.push(row);
@@ -262,90 +224,18 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
         }
 
         let classification = classify_drift(ds, pinned_data_version, lance_head_version).await;
-        let action = match (
-            options.confirm,
-            options.force,
-            classification.classification,
-        ) {
-            (false, _, _) => RepairAction::Preview,
-            (true, _, RepairClassification::VerifiedMaintenance) => RepairAction::Healed,
-            (true, true, RepairClassification::Suspicious | RepairClassification::Unverifiable) => {
-                any_forced = true;
-                RepairAction::Forced
-            }
-            (true, _, RepairClassification::Suspicious | RepairClassification::Unverifiable) => {
-                RepairAction::Refused
-            }
-            (true, _, RepairClassification::NoDrift) => RepairAction::NoOp,
-            // Reported above, before drift is classified; never adopted.
-            (true, _, RepairClassification::BlockedPromotion) => RepairAction::Refused,
-            (true, _, RepairClassification::ForeignDrift) => RepairAction::NoOp,
-        };
-
-        if matches!(action, RepairAction::Healed | RepairAction::Forced) {
-            let state = db.storage().table_state(&full_path, &handle).await?;
-            updates.push(crate::db::DatasetUpdate {
-                identity,
-                type_key: table_key.clone(),
-                published_dataset_version: state.version,
-                native_dataset_branch: None,
-                entity_count: state.row_count,
-                version_metadata: state
-                    .version_metadata
-                    .with_last_linear_version(entry.version_metadata.last_linear_version()),
-            });
-            expected.insert(
-                identity,
-                crate::db::manifest::TableVersionExpectation {
-                    table_key: table_key.clone(),
-                    table_version: pinned_data_version,
-                    native_ref: crate::db::manifest::NativeRefPin::Exact(pinned_native_ref),
-                },
-            );
-        }
-
         tables.push(DatasetRepairStats {
             type_key: table_key,
             published_dataset_version: pinned_data_version,
             lance_head_version,
             classification: classification.classification,
-            action,
+            action: RepairAction::Preview,
             operations: classification.operations,
             error: classification.error,
         });
     }
 
-    let manifest_version = if updates.is_empty() {
-        None
-    } else {
-        let actor = if any_forced {
-            Some("omnigraph:repair:force")
-        } else {
-            Some("omnigraph:repair")
-        };
-        let PublishedSnapshot {
-            graph_manifest_version: manifest_version,
-            ..
-        } = db
-            .coordinator
-            .write()
-            .await
-            .commit_updates_with_actor_with_expected(&updates, &expected, actor)
-            .await?;
-        db.runtime_cache.invalidate_all().await;
-        if updates
-            .iter()
-            .any(|update| update.type_key.starts_with("edge:"))
-        {
-            db.invalidate_graph_index().await;
-        }
-        Some(manifest_version)
-    };
-
-    Ok(RepairStats {
-        datasets: tables,
-        graph_manifest_version: manifest_version,
-    })
+    Ok(RepairStats { datasets: tables })
 }
 
 /// The detached-only rule: the recorded last linear version is the baseline
