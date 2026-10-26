@@ -1,6 +1,5 @@
 //! Existing organization CLI grammar.
 use clap::{Args, Subcommand};
-use std::path::PathBuf;
 
 #[derive(Debug, Args)]
 pub(crate) struct OrganizationArgs {
@@ -11,12 +10,12 @@ pub(crate) struct OrganizationArgs {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum OrganizationCommand {
-    /// Inspect or change local enrollment, admission and control permissions.
+    /// Inspect organization membership or offboard a member.
     Members {
         #[command(subcommand)]
         command: OrganizationMembersCommand,
     },
-    /// Manage provider invitations; acceptance does not grant cluster access.
+    /// Manage provider invitations; native permissions remain in cluster policy.
     Invitations {
         #[command(subcommand)]
         command: OrganizationInvitationsCommand,
@@ -25,22 +24,15 @@ pub(crate) enum OrganizationCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum OrganizationMembersCommand {
-    /// List provider members and retained local enrollment, including current versions.
+    /// List provider members, stable identities and organization service permissions.
     List,
-    /// Apply a versioned YAML add/update/remove patch; graph policy is unchanged.
-    Apply {
-        file: PathBuf,
-        /// Stable request key; retain it if the result is uncertain.
-        #[arg(long)]
-        idempotency_key: String,
-    },
-    /// Remove local access, organization membership and its sessions.
+    /// Remove organization membership and its organization-bound sessions.
     /// Deploy Cedar revocation and verify old graph credentials first.
     Offboard {
         user_id: String,
-        /// Current local grant version; zero for an unenrolled person.
-        #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
-        expected_version: i64,
+        /// Exact current membership ID, or `absent` after observing no membership.
+        #[arg(long)]
+        expected_membership: String,
         /// Stable request key; retain it if the result is uncertain.
         #[arg(long)]
         idempotency_key: String,

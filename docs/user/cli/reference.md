@@ -211,7 +211,7 @@ retarget an invocation.
 |---|---|
 | `login` / `logout` | Selected `omnigraph` profile (also via a managed target) |
 | `cluster create NAME`, `cluster list` | Profile; create returns identity without binding a folder |
-| `cluster members list` | Cluster target; list explicit enrollment |
+| `cluster members list` | Cluster target; list active organization members and identity eligibility |
 | `cluster pull --out NEW_DIR [--rev REVISION]` | Download configuration into a new directory |
 | `cluster push --config DIR --expected-revision REVISION --message TEXT` | Upload source using an exact revision |
 | `cluster plan [--rev REVISION]` | Preview pushed source |

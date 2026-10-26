@@ -50,7 +50,7 @@ prints the exact flags of the installed binary.
 | `lint` | — | Validate `.gq` source against a schema or a graph |
 | `queries` | `validate` `list` | Check a cluster's stored queries; list a cluster's or a served graph's |
 | `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `create` `list` `members list` `pull` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; the target kind selects the backend |
-| `organization` | `members list` `members apply` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | Manage the selected organization's members and invitations; requires a profile; `org` is an alias |
+| `organization` | `members list` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | Manage the selected organization's members and invitations; requires a profile; `org` is an alias |
 | `policy` | `validate` `test` `explain` | Validate or evaluate a cluster's applied policy |
 | `embed` | — | Generate, clean or refresh seed embeddings |
 | `login` | — | Create a profile with `--create-profile`, or sign in to its `omnigraph` auth provider |
@@ -504,12 +504,14 @@ Use a profile for `organization` (`org`):
 ```bash
 omnigraph organization members list --profile work --json
 omnigraph organization invitations send person@example.com --profile work --idempotency-key invite-person
-omnigraph organization members apply member.yaml --profile work --idempotency-key enroll-person --json
-omnigraph organization members offboard USER_ID --profile work --expected-version 4 --idempotency-key offboard-person --json
+omnigraph organization members offboard USER_ID --profile work --expected-membership MEMBERSHIP_ID --idempotency-key offboard-person --json
 ```
 
-The caller needs `members_manage`. Patch organization IDs must match the profile.
-Invitation/admission changes do not grant graph permissions. Deploy Cedar
+The caller needs current provider `members_manage` permission. WorkOS owns
+organization membership and service roles; applied cluster configuration owns
+graph and deployment permissions. No local enrollment or member-patch command
+is required. Use the exact membership ID from the directory for offboarding,
+or `absent` only to finish cleanup after that membership is gone. Deploy Cedar
 revocation before offboarding and verify denial with an existing data credential.
 Writes require exact idempotency keys and uncertain outcomes must be reconciled;
 a partial offboard stays partial on replay. See [team administration](../../../docs/user/cli/managed-team.md).

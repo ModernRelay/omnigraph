@@ -587,6 +587,37 @@ fn organization_id(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Service permissions are bounded display facts, never client-side authority.
+fn validate_service_permissions(permissions: &[String]) -> Result<()> {
+    if permissions.len() > 256
+        || permissions
+            .iter()
+            .any(|permission| !crate::helpers::valid_managed_identifier(permission, 128))
+        || permissions.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(Failure::protocol());
+    }
+    Ok(())
+}
+
+fn provider_timestamp(value: &str) -> Result<time::OffsetDateTime> {
+    if value.len() > 64 {
+        return Err(Failure::protocol());
+    }
+    time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .map_err(|_| Failure::protocol())
+}
+
+/// Validate the original observation window, without turning display data into a permit.
+fn provider_observation(observed_at: &str, expires_at: &str) -> Result<()> {
+    let observed = provider_timestamp(observed_at)?;
+    let expires = provider_timestamp(expires_at)?;
+    if expires <= observed || expires - observed > time::Duration::seconds(30) {
+        return Err(Failure::protocol());
+    }
+    Ok(())
+}
+
 struct Api {
     client: Client,
     origin: String,

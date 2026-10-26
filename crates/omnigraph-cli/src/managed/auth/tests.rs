@@ -392,7 +392,7 @@ pub(super) fn metadata(seconds: i64, principal: &str) -> IntentReply {
 fn metadata_for(seconds: i64, principal: &str, organization: &str) -> IntentReply {
     IntentReply::json(
         200,
-        json!({"data":{"principal_id":principal,"account_id":organization,"kind":"human","scopes":{},
+        json!({"data":{"principal_id":principal,"account_id":organization,"kind":"human","service_permissions":["source_read","status"],
         "expires_at":OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp()+seconds).unwrap().format(&Rfc3339).unwrap()},"meta":{}}),
     )
 }
@@ -599,24 +599,55 @@ async fn official_sdk_uses_public_client_device_and_refresh_without_secret_or_re
 
 #[tokio::test]
 async fn api_verifies_new_provider_identity_before_the_cache_accepts_it() {
-    let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
-    crate::operator_routing::test_transport_scope(&[&api.origin], async {
-        let response = serde_json::from_value(tokens(120, "user_one")).unwrap();
-        let (saved, output) = renewal::accept(&api.origin, config(), response, None)
-            .await
-            .unwrap();
-        let store = MemoryStore::default();
-        renewal::save(&store, &saved).unwrap();
-        assert!(renewal::load(&store, &api.origin).unwrap().is_some());
-        assert!(!output.to_string().contains("rotated-refresh"));
-        assert!(!output.to_string().contains(".signature"));
-        let requests = api.requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].path, "/v1/auth/session");
-        assert!(requests[0].headers["authorization"].starts_with("Bearer ey"));
-        api.assert_complete();
-    })
-    .await;
+    for permissions in [
+        Some(json!(["source_read", "status"])),
+        Some(json!([])),
+        Some(json!(["status", "status"])),
+        Some(json!(["status", "source_read"])),
+        Some(json!(["bad\n"])),
+        Some(Value::Null),
+        None,
+    ] {
+        let valid = matches!(&permissions, Some(Value::Array(values)) if values.is_empty() || values == &vec![json!("source_read"), json!("status")]);
+        let mut reply = metadata(120, "principal_one");
+        let mut body: Value = serde_json::from_slice(&reply.body).unwrap();
+        if let Some(permissions) = permissions {
+            body["data"]["service_permissions"] = permissions;
+        } else {
+            body["data"]
+                .as_object_mut()
+                .unwrap()
+                .remove("service_permissions");
+            body["data"]["scopes"] = json!({});
+        }
+        reply.body = body.to_string().into_bytes();
+        let api = IntentApiFixture::new(vec![reply]);
+        crate::operator_routing::test_transport_scope(&[&api.origin], async {
+            let response = serde_json::from_value(tokens(120, "user_one")).unwrap();
+            let result = renewal::accept(&api.origin, config(), response, None).await;
+            if valid {
+                let (saved, output) = result.unwrap();
+                let store = MemoryStore::default();
+                renewal::save(&store, &saved).unwrap();
+                assert!(renewal::load(&store, &api.origin).unwrap().is_some());
+                assert_eq!(
+                    output["data"]["service_permissions"],
+                    body["data"]["service_permissions"]
+                );
+                assert!(output["data"].get("scopes").is_none());
+                assert!(!output.to_string().contains("rotated-refresh"));
+                assert!(!output.to_string().contains(".signature"));
+            } else {
+                assert!(result.is_err());
+            }
+            let requests = api.requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].path, "/v1/auth/session");
+            assert!(requests[0].headers["authorization"].starts_with("Bearer ey"));
+            api.assert_complete();
+        })
+        .await;
+    }
 }
 
 #[tokio::test]

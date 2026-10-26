@@ -1,0 +1,3 @@
+- Managed organization membership and service permissions now come from current WorkOS membership and roles. `organization members apply` and local grant patches are removed; use WorkOS for service permissions and applied cluster policies for graph and deployment access. Offboarding now requires `--expected-membership MEMBERSHIP_ID` (or `absent`) instead of `--expected-version`; directory output reports provider observations and service permissions instead of local grants and enrollment. See [managed team administration][provider-service-team].
+
+[provider-service-team]: ../docs/user/cli/managed-team.md
