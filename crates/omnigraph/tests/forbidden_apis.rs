@@ -1053,6 +1053,7 @@ durable_calls! {
     ("omnigraph-storage/scoped.rs", ".complete(", 1, WriteProtocol::Composed("owned multipart publication, never success after uncertain part completion")),
     ("omnigraph-storage/scoped.rs", ".abort(", 1, WriteProtocol::Composed("owned multipart cleanup retained across detached abort")),
     ("engine/operators/memory.rs", ".abort(", 1, WriteProtocol::ReadTaskCancellation),
+    ("db/maintenance.rs", ".abort(", 1, WriteProtocol::Composed("drop a cancelled maintenance task's Lance work, whose effects stay unreachable staging")),
     ("omnigraph-storage/lib.rs", ".rename(", 1, WriteProtocol::Composed("object storage rename primitive")),
     ("storage_layer.rs", ".force_delete_branch(", 1, WriteProtocol::NativeRefControl),
     ("storage_layer.rs", ".commit_staged_create_exact(", 1, WriteProtocol::Exact("sealed TableStorage create forwarding")),
