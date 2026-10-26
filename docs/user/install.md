@@ -157,7 +157,7 @@ http-contract 0.14
   "channel": null,
   "commit": null,
   "http_contract": "0.14",
-  "protocols": { "target": 2, "credential": 2, "access": 2 },
+  "protocols": { "studio": 1, "target": 2, "credential": 2, "access": 2 },
   "internal_schema": {
     "writes": 16,
     "serves": [14, 16]
@@ -188,7 +188,9 @@ with multiple incompatible 0.14 edge grammars, so that number alone cannot
 select one of them. Use protocol 2 for the [current format](cli/targets.md).
 An incompatible change to either contract requires its discovery number to change.
 `protocols.access` identifies the `omnigraph access --json` shape: protocol 2
-uses `actor_id` in place of protocol 1's `actor`.
+uses `actor_id` in place of protocol 1's `actor`. `protocols.studio` identifies
+the [Studio link](cli/studio.md#the-link), `studio --json`, and the `home` and
+`binding` digests `target inspect --json` reports for checking a link.
 `internal_schema.writes` is the storage-format stamp this binary's commits
 write, and `internal_schema.serves` is the inclusive range, lowest first, that
 normal open accepts; `snapshot --json` reports a graph's own stamp as

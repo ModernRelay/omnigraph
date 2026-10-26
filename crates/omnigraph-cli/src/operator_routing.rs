@@ -674,6 +674,11 @@ pub(crate) fn authentication(
     ) {
         return Ok(None);
     }
+    // Handing a server target to another client sends no request: nothing
+    // binds or acquires a credential, and the client obtains its own.
+    if crate::planes::requirement(&cli.command) == crate::planes::Requirement::ServedTarget {
+        return Ok(None);
+    }
     let config = input.get(&mut std::io::sink())?;
     let source = config
         .schema

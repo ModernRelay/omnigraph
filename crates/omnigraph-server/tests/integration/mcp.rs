@@ -5,7 +5,7 @@ use std::task::Poll;
 
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
-use axum::http::{Request, StatusCode};
+use axum::http::{Method, Request, StatusCode};
 use futures::StreamExt as _;
 use omnigraph_server::AppState;
 use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
@@ -204,10 +204,14 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
             "snapshot",
             "access",
             "branches_list",
+            "branches_diff",
+            "branches_merge_base",
             "commits_list",
             "commits_get",
             "commits_changes",
+            "diff",
             "changes_poll",
+            "blobs_stat",
         ]
     );
     for tool in list["result"]["tools"].as_array().unwrap() {
@@ -259,12 +263,21 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
     }
     transition.wait_requests().await.unwrap();
     transition.resume_same_view().unwrap();
+    // The whole catalog, stored mutations included, as the route lists it.
     let catalog = call(&app, &alice, "queries", json!({"graph":"default"})).await;
     let queries = catalog["result"]["structuredContent"]["queries"]
         .as_array()
         .unwrap();
-    assert_eq!(queries.len(), 2, "{catalog}");
-    assert!(queries.iter().all(|q| q["mutation"] == false));
+    assert_eq!(queries.len(), 3, "{catalog}");
+    assert_eq!(
+        queries.iter().filter(|q| q["mutation"] == true).count(),
+        1,
+        "{catalog}"
+    );
+    assert_eq!(
+        catalog["result"]["structuredContent"],
+        http_get(&app, "/graphs/default/queries", &alice).await
+    );
     let denied = call(&app, &bob, "queries", json!({"graph":"default"})).await;
     assert_eq!(denied["result"]["isError"], true);
     assert_eq!(denied["result"]["structuredContent"]["status"], 403);
@@ -634,63 +647,49 @@ async fn instructions(app: &Router, token: &str) -> String {
 async fn mcp_tool_list_follows_the_adhoc_setting_and_describes_every_tool() {
     let mut advertised = std::collections::BTreeSet::new();
     let alice = token("alice", RESOURCE);
+    let reads = |adhoc: bool| {
+        let mut lines = vec![
+            "health [] read_only output",
+            "graphs [] read_only output",
+            "schema [graph] read_only output",
+            "queries [graph] read_only output",
+            "query [graph,name] read_only",
+        ];
+        if adhoc {
+            lines.push("read [graph,query] read_only");
+        }
+        lines.extend([
+            "snapshot [graph] read_only",
+            "access [graph] read_only output",
+            "branches_list [graph] read_only output",
+            "branches_diff [graph,source] read_only",
+            "branches_merge_base [graph,source] read_only",
+            "commits_list [graph] read_only",
+            "commits_get [graph,commit_id] read_only",
+            "commits_changes [graph,commit_id] read_only",
+            "diff [graph,from,to] read_only",
+            "changes_poll [graph] read_only",
+            "blobs_stat [graph,entity,type,id,property] read_only",
+        ]);
+        lines
+    };
+    let mut with_writes = reads(false);
+    with_writes.extend([
+        "mutate [graph]",
+        "load [graph,mode,data]",
+        "blobs_clear [graph,entity,type,id,property]",
+        "branches_create [graph,name]",
+        "branches_delete [graph,name]",
+        "branches_merge [graph,source]",
+        "commits_publish [graph,commit_id]",
+        "commits_drop [graph,commit_id]",
+    ]);
     for (settings, expected) in [
-        (
-            omnigraph_server::McpSettings::default(),
-            vec![
-                "health [] read_only output",
-                "graphs [] read_only output",
-                "schema [graph] read_only output",
-                "queries [graph] read_only output",
-                "query [graph,name] read_only",
-                "snapshot [graph] read_only",
-                "access [graph] read_only output",
-                "branches_list [graph] read_only output",
-                "commits_list [graph] read_only",
-                "commits_get [graph,commit_id] read_only",
-                "commits_changes [graph,commit_id] read_only",
-                "changes_poll [graph] read_only",
-            ],
-        ),
-        (
-            adhoc(),
-            vec![
-                "health [] read_only output",
-                "graphs [] read_only output",
-                "schema [graph] read_only output",
-                "queries [graph] read_only output",
-                "query [graph,name] read_only",
-                "read [graph,query] read_only",
-                "snapshot [graph] read_only",
-                "access [graph] read_only output",
-                "branches_list [graph] read_only output",
-                "commits_list [graph] read_only",
-                "commits_get [graph,commit_id] read_only",
-                "commits_changes [graph,commit_id] read_only",
-                "changes_poll [graph] read_only",
-            ],
-        ),
+        (omnigraph_server::McpSettings::default(), reads(false)),
+        (adhoc(), reads(true)),
         (
             writes(omnigraph_server::McpSettings::default()),
-            vec![
-                "health [] read_only output",
-                "graphs [] read_only output",
-                "schema [graph] read_only output",
-                "queries [graph] read_only output",
-                "query [graph,name] read_only",
-                "snapshot [graph] read_only",
-                "access [graph] read_only output",
-                "branches_list [graph] read_only output",
-                "commits_list [graph] read_only",
-                "commits_get [graph,commit_id] read_only",
-                "commits_changes [graph,commit_id] read_only",
-                "changes_poll [graph] read_only",
-                "mutate [graph,query]",
-                "load [graph,mode,data]",
-                "branches_create [graph,name]",
-                "branches_delete [graph,name]",
-                "branches_merge [graph,source]",
-            ],
+            with_writes,
         ),
     ] {
         let enabled = settings.allow_adhoc;
@@ -1041,6 +1040,30 @@ async fn mcp_read_parity_tools_equal_their_routes() {
         .as_str()
         .unwrap()
         .to_owned();
+    // A branch with two changes of its own, and a proposal awaiting
+    // publication.
+    let insert = "query add($name: String) { insert Person { name: $name, age: 9 } }";
+    for (tool, arguments) in [
+        (
+            "branches_create",
+            json!({"graph":"default","name":"feature"}),
+        ),
+        (
+            "mutate",
+            json!({"graph":"default","branch":"feature","query":insert,"params":{"name":"Fern"}}),
+        ),
+        (
+            "mutate",
+            json!({"graph":"default","branch":"feature","query":insert,"params":{"name":"Gus"}}),
+        ),
+        (
+            "mutate",
+            json!({"graph":"default","query":"query propose() as commit { insert Person { name: \"Pia\", age: 33 } }"}),
+        ),
+    ] {
+        let result = call(&app, "secret", tool, arguments).await;
+        assert_eq!(result["result"]["isError"], false, "{tool}: {result}");
+    }
 
     let health = call(&app, "secret", "health", json!({})).await;
     let (_, native_health) =
@@ -1098,6 +1121,49 @@ async fn mcp_read_parity_tools_equal_their_routes() {
             json!({"graph":"default","start":"beginning","type":["Person"]}),
             "/graphs/default/changes?start=beginning&type=Person".to_string(),
         ),
+        (
+            "commits_list",
+            json!({"graph":"default","listing":"unpublished"}),
+            "/graphs/default/commits?listing=unpublished".to_string(),
+        ),
+        (
+            "commits_list",
+            json!({"graph":"default","branch":"feature","listing":"history"}),
+            "/graphs/default/commits?branch=feature&listing=history".to_string(),
+        ),
+        (
+            "diff",
+            json!({"graph":"default","from":"main","to":"feature"}),
+            "/graphs/default/diff?from=main&to=feature".to_string(),
+        ),
+        (
+            "diff",
+            json!({"graph":"default","from":"feature","to":commit,"kind":["node"],"op":["insert","delete"],"limit":1}),
+            format!(
+                "/graphs/default/diff?from=feature&to={commit}&kind=node&op=insert&op=delete&limit=1"
+            ),
+        ),
+        (
+            "branches_diff",
+            json!({"graph":"default","source":"feature"}),
+            "/graphs/default/branches/diff?source=feature".to_string(),
+        ),
+        (
+            "branches_diff",
+            json!({"graph":"default","source":"feature","target":"main","type":["Person"],"limit":1}),
+            "/graphs/default/branches/diff?source=feature&target=main&type=Person&limit=1"
+                .to_string(),
+        ),
+        (
+            "branches_merge_base",
+            json!({"graph":"default","source":"feature"}),
+            "/graphs/default/branches/merge-base?source=feature".to_string(),
+        ),
+        (
+            "branches_merge_base",
+            json!({"graph":"default","source":"main","target":"feature"}),
+            "/graphs/default/branches/merge-base?source=main&target=feature".to_string(),
+        ),
     ] {
         let result = call(&app, "secret", tool, arguments).await;
         assert_eq!(result["result"]["isError"], false, "{tool}: {result}");
@@ -1112,16 +1178,116 @@ async fn mcp_read_parity_tools_equal_their_routes() {
             "{tool}"
         );
     }
-    // The route's own refusals pass through unchanged.
-    let refused = call(
+    // The proposal is listed as unpublished, so the listing above was not
+    // trivially empty.
+    let unpublished = call(
         &app,
         "secret",
-        "changes_poll",
-        json!({"graph":"default","start":"now","cursor":"x"}),
+        "commits_list",
+        json!({"graph":"default","listing":"unpublished"}),
     )
     .await;
-    assert_eq!(refused["result"]["isError"], true);
-    assert_eq!(refused["result"]["structuredContent"]["status"], 400);
+    assert_eq!(
+        unpublished["result"]["structuredContent"]["commits"][0]["published"], false,
+        "{unpublished}"
+    );
+    // A page continues as the route's continuation does: the branch's two
+    // changes take two pages of one.
+    for (tool, sides) in [
+        ("branches_diff", [("source", "feature"), ("target", "main")]),
+        ("diff", [("from", "main"), ("to", "feature")]),
+    ] {
+        let mut arguments = json!({"graph":"default","limit":1});
+        for (name, value) in sides {
+            arguments[name] = json!(value);
+        }
+        let first = call(&app, "secret", tool, arguments.clone()).await;
+        let token = first["result"]["structuredContent"]["next_page_token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{tool}: {first}"));
+        arguments["page_token"] = json!(token);
+        let next = call(&app, "secret", tool, arguments).await;
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        for (name, value) in sides {
+            query.append_pair(name, value);
+        }
+        let query = query
+            .append_pair("limit", "1")
+            .append_pair("page_token", token)
+            .finish();
+        let route = if tool == "diff" {
+            "diff"
+        } else {
+            "branches/diff"
+        };
+        assert_eq!(
+            next["result"]["structuredContent"],
+            http_get(&app, &format!("/graphs/default/{route}?{query}"), "secret").await,
+            "{tool}"
+        );
+        assert_eq!(
+            next["result"]["structuredContent"]["changes"]
+                .as_array()
+                .map(Vec::len),
+            Some(1),
+            "{tool}: {next}"
+        );
+    }
+
+    // The route's own refusals pass through unchanged: status and body.
+    for (tool, arguments, uri, status) in [
+        (
+            "changes_poll",
+            json!({"graph":"default","start":"now","cursor":"x"}),
+            "/graphs/default/changes?start=now&cursor=x".to_string(),
+            400,
+        ),
+        (
+            "commits_list",
+            json!({"graph":"default","listing":"unpublished","limit":1}),
+            "/graphs/default/commits?listing=unpublished&limit=1".to_string(),
+            400,
+        ),
+        (
+            "diff",
+            json!({"graph":"default","from":"main","to":"missing"}),
+            "/graphs/default/diff?from=main&to=missing".to_string(),
+            404,
+        ),
+        (
+            "branches_diff",
+            json!({"graph":"default","source":"missing"}),
+            "/graphs/default/branches/diff?source=missing".to_string(),
+            404,
+        ),
+        (
+            "branches_merge_base",
+            json!({"graph":"default","source":"feature","target":"missing"}),
+            "/graphs/default/branches/merge-base?source=feature&target=missing".to_string(),
+            404,
+        ),
+    ] {
+        let refused = call(&app, "secret", tool, arguments).await;
+        assert_eq!(refused["result"]["isError"], true, "{tool}: {refused}");
+        let (native_status, native) = json_response(&app, get_request(&uri, "secret")).await;
+        assert_eq!(native_status.as_u16(), status, "{uri}: {native}");
+        assert_eq!(
+            refused["result"]["structuredContent"],
+            json!({"status": status, "error": native}),
+            "{tool}"
+        );
+    }
+    let invalid = call(
+        &app,
+        "secret",
+        "commits_list",
+        json!({"graph":"default","listing":"everything"}),
+    )
+    .await;
+    assert_eq!(
+        invalid["result"]["structuredContent"]["status"], 400,
+        "{invalid}"
+    );
 }
 
 #[tokio::test]
@@ -1255,9 +1421,12 @@ async fn mcp_write_tools_are_opt_in_conditional_and_policy_gated() {
     for write in [
         "mutate",
         "load",
+        "blobs_clear",
         "branches_create",
         "branches_delete",
         "branches_merge",
+        "commits_publish",
+        "commits_drop",
     ] {
         assert!(!names.iter().any(|name| name == write), "{write}");
         let refused = call(&app, "secret", write, json!({"graph":"default"})).await;
@@ -1273,9 +1442,12 @@ async fn mcp_write_tools_are_opt_in_conditional_and_policy_gated() {
     for (name, destructive, idempotent) in [
         ("mutate", true, false),
         ("load", true, false),
+        ("blobs_clear", true, true),
         ("branches_create", false, false),
         ("branches_delete", true, true),
         ("branches_merge", true, false),
+        ("commits_publish", true, true),
+        ("commits_drop", true, true),
     ] {
         let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
         assert_eq!(tool["annotations"]["readOnlyHint"], false, "{name}");
@@ -1467,4 +1639,598 @@ async fn mcp_write_tools_are_opt_in_conditional_and_policy_gated() {
     )
     .await;
     assert_eq!(allowed["result"]["isError"], false, "{allowed}");
+}
+
+const DOCUMENT_SCHEMA: &str = "
+node Document {
+    title: String @key
+    content: Blob?
+}
+";
+
+const DOCUMENTS: &str = r#"{"type":"Document","data":{"title":"readme","content":"base64:SGVsbG8gV29ybGQ="}}
+{"type":"Document","data":{"title":"notes","content":"base64:Tm90ZXM="}}
+{"type":"Document","data":{"title":"empty"}}"#;
+
+/// `default` may do everything the tools below need, `reader` may read and
+/// invoke stored queries but change nothing, `stranger` may do nothing.
+const OPERATIONS_POLICY: &str = r#"version: 1
+groups:
+  writers: ["default"]
+  readers: ["reader"]
+rules:
+  - id: writers-data
+    allow:
+      actors: {group: writers}
+      actions: [read, change, export]
+      branch_scope: any
+  - id: writers-targets
+    allow:
+      actors: {group: writers}
+      actions: [branch_create, branch_delete, branch_merge, commit_publish, commit_drop]
+      target_branch_scope: any
+  - id: writers-invoke
+    allow:
+      actors: {group: writers}
+      actions: [invoke_query]
+  - id: readers-data
+    allow:
+      actors: {group: readers}
+      actions: [read]
+      branch_scope: any
+  - id: readers-invoke
+    allow:
+      actors: {group: readers}
+      actions: [invoke_query]
+"#;
+
+/// The standard graph plus Blob documents, a stored read and a stored
+/// mutation, behind static tokens and [`OPERATIONS_POLICY`].
+async fn operations_app(settings: omnigraph_server::McpSettings) -> (tempfile::TempDir, Router) {
+    let schema = format!(
+        "{}{DOCUMENT_SCHEMA}",
+        std::fs::read_to_string(fixture("test.pg")).unwrap()
+    );
+    let data = format!(
+        "{}\n{DOCUMENTS}",
+        std::fs::read_to_string(fixture("test.jsonl"))
+            .unwrap()
+            .trim_end()
+    );
+    let temp = init_graph_with_schema_and_data(&schema, &data).await;
+    let policy = temp.path().join("policy.yaml");
+    std::fs::write(&policy, OPERATIONS_POLICY).unwrap();
+    let queries = stored_query_registry(&[
+        (
+            "people",
+            "query people() { match { $p: Person } return { $p.name } }",
+            true,
+        ),
+        (
+            "add",
+            "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }",
+            true,
+        ),
+    ]);
+    let tokens = [
+        ("default", "secret"),
+        ("reader", "reader-secret"),
+        ("stranger", "stranger-secret"),
+    ];
+    let state = AppState::open_single_with_queries(
+        graph_path(temp.path()).to_string_lossy().to_string(),
+        tokens
+            .iter()
+            .map(|(actor, token)| ((*actor).to_string(), (*token).to_string()))
+            .collect(),
+        Some(&policy),
+        queries,
+    )
+    .await
+    .unwrap()
+    .with_mcp_settings(settings);
+    (temp, omnigraph_server::build_app(state))
+}
+
+/// One authenticated HTTP request, with extra headers and an optional JSON
+/// body, as the route's own caller sends it.
+fn http_request(
+    method: Method,
+    uri: &str,
+    token: &str,
+    headers: &[(&str, &str)],
+    body: Option<Value>,
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+        .header("authorization", format!("Bearer {token}"));
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    match body {
+        Some(body) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    }
+}
+
+fn blob_uri(id: &str) -> String {
+    format!("/graphs/default/blob?entity=node&type=Document&id={id}&property=content")
+}
+
+fn blob_cell(id: &str) -> Value {
+    json!({"graph":"default","entity":"node","type":"Document","id":id,"property":"content"})
+}
+
+async fn main_head(app: &Router) -> String {
+    http_get(app, "/graphs/default/commits?limit=1", "secret").await["head_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// A refused tool call carries the route's status and error body unchanged.
+fn assert_refusal(result: &Value, status: StatusCode, native: &Value) {
+    assert_eq!(result["result"]["isError"], true, "{result}");
+    assert_eq!(
+        result["result"]["structuredContent"],
+        json!({"status": status.as_u16(), "error": native}),
+    );
+}
+
+/// Blob stat and clear, commit publish and drop, and stored mutations equal
+/// their routes for the same request: the result, the refusal body, the
+/// precondition and the policy decision.
+#[tokio::test]
+async fn mcp_blob_commit_control_and_stored_mutation_tools_equal_their_routes() {
+    let (temp, app) = operations_app(writes(omnigraph_server::McpSettings::default())).await;
+    let graph = graph_path(temp.path());
+
+    // `blobs_stat` is the HEAD answer's headers as `blob stat` JSON.
+    let stat = call(&app, "secret", "blobs_stat", blob_cell("readme")).await;
+    let head = app
+        .clone()
+        .oneshot(http_request(
+            Method::HEAD,
+            &blob_uri("readme"),
+            "secret",
+            &[],
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::OK);
+    let header = |name: &str| head.headers()[name].to_str().unwrap().to_owned();
+    assert_eq!(header("content-length"), "11");
+    assert_eq!(
+        stat["result"]["structuredContent"],
+        json!({
+            "selector": {"entity":"node","type":"Document","id":"readme","property":"content"},
+            "kind": "managed",
+            "size": 11,
+            "etag": header("etag"),
+            "target": {"resolved_snapshot": header("omnigraph-snapshot-id")},
+        }),
+        "{stat}"
+    );
+    let mut on_main = blob_cell("readme");
+    on_main["branch"] = json!("main");
+    let on_main = call(&app, "secret", "blobs_stat", on_main).await;
+    assert_eq!(
+        on_main["result"]["structuredContent"]["target"],
+        json!({"branch": "main", "resolved_snapshot": header("omnigraph-snapshot-id")})
+    );
+    // A null cell and an unknown entity answer what GET and HEAD answer.
+    for id in ["empty", "missing"] {
+        let refused = call(&app, "secret", "blobs_stat", blob_cell(id)).await;
+        let (status, native) = json_response(
+            &app,
+            http_request(Method::GET, &blob_uri(id), "secret", &[], None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {native}");
+        let head = app
+            .clone()
+            .oneshot(http_request(
+                Method::HEAD,
+                &blob_uri(id),
+                "secret",
+                &[],
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(head.status(), status, "{id}");
+        assert_refusal(&refused, status, &native);
+    }
+
+    // `blobs_clear` is `DELETE /blob`: a validator that does not hold is the
+    // route's 412, with nothing written.
+    let before = manifest_dataset_version(&graph).await;
+    let (status, native) = json_response(
+        &app,
+        http_request(
+            Method::DELETE,
+            &blob_uri("readme"),
+            "secret",
+            &[("if-match", "\"stale\"")],
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{native}");
+    let mut stale = blob_cell("readme");
+    stale["if_match"] = json!("\"stale\"");
+    assert_refusal(
+        &call(&app, "secret", "blobs_clear", stale).await,
+        status,
+        &native,
+    );
+    assert_eq!(manifest_dataset_version(&graph).await, before);
+    let mut current = blob_cell("readme");
+    current["if_match"] = stat["result"]["structuredContent"]["etag"].clone();
+    let cleared = call(&app, "secret", "blobs_clear", current).await;
+    assert_eq!(cleared["result"]["isError"], false, "{cleared}");
+    let receipt = &cleared["result"]["structuredContent"];
+    assert_eq!(receipt["kind"], "null", "{cleared}");
+    assert_eq!(receipt["actor_id"], "default", "{cleared}");
+    let cleared_commit = receipt["commit"]["graph_commit_id"].as_str().unwrap();
+    assert_eq!(
+        receipt["commit"],
+        http_get(
+            &app,
+            &format!("/graphs/default/commits/{cleared_commit}"),
+            "secret"
+        )
+        .await
+    );
+    // A null cell publishes nothing: the route and the tool answer one body.
+    let (status, native) = json_response(
+        &app,
+        http_request(Method::DELETE, &blob_uri("readme"), "secret", &[], None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{native}");
+    assert!(native["commit"].is_null(), "{native}");
+    let again = call(&app, "secret", "blobs_clear", blob_cell("readme")).await;
+    assert_eq!(again["result"]["structuredContent"], native);
+
+    // `commits_publish` and `commits_drop` on proposals written `as commit`.
+    let propose = |name: &str| {
+        let app = app.clone();
+        let source = format!(
+            "query propose() as commit {{ insert Person {{ name: \"{name}\", age: 40 }} }}"
+        );
+        async move {
+            let proposed = call(
+                &app,
+                "secret",
+                "mutate",
+                json!({"graph":"default","query":source}),
+            )
+            .await;
+            let commit = &proposed["result"]["structuredContent"]["commit"];
+            assert_eq!(commit["published"], false, "{proposed}");
+            commit["graph_commit_id"].as_str().unwrap().to_owned()
+        }
+    };
+    let proposals = [propose("Pia").await, propose("Quinn").await];
+    let published = call(
+        &app,
+        "secret",
+        "commits_publish",
+        json!({"graph":"default","commit_id":proposals[0]}),
+    )
+    .await;
+    assert_eq!(published["result"]["isError"], false, "{published}");
+    let shown = http_get(
+        &app,
+        &format!("/graphs/default/commits/{}", proposals[0]),
+        "secret",
+    )
+    .await;
+    assert_eq!(shown["published"], true, "{shown}");
+    assert_eq!(published["result"]["structuredContent"], shown);
+    // A published id is answered as it stands, by the route and the tool.
+    let publish_uri = format!("/graphs/default/commits/{}/publish", proposals[0]);
+    let (status, native) = json_response(
+        &app,
+        http_request(Method::POST, &publish_uri, "secret", &[], None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{native}");
+    let republished = call(
+        &app,
+        "secret",
+        "commits_publish",
+        json!({"graph":"default","commit_id":proposals[0]}),
+    )
+    .await;
+    assert_eq!(republished["result"]["structuredContent"], native);
+    let dropped = call(
+        &app,
+        "secret",
+        "commits_drop",
+        json!({"graph":"default","commit_id":proposals[1]}),
+    )
+    .await;
+    assert_eq!(dropped["result"]["isError"], false, "{dropped}");
+    assert_eq!(dropped["result"]["structuredContent"], json!({}));
+    // The dropped id and a published one refuse as their route refuses.
+    for (commit, expected) in [
+        (&proposals[1], StatusCode::NOT_FOUND),
+        (&proposals[0], StatusCode::CONFLICT),
+    ] {
+        let (status, native) = json_response(
+            &app,
+            http_request(
+                Method::DELETE,
+                &format!("/graphs/default/commits/{commit}"),
+                "secret",
+                &[],
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, expected, "{native}");
+        let refused = call(
+            &app,
+            "secret",
+            "commits_drop",
+            json!({"graph":"default","commit_id":commit}),
+        )
+        .await;
+        assert_refusal(&refused, status, &native);
+    }
+
+    // `mutate` with a stored mutation's name and no source is the stored
+    // query route.
+    let stale_head = main_head(&app).await;
+    let added = call(
+        &app,
+        "secret",
+        "mutate",
+        json!({"graph":"default","name":"add","params":{"name":"Rae","age":20}}),
+    )
+    .await;
+    assert_eq!(added["result"]["isError"], false, "{added}");
+    let receipt = added["result"]["structuredContent"].clone();
+    let added_commit = receipt["commit"]["graph_commit_id"].as_str().unwrap();
+    assert_eq!(
+        receipt["commit"],
+        http_get(
+            &app,
+            &format!("/graphs/default/commits/{added_commit}"),
+            "secret"
+        )
+        .await
+    );
+    let (status, native) = json_response(
+        &app,
+        invoke_request(
+            "add",
+            "secret",
+            json!({"params":{"name":"Sol","age":21},"expect_mutation":true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{native}");
+    let without_commit = |mut output: Value| {
+        output["commit"] = Value::Null;
+        output
+    };
+    assert_eq!(without_commit(receipt), without_commit(native));
+    // `if_graph_commit` takes the conditional route, which requires it: a
+    // stale, an empty and an entity-tag value refuse as that route refuses,
+    // and none of them writes unconditionally.
+    let before = manifest_dataset_version(&graph).await;
+    let body = json!({"params":{"name":"Tao","age":22},"expect_mutation":true});
+    for (precondition, expected) in [
+        (stale_head.as_str(), StatusCode::PRECONDITION_FAILED),
+        ("", StatusCode::BAD_REQUEST),
+        ("W/\"etag\"", StatusCode::BAD_REQUEST),
+    ] {
+        let (status, native) = json_response(
+            &app,
+            http_request(
+                Method::POST,
+                "/graphs/default/queries/add/if-graph-commit",
+                "secret",
+                &[("omnigraph-if-graph-commit", precondition)],
+                Some(body.clone()),
+            ),
+        )
+        .await;
+        assert_eq!(status, expected, "{precondition:?}: {native}");
+        let refused = call(
+            &app,
+            "secret",
+            "mutate",
+            json!({"graph":"default","name":"add","params":{"name":"Tao","age":22},"if_graph_commit":precondition}),
+        )
+        .await;
+        assert_refusal(&refused, status, &native);
+    }
+    assert_eq!(manifest_dataset_version(&graph).await, before);
+    let conditional = call(
+        &app,
+        "secret",
+        "mutate",
+        json!({"graph":"default","name":"add","params":{"name":"Tao","age":22},"if_graph_commit":main_head(&app).await}),
+    )
+    .await;
+    assert_eq!(conditional["result"]["isError"], false, "{conditional}");
+    // A stored read is not a mutation, and `mutate` needs source or a name.
+    let (status, native) = json_response(
+        &app,
+        invoke_request("people", "secret", json!({"expect_mutation":true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{native}");
+    let refused = call(
+        &app,
+        "secret",
+        "mutate",
+        json!({"graph":"default","name":"people"}),
+    )
+    .await;
+    assert_refusal(&refused, status, &native);
+    let nameless = call(&app, "secret", "mutate", json!({"graph":"default"})).await;
+    assert_eq!(
+        nameless["result"]["structuredContent"]["status"], 400,
+        "{nameless}"
+    );
+
+    // Policy decides each tool exactly as it decides the route. The proposal
+    // is live, written at main's current head, so its 404 is the denial's.
+    let pending = propose("Uma").await;
+    let pending = pending.as_str();
+    let head = main_head(&app).await;
+    let before = manifest_dataset_version(&graph).await;
+    let stored_add = json!({"params":{"name":"Vic","age":23},"expect_mutation":true});
+    let add_arguments = json!({"graph":"default","name":"add","params":{"name":"Vic","age":23}});
+    let mut conditional_add = add_arguments.clone();
+    conditional_add["if_graph_commit"] = json!(head);
+    let publish_uri = format!("/graphs/default/commits/{pending}/publish");
+    let drop_uri = format!("/graphs/default/commits/{pending}");
+    let get = |uri: &str, token: &str| http_request(Method::GET, uri, token, &[], None);
+    for (token, tool, arguments, request, expected) in [
+        (
+            "stranger-secret",
+            "diff",
+            json!({"graph":"default","from":"main","to":"main"}),
+            get("/graphs/default/diff?from=main&to=main", "stranger-secret"),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "stranger-secret",
+            "branches_diff",
+            json!({"graph":"default","source":"main"}),
+            get(
+                "/graphs/default/branches/diff?source=main",
+                "stranger-secret",
+            ),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "stranger-secret",
+            "branches_merge_base",
+            json!({"graph":"default","source":"main"}),
+            get(
+                "/graphs/default/branches/merge-base?source=main",
+                "stranger-secret",
+            ),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "stranger-secret",
+            "commits_list",
+            json!({"graph":"default","listing":"unpublished"}),
+            get(
+                "/graphs/default/commits?listing=unpublished",
+                "stranger-secret",
+            ),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "stranger-secret",
+            "blobs_stat",
+            blob_cell("notes"),
+            get(&blob_uri("notes"), "stranger-secret"),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "reader-secret",
+            "blobs_clear",
+            blob_cell("notes"),
+            http_request(
+                Method::DELETE,
+                &blob_uri("notes"),
+                "reader-secret",
+                &[],
+                None,
+            ),
+            StatusCode::FORBIDDEN,
+        ),
+        // A denied commit control is the 404 of an unknown id.
+        (
+            "reader-secret",
+            "commits_publish",
+            json!({"graph":"default","commit_id":pending}),
+            http_request(Method::POST, &publish_uri, "reader-secret", &[], None),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "reader-secret",
+            "commits_drop",
+            json!({"graph":"default","commit_id":pending}),
+            http_request(Method::DELETE, &drop_uri, "reader-secret", &[], None),
+            StatusCode::NOT_FOUND,
+        ),
+        // `invoke_query` without `change`: the inner gate's 403.
+        (
+            "reader-secret",
+            "mutate",
+            add_arguments.clone(),
+            http_request(
+                Method::POST,
+                "/graphs/default/queries/add",
+                "reader-secret",
+                &[],
+                Some(stored_add.clone()),
+            ),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "reader-secret",
+            "mutate",
+            conditional_add,
+            http_request(
+                Method::POST,
+                "/graphs/default/queries/add/if-graph-commit",
+                "reader-secret",
+                &[("omnigraph-if-graph-commit", &head)],
+                Some(stored_add.clone()),
+            ),
+            StatusCode::FORBIDDEN,
+        ),
+        // Without `invoke_query`, a stored mutation is the 404 of a missing one.
+        (
+            "stranger-secret",
+            "mutate",
+            add_arguments,
+            http_request(
+                Method::POST,
+                "/graphs/default/queries/add",
+                "stranger-secret",
+                &[],
+                Some(stored_add),
+            ),
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let (status, native) = json_response(&app, request).await;
+        assert_eq!(status, expected, "{tool} as {token}: {native}");
+        let refused = call(&app, token, tool, arguments).await;
+        assert_refusal(&refused, status, &native);
+    }
+    assert_eq!(manifest_dataset_version(&graph).await, before);
+    let unpublished = http_get(
+        &app,
+        "/graphs/default/commits?listing=unpublished",
+        "secret",
+    )
+    .await;
+    assert!(
+        unpublished["commits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|commit| commit["graph_commit_id"] == pending),
+        "a denied control leaves the proposal in place: {unpublished}"
+    );
 }

@@ -118,6 +118,7 @@ pub(crate) fn kind(cli: &Cli) -> Option<CommandKind> {
         | Command::Config { .. }
         | Command::Credential { .. }
         | Command::Mcp(_)
+        | Command::Studio(_)
         | Command::Skill { .. }
         | Command::Version { .. } => None,
     }

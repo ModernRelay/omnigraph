@@ -36,6 +36,7 @@ pub(in crate::engine) struct QueryResources {
     pool: Arc<dyn MemoryPool>,
     limit: u64,
     probes: Option<crate::instrumentation::QueryMemoryProbes>,
+    read_seams: crate::instrumentation::ExternalReadSeams,
     buffers: Mutex<BufferRegistry>,
     registry_memory: MemoryReservation,
     traversal: TraversalWork,
@@ -135,6 +136,7 @@ impl QueryResources {
             pool,
             limit,
             probes: crate::instrumentation::current_query_memory_probes(),
+            read_seams: crate::instrumentation::capture_external_read_seams(),
             buffers: Mutex::new(BufferRegistry::default()),
             traversal: TraversalWork::new(traversal_limit),
             work,
@@ -327,9 +329,13 @@ impl WorkMemory {
         let cancellation = self.cancel_on_drop();
         let memory = Arc::clone(self);
         let io_probes = crate::instrumentation::capture_query_io_probes();
+        let read_seams = self.resources.read_seams.clone();
         let memory_probes = self.resources.probes.clone();
         let mut work = Box::pin(async move {
-            let body = body(memory);
+            let body = crate::instrumentation::with_external_read_seams(
+                read_seams,
+                Box::pin(body(memory)),
+            );
             let observed = async move {
                 match io_probes {
                     Some(probes) => {
@@ -508,6 +514,17 @@ impl WorkMemory {
             .inspect_err(|_| self.resources.refused(&self.name))
     }
 
+    /// Raise this work's charge to `bytes` where it is lower; a charge already
+    /// at or above `bytes` grows nothing.
+    pub(in crate::engine) fn ensure(&self, bytes: usize) -> DfResult<()> {
+        let held = self.scratch.size();
+        if bytes > held {
+            self.grow(bytes - held)
+        } else {
+            self.check()
+        }
+    }
+
     /// `grow` for a charge the caller does without when the pool refuses it:
     /// `false` then, with no refusal recorded, since the query goes on.
     pub(in crate::engine) fn grow_if_free(&self, bytes: usize) -> DfResult<bool> {
@@ -525,11 +542,12 @@ impl WorkMemory {
     /// Reserve conservative capacity for collection entries, including element
     /// storage, growth and hash-table overhead.
     pub(in crate::engine) fn entries<T>(&self, count: usize) -> DfResult<()> {
-        self.grow(
-            count
-                .saturating_mul(std::mem::size_of::<T>().saturating_add(1))
-                .saturating_mul(4),
-        )
+        self.grow(count.saturating_mul(Self::entry_bytes::<T>()))
+    }
+
+    /// What [`Self::entries`] charges per entry of `T`.
+    pub(in crate::engine) fn entry_bytes<T>() -> usize {
+        std::mem::size_of::<T>().saturating_add(1).saturating_mul(4)
     }
 
     pub(in crate::engine) fn string(&self, bytes: usize) -> DfResult<()> {

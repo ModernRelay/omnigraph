@@ -76,6 +76,9 @@ pub struct Case {
     /// The harness-only traversal setting; any header requests index preparation.
     /// `auto` retains cost selection, while `indexed` and `csr` check the forced path.
     traversal: Option<&'static str>,
+    /// The `# csv_slice_bytes:` pin: the bytes one `load csv` parse partition
+    /// owns and the slice it reads at once, so a small source cuts partitions.
+    csv_slice_bytes: Option<usize>,
     pub items: Vec<Item>,
     pub needs_indices: bool,
     /// `--- csv <name>` sections: the CSV text a `load csv "<name>"` step
@@ -571,6 +574,7 @@ struct BodySpan {
 struct Header {
     issue: IssueRef,
     traversal: Option<&'static str>,
+    csv_slice_bytes: Option<usize>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -579,8 +583,8 @@ enum IssueRef {
     Num(u64),
 }
 
-/// The four header keys, in the spelling the canonical form requires.
-const HEADER_KEYS: [&str; 4] = ["issue", "red_on", "notes", "traversal"];
+/// The five header keys, in the spelling the canonical form requires.
+const HEADER_KEYS: [&str; 5] = ["issue", "red_on", "notes", "traversal", "csv_slice_bytes"];
 
 /// Canonical spelling for one header key and its trimmed value.
 fn canonical_header_line(key: &str, value: &str) -> String {
@@ -618,6 +622,7 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
     let mut issue: Option<IssueRef> = None;
     let mut red_on = false;
     let mut traversal: Option<&'static str> = None;
+    let mut csv_slice_bytes: Option<usize> = None;
     for (idx, line) in lines.iter().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -633,6 +638,7 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
             "issue" => issue.is_some(),
             "red_on" => red_on,
             "traversal" => traversal.is_some(),
+            "csv_slice_bytes" => csv_slice_bytes.is_some(),
             _ => false,
         };
         if duplicate {
@@ -670,6 +676,19 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
                     }
                 });
             }
+            "csv_slice_bytes" => {
+                let bytes = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|bytes| *bytes > 0 && value == bytes.to_string())
+                    .ok_or_else(|| {
+                        format!(
+                            "line {}: `# csv_slice_bytes:` takes a positive byte count without sign or leading zeros, got `{value}`",
+                            idx + 1
+                        )
+                    })?;
+                csv_slice_bytes = Some(bytes);
+            }
             other => unreachable!("split_header_line admits only HEADER_KEYS, got `{other}`"),
         }
     }
@@ -679,7 +698,11 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
     if matches!(issue, IssueRef::Num(_)) && !red_on {
         return Err("`# red_on:` is required when `# issue:` names a number".into());
     }
-    Ok(Header { issue, traversal })
+    Ok(Header {
+        issue,
+        traversal,
+        csv_slice_bytes,
+    })
 }
 
 fn check_file_name(stem: &str, issue: &IssueRef) -> Result<(), String> {
@@ -2824,6 +2847,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         source_lines,
         fixture,
         traversal: header.traversal,
+        csv_slice_bytes: header.csv_slice_bytes,
         items,
         needs_indices,
         csv_sections,
@@ -4287,7 +4311,11 @@ pub fn execute_steps<'a, H: ExecutionHost>(
     storage: Option<Arc<dyn StorageAdapter>>,
     host: &'a H,
 ) -> futures::future::BoxFuture<'a, Result<Session, String>> {
-    execute_steps_inner(case, path, bless, session, uri, storage, host).boxed()
+    let steps = execute_steps_inner(case, path, bless, session, uri, storage, host);
+    match case.csv_slice_bytes {
+        Some(bytes) => omnigraph::instrumentation::with_csv_slice_bytes(bytes, steps).boxed(),
+        None => steps.boxed(),
+    }
 }
 
 async fn execute_steps_inner<H: ExecutionHost>(

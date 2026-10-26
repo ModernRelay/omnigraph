@@ -799,6 +799,9 @@ pub struct LoadSliceExecutedOutput {
     pub rows: u64,
     /// Nanoseconds the slice's parse and normalization took.
     pub elapsed_compute_ns: u64,
+    /// Nanoseconds the slice's partition waited for the source's bytes.
+    #[serde(default)]
+    pub read_ns: u64,
     /// Nanoseconds after the source's first poll at which the slice was
     /// claimed.
     pub start_ns: u64,
@@ -2983,6 +2986,7 @@ pub fn load_executed_output(executed: &LoadExecuted) -> LoadExecutedOutput {
                             partition: slice.partition,
                             rows: slice.rows,
                             elapsed_compute_ns: slice.elapsed_compute_ns,
+                            read_ns: slice.read_ns,
                             start_ns: slice.start_ns,
                             end_ns: slice.end_ns,
                         })
@@ -3957,6 +3961,7 @@ mod tests {
                     partition: 0,
                     rows: 2,
                     elapsed_compute_ns: 10,
+                    read_ns: 0,
                     start_ns: 1,
                     end_ns: 30,
                 }],
@@ -3971,7 +3976,8 @@ mod tests {
                                "rows": 2, "elapsed_compute_ns": 12, "wall_ns": 34,
                                "partitions": 1,
                                "slices": [{"slice": 0, "partition": 0, "rows": 2,
-                                           "elapsed_compute_ns": 10, "start_ns": 1, "end_ns": 30}]}]
+                                           "elapsed_compute_ns": 10, "read_ns": 0,
+                                           "start_ns": 1, "end_ns": 30}]}]
             }
         });
         let decoded: ChangeOutput = serde_json::from_value(change.clone()).unwrap();
