@@ -2606,6 +2606,71 @@ fn merge_history_cost_rows(replay: &str) -> String {
     rows
 }
 
+/// The bounded optimizer adds only accepted-input inventory reads; keep their
+/// cost separate from the legacy direct Optimize row.
+fn bounded_optimize_cost_rows(replay: &str) -> String {
+    struct BoundedOptimizeCost;
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for BoundedOptimizeCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_bounded_optimize_setup");
+            let db = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::init_with_storage(
+                        &resources.root,
+                        TEST_SCHEMA,
+                        resources.adapter.clone(),
+                        InitOptions::default(),
+                    )
+                    .await
+                    .unwrap(),
+                ),
+                SessionSettings::default(),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+            for (name, age) in [("Eve", 34), ("Frank", 35)] {
+                db.mutate(
+                    "main",
+                    MUTATION_QUERIES,
+                    "insert_person",
+                    &mixed_params(&[("$name", name)], &[("$age", age)]),
+                )
+                .await
+                .unwrap();
+            }
+            let detached = db.detach();
+            let db = detached.attach(Arc::new(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap(),
+            ));
+            let limits = omnigraph::db::OptimizeLimits {
+                max_tables: 16,
+                max_fragments: 1024,
+                max_rows: 100_000,
+                max_source_bytes: 64 * 1024 * 1024,
+                max_files: 4096,
+            };
+            omnigraph_dst::cost::set_label("BoundedOptimize");
+            let report = db.optimize_with_limits_as(&limits, None).await.unwrap();
+            omnigraph_dst::cost::set_label("_bounded_optimize_verify");
+            assert!(report.source_rows > 0);
+            assert_ne!(report.before_commit, report.after_commit);
+            assert_eq!(person_rows_on(&db, "main").await.len(), 6);
+        }
+    }
+    labeled_cost_rows(
+        format!("shared-memory://dst-bounded-optimize-{replay}"),
+        &BoundedOptimizeCost,
+        "BoundedOptimize",
+    )
+}
+
 fn labeled_cost_rows<S>(root: String, scenario: &S, label: &str) -> String
 where
     S: omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage, Output = ()>,
@@ -3339,6 +3404,7 @@ fn dst_bench_cost_count_golden() {
     table.push_str(&writer_buffer_cost_rows("a"));
     table.push_str(&overwrite_removal_cost_rows("a"));
     table.push_str(&endpoint_probe_cost_rows("a"));
+    table.push_str(&bounded_optimize_cost_rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-b", &sc);
     let mut table2 = ledger2.render_calls();
@@ -3350,6 +3416,7 @@ fn dst_bench_cost_count_golden() {
     table2.push_str(&writer_buffer_cost_rows("b"));
     table2.push_str(&overwrite_removal_cost_rows("b"));
     table2.push_str(&endpoint_probe_cost_rows("b"));
+    table2.push_str(&bounded_optimize_cost_rows("b"));
     assert_eq!(
         table, table2,
         "the counting pass must replay identically before any golden claim"

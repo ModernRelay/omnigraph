@@ -2828,7 +2828,7 @@ impl TableStore {
 
     /// The partition count Lance reports for a vector index, or one when the
     /// statistics do not name it.
-    async fn vector_partition_count(ds: &Dataset, name: &str) -> usize {
+    async fn vector_partition_count(ds: &Dataset, name: &str) -> Result<usize> {
         fn first_num_partitions(value: &serde_json::Value) -> Option<usize> {
             match value {
                 serde_json::Value::Object(map) => map
@@ -2840,13 +2840,16 @@ impl TableStore {
                 _ => None,
             }
         }
-        ds.index_statistics(name)
+        let statistics = ds
+            .index_statistics(name)
             .await
-            .ok()
-            .and_then(|stats| serde_json::from_str::<serde_json::Value>(&stats).ok())
-            .and_then(|stats| first_num_partitions(&stats))
+            .map_err(OmniError::storage)?;
+        let statistics: serde_json::Value = serde_json::from_str(&statistics).map_err(|error| {
+            OmniError::manifest_internal(format!("invalid vector index statistics: {error}"))
+        })?;
+        Ok(first_num_partitions(&statistics)
             .filter(|partitions| *partitions >= 1)
-            .unwrap_or(1)
+            .unwrap_or(1))
     }
 
     async fn foldable_index_lag(ds: &Dataset) -> Result<Vec<IndexLag>> {
@@ -2896,8 +2899,9 @@ impl TableStore {
     /// merges the delta and previous segments through a crate-private path
     /// and commits linearly; this rebuilds each lagging index whole under its
     /// name with the public builder, which leaves the same single segment
-    /// Lance's merge would. A vector index the builder cannot train (a column
-    /// with no non-null rows) is skipped and reported by column.
+    /// Lance's merge would. A vector column with no non-null rows is deferred
+    /// before building. Actual builder failures
+    /// propagate, because an I/O failure can follow partial artifact writes.
     pub async fn stage_index_fold(&self, ds: &Dataset) -> Result<StagedIndexFold> {
         let lag = Self::foldable_index_lag(ds).await?;
         if lag.is_empty() {
@@ -2920,10 +2924,22 @@ impl TableStore {
             let mut ds_clone = ds.clone();
             let columns = [column.as_str()];
             let built = if item.vector {
-                // Keep the index's partition count: the engine builds one
-                // partition, but a partitioned index (Lance's split, or an
-                // explicit build) keeps its shape across folds.
-                let partitions = Self::vector_partition_count(ds, &item.name).await;
+                let mut scanner = ds.scan();
+                scanner.filter_expr(
+                    Expr::Column(datafusion::common::Column::new_unqualified(&column))
+                        .is_not_null(),
+                );
+                let rows = scanner.count_rows().await.map_err(OmniError::storage)?;
+                if rows == 0 {
+                    skipped.push((
+                        column,
+                        crate::db::PendingIndex::NO_VECTORS_REASON.to_string(),
+                    ));
+                    continue;
+                }
+                // Request the existing partition count. Lance alone reduces
+                // it when fewer trainable vectors remain after deletions.
+                let partitions = Self::vector_partition_count(ds, &item.name).await?;
                 let params =
                     lance::index::vector::VectorIndexParams::ivf_flat(partitions, MetricType::L2);
                 ds_clone
@@ -2943,16 +2959,6 @@ impl TableStore {
             };
             let new_idx = match built {
                 Ok(index) => index,
-                Err(error) if item.vector => {
-                    tracing::warn!(
-                        index = item.name.as_str(),
-                        column = column.as_str(),
-                        error = %error,
-                        "vector index fold skipped: the column cannot train an index"
-                    );
-                    skipped.push((column, error.to_string()));
-                    continue;
-                }
                 Err(error) => {
                     return Err(OmniError::storage_context(
                         format!("stage_index_fold: fold index '{}' on '{column}'", item.name),
@@ -4388,6 +4394,76 @@ impl TableStore {
             staged: StagedWrite::new(transaction, new_fragments, removed_fragment_ids),
             metrics,
         }))
+    }
+
+    /// Conservative managed Blob source inventory, without reading payloads.
+    /// One nonempty descriptor is charged as one source reference, even when
+    /// several descriptors share a packed file. External references are not
+    /// hydrated by compaction and do not charge unrelated external objects.
+    pub(crate) async fn managed_blob_source_size(
+        ds: &Dataset,
+        max_bytes: u64,
+        max_files: u64,
+    ) -> Result<(u64, u64)> {
+        if nested_blob_field(ds.schema()).is_some()
+            || ds
+                .schema()
+                .fields
+                .iter()
+                .any(|field| field.is_blob() && !field.is_blob_v2())
+        {
+            return Err(OmniError::manifest(
+                "bounded optimize cannot account for nested or non-v2 Blob fields",
+            ));
+        }
+        let columns = ds
+            .schema()
+            .fields
+            .iter()
+            .filter(|field| field.is_blob())
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        if columns.is_empty() {
+            return Ok((0, 0));
+        }
+        let mut stream = Self::scan_stream_with(ds, Some(&columns), None, None, false, |scanner| {
+            scanner.batch_size(1024);
+            Ok(())
+        })
+        .await?;
+        let mut bytes = 0_u64;
+        let mut files = 0_u64;
+        while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+            for column in batch.columns() {
+                let descriptions = column
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .ok_or_else(|| OmniError::blob_integrity("expected Blob descriptions"))?;
+                let decoder = BlobDescriptorDecoder::try_new(descriptions)?;
+                for row in 0..batch.num_rows() {
+                    if let BlobDescriptor::Managed { length } = decoder.classify(row)? {
+                        bytes = bytes.checked_add(length).ok_or_else(|| {
+                            OmniError::manifest("optimize Blob byte count overflow")
+                        })?;
+                        files = files.checked_add(u64::from(length > 0)).ok_or_else(|| {
+                            OmniError::manifest("optimize Blob reference count overflow")
+                        })?;
+                        for (name, actual, limit) in
+                            [("bytes", bytes, max_bytes), ("files", files, max_files)]
+                        {
+                            if actual > limit {
+                                return Err(OmniError::ResourceLimitExceeded {
+                                    resource: format!("optimize_blob_source_{name}"),
+                                    limit,
+                                    actual,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok((bytes, files))
     }
 
     /// Most managed Blob bytes in one row of `fragments`, from descriptors (externals count
@@ -7222,6 +7298,111 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
         let col = Arc::new(StringArray::from(ids.to_vec())) as ArrayRef;
         RecordBatch::try_new(schema, vec![col]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn vector_fold_defers_untrainable_input_but_propagates_storage_failure() {
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+
+        for case in ["storage-failure", "empty", "reduced"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().to_str().unwrap();
+            let uri = format!("{root}/vectors");
+            let batch = |vectors: &[Option<[f32; 2]>]| {
+                let mut values = FixedSizeListBuilder::new(Float32Builder::new(), 2);
+                for vector in vectors {
+                    values.values().append_slice(&vector.unwrap_or([0.0; 2]));
+                    values.append(vector.is_some());
+                }
+                let values = values.finish();
+                let schema = Arc::new(Schema::new(vec![Field::new(
+                    "embedding",
+                    values.data_type().clone(),
+                    true,
+                )]));
+                RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap()
+            };
+            let initial = batch(&[
+                Some([1.0, 2.0]),
+                Some([3.0, 4.0]),
+                Some([5.0, 6.0]),
+                Some([7.0, 8.0]),
+            ]);
+            let reader =
+                arrow_array::RecordBatchIterator::new(vec![Ok(initial.clone())], initial.schema());
+            let mut dataset = Dataset::write(reader, &uri, None).await.unwrap();
+            dataset
+                .create_index_builder(
+                    &["embedding"],
+                    IndexType::Vector,
+                    &lance::index::vector::VectorIndexParams::ivf_flat(4, MetricType::L2),
+                )
+                .await
+                .unwrap();
+            if case == "empty" {
+                dataset.delete("true").await.unwrap();
+            } else if case == "reduced" {
+                dataset.delete("embedding[1] < 7").await.unwrap();
+                assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
+            }
+            let appended = batch(&[(case != "empty").then_some([9.0, 10.0])]);
+            let reader = arrow_array::RecordBatchIterator::new(
+                vec![Ok(appended.clone())],
+                appended.schema(),
+            );
+            let dataset = Dataset::write(
+                reader,
+                &uri,
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(
+                TableStore::has_foldable_unindexed_fragments(&dataset)
+                    .await
+                    .unwrap()
+            );
+            let version = dataset.version().version;
+            if case == "storage-failure" {
+                // Preserve the exact input manifests but make the native index
+                // path unusable. A genuine storage error must not be reported
+                // as an untrainable column with a successful optimization.
+                let indices = dir.path().join("vectors/_indices");
+                std::fs::rename(&indices, dir.path().join("retained-indices")).unwrap();
+                std::fs::write(indices, b"not a directory").unwrap();
+            }
+            let store = TableStore::new(root, Arc::new(lance::session::Session::default()));
+            let result = store.stage_index_fold(&dataset).await;
+            if case == "storage-failure" {
+                assert!(
+                    result.is_err(),
+                    "storage failure must propagate, never become pending"
+                );
+            } else if case == "empty" {
+                let result = result.unwrap();
+                assert!(result.staged.is_none());
+                assert_eq!(result.skipped.len(), 1);
+                assert_eq!(result.skipped[0].0, "embedding");
+                assert_eq!(
+                    result.skipped[0].1,
+                    "property has no non-null vectors to train on yet"
+                );
+            } else {
+                let result = result.unwrap();
+                assert!(
+                    result.staged.is_some(),
+                    "Lance must fold with its reduced partition count"
+                );
+                assert!(result.skipped.is_empty());
+            }
+            assert_eq!(
+                Dataset::open(&uri).await.unwrap().version().version,
+                version
+            );
+        }
     }
 
     #[tokio::test]

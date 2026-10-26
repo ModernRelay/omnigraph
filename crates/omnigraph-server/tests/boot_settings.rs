@@ -79,6 +79,9 @@ async fn deployment_routes_refuse_with_the_error_body() {
         (Method::GET, "/cluster/deployments/some-id"),
         (Method::POST, "/cluster/plan"),
         (Method::POST, "/cluster/deployments"),
+        (Method::GET, "/cluster/maintenance?graph=knowledge"),
+        (Method::GET, "/cluster/maintenance/some-id?graph=knowledge"),
+        (Method::POST, "/cluster/maintenance"),
     ] {
         let (status, body) = json_response(
             &open,
@@ -1539,7 +1542,9 @@ mod owned_shutdown {
                 .env(MODE, mode)
                 .env(
                     "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
-                    if mode.starts_with("startup-") {
+                    if mode.starts_with("maintenance-") {
+                        r#"{"operator":"operator-token","reader":"reader-token"}"#
+                    } else if mode.starts_with("startup-") {
                         r#"{"startup-operator":"startup-secret"}"#
                     } else if mode == "v2-finish" {
                         r#"{"restart-operator":"restart-secret"}"#
@@ -1550,6 +1555,13 @@ mod owned_shutdown {
                 .env_remove("OMNIGRAPH_SERVER_BEARER_TOKEN")
                 .env_remove("OMNIGRAPH_SERVER_BEARER_TOKENS_FILE")
                 .env_remove("OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET")
+                .env_remove("OMNIGRAPH_MAINTENANCE_CONFIG")
+                .envs(mode.starts_with("maintenance-").then(|| {
+                    (
+                        "OMNIGRAPH_MAINTENANCE_CONFIG",
+                        root.join("maintenance.yaml"),
+                    )
+                }))
                 .env("OMNIGRAPH_PER_ACTOR_INFLIGHT_MAX", "1")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
@@ -1675,6 +1687,49 @@ mod owned_shutdown {
             return;
         };
         let mode = std::env::var(MODE).unwrap();
+        if mode.starts_with("maintenance-") {
+            let mut config = omnigraph_server::load_server_settings(
+                Some(&root),
+                Some("127.0.0.1:0".into()),
+                false,
+                true,
+            )
+            .await
+            .unwrap();
+            config.shutdown_grace = if mode == "maintenance-cutoff" {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(10)
+            };
+            let seam = if mode == "maintenance-after-publication" {
+                &omnigraph::seams::catalog::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT
+            } else {
+                &omnigraph::seams::catalog::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT
+            };
+            let (_guard, hold) = seam.hold();
+            let control_root = root.clone();
+            std::thread::spawn(move || {
+                hold.wait_until_reached();
+                fs::write(control_root.join("maintenance-held"), b"held").unwrap();
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while !control_root.join("release").exists() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                hold.release();
+            });
+            let signal_root = root.clone();
+            let mut terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+            tokio::spawn(async move {
+                terminate.recv().await.unwrap();
+                fs::write(signal_root.join("signal-observed"), b"observed").unwrap();
+            });
+            let result = omnigraph_server::serve(config).await;
+            if let Err(error) = &result {
+                eprintln!("maintenance shutdown refused: {error:?}");
+            }
+            std::process::exit(if result.is_ok() { 0 } else { 2 });
+        }
         if mode.starts_with("startup-") {
             let mut config = server_config(
                 &root,
@@ -2328,6 +2383,337 @@ mod owned_shutdown {
         );
     }
 
+    async fn optimization_disconnect_and_shutdown(mode: &str) {
+        let temp = converged_cluster_dir("").await;
+        let root = temp.path();
+        fs::write(root.join("maintenance-policy.yaml"), "version: 1\ngroups:\n  operators: [operator]\n  readers: [reader]\nrules:\n  - id: optimize\n    allow:\n      actors: {group: operators}\n      actions: [optimize, read, change]\n  - id: read\n    allow:\n      actors: {group: readers}\n      actions: [read]\n").unwrap();
+        let mut config = fs::read_to_string(root.join("cluster.yaml")).unwrap();
+        config.push_str("\npolicies:\n  maintenance:\n    file: ./maintenance-policy.yaml\n    applies_to: [knowledge]\n");
+        fs::write(root.join("cluster.yaml"), config).unwrap();
+        apply_cluster_fixture(root).await;
+        fs::write(root.join("maintenance.yaml"), "max_tables: 100\nmax_fragments: 1000\nmax_rows: 100000\nmax_source_bytes: 134217728\nmax_files: 10000\n").unwrap();
+        let graph = root.join("graphs/knowledge.omni");
+        let before = {
+            let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
+            for name in ["Ada", "Grace", "Barbara", "Edsger"] {
+                db.load_jsonl(
+                    &serde_json::json!({"type":"Person","data":{"name":name}}).to_string(),
+                    omnigraph::loader::LoadMode::Append,
+                )
+                .await
+                .unwrap();
+            }
+            db.list_commits(None).await.unwrap()[0]
+                .graph_commit_id
+                .clone()
+        };
+        let authority = fs::read(root.join("__cluster/state.json")).unwrap();
+        let (mut child, address, output_thread) = spawn_owned_child(root, mode);
+        wait_ready(&address, &mut child.0, "serving").await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let get = |path: String| {
+            client
+                .get(format!("http://{address}{path}"))
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .bearer_auth("operator-token")
+        };
+        let status: Value = get("/cluster/maintenance?graph=knowledge".into())
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let native_status: omnigraph_cluster::MaintenanceStatus =
+            serde_json::from_value(status["status"].clone()).unwrap();
+        let id = native_status.next_operation_id();
+        let body = serde_json::json!({"operation_id":id,"graph":"knowledge","kind":"optimize","limits":status["limits"]});
+        let body_text = body.to_string();
+        let mut socket = TcpStream::connect(&address).unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        write!(socket, "POST /cluster/maintenance HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nAuthorization: Bearer operator-token\r\nContent-Type: application/json\r\n{HTTP_API_CONTRACT_HEADER}: {HTTP_API_CONTRACT}\r\nContent-Length: {}\r\n\r\n{body_text}", body_text.len()).unwrap();
+        socket.flush().unwrap();
+        wait_marker(&root.join("maintenance-held"), &mut child.0);
+        // Drop the transport without reading its acceptance response.
+        drop(socket);
+        let path = format!("/cluster/maintenance/{id}?graph=knowledge");
+        let pending: Value = get(path.clone())
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(pending["maintenance"]["status"], "outstanding", "{pending}");
+        assert_eq!(pending["in_progress"], true);
+        let duplicate: Value = client
+            .post(format!("http://{address}/cluster/maintenance"))
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .bearer_auth("operator-token")
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(duplicate, pending, "duplicate delivery is observation only");
+        if mode != "maintenance-after-publication" {
+            // Reads proceed while detached effects await publication. The other case
+            // freezes the publication's coordinator critical section, where
+            // a newly captured snapshot may wait for atomic publication.
+            let read: Value = client.post(format!("http://{address}/graphs/knowledge/query"))
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT).bearer_auth("reader-token")
+                .json(&serde_json::json!({"query":"query names() { match { $p: Person } return { $p.name } }","name":"names"}))
+                .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+            for name in ["Ada", "Grace", "Barbara", "Edsger"] {
+                assert!(
+                    read.to_string().contains(name),
+                    "read blocked or changed while optimizing: {read}"
+                );
+            }
+        }
+        let lock = fs::read(root.join("__cluster/lock.json")).unwrap();
+        let signal = if mode == "maintenance-after-publication" {
+            libc::SIGKILL
+        } else {
+            libc::SIGTERM
+        };
+        assert_eq!(
+            unsafe { libc::kill(child.0.id() as libc::pid_t, signal) },
+            0
+        );
+        if signal == libc::SIGTERM {
+            wait_marker(&root.join("signal-observed"), &mut child.0);
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "shutdown lost its accepted owner"
+            );
+            assert_eq!(fs::read(root.join("__cluster/lock.json")).unwrap(), lock);
+            if mode == "maintenance-finish" {
+                fs::write(root.join("release"), b"release").unwrap();
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let exit = loop {
+            if let Some(exit) = child.0.try_wait().unwrap() {
+                break exit;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "optimization shutdown exceeded its bound"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        output_thread.join().unwrap();
+        let journal: Value =
+            serde_json::from_slice(&fs::read(root.join("__cluster/maintenance.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            fs::read(root.join("__cluster/state.json")).unwrap(),
+            authority
+        );
+        let db = Omnigraph::open_read_only(graph.to_str().unwrap())
+            .await
+            .unwrap();
+        let after = db.list_commits(None).await.unwrap()[0]
+            .graph_commit_id
+            .clone();
+        if mode == "maintenance-finish" {
+            assert_eq!(exit.code(), Some(0));
+            assert!(!root.join("__cluster/lock.json").exists());
+            assert!(journal["outstanding"].is_null());
+            assert_ne!(before, after, "fixture must physically compact and publish");
+            let (mut successor, next_address, next_output) =
+                spawn_owned_child(root, "maintenance-finish");
+            wait_ready(&next_address, &mut successor.0, "serving").await;
+            let result: Value = client
+                .get(format!("http://{next_address}{path}"))
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .bearer_auth("operator-token")
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(result["in_progress"], false);
+            let result = &result["maintenance"]["result"];
+            assert_eq!(result["operation_id"], id);
+            assert_eq!(result["outcome"], "success");
+            assert_eq!(result["report"]["before_commit"], before);
+            assert_eq!(result["report"]["after_commit"], after);
+            assert_eq!(
+                unsafe { libc::kill(successor.0.id() as libc::pid_t, libc::SIGTERM) },
+                0
+            );
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Some(exit) = successor.0.try_wait().unwrap() {
+                    assert_eq!(exit.code(), Some(0));
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "successor shutdown exceeded bound"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            next_output.join().unwrap();
+        } else {
+            assert!(!exit.success());
+            assert_eq!(fs::read(root.join("__cluster/lock.json")).unwrap(), lock);
+            assert_eq!(journal["outstanding"]["request"]["operation_id"], id);
+            if mode == "maintenance-cutoff" {
+                assert_eq!(before, after);
+            } else {
+                assert_ne!(before, after);
+            }
+            assert!(
+                cluster_settings(root).await.is_err(),
+                "uncertain writer cannot restart"
+            );
+            // The predecessor is reaped and this fixture uses local storage.
+            // Recover only its original ID under a fresh exact native lock.
+            let lock_id = omnigraph_cluster::deployment_status(
+                root.to_str().unwrap(),
+                None,
+                &omnigraph_cluster::DeploymentCaller::storage_owner(None),
+            )
+            .await
+            .unwrap()
+            .lock_id
+            .unwrap();
+            omnigraph_cluster::force_unlock_storage_root(root.to_str().unwrap(), &lock_id)
+                .await
+                .unwrap();
+            let recovery = omnigraph_cluster::acquire_cluster_admission(
+                root.to_str().unwrap(),
+                omnigraph_cluster::ClusterAdmissionPurpose::MaintenanceRecovery {
+                    operation_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let identity =
+                omnigraph_cluster::IdentityAuthorization::authenticated("operator").unwrap();
+            let recovered =
+                omnigraph_cluster::reconcile_maintenance(&recovery, "knowledge", &id, &identity)
+                    .await
+                    .unwrap();
+            assert_eq!(recovered.operation_id, id);
+            match &recovered.completion {
+                omnigraph_cluster::MaintenanceCompletion::Interrupted {
+                    publication: omnigraph_cluster::MaintenancePublication::Published { report },
+                } => {
+                    assert_eq!(mode, "maintenance-after-publication");
+                    assert_eq!(report.before_commit, before);
+                    assert_eq!(report.after_commit, after);
+                    assert!(!report.tables.is_empty());
+                }
+                omnigraph_cluster::MaintenanceCompletion::Interrupted {
+                    publication: omnigraph_cluster::MaintenancePublication::Unpublished,
+                } => assert_eq!(mode, "maintenance-cutoff"),
+                other => panic!("recovery must not infer full success: {other:?}"),
+            }
+            let recovered_bytes = fs::read(root.join("__cluster/maintenance.json")).unwrap();
+            assert_eq!(
+                omnigraph_cluster::reconcile_maintenance(&recovery, "knowledge", &id, &identity)
+                    .await
+                    .unwrap(),
+                recovered
+            );
+            assert_eq!(
+                fs::read(root.join("__cluster/maintenance.json")).unwrap(),
+                recovered_bytes
+            );
+            recovery.release_after_settlement().await.unwrap();
+            let reopened = Omnigraph::open_read_only(graph.to_str().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                reopened.list_commits(None).await.unwrap()[0].graph_commit_id,
+                after,
+                "recovery must not replay optimization"
+            );
+            let (mut successor, next_address, next_output) =
+                spawn_owned_child(root, "maintenance-finish");
+            wait_ready(&next_address, &mut successor.0, "serving").await;
+            let response: Value = client
+                .get(format!("http://{next_address}{path}"))
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .bearer_auth("operator-token")
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(response["maintenance"]["status"], "complete");
+            assert_eq!(
+                response["maintenance"]["result"],
+                serde_json::to_value(&recovered).unwrap()
+            );
+            assert_eq!(response["in_progress"], false);
+            let read: Value = client.post(format!("http://{next_address}/graphs/knowledge/query"))
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT).bearer_auth("reader-token")
+                .json(&serde_json::json!({"query":"query names() { match { $p: Person } return { $p.name } }","name":"names"}))
+                .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+            for name in ["Ada", "Grace", "Barbara", "Edsger"] {
+                assert!(read.to_string().contains(name));
+            }
+            assert_eq!(
+                unsafe { libc::kill(successor.0.id() as libc::pid_t, libc::SIGTERM) },
+                0
+            );
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Some(exit) = successor.0.try_wait().unwrap() {
+                    assert_eq!(exit.code(), Some(0));
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "recovered successor shutdown exceeded bound"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            next_output.join().unwrap();
+            assert!(!root.join("__cluster/lock.json").exists());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn served_optimization_disconnect_settles_before_clean_restart() {
+        optimization_disconnect_and_shutdown("maintenance-finish").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn served_optimization_shutdown_cutoff_retains_original_authority() {
+        optimization_disconnect_and_shutdown("maintenance-cutoff").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn served_optimization_crash_after_publication_retains_unknown_receipt() {
+        optimization_disconnect_and_shutdown("maintenance-after-publication").await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn disconnected_write_and_shutdown_share_ownership_finish() {
         disconnected_write_and_shutdown_share_ownership("finish").await;
@@ -2554,6 +2940,385 @@ async fn live_deployment_installs_updates_preserves_and_removes_catalogue_policy
     live_deployment_fixture("catalogue").await;
 }
 
+/// Optimization needs the real admitted owner, installed policy, owned HTTP
+/// task and durable receipt. Engine-only tests cannot establish this boundary.
+#[tokio::test(flavor = "multi_thread")]
+async fn served_optimization_enforces_bounds_and_retains_exact_results() {
+    live_deployment_fixture("maintenance").await;
+}
+
+async fn served_optimization_journey(
+    root: &std::path::Path,
+    state: &AppState,
+    engine: &std::sync::Arc<Omnigraph>,
+) {
+    use omnigraph::db::OptimizeLimits;
+    use omnigraph_cluster::{MaintenanceKind, MaintenanceRequest, MaintenanceStatus};
+    use std::time::Duration;
+
+    fn submit(request: &MaintenanceRequest, token: &str) -> Request<Body> {
+        Request::post("/cluster/maintenance")
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(request).unwrap()))
+            .unwrap()
+    }
+    async fn finish(app: &Router, id: &str) -> Value {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let (code, body) = json_response(
+                    app,
+                    get_request(
+                        &format!("/cluster/maintenance/{id}?graph=knowledge"),
+                        "operator-token",
+                    ),
+                )
+                .await;
+                assert_eq!(code, StatusCode::OK, "{body}");
+                if body["in_progress"] == false {
+                    assert_eq!(body["maintenance"]["status"], "complete", "{body}");
+                    return body["maintenance"]["result"].clone();
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("optimization must retain its owner after the HTTP response")
+    }
+    let limits = OptimizeLimits {
+        max_tables: 100,
+        max_fragments: 1000,
+        max_rows: 100_000,
+        max_source_bytes: 128 * 1024 * 1024,
+        max_files: 10_000,
+    };
+    let disabled = build_app(state.clone());
+    let (code, _) = json_response(
+        &disabled,
+        get_request("/cluster/maintenance?graph=knowledge", "operator-token"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert!(!root.join("__cluster/maintenance.json").exists());
+    let app = build_app(
+        state
+            .clone()
+            .with_maintenance_limits(limits.clone())
+            .unwrap(),
+    );
+    let (code, _) = json_response(
+        &app,
+        get_request("/cluster/maintenance?graph=knowledge", "reader-token"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    let (code, body) = json_response(
+        &app,
+        get_request("/cluster/maintenance?graph=knowledge", "operator-token"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let status: MaintenanceStatus = serde_json::from_value(body["status"].clone()).unwrap();
+    let mut request = MaintenanceRequest {
+        operation_id: status.next_operation_id(),
+        graph: "knowledge".into(),
+        kind: MaintenanceKind::Optimize,
+        limits: limits.clone(),
+    };
+    request.limits.max_tables += 1;
+    let (code, _) = json_response(&app, submit(&request, "operator-token")).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert!(
+        !root.join("__cluster/maintenance.json").exists(),
+        "over-ceiling request must not reserve an identity"
+    );
+    request.limits = limits.clone();
+    let (code, _) = json_response(&app, submit(&request, "reader-token")).await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    assert!(!root.join("__cluster/maintenance.json").exists());
+
+    served_optimization_identity_profiles_refuse_new_work(root, state, engine, &request, None)
+        .await;
+
+    let session =
+        omnigraph::Session::from_defaults(std::sync::Arc::clone(engine), Default::default());
+    for name in ["Ada", "Grace", "Edsger", "Barbara"] {
+        session
+            .mutate_as(
+                "main",
+                &format!("query add() {{ insert Person {{ name: \"{name}\" }} }}"),
+                "add",
+                &Default::default(),
+                Some("operator"),
+            )
+            .await
+            .unwrap();
+    }
+    let before = engine.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    let authority = fs::read(root.join("__cluster/state.json")).unwrap();
+
+    // Preflight refuses the complete accepted source before any graph effect,
+    // and its exact refusal consumes an ID without blocking later valid work.
+    request.limits.max_rows = 1;
+    let (code, body) = json_response(&app, submit(&request, "operator-token")).await;
+    assert!(
+        matches!(code, StatusCode::OK | StatusCode::ACCEPTED),
+        "{body}"
+    );
+    let refused = finish(&app, &request.operation_id).await;
+    assert_eq!(refused["outcome"], "refused", "{refused}");
+    assert_eq!(
+        engine.list_commits(None).await.unwrap()[0].graph_commit_id,
+        before
+    );
+
+    let (_, body) = json_response(
+        &app,
+        get_request("/cluster/maintenance?graph=knowledge", "operator-token"),
+    )
+    .await;
+    let status: MaintenanceStatus = serde_json::from_value(body["status"].clone()).unwrap();
+    request.operation_id = status.next_operation_id();
+    request.limits = limits;
+    let (code, body) = json_response(&app, submit(&request, "operator-token")).await;
+    assert!(
+        matches!(code, StatusCode::OK | StatusCode::ACCEPTED),
+        "{body}"
+    );
+    // The request waiter is gone here; the server owns completion independently.
+    let receipt = finish(&app, &request.operation_id).await;
+    assert_eq!(receipt["outcome"], "success", "{receipt}");
+    assert_eq!(receipt["invocation"]["actor"], "operator");
+    assert_eq!(
+        receipt["invocation"]["input"]["before_commit"],
+        before.to_string()
+    );
+    assert_eq!(receipt["report"]["before_commit"], before.to_string());
+    let after = engine.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    assert_eq!(receipt["report"]["after_commit"], after.to_string());
+    assert_eq!(
+        fs::read(root.join("__cluster/state.json")).unwrap(),
+        authority,
+        "maintenance never rewrites deployment authority or results"
+    );
+
+    let (code, duplicate) = json_response(&app, submit(&request, "operator-token")).await;
+    assert_eq!(code, StatusCode::OK, "{duplicate}");
+    assert_eq!(duplicate["maintenance"]["result"], receipt);
+    assert_eq!(
+        engine.list_commits(None).await.unwrap()[0].graph_commit_id,
+        after
+    );
+    let (_, next) = json_response(
+        &app,
+        get_request("/cluster/maintenance?graph=knowledge", "operator-token"),
+    )
+    .await;
+    let next: MaintenanceStatus = serde_json::from_value(next["status"].clone()).unwrap();
+    let mut fresh = request.clone();
+    fresh.operation_id = next.next_operation_id();
+    served_optimization_identity_profiles_refuse_new_work(
+        root,
+        state,
+        engine,
+        &fresh,
+        Some((&request, &receipt)),
+    )
+    .await;
+    request.limits.max_rows -= 1;
+    let (code, _) = json_response(&app, submit(&request, "operator-token")).await;
+    assert_eq!(
+        code,
+        StatusCode::CONFLICT,
+        "same identity cannot accept different input"
+    );
+    let (code, retained) = json_response(
+        &disabled,
+        get_request(
+            &format!(
+                "/cluster/maintenance/{}?graph=knowledge",
+                request.operation_id
+            ),
+            "operator-token",
+        ),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{retained}");
+    assert_eq!(
+        retained["maintenance"]["result"], receipt,
+        "disabling new work never hides retained receipts"
+    );
+
+    // Once detached physical work has started, an error must retain the
+    // invocation and close process admission, even if no graph commit appeared.
+    for name in ["Donald", "Margaret", "Alan", "Frances"] {
+        session
+            .mutate_as(
+                "main",
+                &format!("query add() {{ insert Person {{ name: \"{name}\" }} }}"),
+                "add",
+                &Default::default(),
+                Some("operator"),
+            )
+            .await
+            .unwrap();
+    }
+    let before_failure = engine.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    let (_, body) = json_response(
+        &app,
+        get_request("/cluster/maintenance?graph=knowledge", "operator-token"),
+    )
+    .await;
+    let status: MaintenanceStatus = serde_json::from_value(body["status"].clone()).unwrap();
+    request.operation_id = status.next_operation_id();
+    let _fault = omnigraph::seams::catalog::OPTIMIZE_POST_TABLE_EFFECT.fire_once_at(1);
+    let (code, body) = json_response(&app, submit(&request, "operator-token")).await;
+    assert!(
+        matches!(
+            code,
+            StatusCode::ACCEPTED | StatusCode::INTERNAL_SERVER_ERROR
+        ),
+        "{body}"
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while state.operation_runtime().snapshot().uncertain_writes == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("physical-effect failure must be contained");
+    assert!(state.operation_runtime().snapshot().closed);
+    let journal: Value =
+        serde_json::from_slice(&fs::read(root.join("__cluster/maintenance.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        journal["outstanding"]["request"]["operation_id"],
+        request.operation_id
+    );
+    assert_eq!(
+        journal["outstanding"]["input"]["before_commit"],
+        before_failure.to_string()
+    );
+    assert_eq!(
+        engine.list_commits(None).await.unwrap()[0].graph_commit_id,
+        before_failure
+    );
+}
+
+/// The CLI's target-kind refusal is not a capacity boundary. Direct HTTP must
+/// refuse on either identity profile, even for a valid static credential and
+/// regardless of embedding builder order, while retaining exact receipt reads.
+async fn served_optimization_identity_profiles_refuse_new_work(
+    root: &std::path::Path,
+    state: &AppState,
+    engine: &std::sync::Arc<Omnigraph>,
+    fresh: &omnigraph_cluster::MaintenanceRequest,
+    retained: Option<(&omnigraph_cluster::MaintenanceRequest, &Value)>,
+) {
+    fn submit(request: &omnigraph_cluster::MaintenanceRequest, token: &str) -> Request<Body> {
+        Request::post("/cluster/maintenance")
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(request).unwrap()))
+            .unwrap()
+    }
+
+    let mut signed = data_tokens::DataTokens::new();
+    let canonical_root = format!("file://{}", fs::canonicalize(root).unwrap().display());
+    signed.document["canonical_root"] = canonical_root.clone().into();
+    signed.trust = omnigraph_server::data_tokens::DataTokenTrust::from_json(
+        &serde_json::to_vec(&signed.document).unwrap(),
+        &canonical_root,
+    )
+    .unwrap();
+    let oidc_trust = oidc::trust(root);
+    let before_journal = fs::read(root.join("__cluster/maintenance.json")).ok();
+    let before_authority = fs::read(root.join("__cluster/state.json")).unwrap();
+    let before_head = engine.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+
+    for use_oidc in [false, true] {
+        let attach_trust = |state: AppState| {
+            if use_oidc {
+                state.with_oidc_identity_trust(oidc_trust.clone())
+            } else {
+                state.with_data_token_trust(signed.trust.clone())
+            }
+        };
+        let identity_token = if use_oidc {
+            oidc::token("alice", oidc::RESOURCE)
+        } else {
+            signed.identity_token()
+        };
+        for limits_first in [false, true] {
+            let bounded = if limits_first {
+                attach_trust(
+                    state
+                        .clone()
+                        .with_maintenance_limits(fresh.limits.clone())
+                        .unwrap(),
+                )
+            } else {
+                attach_trust(state.clone())
+                    .with_maintenance_limits(fresh.limits.clone())
+                    .unwrap()
+            };
+            let app = build_app(bounded);
+            for token in ["operator-token", identity_token.as_str()] {
+                for request in [
+                    get_request("/cluster/maintenance?graph=knowledge", token),
+                    submit(fresh, token),
+                ] {
+                    let (code, body) = json_response(&app, request).await;
+                    assert_eq!(code, StatusCode::CONFLICT, "{body}");
+                    assert!(
+                        body.to_string().contains("resource capacity admission"),
+                        "{body}"
+                    );
+                }
+            }
+            if let Some((request, receipt)) = retained {
+                for read in [
+                    get_request(
+                        &format!(
+                            "/cluster/maintenance/{}?graph=knowledge",
+                            request.operation_id
+                        ),
+                        "operator-token",
+                    ),
+                    submit(request, "operator-token"),
+                ] {
+                    let (code, body) = json_response(&app, read).await;
+                    assert_eq!(code, StatusCode::OK, "{body}");
+                    assert_eq!(&body["maintenance"]["result"], receipt);
+                    assert_eq!(body["in_progress"], false);
+                }
+            }
+            assert_eq!(
+                fs::read(root.join("__cluster/maintenance.json")).ok(),
+                before_journal
+            );
+            assert_eq!(
+                fs::read(root.join("__cluster/state.json")).unwrap(),
+                before_authority
+            );
+            assert_eq!(
+                engine.list_commits(None).await.unwrap()[0].graph_commit_id,
+                before_head
+            );
+        }
+    }
+}
+
 async fn live_deployment_fixture(mode: &str) {
     use omnigraph_cluster::{CapturedDeployment, DeploymentStatus};
     use omnigraph_server::{GraphId, GraphKey, RegistryLookup, ServerConfigMode};
@@ -2650,6 +3415,26 @@ async fn live_deployment_fixture(mode: &str) {
         let policy = fs::read_to_string(temp.path().join("policy.yaml")).unwrap();
         fs::write(temp.path().join("policy.yaml"), policy.replace("[schema_apply, read, invoke_query]", "[schema_apply, read, invoke_query, change, branch_create, branch_merge, branch_delete]")).unwrap();
     }
+    if mode == "maintenance" {
+        let path = temp.path().join("policy.yaml");
+        let policy = fs::read_to_string(&path).unwrap();
+        fs::write(
+            path,
+            policy
+                .replace(
+                    "[schema_apply, read, invoke_query]",
+                    "[schema_apply, read, invoke_query, change, optimize]",
+                )
+                .replace(
+                    "admins: [operator]",
+                    &format!(
+                        "admins: [operator, \"{}\", principal:stable_alice]",
+                        data_tokens::DataTokens::new().actor
+                    ),
+                ),
+        )
+        .unwrap();
+    }
     apply_cluster_fixture(temp.path()).await;
     let mut settings = cluster_settings(temp.path()).await.unwrap();
     settings
@@ -2690,6 +3475,10 @@ async fn live_deployment_fixture(mode: &str) {
         panic!("ready")
     };
     let original_engine = Arc::clone(&original.engine);
+    if mode == "maintenance" {
+        served_optimization_journey(temp.path(), &state, &original_engine).await;
+        return;
+    }
     let original_contract = original_engine.schema_contract_digest();
     let before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
     let boot_ledger: serde_json::Value = serde_json::from_slice(&before).unwrap();

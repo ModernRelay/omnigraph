@@ -299,9 +299,9 @@ Version 1 does not support cloud-direct targets, catalogue targets, Unix sockets
 mTLS, tunnels or arbitrary private identity-provider transport. Server storage
 and deployment retain separate contracts. This rewrite does not qualify BYOC
 private routes or workload federation. Managed and standalone targets share
-served graph operations subject to capabilities and policy; maintenance, schema
-changes and direct-root administration keep their storage restrictions. Remote
-failures never trigger direct storage fallback.
+served graph operations subject to capabilities and policy. Bounded `optimize`
+also supports enabled standalone servers; other maintenance, schema changes
+and direct-root administration keep their storage restrictions. Remote failures never trigger direct storage fallback.
 The old standalone `--target og_catalog` shorthand is not a built-in target;
 catalogue reads through a registered server still use `--graph og_catalog`.
 

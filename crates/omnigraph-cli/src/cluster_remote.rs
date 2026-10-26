@@ -417,7 +417,7 @@ fn is_wait_timeout(error: &color_eyre::Report, deadline: Instant) -> bool {
     error.is::<tokio::time::error::Elapsed>() || Instant::now() >= deadline
 }
 
-fn retry_observation(error: &color_eyre::Report) -> bool {
+pub(crate) fn retry_observation(error: &color_eyre::Report) -> bool {
     error.is::<tokio::time::error::Elapsed>()
         || error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
             error.is_timeout()

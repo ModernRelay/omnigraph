@@ -47,6 +47,7 @@ pub(crate) struct Cli {
     /// On a served write, and on every request `mcp` relays, it is an assertion:
     /// the request carries `omnigraph-if-actor`, and the server refuses it
     /// before anything runs when the bearer token resolves to another actor.
+    /// Served optimize derives its actor only from the credential and refuses --as.
     /// With a policy configured but no actor set, a direct operation is
     /// denied — see docs/user/operations/policy.md.
     #[arg(long = "as", global = true, value_name = "ACTOR", value_parser = crate::invocation::single_selector("--as"))]
@@ -145,7 +146,7 @@ pub(crate) enum Command {
     /// Convert a standalone graph's storage offline from format v8, v9 or v13 to
     /// the current format this binary serves (v16); other formats are rebuilt by export and load
     Upgrade(UpgradeArgs),
-    /// Compact small Lance fragments in every backing dataset of the graph
+    /// Compact small Lance fragments in every backing dataset of the graph on main
     Optimize(OptimizeArgs),
     /// Rebuild all full-text indexes from one branch's current rows
     ///

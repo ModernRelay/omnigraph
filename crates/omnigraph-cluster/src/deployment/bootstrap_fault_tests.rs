@@ -31,6 +31,12 @@ enum Point {
     StateTerminal,
     Claim,
     Release,
+    MaintenanceAccepted,
+    MaintenanceInput,
+    MaintenancePublication,
+    MaintenanceSettlement,
+    MaintenanceTerminal,
+    MaintenanceRecoveryTerminal,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -42,6 +48,7 @@ enum Fault {
 #[derive(Debug)]
 struct Controlled {
     inner: ObjectStorageAdapter,
+    uri_prefix: Option<&'static str>,
     allow_fixture_setup: bool,
     writes: Mutex<Vec<Write>>,
     forbidden_calls: AtomicUsize,
@@ -55,6 +62,7 @@ impl Controlled {
     fn new() -> Self {
         Self {
             inner: ObjectStorageAdapter::in_memory(),
+            uri_prefix: Some(URI_PREFIX),
             allow_fixture_setup: false,
             writes: Mutex::default(),
             forbidden_calls: AtomicUsize::new(0),
@@ -66,8 +74,18 @@ impl Controlled {
     }
 
     fn key<'a>(&self, uri: &'a str) -> &'a str {
-        uri.strip_prefix(URI_PREFIX)
-            .expect("test-only S3 namespace")
+        match self.uri_prefix {
+            Some(prefix) => uri.strip_prefix(prefix).expect("test-only S3 namespace"),
+            None => uri,
+        }
+    }
+
+    fn local() -> Self {
+        Self {
+            inner: ObjectStorageAdapter::local(),
+            uri_prefix: None,
+            ..Self::new()
+        }
     }
 
     fn point(uri: &str, payload: &str, cas: bool) -> Option<Point> {
@@ -95,6 +113,25 @@ impl Controlled {
                     _ => None,
                 }
             }
+        } else if uri.ends_with("/__cluster/maintenance.json") {
+            let journal: serde_json::Value = serde_json::from_str(payload).unwrap();
+            Some(if journal["outstanding"].is_null() {
+                if journal["results"].as_array().unwrap().last().unwrap()["outcome"]
+                    == "interrupted"
+                {
+                    Point::MaintenanceRecoveryTerminal
+                } else {
+                    Point::MaintenanceTerminal
+                }
+            } else if !journal["outstanding"]["settlement"].is_null() {
+                Point::MaintenanceSettlement
+            } else if !journal["outstanding"]["publication"].is_null() {
+                Point::MaintenancePublication
+            } else if journal["outstanding"]["input"].is_null() {
+                Point::MaintenanceAccepted
+            } else {
+                Point::MaintenanceInput
+            })
         } else {
             None
         }
@@ -202,7 +239,10 @@ impl StorageAdapter for Controlled {
         self.inner.list_dir(self.key(uri)).await.map(|entries| {
             entries
                 .into_iter()
-                .map(|entry| format!("{URI_PREFIX}{entry}"))
+                .map(|entry| match self.uri_prefix {
+                    Some(prefix) => format!("{prefix}{entry}"),
+                    None => entry,
+                })
                 .collect()
         })
     }
@@ -218,7 +258,10 @@ impl StorageAdapter for Controlled {
             .map(|entries| {
                 entries
                     .into_iter()
-                    .map(|entry| format!("{URI_PREFIX}{entry}"))
+                    .map(|entry| match self.uri_prefix {
+                        Some(prefix) => format!("{prefix}{entry}"),
+                        None => entry,
+                    })
                     .collect()
             })
     }
@@ -319,6 +362,359 @@ fn fixture() -> (
     let adapter = Arc::new(Controlled::new());
     let store = store.with_bootstrap_test_adapter(adapter.clone());
     (directory, bundle, store, adapter)
+}
+
+#[tokio::test]
+async fn maintenance_committed_journal_writes_do_not_replay_after_loss_or_cancellation() {
+    use crate::{
+        IdentityAuthorization, MaintenanceAcceptance, MaintenanceCompletion, MaintenanceLookup,
+        accept_maintenance, bind_maintenance_input, bind_maintenance_publication,
+        complete_maintenance, maintenance_lookup,
+    };
+    use omnigraph::db::OptimizeInput;
+
+    for point in [
+        Point::MaintenanceAccepted,
+        Point::MaintenanceInput,
+        Point::MaintenancePublication,
+        Point::MaintenanceTerminal,
+    ] {
+        for fault in [Fault::LostResponse, Fault::CancelAfterCommit] {
+            // Reuse the real applied graph/policy fixture and the existing
+            // fault adapter. Only the adapter's post-commit response is lost;
+            // this test does not claim cloud settlement or graph execution.
+            let (directory, admission) = crate::maintenance::tests::fixture().await;
+            admission.release_after_settlement().await.unwrap();
+            let adapter = Arc::new(Controlled::local());
+            let store = ClusterStore::for_storage_root(directory.path().to_str().unwrap())
+                .unwrap()
+                .with_bootstrap_test_adapter(adapter.clone());
+            let admission =
+                crate::admission::acquire_with_store(&store, crate::ClusterAdmissionPurpose::Serve)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let actor = IdentityAuthorization::authenticated("principal:owner").unwrap();
+            let request = crate::maintenance::tests::request(&admission).await;
+            adapter.arm(point, fault);
+            {
+                let invoke = async {
+                    let MaintenanceAcceptance::Accepted(mut accepted) =
+                        accept_maintenance(&admission, request.clone(), &actor).await?
+                    else {
+                        panic!("fresh request was already recorded")
+                    };
+                    bind_maintenance_input(
+                        &admission,
+                        &mut accepted,
+                        OptimizeInput {
+                            before_commit: "retained-input".into(),
+                            report_max_bytes: 16384,
+                            schema_contract: omnigraph::db::SchemaContractDigest {
+                                source_hash: "source".into(),
+                                schema_ir_hash: "ir".into(),
+                                schema_identity_domain: "domain".into(),
+                                schema_identity_version: 1,
+                            },
+                            source_tables: 1,
+                            source_fragments: 1,
+                            source_rows: 1,
+                            source_bytes: 128,
+                            source_files: 1,
+                        },
+                    )
+                    .await?;
+                    if point == Point::MaintenancePublication {
+                        bind_maintenance_publication(
+                            &admission,
+                            &mut accepted,
+                            omnigraph::db::OptimizePublication {
+                                before_manifest_version: 1,
+                                intent_nonce: ulid::Ulid::new().to_string(),
+                                schema_contract: omnigraph::db::SchemaContractDigest {
+                                    source_hash: "source".into(),
+                                    schema_ir_hash: "ir".into(),
+                                    schema_identity_domain: "domain".into(),
+                                    schema_identity_version: 1,
+                                },
+                                actor: Some(actor.actor().into()),
+                                created_at: 1,
+                                report: omnigraph::db::OptimizeReport {
+                                    before_commit: "retained-input".into(),
+                                    after_commit: "retained-input".into(),
+                                    tables: Vec::new(),
+                                    source_tables: 1,
+                                    source_fragments: 1,
+                                    source_rows: 1,
+                                    source_bytes: 128,
+                                    source_files: 1,
+                                },
+                            },
+                        )
+                        .await?;
+                    }
+                    complete_maintenance(
+                        &admission,
+                        accepted,
+                        MaintenanceCompletion::Refused {
+                            code: "fixture_preflight_refusal".into(),
+                            message: "no graph effect was attempted".into(),
+                        },
+                    )
+                    .await
+                };
+                match fault {
+                    Fault::LostResponse => {
+                        let error = invoke.await.unwrap_err();
+                        assert_eq!(error.code, "maintenance_write_uncertain", "{point:?}");
+                    }
+                    Fault::CancelAfterCommit => {
+                        tokio::pin!(invoke);
+                        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                            tokio::select! {
+                                _ = adapter.committed.notified() => {}
+                                result = &mut invoke => panic!("expected committed blocked write: {result:?}"),
+                            }
+                        })
+                        .await
+                        .expect("real journal write must commit before cancellation");
+                    }
+                }
+            }
+            assert!(adapter.fault.lock().unwrap().is_none());
+            let retained =
+                maintenance_lookup(&admission, "knowledge", &request.operation_id, &actor)
+                    .await
+                    .unwrap();
+            match (&retained, point) {
+                (MaintenanceLookup::Complete { .. }, Point::MaintenanceTerminal) => {}
+                (MaintenanceLookup::Outstanding { invocation, .. }, Point::MaintenanceAccepted) => {
+                    assert!(invocation.input.is_none());
+                }
+                (MaintenanceLookup::Outstanding { invocation, .. }, Point::MaintenanceInput) => {
+                    assert!(invocation.input.is_some());
+                }
+                (
+                    MaintenanceLookup::Outstanding { invocation, .. },
+                    Point::MaintenancePublication,
+                ) => {
+                    assert!(invocation.publication.is_some());
+                    assert!(invocation.settlement.is_none());
+                }
+                _ => panic!("wrong retained state after {point:?}: {retained:?}"),
+            }
+            let writes = adapter.writes.lock().unwrap().len();
+            let MaintenanceAcceptance::Existing(existing) =
+                accept_maintenance(&admission, request, &actor)
+                    .await
+                    .unwrap()
+            else {
+                panic!("lost response or cancellation must never mint an execution token")
+            };
+            assert_eq!(
+                serde_json::to_value(existing).unwrap(),
+                serde_json::to_value(retained).unwrap()
+            );
+            assert_eq!(adapter.writes.lock().unwrap().len(), writes);
+            drop(admission);
+            adapter.assert_no_forbidden_calls().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn maintenance_recovery_journal_loss_keeps_the_original_settlement_and_result() {
+    use crate::{
+        ClusterAdmissionPurpose, IdentityAuthorization, MaintenanceAcceptance,
+        MaintenanceCompletion, MaintenancePublication, accept_maintenance, bind_maintenance_input,
+        bind_maintenance_publication, reconcile_maintenance,
+    };
+    use omnigraph::db::{
+        Omnigraph, OptimizeInput, OptimizePublication, OptimizeReport, ReadTarget,
+    };
+
+    for point in [
+        Point::MaintenanceSettlement,
+        Point::MaintenanceRecoveryTerminal,
+    ] {
+        for fault in [Fault::LostResponse, Fault::CancelAfterCommit] {
+            let (directory, admission) = crate::maintenance::tests::fixture().await;
+            admission.release_after_settlement().await.unwrap();
+            let root = directory.path().to_str().unwrap();
+            let adapter = Arc::new(Controlled::local());
+            let store = ClusterStore::for_storage_root(root)
+                .unwrap()
+                .with_bootstrap_test_adapter(adapter.clone());
+            let admission =
+                crate::admission::acquire_with_store(&store, ClusterAdmissionPurpose::Serve)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let actor = IdentityAuthorization::authenticated("principal:owner").unwrap();
+            let request = crate::maintenance::tests::request(&admission).await;
+            let MaintenanceAcceptance::Accepted(mut accepted) =
+                accept_maintenance(&admission, request.clone(), &actor)
+                    .await
+                    .unwrap()
+            else {
+                panic!("fresh invocation must be accepted")
+            };
+
+            // This fixture exercises the journal boundary, not optimization's
+            // physical work. Its prepared publication has the real base and
+            // contract; recovery must publish at most one neutral competitor.
+            let graph_uri = store.graph_root("knowledge");
+            let db = Omnigraph::open(&graph_uri).await.unwrap();
+            let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+            let base_version = snapshot.graph_manifest_version();
+            let before = snapshot.graph_head(None).unwrap().to_string();
+            let schema_contract = db.schema_contract_digest();
+            let input = OptimizeInput {
+                before_commit: before.clone(),
+                schema_contract: schema_contract.clone(),
+                report_max_bytes: 16384,
+                source_tables: 1,
+                source_fragments: 1,
+                source_rows: 1,
+                source_bytes: 128,
+                source_files: 1,
+            };
+            bind_maintenance_input(&admission, &mut accepted, input)
+                .await
+                .unwrap();
+            bind_maintenance_publication(
+                &admission,
+                &mut accepted,
+                OptimizePublication {
+                    before_manifest_version: base_version,
+                    intent_nonce: ulid::Ulid::new().to_string(),
+                    schema_contract,
+                    actor: Some(actor.actor().into()),
+                    created_at: 1,
+                    report: OptimizeReport {
+                        before_commit: before.clone(),
+                        after_commit: before,
+                        tables: Vec::new(),
+                        source_tables: 1,
+                        source_fragments: 1,
+                        source_rows: 1,
+                        source_bytes: 128,
+                        source_files: 1,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+            drop(snapshot);
+            drop(db);
+            drop(accepted);
+            let lock_id = admission.lock_id().to_string();
+            drop(admission);
+            crate::force_unlock_storage_root(root, &lock_id)
+                .await
+                .unwrap();
+            let recovery = crate::admission::acquire_with_store(
+                &store,
+                ClusterAdmissionPurpose::MaintenanceRecovery {
+                    operation_id: request.operation_id.clone(),
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            adapter.arm(point, fault);
+            {
+                let invoke =
+                    reconcile_maintenance(&recovery, "knowledge", &request.operation_id, &actor);
+                match fault {
+                    Fault::LostResponse => {
+                        let error = invoke.await.unwrap_err();
+                        assert_eq!(error.code, "maintenance_write_uncertain", "{point:?}");
+                    }
+                    Fault::CancelAfterCommit => {
+                        tokio::pin!(invoke);
+                        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                            tokio::select! {
+                                _ = adapter.committed.notified() => {}
+                                result = &mut invoke => panic!("expected committed blocked recovery write: {result:?}"),
+                            }
+                        }).await.expect("recovery write must commit before cancellation");
+                    }
+                }
+            }
+            assert!(adapter.fault.lock().unwrap().is_none());
+            let retained: serde_json::Value =
+                serde_json::from_str(&store.read_maintenance().await.unwrap().unwrap().0).unwrap();
+            let retained_invocation = if point == Point::MaintenanceSettlement {
+                assert_eq!(
+                    retained["outstanding"]["request"]["operation_id"],
+                    request.operation_id
+                );
+                &retained["outstanding"]
+            } else {
+                assert!(retained["outstanding"].is_null());
+                &retained["results"].as_array().unwrap().last().unwrap()["invocation"]
+            };
+            let settlement = retained_invocation["settlement"].clone();
+            assert!(!settlement.is_null());
+            let result =
+                reconcile_maintenance(&recovery, "knowledge", &request.operation_id, &actor)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&result.invocation.settlement).unwrap(),
+                settlement
+            );
+            assert!(matches!(
+                result.completion,
+                MaintenanceCompletion::Interrupted {
+                    publication: MaintenancePublication::Unpublished
+                }
+            ));
+            let writes = adapter.writes.lock().unwrap().len();
+            assert_eq!(
+                reconcile_maintenance(&recovery, "knowledge", &request.operation_id, &actor)
+                    .await
+                    .unwrap(),
+                result
+            );
+            assert_eq!(
+                adapter.writes.lock().unwrap().len(),
+                writes,
+                "retained terminal recovery must not write or mint another settlement"
+            );
+            for expected in [
+                Point::MaintenanceSettlement,
+                Point::MaintenanceRecoveryTerminal,
+            ] {
+                assert_eq!(
+                    adapter
+                        .writes
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|write| Controlled::point(
+                            &write.uri,
+                            &write.payload,
+                            write.expected_version.is_some()
+                        ) == Some(expected))
+                        .count(),
+                    1,
+                    "{expected:?} must retain its first committed write"
+                );
+            }
+            let db = Omnigraph::open(&graph_uri).await.unwrap();
+            assert_eq!(
+                db.graph_manifest_version_of(ReadTarget::branch("main"))
+                    .await
+                    .unwrap(),
+                base_version + 1
+            );
+            drop(db);
+            drop(recovery);
+            adapter.assert_no_forbidden_calls().await;
+        }
+    }
 }
 
 #[tokio::test]

@@ -1,32 +1,78 @@
 # Maintenance
 
-OmniGraph provides four direct-storage maintenance commands:
+Use `optimize` for compaction and index reconciliation,
+`rebuild-full-text-indexes` for one branch's full-text indexes, `repair` to
+diagnose foreign storage drift, and `cleanup` to remove unretained versions
+and unused table forks left by branches created before storage format v11.
 
-- `optimize` compacts data and reconciles declared indexes.
-- `rebuild-full-text-indexes` replaces full-text indexes on one branch.
-- `repair` diagnoses foreign storage drift without adopting it.
-- `cleanup` permanently removes unretained table versions and unused table
-  forks left by branches created before storage format v11.
-
-They do not run through the HTTP server. Address a standalone graph directly,
-or select a graph from a cluster root:
+`optimize` also supports enabled cluster servers; other commands require direct
+storage. Address a standalone graph or select a graph from a cluster root:
 
 ```bash
 omnigraph optimize --target ./graph.omni
 omnigraph optimize --target ./cluster-root --graph knowledge
 ```
 
-Follow the command-specific concurrency requirements below. Operator version 1
-accepts local-file direct targets only; cloud-direct maintenance is not exposed
-by this CLI. Engine/server cloud support does not change that client boundary.
-See [operator configuration](../cli/targets.md#transport-and-capability-boundaries).
+Direct targets support local files only. Follow the concurrency rules below and
+[operator configuration](../cli/targets.md#transport-and-capability-boundaries).
 
 ## Optimize
 
+Select a graph explicitly or configure the server target's `default_graph`:
+
 ```bash
-omnigraph optimize --target ./graph.omni
-omnigraph optimize --target ./graph.omni --json
+omnigraph optimize --target production --graph knowledge
+omnigraph optimize --target production --graph knowledge --no-wait --json
+omnigraph optimize --target production --graph knowledge --operation-id '<ID>'
 ```
+
+Both modes enforce installed `optimize` policy on `main`. Served work uses the
+credential's actor and existing storage-owning server; it refuses `--as` and
+never opens storage from the CLI. Direct work selects `--as`, then the operator
+configuration's actor. Managed targets do not support optimize yet.
+
+The CLI flushes the operation ID before submitting once. It waits 300 seconds
+by default; `--timeout` accepts 1–3600 seconds and exits 5 without cancelling
+work. `--no-wait` returns after acceptance; `--operation-id` only observes and
+never submits. Lost responses, unresolved work and expired receipts never
+permit replay: retain the ID and inspect the same target and graph. JSON keeps
+the native receipt, before/after commits and per-table results. Direct storage
+accepts an original ID only with explicit recovery; both modes support
+`--json`.
+
+### Server enablement
+
+Served optimization is off by default. Set `OMNIGRAPH_MAINTENANCE_CONFIG` to a
+local YAML file (at most 4 KiB), loaded at boot, with all five positive input
+ceilings. Example for a small qualification fixture:
+
+```yaml
+max_tables: 100
+max_fragments: 1000
+max_rows: 100000
+max_source_bytes: 134217728
+max_files: 10000
+```
+
+Embedders can call `AppState::with_maintenance_limits`; requests can lower its
+ceilings. All source preflight precedes rewriting; unsupported or unbounded
+layouts refuse. One optimization runs per cluster, one table at a time. Input
+ceilings do not bound CPU, heap or storage rate: size and isolate the process
+before enabling. Fleet-managed admission remains unavailable.
+Servers with root-bound signed-token or OIDC identity trust refuse new
+optimization, including direct HTTP calls, until resource admission is
+supported. Their original-ID receipts remain readable.
+
+Uncertain effects or a lost result write leave the operation outstanding,
+without automatic replay. The complete receipt capacity is reserved from
+accepted metadata before physical effects; an oversized result bound refuses
+before rewriting. Disabling execution does not hide retained receipts.
+
+Unresolved maintenance also blocks writable restart. See
+[interrupted optimization recovery](storage-failures.md#interrupted-optimization)
+for the explicit administrator procedure.
+
+### Data and concurrency
 
 Optimize rewrites small fragments into fewer larger fragments, rewrites every
 fragment that still stores a dropped property's values, rebuilds each scalar or
@@ -34,58 +80,48 @@ vector index whose coverage lags behind appended rows, and builds missing
 declared indexes that are ready to build. It does not delete old versions or
 collect unused table forks. Use `cleanup` for storage reclamation.
 
-Dropping a property removes it from the schema without rewriting its table
-(see [schema changes](../schema/index.md#schema-changes)), so its values stay
-in the table's data files. Every optimize rewrites each fragment that still
-holds them, whatever its size, copying only the remaining properties; the
-dropped values are not read. A `cleanup` then deletes the old files, Blob
-values included, once nothing it retains references them: no commit its
-retention keeps, no live branch created from a commit before that optimize,
-and no tag naming such a commit. Merging a branch does not release its files;
-deleting it does. A table holding no dropped values and nothing else to
-compact is left alone.
+[Dropping a property](../schema/index.md#schema-changes) leaves its values in
+data files. Optimize rewrites every fragment still holding them, regardless
+of size, copying only remaining properties without reading dropped values.
+`cleanup` deletes old files, including Blobs, only after retained commits,
+live branches and tags stop referencing them. Merging a branch does not release
+its files; deleting it does. A table without dropped values or compaction work
+is left alone.
 
-Each table's work is staged as detached Lance versions of the table's current
-pin and published in one graph commit, like any other write. A run
-that fails before that commit leaves the graph unchanged and no recovery
-state; after it the published pins are the tables' versions, with nothing
-left to finish. Optimize runs beside
-live writers: a write that lands on a table while its compaction is staged
-fails the run with a read-set conflict, and the next run re-plans from the
-new state. An update or delete prepared before an optimize published reports
-the same conflict and is retried by its caller. Lance compacts neighbouring
-fragments only when the same indexes cover them, so a table whose index
-coverage was uneven before a run may coalesce fully only on the next run,
-after the rebuilt coverage is in place.
+Work stages as detached Lance versions and publishes together in at most one
+graph commit. Proven failure before publication leaves the visible graph
+unchanged, though detached files may remain. Lost responses do not establish
+publication. Served receipts can remain unresolved before or after the commit:
+observe the original operation ID instead of rerunning optimization.
 
-Compacting a table with Blob properties reads each managed Blob value into
-memory to rewrite it. Optimize sizes the read batches of each compaction task
-(a group of neighbouring fragments compacted together) from the task's largest
-row, summing that row's managed Blob values, so one batch materializes at most
-32 MiB of managed Blob payload whatever the fragment sizes. External Blob
-references are carried without reading the referenced object and count
-nothing. A task holding a row over 16 MiB compacts one row per batch, and a
-single row over 32 MiB is materialized whole. This bounds the payload of a
-batch, not the process heap: Lance's writer copies each inline payload into
-the arrays it prepares while it still holds the batch, so memory use exceeds
-the payload. Every task of a Blob table gets this batch size explicitly, 1 to
-8192 rows, so it takes precedence over `LANCE_DEFAULT_BATCH_SIZE` there,
-including when the variable is smaller. When a fragment being compacted holds
-a Blob descriptor the engine's decoder rejects, sizing can refuse the
-compaction with a Blob integrity error before that table is rewritten, and
-nothing is committed; a table with nothing to compact is not scanned.
-Optimize works on up to
-`OMNIGRAPH_MAINTENANCE_CONCURRENCY` tables at once (default 8), so budget for
-that many Blob tables compacting together.
+Optimize captures authority, then acquires native schema, main-branch and table
+gates and revalidates before physical work; changed authority refuses. Mutations
+prepared against earlier table versions can conflict after optimize publishes.
+Lance compacts neighbours only when the same indexes cover them. Uneven index
+coverage can therefore require another run after index coverage is rebuilt.
+
+Blob compaction materializes managed values. Each task (neighbouring fragments
+compacted together) sizes batches from its largest row's summed Blob payload
+to target at most 32 MiB per batch. External references are copied without
+reading or counting their objects. Rows over 16 MiB run one per batch; a row
+over 32 MiB is materialized whole. This bounds payload, not heap: Lance retains
+the batch while copying payloads into writer arrays. The explicit batch size,
+1–8192 rows, overrides `LANCE_DEFAULT_BATCH_SIZE`, even a smaller value.
+Invalid Blob descriptors can refuse sizing before that table is rewritten,
+with no graph commit; tables without compaction work are not scanned.
+Direct optimize uses up to `OMNIGRAPH_MAINTENANCE_CONCURRENCY` tables at once
+(default 8); budget for concurrent Blob tables. Bounded served optimize uses
+one table at a time, without a peak-memory guarantee.
 
 Optimize also persists the traversal-adjacency artifact
 (`__graph_index/csr-current.bin`), which cold traversal builds load instead of
 scanning every edge dataset. The artifact is derived and regenerable: optimize
 is its only writer, every load is verified and falls back to the in-memory
-build, and a failed write is a warning, not an optimize error. The artifact is
-rewritten by optimize runs that advance an edge dataset; on a store with no
-edge work it is left as-is, and a stale copy costs only the artifact's speedup,
-never correctness.
+build. Direct optimize warns if its write fails. Bounded served optimize
+retains an unresolved operation, even if graph publication already succeeded;
+inspect the original ID instead of retrying. Optimize rewrites the artifact
+when an edge dataset advances; otherwise it leaves it as-is. A stale copy costs
+only the artifact's speedup, never correctness.
 
 Existing full-text indexes are preserved rather than incrementally merged.
 Unindexed rows remain searchable, but a growing uncovered tail can cost more to
@@ -94,8 +130,9 @@ analyzer generation. Optimize reports uncovered full-text coverage under
 `pending_indexes` with this remedy. Deferred coverage alone creates no graph
 commit or maintenance work.
 
-A vector index whose property has no usable vectors remains pending rather than
-failing the run. Run optimize again after loading or generating vectors.
+Vector indexes with no non-null vectors remain pending. With positive input,
+Lance chooses the supported training layout. Statistics, storage and index-build
+failures fail optimization instead of being reported as pending work.
 
 ## Rebuild full-text indexes
 
@@ -305,14 +342,9 @@ Exit 0 means every table was visited and that nothing a retained graph
 commit pins, and no file such a commit references, was removed. It does not mean every table was collected: read the result rows
 for tables with an `error`.
 
-## Suggested cadence
-
-- Run `optimize` after large loads or on a regular cadence for write-heavy
-  graphs.
-- Run `repair` when you want to know whether something outside OmniGraph
-  committed to a table's Lance history.
-- Run `cleanup` from an explicit retention policy after backups and rollback
-  requirements have been reviewed.
+Run optimize after large loads, repair to diagnose foreign table commits, and
+cleanup only with an explicit retention policy that accounts for backups and
+rollback requirements.
 
 Moving a graph to another storage format is not maintenance. See
 [Upgrading](upgrade.md).

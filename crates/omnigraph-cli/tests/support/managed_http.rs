@@ -63,6 +63,8 @@ enum Forwarding {
     Deployment(String, DeploymentDeliveryFault),
 }
 
+type Responder = Box<dyn FnMut(&IntentRequest) -> IntentReply + Send>;
+
 impl Forwarding {
     fn upstream(&self) -> &str {
         match self {
@@ -101,6 +103,25 @@ impl IntentApiFixture {
     /// reply. Control-plane and OAuth fixtures retain their separate protocol.
     pub fn graph(replies: Vec<IntentReply>) -> Self {
         Self::start(replies, None, Duration::ZERO, true)
+    }
+
+    /// Echo identities allocated by the actual client while retaining exact
+    /// request counts and the same transport/discovery fixture.
+    pub fn graph_responding(
+        expected_requests: usize,
+        responder: impl FnMut(&IntentRequest) -> IntentReply + Send + 'static,
+    ) -> Self {
+        let mut fixture = Self::start_with_responder(
+            |_| Vec::new(),
+            None,
+            Duration::ZERO,
+            true,
+            None,
+            None,
+            Some(Box::new(responder)),
+        );
+        fixture.reply_count = Some(expected_requests);
+        fixture
     }
 
     /// Change fixture state before the first discovery response without races
@@ -180,7 +201,28 @@ impl IntentApiFixture {
         delay: Duration,
         graph: bool,
         forwarding: Option<Forwarding>,
+        before_discovery: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Self {
+        Self::start_with_responder(
+            replies,
+            session,
+            delay,
+            graph,
+            forwarding,
+            before_discovery,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_with_responder(
+        replies: impl FnOnce(&str) -> Vec<IntentReply>,
+        session: Option<Value>,
+        delay: Duration,
+        graph: bool,
+        forwarding: Option<Forwarding>,
         mut before_discovery: Option<Box<dyn FnOnce() + Send>>,
+        mut responder: Option<Responder>,
     ) -> Self {
         use std::io::Write;
         use std::sync::atomic::Ordering;
@@ -465,6 +507,8 @@ impl IntentApiFixture {
                     && let Some(session) = &session_response
                 {
                     IntentReply::json(200, session.lock().unwrap().clone())
+                } else if let Some(responder) = &mut responder {
+                    responder(&request)
                 } else {
                     replies.pop_front().unwrap_or_else(|| {
                         IntentReply::json(500, serde_json::json!({"type":"unexpected_request"}))

@@ -1815,6 +1815,7 @@ pub(super) async fn execute_captured_deployment_in_store(
         }
     }
     deployment_policies(store, &before, bundle, caller).await?;
+    crate::maintenance::require_no_maintenance(store).await?;
     let sequence = before.next_sequence.unwrap();
     let id = requested_id.map(str::to_owned).unwrap_or_else(|| {
         format!(

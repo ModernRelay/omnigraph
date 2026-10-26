@@ -61,7 +61,8 @@ pub struct CleanupPolicyOptions {
 
 /// Why `optimize` did not compact a dataset. Typed so callers branch on the
 /// reason rather than sniffing a string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum SkipReason {
     /// The Lance dataset HEAD is ahead of the version recorded in
@@ -97,7 +98,7 @@ impl std::fmt::Display for SkipReason {
 /// Per-dataset outcome of `optimize_all_datasets`. This is a returned result type,
 /// not built by callers, so it is `#[non_exhaustive]`: future fields stay
 /// non-breaking and downstream code reads fields rather than constructing it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct DatasetOptimizeStats {
     /// Qualified graph type key, or `__manifest` for the system dataset.
@@ -123,6 +124,126 @@ pub struct DatasetOptimizeStats {
     /// property without trainable vectors, or full-text coverage requiring an
     /// explicit rebuild. Deferred work alone does not stage or publish.
     pub pending_indexes: Vec<super::PendingIndex>,
+}
+
+/// Admission ceilings for one optimization of the accepted `main` snapshot.
+/// These bound source inventory, not peak memory, output bytes or total I/O.
+/// Bounded optimization always executes one table at a time.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OptimizeLimits {
+    /// Accepted data tables plus the native `__manifest` catalog table.
+    pub max_tables: u32,
+    /// Physical fragments, including `__manifest` fragments.
+    pub max_fragments: u64,
+    /// Physical data rows plus native catalog records, including deleted rows.
+    pub max_rows: u64,
+    pub max_source_bytes: u64,
+    pub max_files: u64,
+}
+
+impl OptimizeLimits {
+    /// Refuse missing bounds before accepting or executing an operation.
+    pub fn validate(&self) -> Result<()> {
+        for (name, value) in [
+            ("tables", u64::from(self.max_tables)),
+            ("fragments", self.max_fragments),
+            ("rows", self.max_rows),
+            ("source_bytes", self.max_source_bytes),
+            ("files", self.max_files),
+        ] {
+            if value == 0 {
+                return Err(OmniError::manifest(format!(
+                    "optimize limit {name} must be nonzero"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Immutable input for one bounded attempt. Source counts include `__manifest`:
+/// `source_tables` counts the catalog table and `source_rows` its native records,
+/// as well as the accepted data tables and their physical rows.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OptimizeInput {
+    pub before_commit: String,
+    /// Actual accepted graph schema, which can differ from applied cluster
+    /// configuration when the graph schema was changed independently.
+    pub schema_contract: SchemaContractDigest,
+    /// Conservative compact-JSON byte bound for the complete exact report.
+    /// Derived from the accepted metadata before effects, independently of
+    /// source-row sizes; the invocation owner reserves its own envelope too.
+    pub report_max_bytes: u64,
+    pub source_tables: u32,
+    pub source_fragments: u64,
+    pub source_rows: u64,
+    pub source_bytes: u64,
+    pub source_files: u64,
+}
+
+/// Exact publication and conservative source inventory for one bounded attempt.
+/// Source counts have the same catalog-inclusive meaning as [`OptimizeInput`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OptimizeReport {
+    pub before_commit: String,
+    pub after_commit: String,
+    pub tables: Vec<DatasetOptimizeStats>,
+    pub source_tables: u32,
+    pub source_fragments: u64,
+    pub source_rows: u64,
+    pub source_bytes: u64,
+    pub source_files: u64,
+}
+
+/// Exact table outcomes captured after detached work and before the one graph
+/// publication. A durable owner can resolve publication by this unique intent
+/// nonce after process exclusion; this does not claim the derived tail finished.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OptimizePublication {
+    pub before_manifest_version: u64,
+    pub intent_nonce: String,
+    pub schema_contract: SchemaContractDigest,
+    pub actor: Option<String>,
+    pub created_at: i64,
+    pub report: OptimizeReport,
+}
+
+/// Whether a failed optimization may have produced physical effects. Callers
+/// may record an effect-free refusal; an effectful failure is not replayable.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct OptimizeFailure {
+    #[source]
+    pub error: OmniError,
+    pub effects_started: bool,
+}
+
+#[derive(Default)]
+struct OptimizeSources {
+    tables: u32,
+    fragments: u64,
+    rows: u64,
+    bytes: u64,
+    files: u64,
+}
+
+fn add_source(total: &mut u64, amount: u64, limit: u64, name: &str) -> Result<()> {
+    let actual = total
+        .checked_add(amount)
+        .ok_or_else(|| OmniError::manifest(format!("optimize source {name} count overflow")))?;
+    if actual > limit {
+        return Err(OmniError::ResourceLimitExceeded {
+            resource: format!("optimize_source_{name}"),
+            limit,
+            actual,
+        });
+    }
+    *total = actual;
+    Ok(())
 }
 
 impl DatasetOptimizeStats {
@@ -179,6 +300,7 @@ struct PreparedOptimizeTable {
     initial_snapshot: crate::storage_layer::SnapshotHandle,
     witness: crate::table_store::StagingWitness,
     last_linear_version: Option<u64>,
+    report_pending_bound: Vec<super::PendingIndex>,
 }
 
 enum OptimizePreparation {
@@ -216,7 +338,28 @@ decide_seam! {
 /// with an exact pin CAS, so one public Optimize produces at most one graph
 /// commit. The publisher owns main's `__manifest` fragment layout; maintenance
 /// only removes obsolete automatic-cleanup configuration from that dataset.
-pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimizeStats>> {
+pub async fn optimize_all_datasets<F, Fut, P, PubFut>(
+    db: &Omnigraph,
+    actor: Option<&str>,
+    limits: Option<&OptimizeLimits>,
+    effects_started: &mut bool,
+    admit: F,
+    record_publication: P,
+) -> Result<OptimizeReport>
+where
+    F: FnOnce(OptimizeInput) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+    P: FnOnce(OptimizePublication) -> PubFut,
+    PubFut: std::future::Future<Output = Result<()>>,
+{
+    db.enforce(
+        omnigraph_policy::PolicyAction::Optimize,
+        &omnigraph_policy::ResourceScope::TargetBranch("main".to_string()),
+        actor,
+    )?;
+    if let Some(limits) = limits {
+        limits.validate()?;
+    }
     let _export_exclusion = db.reserve_export_destructive_control()?;
     db.ensure_schema_state_valid().await?;
 
@@ -246,6 +389,11 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
     let table_guards = db.write_queue().acquire_many(&queue_keys).await;
 
     let snapshot = db.revalidate_write_txn(&authority_txn).await?;
+    let before_commit =
+        authority_txn.authority.graph_head.clone().ok_or_else(|| {
+            OmniError::manifest("optimize requires an accepted main graph commit")
+        })?;
+    let mut after_commit = before_commit.clone();
 
     // Whether this run advanced any edge table — consumed by the graph-index
     // artifact gate at the tail (a no-work optimize skips the rebuild+PUT).
@@ -267,16 +415,55 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
         })
         .collect::<Vec<_>>();
 
-    let concurrency = maint_concurrency().min(table_tasks.len()).max(1);
-
-    let preparations: Vec<Result<OptimizePreparation>> = futures::stream::iter(table_tasks)
-        .map(|task| {
-            let catalog = std::sync::Arc::clone(&catalog);
-            async move { prepare_optimize_table(db, catalog.as_ref(), task).await }
-        })
-        .buffer_unordered(concurrency)
-        .collect()
-        .await;
+    let mut sources = OptimizeSources::default();
+    let preparations = if let Some(limits) = limits {
+        let tables = u64::try_from(table_tasks.len())
+            .ok()
+            .and_then(|tables| tables.checked_add(1))
+            .ok_or_else(|| OmniError::manifest("optimize table count overflow"))?;
+        if tables > u64::from(limits.max_tables) {
+            return Err(OmniError::ResourceLimitExceeded {
+                resource: "optimize_source_tables".to_string(),
+                limit: u64::from(limits.max_tables),
+                actual: tables,
+            });
+        }
+        sources.tables = tables as u32;
+        // The publication and stale-config repair also consume __manifest's
+        // accepted metadata and physical files. Pin the same version as the
+        // revalidated authority; never inventory a later HEAD.
+        let manifest = crate::instrumentation::open_dataset(
+            &crate::db::manifest::manifest_uri(db.root_uri()),
+            crate::instrumentation::VersionResolution::At(snapshot.graph_manifest_version()),
+            Some(&db.control_session()),
+            crate::instrumentation::manifest_wrapper(),
+        )
+        .await?;
+        account_optimize_sources(&manifest, &mut sources, limits).await?;
+        let mut preparations = Vec::with_capacity(table_tasks.len());
+        for task in table_tasks {
+            // Account every accepted table before the first effect. A later
+            // table exceeding the budget cannot leave an earlier one rewritten.
+            preparations.push(Ok(prepare_optimize_table(
+                db,
+                catalog.as_ref(),
+                task,
+                Some((&mut sources, limits)),
+            )
+            .await?));
+        }
+        preparations
+    } else {
+        let concurrency = maint_concurrency().min(table_tasks.len()).max(1);
+        futures::stream::iter(table_tasks)
+            .map(|task| {
+                let catalog = std::sync::Arc::clone(&catalog);
+                async move { prepare_optimize_table(db, catalog.as_ref(), task, None).await }
+            })
+            .buffer_unordered(concurrency)
+            .collect::<Vec<Result<OptimizePreparation>>>()
+            .await
+    };
 
     let mut prepared = Vec::new();
     let mut stats = Vec::new();
@@ -288,20 +475,55 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
     }
     prepared.sort_by(|left, right| left.table_key.cmp(&right.table_key));
 
+    let schema_contract = if limits.is_some() {
+        SchemaContractDigest::from_row(&snapshot.read_schema_contract(db.root_uri()).await?)
+    } else {
+        db.schema_contract_digest()
+    };
+
+    // The invocation owner binds the exact immutable graph commit and complete
+    // source inventory durably while all native writer gates remain held.
+    // A failed binding cannot start compaction or derived-artifact writes.
+    admit(OptimizeInput {
+        before_commit: before_commit.clone(),
+        schema_contract: schema_contract.clone(),
+        report_max_bytes: if limits.is_some() {
+            optimize_report_byte_bound(&before_commit, &sources, &stats, &prepared)?
+        } else {
+            0
+        },
+        source_tables: sources.tables,
+        source_fragments: sources.fragments,
+        source_rows: sources.rows,
+        source_bytes: sources.bytes,
+        source_files: sources.files,
+    })
+    .await?;
+
     if !prepared.is_empty() {
-        let effect_concurrency = maint_concurrency().min(prepared.len()).max(1);
-        let effect_results: Vec<Result<OptimizeEffectOutcome>> = futures::stream::iter(prepared)
-            .map(|work| {
-                let catalog = std::sync::Arc::clone(&catalog);
-                async move { apply_optimize_table_effects(db, catalog.as_ref(), work).await }
-            })
-            .buffer_unordered(effect_concurrency)
-            .collect()
-            .await;
-        let mut outcomes = Vec::new();
-        for result in effect_results {
-            outcomes.push(result?);
-        }
+        *effects_started = true;
+        let mut outcomes: Vec<OptimizeEffectOutcome> = if limits.is_some() {
+            // One table in flight: stop before starting the next table if this
+            // one's effects fail or become uncertain.
+            let mut outcomes = Vec::with_capacity(prepared.len());
+            for work in prepared {
+                outcomes.push(apply_optimize_table_effects(db, catalog.as_ref(), work).await?);
+            }
+            outcomes
+        } else {
+            // Retain the direct path's settlement of all in-flight work.
+            let effect_concurrency = maint_concurrency().min(prepared.len()).max(1);
+            futures::stream::iter(prepared)
+                .map(|work| {
+                    let catalog = std::sync::Arc::clone(&catalog);
+                    async move { apply_optimize_table_effects(db, catalog.as_ref(), work).await }
+                })
+                .buffer_unordered(effect_concurrency)
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<Result<_>>()?
+        };
         fail(&OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT)?;
         let mut updates = Vec::new();
         let mut expected_versions = crate::db::manifest::ExpectedTableVersions::new();
@@ -324,19 +546,49 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
             .any(|update| update.type_key.starts_with("edge:"));
         if any_committed {
             let lineage = db
-                .new_lineage_intent_for_branch(None, None, HistoryReleaseBytes::PRODUCTION)
+                .new_lineage_intent_for_branch(None, actor, HistoryReleaseBytes::PRODUCTION)
                 .await?;
-            super::table_ops::commit_updates_on_branch_with_expected(
+            if limits.is_some() {
+                let mut publication_stats = stats.clone();
+                publication_stats.extend(outcomes.iter().map(|outcome| outcome.stat.clone()));
+                publication_stats.sort_by(|left, right| left.type_key.cmp(&right.type_key));
+                record_publication(OptimizePublication {
+                    before_manifest_version: snapshot.graph_manifest_version(),
+                    intent_nonce: lineage.graph_commit_id.clone(),
+                    schema_contract: schema_contract.clone(),
+                    actor: lineage.actor_id.clone(),
+                    created_at: lineage.created_at,
+                    report: OptimizeReport {
+                        before_commit: before_commit.clone(),
+                        after_commit: before_commit.clone(),
+                        tables: publication_stats,
+                        source_tables: sources.tables,
+                        source_fragments: sources.fragments,
+                        source_rows: sources.rows,
+                        source_bytes: sources.bytes,
+                        source_files: sources.files,
+                    },
+                })
+                .await?;
+            }
+            let commit = super::table_ops::commit_updates_on_branch_with_expected(
                 db,
                 None,
                 &updates,
                 &expected_versions,
-                None,
+                actor,
                 &authority_txn,
                 lineage,
-                super::table_ops::Publication::Publish,
+                if limits.is_some() {
+                    super::table_ops::Publication::PublishExactVersion(
+                        snapshot.graph_manifest_version(),
+                    )
+                } else {
+                    super::table_ops::Publication::Publish
+                },
             )
             .await?;
+            after_commit = commit.graph_commit_id;
         }
         edge_tables_committed = edge_committed;
         stats.extend(outcomes.into_iter().map(|outcome| outcome.stat));
@@ -349,13 +601,48 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
     }
     stats.sort_by(|left, right| left.type_key.cmp(&right.type_key));
 
-    drop(table_guards);
-    drop(schema_permit);
+    let bounded_snapshot = if limits.is_some() {
+        let published = db.fresh_snapshot_for_branch_unchecked(None).await?;
+        if published.graph_head(None) != Some(after_commit.as_str()) {
+            return Err(OmniError::manifest_conflict(
+                "optimize publication changed before derived artifact persistence",
+            ));
+        }
+        Some(published)
+    } else {
+        None
+    };
+    // Bounded work retains the complete effect envelope through derived writes.
+    // The captured post-publication snapshot keeps those writes bound to this
+    // operation's exact result instead of resolving a mutable handle again.
+    let retained_gates = if limits.is_some() {
+        Some((table_guards, schema_permit))
+    } else {
+        drop(table_guards);
+        drop(schema_permit);
+        None
+    };
 
     let mut all = stats.into_iter().map(Ok).collect::<Vec<Result<_>>>();
-    all.push(clear_manifest_auto_cleanup(db).await);
+    let manifest_stat = clear_manifest_auto_cleanup(db, effects_started).await;
+    all.push(if limits.is_some() {
+        Ok(manifest_stat?)
+    } else {
+        manifest_stat
+    });
 
-    if let Err(error) = persist_graph_index_artifact(db, &catalog, edge_tables_committed).await {
+    if let Err(error) = persist_graph_index_artifact(
+        db,
+        &catalog,
+        edge_tables_committed,
+        bounded_snapshot.as_ref(),
+        effects_started,
+    )
+    .await
+    {
+        if limits.is_some() {
+            return Err(error);
+        }
         tracing::warn!(
             target: "omnigraph::optimize",
             error = %error,
@@ -363,7 +650,17 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
         );
     }
 
-    all.into_iter().collect()
+    drop(retained_gates);
+    Ok(OptimizeReport {
+        before_commit,
+        after_commit,
+        tables: all.into_iter().collect::<Result<_>>()?,
+        source_tables: sources.tables,
+        source_fragments: sources.fragments,
+        source_rows: sources.rows,
+        source_bytes: sources.bytes,
+        source_files: sources.files,
+    })
 }
 
 /// Build the full-catalog graph index from a fresh main snapshot and write it
@@ -386,6 +683,8 @@ async fn persist_graph_index_artifact(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
     edge_tables_committed: bool,
+    bounded_snapshot: Option<&crate::db::Snapshot>,
+    effects_started: &mut bool,
 ) -> Result<()> {
     if catalog.edge_types.is_empty() {
         return Ok(());
@@ -403,7 +702,10 @@ async fn persist_graph_index_artifact(
         .iter()
         .map(|(name, et)| (name.clone(), (et.from_type.clone(), et.to_type.clone())))
         .collect();
-    let snapshot = db.snapshot_for_branch(None).await?;
+    let snapshot = match bounded_snapshot {
+        Some(snapshot) => snapshot.clone(),
+        None => db.snapshot_for_branch(None).await?,
+    };
     // `save` refuses a partially-materialized store (no complete identity to
     // stamp); check that BEFORE paying the full-catalog edge scan.
     if edge_types
@@ -417,8 +719,9 @@ async fn persist_graph_index_artifact(
         return Ok(());
     }
     let index =
-        crate::graph_index::GraphIndex::build(&snapshot, &edge_types, db.catalog().system_columns)
+        crate::graph_index::GraphIndex::build(&snapshot, &edge_types, catalog.system_columns)
             .await?;
+    *effects_started = true;
     let written =
         crate::graph_index::persist::save(&snapshot, db.storage_adapter(), &edge_types, &index)
             .await?;
@@ -437,16 +740,140 @@ async fn persist_graph_index_artifact(
     Ok(())
 }
 
+/// Account the complete pinned physical inventory, not only Lance's chosen
+/// compaction tasks. Index folding can scan a whole table and the adapter adds
+/// dropped-column rewrites after Lance plans. Exact object HEADs fill missing
+/// data-file sizes; no history or directory inventory is listed.
+async fn account_optimize_sources(
+    ds: &lance::Dataset,
+    sources: &mut OptimizeSources,
+    limits: &OptimizeLimits,
+) -> Result<()> {
+    let unsupported = |reason: &str| {
+        OmniError::manifest(format!(
+            "bounded optimize cannot account for {}: {reason}",
+            ds.uri()
+        ))
+    };
+    let store = ds.object_store(None).await.map_err(OmniError::storage)?;
+    let base = ds.branch_location().path;
+    add_source(&mut sources.files, 1, limits.max_files, "files")?;
+    let manifest_bytes = match ds.manifest_location().size {
+        Some(bytes) => bytes,
+        None => store
+            .size(&ds.manifest_location().path)
+            .await
+            .map_err(OmniError::storage)?,
+    };
+    add_source(
+        &mut sources.bytes,
+        manifest_bytes,
+        limits.max_source_bytes,
+        "bytes",
+    )?;
+    for fragment in ds.manifest().fragments.iter() {
+        add_source(&mut sources.fragments, 1, limits.max_fragments, "fragments")?;
+        let rows = fragment
+            .physical_rows
+            .ok_or_else(|| unsupported("unknown physical row count"))?;
+        add_source(&mut sources.rows, rows as u64, limits.max_rows, "rows")?;
+        if !fragment.overlays.is_empty() {
+            return Err(unsupported("data overlays"));
+        }
+        for file in &fragment.files {
+            if file.base_id.is_some() {
+                return Err(unsupported("inherited data-file storage base"));
+            }
+            add_source(&mut sources.files, 1, limits.max_files, "files")?;
+            let bytes = match file.file_size_bytes.get() {
+                Some(bytes) => bytes.get(),
+                None => store
+                    .size(&base.clone().join("data").join(file.path.as_str()))
+                    .await
+                    .map_err(OmniError::storage)?,
+            };
+            add_source(&mut sources.bytes, bytes, limits.max_source_bytes, "bytes")?;
+        }
+        if let Some(deletion) = &fragment.deletion_file {
+            if deletion.base_id.is_some() {
+                return Err(unsupported("inherited deletion-file storage base"));
+            }
+            add_source(&mut sources.files, 1, limits.max_files, "files")?;
+            let path = lance_table::io::deletion::deletion_file_path(&base, fragment.id, deletion);
+            let bytes = store.size(&path).await.map_err(OmniError::storage)?;
+            add_source(&mut sources.bytes, bytes, limits.max_source_bytes, "bytes")?;
+        }
+    }
+    // The query-facing listing filters indexes this reader cannot use. Such
+    // filtering is not evidence that their physical inputs are absent.
+    let indexes = lance_table::io::manifest::read_manifest_indexes(
+        &store,
+        ds.manifest_location(),
+        ds.manifest(),
+    )
+    .await
+    .map_err(OmniError::storage)?;
+    for index in &indexes {
+        if index.base_id.is_some() || lance_index::is_system_index(index) {
+            return Err(unsupported("inherited or system index"));
+        }
+        if index.index_details.is_none() {
+            return Err(unsupported("unknown index-kind metadata"));
+        }
+        let files = index
+            .files
+            .as_ref()
+            .ok_or_else(|| unsupported("unknown index-file inventory"))?;
+        for file in files {
+            add_source(&mut sources.files, 1, limits.max_files, "files")?;
+            add_source(
+                &mut sources.bytes,
+                file.size_bytes,
+                limits.max_source_bytes,
+                "bytes",
+            )?;
+        }
+    }
+    let readable = ds.load_indices().await.map_err(OmniError::storage)?;
+    let readable_ids = readable
+        .iter()
+        .map(|index| index.uuid)
+        .collect::<std::collections::HashSet<_>>();
+    if indexes
+        .iter()
+        .any(|index| !readable_ids.contains(&index.uuid))
+    {
+        return Err(unsupported("unsupported physical index format"));
+    }
+    // Descriptor scans do not hydrate Blob payloads. Charge every live managed
+    // value conservatively, including inline values already charged above.
+    let (bytes, files) = TableStore::managed_blob_source_size(
+        ds,
+        limits.max_source_bytes - sources.bytes,
+        limits.max_files - sources.files,
+    )
+    .await?;
+    add_source(&mut sources.bytes, bytes, limits.max_source_bytes, "bytes")?;
+    add_source(&mut sources.files, files, limits.max_files, "files")?;
+    Ok(())
+}
+
 /// Pure planning: classify drift/no-work/productive state without advancing
 /// any Lance HEAD. The caller holds schema -> main -> all table gates.
 async fn prepare_optimize_table(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
     task: OptimizeTableTask,
+    accounting: Option<(&mut OptimizeSources, &OptimizeLimits)>,
 ) -> Result<OptimizePreparation> {
+    let bounded = accounting.is_some();
     let snapshot = db
         .open_pinned_for_write(&task.full_path, &task.entry)
         .await?;
+
+    if let Some((sources, limits)) = accounting {
+        account_optimize_sources(snapshot.dataset(), sources, limits).await?;
+    }
 
     // The same plan `stage_compaction` executes: a fragment still holding a
     // dropped property's values is compaction work even when Lance's planner
@@ -473,6 +900,11 @@ async fn prepare_optimize_table(
         return Ok(OptimizePreparation::Stat(stat));
     }
 
+    let report_pending_bound = if bounded {
+        pending_index_report_bound(catalog, &task.table_key, &snapshot).await?
+    } else {
+        Vec::new()
+    };
     Ok(OptimizePreparation::Work(PreparedOptimizeTable {
         identity: task.identity,
         table_key: task.table_key,
@@ -481,7 +913,158 @@ async fn prepare_optimize_table(
         initial_snapshot: snapshot,
         witness: task.witness,
         last_linear_version: task.entry.version_metadata.last_linear_version(),
+        report_pending_bound,
     }))
+}
+
+fn deferred_full_text_index(table_key: &str, property: &str) -> super::PendingIndex {
+    super::PendingIndex {
+        type_key: table_key.to_string(),
+        property: property.to_string(),
+        reason: "full-text index has incomplete or unknown coverage; \
+                 run omnigraph rebuild-full-text-indexes <URI> --branch main"
+            .to_string(),
+    }
+}
+
+fn deferred_vector_fold_reason(reason: &str) -> String {
+    format!("vector index coverage lags and the column cannot train an index: {reason}")
+}
+
+/// Every possible pending row has metadata known before physical work:
+/// declared missing vectors, one vector-fold row per existing index name,
+/// and full-text fields on existing segments or new declared columns. Counting
+/// every segment deliberately over-reserves duplicate names. Compaction and
+/// index folding preserve content and schema; they introduce no new properties.
+async fn pending_index_report_bound(
+    catalog: &omnigraph_compiler::catalog::Catalog,
+    table_key: &str,
+    snapshot: &crate::storage_layer::SnapshotHandle,
+) -> Result<Vec<super::PendingIndex>> {
+    let mut pending = Vec::new();
+    if let Some(node) = table_key
+        .strip_prefix("node:")
+        .and_then(|name| catalog.node_types.get(name))
+    {
+        for columns in &node.indices {
+            if columns.len() == 1
+                && node.properties.get(&columns[0]).is_some_and(|property| {
+                    property.index_kind() == Some(omnigraph_compiler::types::PropIndexKind::Vector)
+                })
+            {
+                pending.push(super::PendingIndex {
+                    type_key: table_key.to_string(),
+                    property: columns[0].clone(),
+                    reason: super::PendingIndex::NO_VECTORS_REASON.to_string(),
+                });
+            }
+        }
+    }
+    let ds = snapshot.dataset();
+    for index in ds.load_indices().await.map_err(OmniError::storage)?.iter() {
+        if TableStore::index_is_vector(index) {
+            if let Some(field) = index
+                .fields
+                .first()
+                .and_then(|id| ds.schema().field_by_id(*id))
+            {
+                pending.push(super::PendingIndex {
+                    type_key: table_key.to_string(),
+                    property: field.name.clone(),
+                    reason: deferred_vector_fold_reason(super::PendingIndex::NO_VECTORS_REASON),
+                });
+            }
+        } else if is_full_text_index(index) {
+            for field in index
+                .keyed_fields()
+                .iter()
+                .filter_map(|id| ds.schema().field_by_id(*id))
+            {
+                pending.push(deferred_full_text_index(table_key, &field.name));
+            }
+        }
+    }
+    // A detached link can install a declaration for a previously absent FTS
+    // segment. Its generated physical name is irrelevant to the public reason.
+    for column in super::table_ops::declared_full_text_columns(catalog, table_key) {
+        pending.push(deferred_full_text_index(table_key, &column));
+    }
+    Ok(pending)
+}
+
+fn maximum_table_report(
+    type_key: String,
+    pending_indexes: Vec<super::PendingIndex>,
+) -> DatasetOptimizeStats {
+    DatasetOptimizeStats {
+        type_key,
+        fragments_removed: usize::MAX,
+        fragments_added: usize::MAX,
+        committed: false, // JSON false is one byte longer than true.
+        skipped: Some(SkipReason::DriftNeedsRepair),
+        published_dataset_version: Some(u64::MAX),
+        lance_head_version: Some(u64::MAX),
+        pending_indexes,
+    }
+}
+
+fn compact_json_bytes(value: &impl serde::Serialize) -> Result<u64> {
+    #[derive(Default)]
+    struct Counter(u64);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| std::io::Error::other("optimize report byte count overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter::default();
+    serde_json::to_writer(&mut counter, value)
+        .map_err(|error| OmniError::manifest(format!("encode optimize report bound: {error}")))?;
+    Ok(counter.0)
+}
+
+fn optimize_report_byte_bound(
+    before_commit: &str,
+    sources: &OptimizeSources,
+    stats: &[DatasetOptimizeStats],
+    prepared: &[PreparedOptimizeTable],
+) -> Result<u64> {
+    use omnigraph_core::graph_commit_id::{HISTORY_BLOCK_SLOTS, HistoryBlockId};
+    // A productive publish emits a canonical ULID or history-block ID. A
+    // no-op retains the exact input spelling, including accepted older IDs.
+    let largest_commit = HistoryBlockId::new(
+        ulid::Ulid::nil(),
+        HISTORY_BLOCK_SLOTS - 1,
+        ulid::Ulid::nil(),
+    )?
+    .to_string();
+    let after_commit = if compact_json_bytes(&before_commit)? > compact_json_bytes(&largest_commit)?
+    {
+        before_commit.to_string()
+    } else {
+        largest_commit
+    };
+    let mut tables = stats.to_vec(); // No-work table reports are already exact.
+    tables.extend(prepared.iter().map(|work| {
+        maximum_table_report(work.table_key.clone(), work.report_pending_bound.clone())
+    }));
+    tables.push(maximum_table_report("__manifest".to_string(), Vec::new()));
+    compact_json_bytes(&OptimizeReport {
+        before_commit: before_commit.to_string(),
+        after_commit,
+        tables,
+        source_tables: sources.tables,
+        source_fragments: sources.fragments,
+        source_rows: sources.rows,
+        source_bytes: sources.bytes,
+        source_files: sources.files,
+    })
 }
 
 /// Deferred full-text coverage is observable status, never a promise that
@@ -517,14 +1100,7 @@ async fn append_deferred_full_text_indexes(
             .iter()
             .filter_map(|id| ds.schema().field_by_id(*id))
         {
-            pending.push(super::PendingIndex {
-                type_key: table_key.to_string(),
-                property: field.name.clone(),
-                reason: format!(
-                    "full-text index '{name}' has incomplete or unknown coverage; \
-                     run omnigraph rebuild-full-text-indexes <URI> --branch main"
-                ),
-            });
+            pending.push(deferred_full_text_index(table_key, &field.name));
         }
     }
     Ok(())
@@ -597,9 +1173,7 @@ async fn apply_optimize_table_effects(
         index_work.pending.push(super::PendingIndex {
             type_key: table_key.clone(),
             property: column,
-            reason: format!(
-                "vector index coverage lags and the column cannot train an index: {reason}"
-            ),
+            reason: deferred_vector_fold_reason(&reason),
         });
     }
     if !index_work.specs.is_empty() {
@@ -670,6 +1244,7 @@ fn is_retryable_lance_conflict(err: &lance::Error) -> bool {
 /// Remove automatic GC configuration, returning whether Lance HEAD advanced.
 async fn clear_stale_auto_cleanup_config(
     ds: &mut lance::Dataset,
+    effects_started: &mut bool,
 ) -> std::result::Result<bool, lance::Error> {
     let keys: Vec<String> = ds
         .config()
@@ -684,17 +1259,21 @@ async fn clear_stale_auto_cleanup_config(
     // replacement for `delete_config_keys` (awaiting the builder merges rather
     // than replacing the whole config map).
     let entries: Vec<(&str, Option<&str>)> = keys.iter().map(|k| (k.as_str(), None)).collect();
+    *effects_started = true;
     ds.update_config(entries).await?;
     Ok(true)
 }
 
 /// Remove stored automatic GC configuration without changing manifest fragments.
-async fn clear_manifest_auto_cleanup(db: &Omnigraph) -> Result<DatasetOptimizeStats> {
+async fn clear_manifest_auto_cleanup(
+    db: &Omnigraph,
+    effects_started: &mut bool,
+) -> Result<DatasetOptimizeStats> {
     let uri = crate::db::manifest::manifest_uri(db.root_uri());
     for attempt in 0..INTERNAL_CONFIG_RETRY_BUDGET {
         let handle = db.storage().open_dataset_head(&uri, None).await?;
         let mut ds = handle.into_dataset();
-        match clear_stale_auto_cleanup_config(&mut ds).await {
+        match clear_stale_auto_cleanup_config(&mut ds, effects_started).await {
             Ok(cleared) => {
                 if cleared {
                     db.coordinator.write().await.refresh().await?;
@@ -1518,6 +2097,187 @@ pub(super) fn all_table_keys(catalog: &omnigraph_compiler::catalog::Catalog) -> 
 mod tests {
     use super::*;
     use crate::loader::LoadMode;
+
+    #[test]
+    fn report_reservation_counts_escaped_metadata_and_numeric_widths() {
+        let pending = vec![deferred_full_text_index(
+            "node:\"\\\n東京",
+            &"long\"\\\nproperty".repeat(8192),
+        )];
+        let maximum = maximum_table_report("node:\"\\\n東京".to_string(), pending);
+        let reserved = compact_json_bytes(&maximum).unwrap();
+        assert_eq!(reserved, serde_json::to_vec(&maximum).unwrap().len() as u64);
+        assert!(reserved > maximum.pending_indexes[0].property.len() as u64);
+        for committed in [false, true] {
+            for skipped in [None, Some(SkipReason::DriftNeedsRepair)] {
+                for version in [None, Some(0), Some(u64::MAX)] {
+                    let mut actual = maximum.clone();
+                    actual.committed = committed;
+                    actual.skipped = skipped;
+                    actual.published_dataset_version = version;
+                    actual.lance_head_version = version;
+                    for fragments in [0, 9, 10, usize::MAX] {
+                        actual.fragments_removed = fragments;
+                        actual.fragments_added = fragments;
+                        assert!(compact_json_bytes(&actual).unwrap() <= reserved);
+                    }
+                    actual.pending_indexes.clear();
+                    assert!(compact_json_bytes(&actual).unwrap() <= reserved);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_inventory_refuses_unknown_rows_and_heads_unknown_file_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::Session::from_defaults(
+            std::sync::Arc::new(
+                Omnigraph::init(
+                    dir.path().to_str().unwrap(),
+                    "node Person { name: String @key }",
+                )
+                .await
+                .unwrap(),
+            ),
+            omnigraph_compiler::settings::SessionSettings::default(),
+        );
+        db.load_jsonl(
+            "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\"}}",
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap();
+        let snapshot = db
+            .snapshot_of(crate::db::ReadTarget::branch("main"))
+            .await
+            .unwrap();
+        let entry = snapshot.dataset("node:Person").unwrap();
+        let path = format!("{}/{}", db.root_uri(), entry.dataset_path);
+        let mut ds = db
+            .open_pinned_for_write(&path, entry)
+            .await
+            .unwrap()
+            .into_dataset();
+        let limits = OptimizeLimits {
+            max_tables: 1,
+            max_fragments: 16,
+            max_rows: 16,
+            max_source_bytes: 1024 * 1024,
+            max_files: 64,
+        };
+        let mut known = OptimizeSources::default();
+        account_optimize_sources(&ds, &mut known, &limits)
+            .await
+            .unwrap();
+        let mut fragments = ds.manifest.fragments.as_ref().clone();
+        for file in &mut fragments[0].files {
+            file.file_size_bytes = Default::default();
+        }
+        std::sync::Arc::make_mut(&mut ds.manifest).fragments =
+            std::sync::Arc::new(fragments.clone());
+        let mut headed = OptimizeSources::default();
+        account_optimize_sources(&ds, &mut headed, &limits)
+            .await
+            .unwrap();
+        assert_eq!(
+            known.bytes, headed.bytes,
+            "unknown file size must be resolved by exact HEAD"
+        );
+        fragments[0].physical_rows = None;
+        std::sync::Arc::make_mut(&mut ds.manifest).fragments = std::sync::Arc::new(fragments);
+        assert!(
+            account_optimize_sources(&ds, &mut OptimizeSources::default(), &limits)
+                .await
+                .is_err(),
+            "unknown physical rows cannot be treated as zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_inventory_refuses_indexes_hidden_by_the_reader() {
+        use lance::index::DatasetIndexExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::Session::from_defaults(
+            std::sync::Arc::new(
+                Omnigraph::init(
+                    dir.path().to_str().unwrap(),
+                    "node Person { name: String @key }",
+                )
+                .await
+                .unwrap(),
+            ),
+            omnigraph_compiler::settings::SessionSettings::default(),
+        );
+        db.load_jsonl(
+            "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\"}}",
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap();
+        let snapshot = db
+            .snapshot_of(crate::db::ReadTarget::branch("main"))
+            .await
+            .unwrap();
+        let entry = snapshot.dataset("node:Person").unwrap();
+        let path = format!("{}/{}", db.root_uri(), entry.dataset_path);
+        let mut ds = db
+            .open_pinned_for_write(&path, entry)
+            .await
+            .unwrap()
+            .into_dataset();
+        let mut future_index = ds
+            .create_index_builder(
+                &["name"],
+                lance_index::IndexType::BTree,
+                &lance_index::scalar::ScalarIndexParams::default(),
+            )
+            .name("future-index".to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        future_index.index_version = i32::MAX;
+        assert!(
+            future_index
+                .files
+                .as_ref()
+                .is_some_and(|files| !files.is_empty())
+        );
+        let transaction = lance::dataset::transaction::Transaction::new(
+            ds.version().version,
+            lance::dataset::transaction::Operation::CreateIndex {
+                new_indices: vec![future_index],
+                removed_indices: Vec::new(),
+            },
+            None,
+        );
+        let ds = lance::dataset::CommitBuilder::new(std::sync::Arc::new(ds))
+            .with_detached(true)
+            .execute(transaction)
+            .await
+            .unwrap();
+        assert!(
+            ds.load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .all(|index| index.name != "future-index")
+        );
+        let limits = OptimizeLimits {
+            max_tables: 16,
+            max_fragments: 1024,
+            max_rows: 100_000,
+            max_source_bytes: 64 * 1024 * 1024,
+            max_files: 4096,
+        };
+        assert!(
+            account_optimize_sources(&ds, &mut OptimizeSources::default(), &limits)
+                .await
+                .is_err(),
+            "filtered reader metadata cannot prove complete physical inventory"
+        );
+    }
 
     /// Native commit conflicts allow configuration cleanup to reopen and retry.
     #[test]

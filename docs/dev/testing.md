@@ -298,6 +298,21 @@ failure with settled storage I/O is a 500 the server keeps serving through,
 with a clean SIGTERM still releasing the lock. In-source
 `deployment` tests suspend observer read futures across owner start, finish and complete
 turnover, exercising bounded re-observation for aggregate and exact status.
+Served optimization extends `boot_settings` with explicit enablement, policy
+denial, input ceilings, pre-effect refusal, durable input/report binding and
+duplicate-ID lookup without a second effect. Native `maintenance` tests own
+the bounded journal, consumed-ID retention, current authority, publication
+bindings and the unresolved-work shutdown/deployment guards. Engine
+maintenance tests own retained graph contents, complete source accounting and
+the exact prepublication/recovery witness. The cluster owner includes a real
+oversized schema proving receipt-capacity refusal before any graph write;
+its existing journal fault adapter covers lost responses and cancellation.
+The existing server process fixture additionally recovers after shutdown
+cutoff and death after publication, then proves a fresh owner can serve the
+same original result without replay. Root-bound identity tests exercise both
+builder orders and direct HTTP refusals while receipt reads remain available.
+CLI `system_remote` exercises real optimize submission and exact receipt lookup
+against the owning server, including policy denial and unchanged query results.
 CLI `cli_cluster` owns submit-once polling, transient 429/503 and truncated-body
 retries, malformed-receipt refusal, terminal outcomes and caller timeout without
 replay. Its managed fixtures cover status/history scope and filters, explicit

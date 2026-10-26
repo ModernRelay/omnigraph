@@ -30,6 +30,7 @@ mod deployment;
 mod diff;
 mod graph_read;
 mod lease;
+mod maintenance;
 mod serve;
 mod state_lock;
 mod store;
@@ -42,7 +43,8 @@ pub mod lease_protocol {
     pub use crate::lease::{LeaseKeeper, Watch, lease_dir, watch_and_claim};
 }
 pub use admission::{
-    ClusterAdmission, ClusterAdmissionPurpose, acquire_cluster_admission, acquire_graph_admission,
+    ClusterAdmission, ClusterAdmissionPurpose, acquire_cluster_admission,
+    acquire_cluster_admission_with_binding, acquire_graph_admission,
     acquire_graph_admission_with_binding, canonical_graph_uri,
 };
 pub use authorization::{
@@ -56,6 +58,7 @@ use config::{
 pub use deployment::*;
 use diff::{ResourceKind, compute_blast_radius, resource_kind};
 pub use graph_read::GraphReadAuthority;
+pub use maintenance::*;
 #[cfg(any(test, feature = "test-util"))]
 pub use serve::read_serving_snapshot_with_display_root;
 pub use serve::{

@@ -1,4 +1,4 @@
-//! Arguments for direct graph maintenance.
+//! Arguments for graph maintenance.
 
 use clap::Args;
 
@@ -16,6 +16,19 @@ pub(crate) struct UpgradeArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct OptimizeArgs {
+    /// Return after the server accepts the operation; work continues remotely
+    #[arg(long)]
+    pub(crate) no_wait: bool,
+    /// Observe an existing operation; never submit another optimization
+    #[arg(long, value_name = "ID")]
+    pub(crate) operation_id: Option<String>,
+    /// Reconcile this original operation on an explicit direct root after
+    /// excluding prior writers and accepted graph/control I/O
+    #[arg(long, requires = "operation_id", conflicts_with_all = ["no_wait", "timeout"])]
+    pub(crate) writers_stopped: bool,
+    /// Maximum seconds to observe server work (default 300); never cancels work
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    pub(crate) timeout: Option<u64>,
     #[arg(long)]
     pub(crate) json: bool,
 }

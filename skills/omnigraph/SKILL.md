@@ -193,7 +193,7 @@ destination line. Legacy `--server`, `--store`, `--cluster`,
 | Data | `query`, `mutate`, `load --mode overwrite\|append\|merge`, `branch`, `commit`, `snapshot`, `export`, `blob`, `diff`, `changes`; direct or served targets |
 | Managed data | `graphs list` and common served graph commands, subject to endpoint capabilities and policy; no direct maintenance fallback |
 | Direct schema | `schema plan`; `schema apply` and `schema upgrade-system-columns` require standalone graph targets |
-| Direct maintenance | `optimize`, `repair`, `cleanup`, `rebuild-full-text-indexes`; `upgrade --target ADDRESS` is standalone and offline |
+| Maintenance | `optimize` on direct or enabled server targets; `repair`, `cleanup`, `rebuild-full-text-indexes` are direct; `upgrade --target ADDRESS` is standalone and offline |
 | Source-only | `lint --schema FILE --query FILE`, `cluster validate --config DIR`; no backend target |
 | Root control | `queries list/validate`, `policy validate/test/explain`, `cluster observe/force-unlock/upgrade-ledger`; direct root targets; `queries list` also reads one served graph |
 | Deployment | `cluster plan/apply --config DIR` on a direct root or server; `cluster status` uses only the target |

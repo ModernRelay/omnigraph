@@ -22,7 +22,7 @@ mod row;
 mod schema_publication;
 pub use schema_publication::{
     SchemaPublicationCandidate, SchemaPublicationEvidence, read_schema_publication_at,
-    read_schema_publication_candidate_at,
+    read_schema_publication_candidate_at, read_schema_publication_candidate_at_with_session,
 };
 
 use std::collections::{HashMap, HashSet};

@@ -106,3 +106,6 @@ EndpointProbeSwept           l.put        calls=6
 EndpointProbeJudged          l.get        calls=14
 EndpointProbeJudged          l.list       calls=1
 EndpointProbeJudged          l.put        calls=6
+BoundedOptimize              l.get        calls=59
+BoundedOptimize              l.list       calls=4
+BoundedOptimize              l.put        calls=40

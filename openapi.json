@@ -981,6 +981,1004 @@
         ]
       }
     },
+    "/cluster/maintenance": {
+      "get": {
+        "tags": [
+          "cluster"
+        ],
+        "operationId": "maintenanceStatus",
+        "parameters": [
+          {
+            "name": "graph",
+            "in": "query",
+            "description": "Graph to optimize; scope is main",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Omnigraph-Http-Api",
+            "in": "header",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "0.14"
+              ]
+            }
+          },
+          {
+            "name": "Omnigraph-If-Actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MaintenanceStatusOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "unauthorized when no bearer credential is presented or the server refuses it",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found when no route serves the path",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "method_not_allowed when the path is served, but not with this method",
+            "headers": {
+              "Allow": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The methods the path serves."
+              },
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "too_many_requests when server observer, ingress or operation admission capacity is exhausted; honor Retry-After",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "cluster"
+        ],
+        "operationId": "optimize",
+        "parameters": [
+          {
+            "name": "Omnigraph-Http-Api",
+            "in": "header",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "0.14"
+              ]
+            }
+          },
+          {
+            "name": "Omnigraph-If-Actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MaintenanceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MaintenanceOutput"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Durable acceptance; inspect the original identity",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MaintenanceOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "unauthorized when no bearer credential is presented or the server refuses it",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found when no route serves the path",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "method_not_allowed when the path is served, but not with this method",
+            "headers": {
+              "Allow": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The methods the path serves."
+              },
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "request_timeout when the request body deadline passes before operation admission",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "payload_too_large when the request body exceeds its route limit before operation admission",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "too_many_requests when server observer, ingress or operation admission capacity is exhausted; honor Retry-After",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal failure (code `internal`) or uncertain optimization (code `outcome_unknown`); inspect the original identity without resubmission",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/cluster/maintenance/{operation_id}": {
+      "get": {
+        "tags": [
+          "cluster"
+        ],
+        "operationId": "maintenanceLookup",
+        "parameters": [
+          {
+            "name": "operation_id",
+            "in": "path",
+            "description": "Original maintenance identity",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "graph",
+            "in": "query",
+            "description": "Exact graph of the original operation",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Omnigraph-Http-Api",
+            "in": "header",
+            "description": "exactly one Omnigraph-Http-Api header with value 0.14 is required",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "0.14"
+              ]
+            }
+          },
+          {
+            "name": "Omnigraph-If-Actor",
+            "in": "header",
+            "description": "The actor the caller expects its credential to resolve to. A mismatch is refused with 412 actor_mismatch before graph lookup or effects; a match changes nothing.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MaintenanceOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "unauthorized when no bearer credential is presented or the server refuses it",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Bearer challenge (RFC 6750 §3). It carries error=\"invalid_token\" when a presented bearer credential was refused, and resource_metadata naming the OAuth protected-resource metadata when the server has an OIDC resource identity."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found when no route serves the path",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "method_not_allowed when the path is served, but not with this method",
+            "headers": {
+              "Allow": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The methods the path serves."
+              },
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "too_many_requests when server observer, ingress or operation admission capacity is exhausted; honor Retry-After",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Owner changed during observation; retry this GET; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/cluster/plan": {
       "post": {
         "tags": [
@@ -12889,7 +13887,7 @@
       },
       "AccessOutput": {
         "type": "object",
-        "description": "What the caller's own credential may do on one graph, by the graph's\ninstalled policy. It names actions, never the rules that allow them, and\nsays nothing about any other actor.",
+        "description": "What the caller's own credential may do on one graph, by the graph's\ninstalled policy. It names actions, never the rules that allow them, and\nsays nothing about any other actor. This closed vocabulary omits optimize;\nmaintenance status checks that permission separately on main.",
         "required": [
           "graph_id",
           "graph_wide",
@@ -15123,6 +16121,489 @@
           }
         }
       },
+      "MaintenanceInvocation": {
+        "type": "object",
+        "required": [
+          "request",
+          "actor",
+          "canonical_root",
+          "result_revision",
+          "schema_contract",
+          "input",
+          "publication",
+          "settlement"
+        ],
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "canonical_root": {
+            "type": "string"
+          },
+          "input": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OptimizeInput",
+                "description": "Accepted graph commit and source inventory, bound before physical work."
+              }
+            ]
+          },
+          "publication": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OptimizePublication"
+              }
+            ]
+          },
+          "request": {
+            "$ref": "#/components/schemas/MaintenanceRequest"
+          },
+          "result_revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "schema_contract": {
+            "$ref": "#/components/schemas/MaintenanceSchemaContract",
+            "description": "Applied configuration contract at admission, not an execution-time head."
+          },
+          "settlement": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OptimizeSettlement"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "MaintenanceKind": {
+        "type": "string",
+        "enum": [
+          "optimize"
+        ]
+      },
+      "MaintenanceLimits": {
+        "type": "object",
+        "description": "Positive source ceilings for one optimization; none may exceed the server's\nadvertised limits. They do not bound process memory, CPU or total I/O.",
+        "required": [
+          "max_tables",
+          "max_fragments",
+          "max_rows",
+          "max_source_bytes",
+          "max_files"
+        ],
+        "properties": {
+          "max_files": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "max_fragments": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "max_rows": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "max_source_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "max_tables": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "MaintenanceLookup": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "operation_id",
+              "graph",
+              "invocation",
+              "status"
+            ],
+            "properties": {
+              "graph": {
+                "type": "string"
+              },
+              "invocation": {
+                "$ref": "#/components/schemas/MaintenanceInvocation"
+              },
+              "operation_id": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "outstanding"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "result",
+              "status"
+            ],
+            "properties": {
+              "result": {
+                "$ref": "#/components/schemas/MaintenanceResult"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "complete"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "operation_id",
+              "status"
+            ],
+            "properties": {
+              "operation_id": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "result_expired"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "operation_id",
+              "status"
+            ],
+            "properties": {
+              "operation_id": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "not_recorded"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "operation_id",
+              "status"
+            ],
+            "properties": {
+              "operation_id": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "identity_mismatch"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "operation_id",
+              "status"
+            ],
+            "properties": {
+              "operation_id": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "different_ledger"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "MaintenanceOutput": {
+        "type": "object",
+        "required": [
+          "maintenance",
+          "in_progress"
+        ],
+        "properties": {
+          "in_progress": {
+            "type": "boolean",
+            "description": "Current process owns this ID. Ownership alone is not durable acceptance;\nan outstanding receipt without an owner remains unresolved."
+          },
+          "maintenance": {
+            "$ref": "#/components/schemas/MaintenanceLookup",
+            "description": "Native lookup tagged by `status`: outstanding, complete, result_expired,\nnot_recorded, identity_mismatch or different_ledger. Complete contains\n`result` with operation_id, graph, invocation and outcome: success with\nits exact report, or refused with code/message. Only success proves work\ncompleted; missing/expired evidence never permits replay."
+          }
+        },
+        "example": {
+          "maintenance": {
+            "status": "not_recorded",
+            "operation_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV:1:01ARZ3NDEKTSV4RRFFQ69G5FAW"
+          },
+          "in_progress": false
+        }
+      },
+      "MaintenancePublication": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "status"
+            ],
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "unpublished"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "report",
+              "status"
+            ],
+            "properties": {
+              "report": {
+                "$ref": "#/components/schemas/OptimizeReport"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "published"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "MaintenanceRequest": {
+        "type": "object",
+        "description": "Submit exactly once. An uncertain response permits only GET observation of\nthis original operation identity, never a replacement ID or storage fallback.",
+        "required": [
+          "operation_id",
+          "graph",
+          "kind",
+          "limits"
+        ],
+        "properties": {
+          "graph": {
+            "type": "string",
+            "description": "An applied graph ID. Optimization always targets its main branch."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/MaintenanceKind"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/MaintenanceLimits"
+          },
+          "operation_id": {
+            "type": "string",
+            "description": "Canonical ledger ULID, next sequence and fresh ULID nonce, joined by `:`.",
+            "example": "01ARZ3NDEKTSV4RRFFQ69G5FAV:1:01ARZ3NDEKTSV4RRFFQ69G5FAW"
+          }
+        },
+        "additionalProperties": false
+      },
+      "MaintenanceResult": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "operation_id",
+              "graph",
+              "invocation",
+              "report",
+              "outcome"
+            ],
+            "properties": {
+              "graph": {
+                "type": "string"
+              },
+              "invocation": {
+                "$ref": "#/components/schemas/MaintenanceInvocation"
+              },
+              "operation_id": {
+                "type": "string"
+              },
+              "outcome": {
+                "type": "string",
+                "enum": [
+                  "success"
+                ]
+              },
+              "report": {
+                "$ref": "#/components/schemas/OptimizeReport"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "operation_id",
+              "graph",
+              "invocation",
+              "code",
+              "message",
+              "outcome"
+            ],
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "graph": {
+                "type": "string"
+              },
+              "invocation": {
+                "$ref": "#/components/schemas/MaintenanceInvocation"
+              },
+              "message": {
+                "type": "string"
+              },
+              "operation_id": {
+                "type": "string"
+              },
+              "outcome": {
+                "type": "string",
+                "enum": [
+                  "refused"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "operation_id",
+              "graph",
+              "invocation",
+              "publication",
+              "outcome"
+            ],
+            "properties": {
+              "graph": {
+                "type": "string"
+              },
+              "invocation": {
+                "$ref": "#/components/schemas/MaintenanceInvocation"
+              },
+              "operation_id": {
+                "type": "string"
+              },
+              "outcome": {
+                "type": "string",
+                "enum": [
+                  "interrupted"
+                ]
+              },
+              "publication": {
+                "$ref": "#/components/schemas/MaintenancePublication"
+              }
+            }
+          }
+        ]
+      },
+      "MaintenanceSchemaContract": {
+        "type": "object",
+        "required": [
+          "source_hash",
+          "schema_ir_hash",
+          "schema_identity_domain",
+          "schema_identity_version"
+        ],
+        "properties": {
+          "schema_identity_domain": {
+            "type": "string"
+          },
+          "schema_identity_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "schema_ir_hash": {
+            "type": "string"
+          },
+          "source_hash": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "MaintenanceStatus": {
+        "type": "object",
+        "required": [
+          "ledger_id",
+          "next_sequence",
+          "outstanding_id"
+        ],
+        "properties": {
+          "ledger_id": {
+            "type": "string",
+            "description": "Native ledger identity used in the next operation ID."
+          },
+          "next_sequence": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "outstanding_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Outstanding operation for this graph, or null. Status reads create no journal."
+          }
+        }
+      },
+      "MaintenanceStatusOutput": {
+        "type": "object",
+        "required": [
+          "status",
+          "limits"
+        ],
+        "properties": {
+          "limits": {
+            "$ref": "#/components/schemas/MaintenanceLimits"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MaintenanceStatus"
+          }
+        }
+      },
       "MergeBaseOutput": {
         "type": "object",
         "description": "The commit a merge of `source` into `target` would classify against, and\nthe two heads it was computed from.",
@@ -15191,6 +16672,291 @@
             "type": "string"
           }
         }
+      },
+      "OptimizeInput": {
+        "type": "object",
+        "required": [
+          "before_commit",
+          "report_max_bytes",
+          "schema_contract",
+          "source_tables",
+          "source_fragments",
+          "source_rows",
+          "source_bytes",
+          "source_files"
+        ],
+        "properties": {
+          "before_commit": {
+            "type": "string"
+          },
+          "report_max_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "schema_contract": {
+            "$ref": "#/components/schemas/MaintenanceSchemaContract"
+          },
+          "source_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "source_files": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "source_fragments": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "source_rows": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "source_tables": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "OptimizePendingIndex": {
+        "type": "object",
+        "required": [
+          "type_key",
+          "property",
+          "reason"
+        ],
+        "properties": {
+          "property": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "type_key": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "OptimizePublication": {
+        "type": "object",
+        "required": [
+          "before_manifest_version",
+          "intent_nonce",
+          "schema_contract",
+          "actor",
+          "created_at",
+          "report"
+        ],
+        "properties": {
+          "actor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "before_manifest_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "intent_nonce": {
+            "type": "string"
+          },
+          "report": {
+            "$ref": "#/components/schemas/OptimizeReport"
+          },
+          "schema_contract": {
+            "$ref": "#/components/schemas/MaintenanceSchemaContract"
+          }
+        },
+        "additionalProperties": false
+      },
+      "OptimizeReport": {
+        "type": "object",
+        "required": [
+          "before_commit",
+          "after_commit",
+          "tables",
+          "source_tables",
+          "source_fragments",
+          "source_rows",
+          "source_bytes",
+          "source_files"
+        ],
+        "properties": {
+          "after_commit": {
+            "type": "string"
+          },
+          "before_commit": {
+            "type": "string"
+          },
+          "source_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "source_files": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "source_fragments": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "source_rows": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "source_tables": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "tables": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OptimizeTableStats"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "OptimizeSettlement": {
+        "type": "object",
+        "required": [
+          "original_digest",
+          "lineage"
+        ],
+        "properties": {
+          "lineage": {
+            "$ref": "#/components/schemas/OptimizeSettlementLineage"
+          },
+          "original_digest": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "OptimizeSettlementLineage": {
+        "type": "object",
+        "required": [
+          "graph_commit_id",
+          "branch",
+          "actor_id",
+          "merged_parent_commit_id",
+          "created_at"
+        ],
+        "properties": {
+          "actor_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "graph_commit_id": {
+            "type": "string"
+          },
+          "merged_parent_commit_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "OptimizeSkipReason": {
+        "type": "string",
+        "enum": [
+          "drift_needs_repair"
+        ]
+      },
+      "OptimizeTableStats": {
+        "type": "object",
+        "required": [
+          "type_key",
+          "fragments_removed",
+          "fragments_added",
+          "committed",
+          "skipped",
+          "published_dataset_version",
+          "lance_head_version",
+          "pending_indexes"
+        ],
+        "properties": {
+          "committed": {
+            "type": "boolean"
+          },
+          "fragments_added": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "fragments_removed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "lance_head_version": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "pending_indexes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OptimizePendingIndex"
+            }
+          },
+          "published_dataset_version": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "skipped": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OptimizeSkipReason"
+              }
+            ]
+          },
+          "type_key": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
       },
       "ParamDescriptor": {
         "type": "object",

@@ -2013,6 +2013,10 @@ fn access_slot(action: omnigraph_policy::PolicyAction) -> Option<AccessSlot> {
         P::InvokeQuery => Some(AccessSlot::GraphWide),
         // Server- or operator-scoped: no graph's access report names them.
         P::Admin | P::GraphList | P::ConfigManage => None,
+        // This report has a closed wire vocabulary consumed by older clients.
+        // Maintenance status checks Optimize separately on main; do not add a
+        // new AccessAction without deliberately evolving the report contract.
+        P::Optimize => None,
     }
 }
 
@@ -2036,7 +2040,8 @@ impl From<AccessAction> for omnigraph_policy::PolicyAction {
 
 /// What the caller's own credential may do on one graph, by the graph's
 /// installed policy. It names actions, never the rules that allow them, and
-/// says nothing about any other actor.
+/// says nothing about any other actor. This closed vocabulary omits optimize;
+/// maintenance status checks that permission separately on main.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct AccessOutput {
     /// The actor the credential resolves to. Absent only on a server that runs
@@ -3592,6 +3597,14 @@ mod tests {
         assert_eq!(
             transitions,
             [AccessAction::BranchCreate, AccessAction::BranchMerge]
+        );
+        assert_eq!(access_slot(omnigraph_policy::PolicyAction::Optimize), None);
+        assert!(
+            AccessAction::ALL
+                .into_iter()
+                .all(|action| omnigraph_policy::PolicyAction::from(action)
+                    != omnigraph_policy::PolicyAction::Optimize),
+            "the existing closed access vocabulary must stay readable by older clients"
         );
     }
 

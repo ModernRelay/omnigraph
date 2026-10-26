@@ -293,7 +293,23 @@ Aliases are read-only. Invoke a served stored mutation with `omnigraph mutate
 
 ```bash
 omnigraph optimize --target $REPO --json
+omnigraph optimize --target $SERVER --graph $GRAPH --no-wait --json
+omnigraph optimize --target $SERVER --graph $GRAPH --operation-id '<ID>' --json
 ```
+
+Served optimize requires enabled bounded maintenance and applied `optimize`
+permission on `main`; its actor comes from the credential. The CLI submits
+once, prints its operation ID before sending, and then only observes that ID.
+`--timeout` is 1–3600 seconds (default 300); expiry exits 5 without cancelling
+work. `--operation-id` never submits, including when no receipt is recorded.
+Retain the ID after uncertain delivery; never fall back to direct storage.
+Managed targets do not yet support optimize.
+Administrator recovery uses `optimize --target <DIRECT-ROOT> --graph <GRAPH>
+--operation-id <ID> --writers-stopped` only after predecessor and accepted-I/O
+exclusion. It cannot override a held lock. It reconciles the original receipt
+as interrupted unpublished/published; it never reruns compaction. An explicit
+actor with current `optimize` permission is required. Unknown evidence stays
+unresolved, with the original operation and lock identities retained.
 
 Compacts fragments and reconciles declared scalar/vector index coverage without
 deleting retained versions. Lance 13 supports compaction of Blob-bearing data;

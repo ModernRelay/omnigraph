@@ -45,7 +45,7 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
 
             catalogue: true,
         },
-        Command::Mutate(_) | Command::Load(_) => Graph {
+        Command::Mutate(_) | Command::Load(_) | Command::Optimize(_) => Graph {
             direct_only: false,
             root: true,
 
@@ -92,7 +92,6 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
         Command::Schema {
             command: SchemaCommand::Plan { .. },
         }
-        | Command::Optimize(_)
         | Command::RebuildFullTextIndexes(_)
         | Command::Repair(_)
         | Command::Cleanup(_) => Graph {
@@ -274,6 +273,7 @@ fn accepts_actor(command: &Command) -> bool {
         // The bridge asserts the actor on every request it relays.
         Command::Mutate(_)
         | Command::Load(_)
+        | Command::Optimize(_)
         | Command::RebuildFullTextIndexes(_)
         | Command::Mcp(_) => true,
         // The actor a direct target's policy decides for.
@@ -337,7 +337,6 @@ fn accepts_actor(command: &Command) -> bool {
         | Command::Organization { .. }
         | Command::Init(_)
         | Command::Upgrade(_)
-        | Command::Optimize(_)
         | Command::Repair(_)
         | Command::Cleanup(_)
         | Command::Lint(_)
@@ -363,6 +362,35 @@ pub(crate) fn validate_target(
     use Requirement::*;
     use TargetBinding::*;
     let need = requirement(&cli.command);
+    if let Command::Optimize(args) = &cli.command {
+        match &target.binding {
+            Managed(_) => {
+                return Err(crate::targets::refusal(
+                    "target_kind_unsupported",
+                    "optimize is not available for a managed target until maintenance capacity admission is enabled",
+                ));
+            }
+            Server { .. } if args.writers_stopped => {
+                bail!("optimization recovery requires an explicit direct-root --target");
+            }
+            Server { .. } if cli.as_actor.is_some() => {
+                bail!("served optimize derives its actor from the credential; remove --as");
+            }
+            Server { .. } => {}
+            DirectRoot { .. } if args.writers_stopped => {
+                if !target.is_explicit() {
+                    bail!("optimization recovery requires an explicit direct-root --target");
+                }
+            }
+            _ if args.writers_stopped => {
+                bail!("optimization recovery requires an explicit direct-root --target");
+            }
+            _ if args.no_wait || args.operation_id.is_some() || args.timeout.is_some() => {
+                bail!("--no-wait, --operation-id and --timeout require a server target");
+            }
+            _ => {}
+        }
+    }
     if matches!(need, ServedGraph | ServedTarget) && !matches!(target.binding, Server { .. }) {
         let label = command_label(&cli.command);
         let why = match &target.binding {
@@ -774,7 +802,7 @@ mod tests {
             (&["diff", "--from", "a", "--to", "b"], false),
             (&["changes", "poll"], false),
             (&["changes", "baseline", "--out", "out"], false),
-            (&["optimize"], false),
+            (&["optimize"], true),
             (&["cleanup"], false),
             (&["mcp"], true),
             (&["mcp", "--write"], true),

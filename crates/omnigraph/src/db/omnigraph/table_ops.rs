@@ -776,7 +776,7 @@ async fn plan_index_work_node(
                         work.pending.push(PendingIndex {
                             type_key: table_key.to_string(),
                             property: prop_name.clone(),
-                            reason: "property has no non-null vectors to train on yet".to_string(),
+                            reason: PendingIndex::NO_VECTORS_REASON.to_string(),
                         });
                     }
                 }
@@ -1015,11 +1015,15 @@ pub(super) async fn open_owned_dataset_for_branch_write(
 /// vectors can be retried once populated; an existing full-text index with
 /// incomplete coverage requires explicit rebuilding. `reason` names the remedy.
 /// Reads retain their unindexed fallback; this status alone is not a write.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PendingIndex {
     pub type_key: String,
     pub property: String,
     pub reason: String,
+}
+
+impl PendingIndex {
+    pub(crate) const NO_VECTORS_REASON: &str = "property has no non-null vectors to train on yet";
 }
 
 pub(super) async fn build_indices_on_dataset(
@@ -1271,6 +1275,8 @@ pub(super) async fn commit_updates(
 pub(crate) enum Publication {
     /// Advance the branch head: the ordinary publish.
     Publish,
+    /// Bind a durable maintenance publication witness to one exact version.
+    PublishExactVersion(u64),
     /// Write an unpublished commit (RFC "Unpublished graph commits"): the
     /// branch head is unchanged, and a merge carries its held inputs.
     Propose(Option<crate::db::manifest::UnpublishedMergeInputs>),
@@ -1289,9 +1295,16 @@ async fn publish_prepared(
     publication: Publication,
 ) -> Result<crate::db::GraphCommit> {
     match publication {
-        Publication::Publish => {
-            let precondition =
-                crate::db::manifest::PublishPrecondition::ExactGraphHead(expectation);
+        Publication::Publish | Publication::PublishExactVersion(_) => {
+            let precondition = match publication {
+                Publication::PublishExactVersion(version) => {
+                    crate::db::manifest::PublishPrecondition::ExactGraphVersion {
+                        authority: expectation,
+                        version,
+                    }
+                }
+                _ => crate::db::manifest::PublishPrecondition::ExactGraphHead(expectation),
+            };
             Ok(coordinator
                 .commit_changes_with_intent_and_expected(
                     changes,

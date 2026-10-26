@@ -202,6 +202,8 @@ const EXPECTED_PATHS: &[&str] = &[
     "/cluster/plan",
     "/cluster/deployments",
     "/cluster/deployments/{deployment_id}",
+    "/cluster/maintenance",
+    "/cluster/maintenance/{operation_id}",
     "/graphs/{graph_id}/snapshot",
     "/graphs/{graph_id}/blob",
     "/graphs/{graph_id}/query",
@@ -264,6 +266,203 @@ fn openapi_has_no_unexpected_paths() {
             "unexpected path in OpenAPI spec: {path}"
         );
     }
+}
+
+#[test]
+fn openapi_maintenance_exposes_exact_submission_and_observation_fields() {
+    let doc = openapi_json();
+    let paths = &doc["paths"];
+    let schemas = &doc["components"]["schemas"];
+    let submit = &paths["/cluster/maintenance"]["post"];
+    assert_eq!(submit["operationId"], "optimize");
+    assert_eq!(
+        submit["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/MaintenanceRequest"
+    );
+    let request = &schemas["MaintenanceRequest"];
+    for field in ["operation_id", "graph", "kind", "limits"] {
+        assert!(
+            request["properties"].get(field).is_some(),
+            "{field}: {request}"
+        );
+        assert!(
+            request["required"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::from(field))
+        );
+    }
+    assert_eq!(request["additionalProperties"], false);
+    assert_eq!(
+        request["properties"]["kind"]["$ref"],
+        "#/components/schemas/MaintenanceKind"
+    );
+    assert_eq!(
+        schemas["MaintenanceKind"]["enum"],
+        serde_json::json!(["optimize"])
+    );
+    assert_eq!(
+        request["properties"]["limits"]["$ref"],
+        "#/components/schemas/MaintenanceLimits"
+    );
+    let limits = &schemas["MaintenanceLimits"];
+    for field in [
+        "max_tables",
+        "max_fragments",
+        "max_rows",
+        "max_source_bytes",
+        "max_files",
+    ] {
+        assert_eq!(limits["properties"][field]["minimum"].as_f64(), Some(1.0));
+        assert!(
+            limits["required"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::from(field))
+        );
+    }
+    assert_eq!(limits["additionalProperties"], false);
+    assert_eq!(
+        schemas["MaintenanceStatusOutput"]["properties"]["limits"]["$ref"],
+        "#/components/schemas/MaintenanceLimits"
+    );
+    assert_eq!(
+        schemas["MaintenanceStatusOutput"]["properties"]["status"]["$ref"],
+        "#/components/schemas/MaintenanceStatus"
+    );
+    for field in ["ledger_id", "next_sequence", "outstanding_id"] {
+        assert!(
+            schemas["MaintenanceStatus"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::from(field))
+        );
+    }
+    for (path, operation_id) in [
+        ("/cluster/maintenance", "maintenanceStatus"),
+        ("/cluster/maintenance/{operation_id}", "maintenanceLookup"),
+    ] {
+        let operation = &paths[path]["get"];
+        assert_eq!(operation["operationId"], operation_id);
+        assert!(
+            operation["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|param| param["name"] == "graph"
+                    && param["in"] == "query"
+                    && param["required"] == true)
+        );
+    }
+    let receipt = &schemas["MaintenanceOutput"]["properties"]["maintenance"];
+    assert_eq!(receipt["$ref"], "#/components/schemas/MaintenanceLookup");
+    let variants = schemas["MaintenanceLookup"]["oneOf"].as_array().unwrap();
+    let tags: HashSet<_> = variants
+        .iter()
+        .map(|variant| variant["properties"]["status"]["enum"][0].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        tags,
+        HashSet::from([
+            "outstanding",
+            "complete",
+            "result_expired",
+            "not_recorded",
+            "identity_mismatch",
+            "different_ledger",
+        ])
+    );
+    let results = schemas["MaintenanceResult"]["oneOf"].as_array().unwrap();
+    for (tag, fields) in [
+        (
+            "success",
+            vec!["operation_id", "graph", "invocation", "report", "outcome"],
+        ),
+        (
+            "refused",
+            vec![
+                "operation_id",
+                "graph",
+                "invocation",
+                "code",
+                "message",
+                "outcome",
+            ],
+        ),
+    ] {
+        let variant = results
+            .iter()
+            .find(|value| value["properties"]["outcome"]["enum"][0] == tag)
+            .unwrap();
+        for field in fields {
+            assert!(
+                variant["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&Value::from(field)),
+                "{tag}.{field}"
+            );
+        }
+    }
+    for (name, fields) in [
+        (
+            "MaintenanceInvocation",
+            vec![
+                "request",
+                "actor",
+                "canonical_root",
+                "result_revision",
+                "schema_contract",
+                "input",
+            ],
+        ),
+        (
+            "OptimizeReport",
+            vec![
+                "before_commit",
+                "after_commit",
+                "tables",
+                "source_tables",
+                "source_fragments",
+                "source_rows",
+                "source_bytes",
+                "source_files",
+            ],
+        ),
+        (
+            "OptimizeTableStats",
+            vec![
+                "type_key",
+                "fragments_removed",
+                "fragments_added",
+                "committed",
+                "skipped",
+                "published_dataset_version",
+                "lance_head_version",
+                "pending_indexes",
+            ],
+        ),
+    ] {
+        for field in fields {
+            assert!(
+                schemas[name]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&Value::from(field)),
+                "{name}.{field}"
+            );
+        }
+    }
+    assert_eq!(
+        schemas["MaintenanceOutput"]["example"]["maintenance"]["status"],
+        "not_recorded"
+    );
+    assert!(
+        receipt["description"]
+            .as_str()
+            .unwrap()
+            .contains("never permits replay")
+    );
 }
 
 #[test]
@@ -2524,6 +2723,8 @@ async fn multi_mode_openapi_keeps_management_paths_flat() {
         "/cluster/plan",
         "/cluster/deployments",
         "/cluster/deployments/{deployment_id}",
+        "/cluster/maintenance",
+        "/cluster/maintenance/{operation_id}",
         "/.well-known/oauth-protected-resource",
         "/.well-known/oauth-protected-resource/{resource_path}",
     ] {
@@ -2609,6 +2810,8 @@ async fn multi_mode_openapi_declares_graph_id_path_parameter() {
         "/cluster/plan",
         "/cluster/deployments",
         "/cluster/deployments/{deployment_id}",
+        "/cluster/maintenance",
+        "/cluster/maintenance/{operation_id}",
         "/.well-known/oauth-protected-resource",
         "/.well-known/oauth-protected-resource/{resource_path}",
     ] {

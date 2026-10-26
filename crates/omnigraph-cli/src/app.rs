@@ -201,6 +201,7 @@ fn finish(
     if error
         .downcast_ref::<cluster_remote::WaitTimeout>()
         .is_some()
+        || error.is::<commands::maintenance::remote::WaitTimeout>()
     {
         stdout.flush()?;
         return Ok(Completion::exit(5));

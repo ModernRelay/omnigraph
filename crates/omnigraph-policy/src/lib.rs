@@ -20,6 +20,8 @@ pub enum PolicyAction {
     Export,
     Change,
     SchemaApply,
+    /// Compact graph tables on the target branch without deleting history.
+    Optimize,
     BranchCreate,
     BranchDelete,
     BranchMerge,
@@ -52,6 +54,7 @@ impl PolicyAction {
             Self::Export => "export",
             Self::Change => "change",
             Self::SchemaApply => "schema_apply",
+            Self::Optimize => "optimize",
             Self::BranchCreate => "branch_create",
             Self::BranchDelete => "branch_delete",
             Self::BranchMerge => "branch_merge",
@@ -73,6 +76,7 @@ impl PolicyAction {
             self,
             Self::BranchCreate
                 | Self::SchemaApply
+                | Self::Optimize
                 | Self::BranchDelete
                 | Self::BranchMerge
                 | Self::CommitPublish
@@ -93,6 +97,7 @@ impl PolicyAction {
             | Self::Export
             | Self::Change
             | Self::SchemaApply
+            | Self::Optimize
             | Self::BranchCreate
             | Self::BranchDelete
             | Self::BranchMerge
@@ -155,6 +160,7 @@ impl FromStr for PolicyAction {
             "export" => Ok(Self::Export),
             "change" => Ok(Self::Change),
             "schema_apply" => Ok(Self::SchemaApply),
+            "optimize" => Ok(Self::Optimize),
             "branch_create" => Ok(Self::BranchCreate),
             "branch_delete" => Ok(Self::BranchDelete),
             "branch_merge" => Ok(Self::BranchMerge),
@@ -937,6 +943,7 @@ namespace Omnigraph {
     action "export" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "change" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "schema_apply" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "optimize" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "branch_create" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "branch_delete" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "branch_merge" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
@@ -1027,7 +1034,7 @@ pub enum ResourceScope {
     /// modifies this branch (SchemaApply applies the new schema to it)
     /// or removes it (BranchDelete). Maps to
     /// `(branch: None, target_branch: Some(X))`.
-    /// Used by SchemaApply, BranchDelete.
+    /// Used by SchemaApply, Optimize, BranchDelete.
     TargetBranch(String),
     /// Action transitions between two branches. `source` is the
     /// branch being read-from / merged-from / forked-from; `target`
@@ -1417,7 +1424,7 @@ rules:
     }
 
     #[test]
-    fn schema_apply_uses_target_branch_scope() {
+    fn schema_apply_and_optimize_use_target_branch_scope() {
         let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
@@ -1428,36 +1435,38 @@ rules:
   - id: admins-schema-apply
     allow:
       actors: { group: admins }
-      actions: [schema_apply]
+      actions: [schema_apply, optimize]
       target_branch_scope: protected
 "#,
         )
         .unwrap();
 
         let engine = PolicyCompiler::compile(&policy, "graph").unwrap();
-        let allow = engine
-            .authorize(
-                "act-ragnor",
-                &PolicyRequest {
-                    action: PolicyAction::SchemaApply,
-                    branch: None,
-                    target_branch: Some("main".to_string()),
-                },
-            )
-            .unwrap();
-        assert!(allow.allowed);
+        for action in [PolicyAction::SchemaApply, PolicyAction::Optimize] {
+            let allow = engine
+                .authorize(
+                    "act-ragnor",
+                    &PolicyRequest {
+                        action,
+                        branch: None,
+                        target_branch: Some("main".to_string()),
+                    },
+                )
+                .unwrap();
+            assert!(allow.allowed);
 
-        let deny = engine
-            .authorize(
-                "act-ragnor",
-                &PolicyRequest {
-                    action: PolicyAction::SchemaApply,
-                    branch: None,
-                    target_branch: Some("feature".to_string()),
-                },
-            )
-            .unwrap();
-        assert!(!deny.allowed);
+            let deny = engine
+                .authorize(
+                    "act-ragnor",
+                    &PolicyRequest {
+                        action,
+                        branch: None,
+                        target_branch: Some("feature".to_string()),
+                    },
+                )
+                .unwrap();
+            assert!(!deny.allowed);
+        }
     }
 
     #[test]

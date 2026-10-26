@@ -33,6 +33,7 @@ use crate::table_store::TableStore;
 pub(crate) mod collector;
 mod export;
 pub(crate) mod optimize;
+pub(crate) mod optimize_recovery;
 mod prepared_create;
 pub(crate) mod promotion;
 mod repair;
@@ -50,7 +51,11 @@ pub use export::{EXPORT_CHUNK_MAX_BYTES, ExportCut};
 pub(crate) use export::{
     LogicalBlobValue, RangedExternalBlobs, logical_row_image, row_blob_values,
 };
-pub use optimize::{CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, SkipReason};
+pub use optimize::{
+    CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, OptimizeFailure,
+    OptimizeInput, OptimizeLimits, OptimizePublication, OptimizeReport, SkipReason,
+};
+pub use optimize_recovery::{OptimizeSettlement, OptimizeSettlementOutcome};
 use prepared_create::initial_schema_ir;
 pub use prepared_create::{GraphCreateReconciliation, PreparedGraphCreate};
 pub use repair::{
@@ -3586,7 +3591,86 @@ impl Omnigraph {
     /// Compact small Lance fragments into fewer larger ones across every
     /// backing dataset for a node or edge type on `main`. See [`optimize`] for details.
     pub async fn optimize(&self) -> Result<Vec<optimize::DatasetOptimizeStats>> {
-        optimize::optimize_all_datasets(self).await
+        self.optimize_as(None).await
+    }
+
+    /// Optimize `main` as an actor authorized for the `optimize` policy action.
+    pub async fn optimize_as(
+        &self,
+        actor: Option<&str>,
+    ) -> Result<Vec<optimize::DatasetOptimizeStats>> {
+        let mut effects_started = false;
+        Ok(optimize::optimize_all_datasets(
+            self,
+            actor,
+            None,
+            &mut effects_started,
+            |_| async { Ok(()) },
+            |_| async { Ok(()) },
+        )
+        .await?
+        .tables)
+    }
+
+    /// Optimize `main` with finite source-inventory admission and one table in
+    /// flight. Refuse the complete attempt before any effects if accounting is
+    /// unsupported or a limit is exceeded. An effectful error is not replayable.
+    pub async fn optimize_with_limits_as(
+        &self,
+        limits: &OptimizeLimits,
+        actor: Option<&str>,
+    ) -> std::result::Result<OptimizeReport, OptimizeFailure> {
+        self.optimize_with_limits_admitted_as(limits, actor, |_| async { Ok(()) })
+            .await
+    }
+
+    /// Bind the accepted immutable input to an invocation before any physical
+    /// effect. The callback runs once with schema, main and table gates held;
+    /// it must not call graph operations that acquire those same gates.
+    pub async fn optimize_with_limits_admitted_as<F, Fut>(
+        &self,
+        limits: &OptimizeLimits,
+        actor: Option<&str>,
+        admit: F,
+    ) -> std::result::Result<OptimizeReport, OptimizeFailure>
+    where
+        F: FnOnce(OptimizeInput) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        self.optimize_with_limits_recorded_as(limits, actor, admit, |_| async { Ok(()) })
+            .await
+    }
+
+    /// Bind input before effects and exact detached-table outcomes before
+    /// publication. The second callback runs only for productive work, with
+    /// the same native gates held; neither callback may reenter those gates.
+    pub async fn optimize_with_limits_recorded_as<F, Fut, P, PubFut>(
+        &self,
+        limits: &OptimizeLimits,
+        actor: Option<&str>,
+        admit: F,
+        record_publication: P,
+    ) -> std::result::Result<OptimizeReport, OptimizeFailure>
+    where
+        F: FnOnce(OptimizeInput) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+        P: FnOnce(OptimizePublication) -> PubFut,
+        PubFut: std::future::Future<Output = Result<()>>,
+    {
+        let mut effects_started = false;
+        optimize::optimize_all_datasets(
+            self,
+            actor,
+            Some(limits),
+            &mut effects_started,
+            admit,
+            record_publication,
+        )
+        .await
+        .map_err(|error| OptimizeFailure {
+            error,
+            effects_started,
+        })
     }
 
     /// Classify and explicitly repair uncovered graph-manifest/Lance-HEAD drift. See

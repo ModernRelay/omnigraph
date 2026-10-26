@@ -16,8 +16,8 @@ use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance_core::datatypes::BlobHandling;
 use omnigraph::IndexCoverage;
 use omnigraph::db::{
-    CleanupPolicyOptions, MergeOutcome, Omnigraph, ReadTarget, RepairAction, RepairClassification,
-    RepairOptions, SnapshotId,
+    CleanupPolicyOptions, MergeOutcome, Omnigraph, OptimizeLimits, OptimizeSettlementOutcome,
+    ReadTarget, RepairAction, RepairClassification, RepairOptions, SnapshotId,
 };
 use omnigraph::error::{BranchStartRefusal, OmniError};
 use omnigraph::loader::LoadMode;
@@ -31,6 +31,16 @@ use crate::helpers::{
     MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, count_rows, count_rows_branch, init_and_load,
     mixed_params, mutate_main, snapshot_main,
 };
+
+fn optimize_limits() -> OptimizeLimits {
+    OptimizeLimits {
+        max_tables: 16,
+        max_fragments: 1024,
+        max_rows: 100_000,
+        max_source_bytes: 64 * 1024 * 1024,
+        max_files: 4096,
+    }
+}
 
 /// Filesystem URI of the live main-branch incarnation of a node table.
 /// Physical paths are identity-derived, so test fixtures must resolve the
@@ -154,7 +164,23 @@ async fn optimize_after_load_then_again_is_idempotent() {
     let db = init_and_load(&dir).await;
 
     // First pass may compact (load wrote real fragments).
-    let _first = db.optimize().await.unwrap();
+    let before = db.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    let first = db
+        .optimize_with_limits_as(&optimize_limits(), None)
+        .await
+        .unwrap();
+    assert_eq!(first.before_commit, before);
+    assert_eq!(
+        first.after_commit,
+        db.list_commits(None).await.unwrap()[0].graph_commit_id
+    );
+    assert_eq!(first.source_tables, 5);
+    assert!(first.source_fragments > 0);
+    assert!(first.source_rows > 0);
+    assert!(first.source_bytes > 0);
+    assert!(first.source_files > 0);
 
     let commits_before = db.list_commits(None).await.unwrap();
     let head_before = commits_before
@@ -165,8 +191,13 @@ async fn optimize_after_load_then_again_is_idempotent() {
 
     // Second pass should be a no-op: already-compacted graph produces no
     // fragments_removed / fragments_added.
-    let second = db.optimize().await.unwrap();
-    for s in &second {
+    let second = db
+        .optimize_with_limits_as(&optimize_limits(), None)
+        .await
+        .unwrap();
+    assert_eq!(second.before_commit, head_before);
+    assert_eq!(second.after_commit, head_before);
+    for s in &second.tables {
         assert_eq!(
             s.fragments_removed, 0,
             "{} re-optimize should be no-op",
@@ -197,6 +228,427 @@ async fn optimize_after_load_then_again_is_idempotent() {
     assert!(
         helpers::recovery::sidecar_operation_ids(dir.path()).is_empty(),
         "steady-state Optimize must not arm a recovery sidecar"
+    );
+}
+
+#[tokio::test]
+async fn bounded_optimize_refuses_complete_inventory_and_failed_binding_before_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    add_person_fragments(&db).await;
+    let snapshot = snapshot_main(&db).await.unwrap();
+    let before = db.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    let person = node_table_uri(&db, "Person").await;
+    let versions = detached_versions(&person).await;
+    let mut cases = Vec::new();
+    for field in 0..5 {
+        let mut limits = optimize_limits();
+        match field {
+            0 => limits.max_tables = 1,
+            1 => limits.max_fragments = 1,
+            2 => limits.max_rows = 1,
+            3 => limits.max_source_bytes = 1,
+            4 => limits.max_files = 1,
+            _ => unreachable!(),
+        }
+        cases.push(limits.clone());
+        match field {
+            0 => limits.max_tables = 0,
+            1 => limits.max_fragments = 0,
+            2 => limits.max_rows = 0,
+            3 => limits.max_source_bytes = 0,
+            4 => limits.max_files = 0,
+            _ => unreachable!(),
+        }
+        cases.push(limits);
+    }
+    for limits in cases {
+        let failure = db.optimize_with_limits_as(&limits, None).await.unwrap_err();
+        assert!(!failure.effects_started, "{limits:?}: {failure:?}");
+        assert_eq!(detached_versions(&person).await, versions);
+        assert_eq!(
+            db.list_commits(None).await.unwrap()[0].graph_commit_id,
+            before
+        );
+    }
+    let (input_tx, input_rx) = tokio::sync::oneshot::channel();
+    let failure = db
+        .optimize_with_limits_admitted_as(&optimize_limits(), None, |input| async move {
+            assert_eq!(input.source_tables, 5);
+            input_tx.send(input).unwrap();
+            Err(OmniError::manifest("test invocation binding refused"))
+        })
+        .await
+        .unwrap_err();
+    assert!(!failure.effects_started);
+    assert!(
+        failure
+            .error
+            .to_string()
+            .contains("test invocation binding refused")
+    );
+    assert_eq!(detached_versions(&person).await, versions);
+    let after = snapshot_main(&db).await.unwrap();
+    for key in ["node:Person", "node:Company", "edge:WorksAt", "edge:Knows"] {
+        if let Some(entry) = snapshot.dataset(key) {
+            assert_same_dataset_entry(entry, after.dataset(key).unwrap());
+        }
+    }
+
+    // Exercise the far end of the inventory, not only the first catalog file:
+    // every ceiling is inclusive, and even the final source reference must be
+    // admitted before an earlier table can produce detached effects.
+    let input = input_rx.await.unwrap();
+    let exact = OptimizeLimits {
+        max_tables: input.source_tables,
+        max_fragments: input.source_fragments,
+        max_rows: input.source_rows,
+        max_source_bytes: input.source_bytes,
+        max_files: input.source_files,
+    };
+    for field in 0..5 {
+        let mut limits = exact.clone();
+        match field {
+            0 => limits.max_tables -= 1,
+            1 => limits.max_fragments -= 1,
+            2 => limits.max_rows -= 1,
+            3 => limits.max_source_bytes -= 1,
+            4 => limits.max_files -= 1,
+            _ => unreachable!(),
+        }
+        let failure = db.optimize_with_limits_as(&limits, None).await.unwrap_err();
+        assert!(!failure.effects_started, "{limits:?}: {failure:?}");
+        assert_eq!(detached_versions(&person).await, versions);
+        assert_eq!(
+            db.list_commits(None).await.unwrap()[0].graph_commit_id,
+            before
+        );
+    }
+    let (publication_tx, publication_rx) = tokio::sync::oneshot::channel();
+    let report = db
+        .optimize_with_limits_recorded_as(
+            &exact,
+            None,
+            |_| async { Ok(()) },
+            |publication| async move {
+                publication_tx.send(publication).unwrap();
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.before_commit, input.before_commit);
+    assert_eq!(report.source_tables, input.source_tables);
+    assert_eq!(report.source_fragments, input.source_fragments);
+    assert_eq!(report.source_rows, input.source_rows);
+    assert_eq!(report.source_bytes, input.source_bytes);
+    assert_eq!(report.source_files, input.source_files);
+    assert!(serde_json::to_vec(&report).unwrap().len() as u64 <= input.report_max_bytes);
+    let publication = publication_rx.await.unwrap();
+    assert_eq!(
+        publication.before_manifest_version,
+        snapshot.graph_manifest_version()
+    );
+    assert_eq!(publication.report.before_commit, before);
+    assert_eq!(publication.report.after_commit, before);
+    assert_eq!(publication.actor, None);
+    assert_eq!(input.schema_contract, db.schema_contract_digest());
+    assert_eq!(publication.schema_contract, input.schema_contract);
+    assert_eq!(
+        publication.report.tables,
+        report
+            .tables
+            .iter()
+            .filter(|table| table.type_key != "__manifest")
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    assert!(report.after_commit.contains(&publication.intent_nonce));
+    assert!(
+        serde_json::to_vec(&publication.report).unwrap().len() as u64 <= input.report_max_bytes
+    );
+}
+
+#[tokio::test]
+async fn bounded_optimize_includes_manifest_records_on_an_empty_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Omnigraph::init(dir.path().to_str().unwrap(), TEST_SCHEMA)
+        .await
+        .unwrap();
+    let before = db.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    let mut limits = optimize_limits();
+    // Data tables are empty. This must still refuse: the accepted __manifest
+    // records are physical inputs to publication and config maintenance.
+    limits.max_rows = 1;
+    let failure = db.optimize_with_limits_as(&limits, None).await.unwrap_err();
+    assert!(!failure.effects_started);
+    assert!(
+        matches!(failure.error, OmniError::ResourceLimitExceeded {resource, ..}
+        if resource == "optimize_source_rows")
+    );
+    let report = db
+        .optimize_with_limits_as(&optimize_limits(), None)
+        .await
+        .unwrap();
+    assert_eq!(report.source_tables, 5);
+    assert!(report.source_rows > 1);
+    assert!(report.source_fragments > 0);
+    assert_eq!(report.before_commit, before);
+    assert_eq!(report.after_commit, before);
+}
+
+#[tokio::test]
+async fn bounded_optimize_recovery_settles_exact_publication_without_replaying_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    add_person_fragments(&db).await;
+    let source = snapshot_main(&db).await.unwrap();
+    let person = node_table_uri(&db, "Person").await;
+    let (publication_tx, publication_rx) = tokio::sync::oneshot::channel();
+    let failure = db
+        .optimize_with_limits_recorded_as(
+            &optimize_limits(),
+            None,
+            |_| async { Ok(()) },
+            |publication| async move {
+                publication_tx.send(publication).unwrap();
+                Err(OmniError::manifest(
+                    "stop after detached work, before publication",
+                ))
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(failure.effects_started);
+    let original = publication_rx.await.unwrap();
+    let detached = detached_versions(&person).await;
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        source.graph_manifest_version()
+    );
+
+    let settlement = db
+        .prepare_optimize_settlement_as(&original, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.settle_optimize_as(&original, &settlement, None)
+            .await
+            .unwrap(),
+        OptimizeSettlementOutcome::Unpublished,
+    );
+    let settled = snapshot_main(&db).await.unwrap();
+    assert_eq!(
+        settled.graph_manifest_version(),
+        source.graph_manifest_version() + 1
+    );
+    for entry in source.datasets() {
+        assert_same_dataset_entry(entry, settled.dataset(&entry.type_key).unwrap());
+    }
+    assert_eq!(
+        detached_versions(&person).await,
+        detached,
+        "settlement must not replay table work"
+    );
+    assert_eq!(
+        db.settle_optimize_as(&original, &settlement, None)
+            .await
+            .unwrap(),
+        OptimizeSettlementOutcome::Unpublished,
+    );
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        settled.graph_manifest_version()
+    );
+
+    let (publication_tx, publication_rx) = tokio::sync::oneshot::channel();
+    let report = db
+        .optimize_with_limits_recorded_as(
+            &optimize_limits(),
+            None,
+            |_| async { Ok(()) },
+            |publication| async move {
+                publication_tx.send(publication).unwrap();
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    let original = publication_rx.await.unwrap();
+    let settlement = db
+        .prepare_optimize_settlement_as(&original, None)
+        .await
+        .unwrap();
+    let mut expected = report.clone();
+    expected
+        .tables
+        .retain(|table| table.type_key != "__manifest");
+    let expected = OptimizeSettlementOutcome::Published { report: expected };
+    assert_eq!(
+        db.settle_optimize_as(&original, &settlement, None)
+            .await
+            .unwrap(),
+        expected
+    );
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Later")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap();
+    let later = snapshot_main(&db).await.unwrap();
+    let detached = detached_versions(&person).await;
+    assert_eq!(
+        db.settle_optimize_as(&original, &settlement, None)
+            .await
+            .unwrap(),
+        expected
+    );
+
+    let mut tampered = original.clone();
+    tampered.intent_nonce = ulid::Ulid::new().to_string();
+    assert!(
+        db.settle_optimize_as(&tampered, &settlement, None)
+            .await
+            .is_err()
+    );
+    tampered.intent_nonce = "not-a-native-nonce".to_string();
+    assert!(
+        db.prepare_optimize_settlement_as(&tampered, None)
+            .await
+            .is_err()
+    );
+    for field in 0..2 {
+        let mut unknown = original.clone();
+        if field == 0 {
+            unknown.before_manifest_version = u64::MAX - 1;
+        } else {
+            unknown.schema_contract.source_hash = "0".repeat(64);
+        }
+        let token = db
+            .prepare_optimize_settlement_as(&unknown, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.settle_optimize_as(&unknown, &token, None).await.unwrap(),
+            OptimizeSettlementOutcome::Unknown
+        );
+    }
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        later.graph_manifest_version()
+    );
+    assert_eq!(detached_versions(&person).await, detached);
+}
+
+#[tokio::test]
+async fn bounded_optimize_does_not_acknowledge_failed_artifact_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "add_friend",
+        &mixed_params(&[("$from", "Charlie"), ("$to", "Diana")], &[]),
+    )
+    .await
+    .unwrap();
+    let before = db.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    // A directory at the artifact's exact object path lets graph work succeed
+    // but makes the real local adapter's final atomic replacement fail.
+    std::fs::create_dir_all(dir.path().join("__graph_index/csr-current.bin")).unwrap();
+    let failure = db
+        .optimize_with_limits_as(&optimize_limits(), None)
+        .await
+        .unwrap_err();
+    assert!(
+        failure.effects_started,
+        "artifact failure follows a possible publication"
+    );
+    assert_ne!(
+        db.list_commits(None).await.unwrap()[0].graph_commit_id,
+        before,
+        "the failure must not be misreported as a pre-effect refusal or success"
+    );
+}
+
+#[tokio::test]
+async fn bounded_optimize_binds_exact_input_under_writer_gates_and_keeps_reads_available() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    add_person_fragments(&db).await;
+    let before = db.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    let (input_tx, input_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let optimize_db = db.clone();
+    let optimize = tokio::spawn(async move {
+        optimize_db
+            .optimize_with_limits_admitted_as(
+                &optimize_limits(),
+                Some("maintenance-actor"),
+                |input| async move {
+                    input_tx.send(input).unwrap();
+                    release_rx.await.unwrap();
+                    Ok(())
+                },
+            )
+            .await
+    });
+    let input = input_rx.await.unwrap();
+    assert_eq!(input.before_commit, before);
+    // This read completes while maintenance holds every writer gate.
+    let snapshot = tokio::time::timeout(Duration::from_secs(10), snapshot_main(&db))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(snapshot.dataset("node:Person").is_some());
+    let write_db = db.clone();
+    let mut write = tokio::spawn(async move {
+        mutate_main(
+            &write_db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "After")], &[("$age", 45)]),
+        )
+        .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut write)
+            .await
+            .is_err()
+    );
+    release_tx.send(()).unwrap();
+    let report = optimize.await.unwrap().unwrap();
+    write.await.unwrap().unwrap();
+    assert_eq!(report.before_commit, input.before_commit);
+    assert_eq!(report.source_tables, input.source_tables);
+    assert_eq!(report.source_fragments, input.source_fragments);
+    assert_eq!(report.source_rows, input.source_rows);
+    assert_eq!(report.source_bytes, input.source_bytes);
+    assert_eq!(report.source_files, input.source_files);
+    let commits = db.list_commits(None).await.unwrap();
+    let own_commit = commits
+        .iter()
+        .find(|commit| commit.graph_commit_id == report.after_commit)
+        .unwrap();
+    assert_eq!(
+        own_commit.parent_commit_id.as_deref(),
+        Some(before.as_str())
+    );
+    assert_eq!(own_commit.actor_id.as_deref(), Some("maintenance-actor"));
+    assert_ne!(
+        commits[0].graph_commit_id, report.after_commit,
+        "report must retain its own publication, not a later writer's head"
     );
 }
 
@@ -462,7 +914,17 @@ node Doc {
         );
     }
 
-    let stats = db.optimize().await.unwrap();
+    let (input_tx, input_rx) = tokio::sync::oneshot::channel();
+    let report = db
+        .optimize_with_limits_admitted_as(&optimize_limits(), None, |input| async move {
+            input_tx.send(input).unwrap();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let input = input_rx.await.unwrap();
+    assert!(serde_json::to_vec(&report).unwrap().len() as u64 <= input.report_max_bytes);
+    let stats = report.tables;
 
     // Postcondition: optimize_indices folded the scalar tail in, but preserves
     // the existing FTS artifact instead of merging uncertified postings.
@@ -644,9 +1106,19 @@ node Tag {\n    slug: String @key\n}\n";
         .clone();
 
     let probes = omnigraph::instrumentation::MergeWriteProbes::default();
-    let stats = omnigraph::instrumentation::with_merge_write_probes(probes.clone(), db.optimize())
-        .await
-        .expect("optimize must not crash on a graph with a Blob table");
+    let report = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.optimize_with_limits_as(&optimize_limits(), None),
+    )
+    .await
+    .expect("optimize must not crash on a graph with a Blob table");
+    assert_eq!(report.before_commit, head_before);
+    assert_eq!(report.source_tables, 3);
+    assert!(
+        report.source_rows >= 9,
+        "data rows plus accepted manifest records"
+    );
+    let stats = report.tables;
     assert_eq!(
         (
             probes.compaction_blob_batch_calls(),
@@ -1325,9 +1797,32 @@ async fn optimize_then_cleanup_erases_dropped_property_values() {
     let commits_before = db.list_commits(None).await.unwrap().len();
 
     let probes = omnigraph::instrumentation::MergeWriteProbes::default();
-    let stats = omnigraph::instrumentation::with_merge_write_probes(probes.clone(), db.optimize())
+    let limits = optimize_limits();
+    let mut rejected = limits.clone();
+    rejected.max_source_bytes = MIB as u64 - 1;
+    let failure = db
+        .optimize_with_limits_as(&rejected, None)
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(
+        !failure.effects_started,
+        "Blob payload limit must precede dropped-column rewrite"
+    );
+    assert_eq!(
+        pinned_file_field_ids(&db, "node:Doc").await,
+        files_after_drop
+    );
+    let report = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.optimize_with_limits_as(&limits, None),
+    )
+    .await
+    .unwrap();
+    assert!(
+        report.source_bytes >= MIB as u64,
+        "kept managed Blob bytes are admitted"
+    );
+    let stats = report.tables;
     let stat = |key: &str| stats.iter().find(|stat| stat.type_key == key).unwrap();
     let doc = stat("node:Doc");
     assert!(

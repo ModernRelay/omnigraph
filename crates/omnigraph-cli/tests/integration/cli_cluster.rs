@@ -3005,6 +3005,402 @@ fn optimize_resolves_a_cluster_graph_by_id() {
     );
 }
 
+fn maintenance_status() -> Value {
+    serde_json::json!({"status":{"ledger_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","next_sequence":1,"outstanding_id":null},
+        "limits":{"max_tables":32,"max_fragments":1000,"max_rows":100000,"max_source_bytes":10000000,"max_files":2000}})
+}
+
+fn maintenance_receipt(request: &Value, complete: bool) -> Value {
+    let invocation = serde_json::json!({"request":request,"actor":"act-writer","canonical_root":"file:///server-only-storage",
+        "result_revision":1,"input":null,"publication":null,"settlement":null,"schema_contract":{"source_hash":"schema","schema_ir_hash":"ir","schema_identity_domain":"domain","schema_identity_version":1}});
+    if complete {
+        serde_json::json!({"maintenance":{"status":"complete","result":{
+            "operation_id":request["operation_id"],"graph":request["graph"],"invocation":invocation,
+            "outcome":"success","report":{"before_commit":"before","after_commit":"after","tables":[],
+                "source_tables":0,"source_fragments":0,"source_rows":0,"source_bytes":0,"source_files":0}}},"in_progress":false})
+    } else {
+        serde_json::json!({"maintenance":{"status":"outstanding","operation_id":request["operation_id"],
+            "graph":request["graph"],"invocation":invocation},"in_progress":true})
+    }
+}
+
+#[test]
+fn served_optimize_submits_once_and_observes_the_original_identity() {
+    for mode in [
+        "wait",
+        "no_wait",
+        "lost_response",
+        "mismatched_request",
+        "no_wait_before_acceptance",
+    ] {
+        let mut submitted = None;
+        let mut lookups = 0;
+        let api = IntentApiFixture::graph_responding(
+            match mode {
+                "no_wait" => 2,
+                "no_wait_before_acceptance" => 4,
+                _ => 3,
+            },
+            move |request| match (request.method.as_str(), request.path.as_str()) {
+                ("GET", "/cluster/maintenance?graph=knowledge") => {
+                    IntentReply::json(200, maintenance_status())
+                }
+                ("POST", "/cluster/maintenance") => {
+                    assert!(submitted.is_none(), "submission must never replay");
+                    submitted = Some(request.body.clone());
+                    if matches!(
+                        mode,
+                        "lost_response" | "mismatched_request" | "no_wait_before_acceptance"
+                    ) {
+                        IntentReply::json(504, serde_json::json!({"error":"lost response"}))
+                    } else {
+                        IntentReply::json(202, maintenance_receipt(&request.body, false))
+                    }
+                }
+                ("GET", path) => {
+                    lookups += 1;
+                    let body = submitted.as_ref().unwrap();
+                    assert_eq!(
+                        path,
+                        format!(
+                            "/cluster/maintenance/{}?graph=knowledge",
+                            body["operation_id"].as_str().unwrap()
+                        )
+                    );
+                    if mode == "no_wait_before_acceptance" && lookups == 1 {
+                        return IntentReply::json(
+                            200,
+                            serde_json::json!({"maintenance":{"status":"not_recorded","operation_id":body["operation_id"]},"in_progress":true}),
+                        );
+                    }
+                    let mut receipt =
+                        maintenance_receipt(body, mode != "no_wait_before_acceptance");
+                    if mode == "mismatched_request" {
+                        receipt["maintenance"]["result"]["invocation"]["request"]["limits"]["max_rows"] =
+                            1.into();
+                    }
+                    IntentReply::json(200, receipt)
+                }
+                _ => panic!("unexpected request: {request:?}"),
+            },
+        );
+        let operator = KeyedServer::new(&api.origin);
+        let mut command = cli();
+        command.envs(operator.env("optimization-token")).args([
+            "optimize",
+            "--target",
+            KEYED_SERVER_NAME,
+            "--graph",
+            "knowledge",
+            "--json",
+            "--timeout",
+            "5",
+        ]);
+        if mode.starts_with("no_wait") {
+            command.arg("--no-wait");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            mode != "mismatched_request",
+            "{mode}: {output:?}"
+        );
+        let requests = api.workflow_requests();
+        let posts: Vec<_> = requests
+            .iter()
+            .filter(|request| request.method == "POST")
+            .collect();
+        assert_eq!(posts.len(), 1);
+        let id = posts[0].body["operation_id"].as_str().unwrap();
+        assert!(id.starts_with("01ARZ3NDEKTSV4RRFFQ69G5FAV:1:"));
+        assert_eq!(id.len(), 55);
+        assert!(String::from_utf8_lossy(&output.stderr).contains(id));
+        assert_eq!(posts[0].body["limits"], maintenance_status()["limits"]);
+        assert_eq!(posts[0].body["kind"], "optimize");
+        for request in &requests {
+            assert_eq!(
+                request.headers.get("authorization").map(String::as_str),
+                Some("Bearer optimization-token")
+            );
+        }
+        if mode != "mismatched_request" {
+            assert_eq!(
+                parse_stdout_json(&output)["maintenance"]["status"],
+                if mode.starts_with("no_wait") {
+                    "outstanding"
+                } else {
+                    "complete"
+                }
+            );
+        }
+        assert_no_core_effects(operator.home());
+        api.assert_complete();
+    }
+}
+
+#[test]
+fn served_optimize_operation_id_is_get_only_even_when_not_recorded_or_expired() {
+    let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV:1:01ARZ3NDEKTSV4RRFFQ69G5FAW";
+    for status in [
+        "not_recorded",
+        "result_expired",
+        "identity_mismatch",
+        "different_ledger",
+    ] {
+        let response = serde_json::json!({"maintenance":{"status":status,"operation_id":id},"in_progress":false});
+        let api = IntentApiFixture::graph(vec![IntentReply::json(200, response.clone())]);
+        let output = output_failure(
+            cli()
+                .args(["optimize", "--target"])
+                .fixture_target(&api.origin)
+                .args(["--graph", "knowledge", "--operation-id", id, "--json"]),
+        );
+        assert_eq!(parse_stdout_json(&output), response);
+        let requests = api.workflow_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(
+            requests[0].path,
+            format!("/cluster/maintenance/{id}?graph=knowledge")
+        );
+        api.assert_complete();
+    }
+}
+
+#[test]
+fn served_optimize_timeout_never_cancels_or_resubmits() {
+    let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV:1:01ARZ3NDEKTSV4RRFFQ69G5FAW";
+    let api = IntentApiFixture::graph_with_response_delay(
+        vec![IntentReply::json(
+            200,
+            serde_json::json!({"maintenance":{"status":"not_recorded","operation_id":id},"in_progress":false}),
+        )],
+        std::time::Duration::from_secs(2),
+    );
+    let output = output_failure(
+        cli()
+            .args(["optimize", "--target"])
+            .fixture_target(&api.origin)
+            .args([
+                "--graph",
+                "knowledge",
+                "--operation-id",
+                id,
+                "--timeout",
+                "1",
+                "--json",
+            ]),
+    );
+    assert_eq!(output.status.code(), Some(5), "{output:?}");
+    assert_eq!(parse_stdout_json(&output)["outcome"], "wait_timeout");
+    let requests = api.workflow_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "GET");
+    api.assert_complete();
+}
+
+#[test]
+fn served_optimize_preserves_refusal_and_unresolved_receipts_without_success() {
+    let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV:1:01ARZ3NDEKTSV4RRFFQ69G5FAW";
+    let request = serde_json::json!({"operation_id":id,"graph":"knowledge","kind":"optimize","limits":maintenance_status()["limits"]});
+    for outcome in ["refused", "outstanding", "unpublished", "published"] {
+        let mut response = maintenance_receipt(&request, outcome != "outstanding");
+        response["in_progress"] = false.into();
+        if outcome == "refused" {
+            let result = response["maintenance"]["result"].as_object_mut().unwrap();
+            result.remove("report");
+            result.insert("outcome".into(), "refused".into());
+            result.insert("code".into(), "optimization_preflight_refused".into());
+            result.insert("message".into(), "source exceeds configured ceiling".into());
+        } else if matches!(outcome, "unpublished" | "published") {
+            let result = response["maintenance"]["result"].as_object_mut().unwrap();
+            let report = result.remove("report").unwrap();
+            result.insert("outcome".into(), "interrupted".into());
+            result.insert(
+                "publication".into(),
+                if outcome == "published" {
+                    serde_json::json!({"status":"published","report":report})
+                } else {
+                    serde_json::json!({"status":"unpublished"})
+                },
+            );
+        }
+        let api = IntentApiFixture::graph(vec![IntentReply::json(200, response.clone())]);
+        let output = output_failure(
+            cli()
+                .args(["optimize", "--target"])
+                .fixture_target(&api.origin)
+                .args([
+                    "--graph",
+                    "knowledge",
+                    "--operation-id",
+                    id,
+                    "--no-wait",
+                    "--json",
+                ]),
+        );
+        assert_eq!(parse_stdout_json(&output), response);
+        assert_eq!(api.workflow_requests().len(), 1);
+        assert_eq!(api.workflow_requests()[0].method, "GET");
+        api.assert_complete();
+    }
+}
+
+#[test]
+fn optimize_refuses_inapplicable_flags_and_managed_targets_before_requests() {
+    let api = IntentApiFixture::graph(vec![]);
+    for extra in [
+        vec!["--as", "act-other"],
+        vec!["--branch", "review"],
+        vec!["--timeout", "0"],
+        vec!["--timeout", "3601"],
+        vec!["--operation-id", "original", "--writers-stopped"],
+    ] {
+        output_failure(
+            cli()
+                .args(["optimize", "--target"])
+                .fixture_target(&api.origin)
+                .args(["--graph", "knowledge"])
+                .args(extra),
+        );
+    }
+    let root = tempdir().unwrap();
+    for args in [
+        vec!["--no-wait"],
+        vec!["--operation-id", "original"],
+        vec!["--timeout", "1"],
+        vec!["--writers-stopped"],
+        vec![
+            "--operation-id",
+            "original",
+            "--writers-stopped",
+            "--no-wait",
+        ],
+        vec![
+            "--operation-id",
+            "original",
+            "--writers-stopped",
+            "--timeout",
+            "1",
+        ],
+    ] {
+        output_failure(
+            cli()
+                .args(["optimize", "--target"])
+                .arg(root.path().join("must-not-create"))
+                .args(args),
+        );
+        assert!(!root.path().join("must-not-create").exists());
+    }
+    let managed = IntentApiFixture::new(vec![]);
+    let output = output_failure(
+        managed_fixture_command(root.path(), &managed.origin, "managed-test")
+            .arg("optimize")
+            .args(["--graph", "knowledge", "--json"]),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("target_kind_unsupported"),
+        "{output:?}"
+    );
+    assert!(managed.workflow_requests().is_empty());
+    api.assert_complete();
+    managed.assert_complete();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn optimize_recovery_requires_exclusion_and_reconciles_the_original_receipt() {
+    use omnigraph_cluster::{
+        ClusterAdmissionPurpose, IdentityAuthorization, MaintenanceAcceptance, MaintenanceKind,
+        MaintenanceRequest,
+    };
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let policy = temp.path().join("base.policy.yaml");
+    fs::write(
+        &policy,
+        fs::read_to_string(&policy).unwrap().replace(
+            "actions: [change, schema_apply]",
+            "actions: [change, schema_apply, optimize]",
+        ),
+    )
+    .unwrap();
+    apply_cluster_fixture(temp.path());
+    let root = temp.path().to_str().unwrap();
+    let actor = IdentityAuthorization::authenticated("act-cluster-test").unwrap();
+    let owner = omnigraph_cluster::acquire_cluster_admission(root, ClusterAdmissionPurpose::Serve)
+        .await
+        .unwrap()
+        .unwrap();
+    let id = omnigraph_cluster::maintenance_status(&owner, "knowledge", &actor)
+        .await
+        .unwrap()
+        .next_operation_id();
+    let request = MaintenanceRequest {
+        operation_id: id.clone(),
+        graph: "knowledge".into(),
+        kind: MaintenanceKind::Optimize,
+        limits: serde_json::from_value(maintenance_status()["limits"].clone()).unwrap(),
+    };
+    let MaintenanceAcceptance::Accepted(token) =
+        omnigraph_cluster::accept_maintenance(&owner, request, &actor)
+            .await
+            .unwrap()
+    else {
+        panic!("fresh acceptance")
+    };
+    let command = || {
+        let mut command = cli();
+        command.args([
+            "optimize",
+            "--target",
+            root,
+            "--graph",
+            "knowledge",
+            "--as",
+            "act-cluster-test",
+            "--operation-id",
+            &id,
+            "--writers-stopped",
+            "--json",
+        ]);
+        command
+    };
+    let refused = output_failure(&mut command());
+    assert!(
+        String::from_utf8_lossy(&refused.stdout).contains("state_lock_held")
+            || String::from_utf8_lossy(&refused.stderr).contains("state_lock_held"),
+        "{refused:?}"
+    );
+    // This fixture accepted no physical work. Drop every owner before the
+    // explicit administrator unlock; the recovery flag never unlocks it.
+    let lock = owner.lock_id().to_string();
+    drop(token);
+    drop(owner);
+    omnigraph_cluster::force_unlock_storage_root(root, &lock)
+        .await
+        .unwrap();
+    let journal = temp.path().join("__cluster/maintenance.json");
+    let before = fs::read(&journal).unwrap();
+    let recovered = parse_stdout_json(&output_success(&mut command()));
+    assert_eq!(recovered["maintenance"]["result"]["operation_id"], id);
+    assert_eq!(recovered["maintenance"]["result"]["outcome"], "interrupted");
+    assert_eq!(
+        recovered["maintenance"]["result"]["publication"]["status"],
+        "unpublished"
+    );
+    assert_ne!(fs::read(&journal).unwrap(), before);
+    assert_eq!(
+        parse_stdout_json(&output_success(&mut command())),
+        recovered
+    );
+    let successor =
+        omnigraph_cluster::acquire_cluster_admission(root, ClusterAdmissionPurpose::Serve)
+            .await
+            .unwrap()
+            .unwrap();
+    successor.release_after_settlement().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v2_root_admission_blocks_cli_write_and_native_control_doors() {
     let temp = applied_knowledge_cluster();

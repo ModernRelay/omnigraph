@@ -1156,6 +1156,129 @@ fn remote_blob_write_delivery_loss_never_replays_committed_effect() {
 }
 
 #[test]
+fn remote_optimize_preserves_data_and_observes_the_exact_receipt() {
+    const TOKEN: &str = "optimize-wire-token";
+    let cluster = converged_loaded_cluster(GRAPH_ID, None);
+    fs::write(
+        cluster.path().join("graph.policy.yaml"),
+        "version: 1\ngroups:\n  readers: [act-cluster-test, act-reader]\n  operators: [act-cluster-test]\nprotected_branches: [main]\nrules:\n  - id: read\n    allow:\n      actors: { group: readers }\n      actions: [read, invoke_query]\n  - id: optimize\n    allow:\n      actors: { group: operators }\n      actions: [optimize]\n      target_branch_scope: protected\n",
+    ).unwrap();
+    let config_path = cluster.path().join("cluster.yaml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(&config_path, format!("{config}policies:\n  graph:\n    file: ./graph.policy.yaml\n    applies_to: [{GRAPH_ID}]\n")).unwrap();
+    apply_cluster_fixture(cluster.path());
+    let limits_path = cluster.path().join("maintenance.yaml");
+    fs::write(&limits_path, "max_tables: 16\nmax_fragments: 100\nmax_rows: 1000\nmax_source_bytes: 10485760\nmax_files: 1000\n").unwrap();
+    let server = spawn_server_with_cluster_env(
+        cluster.path(),
+        &[
+            (
+                "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+                r#"{"act-cluster-test":"optimize-wire-token","act-reader":"reader-token"}"#,
+            ),
+            (
+                "OMNIGRAPH_MAINTENANCE_CONFIG",
+                limits_path.to_str().unwrap(),
+            ),
+        ],
+    );
+    let client = graph_http_client();
+    let status = || {
+        client
+            .get(format!("{}/cluster/maintenance", server.base_url))
+            .query(&[("graph", GRAPH_ID)])
+            .bearer_auth(TOKEN)
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<serde_json::Value>()
+            .unwrap()
+    };
+    let query_path = cluster.path().join("all-people.gq");
+    fs::write(&query_path, "query all_people() {\n  match { $p: Person }\n  return { $p.name, $p.age }\n  order { $p.name asc }\n}\n").unwrap();
+    let read = || {
+        parse_stdout_json(&output_success(
+            cli()
+                .envs(server.credential(TOKEN))
+                .args(["--target"])
+                .fixture_target(&server.base_url)
+                .args(["--graph", GRAPH_ID, "query", "--query"])
+                .arg(&query_path)
+                .args(["all_people", "--json"]),
+        ))
+    };
+    let before = read();
+    assert_eq!(before["row_count"], 4);
+    let before_status = status();
+    let denied = output_failure(
+        cli()
+            .envs(server.credential("reader-token"))
+            .arg("--target")
+            .fixture_target(&server.base_url)
+            .args(["--graph", GRAPH_ID, "optimize", "--json"]),
+    );
+    let denial = parse_stdout_json(&denied);
+    assert_eq!(denial["code"], "forbidden", "{denial}");
+    assert!(denial["error"].as_str().unwrap().contains("optimize"));
+    assert!(!String::from_utf8_lossy(&denied.stderr).contains("Operation-ID:"));
+    assert_eq!(
+        status(),
+        before_status,
+        "denial must not reserve an identity"
+    );
+    assert_eq!(read(), before, "denial must not change graph data or head");
+
+    let output = output_success(
+        cli()
+            .envs(server.credential(TOKEN))
+            .arg("--target")
+            .fixture_target(&server.base_url)
+            .args(["--graph", GRAPH_ID, "optimize", "--json"]),
+    );
+    let receipt = parse_stdout_json(&output);
+    assert_eq!(receipt["maintenance"]["status"], "complete");
+    let result = &receipt["maintenance"]["result"];
+    assert_eq!(result["outcome"], "success");
+    assert_eq!(result["graph"], GRAPH_ID);
+    assert_eq!(result["invocation"]["actor"], "act-cluster-test");
+    let id = result["operation_id"].as_str().unwrap();
+    assert!(String::from_utf8_lossy(&output.stderr).contains(&format!("Operation-ID: {id}")));
+    let report = &result["report"];
+    let after = read();
+    assert_eq!(report["before_commit"], before["graph_commit_id"]);
+    assert_eq!(report["after_commit"], after["graph_commit_id"]);
+    assert_eq!(after["rows"], before["rows"]);
+    assert_eq!(after["row_count"], before["row_count"]);
+    let after_status = status();
+    assert_eq!(
+        after_status["status"]["next_sequence"].as_u64().unwrap(),
+        before_status["status"]["next_sequence"].as_u64().unwrap() + 1
+    );
+    let observed = parse_stdout_json(&output_success(
+        cli()
+            .envs(server.credential(TOKEN))
+            .arg("--target")
+            .fixture_target(&server.base_url)
+            .args([
+                "--graph",
+                GRAPH_ID,
+                "optimize",
+                "--operation-id",
+                id,
+                "--json",
+            ]),
+    ));
+    assert_eq!(observed["maintenance"], receipt["maintenance"]);
+    assert_eq!(
+        status(),
+        after_status,
+        "lookup must not admit another operation"
+    );
+    assert_eq!(read(), after, "lookup must not move the graph head");
+}
+
+#[test]
 fn remote_deployment_delivery_loss_preserves_owned_completion() {
     use crate::support::managed_http::{DeploymentDeliveryFault, IntentApiFixture};
     use std::io::{BufRead, BufReader, Write};

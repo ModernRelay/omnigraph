@@ -557,6 +557,51 @@ impl ClusterStore {
             .map_err(|err| err.to_string())
     }
 
+    /// Bounded maintenance journal access through this owner's existing I/O
+    /// scope and captured storage binding. The version is an opaque CAS token.
+    pub(crate) async fn read_maintenance(&self) -> Result<Option<(String, String)>, Diagnostic> {
+        self.adapter
+            .read_text_versioned_if_exists_bounded(
+                &self.uri(crate::maintenance::MAINTENANCE_FILE),
+                crate::maintenance::MAX_JOURNAL_BYTES as u64,
+            )
+            .await
+            .map_err(|_| {
+                crate::maintenance::refusal(
+                    "maintenance_read_error",
+                    "could not read the maintenance journal",
+                )
+            })
+    }
+
+    /// A failed or unacknowledged conditional write never authorizes a retry
+    /// of graph effects. The caller retains its original operation identity.
+    pub(crate) async fn write_maintenance(
+        &self,
+        payload: &str,
+        expected_version: Option<&str>,
+    ) -> Result<(), Diagnostic> {
+        use crate::maintenance::{MAINTENANCE_FILE, MAX_JOURNAL_BYTES, refusal};
+        if payload.len() > MAX_JOURNAL_BYTES {
+            return Err(refusal(
+                "maintenance_journal_limit",
+                "maintenance journal exceeds its byte limit",
+            ));
+        }
+        let uri = self.uri(MAINTENANCE_FILE);
+        let written = match expected_version {
+            Some(version) => self.adapter.write_text_if_match(&uri, payload, version).await.map(|value| value.is_some()),
+            None => self.adapter.write_text_if_absent(&uri, payload).await,
+        }.map_err(|_| refusal("maintenance_write_uncertain", "maintenance journal write was not acknowledged; inspect the original identity without replaying effects"))?;
+        if !written {
+            return Err(refusal(
+                "maintenance_cas_mismatch",
+                "maintenance journal changed; inspect the original identity without replaying effects",
+            ));
+        }
+        Ok(())
+    }
+
     /// Shared list-and-parse for the sidecar/approval directories: id
     /// (filename) order; unparseable objects warn and stay for the operator.
     async fn list_json_dir<T: serde::de::DeserializeOwned>(
@@ -1186,6 +1231,7 @@ impl ClusterStore {
     }
 
     pub(crate) async fn release_settled(&self, lock_id: &str) -> Result<(), Diagnostic> {
+        crate::maintenance::require_no_maintenance(self).await?;
         // Permanently close graph/control adapters before the final lock write.
         // This private client can only execute the exact-owner release below;
         // no caller receives a general escape from a closed storage scope.

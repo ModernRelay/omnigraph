@@ -4475,7 +4475,24 @@ async fn optimize_pre_publish_failure_leaves_no_residue() {
         .version;
     {
         let _failpoint = catalog::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
-        let err = db.optimize().await.unwrap_err();
+        let failure = db
+            .optimize_with_limits_as(
+                &omnigraph::db::OptimizeLimits {
+                    max_tables: 16,
+                    max_fragments: 1024,
+                    max_rows: 100_000,
+                    max_source_bytes: 64 * 1024 * 1024,
+                    max_files: 4096,
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            failure.effects_started,
+            "a lost pre-publication attempt is not a pre-effect refusal"
+        );
+        let err = failure.error;
         assert!(
             err.to_string().contains(
                 "injected failpoint triggered: optimize.post_phase_b_pre_manifest_commit"
@@ -4695,6 +4712,16 @@ node Embedding {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial(optimize)]
 async fn optimize_partial_table_effect_leaves_no_residue() {
+    assert_optimize_partial_table_effect_leaves_no_residue(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(optimize)]
+async fn bounded_optimize_partial_effect_stops_before_the_next_table() {
+    assert_optimize_partial_table_effect_leaves_no_residue(true).await;
+}
+
+async fn assert_optimize_partial_table_effect_leaves_no_residue(bounded: bool) {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
@@ -4723,8 +4750,43 @@ async fn optimize_partial_table_effect_leaves_no_residue() {
         .await
         .version()
         .version;
+    let person_versions = detached_versions(&person_uri).await;
+    let company_versions = detached_versions(&company_uri).await;
     let _failpoint = catalog::OPTIMIZE_POST_TABLE_EFFECT.fire_once_at(1);
-    let error = db.optimize().await.unwrap_err();
+    let error = if bounded {
+        let failure = db
+            .optimize_with_limits_as(
+                &omnigraph::db::OptimizeLimits {
+                    max_tables: 16,
+                    max_fragments: 1024,
+                    max_rows: 100_000,
+                    max_source_bytes: 64 * 1024 * 1024,
+                    max_files: 4096,
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(failure.effects_started);
+        assert_eq!(
+            detached_versions(&person_uri).await,
+            person_versions,
+            "the bounded attempt must not start the next table after an error"
+        );
+        assert!(
+            detached_versions(&company_uri).await.len() > company_versions.len(),
+            "the first sorted table must have reached a detached effect"
+        );
+        failure.error
+    } else {
+        db.optimize().await.unwrap_err()
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("injected failpoint triggered: optimize.post_table_effect"),
+        "unexpected error: {error}"
+    );
     assert!(
         !matches!(error, OmniError::RecoveryRequired { .. }),
         "a partial batch before publication needs no recovery: {error}"

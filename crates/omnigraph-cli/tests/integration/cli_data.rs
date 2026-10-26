@@ -1005,7 +1005,9 @@ fn optimize_json_succeeds_on_local_graph() {
     assert!(pending.iter().all(|index| index.get("column").is_none()));
 
     let human = stdout_string(&output_success(
-        cli().arg("optimize").arg("--target").arg(&graph),
+        cli()
+            .args(["optimize", "--as", "act-cli-optimize", "--target"])
+            .arg(&graph),
     ));
     assert!(human.contains(" datasets"), "{human}");
     assert!(human.contains("node type 'Person'"), "{human}");
@@ -1096,15 +1098,9 @@ fn optimize_json_succeeds_on_local_graph() {
 }
 
 #[test]
-fn maintenance_refuses_server_targets_before_network() {
+fn direct_only_maintenance_refuses_server_targets_before_network() {
     let server = crate::support::managed_http::IntentApiFixture::graph(Vec::new());
-    for command in [
-        "optimize",
-        "rebuild-full-text-indexes",
-        "repair",
-        "cleanup",
-        "upgrade",
-    ] {
+    for command in ["rebuild-full-text-indexes", "repair", "cleanup", "upgrade"] {
         let output = output_failure(
             cli()
                 .arg(command)
@@ -1120,12 +1116,6 @@ fn maintenance_refuses_server_targets_before_network() {
         assert!(server.requests().is_empty());
     }
     server.assert_complete();
-}
-
-#[test]
-fn optimize_with_as_flag_errors() {
-    let output = output_failure(cli().args(["optimize", "--as", "act-op"]));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("optimize does not accept --as"));
 }
 
 #[test]

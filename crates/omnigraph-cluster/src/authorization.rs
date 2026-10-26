@@ -336,7 +336,7 @@ impl AppliedPolicies {
             action,
             graph,
             (action == PolicyAction::Read).then_some("main"),
-            (action == PolicyAction::SchemaApply).then_some("main"),
+            matches!(action, PolicyAction::SchemaApply | PolicyAction::Optimize).then_some("main"),
         )
     }
 

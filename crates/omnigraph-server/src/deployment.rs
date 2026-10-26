@@ -35,7 +35,7 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Default)]
 pub(crate) struct DeploymentRuntime {
-    gate: Arc<Mutex<()>>,
+    pub(crate) gate: Arc<Mutex<()>>,
     // Process observation generation and exact current owned invocation.
     current: SyncMutex<(u64, Option<String>)>,
 }

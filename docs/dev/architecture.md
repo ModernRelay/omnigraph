@@ -221,6 +221,9 @@ write admission; rebuild retains its actor and branch; repair delivers its repor
 before any refusal error. The storage-upgrade adapter retains its existing
 conversion and recovery owner. These commands do not use the data-write outcome
 envelope or replay an operation after delivery failure.
+Its `remote` adapter submits enabled served optimization once, after flushing
+the original ID, then only observes that ID. The server retains execution;
+neither disconnect nor a CLI observation timeout cancels it or opens storage.
 
 `commands/cluster` owns direct cluster arguments and dispatch; `cluster_remote`
 owns served deployment submission and observation. `commands/control` owns applied

@@ -54,7 +54,7 @@ rules:
   - id: writers-branches-schema
     allow:
       actors: { group: writers }
-      actions: [schema_apply, branch_create, branch_delete, branch_merge]
+      actions: [schema_apply, optimize, branch_create, branch_delete, branch_merge]
       target_branch_scope: any
 "#;
 
@@ -86,6 +86,26 @@ async fn init_with_policy(dir: &tempfile::TempDir) -> (Session, Arc<PolicyEngine
     drop(init_and_load(dir).await);
     let db = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
     install_policy(db, dir.path())
+}
+
+#[tokio::test]
+async fn optimize_enforces_explicit_action_and_main_target_before_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = init_with_policy(&dir).await;
+    assert!(matches!(db.optimize().await, Err(OmniError::Policy(_))));
+    assert_denied(db.optimize_as(Some("act-denied")).await, "optimize");
+    db.optimize_as(Some("act-allowed")).await.unwrap();
+    drop(db);
+
+    // Neither other write permissions nor permission on unprotected branches
+    // authorizes optimizing main, which is protected in this policy.
+    let source = POLICY_YAML.replace(
+        "actions: [schema_apply, optimize, branch_create, branch_delete, branch_merge]",
+        "actions: [schema_apply, branch_create, branch_delete, branch_merge]",
+    ) + "  - id: optimize-feature-only\n    allow:\n      actors: { group: writers }\n      actions: [optimize]\n      target_branch_scope: unprotected\n";
+    let graph = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+    let (db, _) = install_policy_source(graph, dir.path(), &source);
+    assert_denied(db.optimize_as(Some("act-allowed")).await, "optimize main");
 }
 
 /// Variant for tests that need a pre-created feature branch (branch_delete /

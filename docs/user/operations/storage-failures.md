@@ -99,6 +99,27 @@ conditional update, so a successor could not replace the lock without racing a
 release the old owner already sent. Older binaries refuse the leased
 (version 3) lock record; do not delete it to bypass the version check.
 
+## Interrupted optimization
+
+An administrator can reconcile the original operation after stopping all prior
+writers and establishing accepted graph/control I/O quiescence. Handle any
+retained lock through the existing exact-ID `cluster force-unlock` procedure
+only after that exclusion; recovery itself never overrides a held lock.
+
+```bash
+omnigraph optimize --target ./cluster-root --graph knowledge \
+  --operation-id '<ORIGINAL-ID>' --writers-stopped --as act-operator --json
+```
+
+This requires an explicit direct-root target and current `optimize` permission.
+It reads the original publication witness and native graph evidence and never
+reruns compaction. Where necessary, one native no-effect publication excludes
+a delayed original commit. The terminal outcome is `interrupted`, with
+`publication.status` equal to `unpublished` or `published`; the latter includes
+the exact published table report and does not claim later derived work finished.
+Missing or conflicting evidence keeps the operation unresolved. Preserve the
+printed operation and lock IDs if recovery or result delivery fails.
+
 ## Logs
 
 No storage-failure log carries an error's message, which can name storage

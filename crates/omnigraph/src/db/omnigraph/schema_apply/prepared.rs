@@ -14,7 +14,7 @@ pub struct SchemaContractDigest {
 }
 
 impl SchemaContractDigest {
-    pub(super) fn from_row(row: &SchemaContractRow) -> Self {
+    pub(crate) fn from_row(row: &SchemaContractRow) -> Self {
         Self {
             source_hash: source_hash(&row.source),
             schema_ir_hash: row.head.schema_ir_hash.clone(),

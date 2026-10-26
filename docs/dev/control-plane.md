@@ -72,6 +72,7 @@ scope, response validation and refusal tests.
 | Path | Role |
 |---|---|
 | `__cluster/state.json` | Applied ledger; v2 also owns outstanding deployment authority and bounded results |
+| `__cluster/maintenance.json` | Bounded optimization invocations and exact results; unresolved work blocks deployment, writable admission and clean release |
 | `__cluster/resources/` | Content-addressed queries, policies and immutable deployment bundles |
 | `__cluster/recoveries/` | Legacy evidence read only during explicit conversion checks |
 | `__cluster/approvals/` | Preserved legacy audit artifacts; no operational approval writer |
@@ -84,6 +85,21 @@ The engine has no ordinary graph recovery sidecar: schema, table pins and
 lineage publish together in `__manifest`. Ledger v2 stores prepared schema and
 graph-birth and graph-deletion authority in one outstanding record. Legacy control evidence is
 preserved for explicit conversion checks, never executed by a fallback sweep.
+
+Opt-in served optimization runs under the existing server's cluster admission.
+Its separate receipt journal binds the actual actor, original operation ID and
+accepted graph input before rewriting. Outstanding maintenance excludes native
+deployment and clean ownership release; uncertainty never permits replay.
+Preflight reserves the complete result envelope before effects, including the
+prepared publication witness and interrupted-result shape. Recovery uses a
+restricted original-ID admission after writer/I/O exclusion and classifies
+the exact native publication; its journal is never graph authority. An absent
+candidate alone cannot settle a delayed write. Native conditional no-effect
+publication resolves that race without replaying optimization.
+The [served optimization RFC](../rfcs/2026-10-25-served-optimization.md) defines
+this candidate contract and its qualification limits; the
+[maintenance guide](../user/operations/maintenance.md#server-enablement) describes
+enablement and observation. It provides no scheduler or independent worker.
 
 ## Deployment ledger
 

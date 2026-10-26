@@ -12,7 +12,7 @@ use axum::http::Method;
 use axum::routing::{MethodFilter, MethodRouter};
 use omnigraph_api_types::operations::{HttpMethod, HttpOperation, named_operation};
 
-use crate::{AppState, INGEST_REQUEST_BODY_LIMIT_BYTES, deployment, handlers};
+use crate::{AppState, INGEST_REQUEST_BODY_LIMIT_BYTES, deployment, handlers, maintenance};
 
 pub(crate) fn operation(name: &str) -> &'static HttpOperation {
     named_operation(name).expect("a registered HTTP operation belongs to the shared inventory")
@@ -206,6 +206,13 @@ pub(crate) fn probes() -> HttpRoutes {
         .route("readiness", handlers::server_ready)
 }
 
+pub(crate) fn maintenance() -> HttpRoutes {
+    HttpRoutes::new("")
+        .route("maintenance status", maintenance::status)
+        .route("optimize", maintenance::submit)
+        .route("maintenance lookup", maintenance::lookup)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -219,6 +226,7 @@ mod tests {
         let mut registered = graph().registered();
         registered.extend(management().registered());
         registered.extend(deployments().registered());
+        registered.extend(maintenance().registered());
         registered.extend(probes().registered());
         registered.extend(crate::mcp::metadata_http_operations());
         let count = registered.len();

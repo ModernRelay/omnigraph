@@ -44,6 +44,24 @@ pub async fn read_schema_publication_candidate_at(
     original_id: Option<&str>,
     settlement_id: Option<&str>,
 ) -> Result<Option<SchemaPublicationCandidate>> {
+    read_schema_publication_candidate_at_with_session(
+        root_uri,
+        version,
+        original_id,
+        settlement_id,
+        None,
+    )
+    .await
+}
+
+/// The same exact-version proof, retaining an already captured provider.
+pub async fn read_schema_publication_candidate_at_with_session(
+    root_uri: &str,
+    version: u64,
+    original_id: Option<&str>,
+    settlement_id: Option<&str>,
+    session: Option<&std::sync::Arc<lance::session::Session>>,
+) -> Result<Option<SchemaPublicationCandidate>> {
     if version == 0
         || original_id
             .into_iter()
@@ -58,7 +76,7 @@ pub async fn read_schema_publication_candidate_at(
     let dataset = match open_dataset(
         &manifest_uri(root_uri),
         VersionResolution::At(version),
-        None,
+        session,
         crate::instrumentation::manifest_wrapper(),
     )
     .await

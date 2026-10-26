@@ -16,6 +16,7 @@ Graph-scoped actions:
 | `export` | Snapshot export |
 | `change` | Mutations, loads, and source metadata probes for `explain load csv` |
 | `schema_apply` | Schema changes |
+| `optimize` | Compaction and declared-index reconciliation on target branch `main` |
 | `branch_create` | Branch creation |
 | `branch_delete` | Branch deletion |
 | `branch_merge` | Branch merge |
@@ -41,6 +42,11 @@ The reserved graph `admin` action does not grant cluster management.
 
 A stored mutation requires both `invoke_query` and `change`. A stored read
 requires `invoke_query` and `read`.
+
+`optimize` is explicit: `change`, `schema_apply`, `config_manage` and the
+reserved `admin` action do not imply it. This check applies to direct engine
+and CLI optimization whenever a graph policy is installed, as well as served
+optimization. Use `target_branch_scope` to restrict it to protected `main`.
 
 ## Bind a policy
 
@@ -209,6 +215,11 @@ credential without one nothing, as those routes decide; a server without
 authentication allows every graph action and reports `actor_id: null`. The MCP
 `access` tool returns the same body, and `omnigraph access` prints it for a
 server target ([what you may do at a target](../cli/targets.md#what-you-may-do-at-a-target)).
+
+This report's closed action vocabulary does not include `optimize`; its absence
+does not mean denial. On a server with maintenance enabled, read
+`GET /cluster/maintenance?graph=<ID>` to check current optimize permission on
+`main` without submitting work.
 
 It reports policy actions, not actor views, so a view can still refuse a
 `change` the policy allows.

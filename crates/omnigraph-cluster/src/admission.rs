@@ -17,6 +17,7 @@ pub enum ClusterAdmissionPurpose {
     GraphOperation,
     Deployment,
     Reconcile { deployment_id: String },
+    MaintenanceRecovery { operation_id: String },
 }
 
 impl ClusterAdmissionPurpose {
@@ -26,6 +27,7 @@ impl ClusterAdmissionPurpose {
             Self::GraphOperation => "graph_operation",
             Self::Deployment => "deployment",
             Self::Reconcile { .. } => "deployment_reconcile",
+            Self::MaintenanceRecovery { .. } => "maintenance_reconcile",
         }
     }
 }
@@ -170,6 +172,21 @@ impl ClusterAdmission {
         Ok(())
     }
 
+    pub(crate) async fn validate_maintenance_recovery(
+        &self,
+        operation_id: &str,
+    ) -> Result<(), Diagnostic> {
+        if !matches!(&self.owner().purpose, ClusterAdmissionPurpose::MaintenanceRecovery { operation_id: original } if original == operation_id)
+        {
+            return Err(Diagnostic::error(
+                "cluster_admission_purpose_mismatch",
+                "__cluster/lock.json",
+                "only the exact original maintenance recovery is admitted",
+            ));
+        }
+        self.validate_current_lock().await
+    }
+
     /// The exact achieved contract captured with this serving admission.
     /// This lookup opens no engine. Startup compares it with each opened graph
     /// independently, so an unavailable graph does not block healthy peers.
@@ -249,6 +266,16 @@ impl ClusterAdmission {
     /// Alias spellings are accepted only when they resolve inside this root's
     /// canonical graph layout; graph symlinks escaping that layout are refused.
     pub async fn validate_graph_uri(&self, graph_uri: &str) -> Result<(), Diagnostic> {
+        if matches!(
+            self.owner().purpose,
+            ClusterAdmissionPurpose::MaintenanceRecovery { .. }
+        ) {
+            return Err(Diagnostic::error(
+                "cluster_admission_purpose_mismatch",
+                "__cluster/lock.json",
+                "maintenance recovery cannot admit an ordinary graph writer",
+            ));
+        }
         self.admitted_graph_id(graph_uri).map(|_| ())
     }
 
@@ -348,7 +375,25 @@ pub async fn acquire_cluster_admission(
     purpose: ClusterAdmissionPurpose,
 ) -> Result<Option<ClusterAdmission>, Diagnostic> {
     let mut store = ClusterStore::for_storage_root(storage_root)?;
-    if purpose == ClusterAdmissionPurpose::Serve {
+    if matches!(
+        purpose,
+        ClusterAdmissionPurpose::Serve | ClusterAdmissionPurpose::MaintenanceRecovery { .. }
+    ) {
+        store = store.with_io_scope(omnigraph_storage::StorageIoScope::new())?;
+    }
+    acquire_with_store(&store, purpose).await
+}
+
+/// Capture the caller's provider binding before acquiring the exact native lock.
+pub async fn acquire_cluster_admission_with_binding(
+    binding: &omnigraph_storage::CapturedStorageBinding,
+    purpose: ClusterAdmissionPurpose,
+) -> Result<Option<ClusterAdmission>, Diagnostic> {
+    let mut store = ClusterStore::for_storage_binding(binding)?;
+    if matches!(
+        purpose,
+        ClusterAdmissionPurpose::Serve | ClusterAdmissionPurpose::MaintenanceRecovery { .. }
+    ) {
         store = store.with_io_scope(omnigraph_storage::StorageIoScope::new())?;
     }
     acquire_with_store(&store, purpose).await
@@ -385,7 +430,10 @@ pub async fn acquire_graph_admission_with_binding(
         .for_uri(&root)
         .map_err(|error| Diagnostic::error("storage_root_invalid", "storage", error.to_string()))?;
     let mut store = ClusterStore::for_storage_binding(&root_binding)?;
-    if purpose == ClusterAdmissionPurpose::Serve {
+    if matches!(
+        purpose,
+        ClusterAdmissionPurpose::Serve | ClusterAdmissionPurpose::MaintenanceRecovery { .. }
+    ) {
         store = store.with_io_scope(omnigraph_storage::StorageIoScope::new())?;
     }
     let admission = acquire_with_store(&store, purpose).await?;
@@ -434,6 +482,15 @@ pub(crate) async fn acquire_with_store(
                 CLUSTER_STATE_FILE,
                 "cluster version changed while acquiring admission",
             ));
+        }
+        // Reacquiring the process lock does not settle an earlier optimization.
+        // Check under that exact lock before any successor can open graphs for
+        // writing. The refusal path also preserves the lock while uncertainty
+        // remains; neither restart nor force-unlock is maintenance recovery.
+        match &purpose {
+            ClusterAdmissionPurpose::MaintenanceRecovery { operation_id } =>
+                crate::maintenance::require_maintenance_recovery(store, &state, operation_id).await?,
+            _ => crate::maintenance::require_no_maintenance(store).await?,
         }
         let allowed = match (&purpose, state.outstanding_deployment_id()) {
             (ClusterAdmissionPurpose::Reconcile { deployment_id }, Some(outstanding)) => {

@@ -11,6 +11,7 @@ mod handlers;
 mod http_contract;
 mod http_operations;
 mod ingress;
+mod maintenance;
 mod mcp;
 pub mod operations;
 mod redacted_cause;
@@ -136,6 +137,9 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         deployment::lookup,
         deployment::apply,
         deployment::plan,
+        maintenance::status,
+        maintenance::lookup,
+        maintenance::submit,
         handlers::server_health,
         handlers::server_ready,
         handlers::server_graphs_list,
@@ -421,6 +425,7 @@ pub struct AppState {
     // drain is not qualified native settlement, so the server never unlocks.
     cluster_admission: Option<omnigraph_cluster::ClusterAdmission>,
     deployments: Arc<deployment::DeploymentRuntime>,
+    maintenance: Arc<maintenance::MaintenanceRuntime>,
     /// Runtime routing and availability for every configured graph.
     /// Middleware injects an admitted `serving::GraphRequest` or refuses a blocked
     /// graph before collecting its request body.
@@ -860,6 +865,7 @@ impl AppState {
         Self {
             cluster_admission: None,
             deployments: Arc::new(deployment::DeploymentRuntime::default()),
+            maintenance: Arc::new(maintenance::MaintenanceRuntime::default()),
             routing: GraphRouting {
                 registry,
                 config_path: None,
@@ -914,6 +920,7 @@ impl AppState {
         Ok(Self {
             cluster_admission: None,
             deployments: Arc::new(deployment::DeploymentRuntime::default()),
+            maintenance: Arc::new(maintenance::MaintenanceRuntime::default()),
             routing: GraphRouting {
                 registry,
                 config_path,
@@ -3710,6 +3717,16 @@ pub fn build_app(state: AppState) -> Router {
             routes.layer(DefaultBodyLimit::max(deployment::REQUEST_BYTES)),
         )
     });
+    let maintenance = guarded(
+        &state,
+        http_operations::maintenance().into_router(),
+        |routes| {
+            admitted(
+                &state,
+                routes.layer(DefaultBodyLimit::max(maintenance::REQUEST_BYTES)),
+            )
+        },
+    );
 
     let catalogue_routes = Router::new()
         .route("/query", post(handlers::catalogue::catalogue_query))
@@ -3724,7 +3741,8 @@ pub fn build_app(state: AppState) -> Router {
         .nest(CATALOGUE_ROUTE_PREFIX, catalogue)
         .nest(handlers::CLUSTER_PATH_PREFIX, per_graph_protected)
         .merge(management)
-        .merge(deployments);
+        .merge(deployments)
+        .merge(maintenance);
 
     let mut app = http_operations::probes()
         .into_router()
@@ -3848,6 +3866,9 @@ async fn serve_config(
     let tokens = token_source.load().await?;
     let process_defaults = ProcessDefaults::from_env()
         .map_err(|error| eyre!("session setting refused at startup: {error}"))?;
+    let maintenance_limits = maintenance::load_limits_from_env(
+        data_token_trust.is_some() || oidc_identity_trust.is_some(),
+    )?;
 
     // For runtime-state classification, "any policy configured" means
     // either the top-level/single-mode policy file OR a server-level
@@ -3942,6 +3963,7 @@ async fn serve_config(
             shutdown_grace,
         )
         .with_process_defaults(process_defaults)
+        .with_optional_maintenance_limits(maintenance_limits)
         .with_mcp_settings(mcp);
     deployment::initialize_boot_activation(&state);
     let retained_admission = state.cluster_admission.clone();

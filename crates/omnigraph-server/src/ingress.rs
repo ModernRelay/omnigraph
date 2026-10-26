@@ -149,6 +149,8 @@ pub(crate) async fn admit(
             .map_err(|_| ApiError::internal("Blob put limit exceeds usize"))?
     } else if matches!(route, "/cluster/deployments" | "/cluster/plan") {
         crate::deployment::REQUEST_BYTES
+    } else if route == "/cluster/maintenance" {
+        crate::maintenance::REQUEST_BYTES
     } else if route == "/mcp" {
         crate::mcp::REQUEST_BYTES
     } else if matches!(route, "/load/ndjson" | "/load") {
@@ -339,19 +341,18 @@ mod tests {
         .with_operations(OperationRuntime::with_read_limit(1));
         let entered = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&entered);
+        let write = post(move || {
+            let observed = Arc::clone(&observed);
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                StatusCode::NO_CONTENT
+            }
+        });
         let app = Router::new()
             .route("/snapshot", get(|| async { "read response" }))
             .route("/query", read)
-            .route(
-                "/write",
-                post(move || {
-                    let observed = Arc::clone(&observed);
-                    async move {
-                        observed.fetch_add(1, Ordering::SeqCst);
-                        StatusCode::NO_CONTENT
-                    }
-                }),
-            )
+            .route("/write", write.clone())
+            .route("/cluster/maintenance", write)
             .layer(middleware::from_fn_with_state(
                 state.clone(),
                 |State(state): State<AppState>, request: Request, next: Next| async move {
@@ -633,20 +634,34 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_body_refuses_before_handler_execution_and_releases_capacity() {
-        let (app, state, entered) = router(WorkloadLimits::default());
-        let response = app
-            .oneshot(request(Body::from(vec![
-                b' ';
-                DEFAULT_REQUEST_BODY_LIMIT_BYTES
-                    + 1
-            ])))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(error_code(response).await, "payload_too_large");
-        assert_eq!(entered.load(Ordering::SeqCst), 0);
-        assert_eq!(state.operations.snapshot().active_reads, 0);
-        assert_eq!(state.workload.snapshot(), WorkloadSnapshot::default());
+        for (path, limit) in [
+            ("/write", DEFAULT_REQUEST_BODY_LIMIT_BYTES),
+            ("/cluster/maintenance", crate::maintenance::REQUEST_BYTES),
+        ] {
+            let (app, state, entered) = router(WorkloadLimits::default());
+            let mut request = request(Body::from(vec![b' '; limit + 1]));
+            *request.uri_mut() = path.parse().unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+            assert_eq!(error_code(response).await, "payload_too_large");
+            assert_eq!(entered.load(Ordering::SeqCst), 0);
+            assert_eq!(state.operations.snapshot().active_reads, 0);
+            assert_eq!(state.workload.snapshot(), WorkloadSnapshot::default());
+            // No extractor limit is installed in this fixture: the middleware
+            // itself must enforce the exact route ceiling before dispatch.
+            let response = app
+                .oneshot(
+                    Request::post(path)
+                        .body(Body::from(vec![b' '; limit]))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{path}");
+            assert_eq!(entered.load(Ordering::SeqCst), 1);
+            drop(response);
+            assert_eq!(state.workload.snapshot(), WorkloadSnapshot::default());
+        }
     }
 
     #[tokio::test]
