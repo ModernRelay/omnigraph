@@ -5503,12 +5503,301 @@ fn target_list_and_inspect_have_the_same_versioned_binding() {
     assert_eq!(shown["target"]["uri"], "file:///data/dev.omni");
     assert_eq!(&shown["target"], local);
     assert_eq!(shown["identity"]["status"], "unknown");
+    // Every inspection names its operator home by digest; only a server
+    // target has the binding digest a Studio link carries.
+    assert!(shown["home"].as_str().unwrap().starts_with("sha256:"));
+    assert!(shown.get("binding").is_none(), "{shown}");
+    let server = parse_stdout_json(&output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .args(["target", "inspect", "staging", "--json"]),
+    ));
+    assert_eq!(&server["target"], &list["staging"]);
+    assert_eq!(server["home"], shown["home"]);
+    assert!(server["binding"].as_str().unwrap().starts_with("sha256:"));
     let missing = output_failure(
         cli()
             .env("OMNIGRAPH_HOME", home.path())
             .args(["target", "inspect", "missing"]),
     );
     assert!(String::from_utf8_lossy(&missing.stderr).contains("unknown target"));
+}
+
+/// What the stand-in platform says about Studio.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq)]
+enum StandInStudio {
+    /// `open` finds Studio, and `xdg-mime` names its desktop entry, whose
+    /// `Exec` runs the `studio-handler` stand-in.
+    Installed,
+    /// `open` finds no Studio, and `xdg-mime` names no handler.
+    Absent,
+    /// `open` finds no Studio, and `xdg-mime` names a desktop entry that no
+    /// applications directory holds.
+    Unresolved,
+}
+
+/// Stand-ins on `PATH` for the platform's link openers and what they could
+/// fall back to: `open` on macOS; `xdg-mime`, the `studio-handler` Studio's
+/// desktop entry runs, and `xdg-open` and `www-browser` elsewhere. The
+/// desktop entry lives in its own `XDG_DATA_HOME`, and `XDG_DATA_DIRS`
+/// names an empty directory, so the host's entries never take part. Each
+/// stand-in records its argv in `log`, one tab-separated line per run;
+/// nothing is opened.
+#[cfg(unix)]
+struct FakeOpeners {
+    dir: tempfile::TempDir,
+    log: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl FakeOpeners {
+    fn new(studio: StandInStudio) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("calls.log");
+        // Shell builtins only: `PATH` holds nothing but these scripts.
+        let record = r#"{ printf '%s' "${0##*/}"; for arg in "$@"; do printf '\t%s' "$arg"; done; printf '\n'; } >> "$STUDIO_OPENER_LOG""#;
+        let installed = studio == StandInStudio::Installed;
+        for (name, answer) in [
+            ("open", if installed { "exit 0" } else { "exit 1" }),
+            (
+                "xdg-mime",
+                if studio == StandInStudio::Absent {
+                    "exit 0"
+                } else {
+                    "printf 'omnigraph-studio.desktop\\n'"
+                },
+            ),
+            ("studio-handler", "exit 0"),
+            // A generic opener and a browser that would report success.
+            ("xdg-open", "exit 0"),
+            ("www-browser", "exit 0"),
+        ] {
+            let path = dir.path().join(name);
+            fs::write(&path, format!("#!/bin/sh\n{record}\n{answer}\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            // A platform may hold a new executable's first run for a malware
+            // scan longer than the opener waits; run each once, unbounded and
+            // unrecorded, so the opener sees how it answers.
+            std::process::Command::new(&path)
+                .env("STUDIO_OPENER_LOG", "/dev/null")
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+        }
+        let applications = dir.path().join("data/applications");
+        fs::create_dir_all(&applications).unwrap();
+        if installed {
+            fs::write(
+                applications.join("omnigraph-studio.desktop"),
+                format!(
+                    "[Desktop Entry]\nType=Application\nName=OmniGraph Studio\n\
+                     Exec=\"{}\" --from-desktop %u\nMimeType=x-scheme-handler/omnigraph-studio;\n",
+                    dir.path().join("studio-handler").display()
+                ),
+            )
+            .unwrap();
+        }
+        Self { dir, log }
+    }
+
+    fn studio(&self, home: &std::path::Path, args: &[&str]) -> Command {
+        let mut command = cli();
+        command
+            .env("OMNIGRAPH_HOME", home)
+            .env("PATH", self.dir.path())
+            .env("XDG_DATA_HOME", self.dir.path().join("data"))
+            .env("XDG_DATA_DIRS", self.dir.path().join("no-system-data"))
+            .env("STUDIO_OPENER_LOG", &self.log)
+            .env_remove("OMNIGRAPH_STAGING_TOKEN")
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("XDG_CURRENT_DESKTOP")
+            .env_remove("BROWSER")
+            .arg("studio")
+            .args(args);
+        command
+    }
+
+    /// Each recorded run's argv, and forget them. The opener stops waiting
+    /// for a handler that keeps running, so a slow stand-in may still be
+    /// recording when `studio` exits: wait for `expected` runs, then read.
+    fn take_calls(&self, expected: usize) -> Vec<Vec<String>> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let read = || fs::read_to_string(&self.log).unwrap_or_default();
+        while read().lines().count() < expected && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let calls = read();
+        let _ = fs::remove_file(&self.log);
+        calls
+            .lines()
+            .map(|line| line.split('\t').map(str::to_owned).collect())
+            .collect()
+    }
+}
+
+/// `studio` validates a server target offline and hands the platform one
+/// link, which names the target, the `--graph` given and the digests
+/// `target inspect --json` reports; it reads no credential. On other Unix
+/// desktops the link goes to the program Studio's registered desktop entry
+/// runs, never to `xdg-open`, so a browser on `PATH` cannot stand in for
+/// Studio. Without anything that opens Studio's links it prints the link and
+/// refuses with `studio_unavailable`. Direct and managed targets refuse
+/// before the platform is asked or any endpoint contacted.
+#[cfg(unix)]
+#[test]
+fn studio_opens_a_server_target_whose_digests_target_inspect_reports() {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    probe.set_nonblocking(true).unwrap();
+    let endpoint = format!("https://{}", probe.local_addr().unwrap());
+    let temp = tempdir().unwrap();
+    let absent = temp.path().join("absent");
+    let document = format!(
+        "version: 1\nprofiles:\n  work: {{api: '{endpoint}', organization_id: org, auth: {{provider: omnigraph}}}}\n\
+         targets:\n  staging:\n    kind: server\n    endpoint: '{endpoint}/graph'\n    \
+         auth: {{provider: token, source: {{env: OMNIGRAPH_STAGING_TOKEN}}}}\n    default_graph: knowledge\n  \
+         local:\n    kind: server\n    endpoint: 'http://127.0.0.1:9'\n    auth: {{provider: anonymous}}\n  \
+         scratch:\n    kind: direct\n    scope: graph\n    uri: 'file://{graph}'\n  \
+         managed:\n    kind: managed\n    profile: work\n    cluster_id: c\n    cluster_incarnation: i\n    \
+         endpoint: '{endpoint}/data'\n    default_graph: knowledge\n",
+        graph = absent.join("graph.omni").display(),
+    );
+    let homes: Vec<_> = (0..2)
+        .map(|_| {
+            let home = tempdir().unwrap();
+            fs::write(home.path().join("config.yaml"), &document).unwrap();
+            home
+        })
+        .collect();
+    let inspect = |home: &std::path::Path, name: &str| {
+        parse_stdout_json(&output_success(
+            cli()
+                .env("OMNIGRAPH_HOME", home)
+                .args(["target", "inspect", name, "--json"]),
+        ))
+    };
+    let opened = |openers: &FakeOpeners, link: &str| {
+        let expected: Vec<Vec<String>> = if cfg!(target_os = "macos") {
+            vec![vec![
+                "open".into(),
+                "-b".into(),
+                "com.modernrelay.omnigraph-studio".into(),
+                link.into(),
+            ]]
+        } else {
+            vec![
+                vec![
+                    "xdg-mime".into(),
+                    "query".into(),
+                    "default".into(),
+                    "x-scheme-handler/omnigraph-studio".into(),
+                ],
+                vec![
+                    "studio-handler".into(),
+                    "--from-desktop".into(),
+                    link.into(),
+                ],
+            ]
+        };
+        assert_eq!(openers.take_calls(expected.len()), expected);
+    };
+
+    let installed = FakeOpeners::new(StandInStudio::Installed);
+    let mut links = Vec::new();
+    for home in &homes {
+        let output =
+            output_success(&mut installed.studio(home.path(), &["--target", "staging", "--json"]));
+        let report = parse_stdout_json(&output);
+        let inspected = inspect(home.path(), "staging");
+        let (binding, home_digest) = (
+            inspected["binding"].as_str().unwrap(),
+            inspected["home"].as_str().unwrap(),
+        );
+        let link =
+            format!("omnigraph-studio://open?target=staging&binding={binding}&home={home_digest}");
+        assert_eq!(
+            report,
+            json!({"protocol": 1, "target": "staging", "binding": binding, "home": home_digest, "link": link})
+        );
+        opened(&installed, &link);
+        links.push((binding.to_owned(), home_digest.to_owned()));
+    }
+    // The same target in another home: the same binding, another home.
+    assert_eq!(links[0].0, links[1].0);
+    assert_ne!(links[0].1, links[1].1);
+
+    // `--graph` rides in the link; an anonymous server opens too, with its
+    // own binding.
+    let home = homes[0].path();
+    let report = parse_stdout_json(&output_success(
+        &mut installed.studio(home, &["--target", "local", "--graph", "notes", "--json"]),
+    ));
+    let local = inspect(home, "local");
+    assert_ne!(local["binding"], links[0].0.as_str());
+    let link = format!(
+        "omnigraph-studio://open?target=local&binding={}&home={}&graph=notes",
+        local["binding"].as_str().unwrap(),
+        links[0].1
+    );
+    assert_eq!(report["link"], link.as_str());
+    opened(&installed, &link);
+
+    // Without Studio the link is still printed, and nothing else is run. A
+    // handler named without a desktop entry to run leaves the generic opener
+    // and the browser on `PATH` unrun: neither can make the command succeed.
+    for studio in [StandInStudio::Absent, StandInStudio::Unresolved] {
+        let missing = FakeOpeners::new(studio);
+        let output = missing
+            .studio(home, &["--target", "staging", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let refusal = parse_stdout_json(&output);
+        assert_eq!(refusal["code"], "studio_unavailable");
+        assert_eq!(
+            refusal["install"],
+            "https://github.com/ModernRelay/omnigraph-studio/releases"
+        );
+        assert_eq!(
+            refusal["link"],
+            format!(
+                "omnigraph-studio://open?target=staging&binding={}&home={}",
+                links[0].0, links[0].1
+            )
+            .as_str()
+        );
+        let calls = missing.take_calls(1);
+        let asked = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-mime"
+        };
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0][0], asked);
+        if studio == StandInStudio::Unresolved && !cfg!(target_os = "macos") {
+            let error = refusal["error"].as_str().unwrap();
+            assert!(error.contains("in no applications directory"), "{error}");
+        }
+    }
+
+    let inline = absent.join("inline.omni");
+    for target in ["scratch", "managed", inline.to_str().unwrap()] {
+        let output = installed
+            .studio(home, &["--target", target, "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{target}: {output:?}");
+        assert_eq!(
+            parse_stdout_json(&output)["code"],
+            "target_kind_unsupported",
+            "{target}"
+        );
+        assert!(installed.take_calls(0).is_empty(), "{target}");
+    }
+    assert!(!absent.exists(), "a direct target's storage was touched");
+    assert!(probe.accept().is_err(), "an endpoint was contacted");
 }
 
 /// `access` says what the caller may do at a target. A cluster graph's

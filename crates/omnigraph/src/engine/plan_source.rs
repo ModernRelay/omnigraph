@@ -214,6 +214,7 @@ pub(crate) fn engine_bounds(
         late_materialization_only: false,
         load_workers_max: u32::try_from(load_workers_max).unwrap_or(u32::MAX).max(1),
         load_write_max_bytes,
+        source_partition_bytes: u64::try_from(super::csv_slice_bytes()).unwrap_or(u64::MAX),
     }
 }
 

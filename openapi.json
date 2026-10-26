@@ -15097,6 +15097,12 @@
             "description": "The partition that claimed the slice; which one varies between runs.",
             "minimum": 0
           },
+          "read_ns": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Nanoseconds the slice's partition waited for the source's bytes.",
+            "minimum": 0
+          },
           "rows": {
             "type": "integer",
             "format": "int64",

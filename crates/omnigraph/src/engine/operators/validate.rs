@@ -169,7 +169,7 @@ impl ExecutionPlan for ValidateExec {
                     drain_and_sweep(
                         inputs,
                         &memory,
-                        source.as_ref(),
+                        &source,
                         &schema,
                         &plan,
                         &judge,
@@ -181,7 +181,7 @@ impl ExecutionPlan for ValidateExec {
                 let (batches, partials, facts) = drained?;
                 drop(transient);
                 let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-                let extracted = merge_partials(&memory, &plan, &judge.table, partials).await?;
+                let extracted = Extracted::prepare(&plan, partials);
                 {
                     let charged = memory.child("load removed and retained rows")?;
                     let mut admit_phase =
@@ -247,6 +247,7 @@ impl ExecutionPlan for ValidateExec {
                     .await
                     .map_err(external)?;
                 }
+                release_holders(&memory, &plan).await?;
                 drop(facts);
                 memory.metric(VALIDATED_ROWS, rows);
                 Ok(batches)
@@ -267,7 +268,7 @@ impl ExecutionPlan for ValidateExec {
 async fn drain_and_sweep(
     inputs: Vec<SendableRecordBatchStream>,
     memory: &Arc<WorkMemory>,
-    source: &dyn ExecutionPlan,
+    source: &Arc<dyn ExecutionPlan>,
     schema: &arrow_schema::SchemaRef,
     plan: &Arc<SweepPlan>,
     judge: &Arc<LoadJudge>,
@@ -276,8 +277,10 @@ async fn drain_and_sweep(
     let drained = futures::future::join_all(inputs.into_iter().map(|input| {
         let plan = Arc::clone(plan);
         let judge = Arc::clone(judge);
+        let source = Arc::clone(source);
         let published = published.clone();
-        memory.blocking(move |memory| sweep_partition(input, memory, plan, judge, published))
+        memory
+            .blocking(move |memory| sweep_partition(input, memory, source, plan, judge, published))
     }))
     .await;
     let mut batches = Vec::new();
@@ -387,11 +390,12 @@ async fn load_sets(
 }
 
 /// One partition's input held and swept as it arrives: every batch is held
-/// under `memory`, its facts extracted at its position, and under a swept
-/// plan probed against the sets on arrival, or once the sets arrive.
+/// under `memory`, its facts extracted at its position, probed against the
+/// swept sets once they arrive; the unique holders sized once `source` can.
 async fn sweep_partition(
     mut input: SendableRecordBatchStream,
     memory: Arc<WorkMemory>,
+    source: Arc<dyn ExecutionPlan>,
     plan: Arc<SweepPlan>,
     judge: Arc<LoadJudge>,
     mut published: PublishedSets,
@@ -405,6 +409,7 @@ async fn sweep_partition(
     let mut sets: Option<Arc<SweptSets>> = None;
     let mut unprobed = Vec::new();
     let mut scratch_rows = 0usize;
+    let mut sized = false;
     while let Some(batch) = input.next().await {
         let batch = batch?;
         memory.metric("input_rows", batch.num_rows());
@@ -417,6 +422,9 @@ async fn sweep_partition(
         }
         let base = position(slice, offset);
         admit_validation(&facts, &judge, std::slice::from_ref(&batch))?;
+        if !sized {
+            sized = size_unique_holders(&facts, &plan, source.as_ref())?;
+        }
         partial
             .observe(&plan, &judge.catalog, &batch, system_columns, base)
             .map_err(external)?;
@@ -471,6 +479,49 @@ async fn sweep_partition(
     Ok((held, partial, facts))
 }
 
+/// The shared unique holders sized from the source's row estimate once it has
+/// one, each check's tables charged to `facts` only while the pool has room
+/// ([`WorkMemory::grow_if_free`]); `true` once sized, by any partition.
+fn size_unique_holders(
+    facts: &WorkMemory,
+    plan: &SweepPlan,
+    source: &dyn ExecutionPlan,
+) -> DfResult<bool> {
+    let Some(rows) = source
+        .downcast_ref::<CsvSourceExec>()
+        .and_then(CsvSourceExec::rows_estimate)
+    else {
+        return Ok(false);
+    };
+    let rows = usize::try_from(rows).unwrap_or(usize::MAX);
+    let mut failed = None;
+    plan.size_unique_holders(
+        rows,
+        WorkMemory::entry_bytes::<(Vec<String>, String)>(),
+        &mut |bytes| {
+            let table = match facts.child("load unique holders table") {
+                Ok(table) => table,
+                Err(error) => {
+                    failed = Some(error);
+                    return None;
+                }
+            };
+            match table.grow_if_free(bytes) {
+                Ok(true) => Some(Box::new(table) as Box<dyn Send>),
+                Ok(false) => None,
+                Err(error) => {
+                    failed = Some(error);
+                    None
+                }
+            }
+        },
+    );
+    match failed {
+        Some(error) => Err(error),
+        None => Ok(true),
+    }
+}
+
 /// Probe one held batch; the partition's parse scratch grows under `facts`
 /// to the largest batch it has probed.
 #[allow(clippy::too_many_arguments)]
@@ -494,24 +545,19 @@ fn probe_batch(
         .map_err(external)
 }
 
-/// The partitions' partials joined, each unique shard merged on its own
-/// worker.
-async fn merge_partials(
-    memory: &Arc<WorkMemory>,
-    plan: &SweepPlan,
-    table: &str,
-    partials: Vec<SweepPartial>,
-) -> DfResult<Extracted> {
-    let (merging, jobs) = Extracted::prepare(plan, partials);
-    let table: Arc<str> = Arc::from(table);
-    let shards = futures::future::join_all(jobs.into_iter().map(|job| {
-        let table = Arc::clone(&table);
-        memory.blocking(move |_| async move { Ok((job.check, job.run(&table))) })
+/// The judged unique holders freed shard by shard on workers at once, while
+/// the partitions' charges still cover them.
+async fn release_holders(memory: &Arc<WorkMemory>, plan: &SweepPlan) -> DfResult<()> {
+    futures::future::join_all(plan.release_unique_holders().into_iter().map(|maps| {
+        memory.blocking(move |_| async move {
+            drop(maps);
+            Ok::<(), datafusion::error::DataFusionError>(())
+        })
     }))
     .await
     .into_iter()
-    .collect::<DfResult<Vec<_>>>()?;
-    Ok(merging.finish(shards))
+    .collect::<DfResult<Vec<()>>>()?;
+    Ok(())
 }
 
 fn admit_validation(
@@ -694,9 +740,9 @@ mod tests {
     use super::super::fixtures;
     use super::*;
     use crate::loader::csv::{
-        CSV_READ_BATCH_ROWS, CsvLoadRequest, NormalizeStep, ResolvedCsv, target_arrow_schema,
+        CSV_READ_BATCH_ROWS, CsvBytes, CsvLoadRequest, NormalizeStep, RangeScanner, ResolvedCsv,
+        target_arrow_schema,
     };
-    use crate::table_store::CapturedSource;
 
     const PERSON: &str = "node Person {\n  key: I64 @key\n  score: F64\n}\n";
 
@@ -715,27 +761,38 @@ mod tests {
         Arc::new(build_catalog(&parse_schema(schema).unwrap()).unwrap())
     }
 
-    /// The slice `record` sits in when `source` is cut at 64 bytes.
-    fn slice_of_record(schema: &str, source: &str, record: usize) -> usize {
+    /// The slice `record` sits in when `source` is cut at 64 bytes by one
+    /// partition.
+    async fn slice_of_record(schema: &str, source: &str, record: usize) -> usize {
+        let size = source.len() as u64;
         let resolved =
-            ResolvedCsv::resolve(&catalog(schema), &request(), source.as_bytes(), 64).unwrap();
-        resolved
-            .slices()
-            .iter()
-            .position(|slice| {
-                (slice.first_record..slice.first_record + slice.rows).contains(&record)
-            })
+            ResolvedCsv::resolve(&catalog(schema), &request(), source.as_bytes(), size).unwrap();
+        let mut scanner = RangeScanner::new(
+            bytes(source),
+            b',',
+            resolved.records_start(),
+            size,
+            64,
+            false,
+        );
+        let mut first_record = 1;
+        let mut index = 0;
+        while let Some(slice) = scanner
+            .next_slice(&request(), &mut |_| Ok(()))
+            .await
             .unwrap()
+        {
+            if (first_record..first_record + slice.rows).contains(&record) {
+                return index;
+            }
+            first_record += slice.rows;
+            index += 1;
+        }
+        panic!("record {record} is past the source's {first_record} records");
     }
 
-    fn capture(source: &str) -> Arc<CapturedSource> {
-        Arc::new(CapturedSource {
-            bytes: Arc::from(source.as_bytes()),
-            admission: None,
-            size: source.len() as u64,
-            e_tag: None,
-            version: None,
-        })
+    fn bytes(source: &str) -> Arc<CsvBytes> {
+        Arc::new(CsvBytes::Memory(Arc::from(source.as_bytes())))
     }
 
     /// `source` cut into 64-byte slices, parsed by `partitions` and judged by
@@ -758,11 +815,12 @@ mod tests {
         let schema = target_arrow_schema(&catalog, &request().target).unwrap();
         let exec = Arc::new(CsvSourceExec::new(
             request(),
-            capture(source),
+            bytes(source),
             Arc::clone(&catalog),
             schema,
             partitions,
             64,
+            Arc::default(),
         ));
         let stmt = LoadStmt {
             source: "file:///input.csv".to_string(),
@@ -844,9 +902,9 @@ mod tests {
         assert!(exec.failed_slices().is_empty());
     }
 
-    /// Two bad records at the same normalization step in two slices: every
-    /// slice is normalized whatever partition claimed it, so the lower record
-    /// is the refusal, on every run.
+    /// Two bad records at the same normalization step in two slices: one
+    /// partition normalizes every slice and names the lower record; three
+    /// partitions refuse and mark the run for the loader's one-partition rerun.
     #[tokio::test]
     async fn the_lowest_failed_slice_names_the_refusal() {
         let mut source = String::from("key,score\n");
@@ -859,13 +917,13 @@ mod tests {
         }
         assert_eq!(
             (
-                slice_of_record(PERSON, &source, 12),
-                slice_of_record(PERSON, &source, 28)
+                slice_of_record(PERSON, &source, 12).await,
+                slice_of_record(PERSON, &source, 28).await
             ),
             (1, 3)
         );
 
-        let (exec, drained) = validate(PERSON, &source, 3).await;
+        let (exec, drained) = validate(PERSON, &source, 1).await;
         let error = drained.unwrap_err();
         assert!(
             error.to_string().contains("record 12 has an empty field"),
@@ -877,11 +935,16 @@ mod tests {
             failed.iter().all(|failed| [1, 3].contains(&failed.slice)),
             "{failed:?}"
         );
+        assert!(!exec.refused());
+
+        let (exec, drained) = validate(PERSON, &source, 3).await;
+        assert!(drained.is_err());
+        assert!(exec.refused(), "three partitions mark the rerun");
     }
 
     /// Two properties refused in two slices, the later-declared one in the
-    /// earlier slice: a partition keeps normalizing past a refusal, so the
-    /// earlier-declared property's record is named, from one partition or two.
+    /// earlier slice: one partition keeps normalizing past a refusal and
+    /// names the earlier-declared property's record; two refuse for the rerun.
     #[tokio::test]
     async fn the_first_declared_property_names_the_normalization_refusal() {
         const SCHEMA: &str = "node Person {\n  key: I64 @key\n  a: Bool\n  b: Bool\n}\n";
@@ -894,24 +957,29 @@ mod tests {
             };
             writeln!(&mut source, "{row:03},{a},{b}").unwrap();
         }
-        assert!(slice_of_record(SCHEMA, &source, 9) < slice_of_record(SCHEMA, &source, 21));
-        for partitions in [1, 2] {
-            let (exec, judged) = validate(SCHEMA, &source, partitions).await;
-            let error = judged.unwrap_err().to_string();
-            assert!(
-                error.contains("record 21, property 'a': 'nope' is not `true` or `false`"),
-                "{partitions} partitions: {error}"
-            );
-            let failed = exec.failed_slices();
-            assert!(
-                failed.iter().any(|failed| failed.normalize
-                    == Some(NormalizeStep {
-                        step: 2,
-                        record: 21
-                    })),
-                "{partitions} partitions: {failed:?}"
-            );
-        }
+        assert!(
+            slice_of_record(SCHEMA, &source, 9).await < slice_of_record(SCHEMA, &source, 21).await
+        );
+        let (exec, judged) = validate(SCHEMA, &source, 1).await;
+        let error = judged.unwrap_err().to_string();
+        assert!(
+            error.contains("record 21, property 'a': 'nope' is not `true` or `false`"),
+            "{error}"
+        );
+        let failed = exec.failed_slices();
+        assert!(
+            failed.iter().any(|failed| failed.normalize
+                == Some(NormalizeStep {
+                    step: 2,
+                    record: 21
+                })),
+            "{failed:?}"
+        );
+        assert!(!exec.refused());
+
+        let (exec, judged) = validate(SCHEMA, &source, 2).await;
+        assert!(judged.is_err());
+        assert!(exec.refused(), "two partitions mark the rerun");
     }
 
     /// Two `@range` constraints (the catalog sorts them by property: `age`
@@ -941,7 +1009,9 @@ mod tests {
             };
             writeln!(&mut source, "{row:03},{score},{age}").unwrap();
         }
-        assert!(slice_of_record(SCHEMA, &source, 9) < slice_of_record(SCHEMA, &source, 21));
+        assert!(
+            slice_of_record(SCHEMA, &source, 9).await < slice_of_record(SCHEMA, &source, 21).await
+        );
         for partitions in [1, 2] {
             let (_, judged) = validate(SCHEMA, &source, partitions).await;
             let error = judged.unwrap_err().to_string();
@@ -1138,17 +1208,23 @@ mod tests {
             let memory = work(ctx, "ValidateExec", &metrics).unwrap();
             let (ended_a, a_ended) = tokio::sync::oneshot::channel();
             let (ended_b, b_ended) = tokio::sync::oneshot::channel();
+            let source: Arc<dyn ExecutionPlan> =
+                Arc::new(datafusion::physical_plan::empty::EmptyExec::new(Arc::new(
+                    arrow_schema::Schema::empty(),
+                )));
             let sweep = |batches: Vec<RecordBatch>, ended| {
                 let plan = Arc::clone(&plan);
                 let judge = Arc::clone(&judge);
                 let published = published.clone();
                 let memory = Arc::clone(&memory);
+                let source = Arc::clone(&source);
                 async move {
                     memory
                         .blocking(move |memory| {
                             sweep_partition(
                                 partition_input(batches, ended),
                                 memory,
+                                source,
                                 plan,
                                 judge,
                                 published,
@@ -1171,10 +1247,7 @@ mod tests {
             );
             let (held_a, partial_a, _facts_a) = a.unwrap();
             let (held_b, partial_b, _facts_b) = b.unwrap();
-            let extracted =
-                merge_partials(&memory, &plan, "edge:Knows", vec![partial_a, partial_b])
-                    .await
-                    .unwrap();
+            let extracted = Extracted::prepare(&plan, vec![partial_a, partial_b]);
             let held: Vec<RecordBatch> = held_b.into_iter().chain(held_a).collect();
             let refused = judge_load_swept(
                 "edge:Knows",
@@ -1222,11 +1295,12 @@ mod tests {
 
         let exec = Arc::new(CsvSourceExec::new(
             knows_request(),
-            capture("from,to\n1,2\n2,3\n3,1\n"),
+            bytes("from,to\n1,2\n2,3\n3,1\n"),
             Arc::clone(&catalog),
             target_arrow_schema(&catalog, &LoadTarget::Edge("Knows".to_string())).unwrap(),
             2,
             64,
+            Arc::default(),
         ));
         let validate = ValidateExec::new(
             Arc::clone(&exec) as Arc<dyn ExecutionPlan>,

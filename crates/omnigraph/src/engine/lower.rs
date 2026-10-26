@@ -1253,11 +1253,16 @@ impl Lower for Walk<'_, '_> {
             id,
             CsvSourceExec::new(
                 load.request.clone(),
-                Arc::clone(&load.capture),
+                Arc::clone(&load.bytes),
                 Arc::clone(self.lowering.catalog),
                 schema,
-                usize::try_from(fields.max_partitions).unwrap_or(1),
+                if load.single_partition {
+                    1
+                } else {
+                    usize::try_from(fields.max_partitions).unwrap_or(1)
+                },
                 load.slice_bytes,
+                Arc::clone(&load.source_refused),
             ),
         )
     }

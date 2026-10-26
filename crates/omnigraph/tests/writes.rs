@@ -1388,9 +1388,9 @@ async fn explain_load_answers_the_plan_without_reading_the_source() {
     );
 }
 
-/// One `load csv` statement issues exactly one metadata probe and one payload
-/// read, in every mode: the capture is taken before the first attempt and
-/// every attempt parses it, so no attempt of the statement fetches again.
+/// One probe per statement in every mode; the payload reads are the route's:
+/// append and merge capture once and every attempt parses it, overwrite reads
+/// the head range then its one partition's one piece. Rust: process counters.
 #[tokio::test]
 async fn load_csv_statement_probes_and_reads_its_source_once() {
     use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
@@ -1419,10 +1419,10 @@ async fn load_csv_statement_probes_and_reads_its_source_once() {
             .unwrap(),
     );
 
-    for (mode, expected_rows) in [
-        (LoadMode::Append, 2),
-        (LoadMode::Merge, 2),
-        (LoadMode::Overwrite, 2),
+    for (mode, expected_rows, payload_reads) in [
+        (LoadMode::Append, 2, 1),
+        (LoadMode::Merge, 2, 1),
+        (LoadMode::Overwrite, 2, 2),
     ] {
         let request = CsvLoadRequest {
             source: source.clone(),
@@ -1447,8 +1447,8 @@ async fn load_csv_statement_probes_and_reads_its_source_once() {
         );
         assert_eq!(
             write_probes.external_blob_payload_read_calls(),
-            1,
-            "{mode:?}: one statement reads its source once"
+            payload_reads,
+            "{mode:?}: the route's payload reads, no attempt fetches again"
         );
         assert_eq!(
             helpers::count_rows_branch(&db, "main", "node:Person").await,
@@ -1571,12 +1571,16 @@ async fn load_csv_overwrite_from_many_slices_keeps_source_order() {
         .unwrap();
     assert_eq!(receipt.result.nodes_loaded.values().sum::<usize>(), ROWS);
     let executed = receipt.executed_plan().expect("an overwrite runs the plan");
-    assert_eq!(
-        executed.partitions, 1,
-        "a source under 8 MiB plans one partition"
+    assert!(
+        executed.partitions > 1,
+        "the pinned slice cuts the planner's partitions too: {}",
+        executed.partitions
     );
     let source = &executed.operators[0];
-    assert_eq!((source.node.as_str(), source.partitions), ("CsvSource", 1));
+    assert_eq!(
+        (source.node.as_str(), source.partitions),
+        ("CsvSource", executed.partitions)
+    );
     assert!(source.slices.len() > 1, "{} slices", source.slices.len());
     assert_eq!(
         source
@@ -1610,6 +1614,65 @@ async fn load_csv_overwrite_from_many_slices_keeps_source_order() {
         })
         .collect();
     assert_eq!(keys, (0..ROWS as i64).collect::<Vec<_>>());
+}
+
+/// An overwrite resolves its columns from one head range, the slice size
+/// floored at 64 KiB, and refuses a first record that does not end inside
+/// it; the seam makes 64 KiB the range, so the cliff is one byte past it.
+#[tokio::test]
+async fn load_csv_overwrite_refuses_a_first_record_longer_than_the_head_range() {
+    use omnigraph::instrumentation::with_csv_slice_bytes;
+    use omnigraph::loader::CsvLoadRequest;
+    use omnigraph_compiler::query::ast::LoadTarget;
+
+    const HEAD_RANGE: usize = 64 * 1024;
+    let source_dir = tempfile::tempdir().unwrap();
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(source_dir.path()).unwrap(),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let graph_dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(
+            graph_dir.path().to_str().unwrap(),
+            "node Person { key: I64 @key name: String }",
+        )
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy)
+        .unwrap(),
+    );
+    for (file, first_record_bytes) in [("fits.csv", HEAD_RANGE), ("long.csv", HEAD_RANGE + 1)] {
+        let csv_path = source_dir.path().join(file);
+        let name = "x".repeat(first_record_bytes - "1,\n".len());
+        std::fs::write(&csv_path, format!("1,{name}\n2,b\n")).unwrap();
+        let request = CsvLoadRequest {
+            source: format!("file://{}", csv_path.display()),
+            target: LoadTarget::Node("Person".to_string()),
+            mode: LoadMode::Overwrite,
+            delimiter: b',',
+            header: false,
+            columns: Some(vec!["key".to_string(), "name".to_string()]),
+        };
+        let outcome =
+            with_csv_slice_bytes(64, db.load_csv_as_with_receipt("main", &request, None)).await;
+        if first_record_bytes <= HEAD_RANGE {
+            let receipt = outcome.expect("a first record ending inside the head range loads");
+            assert_eq!(receipt.result.nodes_loaded.values().sum::<usize>(), 2);
+        } else {
+            let error = outcome.expect_err("a first record past the head range is refused");
+            assert!(
+                error.to_string().contains(&format!(
+                    "the first record of the source exceeds {HEAD_RANGE} bytes"
+                )),
+                "{error}"
+            );
+        }
+    }
 }
 
 /// Update predicate matching is itself a bounded allocation. The committed

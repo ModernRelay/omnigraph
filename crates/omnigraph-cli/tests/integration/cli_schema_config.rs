@@ -62,7 +62,7 @@ fn version_command_prints_cli_version_http_contract_and_storage_formats_issue_97
             "channel": channel,
             "commit": commit,
             "http_contract": HTTP_API_CONTRACT,
-            "protocols": {"target": 2, "credential": 2, "access": 2},
+            "protocols": {"studio": 1, "target": 2, "credential": 2, "access": 2},
             "internal_schema": { "writes": WRITES, "serves": [LOWEST, WRITES] },
         }),
     );
