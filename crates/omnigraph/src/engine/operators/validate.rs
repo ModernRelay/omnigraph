@@ -144,12 +144,9 @@ impl ExecutionPlan for ValidateExec {
             .properties()
             .output_partitioning()
             .partition_count();
-        let inputs = (0..partitions)
-            .map(|partition| self.input.execute(partition, Arc::clone(&ctx)))
-            .collect::<DfResult<Vec<_>>>()?;
         let source = Arc::clone(&self.input);
         let schema = self.input.schema();
-        let memory = work(ctx, "ValidateExec", &self.metrics)?;
+        let memory = work(Arc::clone(&ctx), "ValidateExec", &self.metrics)?;
         memory.metric("input_rows", 0);
         memory.metric(VALIDATED_ROWS, 0);
         let judge = Arc::clone(&self.judge);
@@ -164,6 +161,9 @@ impl ExecutionPlan for ValidateExec {
             &self.metrics,
             move |memory| async move {
                 let admitted = admit_sets(&memory, &judge, &plan).await?;
+                let inputs = (0..partitions)
+                    .map(|partition| source.execute(partition, Arc::clone(&ctx)))
+                    .collect::<DfResult<Vec<_>>>()?;
                 let (publish, published) = watch::channel(None::<Arc<SweptSets>>);
                 let (drained, set_guards) = futures::join!(
                     drain_and_sweep(
@@ -333,8 +333,9 @@ async fn drain_and_sweep(
     Ok((batches, partials, facts))
 }
 
-/// The swept endpoint checks' key sets admitted on a worker before the drain
-/// starts, so a refused set precedes every partition's charge.
+/// The swept endpoint checks' key sets admitted on a worker before the source
+/// partitions are executed, so every set's charge precedes every charge of the
+/// parse and a refused set precedes them all.
 async fn admit_sets(
     memory: &Arc<WorkMemory>,
     judge: &Arc<LoadJudge>,
@@ -728,7 +729,11 @@ fn string_payload_bytes(column: &ArrayRef) -> usize {
 #[cfg(test)]
 mod tests {
     use std::fmt::Write;
+    use std::sync::Mutex;
 
+    use datafusion::execution::memory_pool::{
+        GreedyMemoryPool, MemoryConsumer, MemoryPool, MemoryReservation,
+    };
     use omnigraph_compiler::catalog::build_catalog;
     use omnigraph_compiler::ir::lower_load;
     use omnigraph_compiler::query::ast::{LoadStmt, LoadStmtMode, LoadTarget};
@@ -1349,5 +1354,125 @@ mod tests {
         assert_eq!(pool.reserved() - before, three_keys_in_four_slots_retained);
         drop(retained);
         assert_eq!(pool.reserved(), before);
+    }
+
+    /// A pool recording the consumer and size of every charge in the order it
+    /// saw them, over a greedy pool of `limit` bytes.
+    #[derive(Debug)]
+    struct ChargeLedger {
+        inner: GreedyMemoryPool,
+        charges: Mutex<Vec<(String, usize)>>,
+    }
+
+    impl ChargeLedger {
+        fn new(limit: usize) -> Self {
+            Self {
+                inner: GreedyMemoryPool::new(limit),
+                charges: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn record(&self, reservation: &MemoryReservation, additional: usize) {
+            self.charges
+                .lock()
+                .unwrap()
+                .push((reservation.consumer().name().to_owned(), additional));
+        }
+
+        fn charges(&self) -> Vec<(String, usize)> {
+            self.charges.lock().unwrap().clone()
+        }
+    }
+
+    impl fmt::Display for ChargeLedger {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("charge ledger")
+        }
+    }
+
+    impl MemoryPool for ChargeLedger {
+        fn name(&self) -> &str {
+            "charge ledger"
+        }
+
+        fn register(&self, consumer: &MemoryConsumer) {
+            self.inner.register(consumer);
+        }
+
+        fn unregister(&self, consumer: &MemoryConsumer) {
+            self.inner.unregister(consumer);
+        }
+
+        fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+            self.record(reservation, additional);
+            self.inner.grow(reservation, additional);
+        }
+
+        fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+            self.inner.shrink(reservation, shrink);
+        }
+
+        fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> DfResult<()> {
+            self.record(reservation, additional);
+            self.inner.try_grow(reservation, additional)
+        }
+
+        fn reserved(&self) -> usize {
+            self.inner.reserved()
+        }
+    }
+
+    /// Every key-set charge precedes the parse's first charge: the sets are
+    /// admitted before the source partitions are executed, a thread order
+    /// GQT cannot observe (as `partitions_admit_their_source_before_the_first_poll`).
+    #[tokio::test]
+    async fn the_sets_are_charged_before_the_source_partitions_are_executed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = keyed_graph(&dir).await;
+        let catalog = db.catalog();
+        let checks = swept_checks(&catalog);
+        let snapshot = db.snapshot().await;
+        let exec = Arc::new(CsvSourceExec::new(
+            knows_request(),
+            bytes("from,to\n1,2\n2,3\n3,1\n"),
+            Arc::clone(&catalog),
+            target_arrow_schema(&catalog, &LoadTarget::Edge("Knows".to_string())).unwrap(),
+            2,
+            64,
+            Arc::default(),
+        ));
+        let validate = ValidateExec::new(
+            Arc::clone(&exec) as Arc<dyn ExecutionPlan>,
+            knows_judge(&db, &checks, &snapshot),
+        );
+        let ledger = Arc::new(ChargeLedger::new(64 << 20));
+        let ctx = fixtures::context_over(
+            Arc::clone(&ledger) as Arc<dyn MemoryPool>,
+            64 << 20,
+            CSV_READ_BATCH_ROWS,
+        );
+        let judged = validate
+            .execute(0, ctx)
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<DfResult<Vec<_>>>()
+            .unwrap();
+        assert_eq!(judged.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+        let charges = ledger.charges();
+        let first = |consumer: &str| {
+            charges
+                .iter()
+                .position(|(name, _)| name == consumer)
+                .unwrap_or_else(|| panic!("no charge by {consumer}: {charges:?}"))
+        };
+        let last_set = charges
+            .iter()
+            .rposition(|(name, _)| name == "load integer endpoint keys")
+            .unwrap_or_else(|| panic!("no key-set charge: {charges:?}"));
+        assert!(last_set < first("CsvSourceExec"), "{charges:?}");
+        assert!(last_set < first("CSV source bytes"), "{charges:?}");
+        assert!(last_set < first("CSV decoding"), "{charges:?}");
     }
 }
