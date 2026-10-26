@@ -125,8 +125,8 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "branches_list",
         title: "List branches",
-        description: "List a graph's branch names.",
-        input: graph_schema,
+        description: "List a graph's branch names. With `detailed`, also each readable branch's head commit, the branch and commit it started from, and when it was created and last moved.",
+        input: branches_list_schema,
         output: Some(branches_output_schema),
         effect: Effect::Read,
         gate: Gate::Always,
@@ -375,6 +375,13 @@ pub(super) fn no_arguments_schema() -> Value {
 
 pub(super) fn graph_schema() -> Value {
     arguments(json!({}), &[])
+}
+
+pub(super) fn branches_list_schema() -> Value {
+    arguments(
+        json!({"detailed": {"type": "boolean", "description": "`true` adds `details`: for each branch the caller may read, its `head` commit, the branch (`from`) and commit (`from_commit_id`) it started from, and `created_at` and `updated_at`. Defaults to `false`."}}),
+        &[],
+    )
 }
 
 pub(super) fn branch_schema() -> Value {
@@ -674,7 +681,21 @@ pub(super) fn access_output_schema() -> Value {
 pub(super) fn branches_output_schema() -> Value {
     json!({
         "type": "object",
-        "properties": {"branches": {"type": "array", "items": {"type": "string"}}},
+        "properties": {
+            "branches": {"type": "array", "items": {"type": "string"}},
+            "details": {"type": "array", "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "head": {"type": "object"},
+                    "from": {"type": "string"},
+                    "from_commit_id": {"type": "string"},
+                    "created_at": {"type": "integer"},
+                    "updated_at": {"type": "integer"},
+                },
+                "required": ["name", "head", "updated_at"],
+            }},
+        },
         "required": ["branches"],
     })
 }

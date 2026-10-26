@@ -1087,6 +1087,11 @@ async fn mcp_read_parity_tools_equal_their_routes() {
             "/graphs/default/branches".to_string(),
         ),
         (
+            "branches_list",
+            json!({"graph":"default","detailed":true}),
+            "/graphs/default/branches?detailed=true".to_string(),
+        ),
+        (
             "access",
             json!({"graph":"default"}),
             "/graphs/default/access".to_string(),

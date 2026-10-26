@@ -13,6 +13,13 @@ pub struct GraphArguments {
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct BranchesListArguments {
+    pub graph: String,
+    #[serde(default)]
+    pub detailed: bool,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BranchArguments {
     pub graph: String,
     #[serde(default)]
@@ -310,7 +317,7 @@ pub enum ToolCall {
     Read(ReadArguments),
     Snapshot(BranchArguments),
     Access(AccessArguments),
-    BranchesList(GraphArguments),
+    BranchesList(BranchesListArguments),
     CommitsList(CommitsListArguments),
     CommitsGet(CommitArguments),
     CommitsChanges(CommitChangesArguments),

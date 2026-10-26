@@ -463,7 +463,9 @@ impl ServerHost {
                 let output = handlers::server_branch_list(
                     Extension(handle),
                     Some(Extension(actor)),
-                    ApiQuery(Default::default()),
+                    ApiQuery(crate::api::BranchListQuery {
+                        detailed: args.detailed,
+                    }),
                 )
                 .await?;
                 bounded_result(&output.0)
