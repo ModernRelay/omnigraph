@@ -416,6 +416,26 @@ pub fn csv_slice_bytes() -> Option<usize> {
     CSV_SLICE_BYTES.try_with(|bytes| *bytes).ok()
 }
 
+tokio::task_local! {
+    static OVERWRITE_CHUNK_ROWS: usize;
+}
+
+/// Run `fut` with every `load csv` overwrite chunk holding `rows` rows before
+/// its Lance writer takes it, instead of Lance's file target (1 Mi rows).
+/// Test-only entry point; nothing in production sets it.
+pub async fn with_overwrite_chunk_rows<F>(rows: usize, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    OVERWRITE_CHUNK_ROWS.scope(rows, fut).await
+}
+
+/// The chunk row count a test installed for this task, if any; `None` in
+/// production.
+pub fn overwrite_chunk_rows() -> Option<usize> {
+    OVERWRITE_CHUNK_ROWS.try_with(|rows| *rows).ok()
+}
+
 /// Reservations and execution metrics observed by v2 acceptance tests.
 /// Holding a pool here keeps the observer alive without retaining reservations.
 #[derive(Clone, Debug, Default)]

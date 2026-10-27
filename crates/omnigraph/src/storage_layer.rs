@@ -56,7 +56,7 @@ use omnigraph_compiler::SystemColumns;
 use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::table_store::{
-    ExternalBlobPreflight, ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, RefreshedIndex,
+    ExternalBlobPreflight, ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, OverwriteChunk, RefreshedIndex,
     StagedTransactionIdentity, StagedWrite, TableState, TableStore,
 };
 
@@ -860,6 +860,18 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         writers: usize,
     ) -> Result<StagedHandle>;
 
+    /// Stage an overwrite from chunks as a producer cuts them, each written
+    /// as it arrives, the fragments joined in source order at the end; a
+    /// refusal deletes what was written. See `TableStore::stage_overwrite_stream`.
+    async fn stage_overwrite_stream(
+        &self,
+        snapshot: &SnapshotHandle,
+        chunks: futures::stream::BoxStream<'_, Result<OverwriteChunk>>,
+        schema: Option<SchemaRef>,
+        write_budget: WriteBudget,
+        writers: usize,
+    ) -> Result<StagedHandle>;
+
     /// Stage a rename-only column alteration; see
     /// `TableStore::stage_rename_columns`. Committed through `commit_staged_exact`.
     async fn stage_rename_columns(
@@ -1450,6 +1462,26 @@ impl TableStorage for TableStore {
             self,
             snapshot.dataset(),
             batches,
+            write_budget,
+            writers,
+        )
+        .await
+        .map(StagedHandle::new)
+    }
+
+    async fn stage_overwrite_stream(
+        &self,
+        snapshot: &SnapshotHandle,
+        chunks: futures::stream::BoxStream<'_, Result<OverwriteChunk>>,
+        schema: Option<SchemaRef>,
+        write_budget: WriteBudget,
+        writers: usize,
+    ) -> Result<StagedHandle> {
+        TableStore::stage_overwrite_stream(
+            self,
+            snapshot.dataset(),
+            chunks,
+            schema,
             write_budget,
             writers,
         )
