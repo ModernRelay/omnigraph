@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-10-25
-updated: 2026-10-26
+updated: 2026-10-27
 discussion: https://github.com/ModernRelay/omnigraph/pull/1156
 supersedes: []
 superseded_by: []
@@ -27,8 +27,8 @@ one appended row costs a pass over every row, and full-text coverage is never
 refreshed by maintenance at all. This RFC makes the work for appended rows
 proportional to those rows. An index gains a segment over just the fragments
 that hold only rows no segment of that index has indexed; segments are merged
-under a bounded policy; rows an update or compaction moved are folded in by a
-filtered merge (BTREE) or a whole rebuild (full text, vector). One rule keeps
+under a bounded policy; rows an update moved are folded in by a filtered
+merge (BTREE) or a whole rebuild (full text, vector). One rule keeps
 every answer equal to a full build's.
 
 For BTREE and vector indexes the contract of `omnigraph index build` and
@@ -154,8 +154,33 @@ fresh. An update keeps the row ID and writes the new copy to a new fragment,
 which is moved for every index that covered the old copy (also when the same
 write inserted other rows into it); that fragment stays uncovered, so the
 stale entry is masked and the row is answered by the scan of uncovered
-fragments, as today. Compaction moves copies without changing values, so a
-compacted fragment is moved too. Deletions are masked by deletion vectors.
+fragments, as today. Compaction keeps coverage: on a stable-row-ID table
+Lance's `Rewrite` apply moves each row-ID index's bitmap from the replaced
+fragments to their rewritten ones
+(`lance-table-13.0.0/src/transaction/manifest_build.rs:1071-1094`; BTREE,
+full-text and vector indexes are row-ID indexes, `format/index.rs:142-153`),
+and it refuses a rewrite group that mixes covered and uncovered fragments
+(`transaction/index_maintenance.rs:657-689`). A compacted fragment is
+therefore covered exactly when its sources were, and a fragment compacted from
+fresh ones stays fresh. Deletions are masked by deletion vectors.
+
+The argument assumes that coverage leaves a fragment only when the fragment
+leaves the manifest, so that the covered fragments hold every live copy the
+index has indexed. Lance 13.0.0 also withdraws coverage from a fragment that
+stays: on an in-place column rewrite (an update with `fields_modified`, a
+`Merge` that swaps a column's data file, a `DataReplacement`;
+`withdraw_in_place_rewrites`, `transaction/index_maintenance.rs:155`), and
+when a compaction bakes in data overlays newer than the index
+(`prune_overlay_stale_fields_from_indices`, `index_maintenance.rs:474`). The
+fresh test below would call such a fragment fresh while an older segment
+still holds entries for its rows. Graph writers do neither: keyed writes send
+whole rows, so Lance's default merge mode rewrites rows
+(`lance-13.0.0/src/dataset/write/merge_insert.rs:414-426`), and a
+known-present update must stage `RewriteRows`
+(`validate_known_present_update`); schema evolution's `Merge` adds fields
+without swapping a data file; and no graph writer produces data overlays. A
+writer that withdraws coverage in place must first extend the test, for
+example with the persisted watermark under Alternatives.
 
 The rule holds for any number of segments and is preserved by any merge of
 segments that each satisfied it: a merged segment covers the union of its
@@ -181,18 +206,20 @@ fragment is fresh when its smallest row ID exceeds the largest row ID of every
 covered fragment.
 
 The test is conservative. Inserts allocate row IDs above every existing one,
-so a fragment of new rows always passes; a fragment holding an updated or
-compacted row always fails. When a segment names a fragment the current
-manifest no longer holds, or a sequence cannot be read, every uncovered
-fragment counts as moved. Graph compaction commits its `Rewrite` with no
-rewritten indexes (`TableStore::stage_compaction`), so segments keep the ids
-of the fragments it replaced, and the next build after a compaction takes the
-moved-fragment action for every index: the cost today's optimize already pays
-after compaction. A wrong "moved" costs the moved-fragment action (a
-merge for BTREE, a rebuild otherwise); a wrong "fresh" is impossible from the
-sequences alone. An index with a segment whose `fragment_bitmap` is absent
-(coverage unknown) is left to explicit handling, as today: Lance cannot merge
-it, and unknown coverage is not evidence of work.
+so a fragment of new rows always passes; a fragment holding an updated row
+always fails. When a segment names a fragment the current manifest no longer
+holds, or a sequence cannot be read, every uncovered fragment counts as moved.
+Graph compaction does not reach that arm: it commits its `Rewrite` with no
+rewritten indexes (`TableStore::stage_compaction`), and the apply above moves
+every row-ID bitmap to the rewritten fragments. Index work after a compaction
+is therefore only the fragments those bitmaps still omit, read from the bitmap
+Lance wrote like any other coverage; a fully covered index stays covered and
+is left alone, as today's optimize leaves it. A wrong "moved" costs the
+moved-fragment action (a merge for BTREE, a rebuild otherwise); under the
+assumption above, a wrong "fresh" is impossible from the sequences alone. An
+index with a segment whose `fragment_bitmap` is absent (coverage unknown) is
+left to explicit handling, as today: Lance cannot merge it, and unknown
+coverage is not evidence of work.
 
 ### The decision per index
 
@@ -220,7 +247,7 @@ the live row IDs of that segment's own fragments
 `build_per_segment_filters` and `:103` `live_row_ids`), which drops the old
 segment's entry for every moved row. The merged segment therefore satisfies
 the rule's conclusion directly. Lance's 13.0.0 full-text merge applies no such
-filter (`index/scalar/inverted.rs:1002`, `None` as the old-data filter), so full
+filter (`index/scalar/inverted.rs:1004`, `None` as the old-data filter), so full
 text rebuilds. Its vector merge does filter each source
 (`index/vector/ivf.rs:2473`), but it never joins segments trained with
 different centroids (`select_steady_state_rebalance`, `ivf.rs:407`), and
@@ -256,6 +283,10 @@ statistics. The constants are an unresolved question. The planner's
 `K` segments cost `K` probes; the implementation adds the count to that fact,
 so plan cost (request-aware plan cost, PR #996) prices the fan-out from the
 same index inventory.
+
+This RFC owns the segment policy of index maintenance. The served-maintenance
+draft (#1168, closed on 2026-10-27) proposed one segment per catch-up; served
+index work runs this decision function rather than a policy of its own.
 
 ### Full text
 
@@ -301,6 +332,14 @@ contains lance#9785 and lance#9872 removes them: segments over moved
 fragments become safe for every kind, so the reconciler extends over every
 uncovered fragment and merges under the same policy. That bump is the one
 that turns `index_delta_segment_serves_stale_entries_of_an_updated_row` red.
+It also contains lance#9481, which stores BTREE entries as row addresses, and
+lance#10041, which remaps such an index inside Lance's own
+`commit_compaction`. OmniGraph executes compaction tasks itself and commits an
+empty `rewritten_indices`, and for an address-domain index that apply keeps
+only the fragments the rewrite did not touch (`drop_rewritten_fragments`). The
+bump must therefore pass remapped BTREE indexes through `rewritten_indices`,
+or every compaction leaves its BTREE fragments to the next build; the
+moved-row path can go only while compaction keeps coverage.
 Extension over appended rows, the merge policy and full-text certification
 are not part of the fence.
 
@@ -370,9 +409,10 @@ moved fragments.
   (unresolved).
 - **Persist a row-ID watermark per segment** (a file in the segment's
   inventory, as the full-text certificate is). It would keep the fresh test
-  exact after a compaction removes covered fragments, at the cost of a new
-  artifact to verify and collect. The sequences suffice; compaction already
-  rewrites the table.
+  exact however coverage was withdrawn, including in-place column rewrites
+  and overlay pruning, at the cost of a new artifact to verify and collect.
+  The sequences suffice while coverage leaves a fragment only with the
+  fragment (see The rule), as compaction does for row-ID indexes.
 - **Allow vector segments over moved fragments**, relying on vector search's
   per-segment filter. It saves vector rebuilds after updates but splits the
   rule by kind; not worth it until updates of vector rows are measured to
@@ -398,16 +438,23 @@ New `lance_surface_guards.rs` guards, each red when the fact changes:
   (an updated row's old entry is masked while its new fragment is uncovered);
 - the BTREE merge drops a moved row's old entry; the full-text merge keeps it
   (a negative guard, red at the bump that contains lance#9872);
-- a certificate written on a subset build and on a certified merge verifies.
+- a certificate written on a subset build and on a certified merge verifies;
+- a compaction `Rewrite` with no rewritten indexes keeps every BTREE,
+  full-text and vector index covering the rewritten fragments (extending the
+  scalar assertion of
+  `compacting_a_chosen_fragment_drops_the_bytes_of_dropped_columns`; red at
+  the bump that makes BTREE address-domain, lance#9481).
 
 Engine owners (`integration/maintenance.rs`, `integration/branching.rs`):
 appends extend each index, including the identity and endpoint BTREEs,
 without a rebuild; an append and an update in one run produce one merged
 BTREE segment covering both fragments (equality on the old value returns
 nothing) and rebuild full text and vector;
-a compaction followed by a build takes the moved-fragment action; an
-unreadable sequence does too; a segment without a coverage record is left
-alone and reported; the segment count stays within `K`. A
+after a compaction of covered fragments a build does no index work, and after
+a compaction of fresh fragments it extends over them; a segment that names a
+fragment the manifest no longer holds, and an unreadable sequence, take the
+moved-fragment action; a segment without a coverage record is left alone and
+reported; the segment count stays within `K`. A
 differential test in `integration/proptest_equivalence.rs` runs random
 inserts, updates, deletes, compactions and index builds and compares
 equality, range, full-text and exact nearest answers with an index-free scan.
@@ -454,3 +501,11 @@ does not handle, so each ships alone. `implementation` advances per phase.
   Invariant 11 states the moved-row costs. #1150 is in `blocked_on`; the
   segment count joins `IndexFact`; the vector rebuild reason is the separate
   IVF model, not a missing filter.
+- 2026-10-27: second review. Compaction keeps row-ID index coverage, because
+  Lance's `Rewrite` apply moves the bitmap, so index work after a compaction
+  is only the fragments the bitmaps omit; the earlier text had every
+  compaction take the moved-row action. The rule's assumption, that coverage
+  leaves a fragment only with the fragment, is stated with the two Lance
+  applies that break it and why graph writers do neither. The fence names
+  lance#9481 and lance#10041, which change BTREE compaction coverage at the
+  same bump. This RFC owns the segment policy.
