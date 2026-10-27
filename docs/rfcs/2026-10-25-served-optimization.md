@@ -8,7 +8,7 @@ authors:
   - aaltshuler
 created: 2026-10-25
 updated: 2026-10-27
-discussion: https://github.com/ModernRelay/omnigraph/pull/1177
+discussion: https://github.com/ModernRelay/omnigraph/pull/1186
 supersedes: []
 superseded_by: []
 blocked_on:
@@ -356,3 +356,7 @@ separate justification and are not implied follow-on commitments.
   resource admission, publication and settlement. Record the control-plane
   specification changes needed before managed enablement. The implementation
   still needs to be aligned; this revision does not accept its earlier protocol.
+- **2026-10-27:** Move design review to
+  [#1186](https://github.com/ModernRelay/omnigraph/pull/1186), independently of
+  the implementation in #1177. The proposal and its qualification gates are
+  unchanged by the split.
