@@ -323,13 +323,7 @@ impl Upstream {
                 Some(secret) => crate::managed::scrub_response_error(text, secret),
                 None => text,
             });
-            let event_secret = secret.filter(|_| {
-                response
-                    .headers()
-                    .get(CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok())
-                    .is_some_and(|value| value.starts_with("text/event-stream"))
-            });
+            let event_secret = secret.filter(|_| event_stream(response.headers()));
             let body = match (read_body(response).await, event_secret) {
                 (Ok(body), Some(secret)) => {
                     // A whole SSE frame is not JSON. Normalize each event so
@@ -496,6 +490,14 @@ fn challenge(headers: &HeaderMap) -> Option<String> {
     (!fields.is_empty()).then(|| fields.join(", "))
 }
 
+fn event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
 /// A response body, bounded.
 async fn read_body(mut response: reqwest::Response) -> std::result::Result<Vec<u8>, Lost> {
     let mut body = Vec::new();
@@ -539,11 +541,7 @@ fn error_body(body: &[u8], secret: Option<&str>) -> Value {
 
 async fn read_answer(response: reqwest::Response, secret: Option<&str>) -> Delivery {
     let status = response.status();
-    let stream = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with("text/event-stream"));
+    let stream = event_stream(response.headers());
     let body = match read_body(response).await {
         Ok(body) => body,
         Err(lost) => return Delivery::Lost(lost),

@@ -1502,7 +1502,7 @@ fn managed_mcp_redacts_reflected_resource_credentials() {
                 (
                     "content-type".into(),
                     if form == "sse" {
-                        "text/event-stream"
+                        "Text/Event-Stream; charset=utf-8"
                     } else {
                         "application/json"
                     }
@@ -1516,10 +1516,17 @@ fn managed_mcp_redacts_reflected_resource_credentials() {
             body: body.into_bytes(),
         });
         let refused = bridge.tool(2, "fast", json!({}));
-        assert!(
-            refused.to_string().contains("[redacted]"),
-            "{status}/{form}: {refused}"
-        );
+        let body = if status == 401 || matches!(form, "json" | "text") {
+            &refused["error"]["data"]["error"]
+        } else {
+            &refused
+        };
+        match form {
+            "json" | "text" => assert_eq!(body["error"], "refused [redacted]"),
+            "rpc" | "sse" => assert_eq!(body["error"]["message"], "refused [redacted]"),
+            "tool" => assert_eq!(body["result"]["content"][0]["text"], "[redacted]"),
+            _ => unreachable!(),
+        }
         if status == 401 {
             assert_eq!(refused["error"]["data"]["status"], 401);
             assert_eq!(
@@ -1527,7 +1534,11 @@ fn managed_mcp_redacts_reflected_resource_credentials() {
                 "Bearer error=\"invalid_token\", error_description=\"[redacted]\""
             );
         }
-        assert_eq!(endpoint.received(2), [token.clone()], "no replay");
+        assert_eq!(
+            endpoint.received(2).as_slice(),
+            std::slice::from_ref(token),
+            "no replay",
+        );
         let finished = bridge.finish();
         finished.assert_success();
         finished.assert_never_shows(&tokens.iter().map(String::as_str).collect::<Vec<_>>());
@@ -1623,7 +1634,10 @@ fi
                 assert!(endpoint.received(id).is_empty());
             } else {
                 assert_eq!(answer["result"]["content"][0]["text"], "fast", "{answer}");
-                assert_eq!(endpoint.received(id), [tokens[0].clone()]);
+                assert_eq!(
+                    endpoint.received(id).as_slice(),
+                    std::slice::from_ref(&tokens[0]),
+                );
             }
         }
         assert_eq!(
