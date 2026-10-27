@@ -1,0 +1,45 @@
+# issue: none
+# notes: On the swept route a key set the budget cannot admit refuses the statement before a malformed source
+# notes: row does (the sets are admitted before the parse); the judged route reports the parse refusal instead.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Many { id: I64 @key }
+node Named { name: String @key }
+edge ManyLink: Many -> Many
+edge NamedLink: Named -> Named
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Many
+    rows: 50000
+    commits: 13
+    columns:
+      id: {kind: ordinal, start: 0, step: 1}
+  - kind: node
+    name: Named
+    rows: 8
+    commits: 1
+    columns:
+      name: {kind: key, prefix: n, width: 1}
+
+--- csv malformed.csv
+from,to
+0,1
+2,3,4
+
+--- mutate
+set query_memory_bytes = 262144;
+load csv "malformed.csv" into edge:ManyLink mode overwrite header
+--- expect error: resource limit exceeded for query_memory_bytes
+
+--- mutate
+set query_memory_bytes = 262144;
+load csv "malformed.csv" into edge:NamedLink mode overwrite header
+--- expect error: incorrect number of fields for line 2

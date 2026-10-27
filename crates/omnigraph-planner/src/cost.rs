@@ -554,6 +554,29 @@ impl ValidateRemoval {
     }
 }
 
+/// Where an edge load's endpoint checks probe the committed node ids: on the
+/// parse partitions as the delta arrives (`Swept`), when both endpoint checks
+/// read their committed set whole (`Scan`) and both node types carry one
+/// integer `@key`, so the sets load beside the parse and each partition keeps
+/// its earliest miss; or after the drain on one thread (`Judged`), the route a
+/// `Probe` needs, since it reads `id IN (delta values)`, and the route a text
+/// key set keeps, since the delta values bound it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointProbe {
+    Swept,
+    Judged,
+}
+
+impl EndpointProbe {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Swept => "swept",
+            Self::Judged => "judged",
+        }
+    }
+}
+
 /// Usable BTREE coverage of a validation's filter columns. Fragment counts
 /// cannot estimate row work for partially covered tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

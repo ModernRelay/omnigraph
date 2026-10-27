@@ -219,6 +219,78 @@ fn node_overwrite_resolves_to_source_validate_chain_and_write() {
     assert_eq!(pipelines[1]["depends_on"], serde_json::json!([0]));
 }
 
+/// A node target with an integer key and no incoming edge type carries only
+/// checks judged as the rows pass and no removal scan: its validation streams
+/// and the load is one pipeline; the whole-input validation above stays two.
+#[test]
+fn per_row_checks_plan_one_pipeline_through_the_write() {
+    use omnigraph_planner::{PipelineShape, validate_streams};
+
+    let schema = parse_schema(
+        r#"
+node Item {
+    id: I64 @key
+    note: String
+}
+"#,
+    )
+    .expect("schema parses");
+    let catalog = build_catalog(&schema).expect("catalog builds");
+    let stmt = LoadStmt {
+        source: "s3://bucket/items.csv".to_string(),
+        target: LoadTarget::Node("Item".into()),
+        mode: LoadStmtMode::Overwrite,
+        delimiter: b',',
+        header: true,
+        columns: None,
+    };
+    let op = Operation::Load {
+        ir: Box::new(lower_load(&catalog, &stmt)),
+        tables: vec![side("node:Item", 7)],
+        source_bytes: 3 * SOURCE_PARTITION_BYTES,
+    };
+    let Decision::Engine { plan, explain, .. } =
+        route(&op, &source(), RouteOverride::Registry, &BOUNDS)
+    else {
+        panic!("an overwrite load routes to the engine");
+    };
+    let validations: Vec<&PhysicalNode> = chain(&plan)
+        .into_iter()
+        .filter(|node| matches!(node, PhysicalNode::Validate { .. }))
+        .collect();
+    let [validation] = &validations[..] else {
+        panic!("one validation per load plan, found {}", validations.len());
+    };
+    let PhysicalNode::Validate {
+        checks, removal, ..
+    } = validation
+    else {
+        unreachable!();
+    };
+    assert!(validate_streams(checks, *removal), "{checks:?} {removal:?}");
+    assert_eq!(validation.shape(), PipelineShape::Streaming);
+    let document = explain.to_value();
+    let pipelines = document["pipelines"]
+        .as_array()
+        .expect("a load plan has pipelines");
+    assert_eq!(
+        pipelines.len(),
+        1,
+        "a validation judged per row cuts nothing: {pipelines:?}"
+    );
+    assert_eq!(pipelines[0]["source"]["node"], "CsvSource");
+    assert_eq!(pipelines[0]["partitions"], 3);
+    let operators: Vec<&str> = pipelines[0]["operators"]
+        .as_array()
+        .expect("operators")
+        .iter()
+        .map(|operator| operator["name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(operators, ["Validate", "FragmentWrite"]);
+    assert_eq!(pipelines[0]["sink"]["name"], "consumer");
+    assert_eq!(pipelines[0]["depends_on"], serde_json::json!([]));
+}
+
 /// A node target whose manifest count is zero removes nothing, so pass 9 plans
 /// neither the removal scan nor the retained-edge checks; a populated or
 /// uncounted target keeps both; an edge overwrite never scans.
@@ -563,5 +635,144 @@ fn endpoint_access_costs_the_consulted_table_and_index_coverage() {
                 assert_eq!(origin["scan_cost"], rows.unwrap() + input_rows);
             }
         }
+    }
+}
+
+/// The endpoint checks probe on the parse partitions only when both read
+/// their set whole over a one-integer `@key`; a probe access or a text key
+/// keeps the judged route, and the decision is recorded with its inputs.
+#[test]
+fn endpoint_probe_is_swept_only_for_scan_over_integer_keys() {
+    use omnigraph_planner::{EndpointProbe, FragmentCoverage, IndexFact, IndexKind, NodeTypeSpec};
+
+    let input_rows = 10_000;
+    let op = operation(
+        LoadTarget::Edge("Knows".into()),
+        LoadStmtMode::Overwrite,
+        input_rows * 6,
+    );
+    for (key, rows, expected_access, expected_probe) in [
+        (
+            "I64",
+            Some(1_000),
+            ValidateAccess::Scan,
+            EndpointProbe::Swept,
+        ),
+        (
+            "I32",
+            Some(1_000),
+            ValidateAccess::Scan,
+            EndpointProbe::Swept,
+        ),
+        (
+            "String",
+            Some(1_000),
+            ValidateAccess::Scan,
+            EndpointProbe::Judged,
+        ),
+        (
+            "I64",
+            Some(100_000_000),
+            ValidateAccess::Probe,
+            EndpointProbe::Judged,
+        ),
+    ] {
+        let schema = parse_schema(&format!("node Person {{ id: {key} @key }}")).unwrap();
+        let catalog = build_catalog(&schema).unwrap();
+        let node = catalog.node_types.get("Person").unwrap();
+        let source = source()
+            .with_node_type(
+                "Person",
+                NodeTypeSpec {
+                    table: side("node:Person", 7).table,
+                    version: Some(7),
+                    columns: SYSTEM_COLUMNS_V3,
+                    schema: node.arrow_schema.clone(),
+                    key: node.key.clone().unwrap_or_default(),
+                    object_columns: node
+                        .node_object_fields()
+                        .map(|f| f.name().clone())
+                        .collect(),
+                    object_fields: node
+                        .node_object_members()
+                        .map(|(member, field)| {
+                            Field::new(member, field.data_type().clone(), field.is_nullable())
+                        })
+                        .collect(),
+                    row_count: rows,
+                },
+            )
+            .with_index_facts(
+                "node:Person",
+                vec![IndexFact {
+                    name: "id_index".into(),
+                    column: SYSTEM_COLUMNS_V3.id.into(),
+                    kind: IndexKind::Btree { usable: true },
+                    coverage: Some(FragmentCoverage {
+                        covered: 1,
+                        total: 1,
+                    }),
+                }],
+            );
+        let Decision::Engine { plan, explain, .. } =
+            route(&op, &source, RouteOverride::Registry, &BOUNDS)
+        else {
+            panic!("overwrite routes to the engine")
+        };
+        let [PhysicalNode::Validate { checks, .. }] = chain(&plan)
+            .into_iter()
+            .filter(|node| matches!(node, PhysicalNode::Validate { .. }))
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("one validation per load plan");
+        };
+        let endpoints: Vec<(ValidateAccess, Option<EndpointProbe>)> = checks
+            .iter()
+            .filter(|spec| spec.check.name() == "edge_ri")
+            .map(|spec| (spec.access.unwrap(), spec.probe))
+            .collect();
+        assert_eq!(
+            endpoints,
+            [
+                (expected_access, Some(expected_probe)),
+                (expected_access, Some(expected_probe))
+            ],
+            "key={key}, rows={rows:?}"
+        );
+        assert!(
+            checks
+                .iter()
+                .filter(|spec| spec.check.name() != "edge_ri")
+                .all(|spec| spec.probe.is_none()),
+            "only edge_ri checks carry a probe"
+        );
+        let document = explain.to_value();
+        let validation = &document["physical_plan"]["inputs"][0];
+        let probes: Vec<&str> = validation["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|check| check["probe"].as_str())
+            .collect();
+        assert_eq!(
+            probes,
+            [expected_probe.as_str(), expected_probe.as_str()],
+            "key={key}, rows={rows:?}"
+        );
+        let decision = explain
+            .statistics
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|stat| stat.statistic == "endpoint_probe")
+            .expect("the probe decision is recorded");
+        assert_eq!(decision.value, expected_probe.as_str());
+        let origin: serde_json::Value = serde_json::from_str(&decision.origin).unwrap();
+        assert_eq!(origin["endpoints"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            origin["endpoints"][0]["integer_key"],
+            key != "String",
+            "key={key}"
+        );
     }
 }

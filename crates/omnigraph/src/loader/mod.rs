@@ -133,6 +133,9 @@ pub struct LoadSliceExecuted {
     pub rows: u64,
     /// Nanoseconds the slice's parse and normalization took.
     pub elapsed_compute_ns: u64,
+    /// Nanoseconds the slice's partition waited for the source's bytes.
+    #[serde(default)]
+    pub read_ns: u64,
     /// Nanoseconds after the source's first poll at which the slice was
     /// claimed.
     pub start_ns: u64,
@@ -186,16 +189,37 @@ enum LoadInputShape<'a> {
 }
 
 /// What one attempt of a load statement interprets: the input shape, with a
-/// CSV source as the capture every attempt of the statement shares.
+/// CSV source as the probe every attempt of the statement shares.
 #[derive(Clone, Copy)]
 enum LoadAttemptInput<'a> {
     LoaderCompatible,
     StrictGraphBatch,
-    Csv(
-        &'a CsvLoadRequest,
-        &'a crate::table_store::CapturedSource,
-        &'a Arc<Omnigraph>,
-    ),
+    Csv(&'a CsvLoadRequest, &'a CsvInput, &'a Arc<Omnigraph>),
+}
+
+/// The CSV source of one statement across its attempts: probed once before
+/// the plan; the plan route reads it by range inside its partitions, the
+/// keyed route reads it whole once and replays that capture on every retry.
+struct CsvInput {
+    bytes: Arc<csv::CsvBytes>,
+    source_max_bytes: u64,
+    source_charge: Arc<crate::engine::LoadCharge>,
+    capture: tokio::sync::OnceCell<CapturedSource>,
+}
+
+impl CsvInput {
+    async fn capture(&self, request: &CsvLoadRequest) -> Result<&CapturedSource> {
+        self.capture
+            .get_or_try_init(|| {
+                csv::capture_csv_source(
+                    &self.bytes,
+                    request,
+                    self.source_max_bytes,
+                    Arc::clone(&self.source_charge),
+                )
+            })
+            .await
+    }
 }
 
 /// The resource each staged-write input of an overwrite is admitted under:
@@ -714,16 +738,18 @@ async fn load_jsonl_data(
     // peak input memory before the parser's per-type materialization.
     let retryable = matches!(mode, LoadMode::Append | LoadMode::Merge);
     let memory = crate::engine::LoadMemory::new(query_memory_bytes)?;
-    let source_charge = Arc::new(memory.charge("load source")?);
-    let csv_capture;
+    let csv_input;
     let input = match input_shape {
         LoadInputShape::LoaderCompatible => LoadAttemptInput::LoaderCompatible,
         LoadInputShape::StrictGraphBatch => LoadAttemptInput::StrictGraphBatch,
         LoadInputShape::Csv(request, source_max_bytes, handle) => {
-            csv_capture =
-                csv::capture_csv_source(db, request, source_max_bytes, Arc::clone(&source_charge))
-                    .await?;
-            LoadAttemptInput::Csv(request, &csv_capture, handle)
+            csv_input = CsvInput {
+                bytes: Arc::new(csv::probe_csv_source(db, request, source_max_bytes).await?),
+                source_max_bytes,
+                source_charge: Arc::new(memory.charge("load source")?),
+                capture: tokio::sync::OnceCell::new(),
+            };
+            LoadAttemptInput::Csv(request, &csv_input, handle)
         }
     };
     for attempt in 0..=MAX_PRE_EFFECT_REPREPARES {
@@ -819,14 +845,14 @@ async fn load_jsonl_reader_once<R: BufRead>(
     let mut csv_batch = None;
     let mut load_plan = None;
     let mut executed = LoadExecuted::default();
-    if let LoadAttemptInput::Csv(request, capture, handle) = input {
+    if let LoadAttemptInput::Csv(request, source, handle) = input {
         executed.partitions = 1;
-        executed.source_bytes = capture.size;
+        executed.source_bytes = source.bytes.size();
         let decision = plan_load(
             &catalog,
             &snapshot,
             request,
-            capture.size,
+            source.bytes.size(),
             memory.limit(),
             write_budget.bytes(),
             stage_write_concurrency,
@@ -839,7 +865,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
                 &snapshot,
                 branch,
                 request,
-                capture,
+                &source.bytes,
                 decision,
                 actor_id,
                 history_release_bytes,
@@ -851,6 +877,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
             .await;
         }
         load_plan = decision.explain().cloned();
+        let capture = source.capture(request).await?;
         let decoding = memory.charge("load CSV decoding")?;
         let prepared = csv::prepare_csv_batches(&catalog, request, capture, &mut |bytes| {
             decoding.grow(bytes)
@@ -1284,9 +1311,9 @@ async fn load_jsonl_reader_once<R: BufRead>(
     })
 }
 
-/// A CSV overwrite as a plan: the engine's operators parse, judge and stage,
-/// then the attempt commits the staged transaction detached and publishes
-/// once, today's tail; append and merge keep the keyed path.
+/// A CSV overwrite as a plan: the operators read, parse, judge and stage, the
+/// attempt commits detached and publishes once; a partitioned run that
+/// refused reruns as one partition, whose source-numbered refusal is reported.
 #[allow(clippy::too_many_arguments)]
 async fn load_csv_overwrite_plan(
     db: &Arc<Omnigraph>,
@@ -1294,7 +1321,7 @@ async fn load_csv_overwrite_plan(
     snapshot: &Snapshot,
     branch: Option<&str>,
     request: &CsvLoadRequest,
-    capture: &CapturedSource,
+    bytes: &Arc<csv::CsvBytes>,
     decision: Decision,
     actor_id: Option<&str>,
     history_release_bytes: HistoryReleaseBytes,
@@ -1324,26 +1351,47 @@ async fn load_csv_overwrite_plan(
         plan,
         values: ValueTable::default(),
     };
-    let staged = Arc::new(std::sync::Mutex::new(None));
-    let facts = LoadFacts {
-        request: request.clone(),
-        capture: Arc::new(capture.clone()),
-        write: Some(LoadWrite {
-            db: Arc::clone(db),
-            txn: Arc::new(txn.clone()),
-            write_budget,
-            writers: stage_write_concurrency,
-            staged: Arc::clone(&staged),
-        }),
-        slice_bytes: crate::engine::csv_slice_bytes(),
+    let mut single_partition = false;
+    let (run, staged) = loop {
+        let staged = Arc::new(std::sync::Mutex::new(None));
+        let source_refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let facts = LoadFacts {
+            request: request.clone(),
+            bytes: Arc::clone(bytes),
+            write: Some(LoadWrite {
+                db: Arc::clone(db),
+                txn: Arc::new(txn.clone()),
+                write_budget,
+                writers: stage_write_concurrency,
+                staged: Arc::clone(&staged),
+            }),
+            slice_bytes: crate::engine::csv_slice_bytes(),
+            single_partition,
+            source_refused: Arc::clone(&source_refused),
+        };
+        let context = EngineContext {
+            snapshot: Some(snapshot),
+            catalog: &catalog,
+            graph_index: Arc::new(GraphIndexHandle::none()),
+            load: Some(&facts),
+        };
+        match crate::engine::execute_load(&bound, &context, memory).await {
+            Ok(run) => break (run, staged),
+            Err(error)
+                if !single_partition
+                    && source_refused.load(std::sync::atomic::Ordering::Acquire) =>
+            {
+                tracing::debug!(
+                    source = %request.source,
+                    %error,
+                    "load csv: a partitioned read refused; rerunning as one partition"
+                );
+                memory.reopen();
+                single_partition = true;
+            }
+            Err(error) => return Err(error),
+        }
     };
-    let context = EngineContext {
-        snapshot: Some(snapshot),
-        catalog: &catalog,
-        graph_index: Arc::new(GraphIndexHandle::none()),
-        load: Some(&facts),
-    };
-    let run = crate::engine::execute_load(&bound, &context, memory).await?;
     let rows = run.rows;
     executed.operators = run.operators;
     executed.partitions = executed

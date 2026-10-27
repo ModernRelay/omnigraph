@@ -6,7 +6,8 @@
 # notes: not an integer's canonical decimal (`007`, `01`) names no node even when the integer
 # notes: it reads as is present. The first orphan in row order refuses (row two's dst before row
 # notes: three's src), src before dst within a row, and append gives the same message as overwrite
-# notes: for the absent integer and for the padded spelling; a refused load leaves no rows.
+# notes: for the absent integer and for the padded spelling; a refused load leaves no rows. The scan
+# notes: path probes on the parse partitions (`probe swept`), the probe path after the drain (`probe judged`).
 
 --- runner
 timeout_ms: 10000
@@ -46,6 +47,8 @@ load csv "links.csv" into edge:SmallLink mode overwrite header
 --- expect plan
 load validate edge_ri edge:SmallLink from Small: access scan
 load validate edge_ri edge:SmallLink to Small: access scan
+load validate edge_ri edge:SmallLink from Small: probe swept
+load validate edge_ri edge:SmallLink to Small: probe swept
 load executed: partitions 1 rows 2
 
 --- csv large_links.csv
@@ -59,6 +62,8 @@ load csv "large_links.csv" into edge:LargeLink mode overwrite header
 --- expect plan
 load validate edge_ri edge:LargeLink from Large: access probe
 load validate edge_ri edge:LargeLink to Large: access probe
+load validate edge_ri edge:LargeLink from Large: probe judged
+load validate edge_ri edge:LargeLink to Large: probe judged
 load executed: partitions 1 rows 2
 
 --- csv absent_dst.csv

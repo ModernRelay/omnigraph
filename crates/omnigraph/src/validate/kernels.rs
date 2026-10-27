@@ -9,6 +9,8 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use arrow_array::{Array, RecordBatch};
 use datafusion::scalar::ScalarValue;
@@ -122,8 +124,9 @@ impl UniqueImageBuilder {
     }
 }
 
-/// A row's place in the delta, `slice << 32 | row in slice`, so facts the
-/// partitions extracted from different slices compare in source order.
+/// A row's place in the delta, `partition << 48 | slice << 24 | row in
+/// slice` (`load::position`), so facts the partitions extracted from
+/// different slices compare in source order.
 pub(crate) type Position = u64;
 
 /// The first holder of each key by position, `(id, position)`.
@@ -139,28 +142,240 @@ fn shard_of(key: &[String], shards: usize) -> usize {
     usize::try_from(hasher.finish() % shards as u64).unwrap_or(0)
 }
 
-/// Pass 1 of uniqueness over the rows one partition saw, mergeable with the
-/// other partitions' ([`merge_unique_shard`], [`merge_unique_image`]): the
-/// first holder of each key by position, sharded by the key's hash so the
-/// partitions' shards merge side by side; each id's last key by position;
-/// and the first repeat the partition saw among its own rows.
+/// One row's key on its way into a shard: the key, its holder's id, its position.
+type Keyed = (Vec<String>, String, Position);
+
+/// One shard of the shared holders: the map and the earliest repeat judged
+/// into it, under one lock.
+#[derive(Debug, Default)]
+struct SharedShard {
+    holders: FirstHolders,
+    first: Option<(Position, Violation)>,
+}
+
+/// The first holder of each key over every partition's rows, sharded by the
+/// key's hash under one lock per shard, which a partition takes once per
+/// batch. A key held by two partitions is judged as the second arrives, at
+/// the later holder and named against the earlier, as one pass in source
+/// order would report it: the key's two earliest positions always meet,
+/// whatever the arrival order, so the earliest repeat is the same. The
+/// shards are sized once from the source's row estimate ([`Self::size`]) so
+/// no table grows under its lock.
+pub(super) struct SharedFirstHolders {
+    shards: Vec<Mutex<SharedShard>>,
+    sizing: Mutex<Sizing>,
+    inserted: AtomicUsize,
+}
+
+/// Whether the shards were sized, and the table charge held meanwhile.
+enum Sizing {
+    Unsized,
+    /// `charge` is the sized tables' admitted memory, released once
+    /// `covered_after` rows are inserted and the drain's per-row charges
+    /// carry the tables; `None` when the pool declined and the shards grow.
+    Sized {
+        covered_after: usize,
+        charge: Option<Box<dyn Send>>,
+    },
+}
+
+impl std::fmt::Debug for SharedFirstHolders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedFirstHolders")
+            .field("shards", &self.shards.len())
+            .field("inserted", &self.inserted.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+impl SharedFirstHolders {
+    pub(super) fn new(shards: usize) -> Self {
+        Self {
+            shards: (0..shards.max(1))
+                .map(|_| Mutex::new(SharedShard::default()))
+                .collect(),
+            sizing: Mutex::new(Sizing::Unsized),
+            inserted: AtomicUsize::new(0),
+        }
+    }
+
+    /// The bytes the shards' tables take holding `rows` entries, as the
+    /// standard map allocates them: buckets to the next power of two over
+    /// 8/7 of a shard's share, one control byte each.
+    pub(super) fn table_bytes(&self, rows: usize) -> usize {
+        let per_shard = rows.div_ceil(self.shards.len());
+        let buckets = if per_shard < 8 {
+            8
+        } else {
+            per_shard
+                .saturating_mul(8)
+                .checked_div(7)
+                .unwrap_or(usize::MAX)
+                .checked_next_power_of_two()
+                .unwrap_or(usize::MAX)
+        };
+        buckets
+            .saturating_mul(std::mem::size_of::<(Vec<String>, (String, Position))>() + 1)
+            .saturating_mul(self.shards.len())
+    }
+
+    /// Every shard reserved for its share of `rows`, by the first caller only;
+    /// `admit` charges [`Self::table_bytes`] and returns the charge, or `None`
+    /// to leave the shards growing as they fill. A charge is released once the
+    /// inserted rows, at `per_row_charged` bytes each, cover the tables.
+    pub(super) fn size(
+        &self,
+        rows: usize,
+        per_row_charged: usize,
+        admit: impl FnOnce(usize) -> Option<Box<dyn Send>>,
+    ) {
+        let mut sizing = self.sizing.lock().unwrap_or_else(PoisonError::into_inner);
+        if !matches!(*sizing, Sizing::Unsized) {
+            return;
+        }
+        let bytes = self.table_bytes(rows);
+        let charge = admit(bytes);
+        if charge.is_some() {
+            let per_shard = rows.div_ceil(self.shards.len());
+            for shard in &self.shards {
+                let mut shard = shard.lock().unwrap_or_else(PoisonError::into_inner);
+                let additional = per_shard.saturating_sub(shard.holders.len());
+                shard.holders.reserve(additional);
+            }
+        }
+        *sizing = Sizing::Sized {
+            covered_after: bytes.div_ceil(per_row_charged.max(1)),
+            charge,
+        };
+    }
+
+    /// The table charge dropped once `inserted` rows carry it.
+    fn release_covered_charge(&self, inserted: usize) {
+        let mut sizing = self.sizing.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Sizing::Sized {
+            covered_after,
+            charge,
+        } = &mut *sizing
+            && charge.is_some()
+            && inserted >= *covered_after
+        {
+            *charge = None;
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn capacity(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .holders
+                    .capacity()
+            })
+            .sum()
+    }
+
+    /// Every bucket's rows into its shard; the buckets are left empty.
+    fn insert_buckets(&self, table_key: &str, columns: &[String], buckets: &mut [Vec<Keyed>]) {
+        let rows: usize = buckets.iter().map(Vec::len).sum();
+        let inserted = self
+            .inserted
+            .fetch_add(rows, Ordering::Relaxed)
+            .saturating_add(rows);
+        for (shard, bucket) in self.shards.iter().zip(buckets) {
+            if bucket.is_empty() {
+                continue;
+            }
+            let mut shard = shard.lock().unwrap_or_else(PoisonError::into_inner);
+            let SharedShard { holders, first } = &mut *shard;
+            for (key, id, position) in bucket.drain(..) {
+                match holders.entry(key) {
+                    Entry::Occupied(mut held) => {
+                        let (held_id, held_position) = held.get();
+                        let held_position = *held_position;
+                        let (early, late, late_position) = if held_position <= position {
+                            (held_id.clone(), id, position)
+                        } else {
+                            (id, held_id.clone(), held_position)
+                        };
+                        if first.as_ref().is_none_or(|(at, _)| late_position < *at) {
+                            *first = Some((
+                                late_position,
+                                unique_violation(table_key, columns, held.key(), &late, &early),
+                            ));
+                        }
+                        if position < held_position {
+                            held.insert((early, position));
+                        }
+                    }
+                    Entry::Vacant(slot) => {
+                        slot.insert((id, position));
+                    }
+                }
+            }
+        }
+        self.release_covered_charge(inserted);
+    }
+
+    /// The earliest repeat over every shard.
+    pub(super) fn first_repeat(&self) -> Option<(Position, Violation)> {
+        self.shards
+            .iter()
+            .filter_map(|shard| {
+                shard
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .first
+                    .clone()
+            })
+            .min_by_key(|(position, _)| *position)
+    }
+
+    /// The shards' maps taken out, one box each, so the caller frees them on
+    /// workers of its choosing; the shards are left empty and the table
+    /// charge, if still held, released.
+    pub(super) fn take_maps(&self) -> Vec<Box<dyn Send>> {
+        *self.sizing.lock().unwrap_or_else(PoisonError::into_inner) = Sizing::Sized {
+            covered_after: 0,
+            charge: None,
+        };
+        self.shards
+            .iter()
+            .map(|shard| {
+                let map = std::mem::take(
+                    &mut shard.lock().unwrap_or_else(PoisonError::into_inner).holders,
+                );
+                Box::new(map) as Box<dyn Send>
+            })
+            .collect()
+    }
+}
+
+/// Pass 1 of uniqueness over the rows one partition saw: every key goes into
+/// the [`SharedFirstHolders`] all partitions insert into, bucketed by shard
+/// per batch, so repeats across partitions are judged as the rows arrive and
+/// nothing merges after the drain; each id's last key by position stays with
+/// the partition for the image ([`merge_unique_image`]).
 #[derive(Debug)]
 pub(super) struct UniquePartial {
     input_only: bool,
-    first_by_key: Vec<FirstHolders>,
+    holders: Arc<SharedFirstHolders>,
     final_by_id: FinalKeys,
-    repeat: Option<(Position, Violation)>,
+    buckets: Vec<Vec<Keyed>>,
 }
 
 impl UniquePartial {
     /// `input_only` is the replacement's pass: a repeat inside the input is
     /// the only judgment and no image is kept.
-    pub(super) fn new(input_only: bool, shards: usize) -> Self {
+    pub(super) fn new(input_only: bool, holders: Arc<SharedFirstHolders>) -> Self {
+        let shards = holders.shards.len();
         Self {
             input_only,
-            first_by_key: (0..shards.max(1)).map(|_| HashMap::new()).collect(),
+            holders,
             final_by_id: HashMap::new(),
-            repeat: None,
+            buckets: (0..shards).map(|_| Vec::new()).collect(),
         }
     }
 
@@ -175,7 +390,7 @@ impl UniquePartial {
     ) -> Result<()> {
         let group_columns = group_columns(batch, table_key, columns)?;
         let ids = string_col(batch, system_columns.id)?;
-        let shards = self.first_by_key.len();
+        let shards = self.buckets.len();
         for row in 0..batch.num_rows() {
             let position = base.saturating_add(row as Position);
             let id = ids.value(row).to_string();
@@ -194,73 +409,17 @@ impl UniquePartial {
                 self.final_by_id
                     .insert(id.clone(), (position, Some((key.clone(), values))));
             }
-            match self.first_by_key[shard_of(&key, shards)].entry(key) {
-                Entry::Occupied(first) => {
-                    if self.repeat.is_none() {
-                        let (prior, _) = first.get();
-                        self.repeat = Some((
-                            position,
-                            unique_violation(table_key, columns, first.key(), &id, prior),
-                        ));
-                    }
-                }
-                Entry::Vacant(slot) => {
-                    slot.insert((id, position));
-                }
-            }
+            self.buckets[shard_of(&key, shards)].push((key, id, position));
         }
+        self.holders
+            .insert_buckets(table_key, columns, &mut self.buckets);
         Ok(())
     }
 
-    /// The pass taken apart for the merge: the shards, the final keys, the
-    /// own repeat.
-    pub(super) fn into_parts(
-        self,
-    ) -> (Vec<FirstHolders>, FinalKeys, Option<(Position, Violation)>) {
-        (self.first_by_key, self.final_by_id, self.repeat)
+    /// The partition's final keys, for the image.
+    pub(super) fn into_final_keys(self) -> FinalKeys {
+        self.final_by_id
     }
-}
-
-/// One shard of every partition's first holders merged: the earliest repeat
-/// across partitions, placed at the later of its two holders and named
-/// against the earlier, as a single pass in source order would report it.
-pub(super) fn merge_unique_shard(
-    table_key: &str,
-    columns: &[String],
-    mut maps: Vec<FirstHolders>,
-) -> Option<(Position, Violation)> {
-    maps.sort_by_key(|map| std::cmp::Reverse(map.len()));
-    let mut maps = maps.into_iter();
-    let mut merged = maps.next()?;
-    let mut first: Option<(Position, Violation)> = None;
-    for map in maps {
-        for (key, (id, position)) in map {
-            match merged.entry(key) {
-                Entry::Occupied(mut held) => {
-                    let (held_id, held_position) = held.get();
-                    let held_position = *held_position;
-                    let (early, late, late_position) = if held_position <= position {
-                        (held_id.clone(), id, position)
-                    } else {
-                        (id, held_id.clone(), held_position)
-                    };
-                    if first.as_ref().is_none_or(|(at, _)| late_position < *at) {
-                        first = Some((
-                            late_position,
-                            unique_violation(table_key, columns, held.key(), &late, &early),
-                        ));
-                    }
-                    if position < held_position {
-                        held.insert((early, position));
-                    }
-                }
-                Entry::Vacant(slot) => {
-                    slot.insert((id, position));
-                }
-            }
-        }
-    }
-    first
 }
 
 /// Every partition's final keys merged, the last by position winning and a
@@ -880,6 +1039,45 @@ mod tests {
                 "a"
             )]
         );
+    }
+
+    /// A charge guard whose drop records the release.
+    struct Released(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for Released {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn shared_holders_are_sized_once_and_release_the_charge_when_rows_cover_it() {
+        let holders = Arc::new(SharedFirstHolders::new(2));
+        assert_eq!(holders.capacity(), 0);
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bytes = holders.table_bytes(1000);
+        let charged = Arc::clone(&released);
+        holders.size(1000, bytes, |asked| {
+            assert_eq!(asked, bytes);
+            Some(Box::new(Released(charged)) as Box<dyn Send>)
+        });
+        assert!(holders.capacity() >= 1000, "{}", holders.capacity());
+        assert!(!released.load(Ordering::Relaxed));
+        holders.size(5, 1, |_| panic!("sized twice"));
+
+        let mut partial = UniquePartial::new(true, Arc::clone(&holders));
+        partial
+            .observe(TABLE, &columns(), &slug_batch(&[("a", Some("k1"))]), SC, 0)
+            .unwrap();
+        assert!(
+            released.load(Ordering::Relaxed),
+            "one row at the table's bytes covers the charge"
+        );
+
+        let declined = SharedFirstHolders::new(2);
+        declined.size(1000, 1, |_| None);
+        assert!(declined.capacity() < 1000);
+        declined.size(1000, 1, |_| panic!("a declined sizing is not retried"));
     }
 
     #[test]

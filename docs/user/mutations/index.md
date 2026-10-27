@@ -163,7 +163,9 @@ load csv "s3://imports/knows.csv" into edge:Knows mode append delimiter "|" head
 - `delimiter "<c>"` is one printable ASCII character; `,` when unspelled.
 - `header` makes the first record name the columns: each name is the property
   it feeds, and an edge file's first two columns are its endpoints whatever
-  the header calls them (`Person.id|Person.id` in an LDBC file).
+  the header calls them (`Person.id|Person.id` in an LDBC file). In mode
+  `overwrite` the first record is read from the source's first 8 MiB, with or
+  without `header`; a first record longer than that is refused.
 - `columns (a, b, …)` names the property each column feeds, by position. It
   is required without `header` and overrides a header's names. `from` and
   `to` name an edge file's endpoint columns and are refused on a node file.
@@ -197,8 +199,9 @@ base, and for an embedded run `file://` paths beneath an `embedded_only`
 base. A graph with no policy denies every source; a URI outside every base,
 an unsupported scheme, and an object over the
 [`load_source_max_bytes`](../queries/settings.md) setting (default 32 MiB)
-are refused before any byte is read, and the read is bounded by a 120-second
-deadline. A refused source names `csv_source_bytes`; raising the setting in
+are refused before any byte is read, and every read of the object (each
+range an overwrite's partition reads, or the one read of an append or merge)
+is bounded by a 120-second deadline. A refused source names `csv_source_bytes`; raising the setting in
 the statement's `set` prefix (or the request's `settings` field) admits a
 larger object. A direct `omnigraph mutate`
 run installs an embedded-only base over a `file://` source's directory for
@@ -258,20 +261,26 @@ A CSV load has no whole-statement input check.
 It applies `write_max_bytes` to each staged-write input instead.
 An overwrite stages the reader's 8,192-row batches, and a batch over the
 allowance refuses as `staged_write_input_bytes`.
+An overwrite writes a fragment per parse partition, up to 1 Mi rows each, as
+the rows drain; nothing commits before the publish, a refusal deletes them all.
 An append or merge keeps the keyed adapter's ceilings
 (`retained keyed batch bytes per operation`, `keyed entities for <table>`,
 `keyed entity bytes for <table>`).
 The [`query_memory_bytes`](../queries/settings.md) setting bounds one
 `load csv` statement's tracked memory as a whole: the retained source, every
-decoded batch, validation state and the staging working set.
+decoded batch, validation state and the staging working set; a streaming
+overwrite's working set is its open fragments and the writers in flight.
 A statement the allowance cannot hold refuses with the `query_memory_bytes`
 resource error before any fragment write.
 A CSV load needs roughly the source plus twice its typed input under that
 allowance.
 The source object is bounded by `load_source_max_bytes` before it is read
 (refused as `csv_source_bytes`).
-The loader reads the object once per statement, under the size, etag and
-version its metadata probe captured, and every reprepare attempt reuses those
+An overwrite probes the object's metadata once, then each parse partition
+reads its own byte range in 8 MiB pieces, every read conditional on the etag
+and size the probe captured; a refusal of the partitioned run reads the ranges
+once more as one partition. An append or merge reads the object once per
+statement under the same validators, and every reprepare attempt reuses those
 bytes.
 An object replaced between the probe and the read refuses as an
 external-source error, and nothing is staged.
@@ -312,10 +321,13 @@ The same width is the number of Lance writers a `load csv` overwrite runs at
 once: its batches are cut into runs of at most one Lance file (1 M rows), each
 run written by its own writer, and the files are published in input order, so
 the table's files are the ones a single writer would have produced. It is also
-the most streams that parse the overwrite's source: the source is cut on
-record ends into 8 MiB slices, a stream claims the next slice as it finishes
-one, and the validation puts the slices back in source order, so the rows and
-their order are those of a single parser. Delete staging remains serial. This affects preparation only—one request still
+the most streams that parse the overwrite's source: each parse partition owns
+an equal byte range of the source, reads it in 8 MiB pieces and cuts its
+records on record ends, neighbouring partitions meet at one record end, and
+the validation puts the slices back in source order, so the rows and their
+order are those of a single parser. A boundary the neighbours cannot agree on
+(inside a quoted field, or after an empty line) refuses that run, and the
+same plan reruns as one partition. Delete staging remains serial. This affects preparation only—one request still
 publishes exactly one graph commit.
 
 A stale strict update, delete, or overwrite can return `read_set_conflict`.
