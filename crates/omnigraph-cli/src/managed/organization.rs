@@ -8,8 +8,156 @@ use crate::cli::{
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
+mod custody;
+
 const TEAM_TIMEOUT: Duration = Duration::from_secs(35);
 const CREDENTIAL_LIFETIME: u64 = 86400;
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+enum Operation {
+    Set {
+        selector: String,
+        role: String,
+    },
+    Offboard {
+        selector: String,
+        expected_membership: Option<String>,
+    },
+    Send {
+        email: String,
+    },
+    Resend {
+        selector: String,
+    },
+    Revoke {
+        selector: String,
+    },
+}
+
+impl Operation {
+    fn from_command(command: &OrganizationCommand) -> Option<(Self, &str)> {
+        Some(match command {
+            OrganizationCommand::Members {
+                command:
+                    Members::Set {
+                        selector,
+                        role,
+                        idempotency_key,
+                    },
+            } => (
+                Self::Set {
+                    selector: selector.clone(),
+                    role: role.clone(),
+                },
+                idempotency_key,
+            ),
+            OrganizationCommand::Members {
+                command:
+                    Members::Offboard {
+                        selector,
+                        expected_membership,
+                        idempotency_key,
+                    },
+            } => (
+                Self::Offboard {
+                    selector: selector.clone(),
+                    expected_membership: expected_membership.clone(),
+                },
+                idempotency_key,
+            ),
+            OrganizationCommand::Invitations {
+                command:
+                    Invitations::Send {
+                        email,
+                        idempotency_key,
+                    },
+            } => (
+                Self::Send {
+                    email: email.clone(),
+                },
+                idempotency_key,
+            ),
+            OrganizationCommand::Invitations {
+                command:
+                    Invitations::Resend {
+                        selector,
+                        idempotency_key,
+                    },
+            } => (
+                Self::Resend {
+                    selector: selector.clone(),
+                },
+                idempotency_key,
+            ),
+            OrganizationCommand::Invitations {
+                command:
+                    Invitations::Revoke {
+                        selector,
+                        idempotency_key,
+                    },
+            } => (
+                Self::Revoke {
+                    selector: selector.clone(),
+                },
+                idempotency_key,
+            ),
+            _ => return None,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        let selector = match self {
+            Self::Set { selector, role } => {
+                if !role_slug(role) {
+                    return Err(Failure::refused(
+                        "role_invalid",
+                        "role must contain 1–128 lowercase ASCII letters, digits, underscores or hyphens",
+                    ));
+                }
+                selector
+            }
+            Self::Offboard {
+                selector,
+                expected_membership,
+            } => {
+                if expected_membership.as_deref().is_some_and(|membership| {
+                    membership != "absent" && !valid_membership(membership)
+                }) {
+                    return Err(Failure::refused(
+                        "membership_invalid",
+                        "provide an exact membership ID, or absent after observing no membership",
+                    ));
+                }
+                if expected_membership.as_deref() == Some("absent") && !identity(selector) {
+                    return Err(Failure::refused(
+                        "membership_invalid",
+                        "absent membership cleanup requires an exact user ID",
+                    ));
+                }
+                selector
+            }
+            Self::Send { email: address } => {
+                return if email(address) {
+                    Ok(())
+                } else {
+                    Err(Failure::refused(
+                        "email_invalid",
+                        "provide a bounded email address without whitespace or control characters",
+                    ))
+                };
+            }
+            Self::Resend { selector } | Self::Revoke { selector } => selector,
+        };
+        if !email(selector) && !identity(selector) {
+            return Err(Failure::refused(
+                "identifier_invalid",
+                "provide a valid email or exact ID without whitespace, path separators or control characters",
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Deserialize)]
 struct DirectoryMember {
@@ -18,6 +166,7 @@ struct DirectoryMember {
     principal_id: Option<String>,
     membership_id: String,
     membership_status: String,
+    roles: Vec<String>,
     service_permissions: Vec<String>,
     name: Option<String>,
     email: Option<String>,
@@ -102,7 +251,32 @@ fn parse<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T> {
     serde_json::from_value(value.clone()).map_err(|_| Failure::protocol())
 }
 
-fn directory_human(data: &Value, organization: &str) -> Result<String> {
+fn role_slug(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
+}
+
+fn validate_roles(roles: &[String]) -> Result<()> {
+    let mut unique = BTreeSet::new();
+    if roles.is_empty()
+        || roles.len() > 256
+        || roles
+            .iter()
+            .any(|role| !role_slug(role) || !unique.insert(role))
+    {
+        return Err(Failure::protocol());
+    }
+    Ok(())
+}
+
+fn valid_membership(value: &str) -> bool {
+    value.starts_with("om_") && identity(value)
+}
+
+fn directory(data: &Value) -> Result<Directory> {
     let directory: Directory = parse(data)?;
     provider_observation(
         &directory.provider_observed_at,
@@ -114,51 +288,58 @@ fn directory_human(data: &Value, organization: &str) -> Result<String> {
     let mut users = BTreeSet::new();
     let mut principals = BTreeSet::new();
     let mut memberships = BTreeSet::new();
-    let mut human = format!("Organization {organization} members\n");
-    for member in directory.members {
+    for member in &directory.members {
         validate_service_permissions(&member.service_permissions)?;
+        validate_roles(&member.roles)?;
         if !identity(&member.user_id)
             || !optional_identity(&member.principal_id)
-            || !identity(&member.membership_id)
-            || !member.membership_id.starts_with("om_")
-            || !users.insert(member.user_id.clone())
-            || !memberships.insert(member.membership_id.clone())
+            || !valid_membership(&member.membership_id)
+            || !users.insert(&member.user_id)
+            || !memberships.insert(&member.membership_id)
             || member
                 .principal_id
                 .as_ref()
-                .is_some_and(|id| !principals.insert(id.clone()))
+                .is_some_and(|id| !principals.insert(id))
             || !matches!(
                 member.membership_status.as_str(),
                 "active" | "pending" | "inactive"
             )
             || (member.membership_status != "active" && !member.service_permissions.is_empty())
             || !optional_text(&member.name, 256)
-            || !optional_text(&member.email, 320)
+            || member
+                .email
+                .as_deref()
+                .is_some_and(|address| !email(address))
         {
             return Err(Failure::protocol());
         }
+    }
+    Ok(directory)
+}
+
+fn directory_human(data: &Value, organization: &str) -> Result<String> {
+    let directory = directory(data)?;
+    let mut human = format!("Organization {organization} members\n");
+    for member in &directory.members {
         writeln!(
             human,
             "\n{} · {}",
-            member.name.as_deref().unwrap_or("Name unavailable"),
+            member.name.as_deref().unwrap_or(&member.user_id),
             member.email.as_deref().unwrap_or("email unavailable")
         )
         .unwrap();
         writeln!(
             human,
-            "  User: {} · membership: {} ({})",
-            member.user_id, member.membership_status, member.membership_id
+            "  Membership: {} · service roles: {}",
+            member.membership_status,
+            member.roles.join(", ")
         )
         .unwrap();
-        writeln!(
-            human,
-            "  Principal: {}",
-            member
-                .principal_id
-                .as_deref()
-                .unwrap_or("not yet signed in")
-        )
-        .unwrap();
+        if let Some(principal) = &member.principal_id {
+            writeln!(human, "  Cedar principal: principal:{principal}").unwrap();
+        } else {
+            human.push_str("  Cedar principal: not yet signed in\n");
+        }
         writeln!(
             human,
             "  Organization service permissions: {}",
@@ -170,31 +351,32 @@ fn directory_human(data: &Value, organization: &str) -> Result<String> {
         )
         .unwrap();
     }
-    if users.is_empty() {
+    if directory.members.is_empty() {
         human.push_str("No organization members.\n");
     }
-    writeln!(
-        human,
-        "\nProvider observed: {} · expires: {}",
-        directory.provider_observed_at, directory.provider_expires_at
-    )
-    .unwrap();
-    human.push_str("Active membership establishes identity eligibility. Applied Cedar owns native graph and configuration permissions.\n");
+    human.push_str("\nActive membership establishes identity eligibility. Applied Cedar owns native graph and configuration permissions.\n");
     Ok(human)
 }
 
-fn invitation_page_human(data: &Value, organization: &str) -> Result<String> {
+fn invitation_page(data: &Value, organization: &str) -> Result<InvitationPage> {
     let page: InvitationPage = parse(data)?;
     if page.invitations.len() > 100 || !optional_text(&page.after, 256) {
         return Err(Failure::protocol());
     }
     let mut seen = BTreeSet::new();
-    let mut human = format!("Organization {organization} invitations\n");
-    for invitation in page.invitations {
-        validate_invitation(&invitation, organization)?;
-        if !seen.insert(invitation.id.clone()) {
+    for invitation in &page.invitations {
+        validate_invitation(invitation, organization)?;
+        if !seen.insert(&invitation.id) {
             return Err(Failure::protocol());
         }
+    }
+    Ok(page)
+}
+
+fn invitation_page_human(data: &Value, organization: &str) -> Result<String> {
+    let page = invitation_page(data, organization)?;
+    let mut human = format!("Organization {organization} invitations\n");
+    for invitation in &page.invitations {
         writeln!(
             human,
             "{}  {}  {}  expires {}",
@@ -202,7 +384,7 @@ fn invitation_page_human(data: &Value, organization: &str) -> Result<String> {
         )
         .unwrap();
     }
-    if seen.is_empty() {
+    if page.invitations.is_empty() {
         human.push_str("No invitations on this page.\n");
     }
     if let Some(after) = page.after {
@@ -317,91 +499,314 @@ fn offboard_human(
     ))
 }
 
+fn invitation_path(after: Option<&str>) -> String {
+    let mut path = "/v1/organization/invitations".to_owned();
+    if let Some(after) = after {
+        path.push('?');
+        path.push_str(
+            &url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("after", after)
+                .finish(),
+        );
+    }
+    path
+}
+
+async fn resolve_member(api: &Api, selector: &str) -> Result<DirectoryMember> {
+    let body = request(api, Method::GET, "/v1/organization/members", None, None).await?;
+    let mut matches = directory(&body["data"])?
+        .members
+        .into_iter()
+        .filter(|member| {
+            if email(selector) {
+                member
+                    .email
+                    .as_deref()
+                    .is_some_and(|address| address.eq_ignore_ascii_case(selector))
+            } else {
+                member.user_id == selector
+            }
+        });
+    let selected = matches.next().ok_or_else(|| {
+        Failure::refused(
+            "organization_member_not_found",
+            "no member matches this selector in the selected organization",
+        )
+    })?;
+    if matches.next().is_some() {
+        return Err(Failure::refused(
+            "organization_member_ambiguous",
+            "more than one member matches this email; use an exact user ID",
+        ));
+    }
+    Ok(selected)
+}
+
+async fn resolve_invitation(api: &Api, selector: &str) -> Result<String> {
+    if !email(selector) {
+        return Ok(selector.into());
+    }
+    tokio::time::timeout(TEAM_TIMEOUT, async {
+        let mut cursor = None;
+        let mut cursors = BTreeSet::new();
+        let mut ids = BTreeSet::new();
+        let mut selected = None;
+        for _ in 0..10 {
+            let body = request(api, Method::GET, &invitation_path(cursor.as_deref()), None, None).await?;
+            let page = invitation_page(&body["data"], api.account_id()?)?;
+            for invitation in page.invitations {
+                if !ids.insert(invitation.id.clone()) { return Err(Failure::protocol()); }
+                if invitation.state == "pending" && invitation.email.eq_ignore_ascii_case(selector) {
+                    if selected.is_some() { return Err(Failure::refused("organization_invitation_ambiguous", "more than one pending invitation matches this email; use an exact invitation ID")); }
+                    selected = Some(invitation.id);
+                }
+            }
+            if ids.len() > 1000 { return Err(Failure::protocol()); }
+            match page.after {
+                Some(after) if cursors.insert(after.clone()) => cursor = Some(after),
+                Some(_) => return Err(Failure::refused("organization_invitation_scan_incomplete", "invitation pagination repeated a cursor; no invitation was changed")),
+                None => return selected.ok_or_else(|| Failure::refused("organization_invitation_not_found", "no pending invitation matches this email in the selected organization")),
+            }
+        }
+        Err(Failure::refused("organization_invitation_scan_incomplete", "invitation lookup exceeds ten pages or 1,000 entries; use an exact invitation ID"))
+    }).await.map_err(|_| Failure::new("organization_invitation_scan_timeout", "invitation lookup exceeded 35 seconds; no invitation was changed", 1))?
+}
+
+async fn resolve(api: &Api, operation: &Operation) -> Result<custody::ExactRequest> {
+    let organization = api.account_id()?;
+    let (path, body) = match operation {
+        Operation::Set { selector, role } => {
+            let member = resolve_member(api, selector).await?;
+            if member.membership_status != "active" {
+                return Err(Failure::refused(
+                    "organization_member_inactive",
+                    "role assignment requires an existing active membership",
+                ));
+            }
+            (
+                format!("/v1/organization/members/{}:set-role", member.user_id),
+                json!({"version":1,"organization_id":organization,"user_id":member.user_id,"expected_membership_id":member.membership_id,"role":role}),
+            )
+        }
+        Operation::Offboard {
+            selector,
+            expected_membership,
+        } => {
+            // An exact user+membership assertion already supplies the immutable binding.
+            let (user, membership) = if !email(selector) && expected_membership.is_some() {
+                (
+                    selector.clone(),
+                    expected_membership
+                        .as_deref()
+                        .filter(|value| *value != "absent")
+                        .map(str::to_owned),
+                )
+            } else {
+                let member = resolve_member(api, selector).await?;
+                if expected_membership
+                    .as_deref()
+                    .is_some_and(|expected| expected != member.membership_id)
+                {
+                    return Err(Failure::refused(
+                        "membership_mismatch",
+                        "the selected member has a different membership; inspect it before creating a new request",
+                    ));
+                }
+                (member.user_id, Some(member.membership_id))
+            };
+            (
+                format!("/v1/organization/members/{user}:offboard"),
+                json!({"version":2,"organization_id":organization,"user_id":user,"expected_membership_id":membership}),
+            )
+        }
+        Operation::Send { email } => (
+            "/v1/organization/invitations".into(),
+            json!({"organization_id":organization,"email":email}),
+        ),
+        Operation::Resend { selector } | Operation::Revoke { selector } => {
+            let invitation = resolve_invitation(api, selector).await?;
+            let action = if matches!(operation, Operation::Resend { .. }) {
+                "resend"
+            } else {
+                "revoke"
+            };
+            (
+                format!("/v1/organization/invitations/{invitation}:{action}"),
+                json!({"organization_id":organization}),
+            )
+        }
+    };
+    Ok(custody::ExactRequest { path, body })
+}
+
+fn role_human(data: &Value, exact: &custody::ExactRequest) -> Result<(String, i32)> {
+    #[derive(Deserialize)]
+    struct Receipt {
+        user_id: String,
+        membership_id: String,
+        previous_roles: Vec<String>,
+        requested_role: String,
+        role_update: String,
+        roles: Vec<String>,
+        service_permissions: Vec<String>,
+        provider_observed_at: String,
+        graph_policy_changed: bool,
+    }
+    let receipt: Receipt = parse(data)?;
+    validate_roles(&receipt.previous_roles)?;
+    validate_roles(&receipt.roles)?;
+    validate_service_permissions(&receipt.service_permissions)?;
+    let updated = receipt.role_update == "updated";
+    if exact.body["user_id"].as_str() != Some(receipt.user_id.as_str())
+        || exact.body["expected_membership_id"].as_str() != Some(receipt.membership_id.as_str())
+        || exact.body["role"].as_str() != Some(receipt.requested_role.as_str())
+        || !matches!(receipt.role_update.as_str(), "updated" | "uncertain")
+        || updated && receipt.roles != [receipt.requested_role.clone()]
+        || !updated && receipt.roles != receipt.previous_roles
+        || receipt.graph_policy_changed
+        || receipt.provider_observed_at.len() > 64
+        || time::OffsetDateTime::parse(
+            &receipt.provider_observed_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .is_err()
+    {
+        return Err(Failure::protocol());
+    }
+    Ok((
+        format!(
+            "Service role for {}: {}\n{}: {}\nOrganization service permissions: {}\nGraph policy is unchanged; applied Cedar owns native permissions.\n",
+            receipt.user_id,
+            receipt.role_update,
+            if updated {
+                "Assigned role"
+            } else {
+                "Last verified roles (requested change is uncertain)"
+            },
+            receipt.roles.join(", "),
+            if receipt.service_permissions.is_empty() {
+                "none".into()
+            } else {
+                receipt.service_permissions.join(", ")
+            }
+        ),
+        if updated { 0 } else { 3 },
+    ))
+}
+
+fn mutation_human(
+    data: &Value,
+    operation: &Operation,
+    exact: &custody::ExactRequest,
+    organization: &str,
+) -> Result<(String, i32)> {
+    match operation {
+        Operation::Set { .. } => role_human(data, exact),
+        Operation::Offboard { .. } => offboard_human(
+            data,
+            exact.body["user_id"]
+                .as_str()
+                .ok_or_else(Failure::protocol)?,
+            exact.body["expected_membership_id"].as_str(),
+        ),
+        Operation::Send { .. } | Operation::Resend { .. } | Operation::Revoke { .. } => {
+            let (action, address) = match operation {
+                Operation::Send { email } => ("send", Some(email.as_str())),
+                Operation::Resend { .. } => ("resend", None),
+                Operation::Revoke { .. } => ("revoke", None),
+                _ => unreachable!(),
+            };
+            let invitation: Invitation = parse(&data["invitation"])?;
+            validate_invitation(&invitation, organization)?;
+            if data["action"].as_str() != Some(action)
+                || action != "send"
+                    && exact.path
+                        != format!("/v1/organization/invitations/{}:{action}", invitation.id)
+                || address.is_some_and(|address| !address.eq_ignore_ascii_case(&invitation.email))
+                || action == "revoke" && invitation.state != "revoked"
+            {
+                return Err(Failure::protocol());
+            }
+            Ok((
+                format!(
+                    "Invitation {}: {} · {}\nEmail: {}\nActive membership establishes identity eligibility; native permissions remain in applied Cedar.\n",
+                    invitation.id, action, invitation.state, invitation.email
+                ),
+                0,
+            ))
+        }
+    }
+}
+
 pub(super) async fn dispatch(
+    input: &crate::operator::InvocationConfig,
     binding: &Binding,
     args: &OrganizationArgs,
     command: &OrganizationCommand,
     stderr: &mut dyn Write,
 ) -> Output {
-    let key = match command {
-        OrganizationCommand::Members {
-            command: Members::Offboard {
-                idempotency_key, ..
-            },
-        }
-        | OrganizationCommand::Invitations {
-            command:
-                Invitations::Send {
-                    idempotency_key, ..
-                }
-                | Invitations::Resend {
-                    idempotency_key, ..
-                }
-                | Invitations::Revoke {
-                    idempotency_key, ..
-                },
-        } => Some(idempotency_key.as_str()),
-        _ => None,
-    };
+    let operation = Operation::from_command(command);
+    let key = operation.as_ref().map(|(_, key)| *key);
     let result = async {
-        if let Some(key) = key { idempotency_key(Some(key), stderr)?; }
-        // Validate all caller-provided write targets before authentication or HTTP.
-        match command {
-            OrganizationCommand::Members { command: Members::Offboard { user_id, .. } } if !identity(user_id) => return Err(Failure::refused("identifier_invalid", "user ID must contain 1–128 ASCII letters, digits, underscores, or hyphens")),
-            OrganizationCommand::Invitations { command: Invitations::Send { email: address, .. } } if !email(address) => return Err(Failure::refused("email_invalid", "provide a bounded email address without whitespace or control characters")),
-            OrganizationCommand::Invitations { command: Invitations::Resend { invitation_id, .. } | Invitations::Revoke { invitation_id, .. } } if !identity(invitation_id) => return Err(Failure::refused("identifier_invalid", "invitation ID must contain 1–128 ASCII letters, digits, underscores, or hyphens")),
-            OrganizationCommand::Invitations { command: Invitations::List { after: Some(cursor) } } if !plain(cursor, 256) => return Err(Failure::refused("cursor_invalid", "invitation cursor must contain 1–256 bytes without control characters")),
-            OrganizationCommand::Members { command: Members::Offboard { expected_membership, .. } }
-                if expected_membership != "absent" && (!expected_membership.starts_with("om_") || !identity(expected_membership)) => return Err(Failure::refused("membership_invalid", "provide the exact WorkOS membership ID, or absent after observing no membership")),
-            _ => (),
-        };
+        if let Some((operation, key)) = &operation {
+            idempotency_key(Some(key), stderr)?;
+            operation.validate()?;
+        }
+        if let OrganizationCommand::Invitations {
+            command: Invitations::List {
+                after: Some(cursor),
+            },
+        } = command
+            && !plain(cursor, 256)
+        {
+            return Err(Failure::refused(
+                "cursor_invalid",
+                "invitation cursor must contain 1–256 bytes without control characters",
+            ));
+        }
         binding.organization()?;
         let api = binding.client().await?;
         let organization = api.account_id()?;
-        let (body, human, exit) = match command {
-            OrganizationCommand::Members { command: Members::List } => {
-                let body = request(&api, Method::GET, "/v1/organization/members", None, None).await?;
-                let human = directory_human(&body["data"], organization)?;
-                (body, human, 0)
-            }
-            OrganizationCommand::Members { command: Members::Offboard { user_id, expected_membership, .. } } => {
-                let membership = (expected_membership != "absent").then_some(expected_membership.as_str());
-                let input = json!({"version":2,"organization_id":organization,"user_id":user_id,"expected_membership_id":membership});
-                let body = request(&api, Method::POST, &format!("/v1/organization/members/{user_id}:offboard"), Some(&input), key).await?;
-                let (human, exit) = offboard_human(&body["data"], user_id, membership)?;
-                (body, human, exit)
-            }
-            OrganizationCommand::Invitations { command: Invitations::List { after } } => {
-                let mut path = "/v1/organization/invitations".to_owned();
-                if let Some(after) = after { path.push('?'); path.push_str(&url::form_urlencoded::Serializer::new(String::new()).append_pair("after", after).finish()); }
-                let body = request(&api, Method::GET, &path, None, None).await?;
-                let human = invitation_page_human(&body["data"], organization)?;
-                (body, human, 0)
-            }
-            OrganizationCommand::Invitations { command } => {
-                let (action, target_id, address) = match command {
-                    Invitations::Send { email, .. } => ("send", None, Some(email.as_str())),
-                    Invitations::Resend { invitation_id, .. } => ("resend", Some(invitation_id.as_str()), None),
-                    Invitations::Revoke { invitation_id, .. } => ("revoke", Some(invitation_id.as_str()), None),
-                    Invitations::List { .. } => unreachable!(),
-                };
-                let path = target_id.map_or_else(|| "/v1/organization/invitations".into(), |id| format!("/v1/organization/invitations/{id}:{action}"));
-                let mut input = json!({"organization_id":organization});
-                if let Some(address) = address { input["email"] = json!(address); }
-                let body = request(&api, Method::POST, &path, Some(&input), key).await?;
-                let invitation: Invitation = parse(&body["data"]["invitation"])?;
-                validate_invitation(&invitation, organization)?;
-                if body["data"]["action"].as_str() != Some(action)
-                    || target_id.is_some_and(|id| id != invitation.id)
-                    || address.is_some_and(|address| !address.eq_ignore_ascii_case(&invitation.email))
-                    || (action == "revoke" && invitation.state != "revoked")
-                { return Err(Failure::protocol()); }
-                let human = format!("Invitation {}: {} · {}\nEmail: {}\nActive membership establishes identity eligibility; native permissions remain in applied Cedar.\n", invitation.id, action, invitation.state, invitation.email);
-                (body, human, 0)
-            }
-        };
-        Ok((body, human, exit))
-    }.await;
+        if let Some((operation, key)) = &operation {
+            let mut journal = custody::Journal::open(input, binding, &api)?;
+            // Look up original custody before any selector read, even after a failed write.
+            let exact = match journal.retained(key, operation)? {
+                Some(exact) => exact,
+                None => {
+                    let exact = resolve(&api, operation).await?;
+                    journal.retain(key, operation.clone(), exact)?
+                }
+            };
+            let body = request(
+                &api,
+                Method::POST,
+                &exact.path,
+                Some(&exact.body),
+                Some(key),
+            )
+            .await?;
+            let (human, exit) = mutation_human(&body["data"], operation, &exact, organization)?;
+            Ok((body, human, exit))
+        } else {
+            let (path, members) = match command {
+                OrganizationCommand::Members {
+                    command: Members::List,
+                } => ("/v1/organization/members".into(), true),
+                OrganizationCommand::Invitations {
+                    command: Invitations::List { after },
+                } => (invitation_path(after.as_deref()), false),
+                _ => unreachable!(),
+            };
+            let body = request(&api, Method::GET, &path, None, None).await?;
+            let human = if members {
+                directory_human(&body["data"], organization)?
+            } else {
+                invitation_page_human(&body["data"], organization)?
+            };
+            Ok((body, human, 0))
+        }
+    }
+    .await;
     match result {
         Ok((body, human, exit)) => Output {
             body,
@@ -411,21 +816,22 @@ pub(super) async fn dispatch(
             recovery: key.map(|key| json!({"idempotency_key":key})),
         },
         Err(mut error) => {
-            if let Some(key) = key {
-                // A lost acknowledgement never allocates or submits a replacement action.
-                if key.len() <= 256 && key.bytes().all(|b| b.is_ascii_graphic()) {
-                    error.body["idempotency_key"] = json!(key);
-                    if error.body["type"] != "output_delivery_failed" {
-                        if let Err(mut delivery) = write_diagnostic(
-                            stderr,
-                            format_args!(
-                                "Retain this idempotency key; inspect the result or repeat the identical request with the same key. A new key starts a new action.\n"
-                            ),
-                        ) {
-                            delivery.body["original_error"] = error.body;
-                            delivery.body["idempotency_key"] = json!(key);
-                            error = delivery;
-                        }
+            if let Some(key) = key
+                && !key.is_empty()
+                && key.len() <= 256
+                && key.bytes().all(|b| b.is_ascii_graphic())
+            {
+                error.body["idempotency_key"] = json!(key);
+                if error.body["type"] != "output_delivery_failed" {
+                    if let Err(mut delivery) = write_diagnostic(
+                        stderr,
+                        format_args!(
+                            "Retain this operator home, profile and idempotency key; repeat the identical request with the same key. A new key starts a new action.\n"
+                        ),
+                    ) {
+                        delivery.body["original_error"] = error.body;
+                        delivery.body["idempotency_key"] = json!(key);
+                        error = delivery;
                     }
                 }
             }

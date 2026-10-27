@@ -10,12 +10,12 @@ pub(crate) struct OrganizationArgs {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum OrganizationCommand {
-    /// Inspect organization membership or offboard a member.
+    /// List members, set service roles or offboard a member.
     Members {
         #[command(subcommand)]
         command: OrganizationMembersCommand,
     },
-    /// Manage provider invitations; native permissions remain in cluster policy.
+    /// Manage organization invitations; native permissions remain in cluster policy.
     Invitations {
         #[command(subcommand)]
         command: OrganizationInvitationsCommand,
@@ -24,15 +24,27 @@ pub(crate) enum OrganizationCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum OrganizationMembersCommand {
-    /// List provider members, stable identities and organization service permissions.
+    /// List members, stable identities, service roles and permissions.
     List,
+    /// Set an existing active member's service role; graph policy is unchanged.
+    Set {
+        /// Organization member email or exact user ID.
+        selector: String,
+        /// Existing organization service-role slug.
+        #[arg(long)]
+        role: String,
+        /// Stable request key; retain it if the result is uncertain.
+        #[arg(long)]
+        idempotency_key: String,
+    },
     /// Remove organization membership and its organization-bound sessions.
     /// Deploy Cedar revocation and verify old graph credentials first.
     Offboard {
-        user_id: String,
-        /// Exact current membership ID, or `absent` after observing no membership.
+        /// Organization member email or exact user ID.
+        selector: String,
+        /// Assert an exact membership ID, or `absent` with an exact user ID.
         #[arg(long)]
-        expected_membership: String,
+        expected_membership: Option<String>,
         /// Stable request key; retain it if the result is uncertain.
         #[arg(long)]
         idempotency_key: String,
@@ -54,15 +66,15 @@ pub(crate) enum OrganizationInvitationsCommand {
         #[arg(long)]
         idempotency_key: String,
     },
-    /// Resend one exact pending invitation.
+    /// Resend a pending invitation by email or exact invitation ID.
     Resend {
-        invitation_id: String,
+        selector: String,
         #[arg(long)]
         idempotency_key: String,
     },
-    /// Revoke one exact pending invitation.
+    /// Revoke a pending invitation by email or exact invitation ID.
     Revoke {
-        invitation_id: String,
+        selector: String,
         #[arg(long)]
         idempotency_key: String,
     },

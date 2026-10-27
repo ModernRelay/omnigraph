@@ -13,6 +13,7 @@ use url::Url;
 
 pub(crate) mod args;
 mod auth;
+mod custody;
 pub(crate) mod data;
 mod deployment;
 mod lifecycle;
@@ -1012,7 +1013,7 @@ pub(crate) async fn dispatch(
             if let Err(error) = reject_scope(cli).and_then(|()| binding.account()) {
                 return Some(Output::from_result(Err(error), args.json, 2));
             }
-            Some(organization::dispatch(binding, args, command, stderr).await)
+            Some(organization::dispatch(input, binding, args, command, stderr).await)
         }
         Command::Login {
             json,
