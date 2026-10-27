@@ -50,7 +50,7 @@ prints the exact flags of the installed binary.
 | `lint` | — | Validate `.gq` source against a schema or a graph |
 | `queries` | `validate` `list` | Check a cluster's stored queries; list a cluster's or a served graph's |
 | `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `create` `list` `members list` `pull` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; the target kind selects the backend |
-| `organization` | `members list` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | Manage the selected organization's members and invitations; requires a profile; `org` is an alias |
+| `organization` | `members list` `members set` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | Manage the selected organization's members and invitations; requires a profile; `org` is an alias |
 | `policy` | `validate` `test` `explain` | Validate or evaluate a cluster's applied policy |
 | `embed` | — | Generate, clean or refresh seed embeddings |
 | `login` | — | Create a profile with `--create-profile`, or sign in to its `omnigraph` auth provider |
@@ -504,17 +504,23 @@ Use a profile for `organization` (`org`):
 ```bash
 omnigraph organization members list --profile work --json
 omnigraph organization invitations send person@example.com --profile work --idempotency-key invite-person
-omnigraph organization members offboard USER_ID --profile work --expected-membership MEMBERSHIP_ID --idempotency-key offboard-person --json
+omnigraph organization members set person@example.com --profile work --role member --idempotency-key role-person
+omnigraph organization members offboard person@example.com --profile work --idempotency-key offboard-person --json
 ```
 
 The caller needs current provider `members_manage` permission. WorkOS owns
 organization membership and service roles; applied cluster configuration owns
 graph and deployment permissions. No local enrollment or member-patch command
-is required. Use the exact membership ID from the directory for offboarding,
+is required. Member operations accept an email or exact user ID; role assignment
+requires an existing active member and a configured service-role slug. Invitation
+resend/revoke accepts email or exact invitation ID. Optional
+`--expected-membership` asserts an exact offboarding membership,
 or `absent` only to finish cleanup after that membership is gone. Deploy Cedar
 revocation before offboarding and verify denial with an existing data credential.
 Writes require exact idempotency keys and uncertain outcomes must be reconciled;
-a partial offboard stays partial on replay. See [team administration](../../../docs/user/cli/managed-team.md).
+a partial offboard stays partial on replay. Keep the same operator home and profile:
+the CLI retains the resolved request before sending and never resolves its
+subject again on a same-key retry. See [team administration](../../../docs/user/cli/managed-team.md).
 
 ## Cluster Control Plane
 

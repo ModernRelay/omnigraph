@@ -72,8 +72,11 @@ binding, path, body and explicit idempotency key. A retry with the same key and
 arguments reuses this request without resolving the email or membership again.
 Changed arguments or an identity/custody mismatch refuse. Persistence must
 finish atomically before submission; neither timeout nor output failure clears
-the record. Keep at most 128 records and 1 MiB of encoded custody per
-API/organization, with no eviction. Reaching a bound refuses new requests while
+the record. Keep at most 128 records and 1 MiB of encoded custody per stable
+profile identity, with no eviction. Renaming a profile preserves this identity;
+changing its API, organization or authenticated principal does not permit a key
+to select a different request. Independent profiles have separate custody.
+Reaching a bound refuses new requests while
 preserving exact retries. Reuse the existing atomic file and locking primitives;
 do not add a second recovery command or an automatic write replay.
 

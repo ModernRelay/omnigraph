@@ -156,7 +156,7 @@ durably retains the exact resolved request in private `OMNIGRAPH_HOME` custody.
 Keep this home, the same profile/identity, arguments and key until the outcome
 is known. Repeating the identical command uses the retained request; it does
 not resolve the email again. Changed arguments or a different identity refuse.
-Custody is bounded to 128 records and 1 MiB per API/organization, with no
+Custody is bounded to 128 records and 1 MiB per stable profile identity, with no
 automatic eviction. At the limit, new writes refuse while exact retries remain
 available.
 
