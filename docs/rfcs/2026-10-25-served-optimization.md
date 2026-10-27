@@ -7,223 +7,309 @@ implementation: in-progress
 authors:
   - aaltshuler
 created: 2026-10-25
-updated: 2026-10-26
-discussion: null
+updated: 2026-10-27
+discussion: https://github.com/ModernRelay/omnigraph/pull/1177
 supersedes: []
 superseded_by: []
 blocked_on:
-  - "Native qualification of resource bounds, retained data and shutdown settlement before deployment."
+  - "Align the implementation with the synchronous execution contract and qualify disconnect, publication and shutdown outcomes."
+  - "Qualify finite native work bounds and the supported deployment resource envelope before enabling execution."
+  - "Before managed enablement: amend LCY-04.2 and DEC-08-76 and qualify native enforcement of control-plane capacity allocation."
 ---
 
 # RFC: Served optimization
 
-## Problem and scope
+## Summary
 
-`optimize` currently opens graph storage directly. A running cluster already
-owns that storage, so an independent process cannot safely run this command
-beside it. Expose the existing optimization through that owning server, retain
-an exact operation identity, and let a disconnected client inspect its result.
+Expose `optimize` through the server that already owns the cluster. The server
+owns safe execution and returns the exact result it observes. The control plane
+owns scheduling, delivery, operational history and collected logs. The engine
+keeps its existing snapshot, staging and graph-publication contract.
 
-The first implementation operates on one graph's `main`. It can block writes
-while holding existing native gates. Reads keep their admitted snapshots.
-It does not introduce automatic scheduling, independent task workers, cleanup,
-repair, history deletion or a second graph publication path.
+The first slice is one synchronous request for one graph's `main`. It adds no
+durable maintenance journal, scheduler, restart lookup or recovery command.
+A lost response leaves the caller's outcome unknown; it never authorizes an
+automatic retry. This is a deliberate limit on the execution contract.
 
-## Authority and execution
+The implementation in [#1177](https://github.com/ModernRelay/omnigraph/pull/1177)
+currently includes a stronger durable invocation protocol. It must be reduced
+to this revised design before it can claim conformance. This document changes
+the proposal; it does not claim the implementation already matches it.
 
-Add the explicit graph policy action `optimize`, scoped to target branch
-`main`. `admin` stays reserved; configuration management and graph membership
-do not imply optimization permission. HTTP authenticates the actor. Native
-cluster acceptance checks current applied policy; the engine entry point
-checks the same action before work. No bearer bytes enter durable records.
+## Motivation
 
-The server uses its existing cluster admission and owned-operation runtime.
-One process gate serializes maintenance with configuration deployment. Native
-acceptance checks the exact cluster owner and refuses outstanding deployment
-work. Every accepted optimization remains owned after its HTTP waiter exits.
-Shutdown uses the existing owned-operation and storage-settlement rules.
+The existing direct `optimize` opens graph storage. A running cluster already
+owns that storage, so an independent process cannot safely optimize beside it.
+Operators need to run the existing operation through that owner.
 
-The engine retains the existing schema, branch and sorted-table gates, exact
+Durable job tracking is a separate requirement. Making receipt retention a
+prerequisite for serving creates an availability dependency unrelated to whether
+the graph is safe. A manual operation does not need its own sequence ledger,
+publication-witness protocol or offline recovery workflow to be useful.
+
+## User and operational behavior
+
+For a configured server target, the proposed command is:
+
+```bash
+omnigraph optimize --target prod --graph knowledge
+omnigraph optimize --target prod --graph knowledge --json
+```
+
+The command waits for this attempt's result. It reports the accepted input
+commit, its resulting commit or unchanged commit, table statistics, skips,
+deferred indexes and any optional-work failures. It may block writes while
+holding existing gates; admitted reads retain their snapshots.
+
+The existing direct command remains available under normal exclusive native
+ownership. A remote refusal never falls back to direct storage. Existing
+target selection, actor assertion and result-output conventions apply. There
+are no new `--no-wait`, `--operation-id` or `--writers-stopped` modes.
+
+| Observation | Meaning and caller action |
+|---|---|
+| Definitive refusal before effects | This request did not optimize. Correct the reported cause before making another request. |
+| Completed result | Use this attempt's exact report, including no-work and optional-work outcomes. |
+| Lost response or observation timeout | Execution may still be running or may have completed. Record unknown; do not automatically resubmit. |
+| Native failure | Preserve its typed effect and settlement evidence; an error alone does not prove that nothing published. |
+
+A later explicitly requested optimization is a new attempt against a fresh
+accepted snapshot, after native admission permits it. It may perform additional
+work or publish another commit. It is not replay, recovery or proof that the
+previous attempt failed. A changed graph head or equal logical data does not
+identify the old attempt's result.
+
+## Design
+
+### Responsibility boundary
+
+| Owner | Responsibility |
+|---|---|
+| Control plane | Scheduling, fleet capacity allocation, delivery policy, durable workflow history, log collection/retention and operator presentation. |
+| Server | Authentication, local admission, ownership of execution through disconnect, bounded execution status and exact responses. |
+| Engine | Authorization at the native entry point, accepted snapshot, physical optimization, graph publication and typed storage outcomes. |
+
+The control plane records intent, delivery attempts and responses it actually
+observed. Its records are authoritative for its workflow, not native acceptance
+or publication. An unobserved result remains unknown. Self-hosted callers can
+use the same native endpoint without deploying a control plane.
+
+The server emits ordinary correlated diagnostic events and metrics through the
+existing observability facilities. It does not persist a second operational
+history or manage log delivery. Loss of an observational record is neither
+proof of safety nor a reason to close otherwise valid native admission.
+This minimizes management overhead; physical optimization still runs in the
+engine. Moving that computation to independent workers is out of scope.
+
+### Native execution and outcomes
+
+Add the graph policy action `optimize`, scoped to `main`. Installed policies
+must explicitly grant it; `admin`, configuration management and membership do
+not imply it. HTTP resolves the bearer to an actor; cluster admission checks
+current applied policy and the engine checks the same action before effects.
+Keep normal access discovery and the existing `--as` credential-actor assertion.
+An assertion never supplies a trusted actor. Do not retain bearer bytes.
+
+Reuse the existing cluster admission, owned-operation runtime and deployment
+gate. Admit at most one optimization per cluster and serialize it with
+configuration deployment. Refuse another optimization while that slot or the
+deployment gate is busy; ordinary writes keep their existing gate behavior.
+Accepted work remains owned after its HTTP waiter exits. Disconnect and
+observation deadlines end waiting, not native execution.
+
+The engine retains its schema, branch and sorted-table gates, one coherent
 accepted snapshot, detached staging and single graph-manifest publication.
-Its report captures the before/after graph commit while those gates remain
-held, plus exact table statistics, skips and deferred indexes. A report must
-not substitute a later head read for this operation's publication.
+Capture the exact before/after commits as part of that attempt, while the
+relevant gates are held; never infer the result from a later head read.
+Direct and served entry points share these semantics. Resource limits constrain
+work; their presence must not select a different publication or error protocol.
 
-## Durable invocation and lookup
+Separate known graph publication from optional derived-artifact work. A settled
+artifact failure is reported explicitly without relabeling a known commit as
+unknown. Genuine uncertain I/O, including a possibly accepted write to a mutable
+cache object, still needs the existing settlement and containment rules. Never
+discard that uncertainty merely because the data is derived.
+Key-scoped storage uncertainty does not itself close process admission;
+containment remains limited to the cases defined by the existing storage-outcome
+contract, rather than every failure after acceptance.
 
-Store a separate bounded native invocation journal at
-`__cluster/maintenance.json`. This is an operation record, not graph authority
-or another ownership lock. Storage uses the admitted root's existing adapter,
-conditional writes and I/O scope. It never modifies deployment outcomes.
+Shutdown and successor admission follow the existing
+[owned-operation](2026-09-30-owned-server-operations.md) and
+[storage-outcome](2026-10-19-storage-outcomes-and-restartable-ownership.md)
+contracts. A dropped future does not exclude accepted I/O or a predecessor.
+There is no additional startup blocker for a missing maintenance receipt, no
+neutral graph commit solely to settle one, and no maintenance-specific unlock.
 
-An operation ID is `<cluster-ledger-id>:<sequence>:<nonce>`; the ledger ID and
-nonce are canonical ULIDs and the sequence is a canonical positive integer.
-Maintenance has its own increasing sequence. Read-only status exposes the
-next sequence but reserves nothing. Acceptance consumes one sequence and
-persists the exact graph, kind, options, budget and authenticated actor before
-any effect. It returns a single-use in-process execution token. No caller can
-construct an accepted token from the serialized journal.
+### HTTP, receipts and status
 
-After the engine completes source preflight under its graph gates, it
-conditionally binds the exact input commit and source inventory to that
-invocation before any physical rewrite. Success must match this binding.
-A failed binding write retains uncertainty and never permits execution.
-The invocation also records its applied configuration revision and schema
-contract; these identify admission, while the immutable input commit binds
-the actual graph schema and table pins used by optimization.
+Add `POST /graphs/{graph_id}/optimize` through the shared operation registry,
+typed API and [HTTP conventions](2026-10-19-http-api-conventions.md). The graph
+is addressed once, in the path. The initial operation uses the existing optimize
+behavior without new request options; clients do not copy server ceilings into
+a maintenance envelope.
+Return the exact completed report after durable publication, or the typed
+failure. A no-work result names the unchanged commit. Do not return `202` as a
+promise of durable acceptance.
 
-Only one outstanding invocation is allowed per cluster. A duplicate identity
-and matching input/actor returns the recorded status without execution.
-Different input or actor refuses. A different nonce at a retained sequence
-refuses. A consumed sequence whose result was evicted reports expired,
-unknown acceptance/outcome; it never becomes executable again. Future
-sequences and another ledger are refused.
+Here, a receipt means the completed response observed by the caller. It is not
+a server-persisted record. The first slice exposes completion through that
+response and keeps execution status in the existing owned-operation runtime;
+it adds no per-invocation lookup endpoint. A request correlation ID supplies
+identification only, not idempotency, deduplication or restart recovery.
+Clients and control-plane delivery code must disable automatic POST retries
+after ambiguous dispatch. Native status may be lost at restart.
 
-Completion conditionally records the exact native report or a proven
-pre-effect refusal. A refusal consumes its ID and releases the slot; an
-uncertain failure keeps it outstanding. Keep at most 32
-terminal reports, at most 1 MiB each and 4 MiB combined. The complete journal
-is limited to 8 MiB. Eviction only removes terminal result payloads; the
-monotonic sequence retains the no-replay boundary. Outstanding work cannot
-be evicted. A result larger than its retention bound leaves uncertainty rather
-than publishing a truncated success.
+MCP exposure and asynchronous lookup are deferred. If reconnect lookup becomes
+necessary, a separate bounded, process-local extension can retain active and
+terminal statuses scoped to the server incarnation. Missing, evicted or old
+statuses must mean unknown, never not-executed, and lookup must never execute
+work. That extension must define its limits and authorization before shipping;
+this RFC does not require a generic jobs API to expose optimize.
 
-Before physical effects, the engine derives a conservative report bound from
-the exact accepted table and index strings, all supported pending-index
-outcomes and maximal numeric widths. Cluster admission includes the complete
-invocation/result wrapper, prepared witness and interrupted-result shapes in
-the reservation. An envelope that cannot fit refuses before physical work.
-The final exact-size check remains a defensive guard. No report is truncated,
-and no input/output size ratio substitutes for this proof.
+### Bounds and enablement
 
-A crash or storage error between invocation acceptance, graph publication and
-result recording leaves an outstanding operation. Lookup labels it unresolved
-when no local owner exists. Neither a new process nor another request replays
-it or infers success from equal data or a changed head. It preserves its evidence
-and refuses new maintenance, deployment and writable process admission. Even
-after explicit predecessor exclusion, a successor cannot start ordinary
-serving or direct graph operations while the journal is unresolved. The
-original process can expose its exact receipt while its admission remains
-available. Explicit recovery takes a restricted admission for the original
-operation after the administrator establishes predecessor and accepted-I/O
-exclusion and handles the exact old lock. It cannot serve requests, deploy
-configuration or rerun optimization.
+Execution is disabled until explicitly configured and qualified. Keep typed
+limits under the server's existing configuration/builder ownership, without a
+maintenance-only YAML file or parser. The server selects finite ceilings for
+tables, fragments, physical rows, source bytes and file references; callers
+cannot raise them. Start with one dataset and one compaction task in flight.
+Bound metadata enumeration and result construction as well as physical work.
 
-Before publication, retain the exact native publication witness and prepared
-report. Recovery compares that witness against native graph authority. No
-prepared witness means graph publication was never attempted. A prepared
-candidate's absence alone does not exclude a delayed storage write: use the
-existing native no-effect settlement publication to resolve that race, then
-validate the exact winner. Missing, conflicting or unclassifiable evidence
-leaves the original invocation unresolved. A recovered receipt explicitly
-reports interrupted unpublished or interrupted published work; publication
-does not claim subsequent derived-artifact work completed. Detached output
-remains subject to ordinary native cleanup safety. Recovery never deletes it.
+Validate the complete accepted source inventory before the first rewrite,
+including dropped-column materialization, catalog work, table manifests,
+index files, deletion files and managed Blob payloads. External Blob references
+remain references; their payloads are not fetched. Count before exceeding the
+limit, rather than materializing an unbounded inventory and checking afterwards.
+Unknown sizes or unsupported layouts refuse. Preserve the current full-text
+rebuild boundary; index/statistics/storage errors must not masquerade as
+insufficient vector training data. Do not add historical-prefix scans or output
+truncation.
 
-Current `optimize` permission authorizes status for the requested graph. The
-exact authenticated initiator may retrieve its retained individual receipt
-after permission revocation, without gaining graph data or other operations.
-Missing or expired ownership evidence cannot grant this exception.
+Finite source ceilings and concurrency do not establish hard memory, CPU,
+scratch-space or I/O-rate guarantees. Native work and completion resources need
+measured limits and process/platform isolation for the supported envelope,
+including competition with foreground requests. Existing request-count and
+request-byte admission is not a substitute. Ordinary bounded result delivery
+remains necessary; the durable-journal report reservation and recovery-envelope
+machinery are not part of this contract.
 
-## Bounds and enablement
+Managed execution additionally requires native enforcement of control-plane
+capacity allocation on every entry point, including direct remote CLI calls.
+A proxy check alone is insufficient. State support through explicit deployment
+capability and resource admission, not an inference from static-token, signed
+token or OIDC authentication. Until qualified, managed execution stays disabled.
 
-Served optimization is explicitly enabled at boot; it is off by default.
-The optional `OMNIGRAPH_MAINTENANCE_CONFIG` names a local YAML file (at most
-4 KiB) containing positive `max_tables`, `max_fragments`, `max_rows`,
-`max_source_bytes` and `max_files`. Embedders may provide the same limits
-through the server builder. There are no implicit defaults that enable work.
-The server chooses finite ceilings for source tables, fragments, rows, bytes,
-file references and dataset concurrency. Requests may lower those ceilings, never raise them.
-The first implementation uses one dataset at a time. Limits are validated
-before durable acceptance and the complete accepted work is checked before
-the first physical effect, including dropped-column rewrite tasks.
+## Invariants
 
-Source accounting includes `__manifest` and all pinned table manifests, data and deletion
-files, index-file inventories and live managed Blob lengths. It conservatively
-counts whole accepted tables, including dropped-column rewrites; Blob lengths
-may count bytes already inside a data file, and each nonempty managed Blob
-counts as a file reference even when values share a packed file. External Blob
-payloads are not read by compaction. Missing file sizes use exact object HEADs;
-unknown index inventories or physical formats, inherited storage bases, system
-indexes, overlays and unsupported Blob layouts refuse before effects. Index
-accounting inspects native metadata before reader compatibility filtering;
-an unsupported index cannot disappear from the accepted inventory.
-No historical prefix is listed.
-Unknown sizes or unsupported accounting refuse; a per-dataset concurrency
-setting alone is not a whole-operation limit. A bounded input is not a claim
-of a hard process memory, CPU or storage-rate cap. Live enablement additionally
-requires process/platform resource isolation and measured limits. An elapsed
-HTTP deadline never interrupts an uncertain storage write.
+The [architectural invariants](../dev/invariants.md) remain unchanged: one
+accepted snapshot, detached pre-publication effects, one graph publication,
+engine authorization, bounded work and typed uncertain outcomes. Derived indexes
+and caches affect cost, never logical correctness. Existing ownership and I/O
+settlement remain necessary even when observational status is missing.
 
-This accounting was checked against the pinned Lance 13.0.0 source:
-[`CompactionOptions`, planning and task execution](https://docs.rs/crate/lance/13.0.0/source/src/dataset/optimize.rs),
-[`Fragment` and `DataFile` metadata](https://docs.rs/crate/lance-table/13.0.0/source/src/format/fragment.rs),
-[`IndexMetadata.files`](https://docs.rs/crate/lance-table/13.0.0/source/src/format/index.rs),
-the native [`deletion_file_path`](https://docs.rs/crate/lance-table/13.0.0/source/src/io/deletion.rs),
-[`Dataset::object_store` and `branch_location`](https://docs.rs/crate/lance/13.0.0/source/src/dataset.rs),
-and [`ObjectStore::size`](https://docs.rs/crate/lance-io/13.0.0/source/src/object_store.rs).
-Lance's own compaction byte option omits Blob-v2 payloads and can select only
-part of the work. It therefore does not substitute for the complete accepted
-inventory checked here. These source checks establish the accounting contract,
-not a measured process-memory or throughput limit.
+There is no second storage writer, manifest-derived job queue, custom WAL,
+shadow publication authority, implicit retry, or inline content-write rebuild.
+The control plane cannot bypass native policy, resource admission or fencing.
+Cleanup, repair, history deletion and isolated workers remain outside this RFC.
 
-Index reconciliation defers an existing vector index only when it has no
-non-null vectors. With positive input, native Lance chooses its supported
-training layout. Statistics, storage and index builder errors propagate; they
-cannot masquerade as insufficient training data.
-New declared vector indexes with no non-null rows retain their existing pending
-status. Full-text reconciliation keeps its explicit rebuild boundary.
+## Compatibility and reversibility
 
-No externally scheduled capacity allocation is defined here. A deployment
-requiring a fleet-wide budget must keep this capability disabled until native
-admission validates that allocation on every entry point. A proxy-only check
-is insufficient. Root-bound signed-token and OIDC identity profiles refuse
-new optimization at boot and native request admission while this allocation
-contract is absent. Disabling execution retains original-ID lookup.
-Independent workers additionally require retained immutable
-inputs, serialized bounded plans, output-only credentials and native result
-validation/publication; none is implied by this endpoint.
+This design adds no graph format or durable maintenance object. Adding the
+`optimize` action requires policy and access-discovery updates for direct and
+served callers. Removing the endpoint later leaves ordinary graph commits and
+detached output governed by existing retention and cleanup rules.
 
-## HTTP and CLI
+The candidate in #1177 has not established a supported wire or disk contract.
+Remove its maintenance journal, sequence protocol, lookup/recovery routes,
+receipt-only admission blocks and recovery CLI flags before shipping. Do not
+silently delete an outstanding journal in an experimental deployment: exclude
+its owner and settle its native work using the candidate's recovery procedure
+before switching binaries. Migration of such experimental roots is not supplied
+by this documentation change.
 
-Use the shared operation registry and existing HTTP version:
+The control-plane specifications
+[LCY-04.2](https://github.com/ModernRelay/og-control-plane/blob/58a29d6dd4ea00cef84829f03181ffe740d01974/specs/08-LCY-Lifecycle.md#L702)
+and [DEC-08-76](https://github.com/ModernRelay/og-control-plane/blob/58a29d6dd4ea00cef84829f03181ffe740d01974/specs/02-DEC-Decisions.md#L3601)
+currently require durable native invocation identity, acceptance, results and
+original-ID reconciliation. Amend those requirements before claiming managed
+compatibility with this weaker observation contract. Moving the same guarantees
+into control-plane bookkeeping would not satisfy them.
 
-- `GET /cluster/maintenance?graph=<id>`: authorized read-only status and next ID
-  components for one graph.
-- `POST /cluster/maintenance`: exact operation ID, graph, `optimize` kind and
-  bounded options; return after durable acceptance or a recorded refusal.
-- `GET /cluster/maintenance/{id}?graph=<id>`: exact original result/status
-  lookup with the original graph, without scanning other graph policies.
+## Alternatives
 
-Malformed input, denied policy, disabled capability and exhausted admission
-refuse before physical effects. An ambiguous POST response is not a refusal.
-Clients retain the original ID and use GET; no automatic POST replay.
+- **Keep direct-only optimization:** requires stopping the owner for routine
+  physical maintenance; does not solve the operational problem.
+- **Durable native invocation journal:** supports original-ID lookup and
+  publication reconciliation across crashes, with unresolved or partial outcomes
+  when evidence is insufficient. It adds persistent identities, retention,
+  recovery and an availability dependency on receipt settlement. Defer until a
+  concrete use case requires that stronger guarantee.
+- **Reuse the deployment ledger:** couples configuration convergence to physical
+  optimization without removing durable invocation complexity.
+- **Control-plane-only execution receipts:** cannot prove native publication
+  when a response was lost. Keep workflow history there and preserve unknowns.
+- **Process-local asynchronous status:** useful for reconnecting observers, but
+  adds retention, authorization and incarnation semantics. Defer until the
+  synchronous slice demonstrates that need.
 
-These cluster maintenance routes have no MCP binding in this slice. Their
-durable invocation and recovery contract is separate from the non-streaming
-graph operations exposed as MCP tools. The shared registry records this
-explicit transport boundary.
+## Evidence and tests
 
-Extend the existing `optimize` command and target resolution. Remote execution
-waits by default; `--no-wait` returns the known operation ID.
-`--operation-id <id>` observes that original operation without submitting it.
-`--timeout` bounds observation only. Direct storage retains its existing
-command and output; remote refusal never falls back to direct storage.
-For administrator recovery, `optimize --operation-id <id> --writers-stopped`
-requires an explicit direct-root target and graph. The attestation means the
-prior process and accepted graph/control I/O are excluded, as for deployment
-recovery; it never overrides a held lock. This operation reconciles the
-original receipt and never executes a new optimization.
+Extend the existing engine `integration/maintenance.rs`, policy, cluster
+admission, server operation/runtime and CLI maintenance owners. Prove:
 
-## Evidence required
+- Denied actors, unsupported deployments, exhausted bounds and competing work
+  refuse before physical effects; direct calls cannot bypass engine policy.
+- Disconnect and timeout leave execution owned, with no client resubmission.
+  Shutdown and predecessor exclusion preserve native I/O settlement.
+- Success reports this attempt's exact commit; no-work reports the unchanged
+  commit. Lost responses and crashes never become inferred success or failure.
+- Known publication plus settled optional failure preserves both facts;
+  uncertain publication or optional I/O retains the required native fencing.
+- Rows, schema, Blob values, index behavior, retained history and live branches
+  are preserved. Use GQT for expressible logical assertions; retain Rust owners
+  for physical mechanisms, concurrency and faults.
 
-Extend existing maintenance, policy, cluster, server and CLI test owners.
-Cover denied and allowed actors, complete bounds before effects, concurrent
-reads and write contention, identical/mismatched duplicates, response loss,
-result eviction, accepted-operation interruption, shutdown and restart lookup.
-Compare logical rows, schema, Blob values, index behavior, retained history and
-live branches before and after. Test failures before and after publication
-without treating a lost response as permission to execute again.
+Update the registry, OpenAPI, CLI contracts and DST storage-cost golden with
+implementation changes. Verify that no receipt lookup, journal write or
+maintenance-specific startup gate remains. Qualify resource and live-cloud
+settlement separately; local correctness tests cannot establish those limits.
+Measure large Blob rows, wide/high-dimensional rows, many small fragments and
+index rebuilds under the intended allocation. Publish the tested limits.
 
-Local tests establish the candidate's contract. They do not qualify cloud
-storage settlement, fleet admission or production resource ceilings.
+The candidate's source accounting was inspected against unmodified Lance
+13.0.0: [compaction planning/execution](https://docs.rs/crate/lance/13.0.0/source/src/dataset/optimize.rs),
+[fragment metadata](https://docs.rs/crate/lance-table/13.0.0/source/src/format/fragment.rs),
+[index inventories](https://docs.rs/crate/lance-table/13.0.0/source/src/format/index.rs)
+and [object-store sizing](https://docs.rs/crate/lance-io/13.0.0/source/src/object_store.rs).
+Lance's compaction byte option alone excludes Blob-v2 payload accounting and
+does not bound all optimization work. Reuse qualified native mechanisms rather
+than introducing another transaction or recovery protocol. Tests of the prior
+journal design are not evidence that this revised contract is implemented.
+
+## Rollout
+
+1. Review this reduced contract and align #1177's code, tests, OpenAPI and user
+   documentation. Keep execution disabled during qualification.
+2. Enable the synchronous self-hosted slice only for the measured supported
+   resource envelope. Preserve explicit unknown outcomes and existing shutdown
+   behavior; publish the policy change and limits with the implementation.
+3. Amend the control-plane specifications and qualify native capacity admission
+   before enabling managed calls. Keep scheduling and operational history in
+   the control plane. This phase does not gate the self-hosted slice.
+
+## Unresolved questions
+
+No additional design decision is required for the synchronous scope. The
+implementation, resource and managed-integration evidence gates are listed in
+`blocked_on`. Durable receipts, asynchronous lookup and worker offload require
+separate justification and are not implied follow-on commitments.
+
+## Decision log
+
+- **2026-10-27:** Narrow the initial candidate to safe execution through the
+  existing owner. Replace durable invocation/lookup and offline recovery with
+  synchronous exact results and explicit unknown outcomes. Assign orchestration,
+  history and log collection to the control plane; retain native authorization,
+  resource admission, publication and settlement. Record the control-plane
+  specification changes needed before managed enablement. The implementation
+  still needs to be aligned; this revision does not accept its earlier protocol.
