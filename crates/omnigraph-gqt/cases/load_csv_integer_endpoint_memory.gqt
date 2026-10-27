@@ -11,7 +11,7 @@ environments:
     storage: local-filesystem
   - target: omnigraph-engine-dst
     storage: in-memory-object-store
-    seeds: [0]
+    seeds: [0, 1]
 
 --- schema
 node Person { id: I64 @key }

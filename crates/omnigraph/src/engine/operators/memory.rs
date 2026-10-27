@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 use arrow_array::{Array, RecordBatch, RecordBatchOptions, UInt32Array};
 use arrow_schema::{DataType, SchemaRef};
@@ -23,6 +23,7 @@ use datafusion::physical_plan::{
 use futures::StreamExt;
 use lance_datafusion::exec::HardCapBatchSizeExec;
 
+use super::load_budget::{LoadBudget, ShareClass};
 use crate::engine::context::{QueryWorkLease, QueryWorkScope};
 use crate::error::OmniError;
 use datafusion::physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder};
@@ -41,6 +42,8 @@ pub(in crate::engine) struct QueryResources {
     registry_memory: MemoryReservation,
     traversal: TraversalWork,
     work: QueryWorkScope,
+    /// A csv load's shares of this pool, carved per run by `ValidateExec`.
+    load_budget: Mutex<Option<Arc<LoadBudget>>>,
 }
 
 /// Monotonic statement-wide work admission. Child operators and repeated
@@ -102,6 +105,60 @@ impl BufferRegistry {
 struct BufferCharge {
     _buffer: Buffer,
     reservation: MemoryReservation,
+    share: Option<LoadShare>,
+}
+
+impl BufferCharge {
+    /// The same allocation charged wider, under the share it was registered in.
+    fn grow(&self, more: usize) -> DfResult<()> {
+        match &self.share {
+            Some(share) => {
+                share.charge("graph Arrow allocation", more)?;
+                self.reservation.grow(more);
+                Ok(())
+            }
+            None => self.reservation.try_grow(more),
+        }
+    }
+}
+
+impl Drop for BufferCharge {
+    fn drop(&mut self) {
+        if let Some(share) = &self.share {
+            share.release(self.reservation.size());
+        }
+    }
+}
+
+/// One memory's share of the run's load budget: the class it charges and
+/// the budget it charged, which its releases return to.
+#[derive(Clone, Debug)]
+struct LoadShare {
+    budget: Arc<LoadBudget>,
+    class: ShareClass,
+}
+
+impl LoadShare {
+    fn charge(&self, consumer: &str, bytes: usize) -> DfResult<()> {
+        self.budget.charge(self.class, bytes).map_err(|actual| {
+            tracing::debug!(
+                consumer,
+                class = ?self.class,
+                bytes,
+                actual,
+                "load memory share refused"
+            );
+            super::external(OmniError::resource_limit(
+                "query_memory_bytes",
+                self.budget.limit(),
+                actual,
+            ))
+        })
+    }
+
+    fn release(&self, bytes: usize) {
+        self.budget.release(self.class, bytes);
+    }
 }
 
 fn charged_size(buffer: &Buffer) -> usize {
@@ -109,6 +166,30 @@ fn charged_size(buffer: &Buffer) -> usize {
         .capacity()
         .max(buffer.len())
         .saturating_add(std::mem::size_of::<BufferCharge>() + 32)
+}
+
+/// The Arrow bytes `hold` registers for `batch`: every buffer, null bitmap
+/// and child buffer at its charged size, shared buffers counted once each
+/// time they appear; what a copy of the batch costs its holder.
+pub(in crate::engine) fn batch_bytes(batch: &RecordBatch) -> usize {
+    fn bytes(data: &ArrayData) -> usize {
+        data.buffers()
+            .iter()
+            .chain(data.nulls().map(|nulls| nulls.buffer()))
+            .map(charged_size)
+            .fold(0usize, usize::saturating_add)
+            .saturating_add(
+                data.child_data()
+                    .iter()
+                    .map(bytes)
+                    .fold(0usize, usize::saturating_add),
+            )
+    }
+    batch
+        .columns()
+        .iter()
+        .map(|column| bytes(&column.to_data()))
+        .fold(0usize, usize::saturating_add)
 }
 
 #[derive(Debug, Default)]
@@ -140,7 +221,16 @@ impl QueryResources {
             buffers: Mutex::new(BufferRegistry::default()),
             traversal: TraversalWork::new(traversal_limit),
             work,
+            load_budget: Mutex::new(None),
         }
+    }
+
+    fn load_budget(&self) -> Option<Arc<LoadBudget>> {
+        locked(&self.load_budget).clone()
+    }
+
+    fn set_load_budget(&self, budget: Arc<LoadBudget>) {
+        *locked(&self.load_budget) = Some(budget);
     }
 
     fn refused(&self, owner: &str) {
@@ -161,7 +251,18 @@ impl QueryResources {
         Ok(reservation)
     }
 
-    fn batch(&self, batch: &RecordBatch) -> DfResult<BatchLease> {
+    /// A lease's handle metadata: tried on the pool for a query; under a load
+    /// share counted past it, within the budget's uncharged 64ths.
+    fn handles(&self, bytes: usize, shared: bool) -> DfResult<MemoryReservation> {
+        if !shared {
+            return self.unrecorded("graph batch handles", bytes);
+        }
+        let reservation = MemoryConsumer::new("graph batch handles").register(&self.pool);
+        reservation.grow(bytes);
+        Ok(reservation)
+    }
+
+    fn batch(&self, batch: &RecordBatch, share: Option<&LoadShare>) -> DfResult<BatchLease> {
         fn buffers(data: &ArrayData) -> usize {
             data.buffers().len()
                 + usize::from(data.nulls().is_some())
@@ -172,15 +273,12 @@ impl QueryResources {
             .iter()
             .map(|column| buffers(&column.to_data()))
             .sum();
-        let metadata = self.unrecorded(
-            "graph batch handles",
-            count.saturating_add(1).saturating_mul(64),
-        )?;
+        let metadata = self.handles(count.saturating_add(1).saturating_mul(64), share.is_some())?;
         let mut leases = Vec::with_capacity(count);
         let mut registry = locked(&self.buffers);
         registry.sweep();
         for column in batch.columns() {
-            self.array(&column.to_data(), &mut registry, &mut leases)?;
+            self.array(&column.to_data(), &mut registry, &mut leases, share)?;
         }
         Ok(BatchLease {
             _charges: leases,
@@ -193,6 +291,7 @@ impl QueryResources {
         data: &ArrayData,
         registry: &mut BufferRegistry,
         leases: &mut Vec<Arc<BufferCharge>>,
+        share: Option<&LoadShare>,
     ) -> DfResult<()> {
         for buffer in data
             .buffers()
@@ -204,7 +303,7 @@ impl QueryResources {
             if let Some(charge) = registry.charges.get(&key).and_then(Weak::upgrade) {
                 let recorded = charge.reservation.size();
                 if size > recorded {
-                    charge.reservation.try_grow(size - recorded)?;
+                    charge.grow(size - recorded)?;
                 }
                 leases.push(charge);
             } else {
@@ -218,19 +317,33 @@ impl QueryResources {
                     .saturating_mul(2)
                     .saturating_mul(std::mem::size_of::<(usize, Weak<BufferCharge>)>() + 1);
                 if target > self.registry_memory.size() {
-                    self.registry_memory
-                        .try_grow(target - self.registry_memory.size())?;
+                    let growth = target - self.registry_memory.size();
+                    match share {
+                        Some(_) => self.registry_memory.grow(growth),
+                        None => self.registry_memory.try_grow(growth)?,
+                    }
                 }
+                let reservation = match share {
+                    Some(share) => {
+                        share.charge("graph Arrow allocation", size)?;
+                        let reservation =
+                            MemoryConsumer::new("graph Arrow allocation").register(&self.pool);
+                        reservation.grow(size);
+                        reservation
+                    }
+                    None => self.unrecorded("graph Arrow allocation", size)?,
+                };
                 let charge = Arc::new(BufferCharge {
                     _buffer: buffer.clone(),
-                    reservation: self.unrecorded("graph Arrow allocation", size)?,
+                    reservation,
+                    share: share.cloned(),
                 });
                 registry.charges.insert(key, Arc::downgrade(&charge));
                 leases.push(charge);
             }
         }
         for child in data.child_data() {
-            self.array(child, registry, leases)?;
+            self.array(child, registry, leases, share)?;
         }
         Ok(())
     }
@@ -259,6 +372,19 @@ pub(in crate::engine) struct WorkMemory {
     checkpoint: WorkCheckpoint,
     batches: Mutex<Vec<BatchLease>>,
     cancelled: Arc<QueryCancellation>,
+    /// The load share class this memory charges, inherited by its children;
+    /// `share` is the run's budget resolved at the first charge.
+    class: Option<ShareClass>,
+    share: OnceLock<Option<LoadShare>>,
+}
+
+impl Drop for WorkMemory {
+    fn drop(&mut self) {
+        let held = self.scratch.size();
+        if held > 0 {
+            self.release_share(held);
+        }
+    }
 }
 
 impl WorkMemory {
@@ -280,7 +406,58 @@ impl WorkMemory {
             checkpoint: Arc::new(Mutex::new(HashMap::new())),
             batches: Mutex::new(Vec::new()),
             cancelled: Arc::new(QueryCancellation::default()),
+            class: None,
+            share: OnceLock::new(),
         })
+    }
+
+    /// Charge this memory's work on `class`'s share of the run's load budget,
+    /// children included; the budget is the one set when the memory first
+    /// charges, so a run's releases reach its own shares.
+    pub(in crate::engine) fn in_share(mut self, class: ShareClass) -> Self {
+        self.class = Some(class);
+        self
+    }
+
+    fn share(&self) -> Option<&LoadShare> {
+        let class = self.class?;
+        self.share
+            .get_or_init(|| {
+                self.resources
+                    .load_budget()
+                    .map(|budget| LoadShare { budget, class })
+            })
+            .as_ref()
+    }
+
+    fn release_share(&self, bytes: usize) {
+        if let Some(share) = self.share.get().and_then(Option::as_ref) {
+            share.release(bytes);
+        }
+    }
+
+    /// Carve the run's load budget from the pool's room now, `partitions`
+    /// ways (`holders` when the plan sizes unique holders); `Err` is the
+    /// refusal when a partition's share is under `floor`, the source bytes
+    /// it needs before it can cut a slice.
+    pub(in crate::engine) fn carve_load_budget(
+        &self,
+        partitions: usize,
+        holders: bool,
+        floor: usize,
+    ) -> DfResult<()> {
+        let reserved = u64::try_from(self.resources.pool.reserved()).unwrap_or(u64::MAX);
+        let budget = LoadBudget::carve(self.resources.limit, reserved, partitions, holders);
+        budget.admit(floor).map_err(|actual| {
+            self.resources.refused(&self.name);
+            super::external(OmniError::resource_limit(
+                "query_memory_bytes",
+                self.resources.limit,
+                actual,
+            ))
+        })?;
+        self.resources.set_load_budget(Arc::new(budget));
+        Ok(())
     }
 
     /// Run each CPU poll on a blocking worker, releasing that thread on Pending.
@@ -460,6 +637,8 @@ impl WorkMemory {
             checkpoint: Arc::clone(&self.checkpoint),
             batches: Mutex::new(Vec::new()),
             cancelled: Arc::clone(&self.cancelled),
+            class: self.class,
+            share: OnceLock::new(),
         })
     }
 
@@ -509,9 +688,19 @@ impl WorkMemory {
 
     pub(in crate::engine) fn grow(&self, bytes: usize) -> DfResult<()> {
         self.check()?;
-        self.scratch
-            .try_grow(bytes)
-            .inspect_err(|_| self.resources.refused(&self.name))
+        match self.share() {
+            Some(share) => {
+                share
+                    .charge(&self.name, bytes)
+                    .inspect_err(|_| self.resources.refused(&self.name))?;
+                self.scratch.grow(bytes);
+                Ok(())
+            }
+            None => self
+                .scratch
+                .try_grow(bytes)
+                .inspect_err(|_| self.resources.refused(&self.name)),
+        }
     }
 
     /// Raise this work's charge to `bytes` where it is lower; a charge already
@@ -529,14 +718,25 @@ impl WorkMemory {
     /// `false` then, with no refusal recorded, since the query goes on.
     pub(in crate::engine) fn grow_if_free(&self, bytes: usize) -> DfResult<bool> {
         self.check()?;
-        Ok(self.scratch.try_grow(bytes).is_ok())
+        Ok(match self.share() {
+            Some(share) => {
+                let admitted = share.charge(&self.name, bytes).is_ok();
+                if admitted {
+                    self.scratch.grow(bytes);
+                }
+                admitted
+            }
+            None => self.scratch.try_grow(bytes).is_ok(),
+        })
     }
 
     /// Lower this work's charge to `bytes` once its peak has passed; a charge
     /// already at or under `bytes`, or freed meanwhile, stays as it is.
     pub(in crate::engine) fn shrink_to(&self, bytes: usize) {
         let excess = self.scratch.size().saturating_sub(bytes);
-        let _ = self.scratch.try_shrink(excess);
+        if self.scratch.try_shrink(excess).is_ok() {
+            self.release_share(excess);
+        }
     }
 
     /// Reserve conservative capacity for collection entries, including element
@@ -558,7 +758,7 @@ impl WorkMemory {
         self.check()?;
         let lease = self
             .resources
-            .batch(batch)
+            .batch(batch, self.share())
             .inspect_err(|_| self.resources.refused(&self.name))?;
         locked(&self.batches).push(lease);
         Ok(())
@@ -566,16 +766,18 @@ impl WorkMemory {
 
     pub(in crate::engine) fn release_work(&self) {
         locked(&self.batches).clear();
-        self.scratch.free();
+        let freed = self.scratch.free();
+        self.release_share(freed);
     }
 
     pub(in crate::engine) fn output(&self, batch: &RecordBatch) -> DfResult<()> {
         let lease = self
             .resources
-            .batch(batch)
+            .batch(batch, self.share())
             .inspect_err(|_| self.resources.refused(&self.name))?;
         *locked(&self.batches) = vec![lease];
-        self.scratch.free();
+        let freed = self.scratch.free();
+        self.release_share(freed);
         Ok(())
     }
 

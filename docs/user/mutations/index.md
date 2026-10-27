@@ -270,10 +270,23 @@ The [`query_memory_bytes`](../queries/settings.md) setting bounds one
 `load csv` statement's tracked memory as a whole: the retained source, every
 decoded batch, validation state and the staging working set; a streaming
 overwrite's working set is its open fragments and the writers in flight.
-A statement the allowance cannot hold refuses with the `query_memory_bytes`
-resource error before any fragment write.
-A CSV load needs roughly the source plus twice its typed input under that
-allowance.
+An overwrite admits that memory once, before any partition reads: what the
+statement already holds comes off the top, and the rest is shared out, 52 of
+64 parts equally across the parse partitions (60 when the type has no unique
+check), 8 to the unique holders, 4 uncharged for lease bookkeeping and the
+fragment sink's open chunks, a copy of rows each partition's reader already
+charged. A partition's share holds its source pieces, its decoding and every
+batch it decoded twice over (the batch and the sink's copy of it) with that
+batch's validation facts, charged by the partition's own reader in source
+order, so whether a load refuses and the
+`actual` it reports (the smallest limit that would have admitted the charge)
+are the same on every run. A share under the partition's source admission
+plus one slice refuses before anything is read; a refused run of several
+partitions is rerun as one partition that holds the whole partition share,
+and that run's refusal is the one reported. A statement the allowance cannot
+hold refuses with the `query_memory_bytes` resource error before any fragment
+write. A partition needs roughly its source range plus twice its typed rows
+within its share.
 The source object is bounded by `load_source_max_bytes` before it is read
 (refused as `csv_source_bytes`).
 An overwrite probes the object's metadata once, then each parse partition
