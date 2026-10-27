@@ -574,7 +574,9 @@ fn stamp_no_by_source_delete(transaction: &mut Transaction) {
 /// indexes: a `CreateIndex`, such as a full-text declaration
 /// ([`TableStore::stage_full_text_declarations`]), an index build or a fold.
 /// Lance applies `CreateIndex` with every fragment of the version it read
-/// unchanged, so it moves no row.
+/// unchanged, so it moves no row; the
+/// `rfc_0067_create_index_keeps_every_fragment_of_its_read_version` guard pins
+/// that apply.
 pub(crate) fn is_index_only_commit(transaction: &Transaction, expected_read_version: u64) -> bool {
     transaction.read_version == expected_read_version
         && matches!(&transaction.operation, Operation::CreateIndex { .. })
