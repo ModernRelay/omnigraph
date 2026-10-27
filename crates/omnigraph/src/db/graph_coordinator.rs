@@ -646,8 +646,9 @@ impl GraphCoordinator {
     }
 
     /// The commit `snapshot_id` names and the graph as of it, from its record:
-    /// held by this coordinator, else in `__history`, else in a live branch.
-    /// Refused once the branch incarnation that wrote it is not live.
+    /// held by this coordinator, else on the branch a lookup last found its
+    /// block on, else in `__history`, else in a live branch. Refused once the
+    /// branch incarnation that wrote it is not live.
     async fn commit_state(&self, snapshot_id: &SnapshotId) -> Result<CommitState> {
         let session = self.manifest.control_session();
         let id = snapshot_id.as_str();
@@ -665,14 +666,7 @@ impl GraphCoordinator {
         }
         let record = match self.manifest.held_record(id) {
             Some(record) => Some(record),
-            None => match self
-                .history()
-                .read_record(self.root_uri(), &session, id)
-                .await?
-            {
-                Some(record) => Some(record),
-                None => self.record_in_live_branches(id).await?,
-            },
+            None => self.record_held_elsewhere(id).await?,
         };
         match record {
             Some(record) => settled_commit_state(self.root_uri(), &session, record).await,
@@ -701,10 +695,23 @@ impl GraphCoordinator {
     }
 
     /// The record of the published commit `id`: held by this coordinator,
-    /// else in `__history`, else in a live branch. `None` for an id no
-    /// published commit has.
+    /// else on the branch a lookup last found its block on, else in
+    /// `__history`, else in a live branch. `None` for an id no published
+    /// commit has.
     pub(crate) async fn published_record(&self, id: &str) -> Result<Option<HistoryRecord>> {
         if let Some(record) = self.manifest.held_record(id) {
+            return Ok(Some(record));
+        }
+        self.record_held_elsewhere(id).await
+    }
+
+    /// The record of a published commit this coordinator does not hold: on
+    /// the branch a lookup last found a commit of its history block on, else
+    /// in `__history`, else in a live branch. The first answers a branch's
+    /// commits read one after another, as a history list or a review does,
+    /// with one branch scan instead of a scan of every live branch each.
+    async fn record_held_elsewhere(&self, id: &str) -> Result<Option<HistoryRecord>> {
+        if let Some(record) = self.manifest.record_in_hinted_branch(id).await? {
             return Ok(Some(record));
         }
         let session = self.manifest.control_session();
@@ -754,7 +761,8 @@ impl GraphCoordinator {
     }
 
     /// The commit `snapshot_id` names: the head of the active branch or a
-    /// commit its `__manifest` buffers, a settled commit of `__history`, or
+    /// commit its `__manifest` buffers, a commit buffered on the branch a
+    /// lookup last found its block on, a settled commit of `__history`, or
     /// what [`Self::record_in_live_branches`] finds.
     pub async fn resolve_commit(&self, snapshot_id: &SnapshotId) -> Result<GraphCommit> {
         let id = snapshot_id.as_str();
@@ -763,6 +771,9 @@ impl GraphCoordinator {
         }
         if let Some(commit) = self.history().get_commit(id) {
             return Ok(commit);
+        }
+        if let Some(record) = self.manifest.record_in_hinted_branch(id).await? {
+            return Ok(graph_commit_from_manifest_row(record.commit));
         }
         let session = self.manifest.control_session();
         if let Some(commit) = self
