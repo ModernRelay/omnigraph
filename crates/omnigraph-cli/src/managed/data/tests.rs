@@ -246,6 +246,11 @@ async fn valid_data_credential_remains_usable_when_control_expires_during_discov
                 assert_eq!(data.requests().len(), 2);
                 assert_eq!(data.requests()[1].headers["authorization"], expected);
                 assert_eq!(
+                    std::fs::read_to_string(&calls).unwrap(),
+                    "called\n",
+                    "the valid data request does not renew its expired control credential",
+                );
+                assert_eq!(
                     authentication
                         .token()
                         .await
@@ -253,7 +258,11 @@ async fn valid_data_credential_remains_usable_when_control_expires_during_discov
                         .downcast_ref::<crate::credential_sources::CredentialError>(),
                     Some(&crate::credential_sources::CredentialError::Expired)
                 );
-                assert_eq!(std::fs::read_to_string(&calls).unwrap(), "called\n");
+                assert_eq!(
+                    std::fs::read_to_string(&calls).unwrap(),
+                    "called\ncalled\n",
+                    "explicit control acquisition retries the helper, which still returns an expired credential",
+                );
                 data.assert_complete();
             })
             .await;
