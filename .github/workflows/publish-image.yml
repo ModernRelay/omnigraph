@@ -211,11 +211,14 @@ jobs:
       # image; Docker Hub carries no attestation of its own.
       - name: Attest image provenance
         if: steps.provenance.outputs.attest == 'true'
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ steps.push.outputs.image }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
+          # Storage records need `artifact-metadata: write`, which this job does
+          # not grant; left on, every run would fail to create one and warn.
+          create-storage-record: false
 
       # Docker Hub is the primary public distribution channel (anonymous pulls
       # for deployments). Skipped when the DOCKERHUB_* secrets are not
