@@ -1,5 +1,5 @@
 # issue: none
-# notes: CSV fixtures keep their source policy before and after a DST restart; a failed publication keeps the graph unchanged.
+# notes: CSV fixtures keep their source policy before and after a DST restart; a failure before the publication point keeps the graph unchanged, one past it leaves the publication durable.
 
 --- runner
 timeout_ms: 10000
@@ -85,6 +85,84 @@ query unchanged_before_publish() { match { $p: Person } return { $p.name } }
 --- expect unordered
 {"p.name":"alice"}
 {"p.name":"bob"}
+--- expect shape
+p.name: String
+
+--- seam
+at: mutation.post_table_commit
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+load csv "replacement.csv" into node:Person mode overwrite header
+--- expect error: injected failpoint triggered: mutation.post_table_commit
+
+--- restart
+--- query
+query unchanged_after_table_commit() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+--- expect shape
+p.name: String
+
+--- seam
+at: publish.pre_merge
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+load csv "replacement.csv" into node:Person mode overwrite header
+--- expect error: injected failpoint triggered: publish.pre_merge
+
+--- restart
+--- query
+query unchanged_before_merge() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+--- expect shape
+p.name: String
+
+--- seam
+at: publish.post_merge_pre_ack
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+load csv "replacement.csv" into node:Person mode overwrite header
+--- expect ok
+
+--- restart
+--- query
+query durable_past_the_merge() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"carol"}
+--- expect shape
+p.name: String
+
+--- mutate
+load csv "people.csv" into node:Person mode overwrite header
+--- expect ok
+
+--- seam
+at: graph_publish.after_manifest_commit
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+load csv "replacement.csv" into node:Person mode overwrite header
+--- expect error: injected failpoint triggered: graph_publish.after_manifest_commit
+
+--- restart
+--- query
+query durable_past_the_manifest_commit() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"carol"}
 --- expect shape
 p.name: String
 

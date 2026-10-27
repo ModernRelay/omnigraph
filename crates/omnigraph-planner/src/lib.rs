@@ -80,6 +80,7 @@ pub use physical::{
     PhysicalNode, PhysicalNodeKind, PhysicalPlan, PipelineShape, PipelineSink, PipelineSource,
     PipelineSpec, Prefilter, PrefilterMode, Properties, ROW_ADDRESS_PREFIX, RankArm, RankKind,
     RankScope, RankedAccess, ScanInput, SideChain, StatisticSource, operator_rows,
+    validate_streams,
 };
 pub use registry::{Coverage, Entry, Route, Shape};
 pub use route::RouteOverride;
