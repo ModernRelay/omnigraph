@@ -276,15 +276,24 @@ key, since the precondition fences the earlier copy. Its conflict does not: S3
 answers 409, which `object_store` reports as "already exists", while another
 conditional write to the key is in flight, and that write may be the earlier
 copy. The storage adapter's `write_text_if_absent` and `write_text_if_match`
-re-issue an ambiguous answer unchanged, up to four times with pauses doubling
-from 0.2 to 1.6 seconds, and return a refusal at once. After a conflict that an
-earlier copy may explain, after a refused re-issue, or after the last lost
-answer, they read the key back: equal bytes are this request's, a key that
-shows the precondition failed settles at the scope, and a key that still
-satisfies it leaves the write unresolved. An unscoped S3 or Azure client
-retries internally, so its first conflict is read back too. Local filesystem
-puts finish before they answer and publish last, so a local error is a refusal
-there. `forbidden_apis.rs`
+resolve their answers by `omnigraph_storage::conditional`, the one policy the
+manifest commit handler uses too: an ambiguous answer is re-issued unchanged,
+up to `CONDITIONAL_REQUEST_REISSUES` (four) times with pauses doubling from 0.2
+to 1.6 seconds, and the first copy's refusal returns at once. After a conflict
+that an earlier copy may explain or the last lost or refused re-issue, they
+read the key back: equal bytes are this request's, a key that shows the
+precondition failed settles at the scope, and a key that still satisfies it
+leaves the write unresolved. Equal bytes can be read as this request's only
+because every caller's `contents` names its writer: a lock id, a lease
+sequence in the owner's directory, an init claim's attempt id. The prepared
+graph-create claim names its apply for that reason. A state or
+content-addressed object whose bytes are the effect is the same write when the
+bytes match. An unscoped S3 or Azure client retries internally (its
+`max_retries`, and an S3 if-match's 409), so its first conflict is read back
+too and its permission or authentication error is ambiguous, where a scope's
+single-attempt client makes both definite. Local filesystem puts finish before
+they answer and publish last (`LocalFileSystem::new()`, fsync off), so a local
+error is a refusal there. `forbidden_apis.rs`
 (`mutable_key_requests_are_registered_issue_1067`) registers every
 unconditional request to a reused key in the engine, core, catalog, storage,
 cluster, server and Azure admission crates with why its late landing is

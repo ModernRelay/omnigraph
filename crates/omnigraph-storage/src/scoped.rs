@@ -552,19 +552,12 @@ pub(crate) struct Mutation {
 /// Whether a request was refused before it could apply: by the store, or by
 /// this scope before sending it. Every request that can leave a key
 /// unsettled goes to a single-attempt client, so no earlier copy of it was
-/// sent.
-pub(crate) fn refused_before_applying(error: &object_store::Error) -> bool {
-    match error {
-        object_store::Error::Generic { store, .. } => *store == OWNED_STORE_NAME,
-        object_store::Error::NotFound { .. }
-        | object_store::Error::InvalidPath { .. }
-        | object_store::Error::NotSupported { .. }
-        | object_store::Error::NotImplemented { .. }
-        | object_store::Error::UnknownConfigurationKey { .. }
-        | object_store::Error::PermissionDenied { .. }
-        | object_store::Error::Unauthenticated { .. } => true,
-        _ => false,
-    }
+/// sent, and the shared classification's single-attempt rule applies.
+fn refused_before_applying(error: &object_store::Error) -> bool {
+    crate::conditional::classify_failed_request(
+        error,
+        crate::conditional::RequestClient::SingleAttempt,
+    ) == crate::conditional::FailedRequest::Refused
 }
 
 impl Mutation {

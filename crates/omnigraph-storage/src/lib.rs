@@ -23,6 +23,10 @@ pub use binding::{CapturedStorageBinding, StorageDestination, storage_handle_for
 mod scoped;
 pub use scoped::{OWNED_STORE_NAME, StorageIoScope};
 
+pub mod conditional;
+use conditional::{Answer, ConditionalRequest, Resolution, Step};
+pub use conditional::{CONDITIONAL_REQUEST_REISSUES, RequestClient};
+
 pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// The typed condition established at a storage-substrate boundary.
@@ -1067,11 +1071,13 @@ pub trait StorageAdapter: Debug + Send + Sync {
     /// best-effort cleanup on partial failure.
     ///
     /// A lost answer is re-issued unchanged, a bounded number of times, and
-    /// a refusal returns at once. When an earlier copy of this request may be
-    /// what the key holds (after a re-issue, or on a client that retries
-    /// internally), the key is read back and equal bytes mean this call
-    /// created it, so `contents` must identify its writer. An error after a
-    /// lost answer means the object was still absent and a copy may land.
+    /// a refusal returns at once (see [`conditional`]). When an earlier copy
+    /// of this request may be what the key holds (after a re-issue, or on a
+    /// client that retries internally), the key is read back and equal bytes
+    /// mean this call created it. `contents` must therefore identify its
+    /// writer: two callers that write the same bytes cannot tell their
+    /// creates apart, and both can read `Ok(true)`. An error after a lost
+    /// answer means the object was still absent and a copy may land.
     async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool>;
     /// Return whether an exact object or any object recursively below this
     /// URI exists. The prefix probe stops after its first result and
@@ -1711,24 +1717,86 @@ impl ObjectStorageAdapter {
         storage_backend_error("write_if_absent", uri, err)
     }
 
-    /// What one answer to a conditional put settles. The local filesystem
-    /// finishes a put before it answers and publishes it last, by a link or
-    /// a rename with no fsync after it, so its error means the put did not
-    /// apply.
-    fn conditional_answer(&self, error: &object_store::Error, update: bool) -> ConditionalAnswer {
-        match conditional_answer(error, update) {
-            ConditionalAnswer::Ambiguous if self.codec == UriCodec::Local => {
-                ConditionalAnswer::Refused
-            }
-            answer => answer,
+    /// The client that carries this adapter's conditional requests. An
+    /// unscoped remote client retries internally, so its answer can follow
+    /// an earlier copy of the same request; a scope's client sends once.
+    fn request_client(&self) -> RequestClient {
+        if self.scope.is_none()
+            && matches!(self.codec, UriCodec::S3 { .. } | UriCodec::Azure { .. })
+        {
+            RequestClient::Repeating
+        } else {
+            RequestClient::SingleAttempt
         }
     }
 
-    /// Whether this adapter's client can send one conditional request more
-    /// than once on its own. An unscoped remote client retries internally,
-    /// so its precondition conflict can answer its own earlier copy.
-    fn conditional_requests_may_repeat(&self) -> bool {
-        self.scope.is_none() && matches!(self.codec, UriCodec::S3 { .. } | UriCodec::Azure { .. })
+    /// What one failed copy of a conditional put says; `update` is an
+    /// if-match. The local filesystem finishes a put before it answers and
+    /// publishes it last, by a link or a rename with no fsync after it
+    /// (`LocalFileSystem::new()` leaves fsync off), so its error means the
+    /// put did not apply.
+    fn conditional_answer<T>(
+        &self,
+        error: object_store::Error,
+        update: bool,
+    ) -> Answer<T, object_store::Error> {
+        match &error {
+            object_store::Error::Precondition { .. } => return Answer::Conflict(error),
+            // A create met an object. An if-match's "already exists" is S3's
+            // 409 for another conditional write to the key in flight: this
+            // copy did not apply and the version may still hold, so it is
+            // classified below and re-issued.
+            object_store::Error::AlreadyExists { .. } if !update => {
+                return Answer::Conflict(error);
+            }
+            // An if-match on an absent object can never apply.
+            object_store::Error::NotFound { .. } if update => return Answer::Conflict(error),
+            _ => {}
+        }
+        if self.codec == UriCodec::Local {
+            return Answer::Refused(error);
+        }
+        match conditional::classify_failed_request(&error, self.request_client()) {
+            conditional::FailedRequest::Refused => Answer::Refused(error),
+            conditional::FailedRequest::Ambiguous => Answer::Lost(error),
+        }
+    }
+
+    /// Send one conditional put until an answer ends it (see
+    /// [`ConditionalRequest`]). A first conflict ends it only on a
+    /// single-attempt client; on a repeating one it may answer this call's
+    /// own earlier copy.
+    async fn send_conditional_put(
+        &self,
+        op: &'static str,
+        location: &ObjectPath,
+        payload: &PutPayload,
+        mode: PutMode,
+    ) -> Resolution<object_store::PutResult, object_store::Error> {
+        let update = matches!(mode, PutMode::Update(_));
+        let mut request =
+            ConditionalRequest::new(self.request_client() == RequestClient::SingleAttempt);
+        loop {
+            let answer = match self
+                .store
+                .put_opts(location, payload.clone(), mode.clone().into())
+                .await
+            {
+                Ok(result) => Answer::Applied(result),
+                Err(error) => self.conditional_answer(error, update),
+            };
+            match request.answer(answer) {
+                Step::Done(resolution) => return resolution,
+                Step::Reissue {
+                    error,
+                    reissue,
+                    pause,
+                } => {
+                    log_conditional_reissue(op, reissue, &error);
+                    tokio::time::sleep(pause).await;
+                }
+            }
+        }
     }
 
     /// Read a key back after a conditional write: its bytes and its ETag,
@@ -1935,35 +2003,16 @@ impl StorageAdapter for ObjectStorageAdapter {
         // S3, a write still in flight that the store answered 409 over.
         let location = self.object_path(uri)?;
         let payload = PutPayload::from(contents.as_bytes().to_vec());
-        let mut reissues = 0;
-        let lost = loop {
-            let error = match self
-                .store
-                .put_opts(&location, payload.clone(), PutMode::Create.into())
-                .await
-            {
-                Ok(_) => return Ok(true),
-                Err(error) => error,
-            };
-            match self.conditional_answer(&error, false) {
-                ConditionalAnswer::Conflict
-                    if reissues == 0 && !self.conditional_requests_may_repeat() =>
-                {
-                    return Ok(false);
-                }
-                ConditionalAnswer::Refused if reissues == 0 => {
-                    return Err(self.create_if_absent_error(uri, error));
-                }
-                ConditionalAnswer::Ambiguous if reissues < CONDITIONAL_REQUEST_REISSUES => {
-                    reissues += 1;
-                    log_conditional_reissue("write_if_absent", reissues, &error);
-                    tokio::time::sleep(conditional_reissue_pause(reissues)).await;
-                }
-                // A conflict an earlier copy may explain, a refused re-issue,
-                // or the last lost answer: the key tells.
-                _ => break error,
-            }
+        let lost = match self
+            .send_conditional_put("write_if_absent", &location, &payload, PutMode::Create)
+            .await
+        {
+            Resolution::Applied { .. } => return Ok(true),
+            Resolution::Conflict(_) => return Ok(false),
+            Resolution::Refused(error) => return Err(self.create_if_absent_error(uri, error)),
+            Resolution::Unsettled { error, .. } => error,
         };
+        // Equal bytes are this call's: `contents` identifies its writer.
         match self.read_back(uri, &location).await? {
             Some((bytes, _)) => {
                 self.settle_failed_precondition(&location, &scoped::Precondition::Absent);
@@ -2360,43 +2409,26 @@ impl StorageAdapter for ObjectStorageAdapter {
                 version: None,
             };
             let precondition = scoped::Precondition::update(&version);
-            let mut reissues = 0;
-            let lost = loop {
-                let error = match self
-                    .store
-                    .put_opts(
-                        &location,
-                        payload.clone(),
-                        PutMode::Update(version.clone()).into(),
-                    )
-                    .await
-                {
-                    Ok(result) => {
-                        let etag = result.e_tag;
-                        #[cfg(test)]
-                        let etag = if self.omit_write_etag { None } else { etag };
-                        return Ok(Some(required_remote_etag("write_if_match", uri, etag)?));
-                    }
-                    Err(error) => error,
-                };
-                match self.conditional_answer(&error, true) {
-                    ConditionalAnswer::Conflict
-                        if reissues == 0 && !self.conditional_requests_may_repeat() =>
-                    {
-                        return Ok(None);
-                    }
-                    ConditionalAnswer::Refused if reissues == 0 => {
-                        return Err(storage_backend_error("write_if_match", uri, error));
-                    }
-                    ConditionalAnswer::Ambiguous if reissues < CONDITIONAL_REQUEST_REISSUES => {
-                        reissues += 1;
-                        log_conditional_reissue("write_if_match", reissues, &error);
-                        tokio::time::sleep(conditional_reissue_pause(reissues)).await;
-                    }
-                    // A conflict an earlier copy may explain, a refused
-                    // re-issue, or the last lost answer: the key tells.
-                    _ => break error,
+            let lost = match self
+                .send_conditional_put(
+                    "write_if_match",
+                    &location,
+                    &payload,
+                    PutMode::Update(version),
+                )
+                .await
+            {
+                Resolution::Applied { value: result, .. } => {
+                    let etag = result.e_tag;
+                    #[cfg(test)]
+                    let etag = if self.omit_write_etag { None } else { etag };
+                    return Ok(Some(required_remote_etag("write_if_match", uri, etag)?));
                 }
+                Resolution::Conflict(_) => return Ok(None),
+                Resolution::Refused(error) => {
+                    return Err(storage_backend_error("write_if_match", uri, error));
+                }
+                Resolution::Unsettled { error, .. } => error,
             };
             let Some((bytes, etag)) = self.read_back(uri, &location).await? else {
                 self.settle_failed_precondition(&location, &precondition);
@@ -2550,43 +2582,6 @@ pub fn storage_handle_for_uri_scoped(uri: &str, scope: StorageIoScope) -> Result
         adapter: Arc::new(adapter),
         kind,
     })
-}
-
-/// How many times a conditional control-object write re-issues a request
-/// whose answer was lost before it reads the key back.
-const CONDITIONAL_REQUEST_REISSUES: u32 = 4;
-
-/// The pause before re-issue `reissue`, counted from 1: 0.2 s doubling to
-/// 1.6 s.
-fn conditional_reissue_pause(reissue: u32) -> std::time::Duration {
-    std::time::Duration::from_millis(200 << reissue.saturating_sub(1).min(3))
-}
-
-/// What one answer to a conditional put settles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConditionalAnswer {
-    /// This copy did not apply against the key's state: the object exists,
-    /// or no longer holds the version an if-match named. An earlier copy
-    /// may be what the key holds.
-    Conflict,
-    /// Refused before it could apply; a re-issue would be refused too.
-    Refused,
-    /// The request may have applied, or may still.
-    Ambiguous,
-}
-
-fn conditional_answer(error: &object_store::Error, update: bool) -> ConditionalAnswer {
-    match error {
-        object_store::Error::Precondition { .. } => ConditionalAnswer::Conflict,
-        // An if-match on S3 maps 409, another conditional write to the key
-        // in flight, to "already exists": this copy did not apply, and the
-        // version may still hold.
-        object_store::Error::AlreadyExists { .. } if !update => ConditionalAnswer::Conflict,
-        // An if-match on an absent object can never apply.
-        object_store::Error::NotFound { .. } if update => ConditionalAnswer::Conflict,
-        error if scoped::refused_before_applying(error) => ConditionalAnswer::Refused,
-        _ => ConditionalAnswer::Ambiguous,
-    }
 }
 
 /// Logged with the error class alone: paths and messages can carry
@@ -5040,6 +5035,74 @@ mod tests {
         let single = ScriptedPutStore::new([PutScript::Repeat]);
         let adapter = scripted_adapter(&single, UriCodec::Memory, None);
         assert!(!adapter.write_text_if_absent(LOCK, "owner-a").await.unwrap());
+    }
+
+    /// What a failed copy says depends on the client and the store. A local
+    /// error means the put did not apply, so it is not re-issued. On a
+    /// repeating client, an authorization failure can follow an earlier
+    /// attempt that applied, so it is re-issued, and a first conflict over
+    /// an absent object (S3's 409 for a write still in flight) stays
+    /// unresolved. Equal bytes read back as this call's own, which is why
+    /// `contents` must identify its writer.
+    #[tokio::test(start_paused = true)]
+    async fn the_client_decides_what_a_failed_copy_says_issue_1067() {
+        let local_lock = "/omnigraph-test/lock.json";
+        let store = ScriptedPutStore::new([PutScript::LoseRequest]);
+        let adapter = scripted_adapter(&store, UriCodec::Local, None);
+        let error = adapter
+            .write_text_if_absent(local_lock, "owner-a")
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains("unresolved"), "{error}");
+        assert_eq!(store.puts(), 1, "a local error is not re-issued");
+
+        let s3_lock = "s3://bucket/lock.json";
+        let s3 = || UriCodec::S3 {
+            bucket: "bucket".to_string(),
+        };
+        let store = ScriptedPutStore::new([PutScript::Refuse]);
+        let adapter = scripted_adapter(&store, s3(), None);
+        assert!(
+            adapter
+                .write_text_if_absent(s3_lock, "owner-a")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.puts(),
+            2,
+            "a repeating client's authorization failure is re-issued"
+        );
+        let scope = StorageIoScope::new();
+        let store = ScriptedPutStore::new([PutScript::Refuse]);
+        let adapter = scripted_adapter(&store, s3(), Some(scope.clone()));
+        assert!(
+            adapter
+                .write_text_if_absent(s3_lock, "owner-a")
+                .await
+                .is_err()
+        );
+        assert_eq!(store.puts(), 1, "a scope's single attempt was refused");
+        assert!(!scope.is_uncertain());
+
+        let store = ScriptedPutStore::new([PutScript::InFlight]);
+        let adapter = scripted_adapter(&store, s3(), None);
+        let error = adapter
+            .write_text_if_absent(s3_lock, "owner-a")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unresolved"), "{error}");
+        assert_eq!(store.puts(), 1);
+
+        let store = ScriptedPutStore::new([PutScript::ForeignFirst("owner-a")]);
+        let adapter = scripted_adapter(&store, s3(), None);
+        assert!(
+            adapter
+                .write_text_if_absent(s3_lock, "owner-a")
+                .await
+                .unwrap(),
+            "equal bytes are this writer's: the contract callers rely on"
+        );
     }
 
     /// Through a storage scope: the owner's re-issue of a lost conditional

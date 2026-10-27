@@ -15201,7 +15201,7 @@ async fn manifest_create_without_a_definite_answer_stays_in_doubt_issue_1067() {
         fault
             .manifest_puts
             .load(std::sync::atomic::Ordering::SeqCst),
-        1 + crate::manifest_request::MANIFEST_REQUEST_REISSUES as usize,
+        1 + crate::manifest_request::CONDITIONAL_REQUEST_REISSUES as usize,
         "the original request and every re-issue"
     );
 }

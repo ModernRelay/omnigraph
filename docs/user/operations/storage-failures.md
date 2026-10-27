@@ -57,12 +57,19 @@ On S3 and Azure, a conditional write of a control object (the cluster lock and
 state, a deployment resource, a lease heartbeat or claim) whose answer was lost,
 timed out or throttled is re-issued unchanged, as a manifest request is: up to
 four times with about three seconds of pauses in total. A request the store
-refused before applying it, such as a permission or authentication error or a
-missing bucket or container, fails at once. When an earlier copy of the request
-may be what the object holds, the object is read back, and holding this
-request's bytes makes it this write's. An object still absent, or still at the
-expected version, once no re-issue settles the request leaves the write failed
-with its outcome unknown.
+refused before applying it, such as a missing bucket or container, fails at
+once, and so does a permission or authentication error on the server. When an
+earlier copy of the request may be what the object holds, the object is read
+back, and holding this request's bytes makes it this write's. An object still
+absent, or still at the expected version, once no re-issue settles the request
+leaves the write failed with its outcome unknown.
+
+A command that writes storage directly, without a server, uses a client that
+retries a request itself before any re-issue: up to its `max_retries` (10 by
+default), and on S3 an if-match that meets a conflicting write in flight too.
+Those attempts are not logged. Because one of them may have applied, that
+client's permission or authentication error is re-issued like a lost answer,
+and its first conflict is read back.
 
 A write to a reused key whose outcome is unknown refuses later writes to that
 key only, until a clean shutdown; a clean shutdown with such a key retains
@@ -124,8 +131,10 @@ paths; each records the failure's class.
 - `owned write ended without a definite outcome`: the status its response
   sends, 500 for `outcome_unknown`, and whether it contained the process.
 - `manifest request outcome unknown; re-issuing the identical conditional
-  request`, for each re-issue, and
-  `manifest request outcome unknown after every re-issue` when none settles.
+  request`, for each re-issue,
+  `manifest request outcome unknown after every re-issue` when none settles,
+  and `manifest version held after a re-issue` when a re-issue meets a
+  version that the earlier copy may hold, or may still be writing.
 - `re-issuing a conditional storage write whose answer was lost`, with the
   operation and the failure's class, for each re-issue of a control-object
   write.

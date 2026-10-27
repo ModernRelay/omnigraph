@@ -4,5 +4,9 @@
   request the store refused, such as a permission error, no longer leaves its
   key refused for the rest of the server's life. See
   [storage failures][control-object-reissue].
+- A graph commit whose manifest request was re-issued after a lost answer, and
+  whose re-issue then met a conflict, is no longer reported as failed while the
+  first request may still land on S3: its outcome stays unknown until a read
+  shows it.
 
 [control-object-reissue]: ../docs/user/operations/storage-failures.md#retries

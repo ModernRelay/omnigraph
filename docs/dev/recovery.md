@@ -196,7 +196,13 @@ attempt-local genesis before deciding the outcome:
   and preserves initialization artifacts and the claim.
 
 Cluster deployment persists an engine-issued `PreparedGraphCreate` before
-invocation. Its claim binds the exact root, genesis and source/IR contract.
+invocation. Its claim binds the exact root, genesis and source/IR contract by
+the token's digest, and names the apply that wrote it with a fresh attempt id:
+the storage adapter reads a create's lost answer back by the stored bytes, so
+two applies of one token must not write the same claim. Settlement recognizes
+the token's claim by digest, graph commit id and root, whichever apply wrote
+it, and still accepts the exact version-2 claim, without an attempt id, that
+earlier releases wrote.
 Read-only reconciliation recognizes that birth or returns `Absent`/`Unknown`;
 matching schema text is insufficient. After explicit prior-owner quiescence,
 `settle_prepared_graph_create_after_quiescence` may remove only that token's
