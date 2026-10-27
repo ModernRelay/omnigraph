@@ -1043,7 +1043,7 @@ durable_calls! {
     // primitive (graph-index artifact), same atomic-visibility PUT contract
     // as `write_text`.
     ("omnigraph-storage/lib.rs", ".put(", 5, WriteProtocol::Composed("object storage put primitive, including Azure rename destination publication and the binary write_bytes primitive")),
-    ("omnigraph-storage/lib.rs", ".put_opts(", 2, WriteProtocol::Composed("object storage conditional put primitive")),
+    ("omnigraph-storage/lib.rs", ".put_opts(", 1, WriteProtocol::Composed("object storage conditional put primitive (`send_conditional_put`, shared by create-if-absent and if-match)")),
     ("omnigraph-storage/lib.rs", ".put_multipart(", 1, WriteProtocol::Composed("Azure multipart rename staging")),
     ("omnigraph-storage/lib.rs", ".put_part(", 1, WriteProtocol::Composed("Azure multipart rename staging")),
     ("omnigraph-storage/lib.rs", ".complete(", 1, WriteProtocol::Composed("Azure multipart rename destination publication")),
