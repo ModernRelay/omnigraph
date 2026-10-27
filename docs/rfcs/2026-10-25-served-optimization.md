@@ -19,6 +19,49 @@ blocked_on:
 
 # RFC: Served optimization
 
+## In plain language
+
+**Purpose:** let an operator optimize a graph while its server stays running.
+
+**The problem:** as data changes, its storage can become fragmented.
+`optimize` reorganizes data files and maintains supported indexes so the engine
+can read them more efficiently, while preserving the graph's data. Today the
+command opens storage itself. Running it beside a server would introduce a
+second writer that the server does not control.
+
+**The proposed solution:** send the request to the server that already manages
+the graph. That server checks permission and available capacity, runs the
+existing engine operation, and returns a report of what happened. The command
+waits for that report. Reads can continue; writes may wait while optimization
+holds the resources it needs.
+
+**Key design decisions:**
+
+- **Keep management in the control plane.** For managed clusters, it decides
+  when to request work and keeps scheduling records, operational history and
+  collected logs. The server checks each request and owns its execution; the
+  engine performs the storage changes safely. A self-hosted operator can call
+  the server directly without a control plane.
+- **Keep the server interface small.** One request optimizes one graph's
+  `main` branch and returns its result. The server does not gain a persistent
+  jobs database, automatic scheduler or maintenance recovery command. Looking
+  up an individual operation after disconnect is outside this first slice.
+- **Reuse the existing safety rules.** The engine makes the optimized graph
+  visible as one complete change. The server enforces permissions and work
+  limits, and admits only one optimization at a time per cluster. Optimization
+  still consumes server resources; this proposal does not move the computation
+  to the control plane or promise maintenance without impact on other work.
+- **Be honest when the answer is lost.** Losing the connection does not cancel
+  the work. If the caller never receives the result, the outcome is unknown;
+  neither the CLI nor the control plane automatically submits it again. The
+  server does not promise to recover that request's report after a restart.
+
+**The tradeoff:** this gives operators a safe way to request optimization with
+little new server machinery. It deliberately gives up guaranteed recovery of
+every request's result after a crash. The control plane can keep a history of
+what it requested and observed, but cannot turn a missing answer into proof
+that the work succeeded or failed.
+
 ## Summary
 
 Expose `optimize` through the server that already owns the cluster. The server
