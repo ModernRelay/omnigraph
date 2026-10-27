@@ -1,4 +1,5 @@
-# issue: none
+# issue: 1160
+# red_on: aee2a02a; the refusal reported the pool's total at the refused grow, which depends on the order the partition threads reached the pool, so one seed reported `actual 26677` on one machine and `26285` on a loaded runner: a DST replay mismatch.
 # notes: An integer-keyed edge load is admitted against `query_memory_bytes` for its source, batches,
 # notes: the key set with its scan and build buffers (admitted before the parse, released after the drain) and
 # notes: the staged rows: 26,289 bytes at the 8-key shape on the local filesystem. 25 KiB refuses and keeps
