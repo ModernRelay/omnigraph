@@ -2290,6 +2290,10 @@ error_codes! {
     /// The credential's actor may not do this: policy denies the action, or
     /// the action needs a policy permit the server has not been given.
     Forbidden = "forbidden", [403];
+    /// The OIDC access token is valid, but the server admits no principal for
+    /// its subject. Signing in again issues a token for the same subject and
+    /// cannot help; the server's operator must admit the identity.
+    NotAdmitted = "not_admitted", [403];
     /// The request is malformed or invalid: a body, query string, path
     /// parameter or header that does not decode, a query the compiler
     /// refuses (see `diagnostic`), or a value refused before any effect.
@@ -2426,6 +2430,7 @@ impl ErrorCode {
             }
             // The request itself is wrong; no state it could read changes that.
             Self::Unauthorized
+            | Self::NotAdmitted
             | Self::BadRequest
             | Self::ApiContractMismatch
             | Self::ActorMismatch

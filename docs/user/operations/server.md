@@ -106,8 +106,8 @@ Choose one static token source:
 
 Send `Authorization: Bearer secret-a` (the scheme is case-insensitive). The token selects the
 actor for authorization and commit attribution; clients cannot claim another actor. See
-[Authorization and actors](policy.md). Every 401 carries a `WWW-Authenticate: Bearer` challenge,
-with `error="invalid_token"` when the server refused the token sent.
+[Authorization and actors](policy.md). Every 401 carries a `WWW-Authenticate: Bearer` challenge, with `error="invalid_token"` when
+the server refused the token sent; a valid OIDC token it does not admit gets 403 ([MCP](mcp.md)).
 
 A server with neither static tokens, signed-token trust, nor policy refuses to start unless you explicitly
 pass `--unauthenticated` (or set `OMNIGRAPH_UNAUTHENTICATED=1`). Use that only

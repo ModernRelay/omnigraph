@@ -1080,7 +1080,14 @@ impl AppState {
         snapshot.any_per_graph_policy
     }
 
-    fn authenticate_bearer_token(&self, provided_token: &str) -> Option<AuthenticatedActor> {
+    /// The actor a bearer token resolves to: a static token, then a signed
+    /// data token, then OIDC. Only OIDC tells a refused token from an
+    /// unadmitted or temporarily unverifiable identity; every other miss is
+    /// an invalid token.
+    fn authenticate_bearer_token(
+        &self,
+        provided_token: &str,
+    ) -> std::result::Result<AuthenticatedActor, oidc_identity::OidcRefusal> {
         // Hash the incoming token and compare against every stored digest in
         // constant time. Iterate all entries unconditionally so total work —
         // and therefore response timing — doesn't depend on which slot matches.
@@ -1091,20 +1098,27 @@ impl AppState {
                 matched = Some(Arc::clone(actor));
             }
         }
-        matched.map(AuthenticatedActor::cluster_static).or_else(|| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?
-                .as_secs();
-            self.data_token_trust
-                .as_ref()
-                .and_then(|trust| trust.verify_authenticated_at(provided_token, now))
-                .or_else(|| {
-                    self.oidc_identity_trust
-                        .as_ref()?
-                        .verify_at(provided_token, i64::try_from(now).ok()?)
-                })
-        })
+        if let Some(actor) = matched {
+            return Ok(AuthenticatedActor::cluster_static(actor));
+        }
+        let Some(now) = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|elapsed| elapsed.as_secs())
+        else {
+            return Err(oidc_identity::OidcRefusal::Invalid);
+        };
+        if let Some(actor) = self
+            .data_token_trust
+            .as_ref()
+            .and_then(|trust| trust.verify_authenticated_at(provided_token, now))
+        {
+            return Ok(actor);
+        }
+        match (self.oidc_identity_trust.as_ref(), i64::try_from(now)) {
+            (Some(trust), Ok(now)) => trust.check_at(provided_token, now),
+            _ => Err(oidc_identity::OidcRefusal::Invalid),
+        }
     }
 }
 
@@ -1150,6 +1164,25 @@ impl ApiError {
 
     pub fn forbidden(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Forbidden, message)
+    }
+
+    /// HTTP 403 for a valid OIDC token whose subject this server does not
+    /// admit. No challenge: signing in again cannot help.
+    pub(crate) fn not_admitted() -> Self {
+        Self::new(
+            ErrorCode::NotAdmitted,
+            "the signed-in identity is not admitted to this server",
+        )
+    }
+
+    /// HTTP 503 for a valid OIDC token while the identity admission snapshot
+    /// is expired or the clock lies outside it. Access returns with the next
+    /// publication of the snapshot; signing in again cannot help.
+    pub(crate) fn identity_admission_unavailable() -> Self {
+        Self::new(
+            ErrorCode::ServiceUnavailable,
+            "OIDC identity admission is unavailable: the server's identity snapshot has expired; retry after its next publication",
+        )
     }
 
     pub fn bad_request(message: impl Into<String>) -> Self {
@@ -1445,6 +1478,7 @@ impl ApiError {
             let refused_before_start = matches!(
                 self.code,
                 ErrorCode::Unauthorized
+                    | ErrorCode::NotAdmitted
                     | ErrorCode::ApiContractMismatch
                     | ErrorCode::ActorMismatch
                     | ErrorCode::Forbidden
