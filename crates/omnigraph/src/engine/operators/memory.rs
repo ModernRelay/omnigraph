@@ -252,7 +252,7 @@ impl QueryResources {
     }
 
     /// A lease's handle metadata: tried on the pool for a query; under a load
-    /// share counted past it, within the budget's uncharged 64ths.
+    /// share counted past it, within the budget's uncharged sixty-fourths.
     fn handles(&self, bytes: usize, shared: bool) -> DfResult<MemoryReservation> {
         if !shared {
             return self.unrecorded("graph batch handles", bytes);

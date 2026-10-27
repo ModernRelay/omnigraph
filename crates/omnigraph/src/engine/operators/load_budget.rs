@@ -17,7 +17,7 @@ pub(in crate::engine) enum ShareClass {
     Sink,
 }
 
-/// Of the room's 64ths: the holders' (the partitions' when the plan has
+/// Of the room's sixty-fourths: the holders' (the partitions' when the plan has
 /// none) and the partitions' over their count; the four left are uncharged
 /// (lease metadata, registry growth, the sink's chunks), counted on the pool.
 const SIXTY_FOURTHS: u64 = 64;
@@ -62,7 +62,7 @@ impl Share {
 pub(in crate::engine) struct LoadBudget {
     limit: u64,
     reserved: u64,
-    partition_64ths: u64,
+    partition_sixty_fourths: u64,
     partitions: Vec<Share>,
     holders: Share,
 }
@@ -70,7 +70,7 @@ pub(in crate::engine) struct LoadBudget {
 impl LoadBudget {
     /// The shares of one run over the room `limit` leaves past `reserved`,
     /// the pool's total at the carve, `partitions` ways; `holders` is whether
-    /// the plan sizes unique holders, else their 64ths go to the partitions.
+    /// the plan sizes unique holders, else their sixty-fourths go to the partitions.
     pub(in crate::engine) fn carve(
         limit: u64,
         reserved: u64,
@@ -79,7 +79,7 @@ impl LoadBudget {
     ) -> Self {
         let partitions = partitions.max(1);
         let room = limit.saturating_sub(reserved);
-        let (partition_64ths, holders_64ths) = if holders {
+        let (partition_sixty_fourths, holders_sixty_fourths) = if holders {
             (PARTITIONS, HOLDERS)
         } else {
             (PARTITIONS + HOLDERS, 0)
@@ -93,11 +93,11 @@ impl LoadBudget {
         Self {
             limit,
             reserved,
-            partition_64ths,
+            partition_sixty_fourths,
             partitions: (0..partitions)
-                .map(|_| share(partition_64ths, per_partition))
+                .map(|_| share(partition_sixty_fourths, per_partition))
                 .collect(),
-            holders: share(holders_64ths, SIXTY_FOURTHS),
+            holders: share(holders_sixty_fourths, SIXTY_FOURTHS),
         }
     }
 
@@ -114,12 +114,12 @@ impl LoadBudget {
         }
     }
 
-    /// The 64ths `class` takes of the room, over the partitions it is split
+    /// The sixty-fourths `class` takes of the room, over the partitions it is split
     /// across; the sink's is the room itself.
     fn fraction(&self, class: ShareClass) -> (u64, u64) {
         match class {
             ShareClass::Partition(_) => (
-                self.partition_64ths,
+                self.partition_sixty_fourths,
                 SIXTY_FOURTHS.saturating_mul(self.partitions.len() as u64),
             ),
             ShareClass::Holders => (HOLDERS, SIXTY_FOURTHS),
