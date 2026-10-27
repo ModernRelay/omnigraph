@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-06
-updated: 2026-10-23
+updated: 2026-10-27
 discussion: https://github.com/ModernRelay/omnigraph/pull/675
 supersedes: []
 superseded_by: []
@@ -23,6 +23,71 @@ migration examples were subsequently revised before 0.14 shipped. Use the
 [operator configuration guide](../user/cli/targets.md) for released commands
 and configuration; the examples below preserve the decision's implementation
 history.
+
+## Accepted amendment: organization administration (2026-10-27)
+
+This amendment uses the released profile/target model. Account operations
+select `--profile NAME`, then `defaults.profile`; resource operations select
+`--target NAME`, then `defaults.target`. A managed target pins its profile.
+The selectors are mutually exclusive and their defaults never infer one
+another. The earlier target-only examples below remain historical; the
+[operator configuration guide](../user/cli/targets.md) owns current syntax.
+
+Keep the existing `organization` command family and its `org` alias:
+
+```text
+organization members list
+organization members set EMAIL|USER_ID --role ROLE --idempotency-key KEY
+organization members offboard EMAIL|USER_ID [--expected-membership ID|absent]
+                              --idempotency-key KEY
+organization invitations list [--after CURSOR]
+organization invitations send EMAIL --idempotency-key KEY
+organization invitations resend EMAIL|INVITATION_ID --idempotency-key KEY
+organization invitations revoke EMAIL|INVITATION_ID --idempotency-key KEY
+```
+
+`members set` changes the service role of one existing active organization
+membership. It does not invite, enroll, create a role or edit graph policy.
+The identity provider owns role definitions and organization service
+permissions; applied cluster configuration owns native graph and deployment
+permissions. Keep retired local grant commands removed. Do not add a roles
+catalog, a new administration hierarchy or managed `access` reporting in this
+amendment.
+
+Email is a subject selector inside the selected organization, never a
+destination or an authority. Compare email using ASCII case-insensitive equality;
+reject whitespace instead of trimming it. Resolve a fresh member selector from the complete
+bounded organization directory. A role change binds the exact active membership;
+offboarding binds the current membership unless an explicit assertion is given.
+`--expected-membership absent` remains an explicit user-ID operation for session
+cleanup after membership removal. A failed or ambiguous lookup refuses before
+the write; never select the first match. Invitation email selectors resolve
+exactly one pending invitation from complete pagination. Bound the scan to
+1,000 invitations, ten pages and a 35-second total deadline; refuse truncation,
+cursor loops and ambiguity. Exact invitation IDs retain their existing path.
+
+Before any possible write, persist the resolved request in private operator-home
+custody: original operation arguments, exact API/organization/principal/profile
+binding, path, body and explicit idempotency key. A retry with the same key and
+arguments reuses this request without resolving the email or membership again.
+Changed arguments or an identity/custody mismatch refuse. Persistence must
+finish atomically before submission; neither timeout nor output failure clears
+the record. Keep at most 128 records and 1 MiB of encoded custody per
+API/organization, with no eviction. Reaching a bound refuses new requests while
+preserving exact retries. Reuse the existing atomic file and locking primitives;
+do not add a second recovery command or an automatic write replay.
+
+Human member output leads with name/email, membership state, current service
+roles and service permissions. Show the stable, complete `principal:ID` needed
+for Cedar when available. Provider membership IDs and observation details remain
+available in the validated JSON response. Role names are service roles, not
+claims of effective graph access, and displayed assignments are not a catalog of
+all configured roles.
+
+This amendment is accepted. Implementation completion requires parser/help,
+bounded selector resolution, durable same-key retry tests, validated receipts
+and the linked user workflow to agree. The earlier completed implementation
+status does not qualify this new behavior.
 
 ## Summary
 
@@ -1095,6 +1160,11 @@ new submissions while preserving observation and exact retries.
 
 ## Decision log
 
+- **2026-10-27:** Accepted the organization-administration amendment using the
+  released profile/target model. Add one `members set` operation, friendly
+  organization-scoped subject selectors and durable exact request custody;
+  retain existing invitation/offboarding verbs and explicit idempotency keys.
+  No role catalog, local grant authority or new managed access-reporting surface.
 - **2026-09-06:** Initial draft proposed managed variants in the profile/cluster
   resolver. It was not accepted or implemented.
 - **2026-09-08:** The [historical deadline amendment](https://github.com/ModernRelay/omnigraph/commit/e8c616990eb96375554d52b20239dacdedada29c)
