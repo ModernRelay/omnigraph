@@ -132,7 +132,7 @@ before running it again. It never sends a request again:
 
 | Failure | JSON-RPC error `data` |
 |---|---|
-| The server refused the request over HTTP (401, 412, 429, …) | `status` and the server's error body as `error`. A 401 also carries the server's `WWW-Authenticate` challenge, verbatim, as `www_authenticate` when it sends one |
+| The server refused the request over HTTP (401, 412, 429, …) | `status` and the server's error body as `error`. A 401 also carries the server's `WWW-Authenticate` challenge as `www_authenticate` when it sends one. Managed credentials reflected in error bodies or challenges are redacted |
 | Nothing was sent: the server could not be reached, or speaks another HTTP contract | `error.code` `service_unavailable`, or `api_contract_mismatch`, with `effects: none` |
 | The answer was lost, or took longer than 45 seconds | `outcome_unknown` with `effects: unknown` for a call to a tool that may write; otherwise `service_unavailable`, `deadline_exceeded` or `result_too_large` with `effects: none` |
 
@@ -151,6 +151,12 @@ message is never replayed. If an expiring credential runs out before a message
 is sent, including during discovery, the bridge renews it once before sending.
 If the replacement also expires, the message fails without being sent. Renewal
 never starts an interactive login.
+
+An expiring managed profile's `exec` credential is also renewed before later
+requests. The verified organization and principal must remain the same for the
+life of the bridge; a changed identity requires restarting it. Organization
+service permissions remain current provider facts. Managed error messages,
+including JSON-RPC tool errors, never expose a reflected resource credential.
 
 ## Settings
 

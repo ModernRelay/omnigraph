@@ -772,6 +772,8 @@ struct EndpointState {
     accepts: Mutex<String>,
     /// The `WWW-Authenticate` challenge its 401 carries.
     challenge: Mutex<Option<String>>,
+    /// A deliberate refusal after initialization, including reflected secrets.
+    refusal: Mutex<Option<crate::support::managed_http::IntentReply>>,
     /// Every JSON-RPC message posted, with the bearer it carried.
     received: Mutex<Vec<(Value, String)>>,
     slow: AtomicUsize,
@@ -921,6 +923,21 @@ fn answer_one(mut stream: TcpStream, state: &EndpointState) {
         .lock()
         .unwrap()
         .push((message.clone(), bearer.clone()));
+    if let Some(refusal) = state.refusal.lock().unwrap().clone() {
+        let headers = refusal
+            .headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect::<String>();
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {} Fixture\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n",
+            refusal.status,
+            refusal.body.len(),
+        );
+        let _ = stream.write_all(&refusal.body);
+        return;
+    }
     if bearer != *state.accepts.lock().unwrap() {
         let challenge = state.challenge.lock().unwrap().clone();
         let challenge = challenge.map_or_else(String::new, |value| {
@@ -1425,6 +1442,212 @@ fn managed_mcp_uses_resource_credentials_and_renews_without_replay() {
             .all(|(_, token)| tokens.contains(token))
     );
     api.assert_complete();
+}
+
+/// Refusals may reflect the exact bearer in JSON, text, SSE or a challenge.
+/// None is an output channel for managed credentials, including JSON-RPC
+/// errors which otherwise relay their original wire text unchanged.
+#[test]
+fn managed_mcp_redacts_reflected_resource_credentials() {
+    use crate::support::managed_http::{IntentApiFixture, IntentReply};
+
+    for (status, form) in [
+        (401, "json"),
+        (401, "text"),
+        (401, "sse"),
+        (403, "json"),
+        (403, "text"),
+        (403, "rpc"),
+        (403, "sse"),
+        (200, "rpc"),
+        (200, "tool"),
+    ] {
+        let endpoint = McpEndpoint::start("not-yet-issued");
+        let (api, tokens) =
+            IntentApiFixture::identity_issuer(&endpoint.url, if status == 401 { 2 } else { 1 });
+        let token = &tokens[0];
+        endpoint.accept(token);
+        let config = tempdir().unwrap();
+        write_managed_data_target(config.path(), &api.origin, &endpoint.url);
+        let mut command = cli_process();
+        command
+            .env("OMNIGRAPH_HOME", managed_home(config.path()))
+            .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+            .args(["mcp", "--target", "managed-test"]);
+        let mut bridge = Bridge::start(command);
+        assert!(bridge.initialize()["result"].is_object());
+        bridge.call(tools_list(1));
+        let rpc = json!({"jsonrpc":"2.0","id":2,
+            "error":{"code":-32000,"message":format!("refused {token}"),
+                "data":{(token):token}}});
+        let body = match form {
+            "json" => json!({"error":format!("refused {token}"),(token):token}).to_string(),
+            "text" => format!("refused {token}"),
+            "rpc" => rpc.to_string(),
+            "sse" => format!("event: message\ndata: {rpc}\n\n"),
+            "tool" => json!({"jsonrpc":"2.0","id":2,"result":{
+                "isError":true,"content":[{"type":"text","text":token}]}})
+            .to_string(),
+            _ => unreachable!(),
+        };
+        let body = if matches!(form, "json" | "rpc" | "sse" | "tool") {
+            // Normalization must also remove escaped secrets and object keys.
+            body.replace('.', "\\u002e")
+        } else {
+            body
+        };
+        *endpoint.state.refusal.lock().unwrap() = Some(IntentReply {
+            status,
+            headers: vec![
+                (
+                    "content-type".into(),
+                    if form == "sse" {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    }
+                    .into(),
+                ),
+                (
+                    "www-authenticate".into(),
+                    format!("Bearer error=\"invalid_token\", error_description=\"{token}\""),
+                ),
+            ],
+            body: body.into_bytes(),
+        });
+        let refused = bridge.tool(2, "fast", json!({}));
+        assert!(
+            refused.to_string().contains("[redacted]"),
+            "{status}/{form}: {refused}"
+        );
+        if status == 401 {
+            assert_eq!(refused["error"]["data"]["status"], 401);
+            assert_eq!(
+                refused["error"]["data"]["www_authenticate"],
+                "Bearer error=\"invalid_token\", error_description=\"[redacted]\""
+            );
+        }
+        assert_eq!(endpoint.received(2), [token.clone()], "no replay");
+        let finished = bridge.finish();
+        finished.assert_success();
+        finished.assert_never_shows(&tokens.iter().map(String::as_str).collect::<Vec<_>>());
+        finished.assert_never_shows(&["og_fixture_control"]);
+        api.assert_complete();
+    }
+}
+
+/// The long-lived managed bridge renews its expired control helper once,
+/// keeps a valid resource token, and refuses a changed verified principal
+/// before either resource issuance or graph dispatch.
+#[cfg(unix)]
+#[test]
+fn managed_mcp_renews_control_helper_without_changing_identity() {
+    use crate::support::managed_http::IntentApiFixture;
+    use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+
+    for changed_identity in [false, true] {
+        let endpoint = McpEndpoint::start("not-yet-issued");
+        let (api, tokens) = IntentApiFixture::identity_issuer(&endpoint.url, 1);
+        endpoint.accept(&tokens[0]);
+        let helper = tempdir().unwrap();
+        let script = helper.path().join("credential.sh");
+        let expiry = OffsetDateTime::now_utc() + time::Duration::seconds(8);
+        std::fs::write(
+            helper.path().join("initial.json"),
+            json!({"version":1,
+            "credential":{"type":"bearer","token":"initial-control-token"},
+            "expires_at":expiry.format(&Rfc3339).unwrap()})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            helper.path().join("renewed.json"),
+            json!({"version":1,
+            "credential":{"type":"bearer","token":"renewed-control-token"}})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &script,
+            r#"cat >/dev/null
+echo called >> "$1/calls"
+if mkdir "$1/initial" 2>/dev/null; then
+  cat "$1/initial.json"
+else
+  cat "$1/renewed.json"
+fi
+"#,
+        )
+        .unwrap();
+        let config = tempdir().unwrap();
+        write_managed_data_target(config.path(), &api.origin, &endpoint.url);
+        let config_file = managed_home(config.path()).join("config.yaml");
+        let text = std::fs::read_to_string(&config_file).unwrap().replace(
+            "provider: token\n      source: {env: OMNIGRAPH_CONTROL_TOKEN}",
+            &format!(
+                "provider: exec\n      command: ['/bin/sh', '{}', '{}']\n      timeout: 10s",
+                script.display(),
+                helper.path().display()
+            ),
+        );
+        assert!(text.contains("provider: exec"));
+        std::fs::write(config_file, text).unwrap();
+        let mut command = cli_process();
+        command
+            .env("OMNIGRAPH_HOME", managed_home(config.path()))
+            .args(["mcp", "--target", "managed-test"]);
+        let mut bridge = Bridge::start(command);
+        assert!(bridge.initialize()["result"].is_object());
+        bridge.call(tools_list(1));
+        assert_eq!(
+            std::fs::read_to_string(helper.path().join("calls")).unwrap(),
+            "called\n"
+        );
+        api.set_session(json!({"data":{"principal_id":if changed_identity {"principal-two"} else {"principal-one"},
+            "account_id":"account-one","service_permissions":["changed-service-permission"]},
+            "meta":{"provenance":"service_db","assurance":"verified_workload"}}));
+        while OffsetDateTime::now_utc() < expiry {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Concurrent messages share one renewal. Neither may execute under
+        // a new identity, even if the old graph token remains valid.
+        bridge.send(&tool_call(2, "fast", json!({})));
+        bridge.send(&tool_call(3, "fast", json!({})));
+        for answer in [bridge.answer(), bridge.answer()] {
+            let id = answer["id"].as_u64().unwrap();
+            if changed_identity {
+                assert!(
+                    answer.to_string().contains("session_identity_mismatch"),
+                    "{answer}"
+                );
+                assert!(endpoint.received(id).is_empty());
+            } else {
+                assert_eq!(answer["result"]["content"][0]["text"], "fast", "{answer}");
+                assert_eq!(endpoint.received(id), [tokens[0].clone()]);
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(helper.path().join("calls")).unwrap(),
+            "called\ncalled\n"
+        );
+        let sessions: Vec<_> = api
+            .requests()
+            .into_iter()
+            .filter(|request| request.path == "/v1/auth/session")
+            .collect();
+        assert_eq!(
+            sessions.last().unwrap().headers["authorization"],
+            "Bearer renewed-control-token"
+        );
+        let finished = bridge.finish();
+        finished.assert_success();
+        finished.assert_never_shows(&[
+            "initial-control-token",
+            "renewed-control-token",
+            &tokens[0],
+        ]);
+        api.assert_complete();
+    }
 }
 
 #[test]

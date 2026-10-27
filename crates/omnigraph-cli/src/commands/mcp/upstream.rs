@@ -36,14 +36,15 @@ const ANSWER_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 /// What one POST came back with.
 pub(super) enum Delivery {
-    /// The JSON-RPC messages of the answer, each with its text as received.
+    /// The JSON-RPC messages of the answer and their wire text, with managed
+    /// credentials redacted from errors.
     Messages(Vec<(Value, String)>),
     /// Accepted without a message, as a notification or a response is.
     Accepted,
     /// An HTTP answer that carries no JSON-RPC message, with its body.
     Refused { status: u16, body: Value },
     /// The server refused the credential (HTTP 401) before running anything,
-    /// with its `WWW-Authenticate` challenge as sent.
+    /// with its `WWW-Authenticate` challenge (managed credentials redacted).
     Unauthorized {
         body: Value,
         challenge: Option<String>,
@@ -314,11 +315,35 @@ impl Upstream {
             }
             Err(error) => return self.failed(&error),
         };
+        let secret = matches!(self.source, CredentialSource::Managed(_))
+            .then_some(token.as_deref())
+            .flatten();
         if response.status() == StatusCode::UNAUTHORIZED {
-            let challenge = challenge(response.headers());
-            let body = match read_body(response).await {
-                Ok(body) => error_body(&body),
-                Err(_) => Value::Null,
+            let challenge = challenge(response.headers()).map(|text| match secret {
+                Some(secret) => crate::managed::scrub_response_error(text, secret),
+                None => text,
+            });
+            let event_secret = secret.filter(|_| {
+                response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.starts_with("text/event-stream"))
+            });
+            let body = match (read_body(response).await, event_secret) {
+                (Ok(body), Some(secret)) => {
+                    // A whole SSE frame is not JSON. Normalize each event so
+                    // JSON escapes cannot hide a reflected bearer from the
+                    // shared scrubber, then bound the diagnostic as text.
+                    let events = wire::event_data(&String::from_utf8_lossy(&body))
+                        .into_iter()
+                        .map(|text| crate::managed::scrub_response_error(text, secret))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    error_body(events.as_bytes(), Some(secret))
+                }
+                (Ok(body), None) => error_body(&body, secret),
+                (Err(_), _) => Value::Null,
             };
             return Delivery::Unauthorized {
                 body,
@@ -326,7 +351,7 @@ impl Upstream {
                 reread: self.reread(reads, token.as_deref()).await,
             };
         }
-        read_answer(response).await
+        read_answer(response, secret).await
     }
 
     /// Classify a request that failed without an HTTP answer.
@@ -491,7 +516,18 @@ async fn read_body(mut response: reqwest::Response) -> std::result::Result<Vec<u
 
 /// A body that is not a JSON-RPC message, as the error the server sent: its
 /// JSON error body, or its text in one.
-fn error_body(body: &[u8]) -> Value {
+fn error_body(body: &[u8], secret: Option<&str>) -> Value {
+    // Scrub before truncating a text error, so the limit cannot split a token.
+    let scrubbed;
+    let body = if let Some(secret) = secret {
+        scrubbed = crate::managed::scrub_response_error(
+            String::from_utf8_lossy(body).into_owned(),
+            secret,
+        );
+        scrubbed.as_bytes()
+    } else {
+        body
+    };
     match serde_json::from_slice::<Value>(body) {
         Ok(value) if value.is_object() => value,
         _ => {
@@ -501,7 +537,7 @@ fn error_body(body: &[u8]) -> Value {
     }
 }
 
-async fn read_answer(response: reqwest::Response) -> Delivery {
+async fn read_answer(response: reqwest::Response, secret: Option<&str>) -> Delivery {
     let status = response.status();
     let stream = response
         .headers()
@@ -523,12 +559,25 @@ async fn read_answer(response: reqwest::Response) -> Delivery {
     let mut messages = Vec::new();
     for text in texts {
         match serde_json::from_str::<Value>(&text) {
-            Ok(message) if message.get("jsonrpc").is_some() => messages.push((message, text)),
+            Ok(message) if message.get("jsonrpc").is_some() => {
+                let error = !status.is_success()
+                    || message.get("error").is_some()
+                    || message["result"]["isError"] == true;
+                if let Some(secret) = secret.filter(|_| error) {
+                    let text = crate::managed::scrub_response_error(text, secret);
+                    let Ok(message) = serde_json::from_str(&text) else {
+                        return Delivery::Lost(Lost::Transport);
+                    };
+                    messages.push((message, text));
+                } else {
+                    messages.push((message, text));
+                }
+            }
             // A route's own error body, such as an admission refusal.
             _ if !stream => {
                 return Delivery::Refused {
                     status: status.as_u16(),
-                    body: error_body(text.as_bytes()),
+                    body: error_body(text.as_bytes(), secret),
                 };
             }
             // An event that carries no message is not part of the answer.
@@ -576,17 +625,29 @@ mod tests {
     #[test]
     fn a_body_that_is_not_json_rpc_is_an_error_body() {
         assert_eq!(
-            error_body(br#"{"error":"no","code":"unauthorized"}"#)["code"],
+            error_body(br#"{"error":"no","code":"unauthorized"}"#, None)["code"],
             "unauthorized"
         );
         assert_eq!(
-            error_body(b"Forbidden: Host header is not allowed\n"),
+            error_body(b"Forbidden: Host header is not allowed\n", None),
             serde_json::json!({"error": "Forbidden: Host header is not allowed"})
         );
         let long = "x".repeat(4096);
         assert_eq!(
-            error_body(long.as_bytes())["error"].as_str().unwrap().len(),
+            error_body(long.as_bytes(), None)["error"]
+                .as_str()
+                .unwrap()
+                .len(),
             1024
+        );
+        let prefix = "x".repeat(1010);
+        assert_eq!(
+            error_body(
+                format!("{prefix} sensitive-credential").as_bytes(),
+                Some("sensitive-credential"),
+            )["error"],
+            format!("{prefix} [redacted]"),
+            "redact before a text limit could split the secret",
         );
     }
 }
