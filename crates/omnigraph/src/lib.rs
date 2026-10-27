@@ -16,6 +16,10 @@ pub mod changes;
 mod core_tests;
 pub mod db;
 #[cfg(feature = "dst")]
+pub use omnigraph_core::dst_blocking;
+#[cfg(not(feature = "dst"))]
+pub(crate) use omnigraph_core::dst_blocking;
+#[cfg(feature = "dst")]
 pub use omnigraph_core::dst_clock;
 #[cfg(not(feature = "dst"))]
 pub(crate) use omnigraph_core::dst_clock;

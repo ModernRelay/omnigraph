@@ -144,9 +144,12 @@ impl ExecutionPlan for ValidateExec {
             .properties()
             .output_partitioning()
             .partition_count();
+        let inputs = (0..partitions)
+            .map(|partition| self.input.execute(partition, Arc::clone(&ctx)))
+            .collect::<DfResult<Vec<_>>>()?;
         let source = Arc::clone(&self.input);
         let schema = self.input.schema();
-        let memory = work(Arc::clone(&ctx), "ValidateExec", &self.metrics)?;
+        let memory = work(ctx, "ValidateExec", &self.metrics)?;
         memory.metric("input_rows", 0);
         memory.metric(VALIDATED_ROWS, 0);
         let judge = Arc::clone(&self.judge);
@@ -156,19 +159,6 @@ impl ExecutionPlan for ValidateExec {
             judge.mode == LoadMode::Overwrite,
             partitions,
         ));
-        if let Some(csv) = source.downcast_ref::<CsvSourceExec>() {
-            let sizing = Arc::downgrade(&memory);
-            let sized = Arc::downgrade(&plan);
-            csv.observe_rows_estimate(Box::new(move |rows| {
-                match (sizing.upgrade(), sized.upgrade()) {
-                    (Some(memory), Some(plan)) => size_unique_holders(&memory, &plan, rows),
-                    _ => Ok(()),
-                }
-            }));
-        }
-        let inputs = (0..partitions)
-            .map(|partition| self.input.execute(partition, Arc::clone(&ctx)))
-            .collect::<DfResult<Vec<_>>>()?;
         Ok(self.shape.held(
             memory,
             &self.metrics,
@@ -287,8 +277,10 @@ async fn drain_and_sweep(
     let drained = futures::future::join_all(inputs.into_iter().map(|input| {
         let plan = Arc::clone(plan);
         let judge = Arc::clone(judge);
+        let source = Arc::clone(source);
         let published = published.clone();
-        memory.blocking(move |memory| sweep_partition(input, memory, plan, judge, published))
+        memory
+            .blocking(move |memory| sweep_partition(input, memory, source, plan, judge, published))
     }))
     .await;
     let mut batches = Vec::new();
@@ -399,10 +391,11 @@ async fn load_sets(
 
 /// One partition's input held and swept as it arrives: every batch is held
 /// under `memory`, its facts extracted at its position, probed against the
-/// swept sets once they arrive.
+/// swept sets once they arrive; the unique holders sized once `source` can.
 async fn sweep_partition(
     mut input: SendableRecordBatchStream,
     memory: Arc<WorkMemory>,
+    source: Arc<dyn ExecutionPlan>,
     plan: Arc<SweepPlan>,
     judge: Arc<LoadJudge>,
     mut published: PublishedSets,
@@ -416,6 +409,7 @@ async fn sweep_partition(
     let mut sets: Option<Arc<SweptSets>> = None;
     let mut unprobed = Vec::new();
     let mut scratch_rows = 0usize;
+    let mut sized = false;
     while let Some(batch) = input.next().await {
         let batch = batch?;
         memory.metric("input_rows", batch.num_rows());
@@ -428,6 +422,9 @@ async fn sweep_partition(
         }
         let base = position(slice, offset);
         admit_validation(&facts, &judge, std::slice::from_ref(&batch))?;
+        if !sized {
+            sized = size_unique_holders(&facts, &plan, source.as_ref())?;
+        }
         partial
             .observe(&plan, &judge.catalog, &batch, system_columns, base)
             .map_err(external)?;
@@ -482,21 +479,27 @@ async fn sweep_partition(
     Ok((held, partial, facts))
 }
 
-/// The shared unique holders sized from the csv source's row estimate, each
-/// check's tables charged to `memory` only while the pool has room
-/// ([`WorkMemory::grow_if_free`]). The source runs this on the partition that
-/// produced the estimate, before that partition's first batch leaves it
-/// ([`CsvSourceExec::observe_rows_estimate`]): the pool's room then depends
-/// on that partition's own charges, not on how far it got past a batch a
-/// sweep already holds, so a single-partition replay sizes alike.
-fn size_unique_holders(memory: &WorkMemory, plan: &SweepPlan, rows: u64) -> DfResult<()> {
+/// The shared unique holders sized from the source's row estimate once it has
+/// one, each check's tables charged to `facts` only while the pool has room
+/// ([`WorkMemory::grow_if_free`]); `true` once sized, by any partition.
+fn size_unique_holders(
+    facts: &WorkMemory,
+    plan: &SweepPlan,
+    source: &dyn ExecutionPlan,
+) -> DfResult<bool> {
+    let Some(rows) = source
+        .downcast_ref::<CsvSourceExec>()
+        .and_then(CsvSourceExec::rows_estimate)
+    else {
+        return Ok(false);
+    };
     let rows = usize::try_from(rows).unwrap_or(usize::MAX);
     let mut failed = None;
     plan.size_unique_holders(
         rows,
         WorkMemory::entry_bytes::<(Vec<String>, String)>(),
         &mut |bytes| {
-            let table = match memory.child("load unique holders table") {
+            let table = match facts.child("load unique holders table") {
                 Ok(table) => table,
                 Err(error) => {
                     failed = Some(error);
@@ -515,7 +518,7 @@ fn size_unique_holders(memory: &WorkMemory, plan: &SweepPlan, rows: u64) -> DfRe
     );
     match failed {
         Some(error) => Err(error),
-        None => Ok(()),
+        None => Ok(true),
     }
 }
 
@@ -1205,17 +1208,23 @@ mod tests {
             let memory = work(ctx, "ValidateExec", &metrics).unwrap();
             let (ended_a, a_ended) = tokio::sync::oneshot::channel();
             let (ended_b, b_ended) = tokio::sync::oneshot::channel();
+            let source: Arc<dyn ExecutionPlan> =
+                Arc::new(datafusion::physical_plan::empty::EmptyExec::new(Arc::new(
+                    arrow_schema::Schema::empty(),
+                )));
             let sweep = |batches: Vec<RecordBatch>, ended| {
                 let plan = Arc::clone(&plan);
                 let judge = Arc::clone(&judge);
                 let published = published.clone();
                 let memory = Arc::clone(&memory);
+                let source = Arc::clone(&source);
                 async move {
                     memory
                         .blocking(move |memory| {
                             sweep_partition(
                                 partition_input(batches, ended),
                                 memory,
+                                source,
                                 plan,
                                 judge,
                                 published,

@@ -4,6 +4,7 @@ use std::future::Future;
 
 use futures::FutureExt;
 
+use omnigraph::dst_blocking::Placement;
 use omnigraph::dst_clock::Clock;
 use omnigraph::dst_ids::IdSource;
 use omnigraph::seams::{Installed, ThreadLocal};
@@ -71,6 +72,7 @@ struct InstalledEnvironment {
     process: UniverseProcess,
     _clock: Option<Installed<dyn Clock, ThreadLocal<dyn Clock>>>,
     _ids: Option<Installed<dyn IdSource, ThreadLocal<dyn IdSource>>>,
+    _blocking: Option<Installed<dyn Placement, ThreadLocal<dyn Placement>>>,
 }
 
 impl InstalledEnvironment {
@@ -79,6 +81,7 @@ impl InstalledEnvironment {
             process,
             _clock: None,
             _ids: None,
+            _blocking: None,
         }
     }
 }
@@ -149,6 +152,11 @@ pub fn run_universe<E: UniverseEnvironment, S: UniverseScenario<E::Resources>>(
                     )));
                     installed._clock = Some(omnigraph::dst_clock::CLOCK.install(
                         std::sync::Arc::new(omnigraph::dst_clock::LogicalClock::default()),
+                    ));
+                    // Operator bodies run on this seeded runtime, not on
+                    // blocking threads the seed does not order.
+                    installed._blocking = Some(omnigraph::dst_blocking::BLOCKING.install(
+                        std::sync::Arc::new(omnigraph::dst_blocking::OnSeededRuntime),
                     ));
                     let setup = std::panic::AssertUnwindSafe(async { environment.setup().await })
                         .catch_unwind()

@@ -36,11 +36,6 @@ pub(crate) const CSV_SOURCE_ROWS: &str = "csv_source_rows";
 /// under, so the breaker restores source order whatever partition parsed it.
 pub(crate) const CSV_SLICE_METADATA: &str = "omnigraph.load.slice";
 
-/// What a consumer runs with the source's row estimate on the partition that
-/// produced it, before the first slice's batches leave that partition; run
-/// once and then dropped, with whatever it holds.
-pub(crate) type EstimateObserver = Box<dyn FnOnce(u64) -> DfResult<()> + Send>;
-
 pub(crate) struct CsvSourceExec {
     parse: Arc<Parse>,
     shape: Source,
@@ -64,9 +59,6 @@ struct Parse {
     /// The rows of the first slice any partition parsed, set before that
     /// slice's batches leave the partition: the row estimate's sample.
     first_slice_rows: OnceLock<u64>,
-    /// Taken and called with the row estimate by the partition that sets
-    /// `first_slice_rows`, before that slice's batches leave it.
-    estimate_observer: Mutex<Option<EstimateObserver>>,
     slices: Mutex<Vec<LoadSliceExecuted>>,
     failed: Mutex<Vec<FailedSlice>>,
     bounds: Mutex<Vec<Option<(u64, u64)>>>,
@@ -119,17 +111,6 @@ impl Parse {
             self.refused.store(true, Ordering::Release);
         }
         external(error)
-    }
-
-    /// The source's rows, estimated from the first slice any partition
-    /// parsed: its rows per slice byte over the records' bytes; `None`
-    /// until a slice parsed. A short last slice under-estimates, which only
-    /// a source smaller than its partitions' slices can meet.
-    fn rows_estimate(&self) -> Option<u64> {
-        let records_start = self.resolved.get()?.records_start();
-        let rows = *self.first_slice_rows.get()?;
-        let records_bytes = self.bytes.size().saturating_sub(records_start);
-        Some(rows.saturating_mul(records_bytes) / self.slice_bytes as u64)
     }
 
     /// The source bytes one partition holds, the head range the header is
@@ -225,7 +206,6 @@ impl CsvSourceExec {
                 refused,
                 started: OnceLock::new(),
                 first_slice_rows: OnceLock::new(),
-                estimate_observer: Mutex::new(None),
                 slices: Mutex::new(Vec::new()),
                 failed: Mutex::new(Vec::new()),
                 bounds: Mutex::new(vec![None; partitions]),
@@ -264,22 +244,17 @@ impl CsvSourceExec {
         slices
     }
 
-    /// Run `observer` with the row estimate on the partition that first
-    /// parses a slice, before that slice's batches leave it: the observer's
-    /// charges take one place in that partition's own sequence of charges,
-    /// before any consumer holds a batch. Installed before `execute`, since
-    /// `execute` starts the partition; `false` when one is already installed.
-    pub(crate) fn observe_rows_estimate(&self, observer: EstimateObserver) -> bool {
-        let mut installed = self
-            .parse
-            .estimate_observer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if installed.is_some() {
-            return false;
-        }
-        *installed = Some(observer);
-        true
+    /// The source's rows, estimated from the first slice any partition
+    /// parsed: its rows per slice byte over the records' bytes; `None`
+    /// until a slice parsed. The sample is set before the slice's batches
+    /// leave the partition, so a consumer holding a batch reads `Some`. A
+    /// short last slice under-estimates, which only a source smaller than
+    /// its partitions' slices can meet.
+    pub(crate) fn rows_estimate(&self) -> Option<u64> {
+        let records_start = self.parse.resolved.get()?.records_start();
+        let rows = *self.parse.first_slice_rows.get()?;
+        let records_bytes = self.parse.bytes.size().saturating_sub(records_start);
+        Some(rows.saturating_mul(records_bytes) / self.parse.slice_bytes as u64)
     }
 
     /// Every refused slice with the partition that met it, one per failed
@@ -448,18 +423,7 @@ impl ExecutionPlan for CsvSourceExec {
                     let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
                     memory.metric(CSV_SOURCE_ROWS, rows);
                     partition_rows = partition_rows.saturating_add(rows as u64);
-                    if parse.first_slice_rows.set(rows as u64).is_ok()
-                        && let Some(estimate) = parse.rows_estimate()
-                    {
-                        let observe = parse
-                            .estimate_observer
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take();
-                        if let Some(observe) = observe {
-                            observe(estimate)?;
-                        }
-                    }
+                    let _ = parse.first_slice_rows.set(rows as u64);
                     for batch in batches {
                         sender
                             .send(tag_slice(batch, key)?, Arc::clone(&memory))
@@ -656,25 +620,12 @@ mod tests {
         assert_eq!(exec.executed_slices().len(), 1);
     }
 
-    /// The partition that parses the first slice hands the row estimate to
-    /// the observer before it sends that slice's batches, so a consumer
-    /// holding the first batch finds the observer already run, once. The
-    /// order is between two threads, which GQT cannot observe: a consumer
-    /// that sized from the estimate itself raced the producer's release of
-    /// its slice charges, and a DST replay saw both outcomes.
+    /// A consumer holding a partition's first batch reads the row estimate:
+    /// its sample is set before the batches are sent, an order between two
+    /// threads that GQT cannot observe (a DST replay saw it both ways).
     #[tokio::test(flavor = "current_thread")]
-    async fn the_row_estimate_reaches_its_observer_before_the_first_batch_issue_1160() {
+    async fn the_row_estimate_precedes_the_first_batch() {
         let exec = exec("key,score\n1,1.5\n2,2.5\n", 1, usize::MAX);
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let record = Arc::clone(&observed);
-        assert!(exec.observe_rows_estimate(Box::new(move |rows| {
-            record
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(rows);
-            Ok(())
-        })));
-        assert!(!exec.observe_rows_estimate(Box::new(|_| Ok(()))));
         let (_pool, ctx) = fixtures::context(64 << 20, CSV_READ_BATCH_ROWS);
         let mut stream = exec.execute(0, ctx).unwrap();
         let first = stream
@@ -683,22 +634,7 @@ mod tests {
             .expect("the source holds records")
             .unwrap();
         assert_eq!(first.num_rows(), 2);
-        let at_first_batch = observed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        assert_eq!(at_first_batch.len(), 1, "observed before the first batch");
-        while let Some(batch) = stream.next().await {
-            batch.unwrap();
-        }
-        assert_eq!(
-            observed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len(),
-            1,
-            "observed once"
-        );
+        assert!(exec.rows_estimate().is_some());
     }
 
     /// Every partition's output, each collected to its end.

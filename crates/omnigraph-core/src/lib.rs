@@ -13,6 +13,7 @@
 pub mod branch_control;
 pub mod branch_names;
 pub mod dataset_index;
+pub mod dst_blocking;
 pub mod dst_clock;
 pub mod dst_gate;
 pub mod dst_ids;

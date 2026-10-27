@@ -353,6 +353,25 @@ impl WorkMemory {
         });
         let wake = Arc::new(BlockingWake::default());
         let elapsed = MetricBuilder::new(&self.metrics).elapsed_compute(0);
+        if crate::dst_blocking::on_runtime() {
+            // A seeded runtime polls the body as one of its own tasks, so the
+            // seed orders its charges against every other body's. The
+            // checkpoint hook is keyed by thread and every body shares this
+            // one, so none is installed: a checkpoint only checks.
+            let _owner = owner;
+            let mut guard = crate::instrumentation::query_blocking_work_guard();
+            guard.started();
+            let result = std::future::poll_fn(|context| {
+                if let Err(error) = self.check() {
+                    return std::task::Poll::Ready(Err(error));
+                }
+                let _timer = elapsed.timer();
+                work.as_mut().poll(context)
+            })
+            .await;
+            cancellation.disarm();
+            return result;
+        }
         loop {
             self.check()?;
             let memory = Arc::clone(self);
@@ -1383,6 +1402,46 @@ mod tests {
             .expect("one blocking worker must make forward progress")
             .unwrap();
             assert_eq!(result, 42);
+        });
+    }
+
+    /// Under the DST blocking seam a body, and a body it nests, runs on the
+    /// installing thread's runtime, which the seed orders; without the seam
+    /// it runs on a blocking thread, which the seed does not. Two such
+    /// threads charging one pool made a csv load's refusal report a
+    /// different size on a DST replay of one seed. Which thread polls a body
+    /// is invisible to a case.
+    #[cfg(feature = "dst")]
+    #[test]
+    fn blocking_bodies_run_on_the_seeded_runtime_under_the_dst_seam_issue_1160() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let runtime_thread = std::thread::current().id();
+        runtime.block_on(async {
+            let (_, memory) = test_memory(1_048_576);
+            let off_seam = memory
+                .blocking(|_| async { Ok(std::thread::current().id()) })
+                .await
+                .unwrap();
+            assert_ne!(off_seam, runtime_thread, "no seam: a blocking thread");
+            let _seam = crate::dst_blocking::BLOCKING
+                .install(Arc::new(crate::dst_blocking::OnSeededRuntime));
+            let on_seam = memory
+                .blocking(|_| async { Ok(std::thread::current().id()) })
+                .await
+                .unwrap();
+            assert_eq!(on_seam, runtime_thread, "seam: the seeded runtime");
+            let nested = memory
+                .blocking(move |memory| async move {
+                    memory
+                        .blocking(|_| async { Ok(std::thread::current().id()) })
+                        .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(nested, runtime_thread, "a nested body too");
         });
     }
 
