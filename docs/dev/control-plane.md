@@ -96,10 +96,12 @@ restricted original-ID admission after writer/I/O exclusion and classifies
 the exact native publication; its journal is never graph authority. An absent
 candidate alone cannot settle a delayed write. Native conditional no-effect
 publication resolves that race without replaying optimization.
-The [served optimization RFC](../rfcs/2026-10-25-served-optimization.md) defines
-this candidate contract and its qualification limits; the
+The revised [served optimization RFC](https://github.com/ModernRelay/omnigraph/pull/1186)
+is reviewed separately and proposes a smaller execution contract. This
+implementation candidate still needs to be aligned with that design. The
 [maintenance guide](../user/operations/maintenance.md#server-enablement) describes
-enablement and observation. It provides no scheduler or independent worker.
+the candidate's enablement and observation. It provides no scheduler or
+independent worker.
 
 ## Deployment ledger
 
