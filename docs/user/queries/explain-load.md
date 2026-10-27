@@ -20,7 +20,7 @@ root down:
 | `node` | `detail` fields |
 |---|---|
 | `FragmentWrite` | `table`, `version`, `mode`, `adapter`; the physical row adds `max_input_bytes`, `max_workers` |
-| `Validate` | `table` and `checks`, every check of the load in the order it runs, which is the refusal precedence; the physical row adds `removal` and `max_workers` |
+| `Validate` | `table` and `checks`, every check of the load in the order it runs, which is the refusal precedence; the physical row adds `removal` and `max_workers`. The node is a pipeline breaker only while a check reads the whole delta after the rows are in (`retained_edges`, a `judged` `edge_ri`, a `scan` removal); otherwise every check is swept as the rows pass and settled in the judgment after the drain, the node streams, and `pipelines` holds one pipeline from the source through the write instead of two |
 | `CsvSource` | `format`, `source`, `source_bytes`, `estimated_rows`, `delimiter`, `header`, `columns`, `table`, `version`; the physical row adds `max_partitions` (the streams that parse the source: one per 8 MiB of it, at most `stage_write_concurrency`), `max_workers`, `fallback` |
 
 Each entry of `checks` carries `check` (`value`, `unique`, `edge_ri`,

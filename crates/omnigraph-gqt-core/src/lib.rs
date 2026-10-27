@@ -79,6 +79,9 @@ pub struct Case {
     /// The `# csv_slice_bytes:` pin: the bytes one `load csv` parse partition
     /// owns and the slice it reads at once, so a small source cuts partitions.
     csv_slice_bytes: Option<usize>,
+    /// The `# overwrite_chunk_rows:` pin: the rows one `load csv` overwrite
+    /// chunk holds before its writer takes it.
+    overwrite_chunk_rows: Option<usize>,
     pub items: Vec<Item>,
     pub needs_indices: bool,
     /// `--- csv <name>` sections: the CSV text a `load csv "<name>"` step
@@ -575,6 +578,7 @@ struct Header {
     issue: IssueRef,
     traversal: Option<&'static str>,
     csv_slice_bytes: Option<usize>,
+    overwrite_chunk_rows: Option<usize>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -583,8 +587,15 @@ enum IssueRef {
     Num(u64),
 }
 
-/// The five header keys, in the spelling the canonical form requires.
-const HEADER_KEYS: [&str; 5] = ["issue", "red_on", "notes", "traversal", "csv_slice_bytes"];
+/// The six header keys, in the spelling the canonical form requires.
+const HEADER_KEYS: [&str; 6] = [
+    "issue",
+    "red_on",
+    "notes",
+    "traversal",
+    "csv_slice_bytes",
+    "overwrite_chunk_rows",
+];
 
 /// Canonical spelling for one header key and its trimmed value.
 fn canonical_header_line(key: &str, value: &str) -> String {
@@ -623,6 +634,7 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
     let mut red_on = false;
     let mut traversal: Option<&'static str> = None;
     let mut csv_slice_bytes: Option<usize> = None;
+    let mut overwrite_chunk_rows: Option<usize> = None;
     for (idx, line) in lines.iter().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -639,6 +651,7 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
             "red_on" => red_on,
             "traversal" => traversal.is_some(),
             "csv_slice_bytes" => csv_slice_bytes.is_some(),
+            "overwrite_chunk_rows" => overwrite_chunk_rows.is_some(),
             _ => false,
         };
         if duplicate {
@@ -689,6 +702,19 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
                     })?;
                 csv_slice_bytes = Some(bytes);
             }
+            "overwrite_chunk_rows" => {
+                let rows = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|rows| *rows > 0 && value == rows.to_string())
+                    .ok_or_else(|| {
+                        format!(
+                            "line {}: `# overwrite_chunk_rows:` takes a positive row count without sign or leading zeros, got `{value}`",
+                            idx + 1
+                        )
+                    })?;
+                overwrite_chunk_rows = Some(rows);
+            }
             other => unreachable!("split_header_line admits only HEADER_KEYS, got `{other}`"),
         }
     }
@@ -702,6 +728,7 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
         issue,
         traversal,
         csv_slice_bytes,
+        overwrite_chunk_rows,
     })
 }
 
@@ -2848,6 +2875,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         fixture,
         traversal: header.traversal,
         csv_slice_bytes: header.csv_slice_bytes,
+        overwrite_chunk_rows: header.overwrite_chunk_rows,
         items,
         needs_indices,
         csv_sections,
@@ -4312,9 +4340,13 @@ pub fn execute_steps<'a, H: ExecutionHost>(
     host: &'a H,
 ) -> futures::future::BoxFuture<'a, Result<Session, String>> {
     let steps = execute_steps_inner(case, path, bless, session, uri, storage, host);
-    match case.csv_slice_bytes {
+    let steps = match case.csv_slice_bytes {
         Some(bytes) => omnigraph::instrumentation::with_csv_slice_bytes(bytes, steps).boxed(),
         None => steps.boxed(),
+    };
+    match case.overwrite_chunk_rows {
+        Some(rows) => omnigraph::instrumentation::with_overwrite_chunk_rows(rows, steps).boxed(),
+        None => steps,
     }
 }
 

@@ -1,7 +1,9 @@
-//! A load's validation: a pipeline breaker that holds the whole delta from
-//! every partition of its input, restores source order by slice, judges
-//! every check of the plan in one pass over it, and streams the held batches
-//! on only when the delta is admitted.
+//! A load's validation over every partition of its input, every check of the
+//! plan extracted in one pass per batch. Judged per row (the planner's
+//! `validate_streams`), it sends each batch on as it passes and the judgment
+//! after the drain is the stream's last word; otherwise it is a pipeline
+//! breaker that holds the whole delta, restores source order by slice, and
+//! streams the held batches on only when the delta is admitted.
 
 use std::fmt;
 use std::sync::Arc;
@@ -24,7 +26,7 @@ use tokio::sync::watch;
 use super::csv_source::{CsvSourceExec, FailedSlice, slice_of};
 use super::external;
 use super::memory::WorkMemory;
-use super::shape::{Breaker, work};
+use super::shape::{BatchSender, Breaker, Streaming, work};
 use crate::db::{Omnigraph, Snapshot};
 use crate::error::OmniError;
 use crate::loader::LoadMode;
@@ -57,20 +59,50 @@ pub(crate) struct LoadJudge {
     pub(crate) catalog: Arc<Catalog>,
 }
 
+/// The shape the plan's cut declares for the validation, the same fact the
+/// planner's `validate_streams` reads off the node.
+enum ValidateShape {
+    Streaming(Streaming),
+    Breaker(Breaker),
+}
+
+impl ValidateShape {
+    fn new(schema: arrow_schema::SchemaRef, streams: bool) -> Self {
+        if streams {
+            Self::Streaming(Streaming::new(schema))
+        } else {
+            Self::Breaker(Breaker::new(schema))
+        }
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        match self {
+            Self::Streaming(shape) => shape.properties(),
+            Self::Breaker(shape) => shape.properties(),
+        }
+    }
+}
+
+/// The partitions' way of handing batches on: the shared sender of the
+/// streaming shape, each batch sent as it passes; nothing for the breaker,
+/// which holds them.
+type Forward = Option<Arc<tokio::sync::Mutex<BatchSender>>>;
+
 pub(crate) struct ValidateExec {
     input: Arc<dyn ExecutionPlan>,
     judge: Arc<LoadJudge>,
-    shape: Breaker,
+    shape: ValidateShape,
     metrics: ExecutionPlanMetricsSet,
 }
 
 impl ValidateExec {
-    pub(crate) fn new(input: Arc<dyn ExecutionPlan>, judge: LoadJudge) -> Self {
+    /// `streams` is the planner's `validate_streams` for the node's checks.
+    pub(crate) fn new(input: Arc<dyn ExecutionPlan>, judge: LoadJudge, streams: bool) -> Self {
         let schema = input.schema();
         Self {
             input,
             judge: Arc::new(judge),
-            shape: Breaker::new(schema),
+            shape: ValidateShape::new(schema, streams),
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -125,8 +157,9 @@ impl ExecutionPlan for ValidateExec {
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         assert_eq!(children.len(), 1, "ValidateExec has one child");
         let input = children.remove(0);
+        let streams = matches!(self.shape, ValidateShape::Streaming(_));
         Ok(Arc::new(Self {
-            shape: Breaker::new(input.schema()),
+            shape: ValidateShape::new(input.schema(), streams),
             input,
             judge: Arc::clone(&self.judge),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -144,12 +177,9 @@ impl ExecutionPlan for ValidateExec {
             .properties()
             .output_partitioning()
             .partition_count();
-        let inputs = (0..partitions)
-            .map(|partition| self.input.execute(partition, Arc::clone(&ctx)))
-            .collect::<DfResult<Vec<_>>>()?;
         let source = Arc::clone(&self.input);
         let schema = self.input.schema();
-        let memory = work(ctx, "ValidateExec", &self.metrics)?;
+        let memory = work(Arc::clone(&ctx), "ValidateExec", &self.metrics)?;
         memory.metric("input_rows", 0);
         memory.metric(VALIDATED_ROWS, 0);
         let judge = Arc::clone(&self.judge);
@@ -159,112 +189,181 @@ impl ExecutionPlan for ValidateExec {
             judge.mode == LoadMode::Overwrite,
             partitions,
         ));
-        Ok(self.shape.held(
-            memory,
-            &self.metrics,
-            move |memory| async move {
-                let admitted = admit_sets(&memory, &judge, &plan).await?;
-                let (publish, published) = watch::channel(None::<Arc<SweptSets>>);
-                let (drained, set_guards) = futures::join!(
-                    drain_and_sweep(
-                        inputs,
-                        &memory,
-                        &source,
-                        &schema,
-                        &plan,
-                        &judge,
-                        published
-                    ),
-                    load_sets(Arc::clone(&memory), Arc::clone(&judge), admitted, publish)
-                );
-                let (_retained_sets, transient) = set_guards?;
-                let (batches, partials, facts) = drained?;
-                drop(transient);
-                let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-                let extracted = Extracted::prepare(&plan, partials);
-                {
-                    let charged = memory.child("load removed and retained rows")?;
-                    let mut admit_phase =
-                        |LoadPhase::RemovedInput: LoadPhase| -> crate::error::Result<Box<dyn Send>> {
-                            let phase_memory = memory
-                                .child("load removed input")
-                                .map_err(|error| memory.error(error))?;
-                            phase_memory
-                                .entries::<&str>(rows)
-                                .map_err(|error| memory.error(error))?;
-                            Ok(Box::new(phase_memory))
-                        };
-                    let mut admit_bytes = |bytes: usize| -> crate::error::Result<Box<dyn Send>> {
-                        let allocation = memory
-                            .child("load integer endpoint keys")
-                            .map_err(|error| memory.error(error))?;
-                        allocation
-                            .grow(bytes)
-                            .map_err(|error| memory.error(error))?;
-                        Ok(Box::new(allocation))
-                    };
-                    let mut admit_reuse = || {
-                        memory.admit_read_reuse().and_then(|admitted| {
-                            LoadReadReuse::new(&judge.db, &judge.snapshot, admitted)
-                        })
-                    };
-                    let mut deleted = DeletedIdBudget::new(judge.write_budget);
-                    let mut admit_removed = |id: &str| {
-                        deleted.retain(id)?;
-                        let reserve = || {
-                            charged.entries::<String>(1)?;
-                            charged.entries::<Expr>(2)?;
-                            charged.entries::<&String>(2)?;
-                            charged.string(id.len().saturating_mul(3))
-                        };
-                        reserve().map_err(|error| charged.error(error))
-                    };
-                    let mut admit_retained = |batch: &RecordBatch| {
-                        let reserve = || {
-                            charged.hold(batch)?;
-                            charged.entries::<(String, String, String)>(1)?;
-                            charged.grow(batch.get_array_memory_size().saturating_mul(2))
-                        };
-                        reserve().map_err(|error| charged.error(error))
-                    };
-                    judge_load_swept(
-                        &judge.table,
-                        &judge.checks,
-                        judge.removal,
-                        &judge.catalog,
-                        &judge.snapshot,
-                        judge.mode,
-                        &batches,
-                        extracted,
-                        &mut LoadAdmission {
-                            phase: Some(&mut admit_phase),
-                            bytes: Some(&mut admit_bytes),
-                            reuse: Some(&mut admit_reuse),
-                            removed: &mut admit_removed,
-                            retained: &mut admit_retained,
-                        },
+        match &self.shape {
+            ValidateShape::Breaker(breaker) => Ok(breaker.held(
+                memory,
+                &self.metrics,
+                move |memory| async move {
+                    let drained = drain(
+                        partitions, ctx, &memory, &source, &schema, &plan, &judge, None,
                     )
-                    .await
-                    .map_err(external)?;
-                }
-                release_holders(&memory, &plan).await?;
-                drop(facts);
-                memory.metric(VALIDATED_ROWS, rows);
-                Ok(batches)
-            },
-            move |batches, memory, sender| async move {
-                for batch in batches {
-                    sender.send(batch, Arc::clone(&memory)).await?;
-                }
-                Ok(())
-            },
-        ))
+                    .await?;
+                    let batches = drained.batches;
+                    judge_after_drain(
+                        &memory,
+                        &judge,
+                        &plan,
+                        &batches,
+                        drained.rows,
+                        drained.partials,
+                    )
+                    .await?;
+                    drop(drained.facts);
+                    Ok(batches)
+                },
+                move |batches, memory, sender| async move {
+                    for batch in batches {
+                        sender.send(batch, Arc::clone(&memory)).await?;
+                    }
+                    Ok(())
+                },
+            )),
+            ValidateShape::Streaming(streaming) => Ok(streaming.drive(
+                memory,
+                &self.metrics,
+                move |memory, sender| async move {
+                    let forward = Some(Arc::new(tokio::sync::Mutex::new(sender)));
+                    let drained = drain(
+                        partitions, ctx, &memory, &source, &schema, &plan, &judge, forward,
+                    )
+                    .await?;
+                    judge_after_drain(&memory, &judge, &plan, &[], drained.rows, drained.partials)
+                        .await?;
+                    drop(drained.facts);
+                    Ok(())
+                },
+            )),
+        }
     }
+}
+
+/// What the drain left for the judgment: the held batches in source order
+/// (none when the partitions forwarded them), the rows that passed, each
+/// partition's facts and the memory that holds them.
+struct Drained {
+    batches: Vec<RecordBatch>,
+    rows: usize,
+    partials: Vec<SweepPartial>,
+    facts: Vec<WorkMemory>,
+}
+
+/// The swept sets admitted, then the source's `partitions` executed and every
+/// one drained beside the set load; the loaded sets' transient guards are
+/// released once the drain ends.
+#[allow(clippy::too_many_arguments)]
+async fn drain(
+    partitions: usize,
+    ctx: Arc<TaskContext>,
+    memory: &Arc<WorkMemory>,
+    source: &Arc<dyn ExecutionPlan>,
+    schema: &arrow_schema::SchemaRef,
+    plan: &Arc<SweepPlan>,
+    judge: &Arc<LoadJudge>,
+    forward: Forward,
+) -> DfResult<Drained> {
+    let admitted = admit_sets(memory, judge, plan).await?;
+    let inputs = (0..partitions)
+        .map(|partition| source.execute(partition, Arc::clone(&ctx)))
+        .collect::<DfResult<Vec<_>>>()?;
+    let (publish, published) = watch::channel(None::<Arc<SweptSets>>);
+    let (drained, set_guards) = futures::join!(
+        drain_and_sweep(
+            inputs, memory, source, schema, plan, judge, published, forward
+        ),
+        load_sets(Arc::clone(memory), Arc::clone(judge), admitted, publish)
+    );
+    let (_retained_sets, transient) = set_guards?;
+    let drained = drained?;
+    drop(transient);
+    Ok(drained)
+}
+
+/// The checks judged over what the sweep extracted and, for the breaker,
+/// the held batches; the unique holders freed after the verdict.
+async fn judge_after_drain(
+    memory: &Arc<WorkMemory>,
+    judge: &Arc<LoadJudge>,
+    plan: &Arc<SweepPlan>,
+    batches: &[RecordBatch],
+    rows: usize,
+    partials: Vec<SweepPartial>,
+) -> DfResult<()> {
+    let extracted = Extracted::prepare(plan, partials);
+    {
+        let charged = memory.child("load removed and retained rows")?;
+        let mut admit_phase =
+            |LoadPhase::RemovedInput: LoadPhase| -> crate::error::Result<Box<dyn Send>> {
+                let phase_memory = memory
+                    .child("load removed input")
+                    .map_err(|error| memory.error(error))?;
+                phase_memory
+                    .entries::<&str>(rows)
+                    .map_err(|error| memory.error(error))?;
+                Ok(Box::new(phase_memory))
+            };
+        let mut admit_bytes = |bytes: usize| -> crate::error::Result<Box<dyn Send>> {
+            let allocation = memory
+                .child("load integer endpoint keys")
+                .map_err(|error| memory.error(error))?;
+            allocation
+                .grow(bytes)
+                .map_err(|error| memory.error(error))?;
+            Ok(Box::new(allocation))
+        };
+        let mut admit_reuse = || {
+            memory
+                .admit_read_reuse()
+                .and_then(|admitted| LoadReadReuse::new(&judge.db, &judge.snapshot, admitted))
+        };
+        let mut deleted = DeletedIdBudget::new(judge.write_budget);
+        let mut admit_removed = |id: &str| {
+            deleted.retain(id)?;
+            let reserve = || {
+                charged.entries::<String>(1)?;
+                charged.entries::<Expr>(2)?;
+                charged.entries::<&String>(2)?;
+                charged.string(id.len().saturating_mul(3))
+            };
+            reserve().map_err(|error| charged.error(error))
+        };
+        let mut admit_retained = |batch: &RecordBatch| {
+            let reserve = || {
+                charged.hold(batch)?;
+                charged.entries::<(String, String, String)>(1)?;
+                charged.grow(batch.get_array_memory_size().saturating_mul(2))
+            };
+            reserve().map_err(|error| charged.error(error))
+        };
+        judge_load_swept(
+            &judge.table,
+            &judge.checks,
+            judge.removal,
+            &judge.catalog,
+            &judge.snapshot,
+            judge.mode,
+            batches,
+            rows,
+            extracted,
+            &mut LoadAdmission {
+                phase: Some(&mut admit_phase),
+                bytes: Some(&mut admit_bytes),
+                reuse: Some(&mut admit_reuse),
+                removed: &mut admit_removed,
+                retained: &mut admit_retained,
+            },
+        )
+        .await
+        .map_err(external)?;
+    }
+    release_holders(memory, plan).await?;
+    memory.metric(VALIDATED_ROWS, rows);
+    Ok(())
 }
 
 /// Every input partition drained and swept at once ([`sweep_partition`]), the
 /// held batches sorted back into slice order under `schema`; the refusal is a
 /// sliceless failure first, then the best [`FailedSlice::rank`], any partition.
+#[allow(clippy::too_many_arguments)]
 async fn drain_and_sweep(
     inputs: Vec<SendableRecordBatchStream>,
     memory: &Arc<WorkMemory>,
@@ -273,26 +372,31 @@ async fn drain_and_sweep(
     plan: &Arc<SweepPlan>,
     judge: &Arc<LoadJudge>,
     published: PublishedSets,
-) -> DfResult<(Vec<RecordBatch>, Vec<SweepPartial>, Vec<WorkMemory>)> {
+    forward: Forward,
+) -> DfResult<Drained> {
     let drained = futures::future::join_all(inputs.into_iter().map(|input| {
         let plan = Arc::clone(plan);
         let judge = Arc::clone(judge);
         let source = Arc::clone(source);
         let published = published.clone();
-        memory
-            .blocking(move |memory| sweep_partition(input, memory, source, plan, judge, published))
+        let forward = forward.clone();
+        memory.blocking(move |memory| {
+            sweep_partition(input, memory, source, plan, judge, published, forward)
+        })
     }))
     .await;
     let mut batches = Vec::new();
+    let mut rows = 0;
     let mut partials = Vec::new();
     let mut facts = Vec::new();
     let mut failures = Vec::new();
     for (partition, result) in drained.into_iter().enumerate() {
         match result {
-            Ok((held, partial, held_facts)) => {
-                batches.extend(held);
-                partials.push(partial);
-                facts.push(held_facts);
+            Ok(swept) => {
+                batches.extend(swept.held);
+                rows += swept.rows;
+                partials.push(swept.partial);
+                facts.push(swept.facts);
             }
             Err(error) => failures.push((partition, error)),
         }
@@ -330,11 +434,17 @@ async fn drain_and_sweep(
                 .map_err(|error| external(OmniError::arrow_internal(error)))
         })
         .collect::<DfResult<Vec<_>>>()?;
-    Ok((batches, partials, facts))
+    Ok(Drained {
+        batches,
+        rows,
+        partials,
+        facts,
+    })
 }
 
-/// The swept endpoint checks' key sets admitted on a worker before the drain
-/// starts, so a refused set precedes every partition's charge.
+/// The swept endpoint checks' key sets admitted on a worker before the source
+/// partitions are executed, so every set's charge precedes every charge of the
+/// parse and a refused set precedes them all.
 async fn admit_sets(
     memory: &Arc<WorkMemory>,
     judge: &Arc<LoadJudge>,
@@ -389,9 +499,18 @@ async fn load_sets(
     Ok((retained, transient))
 }
 
-/// One partition's input held and swept as it arrives: every batch is held
-/// under `memory`, its facts extracted at its position, probed against the
-/// swept sets once they arrive; the unique holders sized once `source` can.
+/// One partition's drain: what it held (nothing when it forwarded), the rows
+/// it saw, its facts and the memory that holds them.
+struct Swept {
+    held: Vec<RecordBatch>,
+    rows: usize,
+    partial: SweepPartial,
+    facts: WorkMemory,
+}
+
+/// One partition's input swept as it arrives (facts at its position, probed
+/// once the swept sets land), then held under `memory` or sent on through
+/// `forward` once probed, a batch from before the sets waiting in order.
 async fn sweep_partition(
     mut input: SendableRecordBatchStream,
     memory: Arc<WorkMemory>,
@@ -399,10 +518,13 @@ async fn sweep_partition(
     plan: Arc<SweepPlan>,
     judge: Arc<LoadJudge>,
     mut published: PublishedSets,
-) -> DfResult<(Vec<RecordBatch>, SweepPartial, WorkMemory)> {
+    forward: Forward,
+) -> DfResult<Swept> {
     let facts = memory.child("load validation facts")?;
+    let waiting = memory.child("load batches before the sets")?;
     let mut partial = SweepPartial::new(&plan);
     let mut held = Vec::new();
+    let mut rows = 0;
     let mut slice = usize::MAX;
     let mut offset = 0_u64;
     let system_columns = judge.catalog.system_columns;
@@ -413,8 +535,11 @@ async fn sweep_partition(
     while let Some(batch) = input.next().await {
         let batch = batch?;
         memory.metric("input_rows", batch.num_rows());
-        memory.hold(&batch)?;
-        memory.entries::<RecordBatch>(1)?;
+        rows += batch.num_rows();
+        if forward.is_none() {
+            memory.hold(&batch)?;
+            memory.entries::<RecordBatch>(1)?;
+        }
         let tagged = slice_of(&batch);
         if tagged != slice {
             slice = tagged;
@@ -428,26 +553,51 @@ async fn sweep_partition(
         partial
             .observe(&plan, &judge.catalog, &batch, system_columns, base)
             .map_err(external)?;
+        offset += batch.num_rows() as u64;
         if plan.sweeps_endpoints() {
             if sets.is_none() {
                 sets = published.borrow().clone();
             }
             match &sets {
-                Some(sets) => probe_batch(
-                    &facts,
-                    &mut partial,
-                    &plan,
-                    &batch,
-                    system_columns,
-                    base,
-                    sets,
-                    &mut scratch_rows,
-                )?,
-                None => unprobed.push((held.len(), base)),
+                Some(sets) => {
+                    if !unprobed.is_empty() {
+                        probe_held(
+                            &facts,
+                            &mut partial,
+                            &plan,
+                            &held,
+                            &mut unprobed,
+                            system_columns,
+                            sets,
+                            &mut scratch_rows,
+                        )?;
+                        send_held(&forward, &memory, &waiting, &mut held).await?;
+                    }
+                    probe_batch(
+                        &facts,
+                        &mut partial,
+                        &plan,
+                        &batch,
+                        system_columns,
+                        base,
+                        sets,
+                        &mut scratch_rows,
+                    )?;
+                }
+                None => {
+                    if forward.is_some() {
+                        waiting.hold(&batch)?;
+                    }
+                    unprobed.push((held.len(), base));
+                    held.push(batch);
+                    continue;
+                }
             }
         }
-        offset += batch.num_rows() as u64;
-        held.push(batch);
+        match &forward {
+            Some(sender) => sender.lock().await.send(batch, Arc::clone(&memory)).await?,
+            None => held.push(batch),
+        }
     }
     if !unprobed.is_empty() {
         let sets = match sets {
@@ -463,20 +613,70 @@ async fn sweep_partition(
                 })?;
             },
         };
-        for (index, base) in unprobed {
-            probe_batch(
-                &facts,
-                &mut partial,
-                &plan,
-                &held[index],
-                system_columns,
-                base,
-                &sets,
-                &mut scratch_rows,
-            )?;
-        }
+        probe_held(
+            &facts,
+            &mut partial,
+            &plan,
+            &held,
+            &mut unprobed,
+            system_columns,
+            &sets,
+            &mut scratch_rows,
+        )?;
+        send_held(&forward, &memory, &waiting, &mut held).await?;
     }
-    Ok((held, partial, facts))
+    Ok(Swept {
+        held,
+        rows,
+        partial,
+        facts,
+    })
+}
+
+/// Probe the held batches that arrived before the sets, in order.
+#[allow(clippy::too_many_arguments)]
+fn probe_held(
+    facts: &WorkMemory,
+    partial: &mut SweepPartial,
+    plan: &SweepPlan,
+    held: &[RecordBatch],
+    unprobed: &mut Vec<(usize, u64)>,
+    system_columns: SystemColumns,
+    sets: &SweptSets,
+    scratch_rows: &mut usize,
+) -> DfResult<()> {
+    for (index, base) in unprobed.drain(..) {
+        probe_batch(
+            facts,
+            partial,
+            plan,
+            &held[index],
+            system_columns,
+            base,
+            sets,
+            scratch_rows,
+        )?;
+    }
+    Ok(())
+}
+
+/// Send what a forwarding partition held while it waited for the sets, in
+/// order, and release `waiting`'s charge for them; a holding partition keeps
+/// them.
+async fn send_held(
+    forward: &Forward,
+    memory: &Arc<WorkMemory>,
+    waiting: &WorkMemory,
+    held: &mut Vec<RecordBatch>,
+) -> DfResult<()> {
+    let Some(sender) = forward else {
+        return Ok(());
+    };
+    for batch in held.drain(..) {
+        sender.lock().await.send(batch, Arc::clone(memory)).await?;
+    }
+    waiting.release_work();
+    Ok(())
 }
 
 /// The shared unique holders sized from the source's row estimate once it has
@@ -728,7 +928,11 @@ fn string_payload_bytes(column: &ArrayRef) -> usize {
 #[cfg(test)]
 mod tests {
     use std::fmt::Write;
+    use std::sync::Mutex;
 
+    use datafusion::execution::memory_pool::{
+        GreedyMemoryPool, MemoryConsumer, MemoryPool, MemoryReservation,
+    };
     use omnigraph_compiler::catalog::build_catalog;
     use omnigraph_compiler::ir::lower_load;
     use omnigraph_compiler::query::ast::{LoadStmt, LoadStmtMode, LoadTarget};
@@ -802,6 +1006,17 @@ mod tests {
         source: &str,
         partitions: usize,
     ) -> (Arc<CsvSourceExec>, DfResult<Vec<RecordBatch>>) {
+        validate_as(schema, source, partitions, false).await
+    }
+
+    /// [`validate`] with the shape chosen: the breaker under a removal scan,
+    /// the streaming operator under `removal: None`.
+    async fn validate_as(
+        schema: &str,
+        source: &str,
+        partitions: usize,
+        streams: bool,
+    ) -> (Arc<CsvSourceExec>, DfResult<Vec<RecordBatch>>) {
         let dir = tempfile::tempdir().unwrap();
         let db = crate::Session::from_defaults(
             Arc::new(
@@ -847,13 +1062,18 @@ mod tests {
             db: Arc::clone(db.db()),
             table: "node:Person".to_string(),
             checks,
-            removal: ValidateRemoval::Scan,
+            removal: if streams {
+                ValidateRemoval::None
+            } else {
+                ValidateRemoval::Scan
+            },
             mode: LoadMode::Overwrite,
             write_budget: WriteBudget::from_settings(db.settings()),
             snapshot: db.snapshot().await,
             catalog,
         };
-        let validate = ValidateExec::new(Arc::clone(&exec) as Arc<dyn ExecutionPlan>, judge);
+        let validate =
+            ValidateExec::new(Arc::clone(&exec) as Arc<dyn ExecutionPlan>, judge, streams);
         let (_pool, ctx) = fixtures::context(64 << 20, CSV_READ_BATCH_ROWS);
         let judged = validate
             .execute(0, ctx)
@@ -879,6 +1099,40 @@ mod tests {
                     .to_vec()
             })
             .collect()
+    }
+
+    /// The streaming shape sends each partition's batches on as they pass,
+    /// slice tag kept for the sink's ordering: every row once, each partition
+    /// in source order; a case sees the loaded rows, never the batches.
+    #[tokio::test]
+    async fn partitions_stream_their_rows_tagged_by_slice() {
+        let mut source = String::from("key,score\n");
+        for row in 0..1000 {
+            writeln!(&mut source, "{row},1.5").unwrap();
+        }
+        let (exec, streamed) = validate_as(PERSON, &source, 3, true).await;
+        let batches = streamed.unwrap();
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.schema().metadata().contains_key(CSV_SLICE_METADATA))
+        );
+        let mut per_partition: std::collections::BTreeMap<usize, Vec<i64>> =
+            std::collections::BTreeMap::new();
+        for batch in &batches {
+            per_partition
+                .entry(slice_of(batch) >> 32)
+                .or_default()
+                .extend(keys(std::slice::from_ref(batch)));
+        }
+        assert_eq!(per_partition.len(), 3, "{per_partition:?}");
+        for rows in per_partition.values() {
+            assert!(rows.windows(2).all(|pair| pair[0] < pair[1]), "{rows:?}");
+        }
+        let mut all: Vec<i64> = per_partition.into_values().flatten().collect();
+        all.sort_unstable();
+        assert_eq!(all, (0..1000).collect::<Vec<i64>>());
+        assert!(exec.failed_slices().is_empty());
     }
 
     /// Whatever partition claimed each slice, the breaker hands the held rows
@@ -1228,6 +1482,7 @@ mod tests {
                                 plan,
                                 judge,
                                 published,
+                                None,
                             )
                         })
                         .await
@@ -1245,10 +1500,10 @@ mod tests {
                 sweep(earlier_slice_missing_src_and_dst_at_row_2.clone(), ended_b),
                 publisher
             );
-            let (held_a, partial_a, _facts_a) = a.unwrap();
-            let (held_b, partial_b, _facts_b) = b.unwrap();
-            let extracted = Extracted::prepare(&plan, vec![partial_a, partial_b]);
-            let held: Vec<RecordBatch> = held_b.into_iter().chain(held_a).collect();
+            let a = a.unwrap();
+            let b = b.unwrap();
+            let extracted = Extracted::prepare(&plan, vec![a.partial, b.partial]);
+            let held: Vec<RecordBatch> = b.held.into_iter().chain(a.held).collect();
             let refused = judge_load_swept(
                 "edge:Knows",
                 &checks,
@@ -1257,6 +1512,7 @@ mod tests {
                 &snapshot,
                 LoadMode::Overwrite,
                 &held,
+                a.rows + b.rows,
                 extracted,
                 &mut LoadAdmission {
                     phase: None,
@@ -1305,6 +1561,7 @@ mod tests {
         let validate = ValidateExec::new(
             Arc::clone(&exec) as Arc<dyn ExecutionPlan>,
             knows_judge(&db, &checks, &snapshot),
+            false,
         );
         let (_pool, ctx) = fixtures::context(whole_set - 1, CSV_READ_BATCH_ROWS);
         let refused = validate
@@ -1349,5 +1606,126 @@ mod tests {
         assert_eq!(pool.reserved() - before, three_keys_in_four_slots_retained);
         drop(retained);
         assert_eq!(pool.reserved(), before);
+    }
+
+    /// A pool recording the consumer and size of every charge in the order it
+    /// saw them, over a greedy pool of `limit` bytes.
+    #[derive(Debug)]
+    struct ChargeLedger {
+        inner: GreedyMemoryPool,
+        charges: Mutex<Vec<(String, usize)>>,
+    }
+
+    impl ChargeLedger {
+        fn new(limit: usize) -> Self {
+            Self {
+                inner: GreedyMemoryPool::new(limit),
+                charges: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn record(&self, reservation: &MemoryReservation, additional: usize) {
+            self.charges
+                .lock()
+                .unwrap()
+                .push((reservation.consumer().name().to_owned(), additional));
+        }
+
+        fn charges(&self) -> Vec<(String, usize)> {
+            self.charges.lock().unwrap().clone()
+        }
+    }
+
+    impl fmt::Display for ChargeLedger {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("charge ledger")
+        }
+    }
+
+    impl MemoryPool for ChargeLedger {
+        fn name(&self) -> &str {
+            "charge ledger"
+        }
+
+        fn register(&self, consumer: &MemoryConsumer) {
+            self.inner.register(consumer);
+        }
+
+        fn unregister(&self, consumer: &MemoryConsumer) {
+            self.inner.unregister(consumer);
+        }
+
+        fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+            self.record(reservation, additional);
+            self.inner.grow(reservation, additional);
+        }
+
+        fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+            self.inner.shrink(reservation, shrink);
+        }
+
+        fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> DfResult<()> {
+            self.record(reservation, additional);
+            self.inner.try_grow(reservation, additional)
+        }
+
+        fn reserved(&self) -> usize {
+            self.inner.reserved()
+        }
+    }
+
+    /// Every key-set charge precedes the parse's first charge: the sets are
+    /// admitted before the source partitions are executed, a thread order
+    /// GQT cannot observe (as `partitions_admit_their_source_before_the_first_poll`).
+    #[tokio::test]
+    async fn the_sets_are_charged_before_the_source_partitions_are_executed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = keyed_graph(&dir).await;
+        let catalog = db.catalog();
+        let checks = swept_checks(&catalog);
+        let snapshot = db.snapshot().await;
+        let exec = Arc::new(CsvSourceExec::new(
+            knows_request(),
+            bytes("from,to\n1,2\n2,3\n3,1\n"),
+            Arc::clone(&catalog),
+            target_arrow_schema(&catalog, &LoadTarget::Edge("Knows".to_string())).unwrap(),
+            2,
+            64,
+            Arc::default(),
+        ));
+        let validate = ValidateExec::new(
+            Arc::clone(&exec) as Arc<dyn ExecutionPlan>,
+            knows_judge(&db, &checks, &snapshot),
+            false,
+        );
+        let ledger = Arc::new(ChargeLedger::new(64 << 20));
+        let ctx = fixtures::context_over(
+            Arc::clone(&ledger) as Arc<dyn MemoryPool>,
+            64 << 20,
+            CSV_READ_BATCH_ROWS,
+        );
+        let judged = validate
+            .execute(0, ctx)
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<DfResult<Vec<_>>>()
+            .unwrap();
+        assert_eq!(judged.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+        let charges = ledger.charges();
+        let first = |consumer: &str| {
+            charges
+                .iter()
+                .position(|(name, _)| name == consumer)
+                .unwrap_or_else(|| panic!("no charge by {consumer}: {charges:?}"))
+        };
+        let last_set = charges
+            .iter()
+            .rposition(|(name, _)| name == "load integer endpoint keys")
+            .unwrap_or_else(|| panic!("no key-set charge: {charges:?}"));
+        assert!(last_set < first("CsvSourceExec"), "{charges:?}");
+        assert!(last_set < first("CSV source bytes"), "{charges:?}");
+        assert!(last_set < first("CSV decoding"), "{charges:?}");
     }
 }
