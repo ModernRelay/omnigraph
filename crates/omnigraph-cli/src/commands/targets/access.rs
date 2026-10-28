@@ -11,10 +11,11 @@ use omnigraph_api_types::{AccessAction, AccessOutput, ErrorCode};
 use serde::Serialize;
 
 use super::args::AccessArgs;
+use crate::client::GraphClient;
 use crate::helpers::CodedRefusal;
 use crate::operator::InvocationConfig;
 use crate::output::write_json;
-use crate::targets::{ACCESS_PROTOCOL, ResolvedTarget, ServerAuth, TargetBinding};
+use crate::targets::{ACCESS_PROTOCOL, ResolvedTarget, TargetBinding};
 
 #[derive(Serialize)]
 struct AccessReport<'a> {
@@ -48,9 +49,12 @@ pub(crate) async fn run_access(
             .map_err(|error| CodedRefusal::report(ErrorCode::BadRequest, error.to_string()))?;
     }
     let (source, access) = match &target.binding {
-        TargetBinding::Server { endpoint, auth, .. } => (
+        TargetBinding::Server { .. } | TargetBinding::Managed(_) => (
             "server",
-            server_access(input, target, endpoint, auth, graph, actor, &args).await?,
+            GraphClient::from_target(input, target, graph, actor, stderr)
+                .await?
+                .access(args.branch.as_deref(), args.target_branch.as_deref())
+                .await?,
         ),
         TargetBinding::DirectRoot { .. } => {
             let graph = crate::scope::graph_selection(target, graph)?
@@ -64,7 +68,7 @@ pub(crate) async fn run_access(
             let actor = crate::helpers::resolve_actor(input, actor, stderr)?;
             ("direct", store_access(target, actor, &args).await?)
         }
-        TargetBinding::DirectCatalogue | TargetBinding::Managed(_) => {
+        TargetBinding::DirectCatalogue => {
             return Err(crate::targets::refusal(
                 "target_incompatible",
                 "access is not available for this target kind and scope",
@@ -81,35 +85,6 @@ pub(crate) async fn run_access(
         return write_json(&report, stdout);
     }
     write_text(&report, stdout)
-}
-
-/// A server target's access route, with the target's token. `--as` rides as
-/// the `Omnigraph-If-Actor` assertion, which the server refuses when the
-/// token resolves to another actor.
-async fn server_access(
-    input: &InvocationConfig,
-    target: &ResolvedTarget,
-    endpoint: &str,
-    auth: &ServerAuth,
-    graph: Option<&str>,
-    actor: Option<&str>,
-    args: &AccessArgs,
-) -> Result<AccessOutput> {
-    let graph =
-        crate::scope::graph_selection(target, graph)?.expect("a server target selects its graph");
-    let base_url = crate::helpers::remote_url(endpoint, &["graphs", graph], &[])?;
-    let token = crate::targets::resolve_server_token_for(input, auth, endpoint, &base_url)?;
-    let http = crate::graph_http::GraphHttpClient::server_target(input, target)?
-        .with_expected_actor(actor);
-    let mut query = Vec::new();
-    if let Some(branch) = args.branch.as_deref() {
-        query.push(("branch", branch));
-    }
-    if let Some(target_branch) = args.target_branch.as_deref() {
-        query.push(("target_branch", target_branch));
-    }
-    let url = crate::helpers::remote_url(&base_url, &["access"], &query)?;
-    crate::helpers::remote_json(&http, reqwest::Method::GET, url, None, token.as_deref()).await
 }
 
 /// The serving snapshot of the cluster at `root`, read for `graph`. When

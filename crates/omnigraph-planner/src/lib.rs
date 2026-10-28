@@ -81,6 +81,7 @@ pub use physical::{
     PhysicalNode, PhysicalNodeKind, PhysicalPlan, PipelineShape, PipelineSink, PipelineSource,
     PipelineSpec, Prefilter, PrefilterMode, Properties, ROW_ADDRESS_PREFIX, RankArm, RankKind,
     RankScope, RankedAccess, ScanInput, SideChain, StatisticSource, operator_rows,
+    validate_streams,
 };
 pub use ranking::{PlannedRanking, planned_ranking};
 pub use registry::{Coverage, Entry, Route, Shape};

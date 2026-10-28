@@ -35,8 +35,10 @@ pub(crate) async fn run_queries(
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
     // A server answers for one graph: `--json` prints the route's body.
-    if let (QueriesCommand::List { json }, TargetBinding::Server { .. }) =
-        (&command, &scope.target.binding)
+    if let (
+        QueriesCommand::List { json },
+        TargetBinding::Server { .. } | TargetBinding::Managed(_),
+    ) = (&command, &scope.target.binding)
     {
         let client =
             GraphClient::from_target(scope.operator, scope.target, scope.graph, None, stderr)

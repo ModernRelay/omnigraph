@@ -370,6 +370,15 @@ path, and never reflect the credential or a refusal reason. `/mcp` keeps only
 its own `Cache-Control: no-store`. The OpenAPI document records the header on
 every protected operation's 401.
 
+A token that passes its own checks is not a refused one, so it never gets
+`invalid_token`: when the OIDC admission file names no principal for its
+subject the answer is 403 `not_admitted`, and while the admission snapshot is
+expired it is 503 `service_unavailable` with `Retry-After`. Neither carries a
+challenge, since signing in again issues a token for the same subject and
+cannot help; a challenge there sends a standard OAuth client round a sign-in
+loop. The token's own checks run first, so a caller without a validly signed
+token learns nothing about the admission file.
+
 ## Invariants
 
 - **Trust at the boundary, enforcement at the engine (invariant 10).** Actors come
@@ -498,6 +507,12 @@ a deferred item or the existing allowed-origin rule.
 
 ## Decision log
 
+- 2026-10-27: An unadmitted subject and an expired admission snapshot no
+  longer answer 401 `invalid_token` (issue
+  [#1172](https://github.com/ModernRelay/omnigraph/issues/1172)); they answer
+  403 `not_admitted` and 503 `service_unavailable` without a challenge. This
+  narrows "a bearer token that does not authenticate is a refused one" to a
+  token that fails its own checks.
 - 2026-10-22: Amended for operation parity (phase 3), from the one set of
   operations of
   [Graph access and cross-process writes](2026-10-16-graph-access-serving-and-cross-process-writes.md).

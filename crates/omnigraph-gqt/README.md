@@ -607,6 +607,12 @@ the header, so a case of a few KiB cuts two or three partitions and pins what
 happens at their boundaries; the header's head range keeps its 64 KiB floor.
 An in-process pin: a server target refuses it.
 
+The optional `# overwrite_chunk_rows: <n>` header sets the rows one `load csv`
+overwrite chunk holds before a Lance writer takes it, Lance's file target
+(1 Mi rows) without the header, so a case of a few hundred records writes
+fragments before its last record is judged and pins what a late refusal leaves
+behind. An in-process pin: a server target refuses it.
+
 An `expand $src <Edge> $dst:` line selects every matching named-edge physical `Expand` between
 those bindings over that edge type and claims `mode csr` or `mode
 indexed_scan`, the traversal mode the planner recorded (pass `expand_mode`

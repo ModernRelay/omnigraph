@@ -89,6 +89,7 @@ pub(crate) async fn judge_load(
         base,
         mode,
         batches,
+        batches.iter().map(RecordBatch::num_rows).sum(),
         extracted,
         admission,
     )
@@ -101,6 +102,7 @@ pub(crate) async fn judge_load(
 /// the plan's word on the ids an overwrite removes: under `Scan` they are
 /// found before the checks run, under `None` the plan carries no check that
 /// reads them, which the committed table's row count must bear out.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn judge_load_swept(
     table: &str,
     checks: &[ValidateSpec],
@@ -109,6 +111,7 @@ pub(crate) async fn judge_load_swept(
     base: &Snapshot,
     mode: LoadMode,
     batches: &[RecordBatch],
+    delta_rows: usize,
     mut extracted: Extracted,
     admission: &mut LoadAdmission<'_>,
 ) -> Result<()> {
@@ -186,7 +189,7 @@ pub(crate) async fn judge_load_swept(
                 }
             }
             ValidateCheck::EdgeRi { .. } => {
-                if edge_ri_judged || batches.iter().all(|batch| batch.num_rows() == 0) {
+                if edge_ri_judged || delta_rows == 0 {
                     continue;
                 }
                 edge_ri_judged = true;
@@ -402,6 +405,11 @@ impl SweepPlan {
     /// Whether the partitions probe the endpoint checks as they sweep.
     pub(crate) fn sweeps_endpoints(&self) -> bool {
         !self.endpoints.is_empty()
+    }
+
+    /// Whether a uniqueness check's holders are sized and shared.
+    pub(crate) fn has_unique_holders(&self) -> bool {
+        !self.unique_holders.is_empty()
     }
 
     /// Every uniqueness check's holders sized for `rows` once, the first time
@@ -1435,6 +1443,7 @@ mod tests {
             &snapshot,
             LoadMode::Overwrite,
             &batches,
+            3,
             Extracted::sweep("node:Person", &checks, &catalog, &batches, sc, true).unwrap(),
             &mut LoadAdmission {
                 phase: None,
@@ -1466,6 +1475,7 @@ mod tests {
             &snapshot,
             LoadMode::Overwrite,
             &batches,
+            3,
             Extracted::sweep("node:Person", &pruned, &catalog, &batches, sc, true).unwrap(),
             &mut LoadAdmission {
                 phase: None,
