@@ -9,13 +9,14 @@ use serde_json::{Map, Value};
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum ReadOutputFormat {
-    #[default]
     Table,
     Kv,
     Csv,
     Jsonl,
     Json,
     /// The same document as [`Self::Json`], encoded as TOON (specification 4.4).
+    /// This is the format a read uses when no flag and no operator default selects one.
+    #[default]
     Toon,
     /// The result as an Arrow IPC stream on stdout.
     Arrow,

@@ -36,7 +36,7 @@ targets:
     scope: graph
     uri: file:///srv/graphs/scratch.omni
 defaults:
-  output: table
+  output: toon
 ```
 
 A profile requires `api`, `organization_id` and one `auth` provider object. Each profile represents one
@@ -73,7 +73,7 @@ Credential, helper and CA availability are checked only for selected operations.
 | Managed authentication | The selected profile's single `auth` provider |
 | Standalone authentication | The selected server target's single `auth` provider |
 | Graph | `--graph ID`, then target `default_graph`; otherwise graph-scoped operations refuse |
-| Read output | Explicit `--format`, then `defaults.output`, then `table`; `--json` selects JSON where offered. `toon` encodes the same read document as `json` |
+| Read output | Explicit `--format`, then `defaults.output`, then `toon`. `--json` selects JSON. `--format table` prints a table |
 
 Profile and target selectors are mutually exclusive; their defaults never infer each other. Managed targets
 always use their pinned `profile`; neither `defaults.profile` nor a global `--profile` can override that
@@ -89,8 +89,8 @@ local creation shorthand. Defaults and aliases require registered names.
 There are no environment overrides for destination fields.
 
 `defaults.output` accepts only `table`, `json`, `jsonl`, `csv`, `kv`, or `toon` and
-applies to supported read-result formatting. Action receipts retain their own
-contracts. Unsupported formats refuse. Diagnostics go to stderr, results to stdout.
+applies to supported read-result formatting. Omitted, it is `toon`. Action receipts retain their own
+contracts. Unsupported formats refuse. Results go to stdout. A `table`, `kv`, or `csv` read keeps its error on stderr. TOON, JSON, and JSONL put that error on stdout.
 
 ## Authentication providers
 

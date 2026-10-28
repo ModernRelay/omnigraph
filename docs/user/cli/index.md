@@ -213,7 +213,7 @@ and the [managed command reference](reference.md#managed-cluster-commands).
 ## Output and errors
 
 For `query` and `alias`, output selection follows `--json`, then `--format`,
-then operator `defaults.output`, then `table`. Aliases have no format field.
+then operator `defaults.output`, then `toon`. Aliases have no format field.
 Structured execution errors use the selected JSON, JSONL, or TOON format. Mutations
 require explicit `--json` for structured errors. Target diagnostics go to
 stderr and cannot be suppressed by a quiet flag.

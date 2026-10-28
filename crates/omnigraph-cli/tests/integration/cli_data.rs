@@ -3669,8 +3669,11 @@ fn read_requires_name_for_multi_query_files() {
             .arg("--query")
             .arg(fixture("test.gq")),
     );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("multiple queries"));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("multiple queries"),
+        "a read with no format prints the refusal as TOON: {stdout}"
+    );
 }
 
 /// A `--query` file holding no declaration is refused by count; an empty
@@ -3691,9 +3694,12 @@ fn read_refuses_an_empty_source_as_no_query() {
             .arg("--query")
             .arg(&empty_query),
     );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("query file contains no query"), "{stderr}");
-    assert!(!stderr.contains("multiple queries"), "{stderr}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("query file contains no query"),
+        "a read with no format prints the refusal as TOON: {stdout}"
+    );
+    assert!(!stdout.contains("multiple queries"), "{stdout}");
 }
 
 #[test]

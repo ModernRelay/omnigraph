@@ -1691,7 +1691,22 @@ fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
     assert_eq!(line["diagnostic"]["code"], "Q002");
     assert_eq!(line["diagnostic"]["suggestion"], suggestion);
 
-    let human = output_failure(embedded("query", &graph).arg("-e").arg(refused));
+    let default_toon = output_failure(embedded("query", &graph).arg("-e").arg(refused));
+    let toon = stdout_string(&default_toon);
+    assert!(toon.starts_with("error:"), "{toon}");
+    assert!(toon.contains("code: Q002"), "{toon}");
+    assert!(toon.contains("fix: query name()"), "{toon}");
+    assert!(
+        !stderr_string(&default_toon).contains("error[Q002]:"),
+        "the default TOON lane does not also print the human diagnostic"
+    );
+
+    let human = output_failure(
+        embedded("query", &graph)
+            .arg("-e")
+            .arg(refused)
+            .args(["--format", "table"]),
+    );
     let stderr = stderr_string(&human);
     assert!(
         stderr.contains("error[Q002]: parse error: expected `(`"),
@@ -1760,7 +1775,16 @@ fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
     assert_eq!(json["diagnostic"]["code"], "Q002");
     assert_eq!(json["diagnostic"]["suggestion"], suggestion);
     assert_eq!(json["diagnostic"]["fix"], "query name()");
-    let served_human = output_failure(served("query", &server).arg("-e").arg(refused));
+    let served_default = output_failure(served("query", &server).arg("-e").arg(refused));
+    let served_toon = stdout_string(&served_default);
+    assert!(served_toon.contains("code: Q002"), "{served_toon}");
+    assert!(served_toon.contains("fix: query name()"), "{served_toon}");
+    let served_human = output_failure(
+        served("query", &server)
+            .arg("-e")
+            .arg(refused)
+            .args(["--format", "table"]),
+    );
     let stderr = stderr_string(&served_human);
     assert!(stderr.contains("error[Q002]:"), "{stderr}");
     assert!(stderr.contains("fix: query name()"), "{stderr}");

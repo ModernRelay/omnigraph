@@ -209,12 +209,13 @@ pub(crate) struct Defaults {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum OutputFormat {
-    #[default]
     Table,
     Json,
     Jsonl,
     Csv,
     Kv,
+    /// A read with no explicit format. An omitted `defaults.output` means this.
+    #[default]
     Toon,
 }
 
