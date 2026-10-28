@@ -27,10 +27,8 @@ use std::time::Duration;
 
 use futures::stream::StreamExt;
 use lance::dataset::optimize::{CompactionMetrics, CompactionOptions};
-use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 
 use super::*;
-use crate::dataset_index::is_full_text_index;
 use crate::seams::{decide_seam, fail};
 
 /// How many datasets to optimize/cleanup concurrently. Each has separate
@@ -468,8 +466,14 @@ async fn prepare_optimize_table(
         let mut stat =
             DatasetOptimizeStats::compacted(task.table_key, &CompactionMetrics::default(), false);
         stat.pending_indexes = index_work.pending;
-        append_deferred_full_text_indexes(&snapshot, &stat.type_key, &mut stat.pending_indexes)
-            .await?;
+        super::table_ops::append_deferred_full_text_indexes(
+            &snapshot,
+            &stat.type_key,
+            "main",
+            &[],
+            &mut stat.pending_indexes,
+        )
+        .await?;
         return Ok(OptimizePreparation::Stat(stat));
     }
 
@@ -482,52 +486,6 @@ async fn prepare_optimize_table(
         witness: task.witness,
         last_linear_version: task.entry.version_metadata.last_linear_version(),
     }))
-}
-
-/// Deferred full-text coverage is observable status, never a promise that
-/// ordinary optimize will advance this table. Recheck after physical work too:
-/// stable-ID compaction can change coverage while preserving index artifacts.
-async fn append_deferred_full_text_indexes(
-    snapshot: &crate::storage_layer::SnapshotHandle,
-    table_key: &str,
-    pending: &mut Vec<super::PendingIndex>,
-) -> Result<()> {
-    let ds = snapshot.dataset();
-    let indices = ds.load_indices().await.map_err(OmniError::storage)?;
-    let full_text: std::collections::BTreeMap<_, _> = indices
-        .iter()
-        .filter(|index| is_full_text_index(index))
-        .map(|index| (index.name.as_str(), index))
-        .collect();
-    for (name, index) in full_text {
-        let coverage_unknown = indices
-            .iter()
-            .any(|segment| segment.name == name && segment.fragment_bitmap.is_none());
-        if !coverage_unknown
-            && ds
-                .unindexed_fragments(name)
-                .await
-                .map_err(OmniError::storage)?
-                .is_empty()
-        {
-            continue;
-        }
-        for field in index
-            .keyed_fields()
-            .iter()
-            .filter_map(|id| ds.schema().field_by_id(*id))
-        {
-            pending.push(super::PendingIndex {
-                type_key: table_key.to_string(),
-                property: field.name.clone(),
-                reason: format!(
-                    "full-text index '{name}' has incomplete or unknown coverage; \
-                     run omnigraph rebuild-full-text-indexes <URI> --branch main"
-                ),
-            });
-        }
-    }
-    Ok(())
 }
 
 decide_seam! {
@@ -627,12 +585,26 @@ async fn apply_optimize_table_effects(
     let Some(identity) = tip_identity else {
         let mut stat = DatasetOptimizeStats::compacted(table_key, &metrics, false);
         stat.pending_indexes = index_work.pending;
-        append_deferred_full_text_indexes(&tip, &stat.type_key, &mut stat.pending_indexes).await?;
+        super::table_ops::append_deferred_full_text_indexes(
+            &tip,
+            &stat.type_key,
+            "main",
+            &[],
+            &mut stat.pending_indexes,
+        )
+        .await?;
         return Ok(OptimizeEffectOutcome { stat, effect: None });
     };
     let mut stat = DatasetOptimizeStats::compacted(table_key.clone(), &metrics, true);
     stat.pending_indexes = index_work.pending;
-    append_deferred_full_text_indexes(&tip, &stat.type_key, &mut stat.pending_indexes).await?;
+    super::table_ops::append_deferred_full_text_indexes(
+        &tip,
+        &stat.type_key,
+        "main",
+        &[],
+        &mut stat.pending_indexes,
+    )
+    .await?;
     let state = db.storage().table_state(&full_path, &tip).await?;
     let published_dataset_version = work.expected_version + 1 + chain.len() as u64;
     let version_metadata = state

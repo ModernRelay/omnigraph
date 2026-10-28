@@ -93,6 +93,7 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
             command: SchemaCommand::Plan { .. },
         }
         | Command::Optimize(_)
+        | Command::Index { .. }
         | Command::RebuildFullTextIndexes(_)
         | Command::Repair(_)
         | Command::Cleanup(_) => Graph {
@@ -277,6 +278,7 @@ fn accepts_actor(command: &Command) -> bool {
         // The bridge asserts the actor on every request it relays.
         Command::Mutate(_)
         | Command::Load(_)
+        | Command::Index { .. }
         | Command::RebuildFullTextIndexes(_)
         | Command::Mcp(_) => true,
         // The actor a direct target's policy decides for.
@@ -635,6 +637,10 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Policy { .. } => "policy",
         Command::Upgrade(_) => "upgrade",
         Command::Optimize(_) => "optimize",
+        Command::Index { command } => match command {
+            IndexCommand::Build(_) => "index build",
+            IndexCommand::Rebuild(_) => "index rebuild",
+        },
         Command::RebuildFullTextIndexes(_) => "rebuild-full-text-indexes",
         Command::Repair(_) => "repair",
         Command::Cleanup(_) => "cleanup",
@@ -707,6 +713,8 @@ mod tests {
             (&["mutate", "-e", "q"], true),
             (&["load", "--data", "d.jsonl", "--mode", "append"], true),
             (&["rebuild-full-text-indexes"], true),
+            (&["index", "build"], true),
+            (&["index", "rebuild", "--kind", "full-text"], true),
             (&["access"], true),
             (&["branch", "create", "b"], true),
             (&["branch", "delete", "b"], true),

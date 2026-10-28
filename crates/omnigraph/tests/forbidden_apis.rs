@@ -264,7 +264,7 @@ write_surfaces! {
     "db/omnigraph.rs" => WriteProtocol::Exact("unpublished commit publication: the proposal's recorded changes replayed through the manifest publisher under its captured authority, required to allocate the proposal's own id") => ["publish_commit_as"],
     "db/omnigraph.rs" => WriteProtocol::Composed("proposal tag removal confirmed by a readback, then merge-input tag release") => ["drop_commit_as"],
     "db/omnigraph.rs" => INDICES_V9 => [
-        "ensure_indices", "ensure_indices_on",
+        "ensure_indices", "ensure_indices_on", "ensure_indices_on_as",
         "rebuild_full_text_indices_on", "rebuild_full_text_indices_on_as",
     ],
     "db/omnigraph.rs" => WriteProtocol::TestOnly => ["failpoint_publish_table_head_without_index_rebuild_for_test", "init_with_legacy_system_columns_for_tests"],
@@ -866,7 +866,7 @@ gateway_surfaces! {
         "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
         "stage_overwrite_batches", "stage_overwrite_stream",
         "stage_rename_columns", "stage_schema_evolution", "stage_delete", "stage_create_indices",
-        "stage_compaction", "stage_index_fold",
+        "stage_compaction", "stage_index_fold", "stage_index_reconciliation",
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::NativeRefControl) => [
         "force_delete_branch",
@@ -915,7 +915,7 @@ gateway_surfaces! {
         "stage_overwrite_batches", "stage_overwrite_stream",
         "stage_rename_columns", "renamed_schema", "stage_schema_evolution",
         "plan_schema_evolution", "stage_delete", "stage_create_indices", "stage_compaction",
-        "stage_index_fold", "stage_full_text_declarations",
+        "stage_index_fold", "stage_index_reconciliation", "stage_full_text_declarations",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::NativeRefControl) => [
         "force_delete_branch",
@@ -1061,7 +1061,7 @@ durable_calls! {
     ("storage_layer.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("db/omnigraph/promotion.rs", "SnapshotHandle::new(", 1, WriteProtocol::ReadOnlyAccess),
-    ("storage_layer.rs", ".dataset()", 34, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".dataset()", 35, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".into_arc()", 6, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", "SnapshotHandle::new(", 4, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("table_store.rs", ".raw_dataset_append(", 1, WriteProtocol::EphemeralScratch),
@@ -1124,7 +1124,9 @@ durable_calls! {
     ("db/omnigraph/optimize.rs", ".force_delete_branch(", 1, WriteProtocol::PhysicalOnly),
     ("exec/merge.rs", "TableStore::create_empty_dataset(", 1, WriteProtocol::EphemeralScratch),
     ("exec/merge.rs", "TableStore::append_or_create_batch(", 1, WriteProtocol::EphemeralScratch),
-    ("db/omnigraph/table_ops.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
+    // Index metadata reads: the full-text rebuild's inventory, node and edge
+    // coverage lag, and deferred full-text coverage.
+    ("db/omnigraph/table_ops.rs", ".dataset()", 4, WriteProtocol::ReadOnlyAccess),
     // Two pinned entity row scans and one schema read for system-role resolution.
     ("db/omnigraph/export.rs", ".dataset()", 3, WriteProtocol::ReadOnlyAccess),
     // Blob live-branch recheck: lists the table's refs to prove a vanished
@@ -1145,7 +1147,7 @@ durable_calls! {
     ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ManifestAdoption),
     // The sixth accessor reports deferred FTS coverage from an immutable
     // snapshot; it only reads index metadata and never stages or publishes.
-    ("db/omnigraph/optimize.rs", ".dataset()", 10, WriteProtocol::Composed("Optimize planning + read-only coverage and native-fork inventory + physical cleanup, including the release of expired proposal tags and of expired unattached tags descendants first, each confirmed by a readback")),
+    ("db/omnigraph/optimize.rs", ".dataset()", 9, WriteProtocol::Composed("Optimize planning + read-only coverage and native-fork inventory + physical cleanup, including the release of expired proposal tags and of expired unattached tags descendants first, each confirmed by a readback")),
     ("db/omnigraph/optimize.rs", ".into_dataset()", 1, WriteProtocol::PhysicalOnly),
     ("exec/merge.rs", "SnapshotHandle::new(", 4, MERGE_V9),
 }
@@ -3354,6 +3356,8 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "db/manifest.rs: omnigraph_catalog::READ_REFRESH_POST_STATE_PRE_LINEAGE",
     "error.rs: omnigraph_core::error::BranchStartRefusal",
     "error.rs: omnigraph_core::error::CompletionEvidence",
+    "error.rs: omnigraph_core::error::FULL_TEXT_REBUILD_COMMAND",
+    "error.rs: omnigraph_core::error::INDEX_BUILD_COMMAND",
     "error.rs: omnigraph_core::error::ManifestConflictDetails",
     "error.rs: omnigraph_core::error::ManifestError",
     "error.rs: omnigraph_core::error::ManifestErrorKind",

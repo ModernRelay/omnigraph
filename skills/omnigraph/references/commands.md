@@ -9,7 +9,7 @@
 - Schema · offline storage upgrade · lint · embed · init
 - Load (bulk JSONL)
 - Query / mutate
-- Maintenance (optimize, full-text rebuild, cleanup)
+- Maintenance (optimize, index build and rebuild, cleanup)
 - Stored queries
 - Operator config & credentials
 - MCP for agents (mcp)
@@ -44,8 +44,8 @@ prints the exact flags of the installed binary.
 | `graphs` | `list` | List the graphs a multi-graph server serves |
 | `init` | — | Create a graph from a `.pg` schema |
 | `upgrade` | — | Convert a standalone graph's storage offline |
-| `optimize` | — | Compact data and reconcile declared indexes |
-| `rebuild-full-text-indexes` | — | Replace one branch's full-text indexes |
+| `optimize` | — | Compact data and reconcile declared indexes on `main` |
+| `index` | `build` `rebuild` | Build a branch's missing or lagging indexes; replace its full-text indexes |
 | `repair` | — | Report foreign Lance history without adopting it |
 | `cleanup` | — | Delete table versions no retained graph commit pins (destructive) |
 | `lint` | — | Validate `.gq` source against a schema or a graph |
@@ -302,13 +302,30 @@ valid-empty, and non-empty Blob values remain distinct. Existing full-text
 indexes are preserved and any uncovered tail is scanned; use the explicit
 rebuild command when full-text coverage or analyzer compatibility must change.
 `optimize` also persists the derived traversal adjacency used to speed up
-traversal startup; it does not collect unused forks (that is `cleanup`).
+traversal startup; it does not collect unused forks (that is `cleanup`). It
+works on `main`; use `index build` for another branch.
 
-### `rebuild-full-text-indexes` — explicit analyzer upgrade
+### `index build` — a branch's missing and lagging indexes
 
 ```bash
-omnigraph rebuild-full-text-indexes --target "$REPO" --branch main --json
+omnigraph index build --target "$REPO" --branch review --json
 ```
+
+Builds every declared index a table on the branch lacks (a type whose first rows
+landed there) and rebuilds each BTREE or vector index that leaves the branch's
+rows uncovered, in one graph commit on that branch; a second run is a no-op with
+a null `graph_commit_id`. Read `indexes` (`kind`, `action`: `built` or
+`refreshed`) and `pending_indexes`: full-text coverage stays pending with the
+`index rebuild --kind full-text` remedy, as do vector properties with no vectors.
+The remedy for `FullTextIndexRequired` on any branch.
+
+### `index rebuild` — explicit analyzer upgrade
+
+```bash
+omnigraph index rebuild --kind full-text --target "$REPO" --branch main --json
+```
+
+`--kind` is required. `rebuild-full-text-indexes` is the deprecated spelling.
 
 Direct storage only; `--target <root> --graph <id>` also works. Stop overlapping
 writers, preserve a verified whole-store backup, and rebuild every live branch
