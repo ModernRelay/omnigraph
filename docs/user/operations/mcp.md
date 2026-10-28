@@ -108,15 +108,17 @@ Codex in a terminal, connects to an existing server through the CLI:
 ```
 
 `omnigraph mcp --target NAME [--graph G] [--write]` relays each JSON-RPC message
-on stdin to the server target's `/mcp`, one `POST` each, and writes each answer
+on stdin to a server or managed target's `/mcp`, one `POST` each, and writes each answer
 as one line on stdout; diagnostics go to stderr. Tools, their logic and their
 refusals stay the server's.
 
-- **Credential.** Requests carry the token of the target's `auth`, acquired as
-  every served command acquires it ([authentication providers](../cli/targets.md#authentication-providers));
+- **Credential.** Requests use the same credential acquisition as served graph
+  commands. Server targets use their `auth`; managed targets exchange the
+  pinned profile's credential for an identity bound to that cluster ([authentication providers](../cli/targets.md#authentication-providers));
   it never appears in the agent's configuration or output. A target whose
-  `auth` is `provider: anonymous` sends none. `--as ACTOR` sends `Omnigraph-If-Actor` with
-  every request, so another actor's token is refused with `412 actor_mismatch`.
+  `auth` is `provider: anonymous` sends none. On server targets, `--as ACTOR` sends
+  `Omnigraph-If-Actor` with every request, so another actor's token is refused
+  with `412 actor_mismatch`. Managed targets refuse `--as` before any I/O.
 - **One graph.** `--graph`, else the target's `default_graph`; without either the
   command refuses before any request. A tool call that omits `graph` gets it, a
   call or resource URI naming another graph is refused with a JSON-RPC error, and
@@ -126,9 +128,10 @@ refusals stay the server's.
   `--mcp-allow-writes`. Without `--write`, the bridge lists and admits only the
   tools the server annotates `readOnlyHint: true`, and refuses a call to any
   other before sending it. The applied policy still decides every call.
-- **Existing servers only.** A direct graph, root or catalogue target, and a
-  managed target, refuse with `target_kind_unsupported` before any I/O. The
-  bridge opens no storage and never starts or discovers a server.
+- **Existing endpoints only.** A server or managed target must name its existing
+  endpoint. Direct graph, root and catalogue targets refuse with
+  `target_kind_unsupported` before any I/O. The bridge opens no storage and never
+  starts a server or enables its MCP route.
 
 The bridge relays up to 16 requests at once, the server's own limit, and
 answers them as they complete. It applies `notifications/cancelled` itself: the
@@ -138,7 +141,7 @@ before running it again. It never sends a request again:
 
 | Failure | JSON-RPC error `data` |
 |---|---|
-| The server refused the request over HTTP (401, 412, 429, …) | `status` and the server's error body as `error`. A 401 also carries the server's `WWW-Authenticate` challenge, verbatim, as `www_authenticate` when it sends one |
+| The server refused the request over HTTP (401, 412, 429, …) | `status` and the server's error body as `error`. A 401 also carries the server's `WWW-Authenticate` challenge as `www_authenticate` when it sends one. Managed credentials reflected in error bodies or challenges are redacted |
 | Nothing was sent: the server could not be reached, or speaks another HTTP contract | `error.code` `service_unavailable`, or `api_contract_mismatch`, with `effects: none` |
 | The answer was lost, or took longer than 45 seconds | `outcome_unknown` with `effects: unknown` for a call to a tool that may write; otherwise `service_unavailable`, `deadline_exceeded` or `result_too_large` with `effects: none` |
 
@@ -150,7 +153,19 @@ a restart. An `env` source is fixed when the bridge starts, and a token
 replaced with `omnigraph credentials set` belongs to a new credential
 generation, so both take a restart; the error says how to replace the token. A
 server that stays unreachable fails each request; the bridge keeps running
-until stdin closes.
+until stdin closes. Managed resource credentials renew through the selected
+profile's normal cache before expiry. A refused managed credential is removed
+only if it is still the cached one, and renewed for later messages; the refused
+message is never replayed. If an expiring credential runs out before a message
+is sent, including during discovery, the bridge renews it once before sending.
+If the replacement also expires, the message fails without being sent. Renewal
+never starts an interactive login.
+
+An expiring managed profile's `exec` credential is also renewed before later
+requests. The verified organization and principal must remain the same for the
+life of the bridge; a changed identity requires restarting it. Organization
+service permissions remain current provider facts. Managed error messages,
+including JSON-RPC tool errors, never expose a reflected resource credential.
 
 ## Settings
 

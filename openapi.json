@@ -14521,7 +14521,7 @@
       },
       "FullTextIndexRequiredOutput": {
         "type": "object",
-        "description": "A full-text call read a declared full-text index that has no segment at\nthe query's snapshot (HTTP 409), so no segment carries its analyzer. This\nis not a retryable conflict: an operator builds the branch's index\n(`omnigraph optimize` on main, `omnigraph rebuild-full-text-indexes\n--branch` elsewhere). Historical snapshots stay unchanged.",
+        "description": "A full-text call read a declared full-text index that has no segment at\nthe query's snapshot (HTTP 409), so no segment carries its analyzer. This\nis not a retryable conflict: an operator builds the branch's index\n(`omnigraph index build --branch <branch>`). Historical snapshots stay\nunchanged.",
         "required": [
           "index"
         ],

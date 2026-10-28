@@ -7373,6 +7373,93 @@ async fn rfc_0067_detached_commit_from_a_pin_is_private_chains_and_needs_a_retry
     );
 }
 
+/// The pure-insert merge proof crosses a `CreateIndex` link as a commit that
+/// moves no row (`is_index_only_commit` in `table_store.rs`). Lance 13
+/// applies `CreateIndex` with every fragment of the version it read and
+/// changes only the index list, for a first build and for a whole rebuild
+/// that removes the older segment, both committed detached as the engine
+/// commits them. Red when an apply rewrites fragments inside `CreateIndex`,
+/// even with the same ids and row counts: a fast-forward would then adopt
+/// bytes the proof never certified.
+#[tokio::test]
+async fn rfc_0067_create_index_keeps_every_fragment_of_its_read_version() {
+    use lance_table::format::{Fragment, IndexMetadata};
+
+    fn fragments(ds: &Dataset) -> Vec<Fragment> {
+        ds.get_fragments()
+            .iter()
+            .map(|fragment| fragment.metadata().clone())
+            .collect()
+    }
+
+    async fn segments(ds: &Dataset) -> Vec<IndexMetadata> {
+        ds.load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|index| index.name == "value_idx")
+            .cloned()
+            .collect()
+    }
+
+    async fn build_detached(base: &Dataset, removed_indices: Vec<IndexMetadata>) -> Dataset {
+        let mut staging = base.clone();
+        let params = ScalarIndexParams::default();
+        let segment = staging
+            .create_index_builder(&["value"], IndexType::BTree, &params)
+            .name("value_idx".to_string())
+            .replace(true)
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let transaction = Transaction::new(
+            base.version().version,
+            Operation::CreateIndex {
+                new_indices: vec![segment],
+                removed_indices,
+            },
+            None,
+        );
+        CommitBuilder::new(Arc::new(base.clone()))
+            .with_detached(true)
+            .with_skip_auto_cleanup(true)
+            .execute(transaction)
+            .await
+            .unwrap()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("t.lance");
+    let uri = uri.to_str().unwrap();
+    let v1 = rfc0067_create(uri).await;
+    let parent = rfc0067_append(v1, &["b1", "b2"]).await;
+    assert_eq!(parent.get_fragments().len(), 2, "two fragments to keep");
+    let parent_fragments = fragments(&parent);
+    let parent_ids = rfc0067_ids(&parent).await;
+
+    let built = build_detached(&parent, Vec::new()).await;
+    let built = rfc0067_pinned(uri, built.version().version).await;
+    assert_eq!(
+        fragments(&built),
+        parent_fragments,
+        "a first build keeps every fragment: ids, physical rows, data files, deletions"
+    );
+    let first = segments(&built).await;
+    assert_eq!(first.len(), 1, "the build added one segment");
+
+    let rebuilt = build_detached(&built, first.clone()).await;
+    let rebuilt = rfc0067_pinned(uri, rebuilt.version().version).await;
+    assert_eq!(
+        fragments(&rebuilt),
+        parent_fragments,
+        "a rebuild that removes the older segment keeps every fragment too"
+    );
+    let second = segments(&rebuilt).await;
+    assert_eq!(second.len(), 1, "the rebuild replaced the segment");
+    assert_ne!(second[0].uuid, first[0].uuid, "the older segment is gone");
+    assert_eq!(rfc0067_ids(&rebuilt).await, parent_ids, "rows unchanged");
+}
+
 /// RFC 0067 §Promotion: replaying the transaction recorded in a detached
 /// manifest linearly at its base lands an identical twin: same uuid, same
 /// fragment ids, same rows, and the linear row stamps the change feed and

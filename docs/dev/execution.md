@@ -1136,7 +1136,8 @@ a separate design, not a hidden loader behavior.
 ## Derived indexes
 
 Schema apply, mutation, and Load publish logical data and index intent only.
-`ensure_indices` materializes declared missing indexes through the shared
-recovery protocol; `optimize` folds coverage as physical maintenance. Reads
+`ensure_indices` materializes declared missing indexes and rebuilds BTREE and
+vector indexes whose coverage lags, on any branch, through the shared recovery
+protocol; `optimize` does the same on `main` after compaction. Reads
 remain correct through Lance's indexed-plus-unindexed scan behavior while
 coverage converges.

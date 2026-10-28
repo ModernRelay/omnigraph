@@ -11,7 +11,7 @@ use crate::storage_layer::{
     KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, ProvenInsertChunk,
 };
 use crate::table_store::{
-    MATERIALIZED_BLOB_PAYLOAD_BYTES, certified_insert_absence_rows, is_full_text_declaration,
+    MATERIALIZED_BLOB_PAYLOAD_BYTES, certified_insert_absence_rows, is_index_only_commit,
 };
 use futures::StreamExt;
 use omnigraph_compiler::settings::MergeLineage;
@@ -994,9 +994,9 @@ fn opened_at_pin(dataset: &Dataset, entry: &crate::db::DatasetEntry) -> bool {
 }
 
 /// Walk the source's chain of commits by `read_version` links down to either
-/// base pin, certifying each as an exact-id fenced insert or a full-text
-/// declaration (which moves no row); the new fragments are the source's
-/// fragments the base lacks, and the rows are the chain's.
+/// base pin, certifying each as an exact-id fenced insert or an index-only
+/// commit (which moves no row); the new fragments are the source's fragments
+/// the base lacks, and the rows are the chain's.
 async fn proven_chain_fragments(
     source: &Dataset,
     base: &Dataset,
@@ -1010,7 +1010,7 @@ async fn proven_chain_fragments(
         let identity = crate::table_store::StagedTransactionIdentity::recorded_by(&dataset)?;
         crate::instrumentation::record_proven_insert_history_read();
         let transaction = dataset.read_transaction().await.ok()??;
-        let rows = if is_full_text_declaration(&transaction, identity.read_version) {
+        let rows = if is_index_only_commit(&transaction, identity.read_version) {
             0
         } else {
             certified_insert_absence_rows(

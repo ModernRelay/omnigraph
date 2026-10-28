@@ -127,7 +127,9 @@ pub(crate) struct Authentication {
     pub(crate) derived_credentials: crate::managed::data::InvocationCredentials,
     custody: String,
     ids: BindingIds,
-    credential: tokio::sync::OnceCell<credentials::AcquiredCredential>,
+    credential: std::sync::Mutex<Option<credentials::AcquiredCredential>>,
+    acquisition: tokio::sync::Mutex<()>,
+    managed_identity: std::sync::OnceLock<(String, String)>,
 }
 
 impl Authentication {
@@ -188,7 +190,8 @@ impl Authentication {
     }
     /// The selected source's credential, read from it now.
     async fn acquire(&self) -> Result<credentials::AcquiredCredential> {
-        Ok(match &self.profile {
+        self.ensure_current()?;
+        let credential = match &self.profile {
             AuthProfile::Token {
                 source: TokenSource::Env { env },
             } => credentials::acquire_environment(&self.request, env)?,
@@ -212,7 +215,9 @@ impl Authentication {
                 .await?
             }
             _ => bail!("selected provider does not supply a static bearer"),
-        })
+        };
+        self.ensure_current()?;
+        Ok(credential)
     }
     pub(crate) async fn token(&self) -> Result<Option<String>> {
         self.acquire_credential()
@@ -235,15 +240,46 @@ impl Authentication {
         ) {
             return Ok(None);
         }
-        let credential = self.credential.get_or_try_init(|| self.acquire()).await?;
+        let _acquisition = self.acquisition.lock().await;
+        self.ensure_current()?;
+        let cached = self
+            .credential
+            .lock()
+            .map_err(|_| eyre!("credential cache is unavailable"))?
+            .clone();
+        if let Some(credential) = cached {
+            match credential.bearer_for(&self.request, time::OffsetDateTime::now_utc()) {
+                Ok(_) => return Ok(Some(credential)),
+                Err(credentials::CredentialError::Expired)
+                    if matches!(self.profile, AuthProfile::Exec { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let credential = self.acquire().await?;
         credential.bearer_for(&self.request, time::OffsetDateTime::now_utc())?;
-        Ok(Some(credential.clone()))
+        *self
+            .credential
+            .lock()
+            .map_err(|_| eyre!("credential cache is unavailable"))? = Some(credential.clone());
+        Ok(Some(credential))
+    }
+
+    /// A long-lived invocation can renew a secret, but cannot change its
+    /// verified organization or principal. Service permissions stay current.
+    pub(crate) fn accepts_managed_identity(&self, account: &str, principal: &str) -> bool {
+        let identity = self
+            .managed_identity
+            .get_or_init(|| (account.to_owned(), principal.to_owned()));
+        identity.0 == account && identity.1 == principal
     }
     /// The selected credential read from its source again, for a long-lived
     /// client whose server refused the one it holds. The credential this
     /// invocation acquired is unchanged. A stored credential replaced since
     /// the invocation began is of another generation, and refuses.
-    pub(crate) async fn reacquire(&self, endpoint: &str) -> Result<Option<String>> {
+    pub(crate) async fn reacquire(
+        &self,
+        endpoint: &str,
+    ) -> Result<Option<credentials::AcquiredCredential>> {
         if endpoint != self.owner.route() {
             bail!("credential destination differs from the frozen owner");
         }
@@ -253,13 +289,9 @@ impl Authentication {
         ) {
             return Ok(None);
         }
-        Ok(Some(
-            self.acquire()
-                .await?
-                .bearer_for(&self.request, time::OffsetDateTime::now_utc())?
-                .expose()
-                .to_owned(),
-        ))
+        let credential = self.acquire().await?;
+        credential.bearer_for(&self.request, time::OffsetDateTime::now_utc())?;
+        Ok(Some(credential))
     }
     pub(crate) fn cached_token(&self, endpoint: &str) -> Result<Option<String>> {
         self.cached_credential(endpoint)?
@@ -284,10 +316,12 @@ impl Authentication {
         }
         let acquired = self
             .credential
-            .get()
+            .lock()
+            .map_err(|_| eyre!("credential cache is unavailable"))?
+            .clone()
             .ok_or_else(|| eyre!("selected credential has not been acquired"))?;
         acquired.bearer_for(&self.request, time::OffsetDateTime::now_utc())?;
-        Ok(Some(acquired.clone()))
+        Ok(Some(acquired))
     }
 }
 
@@ -766,7 +800,9 @@ pub(crate) fn authentication(
         derived_credentials: Default::default(),
         custody,
         ids,
-        credential: tokio::sync::OnceCell::new(),
+        credential: Default::default(),
+        acquisition: Default::default(),
+        managed_identity: Default::default(),
     })))
 }
 
@@ -811,7 +847,9 @@ pub(crate) fn registration_auth(
         profile: AuthProfile::Omnigraph,
         custody,
         ids,
-        credential: tokio::sync::OnceCell::new(),
+        credential: Default::default(),
+        acquisition: Default::default(),
+        managed_identity: Default::default(),
     }))
 }
 
