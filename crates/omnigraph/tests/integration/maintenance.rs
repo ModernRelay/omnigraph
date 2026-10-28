@@ -5,7 +5,8 @@
 
 use crate::helpers;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use arrow_array::{Array, LargeBinaryArray, StringArray};
@@ -13,13 +14,17 @@ use base64::Engine;
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
+use lance::io::WrappingObjectStore;
 use lance_core::datatypes::BlobHandling;
+use lance_io::utils::tracking_store::IOTracker;
+use lance_table::io::commit::ManifestNamingScheme;
 use omnigraph::IndexCoverage;
 use omnigraph::db::{
     CleanupPolicyOptions, MergeOutcome, Omnigraph, ReadTarget, RepairAction, RepairClassification,
     RepairOptions, SnapshotId,
 };
 use omnigraph::error::{BranchStartRefusal, OmniError};
+use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
 use omnigraph::loader::LoadMode;
 use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 
@@ -4169,6 +4174,171 @@ async fn collector_cost_is_bounded_by_retained_versions_and_garbage_examined() {
         "every transaction read is one of those opens: {:?}",
         report.cost
     );
+}
+
+/// Attached `__manifest` versions by live branch: `None` for main's
+/// `__manifest/_versions/`, the branch's logical name for
+/// `__manifest/tree/<branch>.<incarnation>/_versions/`.
+type ManifestVersions = BTreeMap<Option<String>, BTreeSet<u64>>;
+
+fn attached_manifest_version(path: &str) -> Option<(Option<String>, u64)> {
+    let start = path.find("__manifest")?;
+    let (dir, file) = path[start..].rsplit_once("/_versions/")?;
+    let version = ManifestNamingScheme::detect_scheme(file)
+        .filter(|_| !file.starts_with('d'))?
+        .parse_version(file)?;
+    let branch = match dir.strip_prefix("__manifest/tree/") {
+        Some(tree) => Some(tree.rsplit_once('.')?.0.to_string()),
+        None if dir == "__manifest" => None,
+        None => return None,
+    };
+    Some((branch, version))
+}
+
+fn attached_manifests_on_disk(root: &std::path::Path) -> ManifestVersions {
+    let mut versions = ManifestVersions::new();
+    let mut pending = vec![root.join("__manifest")];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if let Some((branch, version)) =
+                attached_manifest_version(path.to_str().unwrap())
+            {
+                versions.entry(branch).or_default().insert(version);
+            }
+        }
+    }
+    versions
+}
+
+/// Plan `options` and return the attached `__manifest` versions whose
+/// manifest the plan read, from the request log of every `__manifest` store it opened (a
+/// store's own tracker also sees Lance's direct local reads).
+async fn plan_reading_manifests(
+    db: &Omnigraph,
+    options: CleanupPolicyOptions,
+) -> (omnigraph::db::CollectorReport, ManifestVersions) {
+    let probes = QueryIoProbes {
+        manifest_wrapper: Some(Arc::new(IOTracker::default()) as Arc<dyn WrappingObjectStore>),
+        ..Default::default()
+    };
+    let stores = probes.manifest_stores.clone();
+    let report = with_query_io_probes(probes, db.cleanup_plan(options))
+        .await
+        .unwrap();
+    let mut read = ManifestVersions::new();
+    for store in stores.stores() {
+        for request in store.io_stats_incremental().requests {
+            if let Some((branch, version)) = attached_manifest_version(request.path.as_ref()) {
+                read.entry(branch).or_default().insert(version);
+            }
+        }
+    }
+    (report, read)
+}
+
+/// Issue 644: `--keep` alone takes each live branch's `__manifest` version
+/// numbers from the `_versions/` listing and reads no manifest of a version it
+/// prunes; `--older-than` still reads every one for its timestamp. With a zero
+/// age window the cutoff retains nothing `--keep` does not, so both policies
+/// plan the same retention and the same sweep.
+#[tokio::test]
+async fn cleanup_keep_plans_from_the_manifest_listing_issue_644() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    for name in ["Eve", "Frank", "Grace", "Heidi"] {
+        insert_person(&db, "main", name).await;
+    }
+    db.branch_create("feature").await.unwrap();
+    for name in ["Ivan", "Judy", "Mallory"] {
+        insert_person(&db, "feature", name).await;
+    }
+    insert_person(&db, "main", "Niaj").await;
+
+    let on_disk = attached_manifests_on_disk(dir.path());
+    assert_eq!(
+        on_disk.keys().cloned().collect::<Vec<_>>(),
+        vec![None, Some("feature".to_string())],
+        "main and the feature tree: {on_disk:?}"
+    );
+    let keep = CleanupPolicyOptions {
+        keep_versions: Some(2),
+        older_than: None,
+    };
+    let (keep_plan, keep_read) = plan_reading_manifests(&db, keep).await;
+    let (aged_plan, aged_read) = plan_reading_manifests(
+        &db,
+        CleanupPolicyOptions {
+            keep_versions: Some(2),
+            older_than: Some(Duration::ZERO),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        aged_read, on_disk,
+        "an age cutoff reads every attached manifest of every live branch"
+    );
+    for (branch, versions) in &on_disk {
+        let row = retained_on(&keep_plan, branch.as_deref());
+        let retained = row.retained.iter().copied().collect::<BTreeSet<_>>();
+        let listed = retained
+            .union(&row.would_prune.iter().copied().collect())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            &listed, versions,
+            "{branch:?}: the listing names every attached manifest"
+        );
+        assert!(!row.would_prune.is_empty(), "{branch:?}: {row:?}");
+        let read = keep_read.get(branch).cloned().unwrap_or_default();
+        assert!(
+            read.is_subset(&retained),
+            "{branch:?}: --keep read the manifests of {read:?}, retained {retained:?}"
+        );
+    }
+
+    for branch in [None, Some("feature")] {
+        let (keep_row, aged_row) = (
+            retained_on(&keep_plan, branch),
+            retained_on(&aged_plan, branch),
+        );
+        assert_eq!(keep_row.retained, aged_row.retained, "{branch:?}");
+        assert_eq!(keep_row.would_prune, aged_row.would_prune, "{branch:?}");
+    }
+    let sweep = |report: &omnigraph::db::CollectorReport| {
+        report
+            .tables
+            .iter()
+            .map(|plan| {
+                assert!(
+                    plan.errors.is_empty(),
+                    "{}: {:?}",
+                    plan.location,
+                    plan.errors
+                );
+                (
+                    plan.location.clone(),
+                    (
+                        plan.roots.clone(),
+                        plan.linear_roots.clone(),
+                        plan.sweep.clone(),
+                        plan.sweep_paths.clone(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let keep_sweep = sweep(&keep_plan);
+    assert!(
+        keep_sweep
+            .values()
+            .any(|(_, _, sweep, _)| !sweep.is_empty()),
+        "the fixture has table versions to sweep: {keep_sweep:?}"
+    );
+    assert_eq!(keep_sweep, sweep(&aged_plan));
 }
 
 /// Object ages and physical reclamation need filesystem assertions beyond GQT.

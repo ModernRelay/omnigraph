@@ -1193,6 +1193,22 @@ impl CollectorBranch {
             .collect())
     }
 
+    /// The numbers of the versions `versions` returns, from the `_versions/`
+    /// listing alone: `Dataset::version_refs` reads no manifest, where
+    /// `Dataset::versions` reads and decodes every one, one after another.
+    pub async fn version_numbers(&self) -> Result<Vec<u64>> {
+        let head = self.head_version();
+        Ok(self
+            .dataset
+            .version_refs()
+            .await
+            .map_err(OmniError::storage)?
+            .into_iter()
+            .map(|version| version.version)
+            .filter(|version| *version <= head)
+            .collect())
+    }
+
     /// Every pin the branch has held up to the opened version.
     pub async fn rows(&self) -> Result<Vec<DatasetEntry>> {
         state::read_manifest_entries(&self.root_uri, &self.dataset).await

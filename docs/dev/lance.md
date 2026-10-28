@@ -259,8 +259,12 @@ validation, so its retirement history need not remain forever.
 
 `--keep N` retains the newest N `__manifest` versions per live branch, which
 is N graph commits, and every table version they pin; it never counts Lance
-versions of a dataset. `--older-than` retains every `__manifest` version
-newer than the cutoff and also gates pre-v11 fork collection using tree and
+versions of a dataset. It takes the version numbers from the `_versions/`
+listing (`Dataset::version_refs`, as Lance's `retain_n_versions` does since
+lance#9019) and reads no manifest it does not retain. `--older-than` retains
+every `__manifest` version newer than the cutoff, so it reads every manifest of
+every live branch for its timestamp (`Dataset::versions`, one after another),
+and also gates pre-v11 fork collection using tree and
 native ref object timestamps before closing over dependencies. Any recent
 object retains such a fork, including a fresh retirement metadata update over
 an old tree. Ref metadata listings for this age check occur only during

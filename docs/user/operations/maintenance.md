@@ -239,6 +239,11 @@ only after every object of the fork is older than the cutoff. Native tags,
 readable graph snapshots and required native ancestors also protect forks. Choose a policy that matches
 your rollback and audit needs.
 
+Planning with `--keep` alone lists each live branch's graph commits and reads
+only the ones it retains. `--older-than` reads every graph commit of every live
+branch for its time, one after another, so on object storage its plan grows
+with the branch's whole history.
+
 Before cleanup:
 
 1. stop long-lived Blob readers and readers of snapshots the policy removes;

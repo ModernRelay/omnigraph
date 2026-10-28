@@ -711,18 +711,58 @@ fn incarnation_key(identifier: &lance::dataset::refs::BranchIdentifier) -> Resul
     })
 }
 
+/// One `__manifest` version as the retention rule reads it. Its timestamp is
+/// in the manifest, so it is read only when a cutoff needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManifestVersion {
+    version: u64,
+    timestamp: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// One live branch's `__manifest` versions up to its opened head. With no
+/// cutoff the rule needs version numbers only, and the `_versions/` listing
+/// has them (Lance's `retain_n_versions` does the same, lance#9019), so
+/// `--keep` alone reads no manifest; a cutoff reads every manifest of the
+/// branch for its timestamp.
+async fn manifest_versions(
+    opened: &CollectorBranch,
+    cutoff: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<Vec<ManifestVersion>> {
+    Ok(match cutoff {
+        None => opened
+            .version_numbers()
+            .await?
+            .into_iter()
+            .map(|version| ManifestVersion {
+                version,
+                timestamp: None,
+            })
+            .collect(),
+        Some(_) => opened
+            .versions()
+            .await?
+            .into_iter()
+            .map(|version| ManifestVersion {
+                version: version.version,
+                timestamp: Some(version.timestamp),
+            })
+            .collect(),
+    })
+}
+
 /// The `__manifest` versions `keep` and `cutoff` retain: the newest-N /
 /// newer-than rule of Lance's `cleanup_old_versions`, applied to graph commits
 /// (`__manifest` versions) per branch rather than to a table's Lance versions.
 /// HEAD is always among them and, with
 /// `keep_base` (a graph branch, deleting), its oldest: the fork-point merge base.
+/// Under a cutoff, a version without a timestamp is retained.
 fn retained_versions(
-    versions: &[lance::dataset::Version],
+    versions: &[ManifestVersion],
     keep: Option<u32>,
     cutoff: Option<chrono::DateTime<chrono::Utc>>,
     keep_base: bool,
 ) -> (Vec<u64>, Vec<u64>) {
-    let mut sorted: Vec<&lance::dataset::Version> = versions.iter().collect();
+    let mut sorted: Vec<&ManifestVersion> = versions.iter().collect();
     sorted.sort_by_key(|version| version.version);
     let Some(head) = sorted.last().map(|version| version.version) else {
         return (Vec::new(), Vec::new());
@@ -738,7 +778,11 @@ fn retained_versions(
         let kept = version.version == head
             || (keep_base && Some(version.version) == base)
             || floor.is_some_and(|floor| version.version >= floor)
-            || cutoff.is_some_and(|cutoff| version.timestamp >= cutoff);
+            || cutoff.is_some_and(|cutoff| {
+                version
+                    .timestamp
+                    .is_none_or(|timestamp| timestamp >= cutoff)
+            });
         if kept {
             retained.push(version.version);
         } else {
@@ -1018,7 +1062,7 @@ pub(crate) async fn plan_collection(
                 .insert(incarnation.to_string());
         }
         let head_version = opened.head_version();
-        let versions = opened.versions().await?;
+        let versions = manifest_versions(&opened, cutoff).await?;
         fail(&CLEANUP_COLLECTOR_MID_BRANCH_READ)?;
         let (retained, would_prune) =
             retained_versions(&versions, options.keep_versions, cutoff, branch.is_some());
