@@ -601,6 +601,18 @@ selection to the cost model. Without a traversal header or another index
 requirement, a fixture does not build indexes. `indexed` and `csr` prepare
 indexes and force their respective paths.
 
+The optional `# csv_slice_bytes: <n>` header sets the source bytes one
+`load csv` parse partition owns and the slice it reads at once, 8 MiB without
+the header, so a case of a few KiB cuts two or three partitions and pins what
+happens at their boundaries; the header's head range keeps its 64 KiB floor.
+An in-process pin: a server target refuses it.
+
+The optional `# overwrite_chunk_rows: <n>` header sets the rows one `load csv`
+overwrite chunk holds before a Lance writer takes it, Lance's file target
+(1 Mi rows) without the header, so a case of a few hundred records writes
+fragments before its last record is judged and pins what a late refusal leaves
+behind. An in-process pin: a server target refuses it.
+
 An `expand $src <Edge> $dst:` line selects every matching named-edge physical `Expand` between
 those bindings over that edge type and claims `mode csr` or `mode
 indexed_scan`, the traversal mode the planner recorded (pass `expand_mode`
@@ -669,6 +681,7 @@ load route: plan|pipeline
 load scan: partitions <n> fallback single_scan
 load validate unique <table> key|unique [<cols>]: access delta|probe|scan
 load validate edge_ri <edge-table> from|to <node-type>: access probe|scan
+load validate edge_ri <edge-table> from|to <node-type>: probe swept|judged
 load validate cardinality <edge-table> from <node-type>
 load validate retained_edges <node-table> <edge-table> from|to: access delta|probe|scan
 load validate removal <table>: scan|none
@@ -685,7 +698,11 @@ for `executor`.
 `load scan` claims the `CsvSource` node's partition count and its `single_scan`
 fallback.
 A `load validate` line claims one check of the `Validate` node with that
-identity, and its `access` suffix claims the check's access path.
+identity, and its `access` suffix claims the check's access path. An
+`edge_ri` line with a `probe` suffix claims where the check probes the
+committed ids: `swept`, on the parse partitions as the delta arrives, when
+both endpoint checks read their set whole (`scan`) over node types keyed by
+one `I32`, `I64` or `U32` `@key`; `judged`, after the drain, otherwise.
 `load validate removal` claims the node's `removal`: `scan` when the plan
 finds the committed ids an overwrite removes, `none` when no planned check
 reads them (an empty committed table, a node target no edge type references,

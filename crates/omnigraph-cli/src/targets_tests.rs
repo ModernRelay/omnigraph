@@ -212,7 +212,7 @@ fn whole_document_validation_matches_discovery_protocols_issue_1127() {
     let discovery: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
     assert_eq!(
         discovery["protocols"],
-        serde_json::json!({"target": 2, "credential": 2, "access": 2}),
+        serde_json::json!({"studio": 1, "target": 2, "credential": 2, "access": 2}),
         "inline-auth configuration and credential sources require protocol 2"
     );
 }

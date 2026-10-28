@@ -6,8 +6,9 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::ops::Range;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arrow_array::{
     Array, ArrayRef, Date32Array, Date64Array, Float32Array, Float64Array, RecordBatch,
@@ -28,7 +29,7 @@ use super::{
 use crate::db::Omnigraph;
 use crate::error::{OmniError, Result};
 use crate::storage_layer::KEYED_WRITE_MAX_ROWS;
-use crate::table_store::CapturedSource;
+use crate::table_store::{CapturedSource, ExternalSource};
 
 /// The resource a source over the session's `load_source_max_bytes` is
 /// refused under, before any payload byte is read.
@@ -41,6 +42,11 @@ pub const CSV_SOURCE_READ_DEADLINE: Duration = Duration::from_secs(120);
 /// Records per reader batch in overwrite; each batch is one staged-write
 /// input.
 pub(crate) const CSV_READ_BATCH_ROWS: usize = 8192;
+
+/// The least the source operator reads for the header: the first record
+/// must end inside the larger of this and one slice, or the source is
+/// refused.
+pub(crate) const CSV_HEAD_MIN_BYTES: u64 = 64 * 1024;
 
 /// One `load csv` statement, resolved to the loader's vocabulary.
 #[derive(Debug, Clone)]
@@ -152,31 +158,35 @@ enum ColumnRole {
 /// bound to the version the probe reported. Every attempt of the statement
 /// parses this capture; none fetches again.
 pub(super) async fn capture_csv_source(
-    db: &Omnigraph,
+    bytes: &CsvBytes,
     request: &CsvLoadRequest,
     source_max_bytes: u64,
     source_charge: Arc<crate::engine::LoadCharge>,
 ) -> Result<CapturedSource> {
-    let mut capture = tokio::time::timeout(
-        CSV_SOURCE_READ_DEADLINE,
-        db.blob_materializer().read_external_object(
-            &request.source,
-            source_max_bytes,
-            CSV_SOURCE_BYTES_RESOURCE,
-            |size| source_charge.grow(size.saturating_mul(2)),
-        ),
-    )
-    .await
-    .map_err(|_| {
-        OmniError::external_blob_source(
-            &request.source,
-            format!(
-                "load csv: reading the source exceeded {} seconds",
-                CSV_SOURCE_READ_DEADLINE.as_secs()
-            ),
-        )
-    })??;
-    source_charge.shrink_to(capture.size);
+    let mut capture = match bytes {
+        #[cfg(test)]
+        CsvBytes::Memory(bytes) => {
+            source_charge.grow(bytes.len() as u64)?;
+            CapturedSource {
+                bytes: Arc::clone(bytes),
+                admission: None,
+                size: bytes.len() as u64,
+                e_tag: None,
+                version: None,
+            }
+        }
+        CsvBytes::Object(source) => {
+            let captured = source_read_deadline(
+                request,
+                source.read_whole(source_max_bytes, CSV_SOURCE_BYTES_RESOURCE, |size| {
+                    source_charge.grow(size.saturating_mul(2))
+                }),
+            )
+            .await?;
+            source_charge.shrink_to(captured.size);
+            captured
+        }
+    };
     capture.admission = Some(source_charge);
     tracing::debug!(
         source = %request.source,
@@ -188,17 +198,77 @@ pub(super) async fn capture_csv_source(
     Ok(capture)
 }
 
-/// The source's size from its metadata probe alone, for `explain load csv`:
-/// the policy authorization, `source_max_bytes` refusal and deadline of
-/// [`capture_csv_source`], and no payload byte read.
-pub(crate) async fn probe_csv_source_size(
+/// The bytes one `load csv` statement reads: the probed external object, read
+/// by byte range under its validators, or, for the operator's unit tests,
+/// bytes already in memory.
+#[derive(Debug, Clone)]
+pub(crate) enum CsvBytes {
+    Object(ExternalSource),
+    #[cfg(test)]
+    Memory(Arc<[u8]>),
+}
+
+impl CsvBytes {
+    pub(crate) fn size(&self) -> u64 {
+        match self {
+            Self::Object(source) => source.size(),
+            #[cfg(test)]
+            Self::Memory(bytes) => bytes.len() as u64,
+        }
+    }
+
+    /// `range` of the source, read within [`CSV_SOURCE_READ_DEADLINE`].
+    pub(crate) async fn read(
+        &self,
+        request: &CsvLoadRequest,
+        range: Range<u64>,
+    ) -> Result<Arc<[u8]>> {
+        match self {
+            Self::Object(source) => source_read_deadline(request, source.read_range(range)).await,
+            #[cfg(test)]
+            Self::Memory(bytes) => {
+                let start = usize::try_from(range.start).unwrap_or(usize::MAX);
+                let end = usize::try_from(range.end).unwrap_or(usize::MAX);
+                bytes.get(start..end).map(Arc::<[u8]>::from).ok_or_else(|| {
+                    OmniError::external_blob_source(
+                        &request.source,
+                        format!("range {range:?} exceeds the source's {} bytes", bytes.len()),
+                    )
+                })
+            }
+        }
+    }
+}
+
+async fn source_read_deadline<T>(
+    request: &CsvLoadRequest,
+    read: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(CSV_SOURCE_READ_DEADLINE, read)
+        .await
+        .map_err(|_| {
+            OmniError::external_blob_source(
+                &request.source,
+                format!(
+                    "load csv: reading the source exceeded {} seconds",
+                    CSV_SOURCE_READ_DEADLINE.as_secs()
+                ),
+            )
+        })?
+}
+
+/// The source probed and not read: the policy authorization, the `HEAD` and
+/// the `source_max_bytes` refusal, within [`CSV_SOURCE_READ_DEADLINE`]; the
+/// plan is built from the size it reports and every byte is read later, by
+/// range, under the validators it reports.
+pub(crate) async fn probe_csv_source(
     db: &Omnigraph,
     request: &CsvLoadRequest,
     source_max_bytes: u64,
-) -> Result<u64> {
-    tokio::time::timeout(
+) -> Result<CsvBytes> {
+    let source = tokio::time::timeout(
         CSV_SOURCE_READ_DEADLINE,
-        db.blob_materializer().external_object_size(
+        db.blob_materializer().external_source(
             &request.source,
             source_max_bytes,
             CSV_SOURCE_BYTES_RESOURCE,
@@ -209,11 +279,29 @@ pub(crate) async fn probe_csv_source_size(
         OmniError::external_blob_source(
             &request.source,
             format!(
-                "explain load csv: probing the source exceeded {} seconds",
+                "load csv: probing the source exceeded {} seconds",
                 CSV_SOURCE_READ_DEADLINE.as_secs()
             ),
         )
-    })?
+    })??;
+    tracing::debug!(
+        source = %request.source,
+        bytes = source.size(),
+        uri = source.uri(),
+        "load csv: probed the source"
+    );
+    Ok(CsvBytes::Object(source))
+}
+
+/// The source's size from its metadata probe alone, for `explain load csv`.
+pub(crate) async fn probe_csv_source_size(
+    db: &Omnigraph,
+    request: &CsvLoadRequest,
+    source_max_bytes: u64,
+) -> Result<u64> {
+    Ok(probe_csv_source(db, request, source_max_bytes)
+        .await?
+        .size())
 }
 
 /// Resolve the target, the mapping and the supported kinds against the
@@ -351,15 +439,292 @@ fn resolve_csv_columns<'a>(
     })
 }
 
-/// One slice of a capture's records: the byte range after the header, cut on
-/// record ends by the counting pass so a quoted newline never splits a slice,
-/// the 1-based record it starts at, and its record count.
+/// Where a `csv_core` pass over one buffer stands after its next step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CsvSlice {
-    pub(crate) start: usize,
-    pub(crate) end: usize,
-    pub(crate) first_record: usize,
+enum RecordStep {
+    /// A record ended: `end` is the byte after its terminator, the line feed
+    /// of a CRLF included.
+    Record { end: usize },
+    /// The buffer ended inside a record; more bytes decide where it ends.
+    NeedMore,
+    /// No record remains in the buffer.
+    End,
+}
+
+/// A `csv_core` pass over one growing buffer from the unquoted state, one
+/// record at a time, so a cut never falls inside a quoted field.
+struct RecordEnds {
+    delimiter: u8,
+    reader: csv_core::Reader,
+    scanned: usize,
+    cr_pending: bool,
+}
+
+impl RecordEnds {
+    fn new(delimiter: u8) -> Self {
+        Self {
+            delimiter,
+            reader: csv_core::ReaderBuilder::new().delimiter(delimiter).build(),
+            scanned: 0,
+            cr_pending: false,
+        }
+    }
+
+    /// Advance over `buffer[scanned..]` to the next record end; `at_eof`
+    /// closes an unterminated last record.
+    fn next(&mut self, buffer: &[u8], at_eof: bool) -> RecordStep {
+        let mut output = [0; 4096];
+        let mut ends = [0; 128];
+        loop {
+            if self.cr_pending {
+                if self.scanned < buffer.len() {
+                    if buffer[self.scanned] == b'\n' {
+                        self.scanned += 1;
+                    }
+                } else if !at_eof {
+                    return RecordStep::NeedMore;
+                }
+                self.cr_pending = false;
+                return RecordStep::Record { end: self.scanned };
+            }
+            let input = &buffer[self.scanned..];
+            if input.is_empty() && !at_eof {
+                return RecordStep::NeedMore;
+            }
+            let (result, consumed, _, _) = self.reader.read_record(input, &mut output, &mut ends);
+            self.scanned += consumed;
+            match result {
+                csv_core::ReadRecordResult::Record => {
+                    if buffer[..self.scanned].ends_with(b"\r") {
+                        self.cr_pending = true;
+                        continue;
+                    }
+                    return RecordStep::Record { end: self.scanned };
+                }
+                csv_core::ReadRecordResult::InputEmpty if !at_eof || !input.is_empty() => {
+                    if at_eof {
+                        continue;
+                    }
+                    return RecordStep::NeedMore;
+                }
+                csv_core::ReadRecordResult::InputEmpty | csv_core::ReadRecordResult::End => {
+                    return RecordStep::End;
+                }
+                csv_core::ReadRecordResult::OutputFull
+                | csv_core::ReadRecordResult::OutputEndsFull => {}
+            }
+        }
+    }
+
+    /// The buffer lost its first `bytes`, which held only complete records.
+    fn rebase(&mut self, bytes: usize) {
+        self.scanned -= bytes;
+    }
+}
+
+/// What one slice of a partition's range held: its bytes, cut on record
+/// ends, their count, and the time spent waiting for them.
+pub(crate) struct ScannedSlice {
+    pub(crate) body: Vec<u8>,
     pub(crate) rows: usize,
+    pub(crate) read_ns: u64,
+}
+
+/// One partition's walk over its byte range of the source: pieces of
+/// `slice_bytes` read on demand, records cut on their ends, the partition
+/// owning every record that starts before `range_end`. A partition after
+/// the first begins at the first line end at or past its range start; the
+/// one before it stops at the first record end there, so the two agree
+/// unless the range start fell inside a quoted field or right after an
+/// empty line (a line end the parser skips), which the breaker detects.
+pub(crate) struct RangeScanner {
+    bytes: Arc<CsvBytes>,
+    size: u64,
+    range_start: u64,
+    range_end: u64,
+    slice_bytes: usize,
+    align: bool,
+    base: u64,
+    buf: Vec<u8>,
+    at_eof: bool,
+    ends: RecordEnds,
+    aligned: bool,
+    start: u64,
+    end: Option<u64>,
+    records: usize,
+    last_end: usize,
+}
+
+impl RangeScanner {
+    /// `range_start..range_end` is the partition's share of the source's
+    /// records; `align` is false only for the partition whose range begins
+    /// at the records' start.
+    pub(crate) fn new(
+        bytes: Arc<CsvBytes>,
+        delimiter: u8,
+        range_start: u64,
+        range_end: u64,
+        slice_bytes: usize,
+        align: bool,
+    ) -> Self {
+        let size = bytes.size();
+        let align = align && range_start > 0;
+        let base = if align { range_start - 1 } else { range_start };
+        Self {
+            bytes,
+            size,
+            range_start,
+            range_end,
+            slice_bytes: slice_bytes.max(1),
+            align,
+            base,
+            buf: Vec::new(),
+            at_eof: base >= size,
+            ends: RecordEnds::new(delimiter),
+            aligned: false,
+            start: range_start,
+            end: None,
+            records: 0,
+            last_end: 0,
+        }
+    }
+
+    /// The source offset of the partition's first record, once aligned.
+    pub(crate) fn start(&self) -> u64 {
+        self.start
+    }
+
+    /// The source offset after the partition's last record, once it ended.
+    pub(crate) fn end(&self) -> Option<u64> {
+        self.end
+    }
+
+    /// The bytes held for records not yet cut.
+    pub(crate) fn buffered(&self) -> usize {
+        self.buf.len()
+    }
+
+    async fn fetch(
+        &mut self,
+        request: &CsvLoadRequest,
+        admit: &mut (dyn FnMut(usize) -> Result<()> + Send),
+        read_ns: &mut u64,
+    ) -> Result<()> {
+        let from = self.base + self.buf.len() as u64;
+        if from >= self.size {
+            self.at_eof = true;
+            return Ok(());
+        }
+        let to = from.saturating_add(self.slice_bytes as u64).min(self.size);
+        let waited = Instant::now();
+        let piece = self.bytes.read(request, from..to).await?;
+        *read_ns =
+            read_ns.saturating_add(u64::try_from(waited.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        admit(self.buf.len().saturating_add(piece.len()))?;
+        self.buf.extend_from_slice(&piece);
+        if to >= self.size {
+            self.at_eof = true;
+        }
+        Ok(())
+    }
+
+    /// The partition's first record begins at the first line end at or past
+    /// the range start, read without regard to quotes or empty lines; the
+    /// partition before stops there unless a quoted field or an empty line ends it.
+    async fn align(
+        &mut self,
+        request: &CsvLoadRequest,
+        admit: &mut (dyn FnMut(usize) -> Result<()> + Send),
+        read_ns: &mut u64,
+    ) -> Result<()> {
+        let start = if self.range_start >= self.size {
+            self.size
+        } else if !self.align {
+            self.range_start
+        } else {
+            let mut after = 1_usize;
+            loop {
+                if after >= self.buf.len() {
+                    if self.at_eof {
+                        break self.size;
+                    }
+                    self.fetch(request, admit, read_ns).await?;
+                    continue;
+                }
+                match self.buf[after - 1] {
+                    b'\n' => break self.base + after as u64,
+                    b'\r' if self.buf[after] != b'\n' => break self.base + after as u64,
+                    _ => after += 1,
+                }
+            }
+        };
+        let skip = usize::try_from(start.saturating_sub(self.base)).unwrap_or(usize::MAX);
+        if skip >= self.buf.len() {
+            self.buf.clear();
+        } else {
+            self.buf.drain(..skip);
+        }
+        self.base = start;
+        self.ends = RecordEnds::new(self.ends.delimiter);
+        self.start = start;
+        self.aligned = true;
+        if start >= self.range_end || start >= self.size {
+            self.end = Some(start);
+        }
+        Ok(())
+    }
+
+    /// The next slice of the partition's records, or `None` once its range
+    /// is exhausted; `admit` is called before every piece of the source is
+    /// kept, with the bytes the scanner then holds.
+    pub(crate) async fn next_slice(
+        &mut self,
+        request: &CsvLoadRequest,
+        admit: &mut (dyn FnMut(usize) -> Result<()> + Send),
+    ) -> Result<Option<ScannedSlice>> {
+        let mut read_ns = 0;
+        if !self.aligned {
+            self.align(request, admit, &mut read_ns).await?;
+        }
+        if self.end.is_some() {
+            return Ok(None);
+        }
+        loop {
+            match self.ends.next(&self.buf, self.at_eof) {
+                RecordStep::Record { end } => {
+                    self.records += 1;
+                    self.last_end = end;
+                    if self.base + end as u64 >= self.range_end {
+                        self.end = Some(self.base + end as u64);
+                        break;
+                    }
+                    if end >= self.slice_bytes {
+                        break;
+                    }
+                }
+                RecordStep::NeedMore => self.fetch(request, admit, &mut read_ns).await?,
+                RecordStep::End => {
+                    self.end = Some(self.size);
+                    break;
+                }
+            }
+        }
+        if self.records == 0 {
+            return Ok(None);
+        }
+        let mut body = std::mem::take(&mut self.buf);
+        self.buf = body.split_off(self.last_end);
+        self.base += self.last_end as u64;
+        self.ends.rebase(self.last_end);
+        let rows = self.records;
+        self.records = 0;
+        self.last_end = 0;
+        Ok(Some(ScannedSlice {
+            body,
+            rows,
+            read_ns,
+        }))
+    }
 }
 
 /// Where whole-source normalization refuses a record, in the order
@@ -423,9 +788,10 @@ impl From<NormalizeFailure> for SliceRefusal {
     }
 }
 
-/// A capture resolved once for the engine's source operator: the columns,
-/// the record count and the slices its partitions parse; every refusal the
-/// counting pass can raise is raised here, before any slice is parsed.
+/// The source resolved once for the engine's source operator from its first
+/// bytes: the columns, the read schema and where its records begin; every
+/// refusal the header can raise is raised here, before any range is read.
+#[derive(Debug)]
 pub(crate) struct ResolvedCsv {
     table_key: String,
     arrow_schema: SchemaRef,
@@ -433,66 +799,70 @@ pub(crate) struct ResolvedCsv {
     roles: Vec<ColumnRole>,
     read_schema: SchemaRef,
     columns: usize,
-    slices: Vec<CsvSlice>,
+    records_start: u64,
 }
 
 impl ResolvedCsv {
-    /// `slice_bytes` is the size a slice is cut at: the planner's source
-    /// partition size in production, smaller in a test.
+    /// `head` is the source's first bytes and `size` its size: the first
+    /// record (the header, when the statement reads one) must end inside
+    /// `head`, or the source is refused.
     pub(crate) fn resolve(
         catalog: &Catalog,
         request: &CsvLoadRequest,
-        bytes: &[u8],
-        slice_bytes: usize,
+        head: &[u8],
+        size: u64,
     ) -> Result<Self> {
-        let resolved = resolve_csv_columns(catalog, request, bytes)?;
-        let scan = CsvScan::scan(bytes, request, slice_bytes);
-        if scan.rows == 0 {
-            return Err(OmniError::manifest(format!(
-                "load csv into {}: the source holds no records",
-                resolved.table_key
-            )));
-        }
+        let at_eof = head.len() as u64 >= size;
+        let first_end = match RecordEnds::new(request.delimiter).next(head, at_eof) {
+            RecordStep::Record { end } => end,
+            RecordStep::End => head.len(),
+            RecordStep::NeedMore => {
+                return Err(OmniError::manifest(format!(
+                    "load csv into {}: the first record of the source exceeds {} bytes",
+                    request.target.table_key(),
+                    head.len()
+                )));
+            }
+        };
+        let resolved = resolve_csv_columns(catalog, request, &head[..first_end])?;
         Ok(Self {
             table_key: resolved.table_key,
             arrow_schema: resolved.arrow_schema,
             is_edge: resolved.is_edge,
             roles: resolved.roles,
+            columns: resolved.read_schema.fields().len(),
             read_schema: resolved.read_schema,
-            columns: scan.columns,
-            slices: scan.slices,
+            records_start: if request.header { first_end as u64 } else { 0 },
         })
     }
 
-    pub(crate) fn slices(&self) -> &[CsvSlice] {
-        &self.slices
+    /// The source offset of the first record: after the header, when read.
+    pub(crate) fn records_start(&self) -> u64 {
+        self.records_start
     }
 
-    /// Parse and normalize slice `index` of `bytes`, the capture `resolve`
-    /// read, admitting the read and the normalization as the whole-capture
-    /// path does, every record numbered from the slice's first.
+    pub(crate) fn table_key(&self) -> &str {
+        &self.table_key
+    }
+
+    /// Parse and normalize one slice of `rows` records, admitting the read
+    /// and the normalization as the whole-capture path does, every record
+    /// numbered from `first_record`.
     pub(crate) fn parse_slice(
         &self,
         catalog: &Catalog,
         request: &CsvLoadRequest,
-        bytes: &[u8],
-        index: usize,
+        body: &[u8],
+        rows: usize,
+        first_record: usize,
         admit: &mut dyn FnMut(u64) -> Result<()>,
     ) -> std::result::Result<Vec<RecordBatch>, SliceRefusal> {
-        let slice = self.slices.get(index).copied().ok_or_else(|| {
-            OmniError::manifest_internal(format!(
-                "load csv into {}: slice {index} of {} requested",
-                self.table_key,
-                self.slices.len()
-            ))
-        })?;
-        let body = &bytes[slice.start..slice.end];
-        let shape = CsvShape {
-            rows: slice.rows,
+        let slice = CsvShape {
+            rows,
             columns: self.columns,
         };
-        admit(shape.reader_bytes(body.len()))?;
-        let line_offset = slice.first_record - 1 + usize::from(request.header);
+        admit(slice.reader_bytes(body.len()))?;
+        let line_offset = first_record - 1 + usize::from(request.header);
         let parse_error = |error| {
             csv_parse_error(
                 &request.source,
@@ -509,10 +879,10 @@ impl ResolvedCsv {
         let read = reader
             .map(|batch| batch.map_err(parse_error))
             .collect::<Result<Vec<RecordBatch>>>()?;
-        let rows: usize = read.iter().map(RecordBatch::num_rows).sum();
-        if rows != slice.rows {
+        let read_rows: usize = read.iter().map(RecordBatch::num_rows).sum();
+        if read_rows != slice.rows {
             return Err(OmniError::manifest_internal(format!(
-                "load csv into {}: slice {index} counted {} records and read {rows}",
+                "load csv into {}: a slice counted {} records and read {read_rows}",
                 self.table_key, slice.rows
             ))
             .into());
@@ -531,7 +901,7 @@ impl ResolvedCsv {
             is_edge: self.is_edge,
         };
         admit(typing.normalization_bytes(&read)?)?;
-        Ok(typing.normalize_batches_from(&read, slice.first_record)?)
+        Ok(typing.normalize_batches_from(&read, first_record)?)
     }
 }
 
@@ -551,20 +921,10 @@ struct CsvShape {
     columns: usize,
 }
 
-/// What one quote-aware pass over a capture counts: its records and columns,
-/// and the slices it cut on record ends.
-struct CsvScan {
-    rows: usize,
-    columns: usize,
-    slices: Vec<CsvSlice>,
-}
-
-impl CsvScan {
-    /// A slice closes on the first record end at or past `slice_bytes` from
-    /// its start, a CRLF end after its line feed; the header, when read, is
-    /// no slice's. A capture with no record is one empty slice.
-    fn scan(mut bytes: &[u8], request: &CsvLoadRequest, slice_bytes: usize) -> Self {
-        let total = bytes.len();
+impl CsvShape {
+    /// One quote-aware pass over a whole capture: its records after the
+    /// header, when read, and the fields of its first record.
+    fn count(mut bytes: &[u8], request: &CsvLoadRequest) -> Self {
         let mut reader = csv_core::ReaderBuilder::new()
             .delimiter(request.delimiter)
             .build();
@@ -573,22 +933,9 @@ impl CsvScan {
         let mut records = 0_usize;
         let mut columns = 0_usize;
         let mut fields = 0_usize;
-        let mut consumed_total = 0_usize;
-        let mut slice_start = 0_usize;
-        let mut slice_first_record = 1_usize;
-        let mut data_records = 0_usize;
-        let mut slices = Vec::new();
         loop {
-            let (result, mut consumed, _, count) =
-                reader.read_record(bytes, &mut output, &mut ends);
-            if matches!(result, csv_core::ReadRecordResult::Record)
-                && bytes[..consumed].ends_with(b"\r")
-                && bytes.get(consumed) == Some(&b'\n')
-            {
-                consumed += 1;
-            }
+            let (result, consumed, _, count) = reader.read_record(bytes, &mut output, &mut ends);
             bytes = &bytes[consumed..];
-            consumed_total = consumed_total.saturating_add(consumed);
             fields = fields.saturating_add(count);
             match result {
                 csv_core::ReadRecordResult::Record => {
@@ -597,49 +944,14 @@ impl CsvScan {
                     }
                     records = records.saturating_add(1);
                     fields = 0;
-                    if request.header && records == 1 {
-                        slice_start = consumed_total;
-                        continue;
-                    }
-                    data_records = data_records.saturating_add(1);
-                    if consumed_total.saturating_sub(slice_start) >= slice_bytes {
-                        slices.push(CsvSlice {
-                            start: slice_start,
-                            end: consumed_total,
-                            first_record: slice_first_record,
-                            rows: data_records + 1 - slice_first_record,
-                        });
-                        slice_start = consumed_total;
-                        slice_first_record = data_records + 1;
-                    }
                 }
                 csv_core::ReadRecordResult::End => break,
                 _ => {}
             }
         }
-        let tail_rows = data_records + 1 - slice_first_record;
-        if tail_rows > 0 || slices.is_empty() {
-            slices.push(CsvSlice {
-                start: slice_start,
-                end: total,
-                first_record: slice_first_record,
-                rows: tail_rows,
-            });
-        }
         Self {
-            rows: data_records,
+            rows: records.saturating_sub(usize::from(request.header && records > 0)),
             columns,
-            slices,
-        }
-    }
-}
-
-impl CsvShape {
-    fn count(bytes: &[u8], request: &CsvLoadRequest) -> Self {
-        let scan = CsvScan::scan(bytes, request, usize::MAX);
-        Self {
-            rows: scan.rows,
-            columns: scan.columns,
         }
     }
 
@@ -1342,6 +1654,11 @@ mod tests {
     use omnigraph_compiler::schema::parser::parse_schema;
     use std::fmt::Write;
 
+    fn catalog() -> Catalog {
+        build_catalog(&parse_schema("node Person {\n  key: I64 @key\n  score: F64\n}\n").unwrap())
+            .unwrap()
+    }
+
     fn request(mode: LoadMode) -> CsvLoadRequest {
         CsvLoadRequest {
             source: "file:///input.csv".to_string(),
@@ -1466,124 +1783,178 @@ mod tests {
         assert!(!prepared.is_edge);
     }
 
-    fn slice_bodies<'a>(bytes: &'a [u8], scan: &CsvScan) -> Vec<&'a [u8]> {
-        scan.slices
-            .iter()
-            .map(|slice| &bytes[slice.start..slice.end])
-            .collect()
+    fn memory(source: &[u8]) -> Arc<CsvBytes> {
+        Arc::new(CsvBytes::Memory(Arc::from(source)))
     }
 
-    /// A slice closes on the first record end at or past the slice size,
-    /// the header belongs to none, and each slice numbers its first record
-    /// from the source; a case sees one slice under 8 MiB.
-    #[test]
-    fn scan_cuts_slices_on_record_ends_and_numbers_them_from_the_source() {
+    /// Every slice one partition over `range` cuts at `slice_bytes`, reading
+    /// the source in pieces of the same size: `(body, rows)`.
+    async fn slices(
+        source: &[u8],
+        request: &CsvLoadRequest,
+        range: Range<u64>,
+        slice_bytes: usize,
+        align: bool,
+    ) -> (RangeScanner, Vec<(Vec<u8>, usize)>) {
+        let mut scanner = RangeScanner::new(
+            memory(source),
+            request.delimiter,
+            range.start,
+            range.end,
+            slice_bytes,
+            align,
+        );
+        let mut cut = Vec::new();
+        while let Some(slice) = scanner.next_slice(request, &mut |_| Ok(())).await.unwrap() {
+            cut.push((slice.body, slice.rows));
+        }
+        (scanner, cut)
+    }
+
+    /// A slice closes on the first record end at or past the slice size and
+    /// the header belongs to none; a case sees one slice under 8 MiB.
+    #[tokio::test]
+    async fn scanner_cuts_slices_on_record_ends() {
         let mut source = String::from("key,score\n");
         for row in 0..10 {
             writeln!(&mut source, "{row},1.5").unwrap();
         }
         let bytes = source.as_bytes();
-        let scan = CsvScan::scan(bytes, &request(LoadMode::Overwrite), 8);
-        assert_eq!((scan.rows, scan.columns), (10, 2));
+        let request = request(LoadMode::Overwrite);
+        let resolved =
+            ResolvedCsv::resolve(&catalog(), &request, bytes, bytes.len() as u64).unwrap();
+        assert_eq!((resolved.records_start(), resolved.columns), (10, 2));
+        let (scanner, cut) = slices(bytes, &request, 10..bytes.len() as u64, 8, false).await;
         assert_eq!(
-            scan.slices,
-            (0..5)
-                .map(|slice| CsvSlice {
-                    start: 10 + slice * 12,
-                    end: 10 + (slice + 1) * 12,
-                    first_record: 1 + slice * 2,
-                    rows: 2,
-                })
-                .collect::<Vec<_>>()
+            cut.iter()
+                .map(|(body, rows)| (body.len(), *rows))
+                .collect::<Vec<_>>(),
+            vec![(12, 2); 5]
         );
-        assert_eq!(slice_bodies(bytes, &scan)[2], b"4,1.5\n5,1.5\n");
+        assert_eq!(cut[2].0, b"4,1.5\n5,1.5\n");
+        assert_eq!(
+            (scanner.start(), scanner.end()),
+            (10, Some(bytes.len() as u64))
+        );
 
-        let whole = CsvScan::scan(bytes, &request(LoadMode::Overwrite), usize::MAX);
-        assert_eq!(
-            whole.slices,
-            vec![CsvSlice {
-                start: 10,
-                end: bytes.len(),
-                first_record: 1,
-                rows: 10,
-            }]
-        );
+        let (_, whole) = slices(bytes, &request, 10..bytes.len() as u64, usize::MAX, false).await;
+        assert_eq!(whole.len(), 1);
+        assert_eq!((whole[0].0.len(), whole[0].1), (bytes.len() - 10, 10));
     }
 
-    #[test]
-    fn scan_without_a_header_counts_the_first_line_as_a_record() {
+    #[tokio::test]
+    async fn scanner_without_a_header_counts_the_first_line_as_a_record() {
         let bytes = b"0,1.5\n1,1.5\n2,1.5\n";
         let request = CsvLoadRequest {
             header: false,
+            columns: Some(vec!["key".to_string(), "score".to_string()]),
             ..request(LoadMode::Overwrite)
         };
-        let scan = CsvScan::scan(bytes, &request, 7);
-        assert_eq!(scan.rows, 3);
+        let resolved =
+            ResolvedCsv::resolve(&catalog(), &request, bytes, bytes.len() as u64).unwrap();
+        assert_eq!(resolved.records_start(), 0);
+        let (_, cut) = slices(bytes, &request, 0..18, 7, false).await;
         assert_eq!(
-            scan.slices,
-            vec![
-                CsvSlice {
-                    start: 0,
-                    end: 12,
-                    first_record: 1,
-                    rows: 2,
-                },
-                CsvSlice {
-                    start: 12,
-                    end: 18,
-                    first_record: 3,
-                    rows: 1,
-                },
-            ]
+            cut.iter()
+                .map(|(body, rows)| (body.len(), *rows))
+                .collect::<Vec<_>>(),
+            [(12, 2), (6, 1)]
         );
     }
 
     /// `csv_core` reports a CRLF record once it has read the `\r`; the cut
-    /// takes the `\n` with it so no slice starts on a bare line feed.
-    #[test]
-    fn scan_cuts_a_crlf_source_after_the_line_feed() {
+    /// takes the `\n` with it so no slice starts on a bare line feed, even
+    /// when the `\n` arrives in the next piece read.
+    #[tokio::test]
+    async fn scanner_cuts_a_crlf_source_after_the_line_feed() {
         let bytes = b"key,score\r\n0,1.5\r\n1,1.5\r\n2,1.5\r\n";
-        let scan = CsvScan::scan(bytes, &request(LoadMode::Overwrite), 1);
-        assert_eq!(scan.rows, 3);
+        let request = request(LoadMode::Overwrite);
+        let resolved =
+            ResolvedCsv::resolve(&catalog(), &request, bytes, bytes.len() as u64).unwrap();
+        assert_eq!(resolved.records_start(), 11);
+        for slice_bytes in [1, 7] {
+            let (_, cut) =
+                slices(bytes, &request, 11..bytes.len() as u64, slice_bytes, false).await;
+            assert_eq!(
+                cut.iter()
+                    .map(|(body, _)| body.as_slice())
+                    .collect::<Vec<_>>(),
+                [&b"0,1.5\r\n"[..], b"1,1.5\r\n", b"2,1.5\r\n"],
+                "slice_bytes {slice_bytes}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scanner_never_cuts_inside_a_quoted_field() {
+        let bytes = b"key,name\n1,\"a\nb\"\n2,c\n";
+        let request = request(LoadMode::Overwrite);
+        let (_, cut) = slices(bytes, &request, 9..bytes.len() as u64, 1, false).await;
         assert_eq!(
-            slice_bodies(bytes, &scan),
-            [&b"0,1.5\r\n"[..], b"1,1.5\r\n", b"2,1.5\r\n"]
-        );
-        assert_eq!(
-            scan.slices[0],
-            CsvSlice {
-                start: 11,
-                end: 18,
-                first_record: 1,
-                rows: 1,
-            }
+            cut.iter()
+                .map(|(body, _)| body.as_slice())
+                .collect::<Vec<_>>(),
+            [&b"1,\"a\nb\"\n"[..], b"2,c\n"]
         );
     }
 
-    #[test]
-    fn scan_never_cuts_inside_a_quoted_field() {
-        let bytes = b"key,name\n1,\"a\nb\"\n2,c\n";
-        let scan = CsvScan::scan(bytes, &request(LoadMode::Overwrite), 1);
-        assert_eq!((scan.rows, scan.columns), (2, 2));
-        assert_eq!(slice_bodies(bytes, &scan), [&b"1,\"a\nb\"\n"[..], b"2,c\n"]);
-        assert_eq!(
-            scan.slices
-                .iter()
-                .map(|slice| slice.first_record)
-                .collect::<Vec<_>>(),
-            [1, 2]
-        );
+    /// Neighbouring partitions meet at one record end whatever byte the
+    /// range boundary falls on: the record start, inside a record, between
+    /// the `\r` and the `\n` of a CRLF.
+    #[tokio::test]
+    async fn neighbouring_partitions_meet_at_one_record_end() {
+        for (source, records_start) in [
+            (
+                &b"key,score\n0,1.5\n10,1.5\n200,1.5\n3,1.5\n4,1.5\n"[..],
+                10_u64,
+            ),
+            (
+                b"key,score\r\n0,1.5\r\n10,1.5\r\n200,1.5\r\n3,1.5\r\n4,1.5\r\n",
+                11,
+            ),
+            (b"key,score\n0,1.5\n10,1.5\n200,1.5\n3,1.5\n4,1.5", 10),
+        ] {
+            let request = request(LoadMode::Overwrite);
+            let size = source.len() as u64;
+            for boundary in records_start + 1..size {
+                let (before, mut cut) =
+                    slices(source, &request, records_start..boundary, 4, false).await;
+                let (after, tail) = slices(source, &request, boundary..size, 4, true).await;
+                assert_eq!(
+                    before.end(),
+                    Some(after.start()),
+                    "boundary {boundary} of {source:?}"
+                );
+                cut.extend(tail);
+                let rows: usize = cut.iter().map(|(_, rows)| rows).sum();
+                assert_eq!(rows, 5, "boundary {boundary} of {source:?}");
+                let joined: Vec<u8> = cut.into_iter().flat_map(|(body, _)| body).collect();
+                assert_eq!(joined, source[records_start as usize..]);
+            }
+        }
+    }
+
+    /// A range boundary inside a quoted field holding a line break: the
+    /// partition before it ends where the record ends, the one after it
+    /// begins at the quoted line break, and the two disagree.
+    #[tokio::test]
+    async fn a_boundary_inside_a_quoted_line_break_makes_the_partitions_disagree() {
+        let source = b"key,name\n1,\"a\nb\"\n2,c\n";
+        let request = request(LoadMode::Overwrite);
+        let boundary = 12;
+        assert_eq!(&source[boundary as usize..boundary as usize + 2], b"a\n");
+        let (before, _) = slices(source, &request, 9..boundary, 4, false).await;
+        let (after, _) = slices(source, &request, boundary..source.len() as u64, 4, true).await;
+        assert_eq!(before.end(), Some(17));
+        assert_eq!(after.start(), 14);
     }
 
     /// Arrow numbers a parse error's line from its reader's start; a slice's
-    /// refusal carries the whole capture's number, so one slice and many
-    /// refuse the same record in the same words.
-    #[test]
-    fn a_slice_parse_error_names_the_source_line() {
-        let catalog = build_catalog(
-            &parse_schema("node Person {\n  key: I64 @key\n  score: F64\n}\n").unwrap(),
-        )
-        .unwrap();
+    /// refusal carries the source's number, so one slice and many refuse the
+    /// same record in the same words.
+    #[tokio::test]
+    async fn a_slice_parse_error_names_the_source_line() {
+        let catalog = catalog();
         let mut source = String::from("key,score\n");
         for row in 0..40 {
             if row == 27 {
@@ -1605,41 +1976,57 @@ mod tests {
             .to_string();
         assert!(whole.contains("at line 28"), "{whole}");
 
-        let resolved = ResolvedCsv::resolve(&catalog, &request, source.as_bytes(), 64).unwrap();
-        let slice = resolved
-            .slices()
+        let bytes = source.as_bytes();
+        let resolved = ResolvedCsv::resolve(&catalog, &request, bytes, bytes.len() as u64).unwrap();
+        let (_, cut) = slices(bytes, &request, 10..bytes.len() as u64, 64, false).await;
+        let mut first_record = 1;
+        let (body, rows) = cut
             .iter()
-            .position(|slice| (slice.first_record..slice.first_record + slice.rows).contains(&28))
+            .find(|(_, rows)| {
+                let holds = (first_record..first_record + rows).contains(&28);
+                if !holds {
+                    first_record += rows;
+                }
+                holds
+            })
             .unwrap();
-        assert!(slice > 0, "record 28 is past the first slice");
+        assert!(first_record > 1, "record 28 is past the first slice");
         let sliced = resolved
-            .parse_slice(
-                &catalog,
-                &request,
-                source.as_bytes(),
-                slice,
-                &mut |_| Ok(()),
-            )
+            .parse_slice(&catalog, &request, body, *rows, first_record, &mut |_| {
+                Ok(())
+            })
             .unwrap_err()
             .into_error()
             .to_string();
         assert_eq!(sliced, whole);
     }
 
-    #[test]
-    fn scan_of_a_header_alone_is_one_empty_slice() {
+    #[tokio::test]
+    async fn a_header_alone_cuts_no_slice() {
         let bytes = b"key,score\n";
-        let scan = CsvScan::scan(bytes, &request(LoadMode::Overwrite), 8);
-        assert_eq!(scan.rows, 0);
+        let request = request(LoadMode::Overwrite);
+        let resolved =
+            ResolvedCsv::resolve(&catalog(), &request, bytes, bytes.len() as u64).unwrap();
+        assert_eq!(resolved.records_start(), 10);
+        let (scanner, cut) = slices(bytes, &request, 10..10, 8, false).await;
+        assert!(cut.is_empty());
+        assert_eq!((scanner.start(), scanner.end()), (10, Some(10)));
+    }
+
+    /// The header is resolved from the source's first bytes alone; a first
+    /// record longer than them is refused with the bytes named.
+    #[test]
+    fn resolve_refuses_a_first_record_longer_than_the_head() {
+        let request = request(LoadMode::Overwrite);
+        let error = ResolvedCsv::resolve(&catalog(), &request, b"key,sco", 20)
+            .unwrap_err()
+            .to_string();
         assert_eq!(
-            scan.slices,
-            vec![CsvSlice {
-                start: 10,
-                end: 10,
-                first_record: 1,
-                rows: 0,
-            }]
+            error,
+            "load csv into node:Person: the first record of the source exceeds 7 bytes"
         );
+        let resolved = ResolvedCsv::resolve(&catalog(), &request, b"key,score\n0,1", 20).unwrap();
+        assert_eq!(resolved.records_start(), 10);
     }
 
     /// Counts through fixed scratch-buffer boundaries and covers Arrow's

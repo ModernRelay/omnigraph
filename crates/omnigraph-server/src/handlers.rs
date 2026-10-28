@@ -422,11 +422,20 @@ pub(crate) async fn require_bearer_auth(
     }
 
     let provided_token = crate::challenge::bearer_token(request.headers())?;
-    let Some(actor) = state.authenticate_bearer_token(provided_token) else {
-        return Err(ApiError::unauthorized(
-            Unauthenticated::Refused,
-            "invalid bearer token",
-        ));
+    let actor = match state.authenticate_bearer_token(provided_token) {
+        Ok(actor) => actor,
+        Err(crate::oidc_identity::OidcRefusal::Invalid) => {
+            return Err(ApiError::unauthorized(
+                Unauthenticated::Refused,
+                "invalid bearer token",
+            ));
+        }
+        Err(crate::oidc_identity::OidcRefusal::NotAdmitted) => {
+            return Err(ApiError::not_admitted());
+        }
+        Err(crate::oidc_identity::OidcRefusal::Unavailable) => {
+            return Err(ApiError::identity_admission_unavailable());
+        }
     };
     request.extensions_mut().insert(actor.actor().clone());
     request.extensions_mut().insert(actor);
@@ -1259,10 +1268,24 @@ pub(crate) async fn server_blob_delete(
     headers: HeaderMap,
     ApiQuery(query): ApiQuery<BlobWriteQuery>,
 ) -> std::result::Result<Response, ApiError> {
-    let precondition = blob_write_precondition(&headers)?;
     let actor = actor.as_ref().map(|Extension(actor)| actor);
+    blob_write_response(blob_clear_body(&state, &handle, ingress, actor, &headers, query).await?)
+}
+
+/// Body shared by `DELETE /blob` and the MCP `blobs_clear` tool: the
+/// `If-Match` parse, the `change` check on the branch, admission and the
+/// owned engine write, answered as the route's receipt.
+pub(crate) async fn blob_clear_body(
+    state: &AppState,
+    handle: &GraphRequest,
+    ingress: IngressLease,
+    actor: Option<&AuthenticatedActor>,
+    headers: &HeaderMap,
+    query: BlobWriteQuery,
+) -> std::result::Result<BlobWriteOutput, ApiError> {
+    let precondition = blob_write_precondition(headers)?;
     let branch = query.branch.clone().unwrap_or_else(|| "main".to_string());
-    authorize_blob_write(&handle, actor, &branch)?;
+    authorize_blob_write(handle, actor, &branch)?;
     let actor_arc = actor
         .map(|actor| Arc::clone(&actor.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
@@ -1271,19 +1294,18 @@ pub(crate) async fn server_blob_delete(
         .try_admit(&actor_arc, 0)
         .map_err(ApiError::from_workload_reject)?;
 
-    let session = state.session(&handle, None)?;
+    let session = state.session(handle, None)?;
     let selector = BlobSelectorOutput::from(&query);
     let cell = blob_write_cell(query);
     let actor_id = actor.map(|actor| actor.actor_id.to_string());
-    let output = owned_write(&state, admission, ingress, handle.clone(), async move {
+    owned_write(state, admission, ingress, handle.clone(), async move {
         let outcome = session
             .clear_blob_at_as(&branch, cell, precondition, actor_id.as_deref())
             .await
             .map_err(ApiError::from_omni)?;
         Ok(api::blob_write_output(selector, branch, &outcome, actor_id))
     })
-    .await?;
-    blob_write_response(output)
+    .await
 }
 
 fn blob_write_precondition(

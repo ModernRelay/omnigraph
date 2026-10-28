@@ -10,6 +10,7 @@
 //! load validate unique node:Person key [id]: access delta
 //! load validate unique node:Person unique [email]: access scan
 //! load validate edge_ri edge:Knows from Person: access probe
+//! load validate edge_ri edge:Knows from Person: probe judged
 //! load validate cardinality edge:Knows from Person
 //! load validate retained_edges node:Person edge:Knows from: access probe
 //! load validate removal node:Person: scan
@@ -20,7 +21,8 @@
 //! ```
 //!
 //! `route: plan` is the document's `engine` route, `pipeline` its `executor`
-//! route; the validate lines are the one `Validate` node's checks in order,
+//! route; the validate lines are the one `Validate` node's checks in order
+//! (an `edge_ri` check has two lines, its access and where it probes),
 //! then its `removal`, whether an overwrite's removed ids are found at all;
 //! a `pipeline` line is one entry of the document's `pipelines`, its source,
 //! its operators, the sink it drains into, its partitions when above one and
@@ -31,10 +33,11 @@ use omnigraph::loader::LoadExecuted;
 use serde::Serialize;
 use serde_json::Value;
 
-const FORMS: &str = "forms: `load route: <plan|pipeline>`, `load scan: partitions <n> fallback single_scan`, `load validate value <table> [a, b]`, `load validate unique <table> <key|unique> [a, b]: access <delta|probe|scan>`, `load validate edge_ri <edge> <from|to> <Node>: access <delta|probe|scan>`, `load validate cardinality <edge> <from|to> <Node>`, `load validate retained_edges <node> <edge> <from|to>: access <delta|probe|scan>`, `load validate removal <table>: <scan|none>`, `load write: <overwrite fragments|append strict_insert|merge upsert>`, `load pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ partitions <n>][ after <n>[, <m>]]`, `load executed: partitions <n> rows <m>`, `load executed <Node>: rows <m>`";
+const FORMS: &str = "forms: `load route: <plan|pipeline>`, `load scan: partitions <n> fallback single_scan`, `load validate value <table> [a, b]`, `load validate unique <table> <key|unique> [a, b]: access <delta|probe|scan>`, `load validate edge_ri <edge> <from|to> <Node>: access <delta|probe|scan>`, `load validate edge_ri <edge> <from|to> <Node>: probe <swept|judged>`, `load validate cardinality <edge> <from|to> <Node>`, `load validate retained_edges <node> <edge> <from|to>: access <delta|probe|scan>`, `load validate removal <table>: <scan|none>`, `load write: <overwrite fragments|append strict_insert|merge upsert>`, `load pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ partitions <n>][ after <n>[, <m>]]`, `load executed: partitions <n> rows <m>`, `load executed <Node>: rows <m>`";
 
 const ACCESS: [&str; 3] = ["delta", "probe", "scan"];
 const REMOVALS: [&str; 2] = ["scan", "none"];
+const PROBES: [&str; 2] = ["swept", "judged"];
 const ENDPOINTS: [&str; 2] = ["from", "to"];
 const ROUTES: [&str; 2] = ["plan", "pipeline"];
 const WRITES: [&str; 3] = [
@@ -68,6 +71,14 @@ pub(crate) enum LoadFact {
         endpoint: String,
         node: String,
         access: String,
+    },
+    /// An `edge_ri` check's `probe`: where it probes the committed ids,
+    /// `swept` on the parse partitions or `judged` after the drain.
+    EdgeRiProbe {
+        edge: String,
+        endpoint: String,
+        node: String,
+        probe: String,
     },
     Cardinality {
         edge: String,
@@ -222,6 +233,12 @@ impl LoadFact {
                 node,
                 access,
             } => format!("load validate edge_ri {edge} {endpoint} {node}: access {access}"),
+            LoadFact::EdgeRiProbe {
+                edge,
+                endpoint,
+                node,
+                probe,
+            } => format!("load validate edge_ri {edge} {endpoint} {node}: probe {probe}"),
             LoadFact::Cardinality {
                 edge,
                 endpoint,
@@ -366,6 +383,22 @@ fn parse_validate_fact(text: &str) -> Option<LoadFact> {
         });
     }
     if let Some(edge_ri) = text.strip_prefix("edge_ri ") {
+        if let Some((identity, probe)) = edge_ri.rsplit_once(": probe ") {
+            let probe = probe.trim();
+            if !PROBES.contains(&probe) {
+                return None;
+            }
+            let words: Vec<&str> = identity.split_whitespace().collect();
+            let [edge, endpoint, node] = words.as_slice() else {
+                return None;
+            };
+            return Some(LoadFact::EdgeRiProbe {
+                edge: table_key(edge)?,
+                endpoint: endpoint_word(endpoint)?,
+                node: type_name(node)?,
+                probe: probe.to_string(),
+            });
+        }
         let (identity, access) = edge_ri.rsplit_once(": access ")?;
         let words: Vec<&str> = identity.split_whitespace().collect();
         let [edge, endpoint, node] = words.as_slice() else {
@@ -515,12 +548,22 @@ fn node_facts(node: &Value, facts: &mut Vec<LoadFact>) {
                         columns: columns(),
                         access,
                     },
-                    Some("edge_ri") => LoadFact::EdgeRi {
-                        edge: table.clone(),
-                        endpoint: text(&check["endpoint"]),
-                        node: text(&check["node_type"]),
-                        access,
-                    },
+                    Some("edge_ri") => {
+                        if let Some(probe) = check["probe"].as_str() {
+                            facts.push(LoadFact::EdgeRiProbe {
+                                edge: table.clone(),
+                                endpoint: text(&check["endpoint"]),
+                                node: text(&check["node_type"]),
+                                probe: probe.to_string(),
+                            });
+                        }
+                        LoadFact::EdgeRi {
+                            edge: table.clone(),
+                            endpoint: text(&check["endpoint"]),
+                            node: text(&check["node_type"]),
+                            access,
+                        }
+                    }
                     Some("cardinality") => LoadFact::Cardinality {
                         edge: table.clone(),
                         endpoint: text(&check["endpoint"]),
@@ -590,6 +633,8 @@ mod tests {
             "load validate unique node:Person key [id]: access delta",
             "load validate unique node:Person unique [email, name]: access scan",
             "load validate edge_ri edge:Knows from Person: access probe",
+            "load validate edge_ri edge:Knows to Person: probe swept",
+            "load validate edge_ri edge:Knows from Person: probe judged",
             "load validate cardinality edge:Knows from Person",
             "load validate retained_edges node:Person edge:Knows to: access probe",
             "load validate removal node:Person: scan",
@@ -641,6 +686,7 @@ mod tests {
             "load pipeline 0: CsvSource => Validate partitions two",
             "load pipeline 0: CsvSource => Validate partitions 0",
             "load pipeline 1: Validate => consumer after 0 partitions 2",
+            "load validate edge_ri edge:Knows from Person: probe later",
             "load executed CsvSource rows 3",
             "load executed CsvSource: rows three",
             "load executed Csv Source: rows 3",
@@ -663,7 +709,7 @@ mod tests {
                     "checks": [
                         {"check": "value", "columns": ["w"], "consults": null, "access": "delta"},
                         {"check": "unique", "role": "key", "columns": ["from", "to"], "access": "delta"},
-                        {"check": "edge_ri", "endpoint": "from", "node_type": "Person", "access": "scan"},
+                        {"check": "edge_ri", "endpoint": "from", "node_type": "Person", "access": "scan", "probe": "swept"},
                         {"check": "cardinality", "endpoint": "from", "node_type": "Person", "min": 0, "max": 2, "access": "probe"}
                     ],
                     "removal": "none",
@@ -701,6 +747,7 @@ mod tests {
                 "load write: overwrite fragments",
                 "load validate value edge:Knows [w]",
                 "load validate unique edge:Knows key [from, to]: access delta",
+                "load validate edge_ri edge:Knows from Person: probe swept",
                 "load validate edge_ri edge:Knows from Person: access scan",
                 "load validate cardinality edge:Knows from Person",
                 "load validate removal edge:Knows: none",

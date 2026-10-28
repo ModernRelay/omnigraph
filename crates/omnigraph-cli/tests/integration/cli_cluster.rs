@@ -1050,16 +1050,16 @@ fn managed_cluster_list_uses_selected_account_without_folder_routing() {
 
 fn member_directory() -> Value {
     serde_json::json!({
-        "data": {"cluster_id":"managed-test","members":[
-            {"user_id":"user_one","principal_id":"principal-one","name":"Avery Chen","email":"avery@example.com","admitted":true,"control_grants":["source_read","status"]},
-            {"user_id":"user_two","principal_id":"principal-two","name":null,"email":null,"admitted":false,"control_grants":["status"]}
+        "data": {"cluster_id":"managed-test","organization_id":"account-one","provider_observed_at":"2026-10-26T10:00:00Z","provider_expires_at":"2026-10-26T10:00:30Z","members":[
+            {"user_id":"user_one","membership_id":"om_one","principal_id":"principal-one","name":"Avery Chen","email":"avery@example.com","eligible":true,"service_permissions":["source_read","status"]},
+            {"user_id":"user_two","membership_id":"om_two","principal_id":null,"name":null,"email":null,"eligible":true,"service_permissions":[]}
         ]},
         "meta":{"cluster_id":"managed-test","incarnation":"inc-one","provenance":"service_db"}
     })
 }
 
 #[test]
-fn managed_cluster_members_lists_exact_enrollment_as_json_and_readable_text() {
+fn managed_cluster_members_lists_provider_eligibility_as_json_and_readable_text() {
     for json in [true, false] {
         let temp = tempdir().unwrap();
         let response = member_directory();
@@ -1085,12 +1085,12 @@ fn managed_cluster_members_lists_exact_enrollment_as_json_and_readable_text() {
                 "NAME",
                 "EMAIL",
                 "PRINCIPAL",
-                "ADMITTED",
-                "CONTROL GRANTS",
+                "ELIGIBLE",
+                "ORG SERVICE PERMISSIONS",
                 "Avery Chen",
                 "avery@example.com",
                 "principal-one",
-                "principal-two",
+                "not yet signed in",
                 "source_read, status",
                 "Graph permissions are evaluated by Cedar separately.",
             ] {
@@ -1118,7 +1118,7 @@ fn managed_cluster_members_lists_exact_enrollment_as_json_and_readable_text() {
     let api = lifecycle_fixture(vec![IntentReply::json(200, empty)]);
     write_managed_target(temp.path(), &api.origin);
     let output = output_success(managed_cli(temp.path(), &api.origin).args(["members", "list"]));
-    assert!(String::from_utf8_lossy(&output.stdout).contains("No explicitly enrolled members."));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No active organization members."));
     api.assert_complete();
 }
 
@@ -1138,6 +1138,24 @@ fn managed_cluster_members_refuses_wrong_identity_malformed_results_and_denials(
             "context_mismatch",
             2,
         ),
+        (
+            "/data/organization_id",
+            serde_json::json!("foreign"),
+            "context_mismatch",
+            2,
+        ),
+        (
+            "/data/provider_expires_at",
+            serde_json::json!("2026-10-26T10:01:00Z"),
+            "api_response_invalid",
+            1,
+        ),
+        (
+            "/data/members/1/membership_id",
+            serde_json::json!("om_one"),
+            "api_response_invalid",
+            1,
+        ),
         ("/meta/incarnation", Value::Null, "target_mismatch", 2),
         (
             "/meta/incarnation",
@@ -1146,7 +1164,7 @@ fn managed_cluster_members_refuses_wrong_identity_malformed_results_and_denials(
             2,
         ),
         (
-            "/data/members/0/admitted",
+            "/data/members/0/eligible",
             serde_json::json!("yes"),
             "api_response_invalid",
             1,
@@ -1158,14 +1176,14 @@ fn managed_cluster_members_refuses_wrong_identity_malformed_results_and_denials(
             1,
         ),
         (
-            "/data/members/0/control_grants",
+            "/data/members/0/service_permissions",
             serde_json::json!(["status", "status"]),
             "api_response_invalid",
             1,
         ),
         (
-            "/data/members/1/control_grants",
-            serde_json::json!([]),
+            "/data/members/1/eligible",
+            serde_json::json!(false),
             "api_response_invalid",
             1,
         ),
@@ -1179,6 +1197,14 @@ fn managed_cluster_members_refuses_wrong_identity_malformed_results_and_denials(
         let mut response = member_directory();
         *response.pointer_mut(pointer).unwrap() = value;
         cases.push((200, response, kind, exit));
+    }
+    for field in ["principal_id", "service_permissions", "membership_id"] {
+        let mut response = member_directory();
+        response["data"]["members"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        cases.push((200, response, "api_response_invalid", 1));
     }
     for (status, kind) in [
         (401, "unauthorized"),
@@ -3572,14 +3598,10 @@ fn organization_cli(root: &std::path::Path, origin: &str) -> assert_cmd::Command
     command
 }
 
-fn team_scopes() -> Value {
-    serde_json::json!({"admin":false,"clusters":[],"verbs":[],"control_grants":[],"data_grants":[],"cluster_admissions":[]})
-}
-
 fn organization_members() -> Value {
-    serde_json::json!({"data":{"organization_id":"account-one","members":[
-        {"user_id":"user_one","membership_id":"om_one","membership_status":"active","principal_id":"principal-one","grant_version":3,"scopes":team_scopes(),"name":"Avery Chen","email":"avery@example.com"},
-        {"user_id":"user_two","membership_id":"om_two","membership_status":"pending","principal_id":null,"grant_version":0,"scopes":team_scopes(),"name":null,"email":null}
+    serde_json::json!({"data":{"organization_id":"account-one","provider_observed_at":"2026-10-26T10:00:00Z","provider_expires_at":"2026-10-26T10:00:30Z","members":[
+        {"user_id":"user_one","membership_id":"om_one","membership_status":"active","principal_id":"principal-one","roles":["member"],"service_permissions":["source_read","status"],"name":"Avery Chen","email":"avery@example.com"},
+        {"user_id":"user_two","membership_id":"om_two","membership_status":"pending","principal_id":null,"roles":["member"],"service_permissions":[],"name":null,"email":null}
     ]},"meta":{"provenance":"service_db"}})
 }
 
@@ -3587,20 +3609,13 @@ fn team_invitation(state: &str) -> Value {
     serde_json::json!({"id":"inv_one","email":"avery@example.com","state":state,"organization_id":"account-one","accepted_user_id":null,"created_at":"2026-10-15T00:00:00Z","expires_at":"2026-10-22T00:00:00Z"})
 }
 
-fn team_patch(action: &str, version: i64) -> Value {
-    let mut patch = serde_json::json!({"version":1,"organization_id":"account-one","user_id":"user_one","action":action,"expected_grant_version":version,"add":{"control_grants":[],"cluster_admissions":[]},"remove":{"control_grants":[],"cluster_admissions":[]}});
-    if action != "remove" {
-        patch["add"] = serde_json::json!({"control_grants":[{"cluster":"managed-test","verb":"status"},{"cluster":null,"verb":"members_manage"}],"cluster_admissions":["managed-test"]});
-    }
-    patch
-}
-
-fn team_patch_receipt(action: &str, version: i64) -> Value {
-    let mut scopes = team_scopes();
-    let patch = team_patch(action, version);
-    scopes["control_grants"] = patch["add"]["control_grants"].clone();
-    scopes["cluster_admissions"] = patch["add"]["cluster_admissions"].clone();
-    serde_json::json!({"data":{"organization_id":"account-one","action":action,"previous_grant_version":version,"member":{"user_id":"user_one","principal_id":"principal-one","grant_version":version+1,"scopes":scopes},"provider_membership_verified":action!="remove","provider_changed":false,"graph_policy_changed":false,"maximum_existing_native_credential_lifetime_seconds":86400},"meta":{"provenance":"service_db"}})
+fn team_offboard(
+    membership: Option<&str>,
+    provider: &str,
+    session_state: &str,
+    revoked: u64,
+) -> Value {
+    serde_json::json!({"data":{"organization_id":"account-one","user_id":"user_one","principal_id":"principal-one","membership_id":membership,"provider_observed_at":"2026-10-26T10:00:00Z","provider_membership":provider,"sessions":{"revoked":revoked,"total":2,"state":session_state},"graph_policy_changed":false,"maximum_existing_native_credential_lifetime_seconds":86400},"meta":{}})
 }
 
 #[test]
@@ -3624,8 +3639,10 @@ fn managed_organization_lists_directory_and_invitation_pages_without_enrolling()
                 "avery@example.com",
                 "user_two",
                 "pending",
-                "not enrolled",
-                "grant version: 3",
+                "not yet signed in",
+                "Organization service permissions: source_read, status",
+                "service roles: member",
+                "principal:principal-one",
                 "Cedar",
             ] {
                 assert!(text.contains(expected), "{text}");
@@ -3709,85 +3726,78 @@ fn managed_organization_writes_send_exact_identity_and_required_key_once() {
         );
         api.assert_complete();
     }
-    for (action, version, unchanged) in [
-        ("add", 0, false),
-        ("update", 3, false),
-        ("remove", 3, false),
-        ("update", 3, true),
-        ("remove", 3, true),
-    ] {
-        let temp = tempdir().unwrap();
-        let input = team_patch(action, version);
-        fs::write(
-            temp.path().join("member.yaml"),
-            yaml_serde::to_string(&input).unwrap(),
-        )
-        .unwrap();
-        let mut response = team_patch_receipt(action, version);
-        if unchanged {
-            response["data"]["member"]["grant_version"] = serde_json::json!(version);
-        }
-        let api = lifecycle_fixture(vec![IntentReply::json(200, response.clone())]);
-        let output = output_success(organization_cli(temp.path(), &api.origin).args([
-            "members",
-            "apply",
-            "member.yaml",
-            "--idempotency-key",
-            "member-key",
-            "--json",
-        ]));
-        assert_eq!(parse_stdout_json(&output), response);
-        assert_control_request(
-            &api.workflow_requests()[0],
-            "POST",
-            "/v1/organization/members",
-            input,
-            Some("member-key"),
-        );
-        api.assert_complete();
-    }
 }
 
 #[test]
 fn managed_organization_offboard_preserves_partial_outcome_and_graph_boundary() {
-    for (provider, session_state, revoked, exit) in [
-        ("removed", "complete", 2, 0),
-        ("uncertain", "partial", 1, 3),
+    for (membership, provider, session_state, revoked, exit) in [
+        (Some("om_one"), "removed", "complete", 2, 0),
+        (Some("om_one"), "removed", "partial", 1, 3),
+        (Some("om_one"), "uncertain", "not_attempted", 0, 3),
+        (None, "already_absent", "complete", 2, 0),
     ] {
-        let temp = tempdir().unwrap();
-        let response = serde_json::json!({"data":{"organization_id":"account-one","user_id":"user_one","principal_id":"principal-one","grant_version":4,"local_access_removed":true,"provider_membership":provider,"sessions":{"revoked":revoked,"total":2,"state":session_state},"graph_policy_changed":false,"maximum_existing_native_credential_lifetime_seconds":86400},"meta":{}});
-        let api = lifecycle_fixture(vec![IntentReply::json(200, response.clone())]);
-        let output = organization_cli(temp.path(), &api.origin)
-            .args([
+        for json in [true, false] {
+            let temp = tempdir().unwrap();
+            let response = team_offboard(membership, provider, session_state, revoked);
+            let api = lifecycle_fixture(vec![IntentReply::json(200, response.clone())]);
+            let mut command = organization_cli(temp.path(), &api.origin);
+            command.args([
                 "members",
                 "offboard",
                 "user_one",
-                "--expected-version",
-                "3",
+                "--expected-membership",
+                membership.unwrap_or("absent"),
                 "--idempotency-key",
                 "offboard-key",
-                "--json",
-            ])
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(exit));
-        assert_eq!(parse_stdout_json(&output), response);
-        assert_control_request(
-            &api.workflow_requests()[0],
-            "POST",
-            "/v1/organization/members/user_one:offboard",
-            serde_json::json!({"version":1,"organization_id":"account-one","user_id":"user_one","expected_grant_version":3}),
-            Some("offboard-key"),
-        );
-        api.assert_complete();
+            ]);
+            if json {
+                command.arg("--json");
+            }
+            let output = command.output().unwrap();
+            assert_eq!(output.status.code(), Some(exit), "{output:?}");
+            if json {
+                assert_eq!(parse_stdout_json(&output), response);
+            } else {
+                let text = String::from_utf8_lossy(&output.stdout);
+                assert!(text.contains("Graph policy is unchanged"), "{text}");
+                assert!(text.contains(provider), "{text}");
+                assert!(!text.contains("grant version"), "{text}");
+            }
+            assert_control_request(
+                &api.workflow_requests()[0],
+                "POST",
+                "/v1/organization/members/user_one:offboard",
+                serde_json::json!({"version":2,"organization_id":"account-one","user_id":"user_one","expected_membership_id":membership}),
+                Some("offboard-key"),
+            );
+            api.assert_complete();
+        }
     }
 }
 
 #[test]
-fn managed_organization_refuses_invalid_targets_and_yaml_before_external_access() {
+fn managed_organization_refuses_invalid_targets_and_retired_grants_before_external_access() {
     let temp = tempdir().unwrap();
     let api = lifecycle_fixture(vec![]);
     for arguments in [
+        vec![
+            "members",
+            "set",
+            "avery@example.com",
+            "--role",
+            "INVALID ROLE",
+            "--idempotency-key",
+            "key",
+        ],
+        vec![
+            "members",
+            "offboard",
+            "avery@example.com",
+            "--expected-membership",
+            "absent",
+            "--idempotency-key",
+            "key",
+        ],
         vec![
             "invitations",
             "send",
@@ -3807,8 +3817,8 @@ fn managed_organization_refuses_invalid_targets_and_yaml_before_external_access(
             "members",
             "offboard",
             "../user",
-            "--expected-version",
-            "0",
+            "--expected-membership",
+            "absent",
             "--idempotency-key",
             "key",
         ],
@@ -3827,35 +3837,14 @@ fn managed_organization_refuses_invalid_targets_and_yaml_before_external_access(
             .unwrap();
         assert_eq!(output.status.code(), Some(2), "{output:?}");
     }
-    for (pointer, value) in [
-        ("/organization_id", serde_json::json!("foreign")),
-        ("/version", serde_json::json!(2)),
-        ("/expected_grant_version", serde_json::json!(1)),
-        (
-            "/add/control_grants",
-            serde_json::json!([{"cluster":"*","verb":"status"}]),
-        ),
-        (
-            "/add/control_grants",
-            serde_json::json!([{"cluster":null,"verb":"plan"}]),
-        ),
-        (
-            "/add/cluster_admissions",
-            serde_json::json!(["cluster", "cluster"]),
-        ),
-    ] {
-        let mut patch = team_patch("add", 0);
-        *patch.pointer_mut(pointer).unwrap() = value;
-        fs::write(
-            temp.path().join("member.yaml"),
-            yaml_serde::to_string(&patch).unwrap(),
-        )
-        .unwrap();
+    for membership in ["bad/id", "org_wrong", "", "om_bad\n"] {
         let output = organization_cli(temp.path(), &api.origin)
             .args([
                 "members",
-                "apply",
-                "member.yaml",
+                "offboard",
+                "user_one",
+                "--expected-membership",
+                membership,
                 "--idempotency-key",
                 "key",
                 "--json",
@@ -3864,58 +3853,26 @@ fn managed_organization_refuses_invalid_targets_and_yaml_before_external_access(
             .unwrap();
         assert_eq!(output.status.code(), Some(2), "{output:?}");
     }
-    fs::write(
-        temp.path().join("member.yaml"),
-        format!(
-            "{}\nadmin: true\n",
-            yaml_serde::to_string(&team_patch("add", 0)).unwrap()
-        ),
-    )
-    .unwrap();
-    let output = organization_cli(temp.path(), &api.origin)
-        .args([
+    for arguments in [
+        vec![
             "members",
             "apply",
             "member.yaml",
             "--idempotency-key",
             "key",
-            "--json",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(parse_stdout_json(&output)["type"], "member_patch_invalid");
-    fs::write(
-        temp.path().join("oversized.yaml"),
-        vec![b'a'; 256 * 1024 + 1],
-    )
-    .unwrap();
-    let output = organization_cli(temp.path(), &api.origin)
-        .args([
+        ],
+        vec![
             "members",
-            "apply",
-            "oversized.yaml",
+            "offboard",
+            "user_one",
+            "--expected-version",
+            "3",
             "--idempotency-key",
             "key",
-            "--json",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(parse_stdout_json(&output)["type"], "member_patch_invalid");
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink("member.yaml", temp.path().join("linked.yaml")).unwrap();
-        let output = organization_cli(temp.path(), &api.origin)
-            .args([
-                "members",
-                "apply",
-                "linked.yaml",
-                "--idempotency-key",
-                "key",
-                "--json",
-            ])
-            .output()
-            .unwrap();
-        assert_eq!(parse_stdout_json(&output)["type"], "member_patch_invalid");
+        ],
+    ] {
+        let output = output_failure(organization_cli(temp.path(), &api.origin).args(arguments));
+        assert!(output.stdout.is_empty(), "{output:?}");
     }
     write_managed_target(temp.path(), &api.origin);
     for argument in ["--direct", "--target"] {
@@ -3950,25 +3907,29 @@ fn managed_organization_refuses_invalid_targets_and_yaml_before_external_access(
 #[test]
 fn managed_organization_refuses_foreign_malformed_and_uncertain_results_without_replay() {
     for (pointer, value) in [
-        ("/data/member/user_id", serde_json::json!("user_foreign")),
-        ("/data/previous_grant_version", serde_json::json!(10)),
-        ("/data/member/scopes/control_grants", serde_json::json!([])),
+        ("/data/user_id", serde_json::json!("user_foreign")),
+        ("/data/membership_id", serde_json::json!("om_replaced")),
+        ("/data/membership_id", Value::Null),
+        ("/data/provider_observed_at", serde_json::json!("invalid")),
+        (
+            "/data/provider_membership",
+            serde_json::json!("already_absent"),
+        ),
+        ("/data/provider_membership", serde_json::json!("uncertain")),
+        ("/data/sessions/revoked", serde_json::json!(3)),
         ("/data/graph_policy_changed", serde_json::json!(true)),
     ] {
         let temp = tempdir().unwrap();
-        fs::write(
-            temp.path().join("member.yaml"),
-            yaml_serde::to_string(&team_patch("add", 0)).unwrap(),
-        )
-        .unwrap();
-        let mut response = team_patch_receipt("add", 0);
+        let mut response = team_offboard(Some("om_one"), "removed", "complete", 2);
         *response.pointer_mut(pointer).unwrap() = value;
         let api = lifecycle_fixture(vec![IntentReply::json(200, response)]);
         let output = organization_cli(temp.path(), &api.origin)
             .args([
                 "members",
-                "apply",
-                "member.yaml",
+                "offboard",
+                "user_one",
+                "--expected-membership",
+                "om_one",
                 "--idempotency-key",
                 "member-key",
                 "--json",
@@ -3985,13 +3946,26 @@ fn managed_organization_refuses_foreign_malformed_and_uncertain_results_without_
         ("/data/members/0/name", serde_json::json!("bad\u{1b}[2J")),
         (
             "/data/members/1/principal_id",
-            serde_json::json!("principal-two"),
+            serde_json::json!("principal-one"),
         ),
         (
             "/data/members/0/membership_status",
             serde_json::json!("unknown"),
         ),
         ("/data/members/1/user_id", serde_json::json!("user_one")),
+        ("/data/members/1/membership_id", serde_json::json!("om_one")),
+        (
+            "/data/members/1/service_permissions",
+            serde_json::json!(["status"]),
+        ),
+        (
+            "/data/members/0/service_permissions",
+            serde_json::json!(["status", "status"]),
+        ),
+        (
+            "/data/provider_expires_at",
+            serde_json::json!("2026-10-26T10:01:00Z"),
+        ),
     ] {
         let temp = tempdir().unwrap();
         let mut response = organization_members();
@@ -4054,15 +4028,579 @@ fn managed_organization_requires_an_account_target_and_write_keys() {
     let missing = output_failure(cli().args(["organization", "members", "list"]));
     assert!(String::from_utf8_lossy(&missing.stderr).contains("profile_required"));
     for arguments in [
+        vec!["members", "set", "member@example.com", "--role", "writer"],
         vec!["invitations", "send", "member@example.com"],
         vec!["invitations", "resend", "inv_one"],
         vec!["invitations", "revoke", "inv_one"],
-        vec!["members", "offboard", "user_one", "--expected-version", "1"],
+        vec![
+            "members",
+            "offboard",
+            "user_one",
+            "--expected-membership",
+            "om_one",
+        ],
     ] {
         let output = output_failure(organization_cli(temp.path(), &api.origin).args(arguments));
         assert!(String::from_utf8_lossy(&output.stderr).contains("--idempotency-key"));
     }
     assert!(api.requests().is_empty());
+}
+
+fn team_role_result(outcome: &str) -> Value {
+    serde_json::json!({"data":{"organization_id":"account-one","user_id":"user_one","membership_id":"om_one","previous_roles":["member"],"requested_role":"writer","role_update":outcome,"roles":[if outcome == "updated" {"writer"} else {"member"}],"service_permissions":["source_read","status"],"provider_observed_at":"2026-10-27T10:00:00Z","graph_policy_changed":false},"meta":{}})
+}
+
+fn organization_record(root: &std::path::Path) -> std::path::PathBuf {
+    let entries = fs::read_dir(managed_home(root).join("organization"))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    entries[0].path().join("requests.json")
+}
+
+#[test]
+fn managed_organization_resolves_members_once_and_retains_exact_role_and_offboard_requests() {
+    for action in ["set", "offboard"] {
+        for selector in ["AVERY@example.com", "user_one"] {
+            let temp = tempdir().unwrap();
+            let receipt = if action == "set" {
+                team_role_result("updated")
+            } else {
+                team_offboard(Some("om_one"), "removed", "complete", 2)
+            };
+            let api = lifecycle_fixture(vec![
+                IntentReply::json(200, organization_members()),
+                IntentReply::json(200, receipt.clone()),
+                IntentReply::json(200, receipt.clone()),
+            ]);
+            let mut arguments = vec![
+                "members",
+                action,
+                selector,
+                "--idempotency-key",
+                "member-key",
+                "--json",
+            ];
+            if action == "set" {
+                arguments.extend(["--role", "writer"]);
+            }
+            for _ in 0..2 {
+                let output =
+                    output_success(organization_cli(temp.path(), &api.origin).args(&arguments));
+                assert_eq!(parse_stdout_json(&output), receipt);
+            }
+            let requests = api.workflow_requests();
+            assert_eq!(requests.len(), 3);
+            assert_eq!(requests[0].method, "GET");
+            assert_eq!(requests[1].method, "POST");
+            assert_eq!(requests[1].path, requests[2].path);
+            assert_eq!(requests[1].body, requests[2].body);
+            assert_eq!(requests[1].body["user_id"], "user_one");
+            assert_eq!(requests[1].body["expected_membership_id"], "om_one");
+            let records: Value =
+                serde_json::from_slice(&fs::read(organization_record(temp.path())).unwrap())
+                    .unwrap();
+            assert_eq!(records.as_array().unwrap().len(), 1);
+            assert_eq!(records[0]["request"]["body"], requests[1].body);
+            assert_eq!(records[0]["operation"]["selector"], selector);
+            let changed = output_failure(organization_cli(temp.path(), &api.origin).args([
+                "members",
+                "set",
+                selector,
+                "--role",
+                "admin",
+                "--idempotency-key",
+                "member-key",
+                "--json",
+            ]));
+            assert_eq!(
+                parse_stdout_json(&changed)["type"],
+                "organization_request_conflict"
+            );
+            assert_eq!(api.workflow_requests().len(), 3);
+            assert_no_core_effects(temp.path());
+            api.assert_complete();
+        }
+    }
+}
+
+#[test]
+fn managed_organization_resolves_invitation_email_across_pages_once() {
+    for action in ["resend", "revoke"] {
+        let temp = tempdir().unwrap();
+        let receipt = serde_json::json!({"data":{"organization_id":"account-one","action":action,"invitation":team_invitation(if action == "revoke" { "revoked" } else { "pending" })},"meta":{}});
+        let api = lifecycle_fixture(vec![
+            IntentReply::json(
+                200,
+                serde_json::json!({"data":{"organization_id":"account-one","invitations":[],"after":"next"},"meta":{}}),
+            ),
+            IntentReply::json(
+                200,
+                serde_json::json!({"data":{"organization_id":"account-one","invitations":[team_invitation("pending")],"after":null},"meta":{}}),
+            ),
+            IntentReply::json(200, receipt.clone()),
+            IntentReply::json(200, receipt.clone()),
+        ]);
+        for _ in 0..2 {
+            let output = output_success(organization_cli(temp.path(), &api.origin).args([
+                "invitations",
+                action,
+                "AVERY@example.com",
+                "--idempotency-key",
+                "invite-key",
+                "--json",
+            ]));
+            assert_eq!(parse_stdout_json(&output), receipt);
+        }
+        let requests = api.workflow_requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[1].path, "/v1/organization/invitations?after=next");
+        assert_eq!(
+            requests[2].path,
+            format!("/v1/organization/invitations/inv_one:{action}")
+        );
+        assert_eq!(requests[2].path, requests[3].path);
+        api.assert_complete();
+    }
+}
+
+#[test]
+fn managed_organization_refuses_missing_ambiguous_inactive_and_mismatched_members() {
+    for case in ["missing", "ambiguous", "inactive", "assertion"] {
+        let temp = tempdir().unwrap();
+        let mut directory = organization_members();
+        match case {
+            "missing" => directory["data"]["members"] = serde_json::json!([]),
+            "ambiguous" => {
+                directory["data"]["members"][1]["email"] = serde_json::json!("AVERY@example.com")
+            }
+            "inactive" => {
+                directory["data"]["members"][0]["membership_status"] =
+                    serde_json::json!("inactive");
+                directory["data"]["members"][0]["service_permissions"] = serde_json::json!([]);
+            }
+            _ => (),
+        }
+        let api = lifecycle_fixture(vec![IntentReply::json(200, directory)]);
+        let mut command = organization_cli(temp.path(), &api.origin);
+        if case == "assertion" {
+            command.args([
+                "members",
+                "offboard",
+                "avery@example.com",
+                "--expected-membership",
+                "om_replaced",
+            ]);
+        } else {
+            command.args(["members", "set", "avery@example.com", "--role", "writer"]);
+        }
+        let output = output_failure(command.args(["--idempotency-key", "member-key", "--json"]));
+        assert_eq!(output.status.code(), Some(2), "{case}: {output:?}");
+        assert_eq!(api.workflow_requests().len(), 1);
+        assert!(!organization_record(temp.path()).exists());
+        api.assert_complete();
+    }
+}
+
+#[test]
+fn managed_organization_refuses_incomplete_or_ambiguous_invitation_scans() {
+    for case in [
+        "missing",
+        "ambiguous",
+        "cursor-loop",
+        "too-many-pages",
+        "oversized-page",
+        "duplicate-id",
+    ] {
+        let temp = tempdir().unwrap();
+        let page = |invitations: Vec<Value>, after: Option<&str>| {
+            IntentReply::json(
+                200,
+                serde_json::json!({"data":{"organization_id":"account-one","invitations":invitations,"after":after},"meta":{}}),
+            )
+        };
+        let pending = team_invitation("pending");
+        let mut other = pending.clone();
+        other["id"] = serde_json::json!("inv_other");
+        let replies = match case {
+            "missing" => vec![page(vec![team_invitation("accepted")], None)],
+            "ambiguous" => vec![
+                page(vec![pending.clone()], Some("next")),
+                page(vec![other], None),
+            ],
+            "cursor-loop" => vec![page(vec![], Some("next")), page(vec![], Some("next"))],
+            "too-many-pages" => (0..10)
+                .map(|n| page(vec![], Some(&format!("cursor{n}"))))
+                .collect(),
+            "oversized-page" => vec![page(vec![pending.clone(); 101], None)],
+            "duplicate-id" => vec![
+                page(vec![pending.clone()], Some("next")),
+                page(vec![pending], None),
+            ],
+            _ => unreachable!(),
+        };
+        let count = replies.len();
+        let api = lifecycle_fixture(replies);
+        let output = output_failure(organization_cli(temp.path(), &api.origin).args([
+            "invitations",
+            "revoke",
+            "avery@example.com",
+            "--idempotency-key",
+            "invite-key",
+            "--json",
+        ]));
+        assert!(
+            !parse_stdout_json(&output)["type"].is_null(),
+            "{case}: {output:?}"
+        );
+        assert_eq!(api.workflow_requests().len(), count);
+        assert!(
+            api.workflow_requests()
+                .iter()
+                .all(|request| request.method == "GET")
+        );
+        assert!(!organization_record(temp.path()).exists());
+        api.assert_complete();
+    }
+}
+
+#[test]
+fn managed_organization_preserves_uncertain_requests_and_validates_role_receipts() {
+    for outcome in ["updated", "uncertain"] {
+        let temp = tempdir().unwrap();
+        let receipt = team_role_result(outcome);
+        let api = lifecycle_fixture(vec![
+            IntentReply::json(200, organization_members()),
+            IntentReply::json(200, receipt.clone()),
+        ]);
+        let output = organization_cli(temp.path(), &api.origin)
+            .args([
+                "members",
+                "set",
+                "avery@example.com",
+                "--role",
+                "writer",
+                "--idempotency-key",
+                "role-key",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if outcome == "updated" { 0 } else { 3 })
+        );
+        assert_eq!(parse_stdout_json(&output), receipt);
+        assert!(organization_record(temp.path()).exists());
+        api.assert_complete();
+    }
+    for (pointer, value) in [
+        ("/data/user_id", serde_json::json!("user_other")),
+        ("/data/membership_id", serde_json::json!("om_other")),
+        ("/data/requested_role", serde_json::json!("admin")),
+        ("/data/role_update", serde_json::json!("unsupported")),
+        ("/data/roles", serde_json::json!(["admin"])),
+        ("/data/previous_roles", serde_json::json!([])),
+        ("/data/graph_policy_changed", serde_json::json!(true)),
+        ("/data/provider_observed_at", serde_json::json!("invalid")),
+    ] {
+        let temp = tempdir().unwrap();
+        let mut receipt = team_role_result("updated");
+        *receipt.pointer_mut(pointer).unwrap() = value;
+        let api = lifecycle_fixture(vec![
+            IntentReply::json(200, organization_members()),
+            IntentReply::json(200, receipt),
+        ]);
+        let output = output_failure(organization_cli(temp.path(), &api.origin).args([
+            "members",
+            "set",
+            "avery@example.com",
+            "--role",
+            "writer",
+            "--idempotency-key",
+            "role-key",
+            "--json",
+        ]));
+        assert_eq!(parse_stdout_json(&output)["type"], "api_response_invalid");
+        assert_eq!(api.workflow_requests().len(), 2);
+        assert!(organization_record(temp.path()).exists());
+        api.assert_complete();
+    }
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(200, organization_members()),
+        IntentReply {
+            status: 200,
+            headers: vec![],
+            body: b"{\"data\":".to_vec(),
+        },
+        IntentReply::json(200, team_role_result("updated")),
+    ]);
+    let arguments = [
+        "members",
+        "set",
+        "avery@example.com",
+        "--role",
+        "writer",
+        "--idempotency-key",
+        "role-key",
+        "--json",
+    ];
+    output_failure(organization_cli(temp.path(), &api.origin).args(arguments));
+    output_success(organization_cli(temp.path(), &api.origin).args(arguments));
+    assert_eq!(api.workflow_requests().len(), 3);
+    assert_eq!(
+        api.workflow_requests()[1].body,
+        api.workflow_requests()[2].body
+    );
+    api.assert_complete();
+}
+
+#[test]
+fn managed_organization_custody_refuses_capacity_corruption_and_rebinding_without_effects() {
+    for case in [
+        "full",
+        "corrupt",
+        "oversized",
+        "principal",
+        "organization",
+        "api",
+        "request-path",
+    ] {
+        let temp = tempdir().unwrap();
+        let receipt = serde_json::json!({"data":{"organization_id":"account-one","action":"send","invitation":team_invitation("pending")},"meta":{}});
+        let mut replies = vec![IntentReply::json(200, receipt.clone())];
+        if case == "full" {
+            replies.push(IntentReply::json(200, receipt));
+        }
+        let api = lifecycle_fixture(replies);
+        let arguments = [
+            "invitations",
+            "send",
+            "avery@example.com",
+            "--idempotency-key",
+            "invite-key",
+            "--json",
+        ];
+        output_success(organization_cli(temp.path(), &api.origin).args(arguments));
+        let path = organization_record(temp.path());
+        let original = fs::read(&path).unwrap();
+        let mut records: Value = serde_json::from_slice(&original).unwrap();
+        let config_path = managed_home(temp.path()).join("config.yaml");
+        let original_config = fs::read_to_string(&config_path).unwrap();
+        let alternate = lifecycle_fixture(vec![]);
+        let mut selected_origin = api.origin.as_str();
+        match case {
+            "full" => {
+                let first = records[0].clone();
+                for index in 1..128 {
+                    let mut record = first.clone();
+                    record["idempotency_key"] = serde_json::json!(format!("saved-key-{index}"));
+                    records.as_array_mut().unwrap().push(record);
+                }
+                fs::write(&path, serde_json::to_vec(&records).unwrap()).unwrap();
+                output_success(organization_cli(temp.path(), &api.origin).args(arguments));
+            }
+            "corrupt" => fs::write(&path, b"{").unwrap(),
+            "oversized" => fs::write(&path, vec![b' '; 1024 * 1024 + 1]).unwrap(),
+            "principal" => api.set_session(lifecycle_session("principal-other", "account-one")),
+            "organization" => {
+                fs::write(
+                    &config_path,
+                    original_config.replace("account-one", "account-two"),
+                )
+                .unwrap();
+                api.set_session(lifecycle_session("principal-one", "account-two"));
+            }
+            "api" => {
+                fs::write(
+                    &config_path,
+                    original_config.replace(&api.origin, &alternate.origin),
+                )
+                .unwrap();
+                selected_origin = &alternate.origin;
+            }
+            "request-path" => {
+                records[0]["request"]["path"] = serde_json::json!("/v1/clusters");
+                fs::write(&path, serde_json::to_vec(&records).unwrap()).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = fs::read(&path).unwrap();
+        let mut retry = arguments;
+        if case == "full" {
+            retry[4] = "new-key";
+        }
+        let output = output_failure(organization_cli(temp.path(), selected_origin).args(retry));
+        let kind = parse_stdout_json(&output)["type"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let expected = match case {
+            "full" => "organization_custody_full",
+            "principal" | "organization" | "api" => "organization_request_conflict",
+            _ => "organization_record_failed",
+        };
+        assert_eq!(kind, expected, "{case}: {output:?}");
+        assert_eq!(
+            api.workflow_requests().len(),
+            if case == "full" { 2 } else { 1 }
+        );
+        assert!(alternate.workflow_requests().is_empty());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        api.assert_complete();
+        alternate.assert_complete();
+    }
+}
+
+#[test]
+fn managed_organization_profile_rename_preserves_retry_and_other_profiles_have_separate_custody() {
+    let temp = tempdir().unwrap();
+    let receipt = serde_json::json!({"data":{"organization_id":"account-one","action":"send","invitation":team_invitation("pending")},"meta":{}});
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(200, receipt.clone()),
+        IntentReply::json(200, receipt.clone()),
+        IntentReply::json(200, receipt),
+    ]);
+    let arguments = [
+        "organization",
+        "invitations",
+        "send",
+        "avery@example.com",
+        "--idempotency-key",
+        "invite-key",
+        "--json",
+    ];
+    output_success(
+        managed_fixture_command(temp.path(), &api.origin, "managed-account").args(arguments),
+    );
+    let record = organization_record(temp.path());
+    output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", managed_home(temp.path()))
+            .args(["config", "rename-profile", "managed-account", "renamed"]),
+    );
+    let run = |profile: &str| {
+        let mut command = cli();
+        command
+            .env("OMNIGRAPH_HOME", managed_home(temp.path()))
+            .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+            .env("OMNIGRAPH_CONTROL_API", &api.origin)
+            .args(["--profile", profile])
+            .args(arguments);
+        command
+    };
+    output_success(&mut run("renamed"));
+    assert!(record.exists());
+    api.set_session(lifecycle_session("principal-other", "account-one"));
+    let config_path = managed_home(temp.path()).join("config.yaml");
+    let mut config: serde_json::Value =
+        yaml_serde::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["profiles"]["other"] = config["profiles"]["renamed"].clone();
+    fs::write(&config_path, yaml_serde::to_string(&config).unwrap()).unwrap();
+    output_success(&mut run("other"));
+    assert_eq!(
+        fs::read_dir(managed_home(temp.path()).join("organization"))
+            .unwrap()
+            .count(),
+        2
+    );
+    assert_eq!(api.workflow_requests().len(), 3);
+    api.assert_complete();
+}
+
+#[test]
+#[cfg(unix)]
+fn managed_organization_refuses_symlink_custody_before_selector_reads() {
+    use std::os::unix::fs::symlink;
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![]);
+    write_managed_target(temp.path(), &api.origin);
+    let outside = tempdir().unwrap();
+    symlink(
+        outside.path(),
+        managed_home(temp.path()).join("organization"),
+    )
+    .unwrap();
+    let output = output_failure(organization_cli(temp.path(), &api.origin).args([
+        "members",
+        "set",
+        "avery@example.com",
+        "--role",
+        "writer",
+        "--idempotency-key",
+        "role-key",
+        "--json",
+    ]));
+    assert_eq!(
+        parse_stdout_json(&output)["type"],
+        "organization_record_failed"
+    );
+    assert!(api.workflow_requests().is_empty());
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    api.assert_complete();
+}
+
+#[test]
+#[cfg(unix)]
+fn managed_organization_keeps_exact_custody_when_stdout_is_closed_and_lock_is_busy() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+    let temp = tempdir().unwrap();
+    let receipt = serde_json::json!({"data":{"organization_id":"account-one","action":"send","invitation":team_invitation("pending")},"meta":{}});
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(200, receipt.clone()),
+        IntentReply::json(200, receipt),
+    ]);
+    let arguments = [
+        "invitations",
+        "send",
+        "avery@example.com",
+        "--idempotency-key",
+        "invite-key",
+        "--json",
+    ];
+    let (reader, writer) = UnixStream::pair().unwrap();
+    drop(reader);
+    let writer: OwnedFd = writer.into();
+    write_managed_target(temp.path(), &api.origin);
+    let mut command = cli_process();
+    command
+        .env("OMNIGRAPH_HOME", managed_home(temp.path()))
+        .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+        .env("OMNIGRAPH_CONTROL_API", &api.origin)
+        .args(["--profile", "managed-account", "organization"])
+        .args(arguments)
+        .stdout(Stdio::from(writer));
+    let output = command.output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invite-key"));
+    let path = organization_record(temp.path());
+    let original = fs::read(&path).unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path.with_file_name("requests.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let output = output_failure(organization_cli(temp.path(), &api.origin).args(arguments));
+    assert_eq!(
+        parse_stdout_json(&output)["type"],
+        "organization_submission_busy"
+    );
+    assert_eq!(api.workflow_requests().len(), 1);
+    assert_eq!(fs::read(&path).unwrap(), original);
+    drop(lock);
+    output_success(organization_cli(temp.path(), &api.origin).args(arguments));
+    assert_eq!(api.workflow_requests().len(), 2);
+    assert_eq!(
+        api.workflow_requests()[0].body,
+        api.workflow_requests()[1].body
+    );
+    assert_eq!(fs::read(&path).unwrap(), original);
+    api.assert_complete();
 }
 
 #[test]

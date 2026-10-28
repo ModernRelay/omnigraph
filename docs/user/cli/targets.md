@@ -106,8 +106,9 @@ Each profile or server target chooses one provider:
 | Managed OAuth client credentials | `{provider: oauth_client_credentials, token_endpoint: https://auth.example.com/oauth2/token, client_id: client_example, client_secret: {env: OG_CLIENT_SECRET}}` |
 | Explicit anonymous server | `{provider: anonymous}` |
 
-`omnigraph` and `oauth_client_credentials` are managed-only; `anonymous` is standalone-only. Names grant no privileges,
-and token/exec sources do not qualify arbitrary workload federation.
+`omnigraph` and `oauth_client_credentials` are managed-only; `anonymous` is
+standalone-only. Names grant no privileges, and token/exec sources do not qualify
+arbitrary workload federation.
 
 Token profiles declare exactly one source. `store` uses secure local custody;
 `env` reads only the named variable; `file` reads one bounded regular-file
@@ -127,15 +128,16 @@ with `version: 1`, `credential: {type: bearer, token: ...}` and optional RFC 333
 `expires_at`. Unknown fields, expired results and unsupported types refuse.
 Expiry is checked again immediately before an authenticated request is sent,
 including after discovery. A renewable provider can be acquired once again
-before submission; the CLI does not replay a mutation to refresh credentials. Managed control and
-data credentials retain their independent expiry times.
+before submission; the CLI does not replay a mutation to refresh credentials.
+Managed control and data credentials retain their independent expiry times.
 Without expiry the result is not cached across invocations. Timeout terminates
 the helper process group; stderr is not echoed in routine errors.
 Output cannot change routing or prove identity. Helpers inherit the process
 environment and are trusted programs, not sandboxed plugins. Inspection and
 validation never execute them.
 
-Exec requires Unix process-group support; other platforms refuse it.
+The exec adapter currently requires Unix process-group support; other platforms
+refuse it rather than launch a helper without bounded cancellation.
 
 Never put tokens, refresh tokens or private keys in YAML. Persistent login fails
 if secure custody is unavailable; there is no plaintext fallback. Resource
@@ -147,7 +149,8 @@ operations independently of credential acquisition.
 For managed resource commands and managed-target credential export, env/file/exec/OAuth
 profiles keep exchanged credentials only in invocation memory, without requiring
 an OS store. This is explicit source-based custody, not a store-failure fallback.
-Human profiles, stored tokens and existing providers' explicit `cluster token` administration retain secure-store requirements.
+Human profiles, stored tokens and existing providers' explicit `cluster token`
+administration retain secure-store requirements.
 OAuth profiles use invocation memory; see [workload setup](managed-team.md#configure-an-unattended-workload-profile).
 
 ## Login and registration
@@ -179,12 +182,12 @@ endpoint preserves the old pin and reports `endpoint_available: false`.
 Normal requests never adopt changed endpoints or follow redirects.
 
 `target list` shows each destination, its managed profile, and the default marker.
-`target list`, `target inspect NAME [--resolved]` and `config validate` are
-offline, with optional `--json`. `target add NAME` without `--cluster` reads a
-complete target JSON object from piped stdin (64 KiB limit); terminal or empty
-input produces setup guidance. Managed add uses `--profile` or `defaults.profile`.
-`target remove NAME` preserves credentials and journals; references must remain
-valid. Add/remove never switch defaults.
+`target list`, `target inspect NAME [--resolved]` and `config validate` are offline, with optional
+`--json`. `target inspect --json` also reports `home` and, for a server target, `binding`: the digests
+a [Studio link](studio.md#the-link) carries. `target add NAME` without `--cluster` reads a complete
+target JSON object from piped stdin (64 KiB limit); terminal or empty input produces setup guidance.
+Managed add uses `--profile` or `defaults.profile`. `target remove NAME` preserves credentials and
+journals; references must remain valid. Add/remove never switch defaults.
 Discovery-backed add and refresh contact the service. Resolved inspection expands
 the profile and provider; identity is unknown and transport availability is not checked.
 

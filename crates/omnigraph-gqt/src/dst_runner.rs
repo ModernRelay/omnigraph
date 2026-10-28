@@ -410,7 +410,7 @@ struct WorkerReport {
     observations: Vec<String>,
     evidence: Vec<serde_json::Value>,
     /// `--measure` bytes and request logs per step; outside the replay
-    /// comparison (`comparable`).
+    /// comparison (`comparable`, `replay_difference`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     measurements: Vec<serde_json::Value>,
 }
@@ -418,11 +418,8 @@ struct WorkerReport {
 /// The report minus its measurements: Lance stamps manifests with wall-clock
 /// time, so byte counts may differ between two runs of one seed while every
 /// request count stays equal.
-fn comparable(report: &WorkerReport) -> Result<Vec<u8>, String> {
-    if report.measurements.is_empty() {
-        return json(report);
-    }
-    json(&WorkerReport {
+fn comparable(report: &WorkerReport) -> WorkerReport {
+    WorkerReport {
         code: report.code.clone(),
         phase: report.phase.clone(),
         input_digest: report.input_digest.clone(),
@@ -430,7 +427,71 @@ fn comparable(report: &WorkerReport) -> Result<Vec<u8>, String> {
         observations: report.observations.clone(),
         evidence: report.evidence.clone(),
         measurements: Vec::new(),
-    })
+    }
+}
+
+/// The first compared field whose JSON text differs between two reports of one
+/// seed, for the `replay_mismatch` line: both values around their first differing
+/// char, for a list at the first differing index or as the two lengths.
+fn replay_difference(first: &WorkerReport, second: &WorkerReport) -> Option<String> {
+    const SHOWN_CHARS: usize = 240;
+    const LEAD_CHARS: usize = 40;
+    fn text<T: Serialize>(value: &T) -> String {
+        serde_json::to_string(value).unwrap_or_else(|error| error.to_string())
+    }
+    fn window(text: &str, start: usize) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        let mut end = (start + SHOWN_CHARS).min(chars.len());
+        if end < chars.len() && chars[end - 1] == '\\' {
+            end += 1;
+        }
+        let shown: String = chars[start..end].iter().collect();
+        let head = if start > 0 { "…" } else { "" };
+        if end < chars.len() {
+            format!("{head}{shown}… ({} chars)", chars.len())
+        } else {
+            format!("{head}{shown}")
+        }
+    }
+    fn side_by_side(first: &str, second: &str) -> String {
+        let shared = first
+            .chars()
+            .zip(second.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let start = shared.saturating_sub(LEAD_CHARS);
+        format!(
+            "run 0 {} | run 1 {}",
+            window(first, start),
+            window(second, start)
+        )
+    }
+    fn scalar<T: Serialize>(field: &str, first: &T, second: &T) -> Option<String> {
+        let (first, second) = (text(first), text(second));
+        (first != second).then(|| format!("{field} differs: {}", side_by_side(&first, &second)))
+    }
+    fn list<T: Serialize>(field: &str, first: &[T], second: &[T]) -> Option<String> {
+        let texts = first.iter().map(text).zip(second.iter().map(text));
+        if let Some((index, (a, b))) = texts.enumerate().find(|(_, (a, b))| a != b) {
+            return Some(format!(
+                "{field}[{index}] differs: {}",
+                side_by_side(&a, &b)
+            ));
+        }
+        (first.len() != second.len()).then(|| {
+            format!(
+                "{field} has {} entries in run 0 and {} in run 1; the shorter is a prefix of the longer",
+                first.len(),
+                second.len()
+            )
+        })
+    }
+    scalar("code", &first.code, &second.code)
+        .or_else(|| scalar("phase", &first.phase, &second.phase))
+        .or_else(|| scalar("input_digest", &first.input_digest, &second.input_digest))
+        .or_else(|| scalar("result", &first.result, &second.result))
+        .or_else(|| list("observations", &first.observations, &second.observations))
+        .or_else(|| list("evidence", &first.evidence, &second.evidence))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1728,7 +1789,7 @@ fn run_invocation(
                                 env
                             ));
                         }
-                        reports.push(comparable(report)?);
+                        reports.push(comparable(report));
                     }
                     Err(error) => {
                         failures.push(error.clone());
@@ -1747,13 +1808,12 @@ fn run_invocation(
                 });
             }
             if reports.len() == 2 {
-                if reports[0] != reports[1] {
-                    failures.push(format!(
-                        "replay_mismatch: {} seed={seed:?}; both reports retained",
+                match replay_difference(&reports[0], &reports[1]) {
+                    Some(difference) => failures.push(format!(
+                        "replay_mismatch: {} seed={seed:?}; {difference}; both reports retained",
                         env
-                    ));
-                } else {
-                    println!("DST environment={} seed={seed:?} replay matched", env);
+                    )),
+                    None => println!("DST environment={} seed={seed:?} replay matched", env),
                 }
             }
         }
@@ -2384,10 +2444,10 @@ fn replay_attempts(
                 return Err(failures.join("\n"));
             }
         };
-        if comparable(&report)? != comparable(prior)? {
+        if let Some(difference) = replay_difference(prior, &report) {
             failures.push(format!(
-                "replay_mismatch: {} seed={:?}",
-                attempt.environment, attempt.seed
+                "replay_mismatch: {} seed={:?}; {difference} (run 0 the recorded replay={} attempt, run 1 its rerun)",
+                attempt.environment, attempt.seed, attempt.replay
             ));
         }
         if let Err(error) = &report.result {
@@ -2672,8 +2732,8 @@ mod action_tests {
             .unwrap()
         }
 
-        let expected = super::comparable(&report(&[0, 2, 1, 3], "alice").await).unwrap();
-        let interleaved = super::comparable(&report(&[2, 0, 3, 1], "alice").await).unwrap();
+        let expected = super::comparable(&report(&[0, 2, 1, 3], "alice").await);
+        let interleaved = super::comparable(&report(&[2, 0, 3, 1], "alice").await);
         assert!(
             expected == interleaved,
             "session completion order must not change replay evidence"
@@ -2685,7 +2745,7 @@ mod action_tests {
         ] {
             assert_ne!(
                 expected,
-                super::comparable(&report(order, row).await).unwrap(),
+                super::comparable(&report(order, row).await),
                 "per-session order, completeness and rows remain replay evidence"
             );
         }
@@ -2715,11 +2775,11 @@ mod action_tests {
             log: Vec::new(),
             wall_ms: 5,
         };
-        let expected = super::comparable(&report(&sessions, &block).await).unwrap();
+        let expected = super::comparable(&report(&sessions, &block).await);
         block.unattributed = 3;
         block.wall_ms = 9;
         block.log.push(serde_json::json!({"wall_ms": 7}));
-        let measured = super::comparable(&report(&sessions, &block).await).unwrap();
+        let measured = super::comparable(&report(&sessions, &block).await);
         assert!(
             expected == measured,
             "background I/O and timing measurements must not change replay equality"
@@ -2728,20 +2788,235 @@ mod action_tests {
         block.stuck_at = Some(0);
         assert_ne!(
             expected,
-            super::comparable(&report(&sessions, &block).await).unwrap()
+            super::comparable(&report(&sessions, &block).await)
         );
         block.stuck_at = None;
         block.failure = Some("session starved".into());
         assert_ne!(
             expected,
-            super::comparable(&report(&sessions, &block).await).unwrap()
+            super::comparable(&report(&sessions, &block).await)
         );
         block.failure = None;
         sessions[0]["outcome"] = "failed".into();
         sessions[0]["message"] = "query failed".into();
         assert_ne!(
             expected,
-            super::comparable(&report(&sessions, &block).await).unwrap()
+            super::comparable(&report(&sessions, &block).await)
+        );
+    }
+
+    fn compared(
+        result: Result<(), String>,
+        observations: &[&str],
+        evidence: &[serde_json::Value],
+    ) -> super::WorkerReport {
+        super::WorkerReport {
+            code: "ok".into(),
+            phase: "run".into(),
+            input_digest: "digest".into(),
+            result,
+            observations: observations.iter().map(|text| text.to_string()).collect(),
+            evidence: evidence.to_vec(),
+            measurements: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn replay_difference_names_the_first_differing_field_and_entry() {
+        let steps = [
+            serde_json::json!({"step": 1}),
+            serde_json::json!({"step": 2}),
+        ];
+        let base = compared(Ok(()), &["a", "b"], &steps);
+        assert_eq!(super::replay_difference(&base, &base), None);
+
+        let mut measured = compared(Ok(()), &["a", "b"], &steps);
+        measured.measurements.push(serde_json::json!({"bytes": 7}));
+        assert_eq!(super::replay_difference(&base, &measured), None);
+
+        let changed = [
+            serde_json::json!({"step": 1}),
+            serde_json::json!({"step": 9}),
+        ];
+        let failed = compared(Err("rows differ".into()), &["a", "b"], &changed);
+        assert_eq!(
+            super::replay_difference(&base, &failed).as_deref(),
+            Some(r#"result differs: run 0 {"Ok":null} | run 1 {"Err":"rows differ"}"#),
+            "a scalar field is named before a later list difference"
+        );
+
+        let entry = compared(Ok(()), &["a", "b"], &changed);
+        assert_eq!(
+            super::replay_difference(&base, &entry).as_deref(),
+            Some(r#"evidence[1] differs: run 0 {"step":2} | run 1 {"step":9}"#)
+        );
+
+        let longer = compared(Ok(()), &["a", "b", "c"], &steps);
+        assert_eq!(
+            super::replay_difference(&base, &longer).as_deref(),
+            Some(
+                "observations has 2 entries in run 0 and 3 in run 1; the shorter is a prefix of the longer"
+            )
+        );
+        assert_eq!(
+            super::replay_difference(&longer, &base).as_deref(),
+            Some(
+                "observations has 3 entries in run 0 and 2 in run 1; the shorter is a prefix of the longer"
+            )
+        );
+        let none = compared(Ok(()), &[], &[]);
+        assert_eq!(
+            super::replay_difference(&none, &compared(Ok(()), &[], &steps[..1])).as_deref(),
+            Some(
+                "evidence has 0 entries in run 0 and 1 in run 1; the shorter is a prefix of the longer"
+            )
+        );
+        assert_eq!(
+            super::replay_difference(&base, &compared(Ok(()), &["b", "a"], &steps)).as_deref(),
+            Some(r#"observations[0] differs: run 0 "a" | run 1 "b""#)
+        );
+
+        let mut other = compared(Err("e".into()), &["b"], &[]);
+        other.code = "worker_failed".into();
+        other.phase = "setup".into();
+        other.input_digest = "other".into();
+        assert_eq!(
+            super::replay_difference(&base, &other).as_deref(),
+            Some(r#"code differs: run 0 "ok" | run 1 "worker_failed""#)
+        );
+        other.code = "ok".into();
+        assert_eq!(
+            super::replay_difference(&base, &other).as_deref(),
+            Some(r#"phase differs: run 0 "run" | run 1 "setup""#)
+        );
+        other.phase = "run".into();
+        assert_eq!(
+            super::replay_difference(&base, &other).as_deref(),
+            Some(r#"input_digest differs: run 0 "digest" | run 1 "other""#)
+        );
+    }
+
+    #[test]
+    fn replay_difference_agrees_with_the_serialized_report_comparison() {
+        let base = compared(Ok(()), &["a"], &[serde_json::json!({"k": "v", "x": 0.0})]);
+        let mut only_measured =
+            compared(Ok(()), &["a"], &[serde_json::json!({"k": "v", "x": 0.0})]);
+        only_measured
+            .measurements
+            .push(serde_json::json!({"bytes": 7}));
+        let negative_zero: serde_json::Value =
+            serde_json::from_str(r#"{"k":"v","x":-0.0}"#).unwrap();
+        let reordered: serde_json::Value = serde_json::from_str(r#"{"x":0.0,"k":"v"}"#).unwrap();
+        let variants = [
+            compared(Ok(()), &["a"], &[serde_json::json!({"k": "v", "x": 0.0})]),
+            only_measured,
+            compared(
+                Err("e".into()),
+                &["a"],
+                &[serde_json::json!({"k": "v", "x": 0.0})],
+            ),
+            compared(Ok(()), &["b"], &[serde_json::json!({"k": "v", "x": 0.0})]),
+            compared(Ok(()), &["a"], &[]),
+            compared(Ok(()), &["a"], &[negative_zero]),
+            compared(Ok(()), &["a"], &[reordered]),
+            compared(Ok(()), &["a"], &[serde_json::json!({"k": "v", "x": 0})]),
+        ];
+        let bytes = |report: &super::WorkerReport| super::json(&super::comparable(report)).unwrap();
+        for variant in &variants {
+            let differs = bytes(&base) != bytes(variant);
+            assert_eq!(
+                super::replay_difference(&base, variant).is_some(),
+                differs,
+                "{variant:?}"
+            );
+            assert_eq!(
+                super::replay_difference(variant, &base).is_some(),
+                differs,
+                "{variant:?}"
+            );
+        }
+        assert_eq!(
+            super::replay_difference(&base, &variants[5]).as_deref(),
+            Some(r#"evidence[0] differs: run 0 {"k":"v","x":0.0} | run 1 {"k":"v","x":-0.0}"#)
+        );
+        assert_eq!(
+            super::replay_difference(&base, &variants[6]).as_deref(),
+            Some(r#"evidence[0] differs: run 0 {"k":"v","x":0.0} | run 1 {"x":0.0,"k":"v"}"#)
+        );
+    }
+
+    #[test]
+    fn replay_difference_windows_each_rendered_value() {
+        let long = compared(
+            Ok(()),
+            &[],
+            &[serde_json::json!({"text": "é".repeat(1_000)})],
+        );
+        let short = compared(Ok(()), &[], &[serde_json::json!({"text": "short"})]);
+        let line = super::replay_difference(&long, &short).unwrap();
+        assert!(
+            line.starts_with(r#"evidence[0] differs: run 0 {"text":"éééé"#),
+            "{line}"
+        );
+        assert!(line.contains("… (1011 chars) | run 1 "), "{line}");
+        assert!(line.ends_with(r#"| run 1 {"text":"short"}"#), "{line}");
+        assert!(line.chars().count() < 320, "{line}");
+
+        let whole = "x".repeat(238);
+        let line = super::replay_difference(
+            &compared(Ok(()), &[&whole], &[]),
+            &compared(Ok(()), &["y"], &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            line,
+            format!(r#"observations[0] differs: run 0 "{whole}" | run 1 "y""#)
+        );
+        let cut = "x".repeat(239);
+        let line = super::replay_difference(
+            &compared(Ok(()), &[&cut], &[]),
+            &compared(Ok(()), &["y"], &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            line,
+            format!(r#"observations[0] differs: run 0 "{cut}… (241 chars) | run 1 "y""#)
+        );
+
+        let prefix = "a".repeat(300);
+        let line = super::replay_difference(
+            &compared(
+                Ok(()),
+                &[],
+                &[serde_json::json!({"rows": format!("{prefix}1")})],
+            ),
+            &compared(
+                Ok(()),
+                &[],
+                &[serde_json::json!({"rows": format!("{prefix}2")})],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            line,
+            format!(
+                r#"evidence[0] differs: run 0 …{0}1"}} | run 1 …{0}2"}}"#,
+                "a".repeat(40)
+            )
+        );
+
+        let escaped = format!("{}\"", "x".repeat(238));
+        let line = super::replay_difference(
+            &compared(Ok(()), &[&escaped], &[]),
+            &compared(Ok(()), &["y"], &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            line,
+            format!(
+                r#"observations[0] differs: run 0 "{}\"… (242 chars) | run 1 "y""#,
+                "x".repeat(238)
+            )
         );
     }
 

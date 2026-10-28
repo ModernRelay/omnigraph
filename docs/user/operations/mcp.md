@@ -41,6 +41,8 @@ After upgrading the server, reconnect clients and refresh cached tool schemas
 with `tools/list`. The `access` tool now returns `actor_id` instead of `actor`;
 clients with fixed response types must update those types before reconnecting.
 Its output matches the [HTTP access report](policy.md#learn-your-access).
+`queries` now lists stored mutations too, marked `mutation: true`, and
+`mutate` no longer requires `query`.
 
 MCP does not use the `Omnigraph-Http-Api` header, so an old MCP client is not
 automatically refused.
@@ -56,10 +58,19 @@ With OIDC, the challenge names the protected-resource metadata:
 WWW-Authenticate: Bearer resource_metadata="https://graphs.example.com/.well-known/oauth-protected-resource/mcp"
 ```
 
-When a bearer credential was presented and refused (expired, wrong audience,
-unknown subject), the challenge also carries `error="invalid_token"`, which tells
-a client to refresh or sign in again. Without OIDC the challenge is `Bearer`,
-which advertises no sign-in flow.
+When a bearer credential was presented and refused (bad signature, expired,
+wrong audience or organization), the challenge also carries
+`error="invalid_token"`, which tells a client to refresh or sign in again.
+Without OIDC the challenge is `Bearer`, which advertises no sign-in flow.
+
+Two refusals of a valid token carry no challenge, because signing in again
+issues a token for the same person and cannot help:
+
+- the admission file names no principal for the token's subject: 403
+  `not_admitted`. The server's operator must admit the identity;
+- the admission snapshot has expired, for example during a publisher outage:
+  503 `service_unavailable` with `Retry-After`. Access returns with the next
+  publication.
 
 The server has one resource identifier, so every route's challenge names the
 same metadata. RFC 9728 §3.3 has a client that followed a challenge require the
@@ -130,7 +141,7 @@ before running it again. It never sends a request again:
 
 | Failure | JSON-RPC error `data` |
 |---|---|
-| The server refused the request over HTTP (401, 412, 429, …) | `status` and the server's error body as `error`. A 401 also carries the server's `WWW-Authenticate` challenge, verbatim, as `www_authenticate` when it sends one |
+| The server refused the request over HTTP (401, 412, 429, …) | `status` and the server's error body as `error`. A 401 also carries the server's `WWW-Authenticate` challenge as `www_authenticate` when it sends one. Managed credentials reflected in error bodies or challenges are redacted |
 | Nothing was sent: the server could not be reached, or speaks another HTTP contract | `error.code` `service_unavailable`, or `api_contract_mismatch`, with `effects: none` |
 | The answer was lost, or took longer than 45 seconds | `outcome_unknown` with `effects: unknown` for a call to a tool that may write; otherwise `service_unavailable`, `deadline_exceeded` or `result_too_large` with `effects: none` |
 
@@ -149,6 +160,12 @@ message is never replayed. If an expiring credential runs out before a message
 is sent, including during discovery, the bridge renews it once before sending.
 If the replacement also expires, the message fails without being sent. Renewal
 never starts an interactive login.
+
+An expiring managed profile's `exec` credential is also renewed before later
+requests. The verified organization and principal must remain the same for the
+life of the bridge; a changed identity requires restarting it. Organization
+service permissions remain current provider facts. Managed error messages,
+including JSON-RPC tool errors, never expose a reflected resource credential.
 
 ## Settings
 
@@ -172,16 +189,20 @@ for a deployment whose policy was written with an LLM caller in mind.
 | `health` | none | `GET /healthz` | none |
 | `graphs` | none | `GET /graphs/discovery` for an identity credential; otherwise `GET /graphs`, narrowed to ids and names | identity, or `graph_list` |
 | `schema` | `graph` | `GET /graphs/{graph_id}/schema` | `read` |
-| `queries` | `graph` | `GET /graphs/{graph_id}/queries`, stored mutations removed | `read` |
+| `queries` | `graph` | `GET /graphs/{graph_id}/queries` | `read` |
 | `query` | `graph`, `name`, optional `params`, `branch` | `POST /graphs/{graph_id}/queries/{query_name}` as a read | `invoke_query`, then `read` |
 | `read` (opt-in) | `graph`, `query`, optional `name`, `params`, `branch`, `snapshot` | `POST /graphs/{graph_id}/query` | `read`; `change` for `explain load csv` |
 | `snapshot` | `graph`, optional `branch` | `GET /graphs/{graph_id}/snapshot` | `read` |
 | `access` | `graph`, optional `branch`, `target_branch` | `GET /graphs/{graph_id}/access` | none |
 | `branches_list` | `graph` | `GET /graphs/{graph_id}/branches` | `read` |
-| `commits_list` | `graph`, optional `branch`, `limit`, `page_token` | `GET /graphs/{graph_id}/commits` | `read` |
+| `branches_diff` | `graph`, `source`, optional `target`, `kind`, `type`, `op`, `page_token`, `limit` | `GET /graphs/{graph_id}/branches/diff` | `read` on both branches |
+| `branches_merge_base` | `graph`, `source`, optional `target` | `GET /graphs/{graph_id}/branches/merge-base` | `read` on both branches |
+| `commits_list` | `graph`, optional `branch`, `listing`, `limit`, `page_token` | `GET /graphs/{graph_id}/commits` | `read` |
 | `commits_get` | `graph`, `commit_id` | `GET /graphs/{graph_id}/commits/{commit_id}` | `read` |
 | `commits_changes` | `graph`, `commit_id`, optional `kind`, `type`, `op`, `page_token`, `limit` | `GET /graphs/{graph_id}/commits/{commit_id}/changes` | `read` |
+| `diff` | `graph`, `from`, `to`, optional `kind`, `type`, `op`, `page_token`, `limit` | `GET /graphs/{graph_id}/diff` | `read` on the branch each side resolves to |
 | `changes_poll` | `graph`, optional `branch`, `cursor`, `start`, `kind`, `type`, `op`, `page_token`, `limit` | `GET /graphs/{graph_id}/changes` | `read` |
+| `blobs_stat` | `graph`, `entity`, `type`, `id`, `property`, optional `branch`, `snapshot` | `HEAD /graphs/{graph_id}/blob` | `read` |
 
 `graph_list` is a server-scoped action, and a server without an applied cluster
 policy denies every server-scoped action. So with a static or other non-identity
@@ -192,9 +213,22 @@ The server's `initialize` instructions tell a model to call `graphs`, then
 `schema`, then a stored read with `query` or, when enabled, its own GQ read with
 `read`.
 
-- `queries` lists each stored read with its typed parameters (`name`, `kind`,
-  `nullable`, plus `item_kind` for lists and `vector_dim` for vectors).
+- `queries` lists every stored query with its typed parameters (`name`,
+  `kind`, `nullable`, plus `item_kind` for lists and `vector_dim` for
+  vectors). An entry with `mutation: true` is a stored mutation, which
+  `mutate` runs when write tools are enabled.
 - `query` refuses stored mutations.
+- `commits_list` takes `listing`: `history` (the default), `unpublished` for
+  proposals written `as commit` that await `commits_publish`, or `unattached`
+  for snapshots written `as unattached branch`. Only `history` pages.
+- `diff`, `branches_diff` and `commits_changes` page as their routes do:
+  continue with the returned `next_page_token` as `page_token`, keeping the
+  other arguments. A `diff` side the caller cannot read answers the 404 of a
+  side that names nothing.
+- `blobs_stat` answers what `HEAD /blob` answers in its headers, as the body
+  `omnigraph blob stat --json` prints: the `selector`, `kind` (`managed`, with
+  `size` and `etag`, or `external`, with `uri`) and the resolved `target`. It
+  reads no payload byte. The route's conditional headers are not arguments.
 - `read` takes GQ source with typed parameter declarations, the same body as
   `POST /query`. It also answers `branch list`, `branch diff`,
   `branch merge-base`, `branch merge … dry run` and `explain query …`.
@@ -208,16 +242,30 @@ The server's `initialize` instructions tell a model to call `graphs`, then
 | Tool | Arguments | Runs | Policy action |
 |---|---|---|---|
 | `mutate` | `graph`, `query`, optional `name`, `params`, `branch`, `if_graph_commit` | `POST /graphs/{graph_id}/mutate`, or `/mutate/if-graph-commit` with `if_graph_commit` | `change`; a branch statement takes its branch action |
+| `mutate`, stored | `graph`, `name`, optional `params`, `branch`, `if_graph_commit` | `POST /graphs/{graph_id}/queries/{query_name}`, or `/queries/{query_name}/if-graph-commit` with `if_graph_commit` | `invoke_query`, then `change` |
 | `load` | `graph`, `mode`, `data`, optional `branch`, `from` | `POST /graphs/{graph_id}/load` | `change`, plus `branch_create` when `from` creates the branch |
-| `branches_create` | `graph`, `name`, optional `from` | `POST /graphs/{graph_id}/branches` | `branch_create` |
+| `blobs_clear` | `graph`, `entity`, `type`, `id`, `property`, optional `branch`, `if_match` | `DELETE /graphs/{graph_id}/blob` | `change` |
+| `branches_create` | `graph`, `name`, optional `from`, `from_commit` | `POST /graphs/{graph_id}/branches` | `branch_create` |
 | `branches_delete` | `graph`, `name` | `DELETE /graphs/{graph_id}/branches/{branch_name}` | `branch_delete` |
 | `branches_merge` | `graph`, `source`, optional `target` | `POST /graphs/{graph_id}/branches/merge` | `branch_merge` |
+| `commits_publish` | `graph`, `commit_id` | `POST /graphs/{graph_id}/commits/{commit_id}/publish` | `commit_publish` on the commit's recorded target |
+| `commits_drop` | `graph`, `commit_id` | `DELETE /graphs/{graph_id}/commits/{commit_id}` | `commit_drop` on the commit's recorded target |
+
+`mutate` runs a stored mutation when it is given `name` and no `query`, as
+`omnigraph mutate NAME` does; `query` still refuses one. `commits_publish` and
+`commits_drop` answer a commit whose control the policy denies with the 404 of
+an unknown id. `commits_drop` answers an empty object, since its route answers
+204 with no body. `blobs_clear` takes the route's `If-Match` value as
+`if_match`; a value that does not hold fails with 412 and
+`blob_precondition_failure`.
 
 Write tools follow one contract:
 
 - **Conditional writes.** Pass a read's `graph_commit_id` to `mutate` as
-  `if_graph_commit`. If the branch has moved, the call fails with 412 and nothing
-  is written.
+  `if_graph_commit`, for an ad-hoc or a stored mutation. If the branch has
+  moved, the call fails with 412 and nothing is written. `if_graph_commit`
+  always selects the route that requires it, so an empty or malformed value is
+  refused with 400 and never becomes an unconditional write.
 - **No retries.** The server never replays a tool call.
 - **A lost response is an unknown outcome.** A write runs to completion even when
   the caller stops waiting. A write still running after 30 seconds, or one whose
@@ -233,7 +281,10 @@ Write tools follow one contract:
   Use `POST /load/ndjson` for larger loads.
 
 Schema changes and cluster deployments are not MCP tools; operators run them with
-`omnigraph cluster plan` and `apply`.
+`omnigraph cluster plan` and `apply`. Byte streams are not tools either: Blob
+payloads (`GET` and `PUT /blob`), `export`, and the change-feed baseline, whose
+NDJSON snapshot must be installed before its cursor. Use the HTTP routes or the
+CLI for them.
 
 ## Resources
 
@@ -255,8 +306,11 @@ an unknown resource or graph is error `-32002`.
 ## Results and errors
 
 A successful call returns the route's JSON response body as structured content,
-plus a text copy for older clients. `health`, `graphs`, `schema`, `queries`,
-`access` and `branches_list` declare an output schema.
+plus a text copy for older clients. Three tools answer otherwise: `graphs`
+narrows `GET /graphs` for a credential that is not an identity, `blobs_stat`
+answers the `HEAD /blob` headers as `blob stat` JSON, and `commits_drop`
+answers an empty object for the route's 204. `health`, `graphs`, `schema`,
+`queries`, `access` and `branches_list` declare an output schema.
 
 A refused call returns `isError: true` with
 `{"status": <HTTP status>, "error": <error body>}`: the error body every HTTP

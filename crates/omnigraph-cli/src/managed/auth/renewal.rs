@@ -404,9 +404,11 @@ pub(super) async fn verify(
     let principal = bounded_string(data, "principal_id", 1024)?;
     let expires = bounded_string(data, "expires_at", 128)?;
     let expiry = timestamp(expires)?;
+    let permissions: Vec<String> =
+        serde_json::from_value(data["service_permissions"].clone()).map_err(|_| invalid())?;
+    super::super::validate_service_permissions(&permissions).map_err(|_| invalid())?;
     if Some(account) != decoded.org_id.as_deref()
         || data["kind"] != "human"
-        || !data["scopes"].is_object()
         || expiry <= OffsetDateTime::now_utc()
         || expiry > OffsetDateTime::from_unix_timestamp(decoded.exp).map_err(|_| invalid())?
     {
@@ -419,7 +421,7 @@ pub(super) async fn verify(
         session_id: decoded.sid,
     };
     // Provider/API extras never reach normal CLI output.
-    let mut output = json!({"data":{"principal_id":principal,"account_id":account,"kind":"human","subject":identity.subject,"scopes":data["scopes"],"expires_at":expires},"meta":{"assurance":"verified_human"}});
+    let mut output = json!({"data":{"principal_id":principal,"account_id":account,"kind":"human","subject":identity.subject,"service_permissions":permissions,"expires_at":expires},"meta":{"assurance":"verified_human"}});
     scrub_value(&mut output, token);
     Ok((identity, expires.into(), output))
 }

@@ -215,7 +215,7 @@ pub(crate) enum ClusterCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ClusterMembersCommand {
-    /// List explicit cluster enrollment; graph permissions are evaluated by Cedar separately.
+    /// List organization members and identity eligibility; graph permissions are evaluated by Cedar separately.
     List {
         /// Emit the API envelope instead of a readable member table.
         #[arg(long)]

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use color_eyre::eyre::Result;
 use omnigraph_server::{
-    McpSettings, init_tracing, load_server_settings, load_server_settings_with_bootstrap_handoff,
+    McpSettings, load_server_settings, load_server_settings_with_bootstrap_handoff,
     load_server_settings_with_identity_trust, resolve_shutdown_grace, serve_with_data_token_trust,
     serve_with_mcp_settings,
 };
@@ -61,8 +61,9 @@ struct Cli {
     /// `OMNIGRAPH_MCP_ALLOW_ADHOC=1`.
     #[arg(long)]
     mcp_allow_adhoc: bool,
-    /// List and admit the MCP write tools (`mutate`, `load`, `branches_create`,
-    /// `branches_delete`, `branches_merge`), each under its route's policy
+    /// List and admit the MCP write tools (`mutate`, `load`, `blobs_clear`,
+    /// `branches_create`, `branches_delete`, `branches_merge`,
+    /// `commits_publish`, `commits_drop`), each under its route's policy
     /// action. Off by default. Equivalent to setting `OMNIGRAPH_MCP_ALLOW_WRITES=1`.
     #[arg(long)]
     mcp_allow_writes: bool,
@@ -76,9 +77,14 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
-    init_tracing();
-
     let cli = Cli::parse();
+    let telemetry = tokio::task::spawn_blocking(omnigraph_server::telemetry::init).await??;
+    let result = run(cli).await;
+    telemetry.shutdown_in_background();
+    result
+}
+
+async fn run(cli: Cli) -> Result<()> {
     let mcp = McpSettings::resolve(
         cli.mcp_allow_adhoc,
         cli.mcp_allow_writes,

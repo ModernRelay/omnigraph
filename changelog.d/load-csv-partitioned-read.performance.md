@@ -1,0 +1,1 @@
+- A `load csv` overwrite reads its source by partition in 8 MiB pieces instead of capturing the whole object first, and refuses a first record over 8 MiB. LDBC SF30 loads 1.4× faster.

@@ -32,6 +32,7 @@ deployment.
 - [CLI guide](cli/index.md)
 - [CLI reference](cli/reference.md)
 - [Operator profiles, targets and credentials](cli/targets.md)
+- [Open Studio on a server target](cli/studio.md)
 - [Managed data credentials and queries](cli/managed-data.md)
 - [Managed creation, configuration and deletion](cli/managed-lifecycle.md)
 - [Managed organization members and invitations](cli/managed-team.md)
@@ -45,6 +46,7 @@ deployment.
 - [`cluster.yaml` reference](clusters/config.md)
 - [Deployment](deployment.md)
 - [Storage failures and restart](operations/storage-failures.md)
+- [Server logs and traces](operations/observability.md)
 - [Authorization and actors](operations/policy.md)
 - [Maintenance](operations/maintenance.md)
 - [Upgrade from 0.13 to 0.14](operations/upgrade-0.14.md): checklist, YAML and CLI replacements
