@@ -208,7 +208,7 @@ secure-store client secrets are unsupported.
 ```sh
 omnigraph cluster list --profile ops
 omnigraph target add ops-cluster --profile ops --cluster CLUSTER_ID
-omnigraph --target ops-cluster --graph knowledge query 'query q() { return { 1 as ok } }'
+omnigraph --target ops-cluster --graph knowledge query -e 'query q() { return { 1 as ok } }'
 omnigraph mcp --target ops-cluster
 ```
 
