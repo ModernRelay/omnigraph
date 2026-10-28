@@ -221,14 +221,20 @@ organization. Provider service permissions govern organization operations;
 applied Cedar governs graph and deployment operations. Provider scopes do not
 replace either authority.
 
+The token response must include a positive `expires_in`; providers that omit it
+are unsupported. The profile's proxy and custom-CA settings apply to managed
+service requests, not this token exchange.
+
 Tokens stay in invocation memory. Long-running commands renew expired control
 credentials before their next request and keep the same verified organization,
-principal, kind, subject and client ID. A typed native-credential issuance
-preflight refusal may trigger one renewal and one new issuance request. A
+principal, kind, subject, client ID and assurance. A typed native-credential
+issuance preflight refusal may trigger one renewal and one new issuance request. A
 submitted operation, HTTP 401 or uncertain delivery is never replayed for
 authentication. Secret rotation takes effect on the next acquisition; a
 different client or identity needs a separate profile.
 
 OAuth `cluster token` reports issuance metadata without persisting the credential;
-its `--clear` option clears only invocation memory. Ordinary resource commands
-acquire their own credential.
+in a fresh invocation, `--clear` reports `local_credential_removed: false` because
+there is no persisted OAuth credential to remove. It does not clear credentials
+saved by a previous provider. Ordinary resource commands acquire their own
+credential.

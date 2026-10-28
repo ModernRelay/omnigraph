@@ -368,6 +368,7 @@ async fn stored_token_cache_survives_control_outage_but_not_expiry_or_generation
                     &auth.profile,
                     &auth.derived_credentials,
                     &persistent,
+                    false,
                 );
                 let api = Api::new(context.api.clone(), Some("test-control-token".into())).unwrap();
                 mint_for_principal(&store, &context, &api, 3600, Some("alice"))
@@ -426,6 +427,7 @@ async fn stored_token_cache_survives_control_outage_but_not_expiry_or_generation
                     &fresh.profile,
                     &fresh.derived_credentials,
                     &persistent,
+                    false,
                 );
                 assert!(store.get(&key(&context)).unwrap().is_none());
                 let failure = acquire_resource(
@@ -498,6 +500,37 @@ async fn token_clear_skips_unavailable_transport_and_removes_local_credential() 
                     assert_eq!(result["data"]["local_credential_removed"], true);
                     assert_eq!(result["data"]["revocation_performed"], false);
                     assert!(store.get(&key(&context)).unwrap().is_none());
+                    // Invocation-only profiles cannot claim to have removed a
+                    // credential from a previous process or persistent source.
+                    let invocation = InvocationCredentials::default();
+                    let unavailable = UnavailablePersistentStore::default();
+                    let profile = crate::operator_schema::AuthProfile::OauthClientCredentials {
+                        token_endpoint: "https://provider.example/token".into(),
+                        client_id: "client_one".into(),
+                        client_secret: crate::operator_schema::ClientSecretSource::Env {
+                            env: "UNUSED_CLIENT_SECRET".into(),
+                        },
+                        scope: None,
+                    };
+                    let selected =
+                        ResourceStore::for_profile(&profile, &invocation, &unavailable, true);
+                    let cleared = token_with_store(&cli, &context, None, true, &selected)
+                        .await
+                        .unwrap();
+                    assert_eq!(cleared["data"]["local_credential_removed"], false);
+                    invocation
+                        .put(&key(&context), "invocation-only-credential")
+                        .unwrap();
+                    let cleared = token_with_store(&cli, &context, None, true, &selected)
+                        .await
+                        .unwrap();
+                    assert_eq!(cleared["data"]["local_credential_removed"], true);
+                    assert!(invocation.get(&key(&context)).unwrap().is_none());
+                    assert_eq!(
+                        unavailable.0.get(),
+                        0,
+                        "OAuth clear never probes prior persistent custody"
+                    );
                     assert!(api.requests().is_empty());
                 },
             )
@@ -564,8 +597,9 @@ async fn external_resource_and_export_acquire_only_invocation_credentials_withou
         crate::operator_routing::test_transport_scope(&[&cp.origin], async {
         let unavailable = UnavailablePersistentStore::default();
         let memory = InvocationCredentials::default();
-        let store = ResourceStore::for_profile(&profile, &memory, &unavailable);
+        let store = ResourceStore::for_profile(&profile, &memory, &unavailable, false);
         assert!(!store.persistent());
+        assert!(ResourceStore::for_profile(&profile, &memory, &unavailable, true).persistent());
         let exported = acquire_resource(
             None,
             &context,
@@ -615,7 +649,7 @@ async fn external_source_failure_never_falls_back_or_submits_an_exchange() {
     for profile in external_profiles() {
         let unavailable = UnavailablePersistentStore::default();
         let memory = InvocationCredentials::default();
-        let store = ResourceStore::for_profile(&profile, &memory, &unavailable);
+        let store = ResourceStore::for_profile(&profile, &memory, &unavailable, false);
         let context = context();
         let failure = acquire_resource(
             Some("knowledge"),
@@ -651,7 +685,7 @@ async fn persistent_profiles_do_not_fall_back_to_invocation_custody() {
     ] {
         let unavailable = UnavailablePersistentStore::default();
         let memory = InvocationCredentials::default();
-        let store = ResourceStore::for_profile(&profile, &memory, &unavailable);
+        let store = ResourceStore::for_profile(&profile, &memory, &unavailable, false);
         assert!(store.persistent());
         let context = context();
         let failure = acquire_resource(
@@ -710,7 +744,7 @@ async fn invocation_credentials_require_verified_identity_and_exact_resource_exc
             let unavailable = UnavailablePersistentStore::default();
             let memory = InvocationCredentials::default();
             let profile = external_profiles().remove(0);
-            let store = ResourceStore::for_profile(&profile, &memory, &unavailable);
+            let store = ResourceStore::for_profile(&profile, &memory, &unavailable, false);
             assert!(
                 acquire_resource(
                     Some("knowledge"),
@@ -742,7 +776,7 @@ async fn invocation_credentials_require_verified_identity_and_exact_resource_exc
     let profile = external_profiles().remove(0);
     let memory = InvocationCredentials::default();
     let unavailable = UnavailablePersistentStore::default();
-    let store = ResourceStore::for_profile(&profile, &memory, &unavailable);
+    let store = ResourceStore::for_profile(&profile, &memory, &unavailable, false);
     assert!(
         acquire_resource(
             None,
@@ -2148,11 +2182,12 @@ async fn token_bootstrap_reports_endpoint_without_configuring_a_data_destination
 #[cfg(unix)]
 #[tokio::test]
 async fn workload_near_expiry_renews_once_only_before_native_issuance() {
-    for (status, problem, second_refusal, calls) in [
-        (409, "credential_near_expiry", false, 2),
-        (409, "credential_near_expiry", true, 2),
-        (401, "credential_near_expiry", false, 1),
-        (409, "other_refusal", false, 1),
+    for (status, problem, second_refusal, calls, renewable) in [
+        (409, "credential_near_expiry", false, 2, true),
+        (409, "credential_near_expiry", true, 2, true),
+        (401, "credential_near_expiry", false, 1, true),
+        (409, "other_refusal", false, 1, true),
+        (409, "credential_near_expiry", false, 1, false),
     ] {
         let mut context = context();
         context.control_auth = super::super::ControlAuth::AutomationEnv;
@@ -2170,7 +2205,13 @@ async fn workload_near_expiry_renews_once_only_before_native_issuance() {
             };
             let mut replies = vec![session(), refusal()];
             if calls == 2 {
-                replies.push(session());
+                let mut renewed = session();
+                let mut body: Value = serde_json::from_slice(&renewed.body).unwrap();
+                body["data"]["subject"] = json!("rotated-key-subject");
+                body["data"]["provider_client_id"] = json!("rotated-client");
+                body["meta"]["assurance"] = json!("verified_workload");
+                renewed.body = serde_json::to_vec(&body).unwrap();
+                replies.push(renewed);
                 replies.push(if second_refusal {refusal()} else {IntentReply::json(200, json!({"data":response,"meta":{"cluster_id":context.cluster,"incarnation":"incarnation-a"}}))});
             }
             replies
@@ -2179,7 +2220,13 @@ async fn workload_near_expiry_renews_once_only_before_native_issuance() {
         let helper = home.path().join("helper.sh");
         let count = home.path().join("calls");
         std::fs::write(&helper, "IFS= read -r request\nprintf 'called\\n' >> \"$1\"\nprintf '%s\\n' '{\"version\":1,\"credential\":{\"type\":\"bearer\",\"token\":\"test-control-token\"}}'\n").unwrap();
-        std::fs::write(home.path().join("config.yaml"), json!({"version":1,"profiles":{"work":{"api":cp.origin,"organization_id":"org_test","auth":{"provider":"exec","command":["/bin/sh", helper, count]}}}}).to_string()).unwrap();
+        let profile = if renewable {
+            json!({"provider":"exec","command":["/bin/sh", helper, count]})
+        } else {
+            std::fs::write(home.path().join("token"), "test-control-token").unwrap();
+            json!({"provider":"token","source":{"file":"./token"}})
+        };
+        std::fs::write(home.path().join("config.yaml"), json!({"version":1,"profiles":{"work":{"api":cp.origin,"organization_id":"org_test","auth":profile}}}).to_string()).unwrap();
         let input = crate::operator::InvocationConfig::at(Some(home.path().to_owned()), None);
         let cli =
             crate::invocation::parse_from(["omnigraph", "cluster", "list", "--profile", "work"])
@@ -2206,10 +2253,18 @@ async fn workload_near_expiry_renews_once_only_before_native_issuance() {
                         calls == 2 && !second_refusal,
                         "{status}/{problem}"
                     );
-                    assert_eq!(
-                        std::fs::read_to_string(&count).unwrap(),
-                        "called\n".repeat(calls)
-                    );
+                    if renewable {
+                        assert_eq!(
+                            std::fs::read_to_string(&count).unwrap(),
+                            "called\n".repeat(calls)
+                        );
+                    } else {
+                        assert!(!count.exists());
+                        let failure = result.err().unwrap();
+                        assert_eq!(failure.body["type"], problem);
+                        assert_eq!(failure.body["detail"], "issuance preflight refused");
+                        assert_eq!(failure.response_status, Some(reqwest::StatusCode::CONFLICT));
+                    }
                     let requests: Vec<_> = cp
                         .requests()
                         .into_iter()

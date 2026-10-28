@@ -1615,8 +1615,9 @@ fi
             "called\n"
         );
         api.set_session(json!({"data":{"principal_id":if changed_identity {"principal-two"} else {"principal-one"},
-            "account_id":"account-one","service_permissions":["changed-service-permission"]},
-            "meta":{"provenance":"service_db","assurance":"verified_workload"}}));
+            "account_id":"account-one","service_permissions":["changed-service-permission"],
+            "kind":"automation","subject":"rotated-key-subject","provider_client_id":"rotated-client"},
+            "meta":{"provenance":"service_db","assurance":"verified_human"}}));
         while OffsetDateTime::now_utc() < expiry {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -1896,6 +1897,9 @@ fn managed_mcp_client_credentials_renew_without_browser_or_effect_replay() {
         "valid credentials remain cached"
     );
     std::fs::write(home.join("client-secret"), "rotated:&=+ secret\n").unwrap();
+    // No auth expiry margin: 15 seconds leaves room for process startup,
+    // TLS, session verification and the first read on a loaded CI worker.
+    // Only after proving that first grant was cached do we let it expire.
     std::thread::sleep(Duration::from_secs(16));
     assert_eq!(
         bridge.tool(2, "fast", json!({}))["result"]["content"][0]["text"],

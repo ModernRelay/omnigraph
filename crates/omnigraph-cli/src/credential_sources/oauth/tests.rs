@@ -67,6 +67,22 @@ fn explicit_endpoint_client_and_scope_are_strict() {
 
 #[test]
 fn response_requires_a_bounded_bearer_and_finite_future_expiry() {
+    for (status, expected) in [
+        (200, Ok(())),
+        (302, Err(CredentialError::ClientCredentialsRefused)),
+        (400, Err(CredentialError::ClientCredentialsRefused)),
+        (401, Err(CredentialError::ClientCredentialsRefused)),
+        (403, Err(CredentialError::ClientCredentialsRefused)),
+        (429, Err(CredentialError::ClientCredentialsUnavailable)),
+        (500, Err(CredentialError::ClientCredentialsUnavailable)),
+        (503, Err(CredentialError::ClientCredentialsUnavailable)),
+    ] {
+        assert_eq!(
+            check_status(reqwest::StatusCode::from_u16(status).unwrap()),
+            expected,
+            "token endpoint status {status}"
+        );
+    }
     let now = OffsetDateTime::now_utc();
     let body = json!({"access_token":"test-token", "token_type":"Bearer", "expires_in":120});
     let credential = decode(&request(), &serde_json::to_vec(&body).unwrap(), now).unwrap();

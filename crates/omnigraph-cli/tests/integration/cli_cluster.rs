@@ -4678,7 +4678,7 @@ fn managed_workload_explicit_token_and_clear_use_only_invocation_custody() {
     );
     assert_eq!(
         parse_stdout_json(&cleared)["data"]["local_credential_removed"],
-        true
+        false
     );
     assert_eq!(provider.requests().len(), 1);
     assert_eq!(api.workflow_requests().len(), 1);

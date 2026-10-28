@@ -361,7 +361,7 @@ enum Source {
     },
 }
 
-/// The verified service identity is immutable for the selected invocation.
+/// Complete verified metadata; continuity checks follow the selected provider.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct VerifiedIdentity {
     account_id: String,
@@ -370,6 +370,23 @@ pub(crate) struct VerifiedIdentity {
     subject: Option<String>,
     provider_client_id: Option<String>,
     assurance: Option<String>,
+}
+
+impl VerifiedIdentity {
+    // Existing external providers pin organization and principal; OAuth also
+    // pins its verified client identity. Keep the original metadata intact.
+    fn matches_profile(
+        &self,
+        other: &Self,
+        profile: Option<&crate::operator_schema::AuthProfile>,
+    ) -> bool {
+        self.account_id == other.account_id
+            && self.principal_id == other.principal_id
+            && (!matches!(
+                profile,
+                Some(crate::operator_schema::AuthProfile::OauthClientCredentials { .. })
+            ) || self == other)
+    }
 }
 
 async fn verify_external(
@@ -441,7 +458,7 @@ async fn verify_external(
             .verified_managed_identity
             .get_or_init(|| async { identity.clone() })
             .await;
-        if pinned != &identity {
+        if !pinned.matches_profile(&identity, Some(&auth.profile)) {
             return Err(Failure::refused(
                 "session_identity_mismatch",
                 "the verified identity changed during this invocation",
@@ -638,11 +655,11 @@ impl Selection {
                 credential,
                 identity,
             } => {
-                if let Some(auth) = crate::operator_routing::AUTH
+                let authentication = crate::operator_routing::AUTH
                     .try_with(Clone::clone)
                     .ok()
-                    .flatten()
-                {
+                    .flatten();
+                if let Some(auth) = &authentication {
                     auth.ensure_current().map_err(|_| {
                         Failure::refused(
                             "credential_generation_changed",
@@ -660,7 +677,10 @@ impl Selection {
                         .ok_or_else(Failure::protocol)?;
                     let (verified, fresh) =
                         verify_external(origin, Some(&self.account_id), fresh).await?;
-                    if &verified != identity {
+                    if !identity.matches_profile(
+                        &verified,
+                        authentication.as_ref().map(|auth| &auth.profile),
+                    ) {
                         return Err(Failure::refused(
                             "session_identity_mismatch",
                             "the renewed credential names another identity",
@@ -677,23 +697,25 @@ impl Selection {
         }
     }
 
-    pub(super) async fn renew_before_issuance(&self, origin: &str) -> Result<()> {
+    pub(super) async fn renew_before_issuance(&self, origin: &str) -> Result<bool> {
         let Source::Automation {
             credential,
             identity,
         } = &self.source
         else {
-            return Err(Failure::refused(
-                "credential_near_expiry",
-                "the selected credential cannot renew unattended",
-            ));
+            return Ok(false);
         };
-        let mut current = credential.lock().await;
-        let auth = crate::operator_routing::AUTH
+        let Some(auth) = crate::operator_routing::AUTH
             .try_with(Clone::clone)
             .ok()
             .flatten()
-            .ok_or_else(Failure::protocol)?;
+        else {
+            return Ok(false);
+        };
+        if !auth.renewable() {
+            return Ok(false);
+        }
+        let mut current = credential.lock().await;
         let fresh = auth.renew_control_credential(&current).await.map_err(|_| {
             Failure::refused(
                 "credential_unavailable",
@@ -701,14 +723,14 @@ impl Selection {
             )
         })?;
         let (verified, fresh) = verify_external(origin, Some(&self.account_id), fresh).await?;
-        if &verified != identity {
+        if !identity.matches_profile(&verified, Some(&auth.profile)) {
             return Err(Failure::refused(
                 "session_identity_mismatch",
                 "the renewed credential names another identity",
             ));
         }
         *current = fresh;
-        Ok(())
+        Ok(true)
     }
 }
 

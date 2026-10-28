@@ -62,18 +62,25 @@ enum ResourceStore<'a> {
 }
 
 impl<'a> ResourceStore<'a> {
+    // Explicit token administration retains existing providers' persistent
+    // custody. OAuth credentials stay in invocation memory for every command.
     fn for_profile(
         profile: &crate::operator_schema::AuthProfile,
         invocation: &'a InvocationCredentials,
         persistent: &'a dyn Store,
+        explicit_token: bool,
     ) -> Self {
         use crate::operator_schema::{AuthProfile, TokenSource};
         match profile {
+            AuthProfile::OauthClientCredentials { .. } => Self::Invocation(invocation),
             AuthProfile::Token {
                 source: TokenSource::Env { .. } | TokenSource::File { .. },
             }
             | AuthProfile::Exec { .. }
-            | AuthProfile::OauthClientCredentials { .. } => Self::Invocation(invocation),
+                if !explicit_token =>
+            {
+                Self::Invocation(invocation)
+            }
             AuthProfile::Token {
                 source: TokenSource::Store { .. },
             } => Self::StoredToken(persistent),
@@ -347,8 +354,12 @@ async fn issue_for_principal(
             if failure.body["type"] == "credential_near_expiry"
                 && failure.response_status == Some(reqwest::StatusCode::CONFLICT) =>
         {
-            let selected = api.selection.as_ref().ok_or_else(Failure::protocol)?;
-            selected.renew_before_issuance(&api.origin).await?;
+            let Some(selected) = api.selection.as_ref() else {
+                return Err(failure);
+            };
+            if !selected.renew_before_issuance(&api.origin).await? {
+                return Err(failure);
+            }
             api.request(Method::POST, &path, Some(&request), None)
                 .await?
         }
@@ -403,9 +414,12 @@ async fn issue_for_principal(
 }
 
 fn clear(store: &impl Store, context: &Context) -> Result<Value> {
+    // Persistent removal retains its existing remove-only contract; inspecting
+    // it first could add an OS credential prompt. Memory has no such boundary.
+    let removed = store.persistent() || store.get(&key(context))?.is_some();
     store.remove(&key(context))?;
     Ok(
-        json!({"data":{"cluster_id":context.cluster,"local_credential_removed":true,"revocation_performed":false},"meta":{"cluster_id":context.cluster}}),
+        json!({"data":{"cluster_id":context.cluster,"local_credential_removed":removed,"revocation_performed":false},"meta":{"cluster_id":context.cluster}}),
     )
 }
 
@@ -432,18 +446,20 @@ pub(super) async fn token(
     ttl: Option<u64>,
     clear: bool,
 ) -> Result<Value> {
-    if let Some(auth) = crate::operator_routing::AUTH
+    let authentication = crate::operator_routing::AUTH
         .try_with(Clone::clone)
         .ok()
-        .flatten()
-        && matches!(
-            auth.profile,
-            crate::operator_schema::AuthProfile::OauthClientCredentials { .. }
-        )
-    {
-        return token_with_store(cli, context, ttl, clear, &auth.derived_credentials).await;
-    }
-    token_with_store(cli, context, ttl, clear, &auth::DATA_STORE).await
+        .flatten();
+    let store = match authentication.as_ref() {
+        Some(auth) => ResourceStore::for_profile(
+            &auth.profile,
+            &auth.derived_credentials,
+            &auth::DATA_STORE,
+            true,
+        ),
+        None => ResourceStore::Persistent(&auth::DATA_STORE),
+    };
+    token_with_store(cli, context, ttl, clear, &store).await
 }
 
 async fn token_with_store(
@@ -710,6 +726,7 @@ pub(crate) async fn resource(
                 &auth.profile,
                 &auth.derived_credentials,
                 &auth::DATA_STORE,
+                false,
             ),
             None => ResourceStore::Persistent(&auth::DATA_STORE),
         };
@@ -751,6 +768,7 @@ pub(crate) async fn forget_refused(
                 &auth.profile,
                 &auth.derived_credentials,
                 &auth::DATA_STORE,
+                false,
             ),
             None => ResourceStore::Persistent(&auth::DATA_STORE),
         };

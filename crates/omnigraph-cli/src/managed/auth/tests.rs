@@ -1420,87 +1420,126 @@ async fn workload_session_requires_verified_class_client_and_immutable_identity(
     let expires = (OffsetDateTime::now_utc() + time::Duration::minutes(5))
         .replace_nanosecond(0)
         .unwrap();
-    let original = json!({"data":{"account_id":"org_test","principal_id":"principal_one","kind":"automation","subject":"oauth:issuer:client_one","provider_client_id":"client_one","expires_at":expires.format(&Rfc3339).unwrap()},"meta":{"assurance":"verified_workload"}});
-    for (pointer, changed, expected) in [
+    let original = json!({"data":{"account_id":"org_test","principal_id":"principal_one","kind":"automation","subject":"oauth:issuer:client_one","provider_client_id":"client_one","expires_at":expires.format(&Rfc3339).unwrap(),"service_permissions":["source_read"]},"meta":{"assurance":"verified_workload"}});
+    for (profile, strict) in [
         (
-            "/data/account_id",
-            json!("org_other"),
-            "organization_mismatch",
+            json!({"provider":"oauth_client_credentials","token_endpoint":"https://auth.example/oauth2/token","client_id":"client_one","client_secret":{"env":"UNUSED_TEST_SECRET"}}),
+            true,
         ),
         (
-            "/data/principal_id",
-            json!("principal_other"),
-            "session_identity_mismatch",
+            json!({"provider":"exec","command":["/unused/helper"]}),
+            false,
         ),
         (
-            "/data/subject",
-            json!("oauth:other:client_one"),
-            "session_identity_mismatch",
-        ),
-        (
-            "/data/provider_client_id",
-            json!("client_other"),
-            "workload_identity_mismatch",
-        ),
-        ("/data/kind", json!("human"), "workload_identity_mismatch"),
-        (
-            "/meta/assurance",
-            json!("verified_human"),
-            "workload_identity_mismatch",
-        ),
-        (
-            "/data/expires_at",
-            Value::Null,
-            "workload_identity_mismatch",
+            json!({"provider":"token","source":{"env":"UNUSED_TEST_TOKEN"}}),
+            false,
         ),
     ] {
-        let api = IntentApiFixture::with_session(vec![], original.clone());
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("config.yaml"), json!({"version":1,"profiles":{"work":{"api":api.origin,"organization_id":"org_test","auth":{"provider":"oauth_client_credentials","token_endpoint":"https://auth.example/oauth2/token","client_id":"client_one","client_secret":{"env":"UNUSED_TEST_SECRET"}}}}}).to_string()).unwrap();
-        let input = crate::operator::InvocationConfig::at(Some(directory.path().to_owned()), None);
-        let cli =
-            crate::invocation::parse_from(["omnigraph", "cluster", "list", "--profile", "work"])
-                .unwrap()
-                .cli;
-        let target = crate::scope::resolve(&cli, &input, directory.path(), false, &mut Vec::new())
+        for (pointer, changed, expected) in [
+            (
+                "/data/account_id",
+                json!("org_other"),
+                "organization_mismatch",
+            ),
+            (
+                "/data/principal_id",
+                json!("principal_other"),
+                "session_identity_mismatch",
+            ),
+            (
+                "/data/subject",
+                json!("oauth:other:client_one"),
+                "session_identity_mismatch",
+            ),
+            (
+                "/data/provider_client_id",
+                json!("client_other"),
+                "workload_identity_mismatch",
+            ),
+            ("/data/kind", json!("human"), "workload_identity_mismatch"),
+            (
+                "/meta/assurance",
+                json!("verified_human"),
+                "workload_identity_mismatch",
+            ),
+            (
+                "/data/expires_at",
+                Value::Null,
+                "workload_identity_mismatch",
+            ),
+            ("/data/service_permissions", json!(["source_write"]), ""),
+        ] {
+            let api = IntentApiFixture::with_session(vec![], original.clone());
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("config.yaml"), json!({"version":1,"profiles":{"work":{"api":api.origin,"organization_id":"org_test","auth":profile}}}).to_string()).unwrap();
+            let input =
+                crate::operator::InvocationConfig::at(Some(directory.path().to_owned()), None);
+            let cli = crate::invocation::parse_from([
+                "omnigraph",
+                "cluster",
+                "list",
+                "--profile",
+                "work",
+            ])
             .unwrap()
-            .unwrap();
-        let auth = crate::operator_routing::authentication(&cli, &input, Some(&target)).unwrap();
-        crate::operator_routing::test_transport_scope(&[&api.origin], async {
-            crate::operator_routing::AUTH
-                .scope(auth, async {
-                    let (_, credential) = verify_external(
-                        &api.origin,
-                        Some("org_test"),
-                        automation_credential(&api.origin, "test-token"),
-                    )
-                    .await
+            .cli;
+            let target =
+                crate::scope::resolve(&cli, &input, directory.path(), false, &mut Vec::new())
+                    .unwrap()
                     .unwrap();
-                    assert_eq!(credential.expires_at(), Some(expires));
-                    let mut altered = original.clone();
-                    *altered.pointer_mut(pointer).unwrap() = changed;
-                    api.set_session(altered);
-                    let failure = verify_external(
-                        &api.origin,
-                        Some("org_test"),
-                        automation_credential(&api.origin, "rotated-test-token"),
-                    )
-                    .await
-                    .unwrap_err();
-                    assert_eq!(
-                        failure.body["type"], expected,
-                        "{pointer}: {}",
-                        failure.body
-                    );
-                    assert_eq!(
-                        api.requests().len(),
-                        2,
-                        "only session verification is allowed"
-                    );
-                })
-                .await;
-        })
-        .await;
+            let auth =
+                crate::operator_routing::authentication(&cli, &input, Some(&target)).unwrap();
+            crate::operator_routing::test_transport_scope(&[&api.origin], async {
+                crate::operator_routing::AUTH
+                    .scope(auth, async {
+                        let (_, credential) = verify_external(
+                            &api.origin,
+                            Some("org_test"),
+                            automation_credential(&api.origin, "test-token"),
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(credential.expires_at(), Some(expires));
+                        let mut altered = original.clone();
+                        *altered.pointer_mut(pointer).unwrap() = changed;
+                        api.set_session(altered.clone());
+                        let result = verify_external(
+                            &api.origin,
+                            Some("org_test"),
+                            automation_credential(&api.origin, "rotated-test-token"),
+                        )
+                        .await;
+                        if !expected.is_empty()
+                            && (strict
+                                || matches!(pointer, "/data/account_id" | "/data/principal_id"))
+                        {
+                            let failure = result.unwrap_err();
+                            assert_eq!(
+                                failure.body["type"], expected,
+                                "{pointer}: {}",
+                                failure.body
+                            );
+                        } else {
+                            let (identity, _) = result.unwrap();
+                            assert_eq!(
+                                identity.subject.as_deref(),
+                                altered["data"]["subject"].as_str()
+                            );
+                            assert_eq!(
+                                identity.assurance.as_deref(),
+                                altered["meta"]["assurance"].as_str()
+                            );
+                        }
+                        assert_eq!(
+                            api.requests().len(),
+                            2,
+                            "only session verification is allowed"
+                        );
+                    })
+                    .await;
+            })
+            .await;
+        }
     }
 }
 

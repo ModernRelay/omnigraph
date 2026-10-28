@@ -75,6 +75,16 @@ struct TokenResponse {
     expires_in: u64,
 }
 
+fn check_status(status: reqwest::StatusCode) -> Result<()> {
+    if status.is_success() {
+        Ok(())
+    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        Err(CredentialError::ClientCredentialsUnavailable)
+    } else {
+        Err(CredentialError::ClientCredentialsRefused)
+    }
+}
+
 fn decode(
     request: &CredentialRequest,
     bytes: &[u8],
@@ -120,7 +130,6 @@ pub(crate) async fn acquire_client_credentials(
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(25))
         .build()
         .map_err(|_| CredentialError::ClientCredentialsUnavailable)?;
     let secret = secret(source)?;
@@ -140,9 +149,7 @@ pub(crate) async fn acquire_client_credentials(
             .send()
             .await
             .map_err(|_| CredentialError::ClientCredentialsUnavailable)?;
-        if !response.status().is_success() {
-            return Err(CredentialError::ClientCredentialsRefused);
-        }
+        check_status(response.status())?;
         if response
             .content_length()
             .is_some_and(|length| length > MAX_CREDENTIAL_BYTES as u64)
@@ -162,6 +169,7 @@ pub(crate) async fn acquire_client_credentials(
         }
         decode(request, &bytes, started)
     };
+    // One deadline covers response headers and every body chunk.
     tokio::time::timeout(Duration::from_secs(25), exchange)
         .await
         .map_err(|_| CredentialError::ClientCredentialsUnavailable)?
