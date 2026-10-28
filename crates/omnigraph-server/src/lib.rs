@@ -3583,13 +3583,12 @@ mod log_filter_tests {
                 Box::new(capture.subscriber("debug"))
             };
             let logs = tracing::subscriber::set_default(subscriber);
-            let error = super::ApiError::from_omni(
-                omnigraph::error::OmniError::manifest_publish_in_doubt(
+            let error =
+                super::ApiError::from_omni(omnigraph::error::OmniError::manifest_publish_in_doubt(
                     "01JCOMMITUNKNOWN",
                     "graph commit 01JCOMMITUNKNOWN may be durable: \
                      s3://bucket/private/__manifest/_versions/7.manifest",
-                ),
-            );
+                ));
             assert!(error.completion_uncertain());
             let storage = super::ApiError::from_omni(omnigraph::error::OmniError::Storage(
                 omnigraph::error::StorageFailure::new(
