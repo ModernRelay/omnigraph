@@ -229,7 +229,7 @@ then dated RFCs by date.
 | [0066](0066-one-seam-type.md) | One seam type for test-time behavior substitution | maintainer | draft | in-progress |
 | [0067](0067-detached-table-commits.md) | Detached table commits | maintainer | accepted | complete |
 | [0068](0068-graph-commit-record.md) | Graph commit record | maintainer | draft | not-started |
-| [2026-09-09](2026-09-09-identity-credentials-and-applied-policy.md) | Identity credentials and applied policy authorization | maintainer | accepted | complete |
+| [2026-09-09](2026-09-09-identity-credentials-and-applied-policy.md) | Identity credentials and applied policy authorization | maintainer | accepted | in-progress |
 | [2026-09-10](2026-09-10-server-lifecycle-and-online-deployment.md) | Server lifecycle and online deployment | maintainer | superseded | not-started |
 | [2026-09-14](2026-09-14-compatibility-surfaces.md) | Compatibility surfaces | maintainer | draft | not-started |
 | [2026-09-16](2026-09-16-session-settings.md) | Session settings | maintainer | draft | in-progress |
