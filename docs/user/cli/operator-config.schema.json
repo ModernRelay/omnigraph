@@ -574,7 +574,8 @@
             "json",
             "jsonl",
             "csv",
-            "kv"
+            "kv",
+            "toon"
           ],
           "default": "table"
         }

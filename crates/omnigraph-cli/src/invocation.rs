@@ -23,6 +23,7 @@ pub(crate) struct ParsedInvocation {
 pub(crate) enum MachineErrors {
     Json,
     Jsonl,
+    Toon,
 }
 
 /// Clap propagates globals by replacing ancestor matches with the deepest one.
@@ -77,6 +78,8 @@ where
         Some(MachineErrors::Json)
     } else if format == Some(ReadOutputFormat::Jsonl) {
         Some(MachineErrors::Jsonl)
+    } else if format == Some(ReadOutputFormat::Toon) {
+        Some(MachineErrors::Toon)
     } else {
         None
     };
@@ -149,6 +152,10 @@ mod tests {
             (
                 vec!["query", "q", "--format", "jsonl"],
                 Some(MachineErrors::Jsonl),
+            ),
+            (
+                vec!["query", "q", "--format", "toon"],
+                Some(MachineErrors::Toon),
             ),
             (
                 vec!["alias", "unresolved", "--format", "jsonl"],

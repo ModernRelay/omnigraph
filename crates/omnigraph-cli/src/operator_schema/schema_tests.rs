@@ -218,6 +218,7 @@ fn schema_discriminators_defaults_and_owner_variants_match_contract() {
         OutputFormat::Jsonl,
         OutputFormat::Csv,
         OutputFormat::Kv,
+        OutputFormat::Toon,
     ];
     assert_eq!(
         defs["defaults"]["properties"]["output"]["enum"],

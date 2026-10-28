@@ -36,8 +36,8 @@ A direct-graph alias must omit `graph` to pass validation, but cannot execute:
 the stored-query registry is served-only. Validation does not add capabilities.
 
 Use `--format jsonl` or `--json` for automation, or set `defaults.output` to
-`jsonl`/`json`. The supported defaults are `table`, `json`, `jsonl`, `csv`, and
-`kv`. Action receipts retain their own output contracts. Use JSON when the
+`jsonl`/`json`/`toon`. The supported defaults are `table`, `json`, `jsonl`, `csv`,
+`kv`, and `toon`. Action receipts retain their own output contracts. Use JSON or TOON when the
 consumer needs the complete column list or read `graph_commit_id` for a
 conditional mutation; JSONL metadata does not carry those fields. See
 [result values](queries.md#system-fields-and-result-values).
