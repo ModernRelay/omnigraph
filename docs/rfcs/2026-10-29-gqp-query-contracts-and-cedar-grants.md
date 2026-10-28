@@ -8,7 +8,7 @@ authors:
   - aaltshuler
 created: 2026-10-29
 updated: 2026-10-29
-discussion: null
+discussion: https://github.com/ModernRelay/omnigraph/pull/1197
 supersedes: []
 superseded_by: []
 blocked_on:
