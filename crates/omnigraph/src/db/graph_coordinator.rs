@@ -1181,7 +1181,7 @@ mod tests {
                             assert_eq!(error.kind, crate::error::ManifestErrorKind::Internal);
                             assert_eq!(error.message, CAPTURE_ERROR);
                             assert!(error.details.is_none());
-                            assert!(!error.publication_in_doubt);
+                            assert!(error.publication_in_doubt.is_none());
                         }
                         error => panic!("unexpected capture error: {error:?}"),
                     }
@@ -1416,6 +1416,6 @@ mod tests {
             error.message
         );
         assert!(error.details.is_none());
-        assert!(!error.publication_in_doubt);
+        assert!(error.publication_in_doubt.is_none());
     }
 }

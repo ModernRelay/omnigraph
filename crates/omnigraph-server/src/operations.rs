@@ -902,7 +902,8 @@ mod tests {
                 true,
             ),
             (
-                OmniError::manifest_publish_in_doubt("uncertain publication").before_effect(),
+                OmniError::manifest_publish_in_doubt("01JCOMMIT", "uncertain publication")
+                    .before_effect(),
                 false,
             ),
             (
@@ -927,7 +928,10 @@ mod tests {
             ),
             (OmniError::manifest_internal("internal failure"), true),
             (
-                OmniError::manifest_publish_in_doubt("publication acknowledgement unavailable"),
+                OmniError::manifest_publish_in_doubt(
+                    "01JCOMMIT",
+                    "publication acknowledgement unavailable",
+                ),
                 false,
             ),
             (OmniError::manifest("invalid request"), false),
@@ -991,8 +995,11 @@ mod tests {
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
             (
-                OmniError::manifest_publish_in_doubt("manifest publish outcome is in doubt")
-                    .unpublished(),
+                OmniError::manifest_publish_in_doubt(
+                    "01JCOMMIT",
+                    "manifest publish outcome is in doubt",
+                )
+                .unpublished(),
                 true,
                 false,
                 StatusCode::INTERNAL_SERVER_ERROR,
