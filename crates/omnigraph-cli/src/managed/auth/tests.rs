@@ -401,6 +401,7 @@ fn metadata_for(seconds: i64, principal: &str, organization: &str) -> IntentRepl
 pub(super) struct MockTransport {
     pub requests: Mutex<Vec<HttpRequest>>,
     pub responses: Mutex<VecDeque<(u16, Value)>>,
+    pub raw_error_body: Option<Vec<u8>>,
     pending: bool,
 }
 
@@ -432,7 +433,14 @@ impl HttpTransport for MockTransport {
         Ok(HttpResponse {
             status: reqwest::StatusCode::from_u16(status).unwrap(),
             headers: reqwest::header::HeaderMap::new(),
-            body: value.to_string().into(),
+            body: if status >= 400 {
+                self.raw_error_body
+                    .clone()
+                    .unwrap_or_else(|| value.to_string().into_bytes())
+                    .into()
+            } else {
+                value.to_string().into()
+            },
         })
     }
 }
@@ -595,6 +603,54 @@ async fn official_sdk_uses_public_client_device_and_refresh_without_secret_or_re
     }
     assert_eq!(requests[0].url, config().device_authorization_endpoint);
     assert_eq!(requests[1].url, config().token_endpoint);
+    drop(requests);
+    for (status, code, transient) in [
+        (408, "unavailable", true),
+        (429, "unavailable", true),
+        (500, "unavailable", true),
+        (503, "unavailable", true),
+        (400, "invalid_grant", false),
+        (401, "refused", false),
+        (403, "access_denied", false),
+        (302, "redirect", false),
+        (503, "invalid_grant", false),
+    ] {
+        let mut transport = MockTransport::with(vec![(status, json!({"error":code}))]);
+        if code == "unavailable" && matches!(status, 500 | 503) {
+            Arc::get_mut(&mut transport).unwrap().raw_error_body = Some(if status == 500 {
+                Vec::new()
+            } else {
+                b"<html>Bad Gateway</html>".to_vec()
+            });
+        }
+        let error = transport
+            .provider()
+            .refresh("secret-refresh", "org_test")
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(provider::transient(&error), transient);
+        assert_eq!(transport.requests.lock().unwrap().len(), 1);
+    }
+    for (error, transient) in [
+        (
+            TransportError::connect(std::io::Error::other("fixture")),
+            true,
+        ),
+        (
+            TransportError::timeout(std::io::Error::other("fixture")),
+            true,
+        ),
+        (
+            TransportError::other(std::io::Error::other("response refused")),
+            false,
+        ),
+    ] {
+        assert_eq!(
+            provider::transient(&workos::Error::Network(error)),
+            transient
+        );
+    }
 }
 
 #[tokio::test]
@@ -661,6 +717,10 @@ async fn cached_login_does_not_restart_provider_authorization() {
         let (saved, _) = renewal::accept(&api.origin, config(), tokens, None)
             .await
             .unwrap();
+        let deadline = saved.refresh_expires_at.clone();
+        let remaining = renewal::timestamp(&deadline).unwrap() - OffsetDateTime::now_utc();
+        assert!(remaining > time::Duration::days(30) - time::Duration::seconds(5));
+        assert!(remaining <= time::Duration::days(30));
         let store = MemoryStore::default();
         renewal::save(&store, &saved).unwrap();
         let provider = MockTransport::with(vec![]);
@@ -675,7 +735,7 @@ async fn cached_login_does_not_restart_provider_authorization() {
         .await
         .unwrap();
         assert_eq!(output["data"]["principal_id"], "principal_one");
-        assert!(output["data"]["refresh_expires_at"].is_string());
+        assert_eq!(output["data"]["refresh_expires_at"], deadline);
         assert!(provider.requests.lock().unwrap().is_empty());
         api.assert_complete();
     })

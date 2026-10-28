@@ -3,7 +3,7 @@ rfc: "2026-09-09-identity-credentials-and-applied-policy"
 title: "Identity credentials and applied policy authorization"
 track: maintainer
 status: accepted
-implementation: in-progress
+implementation: complete
 authors:
   - andrew
 created: 2026-09-09
@@ -253,11 +253,11 @@ of a particular deployment remain separate from the accepted library contract.
 ## Decision log
 
 - 2026-10-29: New human logins receive a 30-day absolute renewal deadline;
-  existing saved deadlines remain unchanged. Provider inactivity is 14 days,
+  existing saved deadlines remain unchanged. Required provider inactivity is 14 days,
   access JWTs remain at most 15 minutes, and graph credentials retain their
   independent one-hour default and 24-hour maximum. AuthKit renewal may retry
   transient failures only within its documented replay grace period, under the
-  bounds below. This amendment's implementation is in progress.
+  bounds below. Provider configuration and live qualification remain separate.
 
 - 2026-10-06: User behavior and Compatibility replace the token command spelling
   with `cluster token --managed`, using the explicit service mode from
@@ -304,10 +304,16 @@ principal, subject and session identity. A command selects one organization
 once. Another shell's login cannot retarget that command, even within the same
 organization. Refresh and reuse by `login` retain the entire selected identity
 and original saved deadline, including shorter deadlines from older clients.
-The provider enforces 14 days of inactivity and may end a session sooner.
+Configure the provider for a 14-day inactivity timeout (no refresh); it may end
+a session sooner. The CLI cannot override provider policy.
 Access JWTs remain bounded to 15 minutes; graph credentials keep their
 independent one-hour default and 24-hour maximum. Logout removes only the
 selected organization's custody.
+
+The custody format and namespace stay unchanged. An older client enforcing the
+eight-hour maximum refuses a new 30-day record, including during login.
+Upgrade the clients sharing that profile together; deliberate downgrade needs
+logout by the newer client before login by the older one, never automatic deletion.
 
 AuthKit documents a [30-second refresh replay grace period](https://workos.com/docs/authkit/session-resilience)
 for the fixed `/user_management/authenticate` endpoint: replay of the same
@@ -317,7 +323,7 @@ six seconds, within 20 seconds measured monotonically before the first send.
 Backoff is 250 milliseconds then one second, increased to `Retry-After` when
 present; a delay or attempt that cannot fit stops the loop. Only transport
 timeouts/network failures and HTTP 408, 429 or 5xx qualify. Terminal provider
-refusal, malformed responses and identity drift do not. SDK/HTTP automatic
+refusal, malformed successful responses and identity drift do not. SDK/HTTP automatic
 retries remain disabled. A retained pending exchange is never retried by a
 later invocation or beyond that budget.
 
