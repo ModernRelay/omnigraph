@@ -99,12 +99,29 @@ pub(crate) struct EngineContext<'a> {
 }
 
 /// What a load plan's operators need beside the snapshot: the statement as
-/// the loader resolved it, the one captured response its source parses, and
-/// the write verb's facts, `None` where no write runs (an explain).
+/// the loader resolved it, the probed source its partitions read by range,
+/// and the write verb's facts, `None` where no write runs (an explain).
 pub(crate) struct LoadFacts {
     pub(crate) request: crate::loader::csv::CsvLoadRequest,
-    pub(crate) capture: Arc<crate::table_store::CapturedSource>,
+    pub(crate) bytes: Arc<crate::loader::csv::CsvBytes>,
     pub(crate) write: Option<LoadWrite>,
+    /// The bytes one slice of the source is cut at and one piece of it is
+    /// read at: the planner's partition size, or what a test installed with
+    /// `with_csv_slice_bytes`.
+    pub(crate) slice_bytes: usize,
+    /// Run the source as one partition whatever the plan's `max_partitions`:
+    /// the loader's rerun after a partitioned run refused, so the refusal
+    /// numbers its record from the source.
+    pub(crate) single_partition: bool,
+    /// Set by the source when a run of more than one partition refused.
+    pub(crate) source_refused: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The slice size this task's loads cut their sources at.
+pub(crate) fn csv_slice_bytes() -> usize {
+    crate::instrumentation::csv_slice_bytes().unwrap_or_else(|| {
+        usize::try_from(omnigraph_planner::SOURCE_PARTITION_BYTES).unwrap_or(usize::MAX)
+    })
 }
 
 /// The write verb's facts: the graph handle and the open transaction the

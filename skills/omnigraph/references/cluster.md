@@ -36,11 +36,10 @@ selected root. Direct commands resolve a relative assertion against the source
 directory. Server submission requires an absolute assertion or no `storage:`.
 Omitting `storage:` never sends writes to the source directory.
 
-Registered direct targets pin storage URI and provider destination settings.
-S3 region, endpoint and addressing style, and Azure account/endpoint/emulator
-settings are destination identity; credentials continue through the appropriate
-provider chain. Ambient cloud settings cannot redirect a registered target.
-Inline storage addresses capture their provider settings for that invocation.
+Registered direct targets pin a local filesystem URI. Inline direct targets
+also accept only local paths and `file://` URIs. To operate a cloud-backed
+cluster through the CLI, select a registered server or managed target;
+cloud storage settings and credentials belong to the serving or embedded host.
 
 ## Direct bootstrap
 
@@ -68,18 +67,18 @@ not fencing for older binaries or raw storage tools. Azure writers also require
 
 ## Live server deployment
 
-Configure `production` as a server target with a `token`/`store` profile named
-`operator`; see [operator configuration](../../../docs/user/cli/targets.md).
+Configure `production` as a server target with `auth: {provider: token, source: {store: {}}}`;
+see [operator configuration](../../../docs/user/cli/targets.md).
 
 ```bash
-printf '%s' "$TOKEN" | omnigraph credentials set --target production --auth operator --stdin
+printf '%s' "$TOKEN" | omnigraph credentials set --target production --stdin
 omnigraph cluster plan --target production --config . --json
 omnigraph cluster apply --target production --config . --timeout 1800 --json
 omnigraph cluster status --target production --deployment-id ID --wait --timeout 1800 --json
 omnigraph query find_person --target production --params '{"name":"Alice"}' --json
 ```
 
-A named server target uses only its selected owner-local auth profile. Remote
+A named server target uses only its declared auth provider. Remote
 inline URLs and Unix socket targets are unsupported.
 The server derives the actor from authentication;
 `--as` on a server `plan` or `apply` only asserts it, and another actor is

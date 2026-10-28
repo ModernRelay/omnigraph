@@ -396,6 +396,46 @@ pub fn query_memory_limit() -> Option<u64> {
     QUERY_MEMORY_LIMIT.try_with(|bytes| *bytes).ok()
 }
 
+tokio::task_local! {
+    static CSV_SLICE_BYTES: usize;
+}
+
+/// Run `fut` with every `load csv` source it parses cut into slices of
+/// `bytes` instead of the planner's partition size. Test-only entry point;
+/// nothing in production sets it.
+pub async fn with_csv_slice_bytes<F>(bytes: usize, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    CSV_SLICE_BYTES.scope(bytes, fut).await
+}
+
+/// The slice size a test installed for this task, if any; `None` in
+/// production.
+pub fn csv_slice_bytes() -> Option<usize> {
+    CSV_SLICE_BYTES.try_with(|bytes| *bytes).ok()
+}
+
+tokio::task_local! {
+    static OVERWRITE_CHUNK_ROWS: usize;
+}
+
+/// Run `fut` with every `load csv` overwrite chunk holding `rows` rows before
+/// its Lance writer takes it, instead of Lance's file target (1 Mi rows).
+/// Test-only entry point; nothing in production sets it.
+pub async fn with_overwrite_chunk_rows<F>(rows: usize, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    OVERWRITE_CHUNK_ROWS.scope(rows, fut).await
+}
+
+/// The chunk row count a test installed for this task, if any; `None` in
+/// production.
+pub fn overwrite_chunk_rows() -> Option<usize> {
+    OVERWRITE_CHUNK_ROWS.try_with(|rows| *rows).ok()
+}
+
 /// Reservations and execution metrics observed by v2 acceptance tests.
 /// Holding a pool here keeps the observer alive without retaining reservations.
 #[derive(Clone, Debug, Default)]
@@ -780,6 +820,68 @@ pub async fn external_payload_read_stall() {
     }
     if let Ok(hold) = EXTERNAL_PAYLOAD_READ_HOLD.try_with(Clone::clone) {
         hold.park().await;
+    }
+}
+
+/// The task-local seams an external object payload read answers to: the
+/// stall, the hold and the merge-write probes. A load plan's source
+/// partitions read on blocking workers under tasks DataFusion spawns, none of
+/// which inherits a task local, so the statement's task captures these when
+/// it builds its query resources and the worker reinstalls them with
+/// [`with_external_read_seams`]. Production captures three unset lookups.
+#[derive(Clone, Default)]
+pub struct ExternalReadSeams {
+    stalled: bool,
+    hold: Option<ExternalPayloadReadHold>,
+    probes: Option<MergeWriteProbes>,
+}
+
+impl std::fmt::Debug for ExternalReadSeams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalReadSeams")
+            .field("stalled", &self.stalled)
+            .field("hold", &self.hold.is_some())
+            .field("probes", &self.probes.is_some())
+            .finish()
+    }
+}
+
+/// Capture the external read seams of the current task.
+pub fn capture_external_read_seams() -> ExternalReadSeams {
+    ExternalReadSeams {
+        stalled: EXTERNAL_PAYLOAD_READ_STALL.try_with(|_| ()).is_ok(),
+        hold: EXTERNAL_PAYLOAD_READ_HOLD.try_with(Clone::clone).ok(),
+        probes: MERGE_WRITE_PROBES.try_with(Clone::clone).ok(),
+    }
+}
+
+/// Run `fut` under the seams `capture_external_read_seams` took on another
+/// task; an unset seam installs nothing.
+pub async fn with_external_read_seams<F>(seams: ExternalReadSeams, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    let ExternalReadSeams {
+        stalled,
+        hold,
+        probes,
+    } = seams;
+    let probed = async move {
+        match probes {
+            Some(probes) => MERGE_WRITE_PROBES.scope(probes, fut).await,
+            None => fut.await,
+        }
+    };
+    let held = async move {
+        match hold {
+            Some(hold) => EXTERNAL_PAYLOAD_READ_HOLD.scope(hold, probed).await,
+            None => probed.await,
+        }
+    };
+    if stalled {
+        EXTERNAL_PAYLOAD_READ_STALL.scope((), held).await
+    } else {
+        held.await
     }
 }
 

@@ -13,6 +13,7 @@ use url::Url;
 
 pub(crate) mod args;
 mod auth;
+mod custody;
 pub(crate) mod data;
 mod deployment;
 mod lifecycle;
@@ -587,10 +588,42 @@ fn organization_id(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Service permissions are bounded display facts, never client-side authority.
+fn validate_service_permissions(permissions: &[String]) -> Result<()> {
+    if permissions.len() > 256
+        || permissions
+            .iter()
+            .any(|permission| !crate::helpers::valid_managed_identifier(permission, 128))
+        || permissions.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(Failure::protocol());
+    }
+    Ok(())
+}
+
+fn provider_timestamp(value: &str) -> Result<time::OffsetDateTime> {
+    if value.len() > 64 {
+        return Err(Failure::protocol());
+    }
+    time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .map_err(|_| Failure::protocol())
+}
+
+/// Validate the original observation window, without turning display data into a permit.
+fn provider_observation(observed_at: &str, expires_at: &str) -> Result<()> {
+    let observed = provider_timestamp(observed_at)?;
+    let expires = provider_timestamp(expires_at)?;
+    if expires <= observed || expires - observed > time::Duration::seconds(30) {
+        return Err(Failure::protocol());
+    }
+    Ok(())
+}
+
 struct Api {
     client: Client,
     origin: String,
     token: Option<String>,
+    credential: Option<crate::credential_sources::AcquiredCredential>,
     selection: Option<auth::Selection>,
     cluster: Option<(String, String)>,
 }
@@ -660,9 +693,19 @@ impl Api {
             client,
             origin,
             token,
+            credential: None,
             selection: None,
             cluster: None,
         })
+    }
+
+    fn with_credential(
+        origin: String,
+        credential: crate::credential_sources::AcquiredCredential,
+    ) -> Result<Self> {
+        let mut api = Self::new(origin, None)?;
+        api.credential = Some(credential);
+        Ok(api)
     }
 
     async fn authenticated(
@@ -744,12 +787,22 @@ impl Api {
             preserve_contents,
         } = limits;
         let url = self.url(path)?;
+        let mut request = self.client.request(method, url).timeout(timeout);
+        if let Some(key) = key {
+            request = request.header("Idempotency-Key", key);
+        }
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        // Serialization may take time. Check the captured credential only once
+        // the request is ready, without rereading its external source.
         let token = if let Some(selection) = &self.selection {
             Some(Box::pin(selection.credential(&self.origin)).await?)
+        } else if let Some(credential) = &self.credential {
+            Some(auth::acquired_bearer(credential, &self.origin)?.to_owned())
         } else {
             self.token.clone()
         };
-        let mut request = self.client.request(method, url).timeout(timeout);
         if let Some(token) = &token {
             let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
                 .map_err(|_| {
@@ -757,12 +810,6 @@ impl Api {
                 })?;
             value.set_sensitive(true);
             request = request.header(reqwest::header::AUTHORIZATION, value);
-        }
-        if let Some(key) = key {
-            request = request.header("Idempotency-Key", key);
-        }
-        if let Some(body) = body {
-            request = request.json(body);
         }
         let transport = || {
             Failure::new(
@@ -966,7 +1013,7 @@ pub(crate) async fn dispatch(
             if let Err(error) = reject_scope(cli).and_then(|()| binding.account()) {
                 return Some(Output::from_result(Err(error), args.json, 2));
             }
-            Some(organization::dispatch(binding, args, command, stderr).await)
+            Some(organization::dispatch(input, binding, args, command, stderr).await)
         }
         Command::Login {
             json,

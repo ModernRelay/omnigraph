@@ -29,6 +29,7 @@ pub(crate) struct VersionOutput {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ProtocolVersionsOutput {
+    pub(crate) studio: u32,
     pub(crate) target: u32,
     pub(crate) credential: u32,
     pub(crate) access: u32,
@@ -64,6 +65,7 @@ impl VersionOutput {
             commit: omnigraph_api_types::build::SOURCE_COMMIT,
             http_contract: omnigraph_api_types::HTTP_API_CONTRACT,
             protocols: ProtocolVersionsOutput {
+                studio: crate::targets::STUDIO_PROTOCOL,
                 target: crate::targets::TARGET_PROTOCOL,
                 credential: crate::targets::CREDENTIAL_PROTOCOL,
                 access: crate::targets::ACCESS_PROTOCOL,

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::aggregate::AggregateSpec;
-use crate::cost::{AccessPath, AntiJoinStrategy, ExpandMode, ExpandPolicy};
+use crate::cost::{AccessPath, AntiJoinStrategy, ExpandMode, ExpandPolicy, ValidateRemoval};
 use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
 use crate::logical::{
     ColumnRef, CsvSourceSpec, FragmentWriteSpec, KeyJoinKind, ScanSpec, ValidateSpec,
@@ -888,13 +888,14 @@ physical_nodes! {
         max_partitions: u32,
         max_workers: u32,
     } => "CsvSource" [];
-    /// The one validation over the whole delta, a pipeline breaker: every
-    /// check extracted in one pass per batch, each check's `access` saying
-    /// how its committed image is read after the last batch.
+    /// The one validation of the delta, each check's `access` saying how its
+    /// committed image is read and `removal` whether removed ids are found;
+    /// a pipeline breaker only while [`validate_streams`] is false.
     Validate {
         input: NodeId,
         table: String,
         checks: Vec<ValidateSpec>,
+        removal: ValidateRemoval,
         max_workers: u32,
     } => "Validate" [input: NodeId];
     /// The fragment sink: the validated delta, every input checked against
@@ -921,20 +922,46 @@ pub enum PipelineShape {
     Breaker,
 }
 
+/// Whether a validation judges every row as it passes, so its operator
+/// streams: a value, unique or cardinality check reads only what the sweep
+/// extracted, a swept endpoint check probes each row against sets built before
+/// the drain. A judged endpoint check, a retained-edge check or a removal scan
+/// reads the whole delta after the drain and makes the operator a breaker.
+pub fn validate_streams(checks: &[ValidateSpec], removal: ValidateRemoval) -> bool {
+    use omnigraph_compiler::ir::ValidateCheck;
+    removal == ValidateRemoval::None
+        && checks.iter().all(|spec| match &spec.check {
+            ValidateCheck::Value { .. }
+            | ValidateCheck::Unique { .. }
+            | ValidateCheck::Cardinality { .. } => true,
+            ValidateCheck::EdgeRi { .. } => spec.probe == Some(crate::cost::EndpointProbe::Swept),
+            ValidateCheck::RetainedEdges { .. } => false,
+        })
+}
+
 impl PhysicalNode {
     /// The node's [`PipelineShape`] over its streamed input (the one
     /// [`Self::collected_sides`] does not name). A source has no input to
     /// hold and a `FragmentWrite` is the pipeline's end, whose emission is
     /// its input's; neither is a cut. An `Expand` holds its paths only as a
     /// costed multi-hop traversal: one hop streams its pairs and a budgeted
-    /// traversal streams its frontier.
+    /// traversal streams its frontier. A `Validate` holds the delta only
+    /// while a check reads it whole after the drain ([`validate_streams`]).
     pub fn shape(&self) -> PipelineShape {
         match self {
             Self::Sort { .. }
             | Self::Aggregate { .. }
             | Self::AntiJoin { .. }
-            | Self::RankFuse { .. }
-            | Self::Validate { .. } => PipelineShape::Breaker,
+            | Self::RankFuse { .. } => PipelineShape::Breaker,
+            Self::Validate {
+                checks, removal, ..
+            } => {
+                if validate_streams(checks, *removal) {
+                    PipelineShape::Streaming
+                } else {
+                    PipelineShape::Breaker
+                }
+            }
             Self::Expand {
                 max_hops, policy, ..
             } => {
@@ -1524,10 +1551,12 @@ impl PhysicalPlan {
             PhysicalNode::Validate {
                 table,
                 checks,
+                removal,
                 max_workers,
                 ..
             } => {
                 let mut value = validate_json(table, checks);
+                value["removal"] = json!(removal);
                 value["max_workers"] = json!(max_workers);
                 value
             }
@@ -1580,12 +1609,24 @@ impl PhysicalPlan {
         let id = pipelines.len();
         pipelines.push(PipelineSpec {
             id,
+            partitions: self.source_partitions(&source),
             source,
             operators,
             sink: PipelineSink::Consumer,
             depends_on,
         });
         pipelines
+    }
+
+    /// The output partitions of a pipeline's source.
+    fn source_partitions(&self, source: &PipelineSource) -> u32 {
+        match source {
+            PipelineSource::Node(id) => match self.node(*id) {
+                Some(PhysicalNode::CsvSource { max_partitions, .. }) => (*max_partitions).max(1),
+                _ => 1,
+            },
+            PipelineSource::Streaming { .. } | PipelineSource::Tombstone(_) => 1,
+        }
     }
 
     /// [`Self::pipelines`] serialized for explain: per pipeline its `id`,
@@ -1610,6 +1651,7 @@ impl PhysicalPlan {
         json!({
             "id": pipeline.id,
             "source": self.source_json(&pipeline.source),
+            "partitions": pipeline.partitions,
             "operators": self.operators_json(&pipeline.operators),
             "sink": sink,
             "depends_on": pipeline.depends_on,
@@ -1793,6 +1835,7 @@ impl PhysicalPlan {
         let id = pipelines.len();
         pipelines.push(PipelineSpec {
             id,
+            partitions: self.source_partitions(&source),
             source,
             operators,
             sink: PipelineSink::Breaker(sink),
@@ -1817,6 +1860,7 @@ impl PhysicalPlan {
         let id = pipelines.len();
         pipelines.push(PipelineSpec {
             id,
+            partitions: self.source_partitions(&source),
             source,
             operators,
             sink: PipelineSink::Node(sink),
@@ -1854,6 +1898,10 @@ pub struct PipelineSpec {
     /// Position in [`PhysicalPlan::pipelines`], child pipelines first.
     pub id: usize,
     pub source: PipelineSource,
+    /// The output partitions of `source`, which every operator of the
+    /// pipeline keeps and its sink merges: a `CsvSource`'s `max_partitions`,
+    /// 1 for every other source.
+    pub partitions: u32,
     /// Operator node ids between `source` and `sink`, in run order.
     pub operators: Vec<NodeId>,
     pub sink: PipelineSink,

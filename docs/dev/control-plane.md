@@ -4,6 +4,16 @@ The cluster control plane turns a local declarative bundle into a durable applie
 
 ## Authority model
 
+Server telemetry is separate from deployment authority. The optional OTLP
+subscriber exports an explicit span allowlist with W3C request context; it
+does not export arbitrary dependency spans or protocol payloads. Owned reads
+and writes carry child spans through their existing process-owned futures.
+Exporter loss or shutdown does not alter native admission, publication, recovery
+or clean-exit evidence. JSON logs use the same restricted dependency-target
+filter as text logs. Configuration is in the
+[observability guide](../user/operations/observability.md); telemetry and log-filter
+unit tests own context propagation, redaction and the actual OTLP transport.
+
 There are three distinct views:
 
 1. **Desired configuration** — `cluster.yaml` and referenced files in an operator workspace.
@@ -409,7 +419,7 @@ views with new epochs. Uncertain effects use existing process containment.
 Activation identity is installed in the same immutable registry snapshot as
 serving bindings: canonical root, process incarnation, original ID/input digest,
 achieved revision and config digest. The durable achieved receipt stays unchanged;
-there is no second ledger write after activation. `GET /cluster/deployments/{id}`
+there is no second ledger write after activation. `GET /cluster/deployments/{deployment_id}`
 reports active only for that exact current identity while its affected bindings
 are ready under their installed schema contracts, deleted entries are absent,
 and process admission remains open. An unrelated blocked graph does not invalidate
@@ -649,9 +659,19 @@ run every five seconds and access refuses at the original 300-second snapshot
 or token expiry. The exact format and limits are in
 [Identity credentials and applied policy authorization](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients).
 
-This profile enables `/.well-known/oauth-protected-resource` and `/mcp`. MCP
-uses the official Rust SDK and the existing stored-query/discovery handlers.
-The initial tools are read-only; invocation checks the stored query kind and
-the same Cedar policy as HTTP. A registered resource or listed tool is never
-a permission grant. Static-token deployments and the native signed-token
-profiles retain their existing behavior.
+The server mounts `/mcp` whenever it has a bearer credential source: static
+tokens, signed data tokens or OIDC. OIDC additionally enables
+`/.well-known/oauth-protected-resource` and the metadata path advertised in the
+authentication challenge. Ad-hoc reads and write tools require their separate
+boot opt-ins; every invocation uses the same handlers and policy as HTTP.
+A registered resource or listed tool is never a permission grant.
+
+`omnigraph-mcp` owns the SDK integration, tool/resource catalog, settings,
+argument decoding, result formatting and response deadlines. The server adapter
+owns authentication, OAuth metadata, handler dispatch and admission, retaining
+execution ownership when the caller stops waiting. It also supplies the canonical
+`ApiError` projection for protocol refusals and handler failures, including the
+unknown-effect disposition when an admitted write's result cannot be delivered.
+The protocol crate wraps these bodies without a second error-code registry.
+Both transports share one listener and serving lifecycle. The supported tools
+and limits live in the [MCP guide](../user/operations/mcp.md).

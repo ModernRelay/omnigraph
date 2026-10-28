@@ -154,6 +154,20 @@ pub fn managed_command(config: &Path, origin: &str, target: &str) -> Command {
     command
 }
 
+pub fn write_managed_data_target(config: &Path, origin: &str, endpoint: &str) {
+    use std::io::Write;
+    write_managed_target(config, origin);
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(managed_home(config).join("config.yaml"))
+        .unwrap();
+    writeln!(
+        file,
+        "    endpoint: {endpoint}\n    default_graph: knowledge"
+    )
+    .unwrap();
+}
+
 pub fn managed_cli(config: &Path, origin: &str) -> Command {
     let mut command = managed_command(config, origin, "managed-test");
     command.arg("cluster");
@@ -395,7 +409,7 @@ impl KeyedServer {
         fs::write(
             home.path().join("config.yaml"),
             format!(
-                "version: 1\ntargets:\n  {KEYED_SERVER_NAME}:\n    kind: server\n    endpoint: {}\n    default_auth: fixture\n    auth:\n      fixture:\n        provider: token\n        source: {{env: {KEYED_SERVER_TOKEN_ENV}}}\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{}'}}\n",
+                "version: 1\ntargets:\n  {KEYED_SERVER_NAME}:\n    kind: server\n    endpoint: {}\n    auth:\n      provider: token\n      source: {{env: {KEYED_SERVER_TOKEN_ENV}}}\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{}'}}\n",
                 yaml_string(url), tls_gateway::ca_path().display()
             ),
         )

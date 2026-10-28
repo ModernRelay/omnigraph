@@ -10,7 +10,7 @@ version axes. Never derive one axis from another.
 |---|---|---|
 | Release | Published workspace artifacts move in lockstep. | Workspace manifests, lockfile, generated metadata, release automation. |
 | CLI ↔ server wire | One v0.14 contract; coordinated client/server upgrades. Exact request admission and CLI discovery/response validation. | Shared contract header, DTOs, HTTP refusal tests and OpenAPI drift tests. |
-| Graph storage | Closed stamp range `[MIN_SUPPORTED, CURRENT]`, independent of system column vintage; a standalone graph at stamp 8, 9 or 13 is converted by the offline `omnigraph upgrade`, a graph at any other stamp is rebuilt by export and load; no open-time migration. | Main-manifest stamp guard on both bounds. |
+| Graph storage | Closed stamp range `[MIN_SUPPORTED, CURRENT]`, independent of system column vintage; explicit offline conversion, stamp-only upgrade and rebuild routes follow the [support matrix](#storage-upgrade-support-matrix), never open-time migration. | Main-manifest stamp guard on both bounds. |
 | Lance dependency and file format | One deliberately pinned Lance family and explicit stable file version. | Lockfile, write parameters, and Lance surface guards. |
 
 ## Current storage contract
@@ -414,6 +414,14 @@ independent of package and graph-storage versions; it establishes neither suppor
 for another server increment nor permission to replay a write. No old-client
 fallback or negotiation framework is supported. New wire changes update shared
 DTOs, the contract decision, OpenAPI and transport qualification together.
+
+The released 0.14 contract replaces earlier prerelease shapes that used the
+same header value. Upgrade prerelease CLI, server and integrations together
+and regenerate SDKs; the header cannot distinguish those older shapes.
+The [HTTP API guide](http-api.md#compatibility-and-coverage) owns the field and
+SDK-name changes. The CLI access-report protocol is 2. MCP keeps its own
+protocol negotiation and tool schemas; its endpoint does not use the HTTP header.
+The [migration note](../../changelog.d/http-contract-014.breaking.md) owns the steps.
 
 Server URLs identify the service root, preserving any proxy prefix. Migrate
 graph-qualified URLs to that root plus `--graph`, `default_graph` or alias `graph`;

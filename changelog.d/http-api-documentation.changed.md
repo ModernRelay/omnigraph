@@ -1,0 +1,1 @@
+- The OpenAPI specification documents parameter bounds, graph catalogue routing, and required error responses more completely. Convention and coverage checks prevent new documentation gaps.

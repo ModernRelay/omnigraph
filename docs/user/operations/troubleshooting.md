@@ -28,8 +28,8 @@ for `not_retained`.
 | Status | Meaning | Usual action |
 |---:|---|---|
 | 400 | Invalid request, query, schema, configuration, or external-Blob policy, including an update that must carry a stored external Blob reference the policy does not admit | Correct the request; retrying unchanged will fail again. For a stored reference, assign that property in the same update (a new value or null), or admit its base in the policy |
-| 401 | Missing or invalid bearer token | Supply a token configured by the server. The CLI sends a token only to the server it is keyed to; see [server credentials](../cli/index.md#use-a-server) |
-| 403 | The resolved actor is not authorized | Change policy or use an authorized identity |
+| 401 | Missing or invalid bearer token. `WWW-Authenticate` says which: `error="invalid_token"` when the server refused the token sent, and `resource_metadata` when the server accepts OAuth sign-in | Supply a token configured by the server. The CLI sends a token only to the server it is keyed to; see [server credentials](../cli/index.md#use-a-server) |
+| 403 | The resolved actor is not authorized (`forbidden`), or a valid OIDC token's subject is not in the server's admission file (`not_admitted`) | For `forbidden`, change policy or use an authorized identity. For `not_admitted`, signing in again cannot help: the server's operator must admit the identity |
 | 404 | Graph, query, branch, entity, or route is unavailable | Check the name and applied cluster revision; stored-query denials may also appear as 404 |
 | 405 | The path is served, but not with this method (`method_not_allowed`) | Use a method the `Allow` header lists |
 | 408 | The request body did not arrive before its deadline (`request_timeout`) | Send the request again; nothing was admitted |
@@ -42,7 +42,7 @@ for `not_retained`.
 | 424 | An allowed external Blob source could not be read | Restore source availability or correct its URI/credentials |
 | 429 | Server or per-actor admission limit reached | Use the whole-command disposition below before retrying; preserve `Retry-After` |
 | 500 | Server or stored-data integrity failure | Check server logs; do not assume partial success. A Blob delivery, change-route or streamed-response failure logs its error class (`error_variant`, and `storage_kind` for a storage failure), never its storage path; see below |
-| 503 | Admission is closed or the graph is not served (`service_unavailable`, `graph_unavailable`, both with `Retry-After`), or a published schema change requires completion (`recovery_required`) | Inspect the structured error; generic 503 is not permission to repeat a write |
+| 503 | Admission is closed, the server's OIDC identity snapshot has expired, or the graph is not served (`service_unavailable`, `graph_unavailable`, both with `Retry-After`), or a published schema change requires completion (`recovery_required`) | Inspect the structured error; generic 503 is not permission to repeat a write |
 
 A `GET` or `HEAD /blob` 500 logs `error_kind="blob_pre_header_internal"` with a
 `stage`. `target` is a failure resolving a snapshot target for a policy-gated
@@ -135,18 +135,19 @@ exit follows from the disposition:
 
 Maintenance commands (`init`, `upgrade`, `optimize`, `rebuild-full-text-indexes`,
 `repair`, `cleanup`, `schema upgrade-system-columns`), `cluster`, `policy`,
-`target`, `credential` and the managed commands keep their own exits for now:
-their exit 1 does not by itself say that nothing changed, so read their report.
+`target`, `credentials`, `mcp`, `studio` and the managed commands keep their own exits for now:
+their exit 1 does not by itself say that nothing changed, so read their report;
+`mcp` answers each relayed request with its own disposition.
 
 A served write refused with `401` `unauthorized`, `403` `forbidden` or `400`
 `api_contract_mismatch` exits 1 with `effects: none`, and `action: refresh` for
 the policy denial and `fix` for the others. The server answers these before it admits the write:
 bearer authentication, then the API contract header, then policy. Fix the
 credential, the policy grant or the client before running the command again.
-When the CLI sent no credential, the refusal also carries `missing_credential`:
-`server` names a declared server with no stored token, or `unbound` names an
-address under no declared server, and `hint` says how to bind one. The server's
-`error` text is unchanged.
+If a server target with `auth: {provider: anonymous}` receives a 401, the CLI
+adds `missing_credential` with `target`, `auth: "anonymous"` and a setup `hint`.
+A missing credential for a token or exec provider refuses locally before any
+HTTP request. The server's `error` text is unchanged.
 The status counts only with its matching `code` in a response that carries the
 server's API contract header: a bare `403` from a proxy stays `unknown` with
 `reconcile`, and a refusal that also reports recovery work stays `recover`.
@@ -198,9 +199,12 @@ A `409` is not one universal retry signal:
   root or deliberately use the command's destructive option when appropriate.
 
 Writes are atomic at the graph-commit boundary. A normal validation, conflict,
-or limit error does not mean that a subset became visible. A recovery-required
-error is different: a schema change is already published and only its schema
-files remain to be installed, so reopen read-write rather than retrying it.
+or limit error does not mean that a subset became visible. When
+`recovery_required` identifies an already published schema change, its table
+pins and accepted schema contract are durable together; only the process
+view may still need refresh. Reopen the graph read-write or restart its
+server rather than replaying the change. Legacy recovery sidecars require
+the original release, as described under [maintenance failures](#maintenance-failures).
 
 ## Storage-format mismatch
 

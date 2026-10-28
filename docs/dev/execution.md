@@ -1021,17 +1021,31 @@ All load modes share the mutation publisher and recovery protocol:
 
 A `load csv` overwrite is the first write plan: the planner routes
 `Operation::Load` to the engine, which lowers `CsvSource → Validate →
-FragmentWrite` to `CsvSourceExec` (one reader over the captured source),
-`ValidateExec` (a pipeline breaker: one pass over the held delta extracts what
-the value, uniqueness and cardinality checks need, the endpoint check reads the
-held batches' endpoint columns in place against each endpoint table's committed
-key set, then the checks are judged in refusal order against the committed
-image under each check's access) and DataFusion's `DataSinkExec`
+FragmentWrite` to `CsvSourceExec` (up to `max_partitions` readers over the
+captured source, each claiming the next record-aligned 8 MiB slice and tagging
+its batches with the slice index), `ValidateExec` (every input partition
+drained at once; a streaming operator when the planner's `validate_streams`
+says no check reads the whole delta after the rows are in, each batch sent on
+to the sink right after its sweep with its slice tag, the judgment after the
+drain the stream's last word and the refusal the statement reports even when
+the sink's keyed-write check met the same repeated key in a fragment first
+(the sink follows its input to that verdict before deleting what it wrote);
+otherwise a pipeline breaker that holds the batches and
+sorts them back into slice order: one pass over the delta extracts what
+the value, uniqueness and cardinality checks need; the endpoint checks probe
+the batches' endpoint columns against each endpoint table's committed key set,
+on the parse partitions as the batches arrive when the plan marks them
+`swept` (both endpoints `scan` over node types keyed by one `I32`, `I64` or
+`U32` `@key`; the sets
+load on a worker beside the parse, once per table, and the merge keeps the
+earliest miss), in place over the held delta after the drain when it marks
+them `judged`; then the checks are judged in refusal order against the
+committed image under each check's access) and DataFusion's `DataSinkExec`
 over `LanceFragmentSink`, which stages the fragments through the mutation
 staging and never commits. The attempt then commits the staged transaction
 detached and publishes once, the epilogue every write shares. Append, merge
-and JSONL loads keep the keyed path below; every load operator runs one
-worker until the parallel source lands.
+and JSONL loads keep the keyed path below; the source is the one wide load
+operator, the validation and the sink run one stream each.
 
 Integer endpoint sets admit their input capacity, directory, retained keys,
 build offsets and parsed probe buffer to `query_memory_bytes` before allocation.
@@ -1041,6 +1055,29 @@ these sets. Optional statement read caches are released before integer endpoint
 checks so their reservation cannot crowd out mandatory set allocations.
 Buckets larger than 32 keys are sorted and searched by binary
 search, bounding lookup work even when integer keys share a hash prefix.
+
+Once the sets are admitted, `ValidateExec` carves the run's load budget
+(`operators/load_budget.rs`) from the room `query_memory_bytes` leaves past
+the pool's total: one share per parse partition (52 of 64 parts between
+them), one for the unique holders (8, the partitions' when the plan sizes
+none), four uncharged for lease bookkeeping and the fragment sink's open
+chunks, a copy of rows each partition's reader already charged. A `WorkMemory`
+in a share (`in_share`) charges the share and then grows the pool infallibly,
+so the pool keeps counting beside the shares; the sink's `WorkMemory` is in the
+`Sink` class, which the pool counts and never refuses. A partition's share is
+charged only by its reader thread, which, once the slice's decode scratch is
+released, charges each decoded batch's bytes a second time (`batch_bytes`, the
+copy the sink's chunker will hold of it, since the breaker's re-materialized
+output is new buffers the registry cannot dedup) and each batch's validation
+facts ahead of the sweeper (`admit_facts_ahead`), so neither stacks on that
+transient, and the holders' share only by
+partition 0's sweeper, so a refusal and its `actual` (`LoadBudget::admitting_limit`,
+the smallest limit whose share admits the demand with the pool as it was at
+the carve) follow one thread's own sequence. A share under the admission floor (the partition's source admission
+plus one slice) refuses at the carve, before any partition is polled; a share
+refusal in a run of several partitions marks the source refused so the loader
+reruns it single-partitioned. Lease metadata and registry growth under a share
+are counted on the pool and never refused.
 
 Mutation insert/update and keyed Load retain the per-table limit of 8,192 rows.
 An immutable `WriteBudget` captures the session's `write_max_bytes` (default
@@ -1054,7 +1091,10 @@ materialized batches are checked again before staging.
 
 Mutation delete, cascading delete and Overwrite replacement removal scan IDs
 incrementally under their own `write_max_bytes` allowance per operation,
-charging UTF-8 bytes plus one `String` slot before copying. These checks precede
+charging UTF-8 bytes plus one `String` slot before copying. An Overwrite scans
+for removed IDs only when its plan's `removal` is `scan`, a populated node
+target an edge type references; under `none` (an edge target, an unreferenced
+node target, an empty table) nothing is scanned or charged. These checks precede
 the operation's data fragments and publication. They do not bound JSON
 containers, simultaneous conversion copies, predicate/validation state or
 native scan buffers. Overwrite's bulk input retains its separate checks and is

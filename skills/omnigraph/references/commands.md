@@ -12,6 +12,8 @@
 - Maintenance (optimize, full-text rebuild, cleanup)
 - Stored queries
 - Operator config & credentials
+- MCP for agents (mcp)
+- Open Studio (studio)
 - Addressing a graph
 - Output formats and positions · health check
 - Organization administration (members and invitations)
@@ -49,15 +51,17 @@ prints the exact flags of the installed binary.
 | `lint` | — | Validate `.gq` source against a schema or a graph |
 | `queries` | `validate` `list` | Check a cluster's stored queries; list a cluster's or a served graph's |
 | `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `create` `list` `members list` `pull` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; the target kind selects the backend |
-| `organization` | `members list` `members apply` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | Manage the selected organization's members and invitations; requires a profile; `org` is an alias |
+| `organization` | `members list` `members set` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | Manage the selected organization's members and invitations; requires a profile; `org` is an alias |
 | `policy` | `validate` `test` `explain` | Validate or evaluate a cluster's applied policy |
 | `embed` | — | Generate, clean or refresh seed embeddings |
-| `login` | — | Register a profile or sign in to its `omnigraph` profile |
+| `login` | — | Create a profile with `--create-profile`, or sign in to its `omnigraph` auth provider |
 | `logout` | — | Clear the selected platform session and report revocation |
 | `target` | `list` `inspect` `add` `refresh` `remove` | Manage resource bindings |
 | `credentials` | `set` `status` `remove` `export` | Explicit owner/profile custody and pipe-only access export |
-| `config` | `validate` `rename-profile` `rename-target` `rename-auth` `recover-rename` `recover-operations` | Validate/edit operator bindings or preserve legacy operation evidence |
+| `config` | `validate` `rename-profile` `rename-target` `recover-rename` `recover-operations` | Validate/edit operator bindings or preserve legacy operation evidence |
 | `access` | — | Say who you are at a target and which actions its policy grants, graph-wide and on a branch |
+| `mcp` | — | Relay an agent's stdio MCP to an existing server or managed target's `/mcp`, bound to one graph; read-only tools unless `--write` |
+| `studio` | — | Open Omnigraph Studio on an existing server target through an `omnigraph-studio://open` link, and print the link |
 | `skill` | `export` `show` | Export or print this skill as built into the CLI |
 | `version` | — | Print the CLI version, the HTTP contract it speaks and the storage formats it writes and serves; `--json` prints them as one object |
 
@@ -348,7 +352,7 @@ omnigraph queries list --target prod --graph knowledge --json # a server's catal
 registry against its applied schema. `list` reads a direct cluster root, where
 `--graph` may select one graph, or one served graph, which a server target
 selects with `--graph` or its `default_graph`; there `--json` prints the body of
-`GET /graphs/{id}/queries`.
+`GET /graphs/{graph_id}/queries`.
 Distinct from `lint`, which validates authoring source. See
 [`stored-queries.md`](stored-queries.md).
 
@@ -361,19 +365,20 @@ Secrets never belong in YAML. Login/logout are platform-session operations;
 static tokens use explicit owner/profile commands:
 
 ```bash
-omnigraph credentials set --target production --auth operator --stdin < /secure/token-input
-omnigraph credentials status --target production --auth operator --json
-omnigraph credentials remove --target production --auth operator
-omnigraph credentials export --target production --auth operator | consumer
+omnigraph credentials set --target production --stdin < /secure/token-input
+omnigraph credentials status --target production --json
+omnigraph credentials remove --target production
+omnigraph credentials export --target production | consumer
 omnigraph target list --json
 omnigraph target inspect production --resolved --json
 omnigraph config validate --json
-omnigraph access --target production --auth operator --branch main --json
+omnigraph access --target production --branch main --json
 ```
 
 `access` reports the server-resolved actor and allowed graph actions; it is the
 identity check, with no separate `whoami` command. Direct targets use `--as`
-or no actor. Managed targets refuse `access`. See
+or no actor. JSON uses `protocol: 2` and `actor_id`, null without an actor;
+update scripts that read protocol 1's `actor`. Managed targets use their issued resource identity. See
 [access scope and policy semantics](../../../docs/user/cli/targets.md#what-you-may-do-at-a-target).
 
 Set/remove require `token`/`store`; an existing entry needs `--replace`.
@@ -384,10 +389,11 @@ pipe, not terminal/file output, and never exports refresh credentials.
 --cluster ID` uses authenticated discovery. `target refresh NAME` explicitly
 refreshes a managed endpoint without changing its incarnation. `target remove
 NAME` keeps credentials/journals and requires remaining references to be valid.
-`target register` aliases `add`. Onboarding accepts `--organization ID` alongside
-`--register NAME` and optional `--api URL`. Bare login proposes profile name
-`omnigraph` and API `https://platform.omnigraph.dev`. Login rejects `--auth`;
-`login --profile NAME` selects an existing profile.
+Onboarding requires `login --create-profile NAME`, with optional `--organization ID`
+and `--api URL` (default `https://platform.omnigraph.dev`). Bare login uses
+`defaults.profile`; `login --profile NAME` selects an existing profile. Missing
+profiles never cause implicit creation, and creation refuses existing names.
+Managed target add uses `--profile NAME` or `defaults.profile`.
 `config recover-operations --source DIR --profile NAME [--json]`
 preserves matching legacy folder evidence; it neither converts config nor submits
 operations. See the [upgrade reference](../../../docs/user/cli/targets.md#upgrade-from-the-old-format).
@@ -397,7 +403,6 @@ Rename commands preserve custody and update references/defaults:
 ```bash
 omnigraph config rename-profile work company
 omnigraph config rename-target production live
-omnigraph config rename-auth server standalone operator administrator
 omnigraph config recover-rename --operator-config /path/to/config.yaml
 omnigraph login --profile company --replace-principal NEW_PRINCIPAL_ID
 ```
@@ -406,16 +411,50 @@ Rename/recover-rename have no `--json`. Recover an interrupted rename against th
 same operator file; a conflicting later edit refuses. Principal replacement
 requires an existing profile or managed target, verifies the
 **new** principal ID, and invalidates derived credentials. It conflicts with
-onboarding `--register`, `--api` and `--organization`.
+onboarding `--create-profile`, `--api` and `--organization`.
+
+## MCP for Agents
+
+```json
+{"command": "omnigraph", "args": ["mcp", "--target", "staging", "--graph", "knowledge"]}
+```
+
+`omnigraph mcp` speaks MCP on stdio for an agent that starts its tools as a
+child process, relaying every message to an existing server or managed target's `/mcp`
+with the target's credential, which the agent never sees. Managed targets
+exchange their pinned profile's credential for a resource identity. It is bound to one
+graph (`--graph` or `default_graph`): calls that omit `graph` get it, and calls
+or resource URIs naming another graph are refused. Without `--write` only tools
+the server annotates read-only are listed and admitted; the server lists write
+tools only with `--mcp-allow-writes`. On server targets, `--as` asserts the actor
+on every request; managed targets refuse `--as`. Direct targets refuse with
+`target_kind_unsupported`; the
+bridge never starts a server. A lost answer is never resent: an
+`outcome_unknown` error means read the target and reconcile before replaying.
+
+## Open Studio
+
+```bash
+omnigraph studio --target staging --graph knowledge --json
+```
+
+`omnigraph studio` opens OmniGraph Studio on an existing server target with an
+`omnigraph-studio://open?target=NAME&binding=…&home=…[&graph=G]` link, prints
+the link and exits. It sends no request and reads no credential; Studio
+resolves the target itself and refuses a link whose `binding` or `home`
+digest differs from what `target inspect NAME --json` reports in its own
+operator home. Direct and managed targets refuse with
+`target_kind_unsupported`. Where nothing opens Studio's links it prints the
+link and refuses with `studio_unavailable`; it never opens a browser. See
+[Open Studio](../../../docs/user/cli/studio.md).
 
 ## Addressing a Graph
 
 Use `--target NAME` or `defaults.target` for resource operations and
 `--profile NAME` or `defaults.profile` for account operations; selectors
 are mutually exclusive. Managed targets use their pinned profile; global/default
-profiles cannot override it, and managed `--auth` is rejected. Standalone
-`--auth` then `default_auth` selects an entry; without either, refuse even
-with one entry. No last-used identity supplies selection.
+profiles cannot override it. Standalone targets own one auth provider; different
+identities use different targets. There is no `--auth` selector or last-used identity.
 `--config DIR` supplies deployment source and never routes a command.
 
 Direct graph/root targets use local files only. Inline local paths and `file://`
@@ -447,7 +486,7 @@ For params:
 - `jsonl` — NDJSON, one per line, with metadata line first
 - `json` — pretty `ReadOutput` envelope (metadata, columns, and rows); the `rows` array is printed compact and verbatim
 
-`--format arrow` appears in `--help` but 0.12.0 has no Arrow output: it always
+`--format arrow` appears in `--help` but the CLI has no Arrow output: it always
 fails with "has no text rendering". Do not use it, or set it as
 `defaults.output`.
 
@@ -473,7 +512,7 @@ its `status`, the booted applied digest, ledger revision/CAS, the registered,
 ready, loading and blocked graph counts and shutdown grace. It returns `503`
 while a graph is still loading, when a nonempty inventory has no ready graph,
 and once draining starts. Readiness is not proof that every configured graph
-is healthy; authorized `graphs list --target <name|url> --json` returns one
+is healthy; authorized `graphs list --target NAME --json` on a registered target returns one
 `graphs` list with each graph's `state` and `action`, blocked graphs included.
 
 ## Organization Administration
@@ -483,15 +522,23 @@ Use a profile for `organization` (`org`):
 ```bash
 omnigraph organization members list --profile work --json
 omnigraph organization invitations send person@example.com --profile work --idempotency-key invite-person
-omnigraph organization members apply member.yaml --profile work --idempotency-key enroll-person --json
-omnigraph organization members offboard USER_ID --profile work --expected-version 4 --idempotency-key offboard-person --json
+omnigraph organization members set person@example.com --profile work --role member --idempotency-key role-person
+omnigraph organization members offboard person@example.com --profile work --idempotency-key offboard-person --json
 ```
 
-The caller needs `members_manage`. Patch organization IDs must match the profile.
-Invitation/admission changes do not grant graph permissions. Deploy Cedar
+The caller needs current provider `members_manage` permission. WorkOS owns
+organization membership and service roles; applied cluster configuration owns
+graph and deployment permissions. No local enrollment or member-patch command
+is required. Member operations accept an email or exact user ID; role assignment
+requires an existing active member and a configured service-role slug. Invitation
+resend/revoke accepts email or exact invitation ID. Optional
+`--expected-membership` asserts an exact offboarding membership,
+or `absent` only to finish cleanup after that membership is gone. Deploy Cedar
 revocation before offboarding and verify denial with an existing data credential.
 Writes require exact idempotency keys and uncertain outcomes must be reconciled;
-a partial offboard stays partial on replay. See [team administration](../../../docs/user/cli/managed-team.md).
+a partial offboard stays partial on replay. Keep the same operator home and profile:
+the CLI retains the resolved request before sending and never resolves its
+subject again on a same-key retry. See [team administration](../../../docs/user/cli/managed-team.md).
 
 ## Cluster Control Plane
 

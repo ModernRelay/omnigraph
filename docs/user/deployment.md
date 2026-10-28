@@ -2,7 +2,7 @@
 
 OmniGraph can keep a cluster on a local filesystem, S3-compatible object
 storage, or Azure Blob Storage. The server always boots from one cluster root
-and exposes its ready applied graphs under `/graphs/{id}/…`; use
+and exposes its ready applied graphs under `/graphs/{graph_id}/…`; use
 `--require-all-graphs` when any blocked graph must fail startup.
 
 Servers use the v0.14 HTTP contract and open graph storage formats v14 to v16. The
@@ -68,7 +68,7 @@ stored-query changes through this transition; a proved pre-effect refusal restor
 the unchanged views. See [live deployment](clusters/index.md#deploy-without-restarting).
 Ready entries use `none`. There is no separate `quarantined` list or automatic startup retry.
 
-`GET /cluster/deployments/{id}` reports `active` only when this process has installed
+`GET /cluster/deployments/{deployment_id}` reports `active` only when this process has installed
 the exact deployment and all its graph bindings are ready. Loading, blocked graphs,
 partial convergence and shutdown keep it false; a restart must verify its bindings
 again. Successful apply alone is not activation, which never rewrites the durable
@@ -77,8 +77,9 @@ achieved result or receipt.
 Known loading, blocked or transitioning graphs return 503 (`graph_unavailable`) to callers authorized to
 read `main` or list the management inventory; other callers cannot use this response to discover
 them. Unknown graphs return 404. A 503 does not authorize replaying a write.
-`omnigraph graphs list --target <name|url>` displays graph ID, state and URI;
-`--json` preserves the full inventory fields. Minimal discovery remains IDs/names only.
+`omnigraph graphs list --target NAME` displays graph ID, state and URI for a
+registered server or managed target. `--json` preserves the full inventory
+fields. Minimal discovery remains IDs/names only.
 
 Admitted writes and reads with fully accepted request bodies retain capacity
 until execution finishes, even after client disconnect. Writes include optional
@@ -106,7 +107,7 @@ termination grace longer than this value; a cutoff is crash-equivalent for the
 work it interrupts, and the next open recovers it as after any crash.
 On local storage and S3, the server also closes its storage scope, waits for
 accepted graph and control writes, and releases its own cluster admission.
-The next server can start normally with the same `--target`. An initial
+The next server can start normally with the same `--cluster` root. An initial
 `--bootstrap-handoff` receipt is only for the first process; omit it on later
 starts. The data, history and applied configuration remain in place.
 

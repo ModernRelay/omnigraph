@@ -3,16 +3,19 @@
 
 pub mod api;
 mod blob_transport;
+mod challenge;
 mod deployment;
 mod export_transport;
 mod extract;
 mod handlers;
 mod http_contract;
+mod http_operations;
 mod ingress;
 mod mcp;
 pub mod operations;
 mod redacted_cause;
 mod settings;
+pub mod telemetry;
 use extract::{ApiJson, ApiPath, ApiQuery};
 use handlers::*;
 use settings::*;
@@ -52,16 +55,16 @@ use api::{
     BranchCreateRequest, BranchDeleteOutput, BranchListOutput, BranchMergeOutput,
     BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput, CommitListQuery, ErrorCode,
     ErrorOutput, ExportRequest, GraphBatchLoadOutput, GraphBatchLoadQuery, GraphDiscoveryEntry,
-    GraphDiscoveryResponse, GraphInfo, GraphListResponse, HealthOutput, IF_ACTOR_HEADER,
-    IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
-    QueriesCatalogOutput, QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput, SnapshotQuery,
+    GraphDiscoveryOutput, GraphInfo, GraphListOutput, HealthOutput, IF_ACTOR_HEADER, IngestOutput,
+    IngestRequest, InvokeStoredQueryOutput, InvokeStoredQueryRequest, QueriesCatalogOutput,
+    QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput, SnapshotQuery,
     graph_batch_load_receipt_output, ingest_receipt_output, snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Extension, OriginalUri, Request, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -85,7 +88,6 @@ use sha2::{Digest, Sha256};
 use std::io::{self, Write};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
-use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use utoipa::OpenApi;
@@ -112,6 +114,20 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
     info(
         title = "Omnigraph API",
         description = "HTTP API for the Omnigraph graph database",
+    ),
+    tags(
+        (name = "access", description = "Actions available to the authenticated actor"),
+        (name = "blobs", description = "Graph Blob values and conditional byte delivery"),
+        (name = "branches", description = "Graph branches and merges"),
+        (name = "changes", description = "Bounded graph differences and change feeds"),
+        (name = "cluster", description = "Cluster deployment planning and execution"),
+        (name = "commits", description = "Graph commit history and publication"),
+        (name = "health", description = "Process health and readiness probes"),
+        (name = "management", description = "Server graph inventory and OAuth resource metadata"),
+        (name = "mutations", description = "Graph mutations and data loading"),
+        (name = "queries", description = "Inline and stored queries, and graph exports"),
+        (name = "schema", description = "Accepted graph schemas"),
+        (name = "snapshots", description = "Coherent graph snapshot metadata"),
     ),
     paths(
         mcp::resource_metadata,
@@ -155,14 +171,14 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_changes_feed,
         handlers::server_changes_baseline,
     ),
-    components(schemas(api::BlobEntityKind, api::ChangeBaselineRecord, api::ChangeErrorOutput)),
+    components(schemas(api::EntityKind, api::CommitListing, api::ChangeBaselineRecord, api::ChangeErrorOutput)),
     modifiers(&SecurityAddon),
 )]
 pub struct ApiDoc;
 
 /// The canonical served OpenAPI shape (RFC-011 cluster-only): the static
 /// `ApiDoc` with every protected path nested under `/graphs/{graph_id}/…`
-/// and `cluster_`-prefixed operation ids. `/healthz` and `/graphs` stay
+/// and inventory-derived operation ids. `/healthz` and `/graphs` stay
 /// flat. This is the single source of nesting — both the runtime
 /// `server_openapi` handler and the committed `openapi.json` derive from
 /// it, so the published spec can never describe routes the server does
@@ -520,6 +536,9 @@ enum ApiErrorDetails {
     FullTextIndexRebuildRequired(api::FullTextIndexRebuildRequiredOutput),
     FullTextIndexRequired(api::FullTextIndexRequiredOutput),
     Diagnostic(api::DiagnosticOutput),
+    /// Whether a 401 followed a presented bearer credential. The challenge
+    /// layer renders it as `WWW-Authenticate`; the body carries nothing.
+    Unauthenticated(challenge::Unauthenticated),
 }
 
 /// What a detail says about the operation that failed with it.
@@ -548,7 +567,8 @@ impl ApiErrorDetails {
             | Self::PreconditionFailure(_)
             | Self::BlobPreconditionFailure(_)
             | Self::BranchStartRefusal(_)
-            | Self::Diagnostic(_) => DetailClass::Refusal,
+            | Self::Diagnostic(_)
+            | Self::Unauthenticated(_) => DetailClass::Refusal,
             Self::RecoveryRequired(_)
             | Self::FullTextIndexRebuildRequired(_)
             | Self::FullTextIndexRequired(_) => DetailClass::Recovery,
@@ -1060,7 +1080,14 @@ impl AppState {
         snapshot.any_per_graph_policy
     }
 
-    fn authenticate_bearer_token(&self, provided_token: &str) -> Option<AuthenticatedActor> {
+    /// The actor a bearer token resolves to: a static token, then a signed
+    /// data token, then OIDC. Only OIDC tells a refused token from an
+    /// unadmitted or temporarily unverifiable identity; every other miss is
+    /// an invalid token.
+    fn authenticate_bearer_token(
+        &self,
+        provided_token: &str,
+    ) -> std::result::Result<AuthenticatedActor, oidc_identity::OidcRefusal> {
         // Hash the incoming token and compare against every stored digest in
         // constant time. Iterate all entries unconditionally so total work —
         // and therefore response timing — doesn't depend on which slot matches.
@@ -1071,20 +1098,27 @@ impl AppState {
                 matched = Some(Arc::clone(actor));
             }
         }
-        matched.map(AuthenticatedActor::cluster_static).or_else(|| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?
-                .as_secs();
-            self.data_token_trust
-                .as_ref()
-                .and_then(|trust| trust.verify_authenticated_at(provided_token, now))
-                .or_else(|| {
-                    self.oidc_identity_trust
-                        .as_ref()?
-                        .verify_at(provided_token, i64::try_from(now).ok()?)
-                })
-        })
+        if let Some(actor) = matched {
+            return Ok(AuthenticatedActor::cluster_static(actor));
+        }
+        let Some(now) = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|elapsed| elapsed.as_secs())
+        else {
+            return Err(oidc_identity::OidcRefusal::Invalid);
+        };
+        if let Some(actor) = self
+            .data_token_trust
+            .as_ref()
+            .and_then(|trust| trust.verify_authenticated_at(provided_token, now))
+        {
+            return Ok(actor);
+        }
+        match (self.oidc_identity_trust.as_ref(), i64::try_from(now)) {
+            (Some(trust), Ok(now)) => trust.check_at(provided_token, now),
+            _ => Err(oidc_identity::OidcRefusal::Invalid),
+        }
     }
 }
 
@@ -1118,12 +1152,37 @@ impl ApiError {
         self
     }
 
-    pub fn unauthorized(message: impl Into<String>) -> Self {
+    /// HTTP 401, recording whether a bearer credential was presented so the
+    /// response's challenge says which (RFC 6750 §3.1).
+    pub(crate) fn unauthorized(
+        reason: challenge::Unauthenticated,
+        message: impl Into<String>,
+    ) -> Self {
         Self::new(ErrorCode::Unauthorized, message)
+            .with_details(ApiErrorDetails::Unauthenticated(reason))
     }
 
     pub fn forbidden(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Forbidden, message)
+    }
+
+    /// HTTP 403 for a valid OIDC token whose subject this server does not
+    /// admit. No challenge: signing in again cannot help.
+    pub(crate) fn not_admitted() -> Self {
+        Self::new(
+            ErrorCode::NotAdmitted,
+            "the signed-in identity is not admitted to this server",
+        )
+    }
+
+    /// HTTP 503 for a valid OIDC token while the identity admission snapshot
+    /// is expired or the clock lies outside it. Access returns with the next
+    /// publication of the snapshot; signing in again cannot help.
+    pub(crate) fn identity_admission_unavailable() -> Self {
+        Self::new(
+            ErrorCode::ServiceUnavailable,
+            "OIDC identity admission is unavailable: the server's identity snapshot has expired; retry after its next publication",
+        )
     }
 
     pub fn bad_request(message: impl Into<String>) -> Self {
@@ -1419,6 +1478,7 @@ impl ApiError {
             let refused_before_start = matches!(
                 self.code,
                 ErrorCode::Unauthorized
+                    | ErrorCode::NotAdmitted
                     | ErrorCode::ApiContractMismatch
                     | ErrorCode::ActorMismatch
                     | ErrorCode::Forbidden
@@ -1451,10 +1511,42 @@ impl ApiError {
     }
 
     fn from_omni(err: OmniError) -> Self {
+        Self::from_omni_settled(err, Self::with_request_facts)
+    }
+
+    /// [`Self::from_omni`] with `settle` giving the error its final facts
+    /// before the warning reads its status: a served error carries its
+    /// request's, and an embedded caller states its own, so the warning and
+    /// the body agree on both paths.
+    fn from_omni_settled(err: OmniError, settle: impl FnOnce(Self) -> Self) -> Self {
         let cause = redacted_cause::RedactedCause::of(&err);
         // An in-doubt publication's graph commit, logged as its own field: the
         // message that also names it can carry storage paths.
         let publication = err.publication_id().map(str::to_owned);
+        // Every translation leaves through this one exit, an internal
+        // replacement included, so the warning reads each one's settled facts.
+        let response = settle(Self::translated(err));
+        if response.completion_uncertain {
+            // The record of a write's unknown outcome: the failure's class,
+            // the status its response sends, and whether its uncertainty is
+            // scoped to its keys and branch, never its message, which can
+            // carry object URIs. It shares the request's span with the
+            // containment log.
+            tracing::warn!(
+                status = %response.status(),
+                ?cause,
+                publication = publication.as_deref(),
+                scoped = response.scoped_unknown,
+                "engine failure without definite completion evidence"
+            );
+        }
+        response
+    }
+
+    /// An engine failure's code, details and completion facts, before its
+    /// operation's own. A failure naming invalid graph type metadata becomes
+    /// an internal error, which takes no completion evidence from it.
+    fn translated(err: OmniError) -> Self {
         let (err, evidence) = err.into_completion_evidence();
         let storage_outcome = err.is_manifest_publish_in_doubt()
             || matches!(&err, OmniError::Storage(_) | OmniError::Io(_));
@@ -1765,23 +1857,6 @@ impl ApiError {
             None => {}
         }
         response.scoped_unknown = response.completion_uncertain && storage_outcome;
-        // The error carries what its request has done, as one leaving an
-        // owned read's task does, so its status is the one its response sends.
-        let response = response.with_request_facts();
-        if response.completion_uncertain {
-            // The record of a write's unknown outcome: the failure's class,
-            // the status its response sends, whether its uncertainty is
-            // scoped to its keys and branch and, for a publication in doubt,
-            // its graph commit, never its message, which can carry object
-            // URIs. It shares the request's span with the containment log.
-            tracing::warn!(
-                status = %response.status(),
-                ?cause,
-                publication = publication.as_deref(),
-                scoped = response.scoped_unknown,
-                "engine failure without definite completion evidence"
-            );
-        }
         response
     }
 }
@@ -1815,15 +1890,15 @@ fn summarize_merge_conflicts(conflicts: &[api::MergeConflictOutput]) -> String {
     format!("merge conflicts: {}{}", preview.join("; "), suffix)
 }
 
-fn graph_type_subject(entity_kind: api::EntityKindOutput, type_name: &str) -> String {
+fn graph_type_subject(entity_kind: api::EntityKind, type_name: &str) -> String {
     match entity_kind {
-        api::EntityKindOutput::Node => format!("node type '{type_name}'"),
-        api::EntityKindOutput::Edge => format!("edge type '{type_name}'"),
+        api::EntityKind::Node => format!("node type '{type_name}'"),
+        api::EntityKind::Edge => format!("edge type '{type_name}'"),
     }
 }
 
 fn format_key_conflict(
-    entity_kind: api::EntityKindOutput,
+    entity_kind: api::EntityKind,
     type_name: &str,
     entity_id: Option<&str>,
 ) -> String {
@@ -1853,6 +1928,12 @@ impl IntoResponse for ApiError {
         {
             headers.insert(axum::http::header::ETAG, etag);
         }
+        // The output consumes the details; keep authentication's reason for
+        // the challenge layer.
+        let unauthenticated = match error.details.as_deref() {
+            Some(ApiErrorDetails::Unauthenticated(reason)) => Some(*reason),
+            _ => None,
+        };
         let output = error.into_judged_output();
         if output
             .disposition
@@ -1867,7 +1948,11 @@ impl IntoResponse for ApiError {
                 axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
             );
         }
-        (status, headers, Json(output)).into_response()
+        let mut response = (status, headers, Json(output)).into_response();
+        if let Some(reason) = unauthenticated {
+            response.extensions_mut().insert(reason);
+        }
+        response
     }
 }
 
@@ -1881,10 +1966,15 @@ impl ApiError {
     /// The output of one step's error, such as a merge's optional source
     /// deletion, judged by that step alone: it may have taken effect only when
     /// its own completion is uncertain.
-    pub(crate) fn into_step_output(mut self) -> ErrorOutput {
+    pub(crate) fn into_step_output(self) -> ErrorOutput {
+        self.into_step().into_judged_output()
+    }
+
+    /// The facts of one step's error, judged by that step alone.
+    fn into_step(mut self) -> Self {
         self.owned_write = self.completion_uncertain;
         self.compound = false;
-        self.into_judged_output()
+        self
     }
 
     /// The output of an error whose facts are final.
@@ -1928,6 +2018,7 @@ impl ApiError {
                     output.full_text_index_required = Some(value)
                 }
                 ApiErrorDetails::Diagnostic(value) => output.diagnostic = Some(value),
+                ApiErrorDetails::Unauthenticated(_) => {}
             }
         }
         output
@@ -1937,7 +2028,7 @@ impl ApiError {
 /// Project an engine failure into the shared error body, including structured
 /// details, for embedded callers that compose a second effect after success.
 pub fn engine_error_output(error: OmniError) -> api::ErrorOutput {
-    ApiError::from_omni(error).into_step_output()
+    ApiError::from_omni_settled(error, ApiError::into_step).into_judged_output()
 }
 
 /// Project an engine failure into the error body a server answers for a
@@ -1952,9 +2043,11 @@ pub fn engine_error_output(error: OmniError) -> api::ErrorOutput {
 /// a fork is itself a write, so that changes the disposition only together with
 /// `after_write`.
 pub fn engine_error_output_after(error: OmniError, after_write: bool) -> api::ErrorOutput {
-    let mut error = ApiError::from_omni(error);
-    error.owned_write = after_write;
-    error.into_judged_output()
+    ApiError::from_omni_settled(error, |mut error| {
+        error.owned_write = after_write;
+        error
+    })
+    .into_judged_output()
 }
 
 /// The error body of an embedded read's engine failure: a read writes
@@ -2064,10 +2157,10 @@ mod api_error_tests {
     #[test]
     fn merge_summary_uses_type_and_entity_vocabulary() {
         let summary = summarize_merge_conflicts(&[api::MergeConflictOutput {
-            entity_kind: api::EntityKindOutput::Node,
+            entity_kind: api::EntityKind::Node,
             type_name: "Person".to_string(),
             entity_id: Some("p1".to_string()),
-            kind: api::MergeConflictKindOutput::DivergentUpdate,
+            kind: api::MergeConflictKind::DivergentUpdate,
             message: "divergent update for id 'p1'".to_string(),
         }]);
         assert_eq!(
@@ -2094,7 +2187,7 @@ mod api_error_tests {
         let details = error
             .published_dataset_version_conflict
             .expect("structured published dataset version conflict");
-        assert_eq!(details.entity_kind, api::EntityKindOutput::Edge);
+        assert_eq!(details.entity_kind, api::EntityKind::Edge);
         assert_eq!(details.type_name, "Knows");
         assert_eq!(details.expected_published_dataset_version, 7);
         assert_eq!(details.actual_published_dataset_version, 9);
@@ -2447,6 +2540,78 @@ mod api_error_tests {
         assert_eq!(sent, StatusCode::INTERNAL_SERVER_ERROR);
         assert_logged(&in_write, WARNING, sent);
         assert_logged(&in_write, CONTAINMENT, sent);
+
+        // An embedded caller states its own facts, and the warning reads them:
+        // one step's failure, a failure after a write, and a read.
+        let datafusion = || OmniError::DataFusion("execution failure".into());
+        type Judge = fn(OmniError) -> api::ErrorOutput;
+        let embedded: [(&str, Judge, StatusCode); 3] = [
+            (
+                "step",
+                engine_error_output,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                "after a write",
+                |error| engine_error_output_after(error, true),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            ("read", engine_read_error_output, StatusCode::BAD_REQUEST),
+        ];
+        for (label, output, sent) in embedded {
+            let capture = test_log_capture::Capture::default();
+            let logs = tracing::subscriber::set_default(capture.subscriber("warn"));
+            let body = output(datafusion());
+            drop(logs);
+            assert_eq!(body.http_status(), Some(sent.as_u16()), "{label}");
+            assert_logged(&capture, WARNING, sent);
+        }
+
+        // A conflict naming an invalid graph type becomes an internal error,
+        // which settles and logs through the same exit: a write's helpers
+        // report its outcome unknown, at the status its body sends.
+        let invalid_key = || OmniError::key_conflict("Person", "Alice");
+        let writes: [(&str, Judge); 2] = [
+            ("step", engine_error_output),
+            ("after a write", |error| {
+                engine_error_output_after(error, true)
+            }),
+        ];
+        for (label, output) in writes {
+            let capture = test_log_capture::Capture::default();
+            let logs = tracing::subscriber::set_default(capture.subscriber("warn"));
+            let body = output(invalid_key());
+            drop(logs);
+            assert_eq!(body.code, Some(api::ErrorCode::OutcomeUnknown), "{label}");
+            assert_eq!(
+                body.disposition,
+                Some(api::DispositionOutput {
+                    effects: api::DispositionEffects::Unknown,
+                    action: api::DispositionAction::Reconcile,
+                }),
+                "{label}"
+            );
+            assert_logged(&capture, WARNING, StatusCode::INTERNAL_SERVER_ERROR);
+        }
+
+        // A read's helper keeps its own facts even inside a request that has
+        // submitted a write.
+        let capture = test_log_capture::Capture::default();
+        let logs = tracing::subscriber::set_default(capture.subscriber("warn"));
+        let runtime = OperationRuntime::default();
+        let body = scope_request(async {
+            runtime
+                .submit((), async { Ok::<_, ApiError>(()).into() })
+                .unwrap()
+                .result()
+                .await
+                .unwrap();
+            engine_read_error_output(datafusion())
+        })
+        .await;
+        drop(logs);
+        assert_eq!(body.http_status(), Some(400));
+        assert_logged(&capture, WARNING, StatusCode::BAD_REQUEST);
     }
 
     /// Each class of refusal asks its caller for one thing. Before any write
@@ -2473,7 +2638,7 @@ mod api_error_tests {
         let cases = [
             (
                 "unauthorized",
-                ApiError::unauthorized("no token"),
+                ApiError::unauthorized(crate::challenge::Unauthenticated::NoCredential, "no token"),
                 Action::Fix,
             ),
             (
@@ -2910,7 +3075,7 @@ mod api_error_tests {
             let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
             assert!(error.error.contains(expected_message));
             let details = error.key_conflict.expect("structured key conflict");
-            assert_eq!(details.entity_kind, api::EntityKindOutput::Node);
+            assert_eq!(details.entity_kind, api::EntityKind::Node);
             assert_eq!(details.type_name, "Person");
             assert_eq!(details.entity_id, entity_id);
             assert!(error.recovery_required.is_none());
@@ -3307,23 +3472,17 @@ fn server_log_subscriber<W>(filter: EnvFilter, writer: W) -> impl tracing::Subsc
 where
     W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
 {
-    use tracing_subscriber::layer::SubscriberExt as _;
+    telemetry::subscriber(filter, writer, false, None)
+}
 
-    tracing_subscriber::registry()
-        .with(filter)
-        // This independent metadata filter cannot be overridden by a more
-        // specific RUST_LOG directive, and keeps graph values, storage URIs
-        // and entity IDs out of dependency logs.
-        .with(tracing_subscriber::filter::filter_fn(|metadata| {
-            let target = metadata.target();
-            let restricted = RESTRICTED_LOG_TARGETS.iter().any(|restricted| {
-                target
-                    .strip_prefix(restricted)
-                    .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
-            });
-            !restricted || *metadata.level() <= tracing::Level::WARN
-        }))
-        .with(tracing_subscriber::fmt::layer().with_writer(writer))
+fn safe_log_metadata(metadata: &tracing::Metadata<'_>) -> bool {
+    let target = metadata.target();
+    let restricted = RESTRICTED_LOG_TARGETS.iter().any(|restricted| {
+        target
+            .strip_prefix(restricted)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+    });
+    !restricted || *metadata.level() <= tracing::Level::WARN
 }
 
 /// Install native server logging with MCP protocol payload logs and Lance's
@@ -3358,6 +3517,19 @@ pub(crate) mod test_log_capture {
         ) -> impl tracing::Subscriber + Send + Sync {
             let writer = self.clone();
             super::server_log_subscriber(EnvFilter::new(directives), move || writer.clone())
+        }
+
+        pub(crate) fn json_subscriber(
+            &self,
+            directives: &str,
+        ) -> impl tracing::Subscriber + Send + Sync {
+            let writer = self.clone();
+            super::telemetry::subscriber(
+                EnvFilter::new(directives),
+                move || writer.clone(),
+                true,
+                None,
+            )
         }
 
         /// Everything written so far, with ANSI styling removed so a test can
@@ -3437,16 +3609,23 @@ mod log_filter_tests {
     #[test]
     fn restricted_dependency_logs_remain_filtered_under_specific_directives() {
         // Each directive set, and whether it enables DEBUG on unrestricted targets.
-        for (directives, debug) in [
+        for ((directives, debug), json) in [
             ("trace", true),
             ("debug,rmcp::service=trace", true),
             (
                 "info,lance::dataset_events=trace,lance::file_audit=trace",
                 false,
             ),
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|case| [false, true].map(|json| (case, json)))
+        {
             let captured = Capture::default();
-            let subscriber = captured.subscriber(directives);
+            let subscriber: Box<dyn tracing::Subscriber + Send + Sync> = if json {
+                Box::new(captured.json_subscriber(directives))
+            } else {
+                Box::new(captured.subscriber(directives))
+            };
             tracing::subscriber::with_default(subscriber, || {
                 tracing::debug!(target: "rmcp::service", request = "PRIVATE_REQUEST_MARKER", "received request");
                 tracing::trace!(target: "rmcp::transport::streamable_http_server::tower", message = "PRIVATE_RESULT_MARKER");
@@ -3592,59 +3771,7 @@ pub fn build_app(state: AppState) -> Router {
     //   4. `resolve_graph_handle` — captures `serving::GraphRequest` based on
     //      the active mode (single: the only handle; multi: lookup by
     //      `{graph_id}` in the URI path).
-    let per_graph_routes = Router::new()
-        .route("/snapshot", get(server_snapshot))
-        .route("/access", get(server_access))
-        // Register HEAD explicitly. Axum's GET fallback would invoke the GET
-        // handler and could begin payload work before stripping the body; the
-        // dedicated handler makes the zero-payload-read contract structural.
-        .route(
-            "/blob",
-            get(server_blob_get)
-                .head(server_blob_head)
-                .put(server_blob_put)
-                .delete(server_blob_delete),
-        )
-        .route("/export", post(server_export))
-        .route("/query", post(server_query))
-        .route("/mutate", post(server_mutate))
-        .route(
-            "/mutate/if-graph-commit",
-            post(server_mutate_if_graph_commit),
-        )
-        .route("/queries", get(server_list_queries))
-        .route("/queries/{name}", post(server_invoke_query))
-        .route(
-            "/queries/{name}/if-graph-commit",
-            post(server_invoke_query_if_graph_commit),
-        )
-        .route("/schema", get(server_schema_get))
-        .route(
-            "/load",
-            post(server_load).layer(DefaultBodyLimit::max(INGEST_REQUEST_BODY_LIMIT_BYTES)),
-        )
-        .route("/load/ndjson", post(server_load_ndjson))
-        .route(
-            "/branches",
-            get(server_branch_list).post(server_branch_create),
-        )
-        // One route owns `/branches/{name}`: the branch actions `merge`,
-        // `diff` and `merge-base` share its shape, so it dispatches them by
-        // name and method, and DELETE of any name deletes that branch.
-        .route(
-            "/branches/{branch}",
-            axum::routing::delete(server_branch_delete).fallback(server_branch_action),
-        )
-        .route("/commits", get(server_commit_list))
-        .route(
-            "/commits/{commit_id}",
-            get(server_commit_show).delete(server_commit_drop),
-        )
-        .route("/commits/{commit_id}/publish", post(server_commit_publish))
-        .route("/commits/{commit_id}/changes", get(server_commit_changes))
-        .route("/diff", get(server_diff))
-        .route("/changes", get(server_changes_feed))
-        .route("/changes/baseline", post(server_changes_baseline));
+    let per_graph_routes = http_operations::graph().into_router();
     let per_graph_protected = guarded(&state, per_graph_routes, |routes| {
         routes.route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -3660,19 +3787,11 @@ pub fn build_app(state: AppState) -> Router {
     // exposed — inventory additions use the server-owned deployment route.
     let management = guarded(
         &state,
-        Router::new()
-            .route("/graphs", get(server_graphs_list))
-            .route("/graphs/discovery", get(server_graphs_discovery)),
+        http_operations::management().into_router(),
         |routes| routes,
     );
 
-    let deployment_routes = Router::new()
-        .route("/cluster/plan", post(deployment::plan))
-        .route(
-            "/cluster/deployments",
-            get(deployment::status).post(deployment::apply),
-        )
-        .route("/cluster/deployments/{id}", get(deployment::lookup));
+    let deployment_routes = http_operations::deployments().into_router();
     let deployments = guarded(&state, deployment_routes, |routes| {
         admitted(
             &state,
@@ -3691,13 +3810,12 @@ pub fn build_app(state: AppState) -> Router {
     // `/graphs/{graph_id}/...`; there are no flat single-graph routes.
     let protected: Router<AppState> = Router::new()
         .nest(CATALOGUE_ROUTE_PREFIX, catalogue)
-        .nest("/graphs/{graph_id}", per_graph_protected)
+        .nest(handlers::CLUSTER_PATH_PREFIX, per_graph_protected)
         .merge(management)
         .merge(deployments);
 
-    let mut app = Router::new()
-        .route("/healthz", get(server_health))
-        .route("/readyz", get(server_ready))
+    let mut app = http_operations::probes()
+        .into_router()
         .route("/openapi.json", get(server_openapi))
         .merge(protected);
     // MCP needs an authenticated caller; without a credential source there is
@@ -3705,6 +3823,9 @@ pub fn build_app(state: AppState) -> Router {
     if state.has_credential_source() {
         app = app.merge(mcp::router(state.clone()));
     }
+    // Every 401, from any router, handler or fallback, carries the one
+    // challenge, built once from the fixed OIDC resource binding.
+    let challenge = challenge::Challenge::new(state.oidc_resource_url().as_deref());
     // The unrouted answer, and the method fallback of the public routes. A
     // protected route already has its own, from `guarded`, which this one
     // leaves alone. Inside the layers, so both answer with the contract
@@ -3712,8 +3833,9 @@ pub fn build_app(state: AppState) -> Router {
     app.fallback(unrouted)
         .method_not_allowed_fallback(method_not_served)
         .layer(middleware::from_fn(http_contract::identify_response))
+        .layer(middleware::from_fn_with_state(challenge, challenge::answer))
         .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
-        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(telemetry::http_request))
         .with_state(state)
 }
 

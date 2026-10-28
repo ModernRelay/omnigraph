@@ -69,6 +69,21 @@ pub const CRASH_WINDOWS: [&str; 53] = [
 mod tests {
     use super::CRASH_WINDOWS;
 
+    /// Every window the reach census expects dark is a catalog window, so a
+    /// renamed or removed window cannot linger in that list.
+    #[test]
+    fn expected_dark_windows_are_catalog_windows() {
+        let stale: Vec<&str> = crate::harness::REACH_EXPECTED_DARK
+            .iter()
+            .map(|(window, _)| *window)
+            .filter(|window| !CRASH_WINDOWS.contains(window))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "REACH_EXPECTED_DARK names windows the catalog does not hold: {stale:?}"
+        );
+    }
+
     /// The catalog's names-guard (module doc): every entry must be a seam
     /// the engine catalog declares.
     #[test]

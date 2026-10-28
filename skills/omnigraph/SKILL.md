@@ -5,7 +5,7 @@ license: MIT (see LICENSE at repo root)
 compatibility: Covers the current OmniGraph CLI and server, using HTTP contract 0.14. Upgrade the CLI, server and HTTP integrations together; the storage formats `omnigraph version` reports are served, and a standalone v8, v9 or v13 graph is converted by the offline `omnigraph upgrade`, never on open.
 metadata:
   author: ModernRelay
-  version: "0.14.0"
+  version: "0.14.1"
   repository: https://github.com/ModernRelay/omnigraph
 ---
 
@@ -15,7 +15,7 @@ This skill captures the operational rules for working with a locally or remotely
 
 Check `omnigraph version` and the command's `--help` before using these
 instructions. This skill tracks the current CLI/server contract, including
-`Omnigraph-Http-Api: 0.14`; the released 0.13 contract is unsupported. The engine
+`Omnigraph-Http-Api: 0.14`; older HTTP contracts are unsupported. The engine
 reports `internal-schema 16 (serves v14 to v16)`: the storage format it
 writes, then the range it serves. New graphs use `__id`/`__src`/`__dst` system columns; a graph
 that already spells them `id`/`src`/`dst` keeps its physical columns. A
@@ -172,7 +172,7 @@ backend. `--config DIR` is source input only.
 
 - Direct graph: `--target ./graph.omni` or a registered `kind: direct, scope: graph` entry.
 - Direct cluster root: `--target ./cluster --graph knowledge`; registered root targets can set `default_graph`.
-- Server: `--target production --graph knowledge`; the registered target owns endpoint and named auth profiles.
+- Server: `--target production --graph knowledge`; the registered target owns endpoint and one auth provider.
 - Managed: `--profile work` for account operations; a managed target references that profile and pins cluster ID/incarnation. Graph operations need its endpoint and `--graph` or `default_graph`.
 - Direct targets support local files only. Cloud-direct, catalogue and Unix socket targets are unsupported. Remote inline URLs must be registered.
 
@@ -184,7 +184,7 @@ served targets derive their actor from credentials and send `--as` as the
 `Omnigraph-If-Actor` assertion, refusing a mismatch with `actor_mismatch` and
 exit 4; managed targets refuse it. `--yes` supplies explicit
 consent for destructive nonlocal operations. There is no quiet switch for the
-destination line. Legacy `--server`, `--store`, `--cluster`, `--profile`,
+destination line. Legacy `--server`, `--store`, `--cluster`,
 `--managed`, `--direct`, graph `--uri`, `use` and `profile` commands are removed.
 
 | Family | Operations and applicability |
@@ -199,9 +199,11 @@ destination line. Legacy `--server`, `--store`, `--cluster`, `--profile`,
 | Deployment | `cluster plan/apply --config DIR` on a direct root or server; `cluster status` uses only the target |
 | Managed account | `cluster create/list`, `organization members/invitations`; `--profile NAME` |
 | Managed cluster | `cluster members/pull/push/plan/apply/status/history/cancel/token/delete/undo-delete`; complete cluster target |
-| Local configuration | `config validate/rename-profile/rename-target/rename-auth/recover-rename/recover-operations`, `target list/inspect/add/refresh/remove` (`register` aliases `add`), `skill export/show`, `version`, `embed`; `alias NAME` owns its target and graph |
-| Authentication | `login --register NAME`, `login --profile NAME`, or `logout --profile NAME` for platform sessions; `credentials set/status/remove/export` requires explicit profile or standalone target/auth |
+| Local configuration | `config validate/rename-profile/rename-target/recover-rename/recover-operations`, `target list/inspect/add/refresh/remove`, `skill export/show`, `version`, `embed`; `alias NAME` owns its target and graph |
+| Authentication | `login --create-profile NAME`, `login --profile NAME`, or `logout --profile NAME` for platform sessions; `credentials set/status/remove/export` requires explicit profile or standalone target |
 | Access | `access [--branch B [--target-branch T]]`; the actor and the actions the graph's policy grants it, from a server's access route or, for a direct graph or root target, the installed policy; catalogue and managed targets refuse |
+| Agent MCP | `mcp --target NAME [--graph G] [--write]` relays an agent's stdio MCP to an existing server target's `/mcp`, bound to one graph, read-only tools unless `--write`; a cancelled write gets no answer and may still have landed; direct and managed targets refuse |
+| Studio | `studio --target NAME [--graph G] [--json]` opens OmniGraph Studio on an existing server target through an `omnigraph-studio://open` link and prints it, sending no request; direct and managed targets refuse; without Studio it refuses `studio_unavailable` |
 
 `query` and `mutate` invoke stored queries by positional name, or accept
 `--query FILE` / `-e SOURCE`. Use `--params` or `--params-file`, never interpolate
@@ -265,13 +267,16 @@ A graph's bytes live in one of three supported URI families:
 - **S3-compatible object storage** — AWS, Railway, Tigris, etc. (`s3://bucket/prefix`). Authenticate with the standard `AWS_*` environment contract.
 - **Azure Blob storage preview** — `az://container/prefix`. Reads and Azurite qualification are available, but Azure is not production-supported; every write or maintenance process must be launched through the root-scoped `omnigraph-azure-admission` wrapper.
 
-Keep development credentials in a git-ignored `.env.omni` and source it before CLI calls:
+The public CLI accepts only local direct targets. For cloud-backed graphs, use a
+registered server or managed target; the server or embedded host owns storage
+credentials. Keep development credentials in a git-ignored `.env.omni` and
+source it before starting the process that needs them:
 
 ```bash
 set -a && source .env.omni && set +a
 ```
 
-Direct `init`/`load` and **`cluster apply`** write storage without an HTTP server. A served `load` is different: the CLI sends it to `omnigraph-server`, which performs the graph write. A direct `cluster apply` reaches the cluster ledger and graph datasets directly, so its host needs storage credentials (`cluster apply --target managed --plan` is executed by the Intent API). A serving process also needs read-write access for served data-plane writes. Validate with `curl http://127.0.0.1:8080/readyz` (HTTP 200, `ready: true`; `/healthz` only proves the process is alive), then `omnigraph snapshot --target <name> --graph <id> --json`.
+Direct `init`/`load` and direct **`cluster apply`** write local storage without an HTTP server. A served `load` or `cluster apply` sends the request to `omnigraph-server`, which performs the writes with its storage credentials. A managed `cluster apply --target NAME --plan PREVIEW_ID` is submitted through the profile’s control plane. A serving process needs read-write storage access for served data-plane writes. Validate with `curl http://127.0.0.1:8080/readyz` (HTTP 200, `ready: true`; `/healthz` only proves the process is alive), then `omnigraph snapshot --target <name> --graph <id> --json`.
 
 ## Project Layout
 
@@ -284,11 +289,15 @@ Direct `init`/`load` and **`cluster apply`** write storage without an HTTP serve
   config-free) serves it. A direct apply keeps its admission lock: once its
   writes have settled, release that exact lock with
   `cluster force-unlock <LOCK_ID>` before starting the server, and send later
-  changes with `cluster apply --target <name|url>`.
+  changes with `cluster apply --target NAME --config DIR` using a registered server target.
   See `references/cluster.md`.
 - **Direct / embedded access — no server.** Address a graph's storage directly
   with a local path or `--target file:///absolute/path/graph.omni`; `init` also accepts its creation URI positionally.
   There is **no single-graph server mode** — the server is cluster-only.
+- **Agents — one path per place.** In a terminal, an agent runs CLI commands
+  with `--target`, or connects its MCP client to an existing server target with
+  `omnigraph mcp --target NAME` (see `references/commands.md`, MCP for agents);
+  in Studio's agent panel it uses Studio's gateway. No path starts a server.
 
 ### The two config surfaces
 
@@ -302,15 +311,15 @@ schema, providers, transport, defaults and upgrade procedure.
 Profiles pin API/organization and own one auth provider for one identity. Managed targets
 reference a profile and pin cluster ID/incarnation; standalone server targets
 own endpoint/auth. Direct graph/root targets use absolute local `file://` URIs.
-On standalone servers, `--auth` overrides `default_auth`; without either,
-selection refuses even with one entry. Managed `--auth` is rejected. Managed
+Every standalone target owns a single auth provider; use separate targets for
+different identities at the same endpoint. The `--auth` selector is removed. Managed
 targets use their pinned profile; default/global profiles cannot override it. `defaults.profile` and `defaults.target` apply only to their command
 classes. A graph selector overrides target `default_graph`; direct graphs reject
 it. Read output defaults to `table`. Whole-document validation is offline.
 
 ```bash
 omnigraph config validate
-omnigraph login --register work
+omnigraph login --create-profile work
 omnigraph cluster list --profile work --json
 omnigraph target add production --profile work --cluster CLUSTER_ID
 omnigraph target inspect production --resolved --json
@@ -321,23 +330,24 @@ Never put secrets in configuration. Providers are `omnigraph` (managed device
 login), `token` (exactly one `store`, `env` or `file` source), `exec` (absolute
 argv, bounded JSON protocol), and standalone-only `anonymous`. No fallback is
 allowed. Static installation uses `credentials set --stdin`, not login; existing
-entries require `--replace`. Managed credentials require `--profile NAME` without `--auth`; standalone
-credentials require `--target NAME --auth PROFILE`. Status never uses network/helpers or prompts; secure-store availability
+entries require `--replace`. Managed credentials require `--profile NAME`; standalone
+credentials require `--target NAME`. Status never uses network/helpers or prompts; secure-store availability
 and identity remain unknown without reading secrets. Export is raw bearer-plus-newline to a pipe
 only, never terminal/file output; managed-target export releases data access; `--profile` exports control access.
 Neither exports refresh tokens. Read the reference before using credential commands.
 
-Use `config rename-profile FROM TO`, `config rename-target FROM TO`, or
-`config rename-auth server OWNER FROM TO` to preserve custody and update
+Use `config rename-profile FROM TO` or `config rename-target FROM TO` to preserve custody and update
 references/defaults. An interrupted rename needs `config recover-rename` against
 the same operator file; conflicting edits refuse. These commands have no `--json`.
 Changing a profile's principal requires `login --profile NAME
 --replace-principal NEW_PRINCIPAL_ID`, matching the verified new identity and
 invalidating old derived credentials. See the primary operator reference.
 
-Bare login proposes profile name `omnigraph`; registration defaults to
-`https://platform.omnigraph.dev` and rejects `--auth`;
-this does not create routing defaults. Existing sessions need the selected profile.
+`login --create-profile NAME` explicitly creates a new profile, defaulting its API
+to `https://platform.omnigraph.dev`. Bare login uses `defaults.profile`; it never
+creates a missing profile. Neither form changes routing defaults. Operator YAML
+may be read-only; credential metadata stays in writable `OMNIGRAPH_HOME`.
+Credentials retain their expiry through discovery and are checked before dispatch.
 Transport defaults to verified system TLS and direct routing, ignoring proxy
 variables unless opted in. Custom CA plus HTTPS proxy is refused. This model
 qualifies neither BYOC private routing nor workload federation. Direct aliases
@@ -402,7 +412,7 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | `defaults.output: arrow` | configuration refusal | Use `table`, `json`, `jsonl`, `csv` or `kv` |
 | `..` or a symlink in a `cluster.yaml` relative path | `config_path_escape` / `config_path_symlink` | Keep referenced files inside the config directory with plain relative paths |
 | Old operator format | configuration refusal | Replace it with `version: 1`; preserve journals and reconcile unresolved work before retiring old tooling |
-| Policy commands with both a graph and a `cluster` bundle applied | `matches 2 policy bundles` | Known 0.12.0 limitation of `policy validate/test/explain --graph`; inspect each bundle file directly |
+| Policy commands with both a graph and a `cluster` bundle applied | `matches 2 policy bundles` | Current limitation of `policy validate/test/explain --graph`; inspect each bundle file directly |
 
 ## Deep Dives
 

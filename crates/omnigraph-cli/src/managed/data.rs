@@ -506,8 +506,38 @@ fn resolve_loaded(
 ) -> Result<GraphClient> {
     credential.validate(context)?;
     let endpoint = context.endpoint.as_deref().ok_or_else(|| Failure::refused("data_endpoint_required", "complete the managed target's endpoint before data operations; cluster token reports the issuer endpoint"))?;
+    use crate::credential_sources::{
+        AcquiredCredential, CredentialRequest, OwnerBinding, OwnerKind, Purpose, ResourceIdentity,
+    };
+    // This issued credential binds its verified principal and resource. Its
+    // lifetime is independent from the control credential used to acquire it.
+    let owner = OwnerBinding::new(
+        OwnerKind::Profile,
+        context.organization_id.clone(),
+        credential.actor.clone(),
+        context.api.clone(),
+        Some(context.organization_id.clone()),
+    )
+    .map_err(|_| invalid())?;
+    let request = CredentialRequest::new(
+        owner,
+        Purpose::Data,
+        endpoint.to_owned(),
+        Some(format!("urn:omnigraph:data:{}", context.cluster)),
+        Some(ResourceIdentity {
+            cluster_id: context.cluster.clone(),
+            cluster_incarnation: context.incarnation.clone(),
+        }),
+    )
+    .map_err(|_| invalid())?;
+    let credential = AcquiredCredential::issued(
+        request,
+        credential.token,
+        OffsetDateTime::parse(&credential.expires_at, &Rfc3339).map_err(|_| invalid())?,
+    )
+    .map_err(|_| invalid())?;
     let Some(graph) = graph else {
-        return GraphClient::managed_registry(endpoint, credential.token).map_err(|_| {
+        return GraphClient::managed_registry(endpoint, credential).map_err(|_| {
             Failure::new(
                 "transport_failed",
                 "could not initialize the managed discovery client",
@@ -516,7 +546,7 @@ fn resolve_loaded(
         });
     };
     graph_id(graph)?;
-    GraphClient::managed(endpoint, graph, credential.token).map_err(|_| {
+    GraphClient::managed(endpoint, graph, credential).map_err(|_| {
         Failure::new(
             "transport_failed",
             "could not initialize the managed data client",
@@ -679,6 +709,51 @@ pub(crate) async fn resource(
     }
     .await;
     result.map_err(|failure: Failure| color_eyre::eyre::eyre!("{}", failure.body))
+}
+
+/// Forget only the exact rejected credential of this resource. A concurrent
+/// replacement must survive; the next acquisition still verifies current
+/// profile authority and never opens an interactive login.
+pub(crate) async fn forget_refused(
+    binding: &super::Binding,
+    refused_token: &str,
+) -> color_eyre::Result<()> {
+    let result = async {
+        let context = binding.context()?;
+        let authentication = crate::operator_routing::AUTH
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
+        let store = match authentication.as_ref() {
+            Some(auth) => ResourceStore::for_profile(
+                &auth.profile,
+                &auth.derived_credentials,
+                &auth::DATA_STORE,
+            ),
+            None => ResourceStore::Persistent(&auth::DATA_STORE),
+        };
+        let _lock = if store.persistent() {
+            Some(auth::cache_lock(&format!("data:{}", key(&context))).await?)
+        } else {
+            None
+        };
+        remove_refused(&store, &context, refused_token)
+    }
+    .await;
+    result.map_err(|failure: Failure| color_eyre::eyre::eyre!("{}", failure.body))
+}
+
+fn remove_refused(store: &impl Store, context: &Context, refused_token: &str) -> Result<()> {
+    if let Some(raw) = store.get(&key(context))? {
+        if raw.len() > MAX_CREDENTIAL {
+            return Err(invalid());
+        }
+        let credential: Credential = serde_json::from_str(&raw).map_err(|_| invalid())?;
+        if credential.token == refused_token {
+            store.remove(&key(context))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -83,7 +83,7 @@ CLI never follows an external URI: `get` refuses it and directs the caller to
 
 ## HTTP reads
 
-`GET` and `HEAD /graphs/{id}/blob` take `entity`, `type`, `id`, `property`, and
+`GET` and `HEAD /graphs/{graph_id}/blob` take `entity`, `type`, `id`, `property`, and
 either `branch` or `snapshot`, plus the `Omnigraph-Http-Api: 0.14` header every
 protected graph route requires (`api_contract_mismatch` without it). Managed
 values support one standard `Range`,

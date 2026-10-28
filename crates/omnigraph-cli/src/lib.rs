@@ -2,7 +2,7 @@
 
 use color_eyre::eyre::{Result, bail};
 use omnigraph_api_types::{
-    BlobContentKindOutput, BlobStatOutput, BranchOutcomeOutput, ChangeOutput, CommitKindOutput,
+    BlobContentKindOutput, BlobStatOutput, BranchOutcomeOutput, ChangeOutput, CommitKind,
     CommitOutput, ErrorOutput, GraphBatchLoadOutput, SchemaApplyOutput, SnapshotDatasetOutput,
 };
 use omnigraph_cluster::{DiagnosticSeverity, PlanOutput, StateSyncOutput, ValidateOutput};
@@ -51,6 +51,7 @@ mod presentation;
 mod schema_upgrade;
 mod scope;
 mod skill;
+mod target_identity;
 mod targets;
 #[cfg(test)]
 #[path = "../tests/support/tls_gateway.rs"]

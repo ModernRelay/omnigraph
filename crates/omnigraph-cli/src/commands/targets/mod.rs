@@ -25,7 +25,8 @@ fn edit(
 ) -> Result<()> {
     let path = path(input)?;
     let _lock = targets::ConfigEditLock::acquire(&path)?;
-    crate::operator_routing::check_rename_pending(&path)?;
+    let _state_lock = crate::operator_routing::lock_auth_state(input)?;
+    input.check_rename_pending()?;
     let before = crate::operator::read_operator_file(&path, "operator config")?
         .unwrap_or_else(|| "version: 1\n".into());
     let mut config = crate::operator_schema::parse(&before, path.parent().unwrap())?;
@@ -111,21 +112,6 @@ pub(crate) fn run_config(
             writeln!(stdout, "target renamed; profile custody preserved")?;
             Ok(())
         }
-        ConfigCommand::RenameAuth {
-            kind: args::RenameOwner::Server,
-            owner,
-            from,
-            to,
-        } => {
-            crate::operator_routing::rename(
-                input,
-                crate::operator_routing::Rename::Auth { owner },
-                &from,
-                &to,
-            )?;
-            writeln!(stdout, "auth profile renamed; custody preserved")?;
-            Ok(())
-        }
         ConfigCommand::RecoverRename => unreachable!(),
         ConfigCommand::RecoverOperations { source, json } => {
             let TargetBinding::Managed(binding) = &selected
@@ -164,13 +150,12 @@ pub(crate) fn run_config(
 pub(crate) async fn run_target(
     input: &InvocationConfig,
     selected: Option<&ResolvedTarget>,
-    selection: (Option<&str>, Option<&str>),
     command: TargetCommand,
     stdin: &mut dyn Read,
+    stdin_is_terminal: bool,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
-    let (profile, auth_override) = selection;
     match command {
         TargetCommand::List { json } => {
             let config = input.get(stderr)?;
@@ -178,16 +163,38 @@ pub(crate) async fn run_target(
             if json {
                 return crate::output::write_json(&source, stdout);
             }
+            if source.is_none_or(|targets| targets.is_empty()) {
+                writeln!(
+                    stdout,
+                    "No targets configured. Use target add NAME --cluster ID for a managed cluster, or pipe a target JSON object to target add NAME."
+                )?;
+                return Ok(());
+            }
+            writeln!(stdout, "NAME\tKIND\tDESTINATION\tPROFILE\tDEFAULT")?;
             if let Some(source) = source {
                 for (name, target) in source {
+                    let (kind, destination, profile) = match target {
+                        Target::Managed {
+                            endpoint,
+                            cluster_id,
+                            profile,
+                            ..
+                        } => (
+                            "managed",
+                            endpoint.as_deref().unwrap_or(cluster_id),
+                            profile.as_str(),
+                        ),
+                        Target::Server { endpoint, .. } => ("server", endpoint.as_str(), "-"),
+                        Target::Direct { uri, .. } => ("direct", uri.as_str(), "-"),
+                    };
+                    let default = if config.default_target() == Some(name.as_str()) {
+                        "*"
+                    } else {
+                        ""
+                    };
                     writeln!(
                         stdout,
-                        "{name}\t{}",
-                        match target {
-                            Target::Managed { .. } => "managed",
-                            Target::Server { .. } => "server",
-                            Target::Direct { .. } => "direct",
-                        }
+                        "{name}\t{kind}\t{destination}\t{profile}\t{default}"
                     )?;
                 }
             }
@@ -208,26 +215,15 @@ pub(crate) async fn run_target(
                 .get(&name)
                 .ok_or_else(|| eyre!("unknown target '{name}'"))?;
             let mut output = serde_json::json!({"name":name,"target":target});
+            // The digests a Studio link carries, recomputed for this home, so
+            // a client resolving the target itself can compare them.
+            if let Some(binding) = crate::target_identity::binding_digest(target)? {
+                output["binding"] = binding.into();
+            }
+            output["home"] = crate::target_identity::home_digest(input)?.into();
             if resolved {
-                let profiles = match target {
-                    Target::Managed { profile, .. } => {
-                        if auth_override.is_some() {
-                            bail!("managed targets do not accept --auth");
-                        }
-                        output["profile"] = serde_json::to_value(&source.profiles[profile])?;
-                        None
-                    }
-                    Target::Server {
-                        auth, default_auth, ..
-                    } => Some((auth, default_auth.as_deref())),
-                    Target::Direct { .. } => None,
-                };
-                if let Some((profiles, default)) = profiles {
-                    let (name, _) =
-                        crate::operator_routing::choose(profiles, default, auth_override)?;
-                    output["auth_profile"] = serde_json::json!({"name":name,"source":if auth_override.is_some() { "explicit" } else { "owner default" }});
-                } else if auth_override.is_some() {
-                    bail!("direct targets do not accept --auth");
+                if let Target::Managed { profile, .. } = target {
+                    output["profile"] = serde_json::to_value(&source.profiles[profile])?;
                 }
                 output["identity"] =
                     serde_json::json!({"status":"unknown","source":"offline inspection"});
@@ -253,6 +249,18 @@ pub(crate) async fn run_target(
             if frozen.targets.contains_key(&name) {
                 bail!("target already exists");
             }
+            let profile = if cluster.is_some() {
+                let target = selected
+                    .ok_or_else(|| eyre!("select --profile NAME or configure defaults.profile"))?;
+                match &target.binding {
+                    TargetBinding::Managed(binding) if binding.cluster.is_none() => {
+                        Some(target.label())
+                    }
+                    _ => bail!("managed registration requires a profile"),
+                }
+            } else {
+                None
+            };
             let expected_profile = profile.and_then(|name| {
                 frozen
                     .schema
@@ -260,8 +268,7 @@ pub(crate) async fn run_target(
                     .and_then(|source| source.profiles.get(name))
             });
             let entry = if let Some(cluster) = cluster {
-                let profile =
-                    profile.ok_or_else(|| eyre!("managed registration requires --profile NAME"))?;
+                let profile = profile.expect("managed registration resolves a profile");
                 let TargetBinding::Managed(binding) = &selected
                     .ok_or_else(|| eyre!("no selected profile"))?
                     .binding
@@ -270,13 +277,20 @@ pub(crate) async fn run_target(
                 };
                 crate::managed::register_target(binding, profile, &cluster).await?
             } else {
-                if profile.is_some() {
-                    bail!("--profile requires --cluster");
+                if stdin_is_terminal {
+                    bail!(
+                        "target add NAME reads a target JSON object from stdin; pipe one into this command, edit the operator configuration, or use --cluster ID for managed discovery"
+                    );
                 }
                 let mut bytes = Vec::new();
                 stdin.take(65537).read_to_end(&mut bytes)?;
                 if bytes.len() > 65536 {
                     bail!("target input exceeds 64 KiB");
+                }
+                if bytes.iter().all(u8::is_ascii_whitespace) {
+                    bail!(
+                        "no target JSON on stdin; pipe a target object to target add NAME, or use --cluster ID for managed discovery"
+                    );
                 }
                 serde_json::from_slice::<Target>(&bytes)?
             };

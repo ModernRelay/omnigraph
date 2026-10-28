@@ -135,9 +135,11 @@ fn dst_harness_crash_recovery_deterministic() {
 /// 873 universes misses by construction. A window whose precondition is an
 /// earlier crash's aftermath gets that setup crash first
 /// (`setup_crash_for`), and a hit is the window's own verdict
-/// (`window_hit`), never the setup's. Families the workload has no op
-/// for are reported as "unschedulable" so the coverage report says WHY
-/// each dark window is dark. Any panic is a find.
+/// (`window_hit`), never the setup's. Windows in
+/// `harness::REACH_EXPECTED_DARK` are not scheduled; the reach census owns
+/// them. Families the workload has no op for are reported as
+/// "unschedulable" so the coverage report says WHY each dark window is
+/// dark. Any panic is a find.
 #[cfg(feature = "failpoints")]
 #[test]
 #[ignore = "hunt: targeted-scheduling catalog run; run explicitly with -- --ignored"]
@@ -151,8 +153,14 @@ fn dst_hunt_crash_window_sweep() {
     let mut hit: Vec<&str> = Vec::new();
     let mut never_reached: Vec<&str> = Vec::new();
     let mut unschedulable: Vec<&str> = Vec::new();
+    let mut expected_dark: Vec<&str> = Vec::new();
     let mut universes = 0usize;
     for (w, window) in catalog::CRASH_WINDOWS.iter().enumerate() {
+        // The reach census proves these dark; scheduling them only burns cells.
+        if omnigraph_dst::harness::expected_dark_reason(window).is_some() {
+            expected_dark.push(window);
+            continue;
+        }
         if !omnigraph_dst::harness::workload_can_reach(window) {
             unschedulable.push(window);
             continue;
@@ -213,16 +221,18 @@ fn dst_hunt_crash_window_sweep() {
     }
 
     println!(
-        "HUNT COMPLETE ({universes} universes): {} hit, {} crossed-but-absorbed, {} never reached, {} unschedulable",
+        "HUNT COMPLETE ({universes} universes): {} hit, {} crossed-but-absorbed, {} never reached, {} unschedulable, {} expected dark",
         hit.len(),
         absorbed.len(),
         dark.len(),
-        unschedulable.len()
+        unschedulable.len(),
+        expected_dark.len()
     );
     println!("hit: {hit:?}");
     println!("crossed-but-absorbed (self-healing verified live): {absorbed:?}");
     println!("never reached (workload/path gap): {dark:?}");
     println!("unschedulable (need schema/init workload ops): {unschedulable:?}");
+    println!("expected dark (harness::REACH_EXPECTED_DARK, not scheduled): {expected_dark:?}");
     assert!(
         !hit.is_empty(),
         "coverage assertion: the hunt must actually reach SOME windows"
@@ -1942,11 +1952,6 @@ fn dst_dead_staging_sweep_window_is_reached_and_retried() {
             &stopped,
         );
         assert!(
-            window_hit(&a, window),
-            "{label} must stop the cleanup at {window}: {:?}",
-            a.reconcile_verdicts
-        );
-        assert!(
             a.reconcile_verdicts.iter().any(|(tag, verdict, channel)| {
                 tag.starts_with(&format!("deferred:{window}@"))
                     && verdict == "Deferred"
@@ -1995,6 +2000,50 @@ fn dst_setup_crash_waits_for_a_crossed_window() {
     assert!(!window_hit(&a, target));
     let b = run_universe("shared-memory://dst-setup-miss-b", &sc);
     omnigraph_dst::harness::assert_strict_replay(&a, &b, "uncrossed setup");
+}
+
+/// A recorded setup crash arms its target, so the setup window must be one
+/// that is crossed only once the aftermath exists. In hunt cell seed 2 an
+/// Optimize builds the missing indexes before the first EnsureIndices, which
+/// then has nothing to build: it still crosses the index build's
+/// pre-manifest window, but not `ensure_indices.post_table_effect`, the
+/// setup `setup_crash_for` names, so no setup is recorded and the
+/// dead-staging target stays unarmed.
+#[cfg(feature = "failpoints")]
+#[test]
+#[serial]
+fn dst_setup_crash_needs_its_aftermath() {
+    let _s = omnigraph::seams::FailScenario::setup();
+    let window = omnigraph::seams::catalog::CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE.name();
+    let pre_manifest = Scenario {
+        setup_crash: Some((
+            omnigraph::seams::catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.name(),
+            0,
+        )),
+        ..hunt_window_scenario(2, window, 0)
+    };
+    let a = run_universe(
+        "shared-memory://dst-setup-aftermath-pre-manifest",
+        &pre_manifest,
+    );
+    assert_eq!(
+        (a.crashes, window_hit(&a, window)),
+        (1, false),
+        "the cell's index build has nothing to build yet crosses the pre-manifest \
+         window, so a setup there arms the target with no staging: {:?}",
+        a.reconcile_verdicts
+    );
+
+    let named = hunt_window_scenario(2, window, 0);
+    let a = run_universe("shared-memory://dst-setup-aftermath-a", &named);
+    assert_eq!(
+        a.crashes, 0,
+        "an index build with nothing to build must not record the setup: {:?}",
+        a.reconcile_verdicts
+    );
+    assert!(!window_hit(&a, window));
+    let b = run_universe("shared-memory://dst-setup-aftermath-b", &named);
+    omnigraph_dst::harness::assert_strict_replay(&a, &b, "setup without its aftermath");
 }
 
 #[cfg(feature = "failpoints")]
@@ -3008,6 +3057,264 @@ fn writer_buffer_cost_rows(replay: &str) -> String {
     rows
 }
 
+/// A `load csv` overwrite on a reopened handle, one label per `removal` the
+/// planner decides: `scan` (populated, referenced node target), `none`
+/// (unreferenced node target), `none` on an empty referenced target (guard count).
+fn overwrite_removal_cost_rows(replay: &str) -> String {
+    struct OverwriteRemovalCost;
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage>
+        for OverwriteRemovalCost
+    {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            use omnigraph::loader::CsvLoadRequest;
+            use omnigraph_compiler::query::ast::LoadTarget;
+
+            omnigraph_dst::cost::set_label("_overwrite_removal_setup");
+            let schema = "node Person { id: String @key } \
+                          node Note { id: String @key } \
+                          node Doc { id: String @key } \
+                          edge Knows: Person -> Person \
+                          edge Cites: Doc -> Doc";
+            let seed = [
+                r#"{"type":"Person","data":{"id":"p1"}}"#,
+                r#"{"type":"Person","data":{"id":"p2"}}"#,
+                r#"{"type":"Person","data":{"id":"p3"}}"#,
+                r#"{"edge":"Knows","from":"p1","to":"p2","data":{}}"#,
+                r#"{"type":"Note","data":{"id":"n1"}}"#,
+                r#"{"type":"Note","data":{"id":"n2"}}"#,
+            ]
+            .join("\n");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    schema,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
+            drop(db);
+
+            let slug: String = resources
+                .root
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect();
+            let dir = std::env::temp_dir().join(format!("omnigraph-dst-{slug}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let dir = dir.canonicalize().unwrap();
+            for (name, text) in [
+                ("people.csv", "id\np1\np2\np3\n"),
+                ("notes.csv", "id\nn9\n"),
+                ("docs.csv", "id\nd1\n"),
+            ] {
+                std::fs::write(dir.join(name), text).unwrap();
+            }
+            let base_url = format!("file://{}/", dir.to_str().unwrap().trim_end_matches('/'));
+            let policy = omnigraph::ExternalBlobPolicy::allow(vec![
+                omnigraph::ExternalBlobBase::new(
+                    &base_url,
+                    omnigraph::ExternalBlobExecutionScope::EmbeddedOnly,
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+            let db = session(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap()
+                    .with_external_blob_policy(policy)
+                    .unwrap(),
+            );
+            let request = |file: &str, target: &str| CsvLoadRequest {
+                source: format!("{base_url}{file}"),
+                target: LoadTarget::Node(target.to_string()),
+                mode: LoadMode::Overwrite,
+                delimiter: b',',
+                header: true,
+                columns: None,
+            };
+            let removal = |receipt: &omnigraph::loader::LoadReceipt| {
+                receipt.plan.as_ref().unwrap().to_value()["physical_plan"]["inputs"][0]["removal"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            };
+
+            omnigraph_dst::cost::set_label("OverwriteRemovalScan");
+            let people = db
+                .load_csv_as_with_receipt("main", &request("people.csv", "Person"), None)
+                .await;
+            omnigraph_dst::cost::set_label("_overwrite_removal_verify");
+            let people = people.unwrap();
+            assert_eq!(removal(&people), "scan");
+            assert_eq!(people.result.nodes_loaded["Person"], 3);
+
+            omnigraph_dst::cost::set_label("OverwriteRemovalNone");
+            let notes = db
+                .load_csv_as_with_receipt("main", &request("notes.csv", "Note"), None)
+                .await;
+            omnigraph_dst::cost::set_label("_overwrite_removal_verify");
+            let notes = notes.unwrap();
+            assert_eq!(removal(&notes), "none");
+            assert_eq!(notes.result.nodes_loaded["Note"], 1);
+
+            omnigraph_dst::cost::set_label("OverwriteRemovalNoneEmptyTarget");
+            let docs = db
+                .load_csv_as_with_receipt("main", &request("docs.csv", "Doc"), None)
+                .await;
+            omnigraph_dst::cost::set_label("_overwrite_removal_verify");
+            let docs = docs.unwrap();
+            assert_eq!(removal(&docs), "none");
+            assert_eq!(docs.result.nodes_loaded["Doc"], 1);
+            assert_eq!(count_rows(&db, "node:Person").await, 3);
+            assert_eq!(count_rows(&db, "node:Note").await, 1);
+            assert_eq!(count_rows(&db, "node:Doc").await, 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    labeled_cost_rows_of(
+        format!("shared-memory://dst-overwrite-removal-cost-{replay}"),
+        &OverwriteRemovalCost,
+        &[
+            "OverwriteRemovalScan",
+            "OverwriteRemovalNone",
+            "OverwriteRemovalNoneEmptyTarget",
+        ],
+    )
+}
+
+/// An edge `load csv` overwrite on a reopened handle, one label per `probe`
+/// the planner decides: `swept` (one integer-keyed type at both endpoints,
+/// one set read beside the parse) and `judged` (a text key, after the drain).
+fn endpoint_probe_cost_rows(replay: &str) -> String {
+    struct EndpointProbeCost;
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for EndpointProbeCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            use omnigraph::loader::CsvLoadRequest;
+            use omnigraph_compiler::query::ast::LoadTarget;
+
+            omnigraph_dst::cost::set_label("_endpoint_probe_setup");
+            let schema = "node Account { id: I64 @key } \
+                          node Person { id: String @key } \
+                          edge Pays: Account -> Account \
+                          edge Knows: Person -> Person";
+            let seed = [
+                r#"{"type":"Account","data":{"id":1}}"#,
+                r#"{"type":"Account","data":{"id":2}}"#,
+                r#"{"type":"Account","data":{"id":3}}"#,
+                r#"{"type":"Person","data":{"id":"p1"}}"#,
+                r#"{"type":"Person","data":{"id":"p2"}}"#,
+            ]
+            .join("\n");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    schema,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
+            drop(db);
+
+            let slug: String = resources
+                .root
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect();
+            let dir = std::env::temp_dir().join(format!("omnigraph-dst-{slug}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let dir = dir.canonicalize().unwrap();
+            for (name, text) in [
+                ("pays.csv", "from,to\n1,2\n2,3\n"),
+                ("knows.csv", "from,to\np1,p2\n"),
+            ] {
+                std::fs::write(dir.join(name), text).unwrap();
+            }
+            let base_url = format!("file://{}/", dir.to_str().unwrap().trim_end_matches('/'));
+            let policy = omnigraph::ExternalBlobPolicy::allow(vec![
+                omnigraph::ExternalBlobBase::new(
+                    &base_url,
+                    omnigraph::ExternalBlobExecutionScope::EmbeddedOnly,
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+            let db = session(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap()
+                    .with_external_blob_policy(policy)
+                    .unwrap(),
+            );
+            let request = |file: &str, target: &str| CsvLoadRequest {
+                source: format!("{base_url}{file}"),
+                target: LoadTarget::Edge(target.to_string()),
+                mode: LoadMode::Overwrite,
+                delimiter: b',',
+                header: true,
+                columns: None,
+            };
+            let probes = |receipt: &omnigraph::loader::LoadReceipt| -> Vec<String> {
+                receipt.plan.as_ref().unwrap().to_value()["physical_plan"]["inputs"][0]["checks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|check| check["check"] == "edge_ri")
+                    .map(|check| check["probe"].as_str().unwrap().to_string())
+                    .collect()
+            };
+
+            omnigraph_dst::cost::set_label("EndpointProbeSwept");
+            let pays = db
+                .load_csv_as_with_receipt("main", &request("pays.csv", "Pays"), None)
+                .await;
+            omnigraph_dst::cost::set_label("_endpoint_probe_verify");
+            let pays = pays.unwrap();
+            assert_eq!(probes(&pays), ["swept", "swept"]);
+            assert_eq!(pays.result.edges_loaded["Pays"], 2);
+
+            omnigraph_dst::cost::set_label("EndpointProbeJudged");
+            let knows = db
+                .load_csv_as_with_receipt("main", &request("knows.csv", "Knows"), None)
+                .await;
+            omnigraph_dst::cost::set_label("_endpoint_probe_verify");
+            let knows = knows.unwrap();
+            assert_eq!(probes(&knows), ["judged", "judged"]);
+            assert_eq!(knows.result.edges_loaded["Knows"], 1);
+            assert_eq!(count_rows(&db, "edge:Pays").await, 2);
+            assert_eq!(count_rows(&db, "edge:Knows").await, 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    labeled_cost_rows_of(
+        format!("shared-memory://dst-endpoint-probe-cost-{replay}"),
+        &EndpointProbeCost,
+        &["EndpointProbeSwept", "EndpointProbeJudged"],
+    )
+}
+
 /// Storage calls per op kind plus reopened merge-history, branch-write, diff,
 /// commit-list and overwrite scenarios, replayed identically and compared with
 /// `cost_table.txt` (DST_REGEN_COSTS=1 to regen).
@@ -3030,6 +3337,8 @@ fn dst_bench_cost_count_golden() {
     table.push_str(&diff_cost_rows("a"));
     table.push_str(&commit_list_cost_rows("a"));
     table.push_str(&writer_buffer_cost_rows("a"));
+    table.push_str(&overwrite_removal_cost_rows("a"));
+    table.push_str(&endpoint_probe_cost_rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-b", &sc);
     let mut table2 = ledger2.render_calls();
@@ -3039,6 +3348,8 @@ fn dst_bench_cost_count_golden() {
     table2.push_str(&diff_cost_rows("b"));
     table2.push_str(&commit_list_cost_rows("b"));
     table2.push_str(&writer_buffer_cost_rows("b"));
+    table2.push_str(&overwrite_removal_cost_rows("b"));
+    table2.push_str(&endpoint_probe_cost_rows("b"));
     assert_eq!(
         table, table2,
         "the counting pass must replay identically before any golden claim"
@@ -3753,14 +4064,16 @@ fn dst_predict_born_on_both_person_probe() {
 }
 
 /// MILESTONE REACH PROBE: the "one seeded universe per window,
-/// can we catch all 66?" experiment. For each catalog window, ONE universe
-/// with the window's milestone plan woven into the seeded stream +
-/// `crash_on_match` probe_only (record-only crossing). Reports per-window
-/// crossed/not and the tally. Success target: every milestone-reachable
-/// window crosses in its single universe; the residue (recovery internals,
-/// init/open) is expected dark for NAMED reasons. (The schema families
-/// left the dark list when the `schema_ops` face requalified them.)
-///   cargo test -p omnigraph-dst dst_window_reach_probe -- --ignored --nocapture
+/// can we catch them all?" experiment. For each catalog window, up to three
+/// seeded universes with the window's milestone plan woven into the stream,
+/// its setup crash (`setup_crash_for`) when it has one, and a record-only
+/// probe over the whole universe (`probe_window`). Reports per-window
+/// crossed/not and the tally. Every window must cross on one of its seeds
+/// except those in `harness::REACH_EXPECTED_DARK`; the first cross wins, so
+/// a seed that trips an oracle fails the census only when no seed of that
+/// window crosses (`errored`), since the census asks whether the window is
+/// reachable.
+///   cd crates/omnigraph-dst && cargo test --locked --test scenarios dst_window_reach_probe -- --ignored --nocapture
 #[test]
 #[serial]
 #[ignore = "instrument: one-universe-each milestone reach census over the crash-window catalog"]
@@ -3816,17 +4129,16 @@ fn dst_window_reach_probe() {
         "errored (milestone tripped an oracle — separate finding) ({}): {errored:?}",
         errored.len()
     );
-    // Non-regression floor: the census measured 50/66 on 2026-08-12; the
-    // then-16 non-crossing windows all carried NAMED reasons (schema
-    // quarantine — since requalified by the `schema_ops` face, whose
-    // windows now cross — birth-owned init, #473-blocked adopts, chunk
-    // thresholds, branch-from-branch first-touch shapes, kill-territory
-    // orphan discard). Floor 48 leaves margin for benign seed sensitivity;
-    // a bigger drop = a recipe-mechanism regression.
+    // Each universe is a pure function of its seed, so a change in reach
+    // comes from a code change; the message names the window it moved.
+    let expected_dark =
+        |window: &&str| omnigraph_dst::harness::expected_dark_reason(window).is_some();
+    let newly_dark: Vec<&&str> = dark.iter().filter(|w| !expected_dark(w)).collect();
+    let listed_but_crossed: Vec<&&str> = crossed.iter().filter(|w| expected_dark(w)).collect();
     assert!(
-        crossed.len() >= 48,
-        "milestone reach regressed below the measured 50 ({} crossed)",
-        crossed.len()
+        newly_dark.is_empty() && listed_but_crossed.is_empty() && errored.is_empty(),
+        "milestone reach changed: newly dark {newly_dark:?}, listed dark but crossed \
+         {listed_but_crossed:?}, errored {errored:?}"
     );
 }
 
@@ -3980,15 +4292,20 @@ fn dst_fleet() {
             },
             &mut failures,
         );
-        // Crash-window arm: round-robin over the catalog so a 66+-seed
-        // pass draws every window. `reach_target` weaves the
-        // window's milestone recipe into the seeded stream — guarantee from
-        // milestones, diversity from the seed — and skip stays 0 so the
-        // recipe-built op is the one that carries the crash. Windows the
+        // Crash-window arm: round-robin over the catalog so a pass with at
+        // least as many seeds as windows draws every window. `reach_target`
+        // weaves the window's milestone recipe into the seeded stream —
+        // guarantee from milestones, diversity from the seed — and skip
+        // stays 0, so the crash lands on the first matching op; for a window
+        // with a setup crash (`setup_crash_for`), that is the first matching
+        // op after the setup crash is recorded. Windows the
         // workload has no op for are skipped (the hunt's coverage ledger
-        // owns naming those as unschedulable).
+        // owns naming those as unschedulable), and so are those in
+        // `harness::REACH_EXPECTED_DARK`, which no universe can cross.
         let window = catalog::CRASH_WINDOWS[(seed as usize) % catalog::CRASH_WINDOWS.len()];
-        if omnigraph_dst::harness::workload_can_reach(window) {
+        if omnigraph_dst::harness::workload_can_reach(window)
+            && omnigraph_dst::harness::expected_dark_reason(window).is_none()
+        {
             universes += 1;
             run(
                 seed,

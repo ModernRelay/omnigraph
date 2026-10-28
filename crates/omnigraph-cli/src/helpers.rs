@@ -172,9 +172,9 @@ impl std::fmt::Display for MissingCredential {
         match self {
             Self::AnonymousTarget(name) => write!(
                 f,
-                "target `{name}` uses anonymous authentication: configure and select a token or exec \
-                 auth profile; for a token profile with source: store, run \
-                 `omnigraph credentials set --target {name} --auth <profile> --stdin`"
+                "target `{name}` uses anonymous authentication: configure a token or exec \
+                 provider; for a token provider with source: store, run \
+                 `omnigraph credentials set --target {name} --stdin`"
             ),
             Self::Unbound {
                 server_root,
@@ -182,7 +182,7 @@ impl std::fmt::Display for MissingCredential {
             } => write!(
                 f,
                 "no credential is bound to {server_root}: declare a server target and explicit auth \
-                 profile under `targets:` in {}; select it with --target and --auth",
+                 provider under `targets:` in {}; select it with --target",
                 config.as_deref().map_or_else(
                     || "~/.omnigraph/config.yaml".to_string(),
                     |path| path.display().to_string()
@@ -340,40 +340,9 @@ pub(crate) fn precondition_failed_cli(
     }
 }
 
-pub(crate) async fn remote_json<T: DeserializeOwned>(
-    client: &crate::graph_http::GraphHttpClient,
-    method: Method,
-    url: String,
-    body: Option<Value>,
-    bearer_token: Option<&str>,
-) -> Result<T> {
-    remote_json_with_graph_commit_precondition(client, method, url, body, bearer_token, None).await
-}
-
-/// [`remote_json`] with an optional `Omnigraph-If-Graph-Commit` graph-head
-/// precondition (mutation routes only). A 412 whose body carries
-/// `precondition_failure` surfaces as the typed [`PreconditionFailedCli`].
-pub(crate) async fn remote_json_with_graph_commit_precondition<T: DeserializeOwned>(
-    client: &crate::graph_http::GraphHttpClient,
-    method: Method,
-    url: String,
-    body: Option<Value>,
-    bearer_token: Option<&str>,
-    expected_commit: Option<&str>,
-) -> Result<T> {
-    remote_json_bounded(
-        client,
-        method,
-        url,
-        body,
-        bearer_token,
-        expected_commit,
-        None,
-    )
-    .await
-}
-
-/// Same typed graph protocol with an optional response limit for managed data access.
+/// Typed graph protocol with an optional response limit and graph-head
+/// precondition. A 412 whose body carries `precondition_failure` surfaces
+/// as the typed [`PreconditionFailedCli`].
 pub(crate) async fn remote_json_bounded<T: DeserializeOwned>(
     client: &crate::graph_http::GraphHttpClient,
     method: Method,
@@ -526,6 +495,7 @@ pub(crate) async fn remote_no_content(
     method: Method,
     url: String,
     bearer_token: Option<&str>,
+    response_limit: Option<usize>,
 ) -> Result<()> {
     let request = apply_bearer_token(client.request(method, url)?, bearer_token);
     let response = client.send(request).await?;
@@ -533,17 +503,9 @@ pub(crate) async fn remote_no_content(
     if status.is_success() {
         return Ok(());
     }
-    let retry_after = crate::command_outcome::retry_after(response.headers())
-        .map(|value| crate::command_outcome::scrub_backoff(value, bearer_token));
-    let missing = missing_credential(&response).cloned();
-    let text = response.text().await?;
-    Err(remote_refusal(
-        status,
-        text,
-        retry_after,
-        None,
-        missing.as_ref(),
-    ))
+    remote_response_json_bounded::<Value>(response, bearer_token, response_limit)
+        .await
+        .map(|_| ())
 }
 
 pub(crate) fn parse_duration_arg(s: &str) -> Result<std::time::Duration> {

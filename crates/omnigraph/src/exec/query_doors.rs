@@ -200,6 +200,7 @@ impl Session {
             source_bytes,
             self.settings().query_memory_bytes(),
             WriteBudget::from_settings(self.settings()).bytes(),
+            self.settings().stage_write_concurrency(),
         )
         .await?;
         let explain = decision.explain().ok_or_else(|| {

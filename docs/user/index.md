@@ -32,6 +32,7 @@ deployment.
 - [CLI guide](cli/index.md)
 - [CLI reference](cli/reference.md)
 - [Operator profiles, targets and credentials](cli/targets.md)
+- [Open Studio on a server target](cli/studio.md)
 - [Managed data credentials and queries](cli/managed-data.md)
 - [Managed creation, configuration and deletion](cli/managed-lifecycle.md)
 - [Managed organization members and invitations](cli/managed-team.md)
@@ -45,14 +46,16 @@ deployment.
 - [`cluster.yaml` reference](clusters/config.md)
 - [Deployment](deployment.md)
 - [Storage failures and restart](operations/storage-failures.md)
+- [Server logs and traces](operations/observability.md)
 - [Authorization and actors](operations/policy.md)
 - [Maintenance](operations/maintenance.md)
+- [Upgrade from 0.13 to 0.14](operations/upgrade-0.14.md): checklist, YAML and CLI replacements
 - [Storage-format upgrades](operations/upgrade.md)
 
 ## Releases and internals
 
 User-visible changes are recorded in the [release notes](../releases/).
-See [0.13 highlights and upgrade requirements](../releases/v0.13.0-overview.md)
+See [0.14 highlights and upgrade actions](../releases/v0.14.0-overview.md)
 for a short overview of the release.
 Contributors should start with the [developer guide](../dev/index.md). Design
 decisions and proposals live in [RFCs](../rfcs/).

@@ -52,7 +52,8 @@ tokio::task_local! {
 
 /// The kind of a command whose failure reports an outcome. Commands with
 /// their own failure reports (`lint`, `queries validate`, the target and
-/// credential commands, cluster and managed commands) and maintenance report
+/// credential commands, the MCP bridge, which answers each relayed request
+/// itself, cluster and managed commands) and maintenance report
 /// none yet. The match is exhaustive, so a
 /// new command declares how its failure reads.
 pub(crate) fn kind(cli: &Cli) -> Option<CommandKind> {
@@ -115,6 +116,8 @@ pub(crate) fn kind(cli: &Cli) -> Option<CommandKind> {
         | Command::Target { .. }
         | Command::Config { .. }
         | Command::Credential { .. }
+        | Command::Mcp(_)
+        | Command::Studio(_)
         | Command::Skill { .. }
         | Command::Version { .. } => None,
     }
@@ -452,7 +455,9 @@ fn admission_refusal(status: StatusCode, code: Option<&ErrorCode>) -> Option<Act
         | (StatusCode::UNAUTHORIZED, code @ ErrorCode::Unauthorized)
         | (StatusCode::BAD_REQUEST, code @ ErrorCode::ApiContractMismatch)
         | (StatusCode::PRECONDITION_FAILED, code @ ErrorCode::ActorMismatch)
-        | (StatusCode::FORBIDDEN, code @ ErrorCode::Forbidden) => Some(code.action()),
+        | (StatusCode::FORBIDDEN, code @ (ErrorCode::Forbidden | ErrorCode::NotAdmitted)) => {
+            Some(code.action())
+        }
         _ => None,
     }
 }

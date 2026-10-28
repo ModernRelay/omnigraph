@@ -5,6 +5,27 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use workos::transport::{HttpRequest, HttpResponse, HttpTransport, TransportError};
 
+fn automation_credential(
+    origin: &str,
+    token: &str,
+) -> crate::credential_sources::AcquiredCredential {
+    use crate::credential_sources::{CredentialRequest, OwnerBinding, OwnerKind, Purpose};
+    let owner = OwnerBinding::new(
+        OwnerKind::Profile,
+        "test-owner".into(),
+        "test-auth".into(),
+        origin.into(),
+        Some("org_test".into()),
+    )
+    .unwrap();
+    let request =
+        CredentialRequest::new(owner, Purpose::Control, origin.into(), None, None).unwrap();
+    crate::credential_sources::acquire_environment_with(&request, "TEST_TOKEN", |_| {
+        Some(token.into())
+    })
+    .unwrap()
+}
+
 #[test]
 fn status_reports_unknown_without_requesting_keychain_custody() {
     assert_eq!(
@@ -33,14 +54,22 @@ async fn selected_control_token_matches_the_canonical_prefixed_route() {
                 configured_token("https://api.example/prefix")
                     .await
                     .unwrap()
-                    .as_deref(),
+                    .as_ref()
+                    .map(
+                        |credential| acquired_bearer(credential, "https://api.example/prefix")
+                            .unwrap()
+                    ),
                 Some("declared-token")
             );
             assert_eq!(
                 configured_token("https://api.example/prefix/")
                     .await
                     .unwrap()
-                    .as_deref(),
+                    .as_ref()
+                    .map(
+                        |credential| acquired_bearer(credential, "https://api.example/prefix/")
+                            .unwrap()
+                    ),
                 Some("declared-token")
             );
             assert!(
@@ -50,6 +79,106 @@ async fn selected_control_token_matches_the_canonical_prefixed_route() {
             );
         })
         .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn automation_credential_expiry_is_rechecked_before_each_control_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let api = IntentApiFixture::new(vec![
+        metadata(120, "principal_one"),
+        IntentReply::json(200, json!({"data": {}, "meta": {}})),
+        IntentReply::json(
+            200,
+            json!({"data": {"unexpected": "mutation dispatched"}, "meta": {}}),
+        ),
+    ]);
+    let helper = directory.path().join("helper.sh");
+    let response = directory.path().join("response.json");
+    let calls = directory.path().join("calls");
+    std::fs::write(
+        &helper,
+        "IFS= read -r request\nprintf 'called\\n' >> \"$2\"\ncat \"$1\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("config.yaml"),
+        json!({
+            "version": 1, "profiles": {"work": {
+                "api": api.origin, "organization_id": "org_test",
+                "auth": {"provider": "exec", "command": ["/bin/sh", helper, response, calls]}
+            }}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let input = crate::operator::InvocationConfig::at(Some(directory.path().to_owned()), None);
+    let cli = crate::invocation::parse_from(["omnigraph", "cluster", "list", "--profile", "work"])
+        .unwrap()
+        .cli;
+    let target = crate::scope::resolve(&cli, &input, directory.path(), false, &mut Vec::new())
+        .unwrap()
+        .unwrap();
+    let authentication =
+        crate::operator_routing::authentication(&cli, &input, Some(&target)).unwrap();
+    crate::operator_routing::test_transport_scope(&[&api.origin], async {
+        crate::operator_routing::AUTH
+            .scope(authentication, async {
+                let expires = OffsetDateTime::now_utc() + time::Duration::seconds(2);
+                std::fs::write(
+                    &response,
+                    json!({"version": 1,
+                        "credential": {"type": "bearer", "token": "expiring-control-test-only"},
+                        "expires_at": expires.format(&Rfc3339).unwrap()
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                let client = Api::authenticated(
+                    api.origin.clone(),
+                    Some("org_test"),
+                    super::super::ControlAuth::AutomationEnv,
+                )
+                .await
+                .unwrap();
+                client
+                    .request(Method::GET, "/v1/clusters", None, None)
+                    .await
+                    .unwrap();
+                assert_eq!(api.requests().len(), 2);
+                while OffsetDateTime::now_utc() < expires {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let result = client
+                    .request(
+                        Method::POST,
+                        "/v1/clusters",
+                        Some(&json!({"name": "must-not-create"})),
+                        None,
+                    )
+                    .await;
+                assert_eq!(
+                    api.requests().len(),
+                    2,
+                    "expired control credentials must not dispatch another request"
+                );
+                let error = result.unwrap_err();
+                assert_eq!(error.body["type"], "credential_expired");
+                assert!(
+                    !error
+                        .body
+                        .to_string()
+                        .contains("expiring-control-test-only")
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&calls).unwrap(),
+                    "called\n",
+                    "expiry must not rerun the helper"
+                );
+            })
+            .await;
+    })
+    .await;
 }
 
 #[derive(Default)]
@@ -263,7 +392,7 @@ pub(super) fn metadata(seconds: i64, principal: &str) -> IntentReply {
 fn metadata_for(seconds: i64, principal: &str, organization: &str) -> IntentReply {
     IntentReply::json(
         200,
-        json!({"data":{"principal_id":principal,"account_id":organization,"kind":"human","scopes":{},
+        json!({"data":{"principal_id":principal,"account_id":organization,"kind":"human","service_permissions":["source_read","status"],
         "expires_at":OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp()+seconds).unwrap().format(&Rfc3339).unwrap()},"meta":{}}),
     )
 }
@@ -350,7 +479,7 @@ async fn explicit_automation_resolves_its_own_principal_before_data_cache_reuse(
             &store,
             &api.origin,
             Some("org_test"),
-            Some("automation-access".into()),
+            Some(automation_credential(&api.origin, "automation-access")),
             Some(api.origin.clone()),
             super::super::ControlAuth::AutomationEnv,
         )
@@ -470,24 +599,55 @@ async fn official_sdk_uses_public_client_device_and_refresh_without_secret_or_re
 
 #[tokio::test]
 async fn api_verifies_new_provider_identity_before_the_cache_accepts_it() {
-    let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
-    crate::operator_routing::test_transport_scope(&[&api.origin], async {
-        let response = serde_json::from_value(tokens(120, "user_one")).unwrap();
-        let (saved, output) = renewal::accept(&api.origin, config(), response, None)
-            .await
-            .unwrap();
-        let store = MemoryStore::default();
-        renewal::save(&store, &saved).unwrap();
-        assert!(renewal::load(&store, &api.origin).unwrap().is_some());
-        assert!(!output.to_string().contains("rotated-refresh"));
-        assert!(!output.to_string().contains(".signature"));
-        let requests = api.requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].path, "/v1/auth/session");
-        assert!(requests[0].headers["authorization"].starts_with("Bearer ey"));
-        api.assert_complete();
-    })
-    .await;
+    for permissions in [
+        Some(json!(["source_read", "status"])),
+        Some(json!([])),
+        Some(json!(["status", "status"])),
+        Some(json!(["status", "source_read"])),
+        Some(json!(["bad\n"])),
+        Some(Value::Null),
+        None,
+    ] {
+        let valid = matches!(&permissions, Some(Value::Array(values)) if values.is_empty() || values == &vec![json!("source_read"), json!("status")]);
+        let mut reply = metadata(120, "principal_one");
+        let mut body: Value = serde_json::from_slice(&reply.body).unwrap();
+        if let Some(permissions) = permissions {
+            body["data"]["service_permissions"] = permissions;
+        } else {
+            body["data"]
+                .as_object_mut()
+                .unwrap()
+                .remove("service_permissions");
+            body["data"]["scopes"] = json!({});
+        }
+        reply.body = body.to_string().into_bytes();
+        let api = IntentApiFixture::new(vec![reply]);
+        crate::operator_routing::test_transport_scope(&[&api.origin], async {
+            let response = serde_json::from_value(tokens(120, "user_one")).unwrap();
+            let result = renewal::accept(&api.origin, config(), response, None).await;
+            if valid {
+                let (saved, output) = result.unwrap();
+                let store = MemoryStore::default();
+                renewal::save(&store, &saved).unwrap();
+                assert!(renewal::load(&store, &api.origin).unwrap().is_some());
+                assert_eq!(
+                    output["data"]["service_permissions"],
+                    body["data"]["service_permissions"]
+                );
+                assert!(output["data"].get("scopes").is_none());
+                assert!(!output.to_string().contains("rotated-refresh"));
+                assert!(!output.to_string().contains(".signature"));
+            } else {
+                assert!(result.is_err());
+            }
+            let requests = api.requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].path, "/v1/auth/session");
+            assert!(requests[0].headers["authorization"].starts_with("Bearer ey"));
+            api.assert_complete();
+        })
+        .await;
+    }
 }
 
 #[tokio::test]
@@ -732,7 +892,7 @@ async fn explicit_organization_must_match_the_verified_automation_account() {
             &MemoryStore::default(),
             &api.origin,
             Some("org_other"),
-            Some("automation".into()),
+            Some(automation_credential(&api.origin, "automation")),
             Some(api.origin.clone()),
             super::super::ControlAuth::AutomationEnv,
         )
@@ -1212,12 +1372,15 @@ async fn selected_device_custody_failure_revokes_only_the_new_verified_session()
 async fn target_mechanism_never_falls_back_to_another_credential_class() {
     let store = MemoryStore::default();
     let origin = "https://control.example";
-    // A human target ignores even invalid or foreign automation input.
+    // A human target ignores foreign automation input.
     let human = select_with(
         &store,
         origin,
         Some("org_one"),
-        Some("invalid secret".into()),
+        Some(automation_credential(
+            "https://foreign.example",
+            "foreign-secret",
+        )),
         Some("https://foreign.example".into()),
         super::super::ControlAuth::HumanDevice,
     )

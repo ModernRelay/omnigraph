@@ -23,8 +23,8 @@ omnigraph alias triage --params '{"limit":5}' --json
 
 Aliases require an explicit target and, for multi-graph targets, an explicit
 graph. They never inherit `default_graph` and reject target/graph overrides.
-Managed aliases retain their target's pinned profile and reject `--auth`.
-Only standalone aliases allow `--auth` to select a named server auth entry.
+Managed aliases retain their target's pinned profile. Standalone aliases use
+their target's single auth provider; neither accepts an authentication override.
 `query` is a stored
 identifier, never a filename or inline program. Values in `params` are typed
 JSON-compatible defaults; explicit parameters shallowly replace matching names.

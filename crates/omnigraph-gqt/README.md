@@ -33,9 +33,10 @@ counts only cases under `cases/`.
 ## Explicit execution
 
 Every case starts with its issue header and a required runner section.
-Schema and seed sections are optional together; without them, the runner
-requires `--store <URI>`. A case may have zero steps, including a dataset
-containing only schema and seed. Configuration has no default target,
+Schema and seed sections are optional together; without them, embedded execution
+requires `--store <URI>` and served execution uses the selected server graph
+without schema validation or seed loading. A case may have zero steps, including
+a dataset containing only schema and seed. Configuration has no default target,
 storage, seed or timeout:
 
 ```yaml
@@ -417,8 +418,8 @@ The store places, their methods and the actions each honors are RFC 0066's
 table; a place-and-action pair outside it, or listed but not implemented, is
 refused at admission naming the table row. An old `--- fault` block
 converts by renaming the section and its `return_error` action to
-`action: fail`; `at`, `occurrence` and `scope` keep their names. Process crashes,
-server/CLI sessions and network simulation are future extensions.
+`action: fail`; `at`, `occurrence` and `scope` keep their names. The DST runner
+does not support process crashes, server/CLI sessions or network simulation.
 
 ## Concurrent block
 
@@ -600,6 +601,18 @@ selection to the cost model. Without a traversal header or another index
 requirement, a fixture does not build indexes. `indexed` and `csr` prepare
 indexes and force their respective paths.
 
+The optional `# csv_slice_bytes: <n>` header sets the source bytes one
+`load csv` parse partition owns and the slice it reads at once, 8 MiB without
+the header, so a case of a few KiB cuts two or three partitions and pins what
+happens at their boundaries; the header's head range keeps its 64 KiB floor.
+An in-process pin: a server target refuses it.
+
+The optional `# overwrite_chunk_rows: <n>` header sets the rows one `load csv`
+overwrite chunk holds before a Lance writer takes it, Lance's file target
+(1 Mi rows) without the header, so a case of a few hundred records writes
+fragments before its last record is judged and pins what a late refusal leaves
+behind. An in-process pin: a server target refuses it.
+
 An `expand $src <Edge> $dst:` line selects every matching named-edge physical `Expand` between
 those bindings over that edge type and claims `mode csr` or `mode
 indexed_scan`, the traversal mode the planner recorded (pass `expand_mode`
@@ -668,12 +681,14 @@ load route: plan|pipeline
 load scan: partitions <n> fallback single_scan
 load validate unique <table> key|unique [<cols>]: access delta|probe|scan
 load validate edge_ri <edge-table> from|to <node-type>: access probe|scan
+load validate edge_ri <edge-table> from|to <node-type>: probe swept|judged
 load validate cardinality <edge-table> from <node-type>
 load validate retained_edges <node-table> <edge-table> from|to: access delta|probe|scan
+load validate removal <table>: scan|none
 load write: overwrite fragments
 load write: append strict_insert
 load write: merge upsert
-load pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]
+load pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ partitions <n>][ after <n>[, <m>]]
 load executed: partitions <n> rows <m>
 load executed <Node>: rows <m>
 ```
@@ -683,14 +698,24 @@ for `executor`.
 `load scan` claims the `CsvSource` node's partition count and its `single_scan`
 fallback.
 A `load validate` line claims one check of the `Validate` node with that
-identity, and its `access` suffix claims the check's access path.
+identity, and its `access` suffix claims the check's access path. An
+`edge_ri` line with a `probe` suffix claims where the check probes the
+committed ids: `swept`, on the parse partitions as the delta arrives, when
+both endpoint checks read their set whole (`scan`) over node types keyed by
+one `I32`, `I64` or `U32` `@key`; `judged`, after the drain, otherwise.
+`load validate removal` claims the node's `removal`: `scan` when the plan
+finds the committed ids an overwrite removes, `none` when no planned check
+reads them (an empty committed table, a node target no edge type references,
+an edge target, append and merge).
 `load write` claims the `FragmentWrite` node's mode and adapter.
 `load pipeline` claims one entry of the document's `pipelines` by position:
 its source node, its streaming operators in run order, the sink it drains
 into (a node that holds its whole input, a join's build side, or the
-`consumer`) and, after `after`, the pipelines drained before it starts; an
-overwrite load prints `0: CsvSource => Validate` and
-`1: Validate -> FragmentWrite => consumer after 0`.
+`consumer`), after `partitions` the streams its source runs (the `CsvSource`
+node's `max_partitions`, spelled only above one) and, after `after`, the
+pipelines drained before it starts; an overwrite load prints
+`0: CsvSource => Validate` and `1: Validate -> FragmentWrite => consumer after 0`,
+a source over 8 MiB `0: CsvSource => Validate partitions 2`.
 `load executed:` claims the partitions and rows the load executed;
 `load executed <Node>: rows <m>` claims the rows one node's operator emitted
 (`CsvSource`, `Validate`, or the rows `FragmentWrite` staged), read from the

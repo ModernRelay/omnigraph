@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-16
-updated: 2026-10-20
+updated: 2026-10-25
 discussion: https://github.com/ModernRelay/omnigraph/pull/1017
 supersedes: []
 superseded_by: []
@@ -283,7 +283,7 @@ Declared exceptions, by reason:
 |---|---|
 | Runs where the storage is | `init`, `upgrade`, `repair`, `optimize`, `cleanup`, `index rebuild`, `schema plan` and `schema apply` on a direct target, and `cluster validate`, `observe`, `force-unlock` and `upgrade-ledger` |
 | Local tooling with no graph | `lint`, `embed`, `policy test` and `explain`, `queries validate`, `skill`, `version` |
-| Byte streams, which MCP tools do not carry | Blob payloads and export streams; `blob stat` is a tool |
+| Byte streams, which MCP tools do not carry | Blob payloads, export streams and the change-feed baseline, an NDJSON snapshot whose cursor is valid only after the snapshot is installed; `blob stat` is a tool |
 | Deployment control, which is not an agent tool | `/cluster/*` over MCP |
 | Process probes, not graph operations | `/healthz` and `/readyz` in the CLI |
 
@@ -291,8 +291,8 @@ Gaps on main that this closes:
 
 | Gap | Change |
 |---|---|
-| MCP has no commit diff, commit publish or drop, change-feed baseline, branch diff or merge-base tool, and no `blob stat` | Add the tools; write tools stay behind `--mcp-allow-writes` |
-| MCP refuses stored mutations | Admit them as write tools behind `--mcp-allow-writes`, or declare the reason in the table |
+| MCP has no commit diff, commit publish or drop, branch diff or merge-base tool, and no `blob stat` or `blob clear` | Add the tools; write tools stay behind `--mcp-allow-writes` |
+| MCP refuses stored mutations | Admit them as write tools behind `--mcp-allow-writes`: `mutate` with a stored mutation's `name` and no `query`, through the stored-query routes and their preconditions |
 | The CLI cannot list a server's stored queries | `queries list --target NAME` reads `GET …/queries` for a server target |
 | `load --json` prints a CLI-only `LoadOutput`, which adds `uri`, drops `actor_id` and omits a null `base_branch` | Print the route's body |
 
@@ -390,8 +390,11 @@ object.
   outcome is final once the attempted `__manifest` version is readable, by the
   [read-back](#engine-control-facts-on-the-version-cas) rule:
   the write landed if it holds the publication id, and lost if it holds
-  another and the store never acknowledged this attempt. While that version is
-  absent the outcome stays unknown, until some commit holds it. It
+  another, since a create-if-absent cannot land once its version is held. The
+  check cannot see whether the store acknowledged the attempt; the in-doubt
+  result of an acknowledged attempt stays on the publisher's read-back, which
+  holds the request record. While that version is absent the outcome stays
+  unknown, until some commit holds it. It
   arrives with the attempt identity of [cross-process
   writes](#cross-process-writes). Under an actor view that hides the commit
   listing, the check answers for the caller's own publication id and returns
@@ -494,9 +497,13 @@ owns.
 
 - On macOS it opens Studio by bundle identifier (`open -b`). On Linux and
   Windows it opens the link only when the platform names a handler for the
-  scheme (`xdg-mime query default x-scheme-handler/omnigraph-studio`, or the
-  scheme's registry association), because `xdg-open`'s generic path hands an
-  unhandled scheme to a web browser. Without Studio or a handler it prints the
+  scheme. On Linux the CLI launches that handler itself: it finds the desktop
+  entry `xdg-mime query default x-scheme-handler/omnigraph-studio` names
+  under `$XDG_DATA_HOME` and `$XDG_DATA_DIRS`, and runs the entry's `Exec`,
+  without a shell, with the link in place of `%u`. It never runs `xdg-open`,
+  whose generic path, with no display set, skips the registered handler and
+  hands the link to a web browser. On Windows it requires the scheme's
+  registry association. Without Studio or a handler it prints the
   link and how to install Studio, and refuses (`studio_unavailable`), until
   [installing Studio](#installing-studio) ships. It never opens a browser.
 - With `--json` it prints
@@ -1243,7 +1250,7 @@ scope as cross-process correctness and access reporting.
 
 | | Change | Why it is separate | Recommendation |
 |---|---|---|---|
-| A1 | `WWW-Authenticate` on every 401 | Changes every protected route's 401 for every client | Issue [#1020](https://github.com/ModernRelay/omnigraph/issues/1020), as RFC 0003's named follow-up |
+| A1 | `WWW-Authenticate` on every 401 | Changes every protected route's 401 for every client | Implemented for issue [#1020](https://github.com/ModernRelay/omnigraph/issues/1020) with an amendment to RFC 0003 |
 | A2 | OAuth for standard clients and managed access | Security-sensitive and cross-repository, gated on the managed control plane's own qualification | Control-plane and Studio spec changes; tracking issue [#1025](https://github.com/ModernRelay/omnigraph/issues/1025) |
 | A3 | MCP relay for managed targets | Lends the CLI's native managed authority to local agents | Decided after A2, in [#1025](https://github.com/ModernRelay/omnigraph/issues/1025) |
 | A4 | Retire the test-shaped constructors | Public API removal with test churn across crates | Issue [#1021](https://github.com/ModernRelay/omnigraph/issues/1021), with ordinary cluster-backed replacements |
@@ -1252,19 +1259,19 @@ scope as cross-process correctness and access reporting.
 
 ### A1. `WWW-Authenticate` on every 401
 
-The server accepts OIDC resource tokens on every protected route but sends the
-OAuth challenge only from `/mcp`. Every 401 would carry
-`WWW-Authenticate: Bearer resource_metadata="<url>"` with OIDC configured (plus
-`error="invalid_token"` when a presented bearer was refused), and a bare
-`WWW-Authenticate: Bearer` otherwise, as RFC 9110 §15.5.2 asks. The challenge
-would move into the authentication middleware every route shares, so REST and
-`/mcp` cannot drift. A client should follow the challenge's metadata URL, or
-the path RFC 9728 derives from the resource's URL, and never assume the metadata
-sits at the host's root: a deployment may publish it only at
+Every 401 carries `WWW-Authenticate`, as RFC 9110 §15.5.2 asks: `Bearer`, plus
+`error="invalid_token"` when a presented bearer was refused, plus
+`resource_metadata="<url>"` with OIDC configured. Authentication, which every
+route shares, decides it, so REST and `/mcp` cannot drift; the
+[MCP server surface](0003-mcp-server-surface.md#challenge) RFC owns the
+contract. A client should follow the challenge's metadata URL, or the path
+RFC 9728 derives from the resource's URL, and never assume the metadata sits at
+the host's root: a deployment may publish it only at
 `/.well-known/oauth-protected-resource/<resource path>`.
 
-**Recommendation:** issue [#1020](https://github.com/ModernRelay/omnigraph/issues/1020), as the "server-wide follow-up"
-RFC 0003 names, with a short amendment to RFC 0003.
+**Disposition:** implemented for issue
+[#1020](https://github.com/ModernRelay/omnigraph/issues/1020), with an amendment
+to RFC 0003.
 
 ### A2. OAuth for standard clients and managed access
 
@@ -1296,6 +1303,30 @@ URIs, expose the protected-resource metadata and `/mcp` on public data hosts,
 and start managed servers with OIDC identity trust, which also admits the
 resource's host for MCP. A client must not depend on `/openapi.json` being
 reachable through every deployment's proxy. Studio would implement the client.
+
+**Interim exception for Studio.** Until the managed control plane enables that
+resource profile and registers Studio, and Studio implements this client,
+Studio may reach a managed cluster with the CLI's data token for it. The
+launcher stays refused (the target table's "Deferred to A2" and Opening
+Studio): Studio uses the token only after a person selects a managed target
+inside Studio. It takes the token from `omnigraph credentials export --target
+NAME`, the one credential command that accepts a managed target, which writes
+only to a Unix FIFO and never starts an interactive login. Export returns the
+CLI's cached data token while it validates and asks the issuer for a new one
+only when the cache is missing, expired or for another principal. That request
+asks for 3600 seconds, which the issuer may shorten, and the CLI refuses an
+expiry later than that plus 30 seconds; a token stored by `cluster token --ttl`
+can last up to 86400 seconds. After a 401, a new export returns the same token
+while the cache validates, and a target whose endpoint pin no longer matches
+fails the export. Studio keeps the token in memory, and only while `target
+inspect` still names that managed target at that endpoint; that is Studio's
+obligation, since the pipe's reader could store it, and for an `omnigraph`
+profile the CLI's own copy stays in the OS keychain. The exception accepts
+what the first paragraph rules out: Studio and the CLI hold the same bearer as
+one Cedar principal, so the server cannot give Studio less authority; the
+token stays valid until it expires or its signing key retires, and removing
+the person's issuer membership does not cut that short, though a policy change
+denies both on their next request.
 
 **Recommendation:** control-plane and Studio spec changes, tracked in
 [#1025](https://github.com/ModernRelay/omnigraph/issues/1025). No OmniGraph RFC is needed unless the server contract
@@ -1535,3 +1566,33 @@ proposal.
   acknowledged attempt whose version holds another fact stays unknown. The
   version-key fence covers linear publications; §5 keeps the detached proposal
   and snapshot.
+- 2026-10-21: `disposition.check`, a later read that cannot see the store's
+  acknowledgement, reports a loss once the attempted version holds another
+  commit; the acknowledged in-doubt result stays on the publisher's read-back.
+- 2026-10-21: A1 implemented for issue
+  [#1020](https://github.com/ModernRelay/omnigraph/issues/1020). Superseded
+  sentences: "Every 401 would carry … and a bare `WWW-Authenticate: Bearer`
+  otherwise" (a refused credential carries `error="invalid_token"` with or
+  without OIDC), "The challenge would move into the authentication middleware
+  every route shares", and A1's recommendation, now its disposition.
+- 2026-10-22: MCP parity implemented as phase 3 of
+  [RFC 0003](0003-mcp-server-surface.md). The change-feed
+  baseline joins the byte-stream exceptions: its route answers an NDJSON entity
+  snapshot, an export stream, whose cursor is valid only once the snapshot is
+  installed, so no bounded tool result can carry it. Stored mutations are
+  admitted through `mutate`, since a caller allowed `change` can already run
+  any mutation there. Superseded sentences: the gap row "MCP has no commit
+  diff, commit publish or drop, change-feed baseline, branch diff or
+  merge-base tool, and no `blob stat`", the exception "Blob payloads and
+  export streams; `blob stat` is a tool", and the stored-mutation change "or
+  declare the reason in the table".
+- 2026-10-22: The Linux opener launches the `Exec` of the desktop entry `xdg-mime` names instead of running `xdg-open`, which without a display hands the link to a browser.
+- 2026-10-25: A2 gains one exception. Until the managed control plane enables
+  the resource profile and registers Studio, and Studio implements the client,
+  Studio may reach a managed cluster that a person selects inside Studio with
+  the CLI's data token from `credentials export`. It qualifies the sentence "A
+  client other than the CLI should reach an OIDC-enabled server, self-hosted
+  or managed, as a standard OAuth public client rather than borrow the CLI's
+  credentials" for that case only: the rule stays in force for self-hosted
+  OIDC servers and every other client, and the launcher's refusal of a managed
+  target (the target table and Opening Studio) is unchanged.

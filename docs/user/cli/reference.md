@@ -25,8 +25,7 @@ server requires `--graph` or its own `default_graph` for graph operations. No
 request discovers a graph to select automatically. Inline addresses are local paths or `file://` URIs only. Register remote
 endpoints; cloud-direct and catalogue targets are unsupported. Use `./name` for a
 relative filesystem address; a bare name selects a registered target.
-`init --schema graph.pg ./graph.omni` remains a creation convenience; it cannot
-be combined with `--target`.
+`init --schema graph.pg ./graph.omni` remains a creation convenience and refuses `--target`.
 
 `--as ACTOR` attributes supported direct operations. A served target derives its
 actor from its credential and sends `--as` as the `Omnigraph-If-Actor` assertion,
@@ -67,17 +66,19 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `cluster create/list/members/pull/push/delete/undo-delete/token/operation/history/cancel` | Operate a managed cluster | profile or managed target |
 | `policy validate/test/explain` | Validate or evaluate applied policy | cluster |
 | `embed` | Generate, clean, or refresh seed embeddings | local tooling |
-| `login`, `logout` | Register a profile or manage an `omnigraph` profile session | managed profile |
-| `target list/inspect/add/refresh/remove` (`register` aliases `add`) | Inspect/edit targets; managed add/refresh uses discovery | local or managed API |
-| `credentials set/status/remove/export` | Manage static custody or export access to a pipe; explicit profile or standalone target/auth required | profile or server; managed target for export |
+| `login`, `logout` | Create a profile with `login --create-profile NAME` or manage an existing `omnigraph` profile session | managed profile |
+| `target list/inspect/add/refresh/remove` | Inspect/edit targets; managed add/refresh uses discovery | local or managed API |
+| `credentials set/status/remove/export` | Manage static custody or export access to a pipe; explicit profile or standalone target required | profile or server; managed target for export |
 | `config validate` | Validate the whole operator file offline | local |
-| `config rename-profile/rename-target/rename-auth/recover-rename` | Rename local bindings while preserving custody, or finish an interrupted rename ([syntax](targets.md#rename-registrations-and-profiles)) | local |
+| `config rename-profile/rename-target/recover-rename` | Rename local bindings while preserving custody, or finish an interrupted rename ([syntax](targets.md#rename-registrations-and-profiles)) | local |
 | `config recover-operations --source DIR` | Preserve legacy folder lifecycle evidence; no operation submission | profile, local evidence |
-| `access` | Say who you are at a target and which actions its policy grants, graph-wide and on a branch ([access](targets.md#what-you-may-do-at-a-target)) | direct or served |
+| `access` | Say who you are at a target and which actions its policy grants, graph-wide and on a branch ([access](targets.md#what-you-may-do-at-a-target)) | direct, server or managed |
+| `mcp` | Relay an agent's stdio MCP to the target's `/mcp` with its resource credential, bound to one graph; write tools need `--write` ([stdio agents](../operations/mcp.md#connect-a-stdio-agent)) | server or managed |
+| `studio` | Open Omnigraph Studio on a server target through an `omnigraph-studio://open` link and print it; no request or credential; `--json` adds the `binding` and `home` digests ([Open Studio](studio.md)) | server |
 | `alias` | Invoke a personal stored-query alias bound to one target | served |
-| `organization members/invitations` | Administer organization membership and invitations | profile |
+| `organization members/invitations` | List members, set service roles, offboard and manage invitations; see [team access](managed-team.md) | profile |
 | `skill export/show` | Export the agent skill built into this binary, or print one of its files ([matching skill](index.md#give-an-agent-the-matching-skill)) | local |
-| `version` | Print the package version, HTTP contract and storage formats; `--json` includes `version`, `http_contract`, `protocols` (`target`, `credential`, `access`) and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
+| `version` | Print the package version, HTTP contract and storage formats; `--json` includes `version`, `http_contract`, `protocols` (`studio: 1`, `target: 2`, `credential: 2`, `access: 2`) and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
 
 ## Query inputs and output
 
@@ -198,7 +199,7 @@ Account operations use a profile. Resource operations use a managed target
 referencing it; see [registration](targets.md#login-and-registration).
 
 ```bash
-omnigraph login --register work
+omnigraph login --create-profile work
 omnigraph cluster list --profile work --json
 omnigraph target add production --profile work --cluster CLUSTER_ID
 ```
@@ -211,7 +212,7 @@ retarget an invocation.
 |---|---|
 | `login` / `logout` | Selected `omnigraph` profile (also via a managed target) |
 | `cluster create NAME`, `cluster list` | Profile; create returns identity without binding a folder |
-| `cluster members list` | Cluster target; list explicit enrollment |
+| `cluster members list` | Cluster target; list active organization members and identity eligibility |
 | `cluster pull --out NEW_DIR [--rev REVISION]` | Download configuration into a new directory |
 | `cluster push --config DIR --expected-revision REVISION --message TEXT` | Upload source using an exact revision |
 | `cluster plan [--rev REVISION]` | Preview pushed source |
@@ -257,7 +258,9 @@ progress and idempotency information go to stderr.
 ## Managed data access
 
 A managed target uses the common served graph client, including schema reads,
-branches, snapshots, history, exports, Blob operations and change feeds. Select a graph explicitly or use its configured
+access introspection, stored-query catalogs, the stdio MCP bridge, branches,
+snapshots, history, exports, Blob operations and change feeds. Select a graph
+explicitly or use its configured
 `default_graph`; discovery only lists available IDs. A separate identity
 credential authenticates the data endpoint, and applied Cedar policy decides
 permissions. Direct-only maintenance, schema changes and root administration

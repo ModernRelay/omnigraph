@@ -285,7 +285,7 @@ fn parity_schema_show() {
     std::fs::write(
         home.join("config.yaml"),
         format!(
-            "version: 1\ntargets:\n  local:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    default_auth: fixture\n    auth:\n      fixture:\n        provider: token\n        source:\n          env: OMNIGRAPH_TOKEN_LOCAL\n    default_graph: og_catalog\n",
+            "version: 1\ntargets:\n  local:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_LOCAL\n    default_graph: og_catalog\n",
             p.server.base_url
         ),
     )

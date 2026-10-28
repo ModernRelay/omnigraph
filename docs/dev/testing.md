@@ -35,6 +35,7 @@ export budget and must not share a binary with the other export tests.
 | `omnigraph-engine` | `crates/omnigraph/tests/` plus focused in-source tests | `tests/helpers/` and `tests/fixtures/` |
 | `omnigraph-policy` | In-source Cedar policy parsing and evaluation tests | Module-local fixtures |
 | `omnigraph-cluster` | In-source lifecycle, deployment and admission tests; `tests/failpoints.rs`; `tests/identity_recovery.rs`; `tests/s3_cluster.rs` | Module-local fixtures |
+| `omnigraph-mcp` | In-source protocol, settings, catalog and bounded-result tests | Module-local fixtures |
 | `omnigraph-server` | `crates/omnigraph-server/tests/` | `tests/support/mod.rs` |
 | `omnigraph-cli` | In-source application, runtime, parsing, output and transport tests plus `crates/omnigraph-cli/tests/` | `tests/support/mod.rs` |
 | `omnigraph-skill` | In-source `src/lib.rs`: the embedded table is sorted and `file` finds every path. The CLI owns the rest. In-source `src/skill.rs` holds the skill's command index (`references/commands.md`) and condensed reference (`SKILL.md`) to the clap tree and its storage-format line to `omnigraph version`; `integration/cli_schema_config.rs` owns `skill export` and `skill show`, including byte identity with `skills/omnigraph`; `scripts/check-docs.py` holds `metadata.version` and the declared HTTP contract to the CLI | None |
@@ -246,6 +247,14 @@ barrier test proves reported failures do not wait for blocked runtime work;
 `cli_schema_config` owns help/version/refusal statuses with closed streams.
 These are CLI boundary contracts; query-semantic GQT cases remain unchanged.
 
+The operator-config owners also cover read-only YAML and parent directories with
+writable private credential state, preservation/conflict checks when relocating
+legacy state, and explicit profile creation versus default-profile login.
+The existing client and managed-auth fixtures delay discovery or a later request
+past credential expiry and assert that no authenticated operation is dispatched.
+Standalone flat-auth fixtures retain distinct-target identity isolation, including
+two targets sharing an endpoint; no auth-name fallback remains.
+
 The `system_remote` deployment matrix holds a real
 admitted request through drain, disconnects or times out the caller before
 durable acceptance, and loses replies after acceptance. Exact-ID observation
@@ -257,10 +266,24 @@ capability/refusal tests.
 
 Server suites are organized by public route: `auth_policy`, `data_routes`, `schema_routes`, `stored_queries`, `multi_graph`, `boot_settings`, object-store coverage in `s3`, and the generated contract in `openapi`.
 
+The OpenAPI owner checks the [HTTP conventions](http-api.md), their named
+exceptions, and required error responses. Its negative cases remove a required
+response or code from a spec copy and require rejection; a regenerated snapshot
+alone is not proof of complete response coverage.
+
+`omnigraph-mcp` owns protocol, catalog and formatting tests. Server
+`integration/mcp.rs` keeps the real HTTP fixture for authentication, policy,
+tool/route and error-disposition parity, limits and response lifetimes. The
+server adapter's in-source tests own canonical protocol-refusal projection,
+including lost and oversized write results; `boot_settings` covers MCP across
+shutdown and restart. Extend these owners instead of adding a second server
+fixture to the MCP crate.
+
 Per-graph serving transitions extend these owners: in-source `registry` tests
 own capture/close ordering, drain-only deployment deadlines, affected activation
 scope, schema identity and candidate bounds;
-`operations`, `ingress` and `mcp` own detached execution and output lifetimes.
+`operations`, `ingress` and the server's MCP adapter own detached execution and
+output lifetimes.
 `stored_queries` parks a request before engine capture, `data_routes` retains
 disconnected writes and stream bytes, and `boot_settings`/`mcp` check authorized
 availability. The same owners cover coherent schema/query batch activation; these assertions
@@ -299,6 +322,10 @@ share the transport-independent phases; local success does not qualify their
 storage-fault paths. CI requires the local journey to execute successfully.
 
 CLI suites own their named planes: cluster lifecycle, data commands, stored queries, schema/config, cross-version rebuild, embedded/remote parity, and local/remote system journeys. Keep `OMNIGRAPH_HOME` hermetic by using `tests/support::cli()` or `cli_process()`.
+
+CLI `integration/cli_mcp.rs` owns the stdio MCP bridge against a real served cluster and a stand-in endpoint: refusals before any I/O, tool listing under the server's write setting and `--write`, graph binding, reads equal to the server's own `/mcp` answers, a Unix-socket endpoint refused before it connects, `--as`, credential re-reading from the target's `auth` source after a 401 without resending, the server's `WWW-Authenticate` challenge relayed with a 401, managed resource identity renewal without replay or control-token forwarding, wrong-incarnation and actor-override refusals, cancellation, and unreachable servers or lost answers that start nothing and resend nothing. In-source `commands/mcp` tests own framing, binding and narrowing rules, and that the bridge names no server or MCP implementation crate.
+
+CLI `integration/cli_data.rs` owns `studio` through stand-in platform openers on `PATH` and a stand-in desktop entry: the `--json` link and its digests equal to `target inspect --json`, the registered handler's own program receiving the link, no credential read, `studio_unavailable` that runs neither `xdg-open` nor a browser on `PATH`, and direct, managed and inline targets refused before any I/O. In-source `commands/studio` tests own the link format, each platform's opener behind an injected command runner, so no test opens anything, and desktop-entry lookup and `Exec` expansion; `target_identity` tests own the `home` and `binding` digests.
 
 Deployment tests extend these owners: cluster `tests.rs` pins no-reset
 ledger conversion, captured source bytes, exact-ID lookup, bounded results and
