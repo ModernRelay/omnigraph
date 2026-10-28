@@ -711,5 +711,50 @@ pub(crate) async fn resource(
     result.map_err(|failure: Failure| color_eyre::eyre::eyre!("{}", failure.body))
 }
 
+/// Forget only the exact rejected credential of this resource. A concurrent
+/// replacement must survive; the next acquisition still verifies current
+/// profile authority and never opens an interactive login.
+pub(crate) async fn forget_refused(
+    binding: &super::Binding,
+    refused_token: &str,
+) -> color_eyre::Result<()> {
+    let result = async {
+        let context = binding.context()?;
+        let authentication = crate::operator_routing::AUTH
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
+        let store = match authentication.as_ref() {
+            Some(auth) => ResourceStore::for_profile(
+                &auth.profile,
+                &auth.derived_credentials,
+                &auth::DATA_STORE,
+            ),
+            None => ResourceStore::Persistent(&auth::DATA_STORE),
+        };
+        let _lock = if store.persistent() {
+            Some(auth::cache_lock(&format!("data:{}", key(&context))).await?)
+        } else {
+            None
+        };
+        remove_refused(&store, &context, refused_token)
+    }
+    .await;
+    result.map_err(|failure: Failure| color_eyre::eyre::eyre!("{}", failure.body))
+}
+
+fn remove_refused(store: &impl Store, context: &Context, refused_token: &str) -> Result<()> {
+    if let Some(raw) = store.get(&key(context))? {
+        if raw.len() > MAX_CREDENTIAL {
+            return Err(invalid());
+        }
+        let credential: Credential = serde_json::from_str(&raw).map_err(|_| invalid())?;
+        if credential.token == refused_token {
+            store.remove(&key(context))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;

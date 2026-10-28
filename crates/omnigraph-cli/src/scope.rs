@@ -551,6 +551,9 @@ defaults: {target: local, profile: work}
             vec!["commit", "show", "commit-one"],
             vec!["graphs", "list"],
             vec!["changes", "poll"],
+            vec!["access"],
+            vec!["queries", "list"],
+            vec!["mcp"],
         ] {
             for target in ["server", "cluster"] {
                 let mut args = args.clone();
@@ -558,15 +561,17 @@ defaults: {target: local, profile: work}
                 assert!(selected(&args, &input, dir.path()).is_ok(), "{args:?}");
             }
         }
-        assert!(selected(&["optimize", "--target", "cluster"], &input, dir.path()).is_err());
-        assert!(
-            selected(
-                &["queries", "list", "--target", "cluster"],
-                &input,
-                dir.path()
-            )
-            .is_err()
-        );
+        for args in [
+            vec!["optimize"],
+            vec!["queries", "validate"],
+            vec!["policy", "validate"],
+        ] {
+            for target in ["server", "cluster"] {
+                let mut args = args.clone();
+                args.extend(["--target", target]);
+                assert!(selected(&args, &input, dir.path()).is_err(), "{args:?}");
+            }
+        }
     }
 
     #[test]

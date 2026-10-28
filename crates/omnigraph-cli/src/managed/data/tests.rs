@@ -129,6 +129,53 @@ async fn loaded_data_credential_expiry_is_rechecked_after_discovery() {
     }
 }
 
+#[tokio::test]
+async fn managed_mcp_credential_expiry_is_rechecked_after_discovery() {
+    let expiry = OffsetDateTime::now_utc().unix_timestamp() + 2;
+    let data = IntentApiFixture::graph_with_discovery_hook(vec![], move || {
+        while OffsetDateTime::now_utc().unix_timestamp() < expiry {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+    let mut context = context();
+    context.endpoint = Some(data.origin.clone());
+    let mut credential = identity_credential(&context, &data.origin);
+    set_identity_expiry(&mut credential, expiry);
+    crate::operator_routing::test_transport_scope(&[&data.origin], async {
+        let GraphClient::Remote { http, token, .. } =
+            resolve_loaded(None, &context, credential).unwrap()
+        else {
+            unreachable!()
+        };
+        let request = http
+            .request(Method::POST, format!("{}/mcp", data.origin))
+            .unwrap()
+            .bearer_auth(token.unwrap())
+            .body("{}");
+        let error = http.send_mcp(request).await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<crate::credential_sources::CredentialError>(),
+            Some(&crate::credential_sources::CredentialError::Expired)
+        );
+        assert_eq!(data.requests().len(), 1);
+        assert!(!data.requests()[0].headers.contains_key("authorization"));
+        data.assert_complete();
+    })
+    .await;
+}
+
+#[test]
+fn refused_credential_removal_preserves_a_concurrent_replacement() {
+    let context = context();
+    let store = MemoryStore::default();
+    let credential = identity_credential(&context, "https://data.example");
+    save(&store, &context, &credential);
+    remove_refused(&store, &context, "another-refused-token").unwrap();
+    assert!(store.get(&key(&context)).unwrap().is_some());
+    remove_refused(&store, &context, &credential.token).unwrap();
+    assert!(store.get(&key(&context)).unwrap().is_none());
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn valid_data_credential_remains_usable_when_control_expires_during_discovery() {
@@ -199,6 +246,11 @@ async fn valid_data_credential_remains_usable_when_control_expires_during_discov
                 assert_eq!(data.requests().len(), 2);
                 assert_eq!(data.requests()[1].headers["authorization"], expected);
                 assert_eq!(
+                    std::fs::read_to_string(&calls).unwrap(),
+                    "called\n",
+                    "the valid data request does not renew its expired control credential",
+                );
+                assert_eq!(
                     authentication
                         .token()
                         .await
@@ -206,7 +258,11 @@ async fn valid_data_credential_remains_usable_when_control_expires_during_discov
                         .downcast_ref::<crate::credential_sources::CredentialError>(),
                     Some(&crate::credential_sources::CredentialError::Expired)
                 );
-                assert_eq!(std::fs::read_to_string(&calls).unwrap(), "called\n");
+                assert_eq!(
+                    std::fs::read_to_string(&calls).unwrap(),
+                    "called\ncalled\n",
+                    "explicit control acquisition retries the helper, which still returns an expired credential",
+                );
                 data.assert_complete();
             })
             .await;
@@ -1530,7 +1586,18 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
         let mut chunked = format!("{:x}\r\n", 8 * 1024 * 1024 + 1).into_bytes();
         chunked.extend(vec![b' '; 8 * 1024 * 1024 + 1]);
         chunked.extend_from_slice(b"\r\n0\r\n\r\n");
-        let operations = ["query", "load", "commit-list", "commit-show"];
+        let operations = [
+            "query",
+            "load",
+            "commit-list",
+            "commit-show",
+            "access",
+            "queries",
+            "branch-list",
+            "snapshot",
+            "schema",
+            "graph-list",
+        ];
         let cases = [
             (
                 IntentReply {
@@ -1587,6 +1654,12 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
                             .unwrap_err(),
                         "commit-list" => client.list_commits(Some("main")).await.unwrap_err(),
                         "commit-show" => client.get_commit("commit-a").await.unwrap_err(),
+                        "access" => client.access(None, None).await.unwrap_err(),
+                        "queries" => client.list_queries().await.unwrap_err(),
+                        "branch-list" => client.branch_list().await.unwrap_err(),
+                        "snapshot" => client.snapshot("main").await.unwrap_err(),
+                        "schema" => client.schema_source().await.unwrap_err(),
+                        "graph-list" => client.list_graphs().await.unwrap_err(),
                         _ => client
                             .query(
                                 Some(ReadTarget::Branch("main".into())),
@@ -1612,11 +1685,99 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
 }
 
 #[tokio::test]
+async fn managed_stream_and_bodyless_refusals_remain_bounded_and_redacted() {
+    let refused = IntentReply::json(403, json!({"error": format!("refused {DATA_TOKEN}")}));
+    let oversized = IntentReply {
+        status: 403,
+        headers: vec![("Content-Length".into(), (8 * 1024 * 1024 + 1).to_string())],
+        body: vec![],
+    };
+    let export_size = 8 * 1024 * 1024 + 1;
+    let server = IntentApiFixture::graph(vec![
+        refused.clone(),
+        refused.clone(),
+        refused,
+        oversized.clone(),
+        oversized.clone(),
+        oversized,
+        IntentReply {
+            status: 200,
+            headers: vec![],
+            body: vec![b' '; export_size],
+        },
+        IntentReply {
+            status: 204,
+            headers: vec![],
+            body: vec![],
+        },
+    ]);
+    crate::operator_routing::test_transport_scope(&[&server.origin], async {
+        let client = GraphClient::managed(
+            &server.origin,
+            "knowledge",
+            crate::credential_sources::test_credential(&server.origin, DATA_TOKEN),
+        )
+        .unwrap();
+        for oversized in [false, true] {
+            for operation in ["export", "baseline", "drop"] {
+                let error = match operation {
+                    "export" => client
+                        .export("main", &[], &mut Vec::new())
+                        .await
+                        .unwrap_err(),
+                    "baseline" => client
+                        .change_baseline(
+                            Some("main"),
+                            &crate::client::ChangeFilterArgs {
+                                kinds: &[],
+                                types: &[],
+                                ops: &[],
+                            },
+                            &mut Vec::new(),
+                        )
+                        .await
+                        .unwrap_err(),
+                    _ => client
+                        .commit_drop("commit-a", &mut Vec::new())
+                        .await
+                        .unwrap_err(),
+                };
+                assert!(!format!("{error:?}").contains(DATA_TOKEN));
+                if oversized {
+                    assert!(error.to_string().contains("8 MiB"), "{error}");
+                }
+            }
+        }
+        // Successful exports retain streaming size freedom; 204 decodes no body.
+        let mut output = Vec::new();
+        client.export("main", &[], &mut output).await.unwrap();
+        assert_eq!(output.len(), export_size);
+        client
+            .commit_drop("commit-a", &mut Vec::new())
+            .await
+            .unwrap();
+    })
+    .await;
+    server.assert_complete();
+}
+
+#[tokio::test]
 async fn managed_data_errors_redact_reflected_credentials_including_preconditions() {
     let encoded = DATA_TOKEN.replace('h', "\\u0068");
     let batch = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(batch.path(), "{}\n").unwrap();
-    let operations = ["mutate", "load", "commit-list", "commit-show"];
+    let operations = [
+        "mutate",
+        "load",
+        "commit-list",
+        "commit-show",
+        "access",
+        "queries",
+        "branch-list",
+        "snapshot",
+        "schema",
+        "graph-list",
+    ];
     let cases = [
         (200, json!(DATA_TOKEN).to_string()),
         (401, format!("{{\"error\":\"rejected {encoded}\"}}")),
@@ -1665,6 +1826,12 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
                             .unwrap_err(),
                         "commit-list" => client.list_commits(Some("main")).await.unwrap_err(),
                         "commit-show" => client.get_commit("commit-a").await.unwrap_err(),
+                        "access" => client.access(None, None).await.unwrap_err(),
+                        "queries" => client.list_queries().await.unwrap_err(),
+                        "branch-list" => client.branch_list().await.unwrap_err(),
+                        "snapshot" => client.snapshot("main").await.unwrap_err(),
+                        "schema" => client.schema_source().await.unwrap_err(),
+                        "graph-list" => client.list_graphs().await.unwrap_err(),
                         _ => client
                             .mutate(
                                 Some("main"),

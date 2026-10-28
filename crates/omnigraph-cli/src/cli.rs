@@ -212,7 +212,7 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: CredentialCommand,
     },
-    /// Relay an agent's MCP over stdio to an existing server target's `/mcp`.
+    /// Relay an agent's MCP over stdio to an existing server or managed target's `/mcp`.
     ///
     /// For agents that start their tools as child processes. The bridge sends
     /// the target's stored credential, which the agent never sees, and is
