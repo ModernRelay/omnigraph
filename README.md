@@ -29,6 +29,8 @@ Omnigraph is engineered for the new workload introduced by long-horizon agents: 
 
 Omnigraph Cloud is in private preview: [join the waitlist](https://www.omnigraph.dev/cloud?utm_source=github&utm_medium=readme&utm_campaign=cloud-waitlist).
 
+Join the [Omnigraph Slack community](https://join.slack.com/t/omnigraphworkspace/shared_invite/zt-3wfpglyxj-lHvJGhuySPfqLtN35uJZNw) to ask questions, share feedback, and follow development.
+
 ## Capabilities
 
 | Capability | What it gives you |
