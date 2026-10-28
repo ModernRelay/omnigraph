@@ -1,6 +1,5 @@
-- The server supports optional OTLP HTTP/protobuf tracing and structured JSON
-  logs with trace correlation. Request diagnostics use route templates and
-  exclude request payloads and credentials. Log verbosity does not disable
-  tracing or warning/error correlation. See [logs and traces][server-otel-guide].
+- Optional OTLP tracing and correlated JSON logs omit payloads and credentials.
+  Tracing and warning/error correlation work at every log level. See
+  [logs and traces][server-otel-guide].
 
 [server-otel-guide]: ../docs/user/operations/observability.md
