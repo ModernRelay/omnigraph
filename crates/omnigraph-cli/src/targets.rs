@@ -821,11 +821,11 @@ pub(crate) fn resolve_server_token_for(
 /// The credential of [`resolve_server_token_for`] read from its source
 /// again, for a long-lived client whose server refused it. Only the client
 /// holds the new token; the invocation's own credential is unchanged.
-pub(crate) async fn reread_server_token_for(
+pub(crate) async fn reread_server_credential_for(
     auth: &ServerAuth,
     server_root: &str,
     request_url: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<crate::credential_sources::AcquiredCredential>> {
     match frozen_server_credential(auth, server_root, request_url)? {
         Some(selected) => selected.reacquire(server_root).await,
         None => Ok(None),

@@ -4785,6 +4785,7 @@ async fn unattached_child_checks_expected_versions_against_its_base() {
     crate::unattached::release_unattached_tag_confirmed(
         &main,
         &unattached_tag_name(&root.graph_commit_id, &root.graph_commit_id),
+        &root.graph_commit_id,
     )
     .await
     .unwrap();
@@ -15207,7 +15208,8 @@ async fn manifest_create_without_a_definite_answer_stays_in_doubt_issue_1067() {
 }
 
 /// A manifest create no re-issue settled may still land, and its manifest
-/// names the attempt's transaction file. Lance reads the version back after
+/// names the attempt's transaction file. The in-doubt error names the graph
+/// commit that may land, which is the one that does. Lance reads the version back after
 /// the last re-issue; the missing version must not count as proof of
 /// absence there, or Lance deletes that file and the late manifest names a
 /// file that is gone. Here no storage scope backs the protocol, as on an
@@ -15228,6 +15230,19 @@ async fn unresolved_manifest_create_keeps_its_transaction_file_issue_1067() {
         landed.version().version,
         before + 1,
         "the late create landed"
+    );
+    // The error named, as its own field, the graph commit that landed.
+    assert_eq!(
+        error.publication_id(),
+        Some(
+            read_manifest_rows(&landed)
+                .await
+                .unwrap()
+                .head
+                .graph_commit_id
+                .as_str()
+        ),
+        "{error:?}"
     );
     let transaction = landed
         .manifest()

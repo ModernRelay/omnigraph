@@ -432,9 +432,21 @@ async fn select_with(
             .map_err(|failure| scrub(failure, &token))?;
         let account = bounded_string(&body["data"], "account_id", 128)?;
         check_account(organization, account)?;
+        let principal = bounded_string(&body["data"], "principal_id", 1024)?;
+        if let Some(auth) = crate::operator_routing::AUTH
+            .try_with(Clone::clone)
+            .ok()
+            .flatten()
+            && !auth.accepts_managed_identity(account, principal)
+        {
+            return Err(Failure::refused(
+                "session_identity_mismatch",
+                "the verified organization or principal changed; restart with the intended identity",
+            ));
+        }
         return Ok(Some(Selection {
             account_id: account.into(),
-            principal_id: bounded_string(&body["data"], "principal_id", 1024)?.into(),
+            principal_id: principal.into(),
             source: Source::Automation(credential),
         }));
     }

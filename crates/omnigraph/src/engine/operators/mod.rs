@@ -39,6 +39,7 @@ mod fragment_sink;
 mod hash_join;
 mod hydrate;
 mod limit;
+mod load_budget;
 pub(in crate::engine) mod memory;
 mod metadata_count;
 mod pair_buffer;

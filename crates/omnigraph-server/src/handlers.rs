@@ -422,11 +422,20 @@ pub(crate) async fn require_bearer_auth(
     }
 
     let provided_token = crate::challenge::bearer_token(request.headers())?;
-    let Some(actor) = state.authenticate_bearer_token(provided_token) else {
-        return Err(ApiError::unauthorized(
-            Unauthenticated::Refused,
-            "invalid bearer token",
-        ));
+    let actor = match state.authenticate_bearer_token(provided_token) {
+        Ok(actor) => actor,
+        Err(crate::oidc_identity::OidcRefusal::Invalid) => {
+            return Err(ApiError::unauthorized(
+                Unauthenticated::Refused,
+                "invalid bearer token",
+            ));
+        }
+        Err(crate::oidc_identity::OidcRefusal::NotAdmitted) => {
+            return Err(ApiError::not_admitted());
+        }
+        Err(crate::oidc_identity::OidcRefusal::Unavailable) => {
+            return Err(ApiError::identity_admission_unavailable());
+        }
     };
     request.extensions_mut().insert(actor.actor().clone());
     request.extensions_mut().insert(actor);

@@ -72,11 +72,11 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `config validate` | Validate the whole operator file offline | local |
 | `config rename-profile/rename-target/recover-rename` | Rename local bindings while preserving custody, or finish an interrupted rename ([syntax](targets.md#rename-registrations-and-profiles)) | local |
 | `config recover-operations --source DIR` | Preserve legacy folder lifecycle evidence; no operation submission | profile, local evidence |
-| `access` | Say who you are at a target and which actions its policy grants, graph-wide and on a branch ([access](targets.md#what-you-may-do-at-a-target)) | direct or server; managed targets unsupported |
-| `mcp` | Relay an agent's stdio MCP to the target's `/mcp` with its target's token, bound to one graph; write tools need `--write` ([stdio agents](../operations/mcp.md#connect-a-stdio-agent)) | server |
-| `studio` | Open OmniGraph Studio on a server target through an `omnigraph-studio://open` link and print it; no request or credential; `--json` adds the `binding` and `home` digests ([Open Studio](studio.md)) | server |
+| `access` | Say who you are at a target and which actions its policy grants, graph-wide and on a branch ([access](targets.md#what-you-may-do-at-a-target)) | direct, server or managed |
+| `mcp` | Relay an agent's stdio MCP to the target's `/mcp` with its resource credential, bound to one graph; write tools need `--write` ([stdio agents](../operations/mcp.md#connect-a-stdio-agent)) | server or managed |
+| `studio` | Open Omnigraph Studio on a server target through an `omnigraph-studio://open` link and print it; no request or credential; `--json` adds the `binding` and `home` digests ([Open Studio](studio.md)) | server |
 | `alias` | Invoke a personal stored-query alias bound to one target | served |
-| `organization members/invitations` | Administer organization membership and invitations | profile |
+| `organization members/invitations` | List members, set service roles, offboard and manage invitations; see [team access](managed-team.md) | profile |
 | `skill export/show` | Export the agent skill built into this binary, or print one of its files ([matching skill](index.md#give-an-agent-the-matching-skill)) | local |
 | `version` | Print the package version, HTTP contract and storage formats; `--json` includes `version`, `http_contract`, `protocols` (`studio: 1`, `target: 2`, `credential: 2`, `access: 2`) and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
 
@@ -212,7 +212,7 @@ retarget an invocation.
 |---|---|
 | `login` / `logout` | Selected `omnigraph` profile (also via a managed target) |
 | `cluster create NAME`, `cluster list` | Profile; create returns identity without binding a folder |
-| `cluster members list` | Cluster target; list explicit enrollment |
+| `cluster members list` | Cluster target; list active organization members and identity eligibility |
 | `cluster pull --out NEW_DIR [--rev REVISION]` | Download configuration into a new directory |
 | `cluster push --config DIR --expected-revision REVISION --message TEXT` | Upload source using an exact revision |
 | `cluster plan [--rev REVISION]` | Preview pushed source |
@@ -258,7 +258,9 @@ progress and idempotency information go to stderr.
 ## Managed data access
 
 A managed target uses the common served graph client, including schema reads,
-branches, snapshots, history, exports, Blob operations and change feeds. Select a graph explicitly or use its configured
+access introspection, stored-query catalogs, the stdio MCP bridge, branches,
+snapshots, history, exports, Blob operations and change feeds. Select a graph
+explicitly or use its configured
 `default_graph`; discovery only lists available IDs. A separate identity
 credential authenticates the data endpoint, and applied Cedar policy decides
 permissions. Direct-only maintenance, schema changes and root administration

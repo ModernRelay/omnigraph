@@ -905,6 +905,7 @@ async fn cleanup_detached_only(
             crate::db::manifest::unattached::release_unattached_tag_confirmed(
                 manifest.dataset(),
                 &record.name,
+                &record.graph_commit_id,
             )
             .await?;
             unattached_tags_released += 1;

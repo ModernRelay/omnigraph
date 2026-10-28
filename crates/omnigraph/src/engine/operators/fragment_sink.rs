@@ -25,6 +25,7 @@ use futures::StreamExt;
 
 use super::csv_source::slice_of;
 use super::external;
+use super::load_budget::ShareClass;
 use super::memory::WorkMemory;
 use crate::db::MutationOpKind;
 use crate::engine::LoadWrite;
@@ -94,7 +95,8 @@ impl DataSink for LanceFragmentSink {
         data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> DfResult<u64> {
-        let mut work = WorkMemory::new(Arc::clone(context), "LanceFragmentSink")?;
+        let mut work =
+            WorkMemory::new(Arc::clone(context), "LanceFragmentSink")?.in_share(ShareClass::Sink);
         work.set_metrics(self.metrics.clone());
         work.metric(STAGED_ROWS, 0);
         MetricBuilder::new(&self.metrics)

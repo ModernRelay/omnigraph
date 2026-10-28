@@ -646,7 +646,7 @@ pub const CLI_ONLY_OPERATIONS: &[CliOnlyOperation] = &[
     cli_only("cluster history", MANAGED),
     cli_only("cluster cancel", MANAGED),
     cli_only("organization members list", MANAGED),
-    cli_only("organization members apply", MANAGED),
+    cli_only("organization members set", MANAGED),
     cli_only("organization members offboard", MANAGED),
     cli_only("organization invitations list", MANAGED),
     cli_only("organization invitations send", MANAGED),

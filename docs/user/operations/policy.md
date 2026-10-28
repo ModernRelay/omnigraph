@@ -221,7 +221,7 @@ token on a graph without a policy gets `read` alone, and a signed data
 credential without one nothing, as those routes decide; a server without
 authentication allows every graph action and reports `actor_id: null`. The MCP
 `access` tool returns the same body, and `omnigraph access` prints it for a
-server target ([what you may do at a target](../cli/targets.md#what-you-may-do-at-a-target)).
+server or managed target ([what you may do at a target](../cli/targets.md#what-you-may-do-at-a-target)).
 
 It reports policy actions, not actor views, so a view can still refuse a
 `change` the policy allows. It does not report `maintain` or `reclaim`, since

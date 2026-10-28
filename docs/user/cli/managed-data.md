@@ -72,8 +72,9 @@ Use [credential export](targets.md#manage-credentials) to explicitly release a
 cluster-bound data token to another process through a pipe.
 
 Managed and standalone access use the shared served graph client: query/mutation,
-load, schema reads, branches, snapshots, history, export, Blob operations and
-change feeds remain subject to server capabilities and policy. Direct-only
+load, schema reads, access introspection, stored-query catalogs, branches,
+snapshots, history, export, Blob operations, change feeds and the stdio MCP
+bridge remain subject to server capabilities and policy. Direct-only
 maintenance, schema changes and root administration do not acquire storage
 access. `--as` remains refused on managed targets.
 

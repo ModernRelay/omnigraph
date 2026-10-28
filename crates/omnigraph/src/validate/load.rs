@@ -407,6 +407,11 @@ impl SweepPlan {
         !self.endpoints.is_empty()
     }
 
+    /// Whether a uniqueness check's holders are sized and shared.
+    pub(crate) fn has_unique_holders(&self) -> bool {
+        !self.unique_holders.is_empty()
+    }
+
     /// Every uniqueness check's holders sized for `rows` once, the first time
     /// a partition has the source's estimate; `admit` charges one check's
     /// table bytes and returns the charge, or `None` to let that table grow;
