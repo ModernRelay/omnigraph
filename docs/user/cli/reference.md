@@ -22,8 +22,9 @@ Machine results remain on stdout.
 
 A registered direct target declares `scope: graph` or `scope: root`; a root or
 server requires `--graph` or its own `default_graph` for graph operations. No
-request discovers a graph to select automatically. Inline addresses are local paths or `file://` URIs only. Register remote
-endpoints; cloud-direct and catalogue targets are unsupported. Use `./name` for a
+request discovers a graph to select automatically. Inline addresses are local paths or `file://` URIs, plus
+[S3 cluster roots](../operations/maintenance.md#s3-cluster-roots) for deployment, recovery and maintenance commands. Register remote
+endpoints; other cloud-direct and catalogue targets are unsupported. Use `./name` for a
 relative filesystem address; a bare name selects a registered target.
 `init --schema graph.pg ./graph.omni` remains a creation convenience and refuses `--target`.
 

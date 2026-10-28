@@ -128,8 +128,10 @@ Prefix these commands with `omnigraph`:
 `init ./graph.omni --schema schema.pg` is unchanged and creates a **new** graph;
 do not run it to upgrade an existing graph. Local paths can be targets directly;
 remote endpoints need a named target. Folder context no longer selects a target.
-Old direct `s3://` and `az://` CLI routes have no inline `--target` equivalent.
-Use a configured server for supported graph operations; direct-only maintenance
+Old direct `az://` CLI routes have no inline `--target` equivalent, and old
+direct `s3://` routes keep one only for a cluster root's deployment, recovery
+and maintenance commands ([S3 cluster roots](maintenance.md#s3-cluster-roots)).
+Use a configured server for other graph operations; direct-only maintenance
 does not gain a remote equivalent. See [capability boundaries](../cli/targets.md#transport-and-capability-boundaries).
 
 Aliases now bind to a target. Replace their `server`/resource binding with

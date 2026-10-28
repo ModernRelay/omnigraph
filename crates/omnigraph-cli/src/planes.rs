@@ -180,6 +180,26 @@ pub(crate) fn root_input(command: &Command) -> bool {
     )
 }
 
+/// The commands that may name an `s3://` cluster root inline: stopped-writer
+/// deployment and recovery, and the direct maintenance commands. A cluster
+/// whose server is down has no served route for any of them (#1163, #1082).
+/// Every other command reaches cloud storage through a server.
+pub(crate) fn admits_inline_s3_root(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Cluster {
+            command: ClusterCommand::Plan { .. }
+                | ClusterCommand::Apply { .. }
+                | ClusterCommand::Status { .. }
+                | ClusterCommand::ForceUnlock { .. }
+                | ClusterCommand::UpgradeLedger { .. },
+        } | Command::Optimize(_)
+            | Command::Cleanup(_)
+            | Command::Repair(_)
+            | Command::RebuildFullTextIndexes(_)
+    )
+}
+
 /// Whether the operation addresses one graph of `target`, so `--graph` or the
 /// target's `default_graph` must select it before any I/O.
 pub(crate) fn selects_graph(command: &Command, target: &ResolvedTarget) -> bool {

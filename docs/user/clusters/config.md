@@ -185,8 +185,10 @@ If present, `storage` is an equality assertion: a mismatch refuses before
 effects. Remote operations require an absolute path or `file://`, `s3://` or
 `az://` URI and read only source files from the caller's filesystem.
 
-Operator version 1 accepts only local-file direct targets. The storage assertion
-above describes the deployment root; it does not enable CLI cloud-direct access.
+Registered direct targets accept local files only. The storage assertion above
+describes the deployment root; it does not select a target. An inline `s3://`
+root reaches only the commands listed in
+[S3 cluster roots](../operations/maintenance.md#s3-cluster-roots).
 Cloud storage credentials and provider settings belong to the server or embedded
 initializer. Azure remains a qualification preview and requires its admission
 wrapper for every writer; see [Deployment](../deployment.md#azure-blob-preview).

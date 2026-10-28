@@ -274,6 +274,10 @@ omnigraph --target file:///srv/company-brain \
   cluster apply --deployment-id '<DEPLOYMENT_ID>' --writers-stopped --json
 ```
 
+An S3 root works the same way inline, for example
+`--target s3://bucket/company-brain`; see
+[S3 cluster roots](../operations/maintenance.md#s3-cluster-roots).
+
 Reconciliation uses captured input and exact publication evidence; it never
 replays an uncertain schema or graph-creation invocation. Unstarted schema or
 graph-creation work can be recorded as not attempted. A partial graph birth can
