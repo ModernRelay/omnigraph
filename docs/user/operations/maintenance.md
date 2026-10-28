@@ -1,9 +1,10 @@
 # Maintenance
 
-OmniGraph provides four direct-storage maintenance commands:
+OmniGraph provides five direct-storage maintenance commands:
 
-- `optimize` compacts data and reconciles declared indexes.
-- `rebuild-full-text-indexes` replaces full-text indexes on one branch.
+- `optimize` compacts data and reconciles declared indexes on `main`.
+- `index build` brings one branch's declared indexes up to its rows.
+- `index rebuild --kind full-text` replaces full-text indexes on one branch.
 - `repair` diagnoses foreign storage drift without adopting it.
 - `cleanup` permanently removes unretained table versions and unused table
   forks left by branches created before storage format v11.
@@ -31,8 +32,11 @@ omnigraph optimize --target ./graph.omni --json
 Optimize rewrites small fragments into fewer larger fragments, rewrites every
 fragment that still stores a dropped property's values, rebuilds each scalar or
 vector index whose coverage lags behind appended rows, and builds missing
-declared indexes that are ready to build. It does not delete old versions or
-collect unused table forks. Use `cleanup` for storage reclamation.
+declared indexes that are ready to build. It works on `main`. `index build`
+does only the index part, on any branch including `main`; compaction, the
+dropped-value rewrite and the traversal artifact stay with optimize. Optimize
+does not delete old versions or collect unused table forks. Use `cleanup` for
+storage reclamation.
 
 Dropping a property removes it from the schema without rewriting its table
 (see [schema changes](../schema/index.md#schema-changes)), so its values stay
@@ -89,21 +93,48 @@ never correctness.
 
 Existing full-text indexes are preserved rather than incrementally merged.
 Unindexed rows remain searchable, but a growing uncovered tail can cost more to
-scan. Use `rebuild-full-text-indexes` to refresh that coverage or migrate an old
-analyzer generation. Optimize reports uncovered full-text coverage under
+scan. Use `index rebuild --kind full-text` to refresh that coverage or migrate
+an old analyzer generation. Optimize reports uncovered full-text coverage under
 `pending_indexes` with this remedy. Deferred coverage alone creates no graph
 commit or maintenance work.
 
 A vector index whose property has no usable vectors remains pending rather than
 failing the run. Run optimize again after loading or generating vectors.
 
+## Build indexes
+
+```bash
+omnigraph index build --target ./graph.omni --branch review
+omnigraph index build --target ./cluster-root --graph knowledge \
+  --branch review --json
+```
+
+On any branch, `index build` builds every declared index a table lacks, such as
+those of a type whose first rows were loaded there, and rebuilds whole each
+BTREE or vector index that leaves rows uncovered. Every table publishes in one
+graph commit on that branch; other branches and snapshots keep their indexes,
+and a branch with nothing to do publishes nothing. The default branch is `main`.
+As with optimize, a write that lands on a table while its batch is staged fails
+the run with a read-set conflict; run the command again. A vector property with no vectors yet and full-text coverage stay pending: only
+`index rebuild --kind full-text` refreshes a full-text index's coverage, and
+queries match uncovered rows with the index's analyzer meanwhile.
+
+JSON reports `branch`, `graph_commit_id` (null for a no-op), `indexes` with each
+`type_key`, `property` (the indexed column, `__id` for the identity index),
+`kind` (`btree`, `full_text` or `vector`) and `action` (`built` or `refreshed`),
+and `pending_indexes` with each `type_key`, `property` and `reason`. `--as` and
+the trust boundary are as for the full-text rebuild below.
+
 ## Rebuild full-text indexes
 
 ```bash
-omnigraph rebuild-full-text-indexes --target ./graph.omni --branch main
-omnigraph rebuild-full-text-indexes --target ./cluster-root \
+omnigraph index rebuild --kind full-text --target ./graph.omni --branch main
+omnigraph index rebuild --kind full-text --target ./cluster-root \
   --graph knowledge --branch review --json
 ```
+
+`--kind` is required. The deprecated spelling `rebuild-full-text-indexes` still
+works for one release.
 
 The command fully replaces text-search indexes from current entities using the
 engine's default English analyzer, including already indexed entities. It builds
@@ -121,7 +152,7 @@ branch is `main`.
 `--as` supplies actor attribution for this command. Direct CLI access, including
 `--target`, does not load the server's Cedar policy; storage permissions are its
 trust boundary. An embedded host that installs a policy checker also enforces
-the Change permission before rebuilding.
+the Change permission on the selected branch before building or rebuilding.
 
 Other branches and historical snapshots are not rewritten. Rebuild every live
 branch that needs full-text search; restoring an older snapshot may require

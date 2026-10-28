@@ -104,6 +104,7 @@ pub(crate) fn kind(cli: &Cli) -> Option<CommandKind> {
         | Command::Init(_)
         | Command::Upgrade(_)
         | Command::Optimize(_)
+        | Command::Index { .. }
         | Command::RebuildFullTextIndexes(_)
         | Command::Repair(_)
         | Command::Cleanup(_)
