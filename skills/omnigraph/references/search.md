@@ -231,5 +231,5 @@ be `${ENV_VAR}` references and are resolved by the server at startup. Generated
 vectors are finite, nonzero, and L2-normalized.
 
 Full-text indexes built before Lance 11 (the v0.9 era) can still require
-`rebuild-full-text-indexes` on each live branch before full-text queries run. Ordinary reads and vector
-search do not depend on that rebuild; see [`commands.md`](commands.md#rebuild-full-text-indexes--explicit-analyzer-upgrade).
+`index rebuild --kind full-text` on each live branch before full-text queries run. Ordinary reads and vector
+search do not depend on that rebuild; see [`commands.md`](commands.md#index-rebuild--explicit-analyzer-upgrade).
