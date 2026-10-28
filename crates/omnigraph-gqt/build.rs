@@ -67,7 +67,8 @@ fn main() {
     }
     if let Some(reference) = git(&root, &["symbolic-ref", "-q", "HEAD"])
         && let Some(path) = git_path(&root, &reference)
-        && let Some(common) = git(&root, &["rev-parse", "--git-common-dir"]).map(|dir| root.join(dir))
+        && let Some(common) =
+            git(&root, &["rev-parse", "--git-common-dir"]).map(|dir| root.join(dir))
     {
         let watched = if path.is_file() {
             Some(path.as_path())
