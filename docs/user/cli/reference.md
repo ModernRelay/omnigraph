@@ -97,7 +97,7 @@ params; see [Work with branches](index.md#work-with-branches)), or one
 as rows under the query's own target and params; see [Explain](../queries/explain.md).
 
 Read output supports `table`, `json`, `jsonl`, `csv`, `kv`, and `toon`. With no
-`--format`, no `--json`, and no `defaults.output`, a read prints TOON. `--json` is the
+`--format`, no `--json`, and no `defaults.output`, a read prints a table. `--json` is the
 stable machine-readable form for commands that do not use `--format`. Result
 cells use the [JSON result spelling](../queries/index.md#json-result-spelling);
 `table`, `csv`, and `kv` print strings unquoted. `--format json` prints the
@@ -111,7 +111,7 @@ TOON document with a newline. The HTTP API returns JSON. A refusal follows
 
 ### Machine-readable read and write positions
 
-A default `query`, `query --format toon`, and `query --json` return `graph_commit_id` when the read snapshot has a graph head. The id and
+`query --json` and `query --format toon` return `graph_commit_id` when the read snapshot has a graph head. The id and
 rows share one pinned snapshot; use that id for a later conditional mutation.
 
 Successful `mutate --json` and `load --json` responses include `commit`, the exact commit published by

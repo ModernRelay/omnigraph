@@ -577,7 +577,7 @@
             "kv",
             "toon"
           ],
-          "default": "toon"
+          "default": "table"
         }
       },
       "additionalProperties": false

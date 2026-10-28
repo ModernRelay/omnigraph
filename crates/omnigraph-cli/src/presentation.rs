@@ -15,7 +15,7 @@ pub(crate) struct ReadPresentation {
 }
 
 impl ReadPresentation {
-    /// `--json` > `--format` > alias format > operator default > toon.
+    /// `--json` > `--format` > alias format > operator default > table.
     pub(crate) fn capture(
         operator: &OperatorConfig,
         explicit: Option<ReadOutputFormat>,
@@ -73,7 +73,7 @@ mod tests {
         use ReadOutputFormat::{Arrow, Csv, Json, Jsonl, Kv, Table, Toon};
 
         for (default, alias, explicit, json, expected) in [
-            (None, None, None, false, Toon),
+            (None, None, None, false, Table),
             (Some(Json), None, None, false, Json),
             (Some(Json), Some(Jsonl), None, false, Jsonl),
             (Some(Json), Some(Jsonl), Some(Csv), false, Csv),

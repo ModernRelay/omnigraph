@@ -207,9 +207,8 @@ destination line. Legacy `--server`, `--store`, `--cluster`,
 
 `query` and `mutate` invoke stored queries by positional name, or accept
 `--query FILE` / `-e SOURCE`. Use `--params` or `--params-file`, never interpolate
-values into query source. A read prints TOON unless `--format`, `--json`, or
-`defaults.output` says otherwise. `--format` is `table|json|jsonl|csv|kv|toon`;
-TOON encodes the same document as `--format json`;
+values into query source. Reads support `--format table|json|jsonl|csv|kv|toon`;
+`--format toon` encodes the same document as `--format json` in TOON;
 `--json` preserves exact receipt/error structure. Inspect `commit` and
 `graph_commit_id` after uncertain writes; do not infer safe retry from a timeout.
 

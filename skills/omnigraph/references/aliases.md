@@ -35,8 +35,9 @@ Aliases are read-only: a stored mutation refuses. Invoke mutations directly with
 A direct-graph alias must omit `graph` to pass validation, but cannot execute:
 the stored-query registry is served-only. Validation does not add capabilities.
 
-A read prints TOON unless you pass `--format` or `--json`, or set `defaults.output`.
-The supported values are `table`, `json`, `jsonl`, `csv`, `kv`, and `toon`. Action receipts retain their own output contracts. Use JSON or TOON when the
+Use `--format jsonl`, `--format toon`, or `--json` for automation, or set `defaults.output` to
+`jsonl`/`json`/`toon`. The supported defaults are `table`, `json`, `jsonl`, `csv`,
+`kv`, and `toon`. Action receipts retain their own output contracts. Use JSON or TOON when the
 consumer needs the complete column list or read `graph_commit_id` for a
 conditional mutation; JSONL metadata does not carry those fields. See
 [result values](queries.md#system-fields-and-result-values).

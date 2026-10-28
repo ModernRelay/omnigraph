@@ -74,9 +74,9 @@ do not mean there is no possible fix.
 - **CLI, human formats** (`table`, `kv`, `csv`): the form above on stderr,
   then `HTTP 400` when served and the `disposition` line, exit status 1, with no
   colour codes and no backtrace footer.
-- **CLI, machine formats**: the default, `--format toon`, prints the API's error
-  body as TOON. `--json` and `--format json` print it pretty with its `disposition`,
-  and `--format jsonl` prints it as one line. All of them go on stdout with
+- **CLI, machine formats**: `--json` and `--format json` print the API's error
+  body pretty with its `disposition`, `--format jsonl` prints it as one line, and
+  `--format toon` prints that same body as TOON. All of them go on stdout with
   exit status 1. A served refusal keeps the server's `code` field
   (`bad_request`); an embedded one has none.
 - **HTTP**: a `400` that refuses a query carries the additive `diagnostic`

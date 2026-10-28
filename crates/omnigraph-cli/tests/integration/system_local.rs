@@ -2662,11 +2662,11 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
         .output()
         .unwrap();
     assert!(!output.status.success(), "mutation alias must fail");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("'insert_person' is a mutation")
-            && stdout.contains("omnigraph mutate insert_person"),
-        "expected the default TOON refusal; got: {stdout}"
+        stderr.contains("'insert_person' is a mutation")
+            && stderr.contains("omnigraph mutate insert_person"),
+        "expected mutation-kind mismatch; got: {stderr}"
     );
     let output = cli()
         .env("OMNIGRAPH_HOME", operator_home.path())

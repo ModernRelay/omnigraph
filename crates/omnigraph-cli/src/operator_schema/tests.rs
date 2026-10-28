@@ -276,7 +276,7 @@ fn minimal_document_and_output_defaults() {
     let config = decode("version: 1").unwrap();
     assert!(config.targets.is_empty());
     assert!(config.profiles.is_empty());
-    assert_eq!(config.defaults.output, OutputFormat::Toon);
+    assert_eq!(config.defaults.output, OutputFormat::Table);
     assert!(config.defaults.target.is_none());
     assert!(config.defaults.profile.is_none());
     for output in ["table", "json", "jsonl", "csv", "kv", "toon"] {
