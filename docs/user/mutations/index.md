@@ -261,16 +261,19 @@ A CSV load has no whole-statement input check.
 It applies `write_max_bytes` to each staged-write input instead.
 An overwrite stages the reader's 8,192-row batches, and a batch over the
 allowance refuses as `staged_write_input_bytes`.
+An overwrite writes a fragment per parse partition, up to 1 Mi rows each, as
+the rows drain; nothing commits before the publish, a refusal deletes them all.
 An append or merge keeps the keyed adapter's ceilings
 (`retained keyed batch bytes per operation`, `keyed entities for <table>`,
 `keyed entity bytes for <table>`).
 The [`query_memory_bytes`](../queries/settings.md) setting bounds one
 `load csv` statement's tracked memory as a whole: the retained source, every
-decoded batch, validation state and the staging working set.
-A statement the allowance cannot hold refuses with the `query_memory_bytes`
-resource error before any fragment write.
-A CSV load needs roughly the source plus twice its typed input under that
-allowance.
+decoded batch, validation state and the staging working set; a streaming
+overwrite's working set is its open fragments and the writers in flight.
+An overwrite admits that memory once, before any partition reads, one share per
+parse partition that only its own reader charges, so a refusal and its `actual`
+(the smallest admitting limit) are the same on every run (the shares: the
+settings reference); a statement it cannot hold refuses before any fragment write.
 The source object is bounded by `load_source_max_bytes` before it is read
 (refused as `csv_source_bytes`).
 An overwrite probes the object's metadata once, then each parse partition

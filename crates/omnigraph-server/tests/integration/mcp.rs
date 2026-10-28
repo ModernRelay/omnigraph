@@ -424,9 +424,21 @@ async fn mcp_authenticates_every_request_and_enforces_resource_and_http_bounds()
     );
 
     let alice = token("alice", RESOURCE);
+    // A valid token for a subject the admission file does not name is refused
+    // without a sign-in challenge: a new token for that subject cannot help.
+    let response = app
+        .clone()
+        .oneshot(rpc(
+            Some(&token("unknown", RESOURCE)),
+            "tools/list",
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(!response.headers().contains_key("www-authenticate"));
     for wrong in [
         token("alice", "https://data.example/clusters/B/incarnations/one"),
-        token("unknown", RESOURCE),
         "ogc_retired".into(),
     ] {
         let response = app

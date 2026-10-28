@@ -266,10 +266,15 @@ unpublished staging the collector reclaims once it is dead. A strict mutation
 prepared before Optimize's publication reports the same read-set conflict as
 it would after any other writer.
 
-The index writer (`ensure_indices` and the explicit full-text rebuild)
-follows the same protocol: it opens each productive table at its pin, stages
-the complete BTREE/FTS/vector batch before the gates, commits every batch as
-a detached version of the pin and publishes the pins once. A failure before
+The index writer (`ensure_indices`, which `omnigraph index build` runs on any
+branch, and the explicit full-text rebuild) follows the same protocol: it
+opens each productive table at its pin, stages the complete BTREE/FTS/vector
+batch before the gates, commits every batch as a detached version of the pin
+and publishes the pins once. For `ensure_indices` one table's batch holds the
+declared indexes the table lacks and a whole rebuild of each BTREE or vector
+index whose coverage lags (`TableStore::stage_index_reconciliation`), the two
+index links optimize chains after its compaction; full-text coverage stays
+with the explicit rebuild. A failure before
 publication leaves no graph-visible residue; after publication reads,
 including full-text search through the batch's certificate, serve from the
 staged version.

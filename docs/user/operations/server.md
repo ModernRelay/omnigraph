@@ -44,18 +44,8 @@ claim, not a restart or recovery path; see
 
 ### Logs
 
-The server logs to standard output at `info` unless `RUST_LOG` sets other
-levels. `omnigraph_server::init_tracing()` limits three dependency targets, and
-their `::` children, to warnings and errors even with `RUST_LOG=trace`: `rmcp`,
-whose verbose SDK logs contain query arguments and results, and Lance's
-`lance::dataset_events` and `lance::file_audit`, which at `info` name every
-table's full storage URI, every file Lance creates or deletes, and each delete
-predicate with its entity IDs. Other targets keep their configured levels.
-Embedders using their own subscriber must enforce the same filter.
-
-A failed Blob delivery, change-route request or streamed response is logged by
-its error class, never by its message; see
-[HTTP errors](troubleshooting.md#http-errors).
+Use [server logs and traces](observability.md) for JSON logging, optional OTLP
+export and correlation with incoming W3C trace context.
 
 ## HTTP contract
 
@@ -106,8 +96,8 @@ Choose one static token source:
 
 Send `Authorization: Bearer secret-a` (the scheme is case-insensitive). The token selects the
 actor for authorization and commit attribution; clients cannot claim another actor. See
-[Authorization and actors](policy.md). Every 401 carries a `WWW-Authenticate: Bearer` challenge,
-with `error="invalid_token"` when the server refused the token sent.
+[Authorization and actors](policy.md). Every 401 carries a `WWW-Authenticate: Bearer` challenge, with `error="invalid_token"` when
+the server refused the token sent; a valid OIDC token it does not admit gets 403 ([MCP](mcp.md)).
 
 A server with neither static tokens, signed-token trust, nor policy refuses to start unless you explicitly
 pass `--unauthenticated` (or set `OMNIGRAPH_UNAUTHENTICATED=1`). Use that only

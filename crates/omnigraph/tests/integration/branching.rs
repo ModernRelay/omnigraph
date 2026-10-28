@@ -3847,6 +3847,9 @@ async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_ne
     )
     .await
     .unwrap();
+    // The insert leaves feature's identity index lagging; building it here
+    // leaves the child below nothing to index.
+    feature.ensure_indices_on("feature").await.unwrap();
     feature
         .branch_create_from(ReadTarget::branch("feature"), "experiment")
         .await

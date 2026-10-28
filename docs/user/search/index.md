@@ -210,14 +210,16 @@ analyzer before its postings are built. A table version written by an older
 release may hold rows and no part of the index at all; a full-text call on
 it is refused before any scan with HTTP `409` and a
 `full_text_index_required` detail naming `Type.property`, never answered
-with a case-sensitive scan. Build the index to lift it: `omnigraph optimize`
-on `main`, or `omnigraph rebuild-full-text-indexes --branch <branch>` on
-another branch. Historical snapshots of that version stay refused. Run:
+with a case-sensitive scan. Build the index to lift it:
+`omnigraph index build --target <target> --branch <branch>`, on any branch.
+Historical snapshots of that version stay refused. Run:
 
 ```bash
 omnigraph optimize --target ./graph.omni
 ```
 
 after a large load or merge, and on a regular maintenance cadence, to refresh
-coverage and compact data. An empty vector property remains pending until it has a
+coverage and compact data on `main`. On another branch, `index build` builds the
+branch's missing indexes and refreshes lagging BTREE and vector coverage; see
+[Build indexes](../operations/maintenance.md#build-indexes). An empty vector property remains pending until it has a
 non-null vector to index.
