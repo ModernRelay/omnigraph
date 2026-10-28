@@ -609,12 +609,16 @@ pub(crate) fn resolve_registered_graph(
 }
 
 pub(crate) fn log_policy_decision(
-    actor_id: &str,
+    actor: &AuthenticatedActor,
     request: &PolicyRequest,
     decision: &PolicyDecision,
 ) {
+    // A refusal or a read publishes nothing, so this line is the only record
+    // of which OAuth client acted. The client id is opaque text the caller's
+    // authorization server signed; it is a field, never part of the actor.
     info!(
-        actor_id = actor_id,
+        actor_id = actor.actor_id.as_ref(),
+        client_id = actor.client_id().unwrap_or(""),
         action = %request.action,
         branch = request.branch.as_deref().unwrap_or(""),
         target_branch = request.target_branch.as_deref().unwrap_or(""),
@@ -732,7 +736,7 @@ pub(crate) fn authorize(
     let decision = engine
         .authorize(actor_id, &request)
         .map_err(|err| ApiError::internal(format!("policy: {err}")))?;
-    log_policy_decision(actor_id, &request, &decision);
+    log_policy_decision(actor, &request, &decision);
     if decision.allowed {
         Ok(Authz::Allowed)
     } else {
@@ -869,7 +873,7 @@ pub(crate) fn access_body(
     }
     require_canonical_branches([query.branch.as_deref(), query.target_branch.as_deref()])?;
     let policy = handle.policy.as_deref();
-    api::AccessOutput::evaluate(
+    let mut output = api::AccessOutput::evaluate(
         actor.map(|actor| actor.actor_id.to_string()),
         handle.key.graph_id.to_string(),
         query.branch,
@@ -882,7 +886,9 @@ pub(crate) fn access_body(
             };
             Ok(matches!(authorize(actor, policy, request)?, Authz::Allowed))
         },
-    )
+    )?;
+    output.client_id = actor.and_then(|actor| actor.client_id()).map(str::to_owned);
+    Ok(output)
 }
 
 #[utoipa::path(

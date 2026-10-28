@@ -12917,6 +12917,13 @@
             ],
             "description": "The branch asked about, when one was."
           },
+          "client_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The OAuth client the credential was issued to, when it is a verified\nOIDC access token. The actor stays the person's principal across\nclients. Opaque text the client chose: render it escaped."
+          },
           "graph_id": {
             "type": "string"
           },
