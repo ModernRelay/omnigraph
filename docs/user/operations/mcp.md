@@ -72,6 +72,11 @@ issues a token for the same person and cannot help:
   503 `service_unavailable` with `Retry-After`. Access returns with the next
   publication.
 
+A token's `client_id` is kept beside the actor, which stays one `principal:<id>`
+for every client a person uses. The [access route](policy.md#learn-your-access)
+and the `policy decision` log line name it; commits do not yet. It is opaque
+client-chosen text: render it escaped.
+
 The server has one resource identifier, so every route's challenge names the
 same metadata. RFC 9728 §3.3 has a client that followed a challenge require the
 metadata's `resource` to equal the URL it requested, so a strict client uses the
