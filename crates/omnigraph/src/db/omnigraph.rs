@@ -64,7 +64,10 @@ pub use system_column_upgrade::{
 };
 pub(crate) use table_ops::OpenedForMutation;
 pub(crate) use table_ops::Publication;
-pub use table_ops::{FullTextIndexRebuildResult, PendingIndex, RebuiltFullTextIndex};
+pub use table_ops::{
+    BuiltIndex, BuiltIndexAction, BuiltIndexKind, FullTextIndexRebuildResult, IndexBuildResult,
+    PendingIndex, RebuiltFullTextIndex,
+};
 
 use super::commit_graph::GraphCommit;
 use super::manifest::{
@@ -3522,39 +3525,37 @@ impl Omnigraph {
         table_ops::graph_index_for_resolved(self, resolved, edge_types, system_columns).await
     }
 
-    /// Ensure every declared BTREE, full-text, and vector index exists.
-    /// Idempotent — Lance skips indexes that already exist.
-    ///
-    /// Plans from one graph-manifest/schema token, then revalidates under the final
-    /// schema → branch → sorted dataset gates. Existing target refs must still have live
-    /// Lance HEAD equal to their published dataset version; uncovered drift is refused with
-    /// explicit `omnigraph repair` guidance instead of being silently folded.
-    /// The verified handle is reused for index effects and the resulting
-    /// versions are published through the graph manifest.
-    ///
-    /// On named branches, indexing preserves lazy branching:
-    /// unbranched datasets keep inheriting `main`, while datasets inherited
-    /// from an ancestor branch remain inherited when no index work is needed.
-    /// When real index work exists they are forked into the active branch only
-    /// under the final gates.
-    /// Returns the declared indexes that could not be materialized on this
-    /// pass (today: vector properties with no trainable vectors yet). They are
-    /// deferred, not errors; a later `ensure_indices_as`/`optimize_as` builds
-    /// them once the property is trainable. Reads stay correct (brute-force)
-    /// meanwhile.
-    ///
-    /// Works on the handle's current branch. Requires `maintain` on that
-    /// branch before any effect and records `actor` in the publication.
+    /// [`Self::ensure_indices_on_as`] on this handle's current branch,
+    /// returning only what it left pending.
     pub async fn ensure_indices_as(&self, actor: Option<&str>) -> Result<Vec<PendingIndex>> {
-        table_ops::ensure_indices_as(self, actor).await
+        Ok(table_ops::ensure_indices_as(self, actor).await?.pending)
     }
 
-    /// [`Self::ensure_indices_as`] on `branch`, under `maintain` on `branch`.
+    /// Bring the selected branch's declared indexes up to its rows: build
+    /// every declared BTREE, full-text and vector index a table lacks, and
+    /// rebuild whole every BTREE or vector index that leaves a current
+    /// fragment uncovered. Each table's work stages as one detached
+    /// `CreateIndex` on its pinned version, and every table publishes in one
+    /// graph commit on the branch; other branches and historical snapshots
+    /// keep their indexes. Idempotent: a branch with nothing to do publishes
+    /// nothing.
+    ///
+    /// Requires `maintain` on the selected branch before any effect and
+    /// records the actor in the publication. Plans from one graph-manifest
+    /// and schema token and builds the artifacts before taking the schema →
+    /// branch → sorted table gates, then revalidates that authority under
+    /// them; a lost race publishes nothing.
+    ///
+    /// Pending, not errors, and reads stay correct meanwhile: a vector
+    /// property with no trainable vectors yet, and full-text coverage, which
+    /// only the explicit full rebuild ([`Self::rebuild_full_text_indices_on_as`])
+    /// refreshes; the rows it does not cover are matched with the index's
+    /// analyzer.
     pub async fn ensure_indices_on_as(
         &self,
         branch: &str,
         actor: Option<&str>,
-    ) -> Result<Vec<PendingIndex>> {
+    ) -> Result<IndexBuildResult> {
         table_ops::ensure_indices_on_as(self, branch, actor).await
     }
 

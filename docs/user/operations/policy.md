@@ -195,6 +195,9 @@ With the example graph policy above, `act-alice` gets:
  "branch":"feature","target_branch":"main","actions":["read"]}
 ```
 
+- `client_id` appears when the credential is a verified OIDC access token: the
+  OAuth client it was issued to. The actor stays the person's
+  `principal:<id>`, so policy decides alike for every client a person uses.
 - `graph_wide` is the decision with no branch named: `invoke_query`, and an
   action one rule allows on every branch, with no branch scope, `branch_scope:
   any` or `target_branch_scope: any`. Rules that cover every branch only

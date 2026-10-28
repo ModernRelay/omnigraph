@@ -1,6 +1,50 @@
 //! Arguments for direct graph maintenance.
 
-use clap::Args;
+use clap::{Args, Subcommand, ValueEnum};
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum IndexCommand {
+    /// Build the declared indexes a branch lacks and rebuild any BTREE or
+    /// vector index that leaves its rows uncovered
+    ///
+    /// Full-text coverage and vector properties without vectors stay pending;
+    /// `index rebuild --kind full-text` refreshes full-text coverage.
+    Build(IndexBuildArgs),
+    /// Rebuild one kind of index from a branch's current rows
+    ///
+    /// `--kind full-text` uses the default English analyzer and replaces any
+    /// custom tokenizer settings.
+    Rebuild(IndexRebuildArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct IndexBuildArgs {
+    /// Branch whose indexes to build; other branches and historical snapshots are unchanged
+    #[arg(long, default_value = "main")]
+    pub(crate) branch: String,
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct IndexRebuildArgs {
+    /// The kind of index to rebuild
+    #[arg(long, value_enum)]
+    pub(crate) kind: IndexRebuildKind,
+    /// Branch to rebuild; other branches and historical snapshots are unchanged
+    #[arg(long, default_value = "main")]
+    pub(crate) branch: String,
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+/// Required, so a later kind can be added without changing what a bare
+/// `index rebuild` means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum IndexRebuildKind {
+    /// Every full-text index, with the engine's analyzer
+    FullText,
+}
 
 #[derive(Debug, Args)]
 pub(crate) struct UpgradeArgs {

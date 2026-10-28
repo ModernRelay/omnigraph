@@ -958,11 +958,16 @@ rules:
       branch_scope: any
 "#;
 
-/// A graph with a `feature` branch and two extra Person fragments on main, so
-/// optimize has a compaction to publish, under [`MAINTENANCE_POLICY_YAML`].
+/// A graph with a `feature` branch whose Person identity index lags one
+/// loaded row, so an index build there has work to publish, and two extra
+/// Person fragments on main, so optimize has a compaction to publish, under
+/// [`MAINTENANCE_POLICY_YAML`].
 async fn init_with_maintenance_policy(dir: &tempfile::TempDir) -> Session {
     let db = init_and_load(dir).await;
     db.branch_create("feature").await.unwrap();
+    db.load("feature", ONE_PERSON_JSONL, LoadMode::Merge)
+        .await
+        .unwrap();
     for (name, age) in [("Eve", 40), ("Frank", 41)] {
         let params = mixed_params(&[("$name", name)], &[("$age", age)]);
         db.mutate("main", MUTATION_QUERIES, "insert_person", &params)
@@ -984,9 +989,10 @@ fn assert_no_actor(result: Result<impl std::fmt::Debug, OmniError>, what: &str) 
 /// Optimize, index builds and the repair report require `maintain` on the
 /// branch they maintain, before any effect: `change` does not imply it, a
 /// grant on unprotected branches does not reach main, and a missing actor is
-/// refused. An allowed optimize records its actor on the commit it publishes.
+/// refused. An allowed index build or optimize records its actor on the
+/// commit it publishes, and an index build on a branch leaves main alone.
 #[tokio::test]
-async fn maintenance_entry_points_enforce_maintain_on_their_branch_before_effects() {
+async fn maintenance_entry_points_enforce_maintain_on_their_branch_before_effects_issue_840() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_with_maintenance_policy(&dir).await;
     let main_before = db.list_commits(None).await.unwrap();
@@ -1027,9 +1033,31 @@ async fn maintenance_entry_points_enforce_maintain_on_their_branch_before_effect
     );
     assert_eq!(db.list_commits(None).await.unwrap(), main_before);
 
-    db.ensure_indices_on_as("feature", Some("act-branch-maintainer"))
+    let feature_before = db.list_commits(Some("feature")).await.unwrap();
+    let built = db
+        .ensure_indices_on_as("feature", Some("act-branch-maintainer"))
         .await
         .expect("maintain on an unprotected branch admits its index builds");
+    assert_eq!(built.branch, "feature");
+    assert!(
+        built
+            .indexes
+            .iter()
+            .any(|index| index.type_key == "node:Person"
+                && index.action == omnigraph::db::BuiltIndexAction::Refreshed),
+        "{built:?}"
+    );
+    let feature_after = db.list_commits(Some("feature")).await.unwrap();
+    assert_eq!(feature_after.len(), feature_before.len() + 1);
+    assert_eq!(
+        built.graph_commit_id.as_deref(),
+        Some(feature_after[0].graph_commit_id.as_str())
+    );
+    assert_eq!(
+        feature_after[0].actor_id.as_deref(),
+        Some("act-branch-maintainer")
+    );
+    assert_eq!(db.list_commits(None).await.unwrap(), main_before);
     let report = db
         .repair_report_as(Some("act-maintainer"))
         .await

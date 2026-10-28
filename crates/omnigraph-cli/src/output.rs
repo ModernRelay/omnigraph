@@ -102,7 +102,7 @@ pub(crate) fn write_full_text_rebuild(
         }
         writeln!(
             stdout,
-            "rebuild-full-text-indexes {} — branch {}, {} indexes rebuilt",
+            "index rebuild {} — branch {}, {} indexes rebuilt",
             uri,
             result.branch,
             result.rebuilt_indexes.len(),
@@ -113,6 +113,72 @@ pub(crate) fn write_full_text_rebuild(
                 "  {}, property '{}'",
                 graph_type_subject(&index.type_key),
                 index.property,
+            )?;
+        }
+        if let Some(commit_id) = &result.graph_commit_id {
+            writeln!(stdout, "graph commit: {commit_id}")?;
+        } else {
+            writeln!(stdout, "no-op; no graph commit published")?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn write_index_build(
+    uri: &str,
+    result: &omnigraph::db::IndexBuildResult,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<()> {
+    if json {
+        write_json(
+            &serde_json::json!({
+                "uri": uri,
+                "branch": result.branch,
+                "graph_commit_id": result.graph_commit_id,
+                "indexes": result.indexes.iter().map(|index| {
+                    serde_json::json!({
+                        "type_key": index.type_key,
+                        "property": index.property,
+                        "kind": index.kind.as_str(),
+                        "action": index.action.as_str(),
+                    })
+                }).collect::<Vec<_>>(),
+                "pending_indexes": result.pending.iter().map(|pending| {
+                    serde_json::json!({
+                        "type_key": pending.type_key,
+                        "property": pending.property,
+                        "reason": pending.reason,
+                    })
+                }).collect::<Vec<_>>(),
+            }),
+            stdout,
+        )?;
+    } else {
+        writeln!(
+            stdout,
+            "index build {} — branch {}, {} indexes built or refreshed",
+            uri,
+            result.branch,
+            result.indexes.len(),
+        )?;
+        for index in &result.indexes {
+            writeln!(
+                stdout,
+                "  {}, property '{}': {} {}",
+                graph_type_subject(&index.type_key),
+                index.property,
+                index.kind.as_str(),
+                index.action.as_str(),
+            )?;
+        }
+        for pending in &result.pending {
+            writeln!(
+                stdout,
+                "  ↳ index pending on {}, property '{}': {}",
+                graph_type_subject(&pending.type_key),
+                pending.property,
+                pending.reason,
             )?;
         }
         if let Some(commit_id) = &result.graph_commit_id {
@@ -2052,7 +2118,7 @@ mod tests {
             }],
         };
         assert_maintenance_report(
-            "rebuild-full-text-indexes graph — branch dev, 1 indexes rebuilt\n  node type 'Doc', property 'body'\ngraph commit: commit-1\n",
+            "index rebuild graph — branch dev, 1 indexes rebuilt\n  node type 'Doc', property 'body'\ngraph commit: commit-1\n",
             serde_json::json!({"uri":"graph","branch":"dev","graph_commit_id":"commit-1","warnings":[warning],"rebuilt_indexes":[{"type_key":"node:Doc","property":"body"}]}),
             |json, writer| {
                 let mut stderr = Vec::new();
@@ -2085,7 +2151,7 @@ mod tests {
             rebuilt_indexes: vec![],
         };
         assert_maintenance_report(
-            "rebuild-full-text-indexes graph — branch main, 0 indexes rebuilt\nno-op; no graph commit published\n",
+            "index rebuild graph — branch main, 0 indexes rebuilt\nno-op; no graph commit published\n",
             serde_json::json!({"uri":"graph","branch":"main","graph_commit_id":null,"warnings":[],"rebuilt_indexes":[]}),
             |json, writer| {
                 let mut stderr = Vec::new();
@@ -2094,6 +2160,53 @@ mod tests {
                 assert!(stderr.is_empty());
                 output
             },
+        );
+    }
+
+    #[test]
+    fn index_build_reports_kinds_actions_pending_and_noop_issue_840() {
+        use omnigraph::db::{
+            BuiltIndex, BuiltIndexAction, BuiltIndexKind, IndexBuildResult, PendingIndex,
+        };
+        let pending = PendingIndex {
+            type_key: "node:Doc".into(),
+            property: "body".into(),
+            reason: "full-text index 'body_idx' has incomplete or unknown coverage".into(),
+        };
+        let result = IndexBuildResult {
+            branch: "dev".into(),
+            graph_commit_id: Some("commit-1".into()),
+            indexes: vec![
+                BuiltIndex {
+                    type_key: "node:Doc".into(),
+                    property: "__id".into(),
+                    kind: BuiltIndexKind::Btree,
+                    action: BuiltIndexAction::Refreshed,
+                },
+                BuiltIndex {
+                    type_key: "node:Tag".into(),
+                    property: "name".into(),
+                    kind: BuiltIndexKind::FullText,
+                    action: BuiltIndexAction::Built,
+                },
+            ],
+            pending: vec![pending.clone()],
+        };
+        assert_maintenance_report(
+            "index build graph — branch dev, 2 indexes built or refreshed\n  node type 'Doc', property '__id': btree refreshed\n  node type 'Tag', property 'name': full_text built\n  ↳ index pending on node type 'Doc', property 'body': full-text index 'body_idx' has incomplete or unknown coverage\ngraph commit: commit-1\n",
+            serde_json::json!({"uri":"graph","branch":"dev","graph_commit_id":"commit-1","indexes":[{"type_key":"node:Doc","property":"__id","kind":"btree","action":"refreshed"},{"type_key":"node:Tag","property":"name","kind":"full_text","action":"built"}],"pending_indexes":[{"type_key":"node:Doc","property":"body","reason":pending.reason}]}),
+            |json, writer| super::write_index_build("graph", &result, json, writer),
+        );
+        let noop = IndexBuildResult {
+            branch: "main".into(),
+            graph_commit_id: None,
+            indexes: vec![],
+            pending: vec![],
+        };
+        assert_maintenance_report(
+            "index build graph — branch main, 0 indexes built or refreshed\nno-op; no graph commit published\n",
+            serde_json::json!({"uri":"graph","branch":"main","graph_commit_id":null,"indexes":[],"pending_indexes":[]}),
+            |json, writer| super::write_index_build("graph", &noop, json, writer),
         );
     }
 

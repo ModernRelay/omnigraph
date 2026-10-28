@@ -7,11 +7,14 @@ use omnigraph::db::{CleanupPolicyOptions, Omnigraph, RepairAction};
 
 use crate::app::Completion;
 use crate::helpers::{confirm_destructive, parse_duration_arg, resolve_actor};
-use crate::output::{write_cleanup, write_full_text_rebuild, write_optimize, write_repair};
+use crate::output::{
+    write_cleanup, write_full_text_rebuild, write_index_build, write_optimize, write_repair,
+};
 
 pub(crate) mod args;
 pub(crate) use args::{
-    CleanupArgs, OptimizeArgs, RebuildFullTextIndexesArgs, RepairArgs, UpgradeArgs,
+    CleanupArgs, IndexBuildArgs, IndexCommand, IndexRebuildArgs, IndexRebuildKind, OptimizeArgs,
+    RebuildFullTextIndexesArgs, RepairArgs, UpgradeArgs,
 };
 
 /// Only the existing global arguments consumed by this command family.
@@ -54,6 +57,37 @@ pub(crate) async fn run_optimize(
     Ok(Completion::success())
 }
 
+pub(crate) async fn run_index(
+    command: IndexCommand,
+    scope: MaintenanceScope<'_>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<Completion> {
+    match command {
+        IndexCommand::Build(IndexBuildArgs { branch, json }) => {
+            let uri = crate::scope::direct_graph_uri(scope.target, scope.graph).await?;
+            let binding = crate::scope::capture_storage_binding(scope.target)?.for_uri(&uri)?;
+            let actor = resolve_actor(scope.operator, scope.actor, stderr)?;
+            crate::admission::ensure_graph_with_binding(&binding, stderr).await?;
+            let db = Omnigraph::open_with_storage(
+                binding.uri(),
+                omnigraph::storage::storage_for_binding(&binding)?,
+            )
+            .await?;
+            let result = db.ensure_indices_on_as(&branch, actor.as_deref()).await?;
+            write_index_build(binding.uri(), &result, json, stdout)?;
+        }
+        IndexCommand::Rebuild(IndexRebuildArgs { kind, branch, json }) => match kind {
+            IndexRebuildKind::FullText => {
+                run_full_text_rebuild_on(&branch, json, scope, stdout, stderr).await?;
+            }
+        },
+    }
+    Ok(Completion::success())
+}
+
+/// The retired spelling of `index rebuild --kind full-text`, kept hidden for
+/// one release so existing runbooks keep working.
 pub(crate) async fn run_full_text_rebuild(
     args: RebuildFullTextIndexesArgs,
     scope: MaintenanceScope<'_>,
@@ -61,11 +95,25 @@ pub(crate) async fn run_full_text_rebuild(
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
     let RebuildFullTextIndexesArgs { branch, json } = args;
+    writeln!(
+        stderr,
+        "warning: `rebuild-full-text-indexes` is deprecated and will be removed; use `omnigraph index rebuild --kind full-text`"
+    )?;
+    run_full_text_rebuild_on(&branch, json, scope, stdout, stderr).await?;
+    Ok(Completion::success())
+}
+
+async fn run_full_text_rebuild_on(
+    branch: &str,
+    json: bool,
+    scope: MaintenanceScope<'_>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<()> {
     let uri = crate::scope::direct_graph_uri(scope.target, scope.graph).await?;
     let binding = crate::scope::capture_storage_binding(scope.target)?.for_uri(&uri)?;
     let actor = resolve_actor(scope.operator, scope.actor, stderr)?;
-    rebuild_full_text_indexes(&binding, &branch, actor.as_deref(), json, stdout, stderr).await?;
-    Ok(Completion::success())
+    rebuild_full_text_indexes(&binding, branch, actor.as_deref(), json, stdout, stderr).await
 }
 
 /// Execute against the resolved target; the engine retains publication and actor authority.
@@ -171,4 +219,64 @@ pub(crate) async fn run_cleanup(
     let stats = db.cleanup_as(options.clone(), actor.as_deref()).await?;
     write_cleanup(&uri, &options, &policy_desc, &stats, json, stdout)?;
     Ok(Completion::success())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use omnigraph::error::{FULL_TEXT_REBUILD_COMMAND, INDEX_BUILD_COMMAND, OmniError};
+
+    use super::{IndexCommand, IndexRebuildKind};
+    use crate::cli::{Cli, Command};
+
+    fn parse_remedy(remedy: &str) -> Cli {
+        let filled = remedy
+            .replace("<target>", "./graph.omni")
+            .replace("<branch>", "review");
+        let mut words = filled.split_whitespace();
+        assert_eq!(words.next(), Some("omnigraph"), "{remedy}");
+        Cli::try_parse_from(std::iter::once("omnigraph").chain(words))
+            .unwrap_or_else(|error| panic!("`{remedy}` does not parse: {error}"))
+    }
+
+    /// The commands errors and reports name as their remedy parse as the
+    /// command they claim, so a renamed command or flag cannot leave a
+    /// remedy that fails when an operator copies it.
+    #[test]
+    fn index_remedies_name_commands_that_parse_issue_840() {
+        let build = parse_remedy(INDEX_BUILD_COMMAND);
+        assert!(
+            matches!(
+                &build.command,
+                Command::Index { command: IndexCommand::Build(args) } if args.branch == "review"
+            ),
+            "{:?}",
+            build.command
+        );
+        let rebuild = parse_remedy(FULL_TEXT_REBUILD_COMMAND);
+        assert!(
+            matches!(
+                &rebuild.command,
+                Command::Index { command: IndexCommand::Rebuild(args) }
+                    if args.branch == "review" && args.kind == IndexRebuildKind::FullText
+            ),
+            "{:?}",
+            rebuild.command
+        );
+        assert!(
+            OmniError::FullTextIndexRequired {
+                index: "Doc.body".into(),
+            }
+            .to_string()
+            .contains(INDEX_BUILD_COMMAND)
+        );
+        assert!(
+            OmniError::FullTextIndexRebuildRequired {
+                index: "body_idx".into(),
+                reason: "analyzer certificate is missing".into(),
+            }
+            .to_string()
+            .contains(FULL_TEXT_REBUILD_COMMAND)
+        );
+    }
 }

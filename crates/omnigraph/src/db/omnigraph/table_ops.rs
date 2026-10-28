@@ -2,6 +2,7 @@ use super::*;
 use crate::dataset_index::is_full_text_index;
 use crate::error::missing_graph_type_at_snapshot;
 use crate::seams::{decide_seam, fail};
+use crate::table_store::{RefreshedIndex, TableStore};
 use lance::index::DatasetIndexExt;
 use omnigraph_compiler::types::PropIndexKind;
 
@@ -38,23 +39,97 @@ pub(super) async fn graph_index_for_resolved(
 pub(super) async fn ensure_indices_as(
     db: &Omnigraph,
     actor: Option<&str>,
-) -> Result<Vec<PendingIndex>> {
+) -> Result<IndexBuildResult> {
     let current_branch = db
         .coordinator
         .read()
         .await
         .current_branch()
         .map(str::to_string);
-    ensure_indices_for_branch(db, current_branch.as_deref(), actor).await
+    ensure_indices_on_as(db, current_branch.as_deref().unwrap_or("main"), actor).await
 }
 
 pub(super) async fn ensure_indices_on_as(
     db: &Omnigraph,
     branch: &str,
     actor: Option<&str>,
-) -> Result<Vec<PendingIndex>> {
+) -> Result<IndexBuildResult> {
     let branch = normalize_branch_name(branch)?;
-    ensure_indices_for_branch(db, branch.as_deref(), actor).await
+    let public_branch = branch.as_deref().unwrap_or("main");
+    db.enforce(
+        omnigraph_policy::PolicyAction::Maintain,
+        &omnigraph_policy::ResourceScope::Branch(public_branch.to_string()),
+        actor,
+    )?;
+    let outcome =
+        maintain_indices_for_branch(db, branch.as_deref(), IndexMaintenanceMode::Ensure, actor)
+            .await?;
+    Ok(IndexBuildResult {
+        branch: public_branch.to_string(),
+        graph_commit_id: outcome.graph_commit_id,
+        indexes: outcome.built_indexes,
+        pending: outcome.pending,
+    })
+}
+
+/// What one successful index build did on its branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexBuildResult {
+    /// The selected logical graph branch, including `main`.
+    pub branch: String,
+    /// The publication made by this operation, or `None` when no index had work.
+    pub graph_commit_id: Option<String>,
+    /// Every index built or refreshed, all published by `graph_commit_id`.
+    pub indexes: Vec<BuiltIndex>,
+    /// Declared indexes this pass leaves incomplete, each with its reason and remedy.
+    pub pending: Vec<PendingIndex>,
+}
+
+/// One index an index build published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltIndex {
+    pub type_key: String,
+    /// The indexed column: a declared property, or a system column such as
+    /// the identity column every table indexes.
+    pub property: String,
+    pub kind: BuiltIndexKind,
+    pub action: BuiltIndexAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BuiltIndexKind {
+    Btree,
+    FullText,
+    Vector,
+}
+
+impl BuiltIndexKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Btree => "btree",
+            Self::FullText => "full_text",
+            Self::Vector => "vector",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BuiltIndexAction {
+    /// The table had no usable index on the column; one was built from all
+    /// its rows.
+    Built,
+    /// The index left some of the table's current fragments uncovered; it
+    /// was rebuilt whole over all of them.
+    Refreshed,
+}
+
+impl BuiltIndexAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Built => "built",
+            Self::Refreshed => "refreshed",
+        }
+    }
 }
 
 /// The indexes replaced by one successfully published full-text rebuild.
@@ -83,6 +158,9 @@ enum IndexMaintenanceMode {
 struct IndexMaintenanceOutcome {
     pending: Vec<PendingIndex>,
     graph_commit_id: Option<String>,
+    /// What an `Ensure` pass published.
+    built_indexes: Vec<BuiltIndex>,
+    /// What a `RebuildFullText` pass published.
     rebuilt_indexes: Vec<RebuiltFullTextIndex>,
 }
 
@@ -198,24 +276,6 @@ pub(super) async fn failpoint_publish_table_head_without_index_rebuild_for_test(
     .await
 }
 
-/// The index writer on `branch` (`None` is main), under `maintain` on it.
-async fn ensure_indices_for_branch(
-    db: &Omnigraph,
-    branch: Option<&str>,
-    actor: Option<&str>,
-) -> Result<Vec<PendingIndex>> {
-    db.enforce(
-        omnigraph_policy::PolicyAction::Maintain,
-        &omnigraph_policy::ResourceScope::Branch(branch.unwrap_or("main").to_string()),
-        actor,
-    )?;
-    Ok(
-        maintain_indices_for_branch(db, branch, IndexMaintenanceMode::Ensure, actor)
-            .await?
-            .pending,
-    )
-}
-
 decide_seam! {
     pub static ENSURE_INDICES_POST_TABLE_EFFECT = ("ensure_indices.post_table_effect", Unreachable, [Fail]);
 }
@@ -265,6 +325,7 @@ async fn maintain_indices_for_branch(
             None => db.native_branch_for(branch).await?,
         }),
     };
+    let public_branch = active_branch.as_deref().unwrap_or("main");
     let catalog = Arc::clone(&txn.catalog);
 
     let mut targets: Vec<IndexTarget> = Vec::new();
@@ -291,7 +352,19 @@ async fn maintain_indices_for_branch(
         let ds = db.open_pinned_for_write(&full_path, entry).await?;
         let work = match mode {
             IndexMaintenanceMode::Ensure => {
-                plan_index_work_node(db, &catalog, type_name, &table_key, &ds).await?
+                let mut work =
+                    plan_index_work_node(db, &catalog, type_name, &table_key, &ds).await?;
+                work.refresh = TableStore::has_foldable_unindexed_fragments(ds.dataset()).await?;
+                let building = full_text_columns(&work.specs);
+                append_deferred_full_text_indexes(
+                    &ds,
+                    &table_key,
+                    public_branch,
+                    &building,
+                    &mut work.pending,
+                )
+                .await?;
+                work
             }
             IndexMaintenanceMode::RebuildFullText => {
                 let node = &catalog.node_types[type_name];
@@ -325,7 +398,10 @@ async fn maintain_indices_for_branch(
         let ds = db.open_pinned_for_write(&full_path, entry).await?;
         let work = match mode {
             IndexMaintenanceMode::Ensure => {
-                plan_index_work_edge_on_dataset(db, &ds, catalog.system_columns).await?
+                let mut work =
+                    plan_index_work_edge_on_dataset(db, &ds, catalog.system_columns).await?;
+                work.refresh = TableStore::has_foldable_unindexed_fragments(ds.dataset()).await?;
+                work
             }
             IndexMaintenanceMode::RebuildFullText => {
                 let edge = &catalog.edge_types[edge_name];
@@ -351,25 +427,60 @@ async fn maintain_indices_for_branch(
 
     // Validate the entire inventory before building any artifacts. In rebuild
     // mode an unsupported physical FTS index must refuse the whole operation,
-    // not leave a subset looking migrated. First-touch artifacts still wait
-    // for the fork.
-    for target in &targets {
-        if let Some(ds) = existing_targets.get(&target.table_key) {
-            let work = &work_by_table[&target.table_key];
-            let staged = db
-                .storage()
-                .stage_create_indices(ds, &work.specs)
-                .await
-                .map_err(|error| {
-                    error.with_context(format!(
-                        "stage index batch on {} ({:?})",
-                        target.table_key, work.specs
-                    ))
-                })?;
-            fail(&ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE)?;
-            existing_staged.insert(target.table_key.clone(), staged);
-        }
+    // not leave a subset looking migrated. An ensure target whose only work
+    // was a vector index that cannot train stages nothing and is dropped, so
+    // it never becomes a publication target beside productive siblings.
+    let mut refreshed_by_table = HashMap::<String, Vec<RefreshedIndex>>::new();
+    let mut staged_targets = Vec::with_capacity(targets.len());
+    for target in targets {
+        let Some(ds) = existing_targets.get(&target.table_key) else {
+            continue;
+        };
+        let work = &work_by_table[&target.table_key];
+        let context = |error: OmniError| {
+            error.with_context(format!(
+                "stage index batch on {} ({:?})",
+                target.table_key, work.specs
+            ))
+        };
+        let staged = match mode {
+            IndexMaintenanceMode::Ensure => {
+                let reconciliation = db
+                    .storage()
+                    .stage_index_reconciliation(ds, &work.specs)
+                    .await
+                    .map_err(context)?;
+                for (column, reason) in reconciliation.skipped {
+                    pending_by_table
+                        .entry(target.table_key.clone())
+                        .or_default()
+                        .push(PendingIndex {
+                            type_key: target.table_key.clone(),
+                            property: column,
+                            reason: format!(
+                                "vector index coverage lags and the column cannot train an index: {reason}"
+                            ),
+                        });
+                }
+                refreshed_by_table.insert(target.table_key.clone(), reconciliation.refreshed);
+                reconciliation.staged
+            }
+            IndexMaintenanceMode::RebuildFullText => Some(
+                db.storage()
+                    .stage_create_indices(ds, &work.specs)
+                    .await
+                    .map_err(context)?,
+            ),
+        };
+        let Some(staged) = staged else {
+            existing_targets.remove(&target.table_key);
+            continue;
+        };
+        fail(&ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE)?;
+        existing_staged.insert(target.table_key.clone(), staged);
+        staged_targets.push(target);
     }
+    let targets = staged_targets;
 
     let queue_keys: Vec<(String, Option<String>)> = targets
         .iter()
@@ -529,6 +640,15 @@ async fn maintain_indices_for_branch(
             pending.append(&mut table_pending);
         }
     }
+    // Edge tables declare no vector index, but a physical one that cannot
+    // train is still pending work and is reported after the node types.
+    let mut __dst_ek2: Vec<_> = catalog.edge_types.keys().collect();
+    __dst_ek2.sort();
+    for edge_name in __dst_ek2 {
+        if let Some(mut table_pending) = pending_by_table.remove(&format!("edge:{edge_name}")) {
+            pending.append(&mut table_pending);
+        }
+    }
     let mut rebuilt_indexes = Vec::new();
     if mode == IndexMaintenanceMode::RebuildFullText && graph_commit_id.is_some() {
         for target in &targets {
@@ -543,11 +663,121 @@ async fn maintain_indices_for_branch(
         }
         rebuilt_indexes.sort_by(|a, b| (&a.type_key, &a.property).cmp(&(&b.type_key, &b.property)));
     }
+    let mut built_indexes = Vec::new();
+    if mode == IndexMaintenanceMode::Ensure && graph_commit_id.is_some() {
+        for target in &targets {
+            let built = work_by_table[&target.table_key].specs.iter().map(|spec| {
+                let (property, kind) = match spec {
+                    crate::storage_layer::IndexBuildSpec::BTree { column, .. } => {
+                        (column, BuiltIndexKind::Btree)
+                    }
+                    crate::storage_layer::IndexBuildSpec::FullText { column } => {
+                        (column, BuiltIndexKind::FullText)
+                    }
+                    crate::storage_layer::IndexBuildSpec::Vector { column } => {
+                        (column, BuiltIndexKind::Vector)
+                    }
+                };
+                (property.clone(), kind, BuiltIndexAction::Built)
+            });
+            let refreshed = refreshed_by_table
+                .remove(&target.table_key)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|index| {
+                    let kind = if index.vector {
+                        BuiltIndexKind::Vector
+                    } else {
+                        BuiltIndexKind::Btree
+                    };
+                    (index.column, kind, BuiltIndexAction::Refreshed)
+                });
+            built_indexes.extend(built.chain(refreshed).map(|(property, kind, action)| {
+                BuiltIndex {
+                    type_key: target.table_key.clone(),
+                    property,
+                    kind,
+                    action,
+                }
+            }));
+        }
+        built_indexes.sort_by(|a, b| {
+            (&a.type_key, &a.property, a.kind).cmp(&(&b.type_key, &b.property, b.kind))
+        });
+    }
     Ok(IndexMaintenanceOutcome {
         pending,
         graph_commit_id,
+        built_indexes,
         rebuilt_indexes,
     })
+}
+
+/// The columns whose full-text index `specs` build whole.
+fn full_text_columns(specs: &[crate::storage_layer::IndexBuildSpec]) -> Vec<&str> {
+    specs
+        .iter()
+        .filter_map(|spec| match spec {
+            crate::storage_layer::IndexBuildSpec::FullText { column } => Some(column.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Full-text coverage index maintenance leaves to the explicit rebuild: a
+/// full-text index whose segments leave a current fragment uncovered, or
+/// whose coverage is unknown. It is observable status, never folded
+/// (`TableStore::can_fold_index`); uncovered rows are still matched with the
+/// index's analyzer. `building` names columns the caller builds whole in the
+/// same pass, which that build covers. Optimize rechecks after physical work
+/// too: stable-ID compaction can change coverage while preserving index
+/// artifacts.
+pub(super) async fn append_deferred_full_text_indexes(
+    snapshot: &crate::storage_layer::SnapshotHandle,
+    table_key: &str,
+    branch: &str,
+    building: &[&str],
+    pending: &mut Vec<PendingIndex>,
+) -> Result<()> {
+    use lance::index::DatasetIndexInternalExt;
+
+    let ds = snapshot.dataset();
+    let indices = ds.load_indices().await.map_err(OmniError::storage)?;
+    let full_text: std::collections::BTreeMap<_, _> = indices
+        .iter()
+        .filter(|index| is_full_text_index(index))
+        .map(|index| (index.name.as_str(), index))
+        .collect();
+    let remedy = crate::error::FULL_TEXT_REBUILD_COMMAND.replace("<branch>", branch);
+    for (name, index) in full_text {
+        let coverage_unknown = indices
+            .iter()
+            .any(|segment| segment.name == name && segment.fragment_bitmap.is_none());
+        if !coverage_unknown
+            && ds
+                .unindexed_fragments(name)
+                .await
+                .map_err(OmniError::storage)?
+                .is_empty()
+        {
+            continue;
+        }
+        for field in index
+            .keyed_fields()
+            .iter()
+            .filter_map(|id| ds.schema().field_by_id(*id))
+            .filter(|field| !building.contains(&field.name.as_str()))
+        {
+            pending.push(PendingIndex {
+                type_key: table_key.to_string(),
+                property: field.name.clone(),
+                reason: format!(
+                    "full-text index '{name}' has incomplete or unknown coverage; run {remedy}"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The columns of `table_key` that carry a declared full-text index: every
@@ -622,11 +852,15 @@ pub(super) struct IndexWorkStatus {
 pub(super) struct PlannedIndexWork {
     pub(super) specs: Vec<crate::storage_layer::IndexBuildSpec>,
     pub(super) pending: Vec<PendingIndex>,
+    /// A foldable index leaves a current fragment uncovered, so a branch's
+    /// index build rebuilds it whole (`TableStore::stage_index_reconciliation`).
+    /// Optimize plans its fold separately and leaves this unset.
+    pub(super) refresh: bool,
 }
 
 impl PlannedIndexWork {
     fn needs_commit(&self) -> bool {
-        !self.specs.is_empty()
+        !self.specs.is_empty() || self.refresh
     }
 
     /// A property can reach the catalog's index-intent list through more than
@@ -734,6 +968,7 @@ async fn plan_full_text_rebuild(
             .map(|column| crate::storage_layer::IndexBuildSpec::FullText { column })
             .collect(),
         pending: Vec::new(),
+        refresh: false,
     })
 }
 
@@ -1034,7 +1269,7 @@ pub(super) async fn open_owned_dataset_for_branch_write(
 /// vectors can be retried once populated; an existing full-text index with
 /// incomplete coverage requires explicit rebuilding. `reason` names the remedy.
 /// Reads retain their unindexed fallback; this status alone is not a write.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingIndex {
     pub type_key: String,
     pub property: String,

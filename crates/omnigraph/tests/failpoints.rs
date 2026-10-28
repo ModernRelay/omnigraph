@@ -4695,7 +4695,10 @@ node Embedding {
     );
     assert!(
         embedding.pending_indexes.iter().any(|index| {
-            index.property == "name" && index.reason.contains("rebuild-full-text-indexes")
+            index.property == "name"
+                && index
+                    .reason
+                    .contains("omnigraph index rebuild --kind full-text")
         }),
         "the deferred FTS tail must name its explicit rebuild remedy"
     );
