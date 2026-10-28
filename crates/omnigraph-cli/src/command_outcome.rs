@@ -455,7 +455,9 @@ fn admission_refusal(status: StatusCode, code: Option<&ErrorCode>) -> Option<Act
         | (StatusCode::UNAUTHORIZED, code @ ErrorCode::Unauthorized)
         | (StatusCode::BAD_REQUEST, code @ ErrorCode::ApiContractMismatch)
         | (StatusCode::PRECONDITION_FAILED, code @ ErrorCode::ActorMismatch)
-        | (StatusCode::FORBIDDEN, code @ ErrorCode::Forbidden) => Some(code.action()),
+        | (StatusCode::FORBIDDEN, code @ (ErrorCode::Forbidden | ErrorCode::NotAdmitted)) => {
+            Some(code.action())
+        }
         _ => None,
     }
 }

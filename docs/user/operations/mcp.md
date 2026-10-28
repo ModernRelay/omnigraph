@@ -58,10 +58,19 @@ With OIDC, the challenge names the protected-resource metadata:
 WWW-Authenticate: Bearer resource_metadata="https://graphs.example.com/.well-known/oauth-protected-resource/mcp"
 ```
 
-When a bearer credential was presented and refused (expired, wrong audience,
-unknown subject), the challenge also carries `error="invalid_token"`, which tells
-a client to refresh or sign in again. Without OIDC the challenge is `Bearer`,
-which advertises no sign-in flow.
+When a bearer credential was presented and refused (bad signature, expired,
+wrong audience or organization), the challenge also carries
+`error="invalid_token"`, which tells a client to refresh or sign in again.
+Without OIDC the challenge is `Bearer`, which advertises no sign-in flow.
+
+Two refusals of a valid token carry no challenge, because signing in again
+issues a token for the same person and cannot help:
+
+- the admission file names no principal for the token's subject: 403
+  `not_admitted`. The server's operator must admit the identity;
+- the admission snapshot has expired, for example during a publisher outage:
+  503 `service_unavailable` with `Retry-After`. Access returns with the next
+  publication.
 
 The server has one resource identifier, so every route's challenge names the
 same metadata. RFC 9728 §3.3 has a client that followed a challenge require the
