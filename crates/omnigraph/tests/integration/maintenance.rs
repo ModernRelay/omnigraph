@@ -4121,6 +4121,10 @@ async fn collector_cost_is_bounded_by_retained_versions_and_garbage_examined() {
         report.cost.manifest_snapshots
     );
     assert_eq!(
+        report.cost.manifest_time_reads, 0,
+        "--keep alone decides retention from the version listing, reading no commit time"
+    );
+    assert_eq!(
         report.cost.manifest_rechecks, live,
         "coherent capture revalidates each live branch exactly once"
     );
@@ -4239,13 +4243,15 @@ async fn plan_reading_manifests(
     (report, read)
 }
 
-/// Issue 644: `--keep` alone takes each live branch's `__manifest` version
-/// numbers from the `_versions/` listing and reads no manifest of a version it
-/// prunes; `--older-than` still reads every one for its timestamp. With a zero
-/// age window the cutoff retains nothing `--keep` does not, so both policies
-/// plan the same retention and the same sweep.
+/// Issue 644: every policy takes each live branch's `__manifest` version
+/// numbers from the `_versions/` listing. `--keep` alone reads the manifests
+/// of the versions it retains and of the merge base, however long the history
+/// grows; `--older-than` reads the commit time of exactly the versions
+/// `--keep` leaves undecided. With a
+/// zero age window the cutoff retains nothing `--keep` does not, so both
+/// policies plan the same retention and the same sweep, at both depths.
 #[tokio::test]
-async fn cleanup_keep_plans_from_the_manifest_listing_issue_644() {
+async fn cleanup_plans_from_the_manifest_listing_issue_644() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
     for name in ["Eve", "Frank", "Grace", "Heidi"] {
@@ -4256,89 +4262,120 @@ async fn cleanup_keep_plans_from_the_manifest_listing_issue_644() {
         insert_person(&db, "feature", name).await;
     }
     insert_person(&db, "main", "Niaj").await;
-
-    let on_disk = attached_manifests_on_disk(dir.path());
-    assert_eq!(
-        on_disk.keys().cloned().collect::<Vec<_>>(),
-        vec![None, Some("feature".to_string())],
-        "main and the feature tree: {on_disk:?}"
-    );
     let keep = CleanupPolicyOptions {
         keep_versions: Some(2),
         older_than: None,
     };
-    let (keep_plan, keep_read) = plan_reading_manifests(&db, keep).await;
-    let (aged_plan, aged_read) = plan_reading_manifests(
-        &db,
-        CleanupPolicyOptions {
-            keep_versions: Some(2),
-            older_than: Some(Duration::ZERO),
-        },
-    )
-    .await;
-
-    assert_eq!(
-        aged_read, on_disk,
-        "an age cutoff reads every attached manifest of every live branch"
-    );
-    for (branch, versions) in &on_disk {
-        let row = retained_on(&keep_plan, branch.as_deref());
-        let retained = row.retained.iter().copied().collect::<BTreeSet<_>>();
-        let listed = retained
-            .union(&row.would_prune.iter().copied().collect())
-            .copied()
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            &listed, versions,
-            "{branch:?}: the listing names every attached manifest"
-        );
-        assert!(!row.would_prune.is_empty(), "{branch:?}: {row:?}");
-        let read = keep_read.get(branch).cloned().unwrap_or_default();
-        assert!(
-            read.is_subset(&retained),
-            "{branch:?}: --keep read the manifests of {read:?}, retained {retained:?}"
-        );
-    }
-
-    for branch in [None, Some("feature")] {
-        let (keep_row, aged_row) = (
-            retained_on(&keep_plan, branch),
-            retained_on(&aged_plan, branch),
-        );
-        assert_eq!(keep_row.retained, aged_row.retained, "{branch:?}");
-        assert_eq!(keep_row.would_prune, aged_row.would_prune, "{branch:?}");
-    }
-    let sweep = |report: &omnigraph::db::CollectorReport| {
-        report
-            .tables
-            .iter()
-            .map(|plan| {
-                assert!(
-                    plan.errors.is_empty(),
-                    "{}: {:?}",
-                    plan.location,
-                    plan.errors
-                );
-                (
-                    plan.location.clone(),
-                    (
-                        plan.roots.clone(),
-                        plan.linear_roots.clone(),
-                        plan.sweep.clone(),
-                        plan.sweep_paths.clone(),
-                    ),
-                )
-            })
-            .collect::<BTreeMap<_, _>>()
+    let aged = CleanupPolicyOptions {
+        keep_versions: Some(2),
+        older_than: Some(Duration::ZERO),
     };
-    let keep_sweep = sweep(&keep_plan);
-    assert!(
-        keep_sweep
-            .values()
-            .any(|(_, _, sweep, _)| !sweep.is_empty()),
-        "the fixture has table versions to sweep: {keep_sweep:?}"
+
+    let mut time_reads = Vec::new();
+    for later in [
+        &[][..],
+        &["Olivia", "Peggy", "Rupert", "Sybil", "Trent", "Victor"][..],
+    ] {
+        for name in later {
+            insert_person(&db, "main", name).await;
+        }
+        let on_disk = attached_manifests_on_disk(dir.path());
+        assert_eq!(
+            on_disk.keys().cloned().collect::<Vec<_>>(),
+            vec![None, Some("feature".to_string())],
+            "main and the feature tree: {on_disk:?}"
+        );
+        let (keep_plan, keep_read) = plan_reading_manifests(&db, keep.clone()).await;
+        let (aged_plan, aged_read) = plan_reading_manifests(&db, aged.clone()).await;
+        assert_eq!(
+            keep_plan.cost.manifest_time_reads, 0,
+            "--keep alone reads no commit time"
+        );
+
+        // The feature tree's oldest version is main's commit at the fork, the
+        // merge base of the two heads, which cleanup retains on its own rule.
+        let fork = *on_disk[&Some("feature".to_string())].first().unwrap();
+        let mut pruned_total = 0;
+        for (branch, versions) in &on_disk {
+            let row = retained_on(&keep_plan, branch.as_deref());
+            let retained = row.retained.iter().copied().collect::<BTreeSet<_>>();
+            let pruned = row.would_prune.iter().copied().collect::<BTreeSet<_>>();
+            assert_eq!(
+                &retained.union(&pruned).copied().collect::<BTreeSet<_>>(),
+                versions,
+                "{branch:?}: the listing names every attached manifest"
+            );
+            assert!(!pruned.is_empty(), "{branch:?}: {row:?}");
+            pruned_total += pruned.len() as u64;
+            let mut kept = retained.clone();
+            if branch.is_none() {
+                kept.insert(fork);
+            }
+            let read = keep_read.get(branch).cloned().unwrap_or_default();
+            assert!(
+                read.is_subset(&kept),
+                "{branch:?}: --keep read the manifests of {read:?}, retained {retained:?} \
+                 and the merge base {fork}"
+            );
+            let read = aged_read.get(branch).cloned().unwrap_or_default();
+            assert!(
+                pruned.is_subset(&read),
+                "{branch:?}: the cutoff reads each undecided version for its time: \
+                 read {read:?}, pruned {pruned:?}"
+            );
+        }
+        assert_eq!(
+            aged_plan.cost.manifest_time_reads, pruned_total,
+            "the cutoff reads the time of the versions below the --keep floor, \
+             other than HEAD and a branch's base, and no other"
+        );
+        time_reads.push(aged_plan.cost.manifest_time_reads);
+
+        for branch in [None, Some("feature")] {
+            let (keep_row, aged_row) = (
+                retained_on(&keep_plan, branch),
+                retained_on(&aged_plan, branch),
+            );
+            assert_eq!(keep_row.retained, aged_row.retained, "{branch:?}");
+            assert_eq!(keep_row.would_prune, aged_row.would_prune, "{branch:?}");
+        }
+        let sweep = |report: &omnigraph::db::CollectorReport| {
+            report
+                .tables
+                .iter()
+                .map(|plan| {
+                    assert!(
+                        plan.errors.is_empty(),
+                        "{}: {:?}",
+                        plan.location,
+                        plan.errors
+                    );
+                    (
+                        plan.location.clone(),
+                        (
+                            plan.roots.clone(),
+                            plan.linear_roots.clone(),
+                            plan.sweep.clone(),
+                            plan.sweep_paths.clone(),
+                        ),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let keep_sweep = sweep(&keep_plan);
+        assert!(
+            keep_sweep
+                .values()
+                .any(|(_, _, sweep, _)| !sweep.is_empty()),
+            "the fixture has table versions to sweep: {keep_sweep:?}"
+        );
+        assert_eq!(keep_sweep, sweep(&aged_plan));
+    }
+    assert_eq!(
+        time_reads[1],
+        time_reads[0] + 6,
+        "the cutoff's time reads grow with main's history, one per new commit"
     );
-    assert_eq!(keep_sweep, sweep(&aged_plan));
 }
 
 /// Object ages and physical reclamation need filesystem assertions beyond GQT.

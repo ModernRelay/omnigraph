@@ -239,10 +239,11 @@ only after every object of the fork is older than the cutoff. Native tags,
 readable graph snapshots and required native ancestors also protect forks. Choose a policy that matches
 your rollback and audit needs.
 
-Planning with `--keep` alone lists each live branch's graph commits and reads
-only the ones it retains. `--older-than` reads every graph commit of every live
-branch for its time, one after another, so on object storage its plan grows
-with the branch's whole history.
+Planning lists each live branch's graph commits. With `--keep` alone it
+reads only the commits it retains. `--older-than` also reads the time of every
+commit that `--keep`, the HEAD and the branch's oldest commit do not already
+retain, up to 64 at once on object storage (8 on a local disk), so that part
+of the plan still grows with the branch's history.
 
 Before cleanup:
 

@@ -1179,23 +1179,11 @@ impl CollectorBranch {
         .with_registry(Arc::new(rows.registry), &self.dataset))
     }
 
-    /// The version history up to the opened version; a version published
-    /// after the open is listed by the store and dropped here.
-    pub async fn versions(&self) -> Result<Vec<lance::dataset::Version>> {
-        let head = self.head_version();
-        Ok(self
-            .dataset
-            .versions()
-            .await
-            .map_err(OmniError::storage)?
-            .into_iter()
-            .filter(|version| version.version <= head)
-            .collect())
-    }
-
-    /// The numbers of the versions `versions` returns, from the `_versions/`
-    /// listing alone: `Dataset::version_refs` reads no manifest, where
-    /// `Dataset::versions` reads and decodes every one, one after another.
+    /// The attached version numbers up to the opened version, ascending, from
+    /// the `_versions/` listing alone: `Dataset::version_refs` reads no
+    /// manifest (`Dataset::versions` reads and decodes every one, one after
+    /// another). A version published after the open is listed by the store
+    /// and dropped here.
     pub async fn version_numbers(&self) -> Result<Vec<u64>> {
         let head = self.head_version();
         Ok(self
@@ -1207,6 +1195,32 @@ impl CollectorBranch {
             .map(|version| version.version)
             .filter(|version| *version <= head)
             .collect())
+    }
+
+    /// The listed `versions`' manifests, read through the opened branch in
+    /// the order given, as many at once as the store's I/O parallelism allows
+    /// (Lance's own bound: 8 on a local store, 64 on object storage). Each
+    /// read resolves the version's manifest path with a HEAD (V2, else V1),
+    /// then reads the manifest.
+    pub async fn read_versions(&self, versions: &[u64]) -> Result<Vec<lance::dataset::Version>> {
+        use futures::{StreamExt, TryStreamExt};
+        let concurrency = self
+            .dataset
+            .object_store(None)
+            .await
+            .map_err(OmniError::storage)?
+            .io_parallelism();
+        futures::stream::iter(versions.iter().copied())
+            .map(|version| async move {
+                self.dataset
+                    .checkout_version(version)
+                    .await
+                    .map(|dataset| dataset.version())
+                    .map_err(OmniError::storage)
+            })
+            .buffered(concurrency.max(1))
+            .try_collect()
+            .await
     }
 
     /// Every pin the branch has held up to the opened version.
