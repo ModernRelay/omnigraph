@@ -117,3 +117,17 @@ paths; each records the failure's class.
 - `took over a silent owner's cluster lock` when a restarted server takes over
   its predecessor's lock, and an error when an owner's lease lapses or another
   server claims it.
+
+## Rust error API
+
+Rust embedders updating from 0.14.0 must pass the publication's graph commit ID
+before the diagnostic message to
+`OmniError::manifest_publish_in_doubt(graph_commit_id, message)`. The ID must
+name the attempted publication; do not substitute a storage path or invent an
+ID when the outcome is unknown.
+
+`ManifestError.publication_in_doubt` changes from `bool` to
+`Option<Box<String>>`: `Some` carries that commit ID, and `None` means this is
+not an in-doubt publication. Prefer the constructor over struct literals, and
+use `is_manifest_publish_in_doubt()` or `publication_id()` to inspect an
+`OmniError`. HTTP error responses and CLI syntax are unchanged.
