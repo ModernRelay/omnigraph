@@ -126,10 +126,9 @@ The helper receives one version-1 JSON request on stdin with purpose, endpoint,
 `interactive: false` and applicable identity constraints. It returns one object
 with `version: 1`, `credential: {type: bearer, token: ...}` and optional RFC 3339
 `expires_at`. Unknown fields, expired results and unsupported types refuse.
-Expiry is checked again immediately before an authenticated request is sent,
-including after discovery. A renewable provider can be acquired once again
-before submission; the CLI does not replay a mutation to refresh credentials.
-Managed control and data credentials retain their independent expiry times.
+Expiry is rechecked before authenticated dispatch, including after discovery.
+Renewal can precede submission but never replay a mutation. Managed control and
+data credentials have independent expiry times.
 Without expiry the result is not cached across invocations. Timeout terminates
 the helper process group; stderr is not echoed in routine errors.
 Output cannot change routing or prove identity. Helpers inherit the process
@@ -147,11 +146,9 @@ tokens never go to the graph endpoint. Service and graph policy still authorize
 operations independently of credential acquisition.
 
 For managed resource commands and managed-target credential export, env/file/exec/OAuth
-profiles keep exchanged credentials only in invocation memory, without requiring
-an OS store. This is explicit source-based custody, not a store-failure fallback.
-Human profiles, stored tokens and existing providers' explicit `cluster token`
-administration retain secure-store requirements.
-OAuth profiles use invocation memory; see [workload setup](managed-team.md#configure-an-unattended-workload-profile).
+profiles keep exchanged credentials in invocation memory. Human profiles, stored
+tokens and existing providers' explicit `cluster token` require secure storage.
+OAuth always uses invocation memory ([workload setup](managed-team.md#configure-an-unattended-workload-profile)); store failure never changes custody.
 
 ## Login and registration
 
