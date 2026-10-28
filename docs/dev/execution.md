@@ -1056,6 +1056,29 @@ checks so their reservation cannot crowd out mandatory set allocations.
 Buckets larger than 32 keys are sorted and searched by binary
 search, bounding lookup work even when integer keys share a hash prefix.
 
+Once the sets are admitted, `ValidateExec` carves the run's load budget
+(`operators/load_budget.rs`) from the room `query_memory_bytes` leaves past
+the pool's total: one share per parse partition (52 of 64 parts between
+them), one for the unique holders (8, the partitions' when the plan sizes
+none), four uncharged for lease bookkeeping and the fragment sink's open
+chunks, a copy of rows each partition's reader already charged. A `WorkMemory`
+in a share (`in_share`) charges the share and then grows the pool infallibly,
+so the pool keeps counting beside the shares; the sink's `WorkMemory` is in the
+`Sink` class, which the pool counts and never refuses. A partition's share is
+charged only by its reader thread, which, once the slice's decode scratch is
+released, charges each decoded batch's bytes a second time (`batch_bytes`, the
+copy the sink's chunker will hold of it, since the breaker's re-materialized
+output is new buffers the registry cannot dedup) and each batch's validation
+facts ahead of the sweeper (`admit_facts_ahead`), so neither stacks on that
+transient, and the holders' share only by
+partition 0's sweeper, so a refusal and its `actual` (`LoadBudget::admitting_limit`,
+the smallest limit whose share admits the demand with the pool as it was at
+the carve) follow one thread's own sequence. A share under the admission floor (the partition's source admission
+plus one slice) refuses at the carve, before any partition is polled; a share
+refusal in a run of several partitions marks the source refused so the loader
+reruns it single-partitioned. Lease metadata and registry growth under a share
+are counted on the pool and never refused.
+
 Mutation insert/update and keyed Load retain the per-table limit of 8,192 rows.
 An immutable `WriteBudget` captures the session's `write_max_bytes` (default
 32 MiB) once, including retries. Retained row data has one allowance per table

@@ -25,6 +25,7 @@ use tokio::sync::watch;
 
 use super::csv_source::{CsvSourceExec, FailedSlice, slice_of};
 use super::external;
+use super::load_budget::ShareClass;
 use super::memory::WorkMemory;
 use super::shape::{BatchSender, Breaker, Streaming, work};
 use crate::db::{Omnigraph, Snapshot};
@@ -189,6 +190,14 @@ impl ExecutionPlan for ValidateExec {
             judge.mode == LoadMode::Overwrite,
             partitions,
         ));
+        if let Some(csv) = self.input.downcast_ref::<CsvSourceExec>() {
+            let judge = Arc::clone(&judge);
+            let plan = Arc::clone(&plan);
+            let holding = matches!(self.shape, ValidateShape::Breaker(_));
+            csv.admit_facts_ahead(Box::new(move |facts, batch, probed_rows| {
+                admit_facts(facts, &judge, &plan, holding, batch, probed_rows)
+            }));
+        }
         match &self.shape {
             ValidateShape::Breaker(breaker) => Ok(breaker.held(
                 memory,
@@ -247,9 +256,9 @@ struct Drained {
     facts: Vec<WorkMemory>,
 }
 
-/// The swept sets admitted, then the source's `partitions` executed and every
-/// one drained beside the set load; the loaded sets' transient guards are
-/// released once the drain ends.
+/// The swept sets admitted, the load budget carved and the source admitted
+/// against it, then the source's `partitions` executed and every one drained
+/// beside the set load; the sets' transient guards go once the drain ends.
 #[allow(clippy::too_many_arguments)]
 async fn drain(
     partitions: usize,
@@ -262,6 +271,15 @@ async fn drain(
     forward: Forward,
 ) -> DfResult<Drained> {
     let admitted = admit_sets(memory, judge, plan).await?;
+    let csv = source.downcast_ref::<CsvSourceExec>();
+    let floor = csv.map_or(0, CsvSourceExec::admission_floor);
+    memory
+        .carve_load_budget(partitions, plan.has_unique_holders(), floor)
+        .inspect_err(|_| {
+            if let Some(csv) = csv {
+                csv.mark_refused();
+            }
+        })?;
     let inputs = (0..partitions)
         .map(|partition| source.execute(partition, Arc::clone(&ctx)))
         .collect::<DfResult<Vec<_>>>()?;
@@ -374,17 +392,20 @@ async fn drain_and_sweep(
     published: PublishedSets,
     forward: Forward,
 ) -> DfResult<Drained> {
-    let drained = futures::future::join_all(inputs.into_iter().map(|input| {
-        let plan = Arc::clone(plan);
-        let judge = Arc::clone(judge);
-        let source = Arc::clone(source);
-        let published = published.clone();
-        let forward = forward.clone();
-        memory.blocking(move |memory| {
-            sweep_partition(input, memory, source, plan, judge, published, forward)
-        })
-    }))
-    .await;
+    let drained =
+        futures::future::join_all(inputs.into_iter().enumerate().map(|(partition, input)| {
+            let plan = Arc::clone(plan);
+            let judge = Arc::clone(judge);
+            let source = Arc::clone(source);
+            let published = published.clone();
+            let forward = forward.clone();
+            memory.blocking(move |memory| {
+                sweep_partition(
+                    partition, input, memory, source, plan, judge, published, forward,
+                )
+            })
+        }))
+        .await;
     let mut batches = Vec::new();
     let mut rows = 0;
     let mut partials = Vec::new();
@@ -396,12 +417,19 @@ async fn drain_and_sweep(
                 batches.extend(swept.held);
                 rows += swept.rows;
                 partials.push(swept.partial);
-                facts.push(swept.facts);
+                facts.extend(swept.facts);
             }
             Err(error) => failures.push((partition, error)),
         }
     }
     if !failures.is_empty() {
+        if let Some(csv) = source.downcast_ref::<CsvSourceExec>()
+            && failures
+                .iter()
+                .any(|(_, error)| OmniError::is_query_memory_failure(error))
+        {
+            csv.mark_refused();
+        }
         let failed = source
             .downcast_ref::<CsvSourceExec>()
             .map(CsvSourceExec::failed_slices)
@@ -500,18 +528,20 @@ async fn load_sets(
 }
 
 /// One partition's drain: what it held (nothing when it forwarded), the rows
-/// it saw, its facts and the memory that holds them.
+/// it saw, its facts and the memories that hold them, one per batch.
 struct Swept {
     held: Vec<RecordBatch>,
     rows: usize,
     partial: SweepPartial,
-    facts: WorkMemory,
+    facts: Vec<WorkMemory>,
 }
 
-/// One partition's input swept as it arrives (facts at its position, probed
-/// once the swept sets land), then held under `memory` or sent on through
-/// `forward` once probed, a batch from before the sets waiting in order.
+/// Partition `partition`'s input swept as it arrives (facts at its position,
+/// probed once the swept sets land), then held under its state share or sent
+/// on through `forward` once probed, a batch from before the sets in order.
+#[allow(clippy::too_many_arguments)]
 async fn sweep_partition(
+    partition: usize,
     mut input: SendableRecordBatchStream,
     memory: Arc<WorkMemory>,
     source: Arc<dyn ExecutionPlan>,
@@ -520,35 +550,58 @@ async fn sweep_partition(
     mut published: PublishedSets,
     forward: Forward,
 ) -> DfResult<Swept> {
-    let facts = memory.child("load validation facts")?;
-    let waiting = memory.child("load batches before the sets")?;
+    let share = ShareClass::Partition(partition);
+    let holding = memory.child("load held batches")?.in_share(share);
+    let waiting = memory
+        .child("load batches before the sets")?
+        .in_share(share);
+    let forwarded = Arc::new(memory.child("load forwarded batches")?.in_share(share));
+    let csv = source.downcast_ref::<CsvSourceExec>();
     let mut partial = SweepPartial::new(&plan);
     let mut held = Vec::new();
     let mut rows = 0;
     let mut slice = usize::MAX;
     let mut offset = 0_u64;
+    let mut ordinal = 0_usize;
     let system_columns = judge.catalog.system_columns;
     let mut sets: Option<Arc<SweptSets>> = None;
     let mut unprobed = Vec::new();
-    let mut scratch_rows = 0usize;
+    let mut probed_rows = 0_usize;
+    let mut facts = Vec::new();
     let mut sized = false;
     while let Some(batch) = input.next().await {
         let batch = batch?;
         memory.metric("input_rows", batch.num_rows());
         rows += batch.num_rows();
         if forward.is_none() {
-            memory.hold(&batch)?;
-            memory.entries::<RecordBatch>(1)?;
+            holding.hold(&batch)?;
         }
         let tagged = slice_of(&batch);
         if tagged != slice {
             slice = tagged;
             offset = 0;
+            ordinal = 0;
         }
         let base = position(slice, offset);
-        admit_validation(&facts, &judge, std::slice::from_ref(&batch))?;
-        if !sized {
-            sized = size_unique_holders(&facts, &plan, source.as_ref())?;
+        let batch_facts = match csv.and_then(|csv| csv.take_facts_admission(slice, ordinal)) {
+            Some(facts) => facts,
+            None => {
+                let facts = memory.child("load validation facts")?.in_share(share);
+                admit_facts(
+                    &facts,
+                    &judge,
+                    &plan,
+                    forward.is_none(),
+                    &batch,
+                    &mut probed_rows,
+                )?;
+                facts
+            }
+        };
+        facts.push(batch_facts);
+        ordinal += 1;
+        if partition == 0 && !sized {
+            sized = size_unique_holders(&memory, &plan, source.as_ref())?;
         }
         partial
             .observe(&plan, &judge.catalog, &batch, system_columns, base)
@@ -562,27 +615,16 @@ async fn sweep_partition(
                 Some(sets) => {
                     if !unprobed.is_empty() {
                         probe_held(
-                            &facts,
                             &mut partial,
                             &plan,
                             &held,
                             &mut unprobed,
                             system_columns,
                             sets,
-                            &mut scratch_rows,
                         )?;
-                        send_held(&forward, &memory, &waiting, &mut held).await?;
+                        send_held(&forward, &forwarded, &waiting, &mut held).await?;
                     }
-                    probe_batch(
-                        &facts,
-                        &mut partial,
-                        &plan,
-                        &batch,
-                        system_columns,
-                        base,
-                        sets,
-                        &mut scratch_rows,
-                    )?;
+                    probe_batch(&mut partial, &plan, &batch, system_columns, base, sets)?;
                 }
                 None => {
                     if forward.is_some() {
@@ -595,7 +637,13 @@ async fn sweep_partition(
             }
         }
         match &forward {
-            Some(sender) => sender.lock().await.send(batch, Arc::clone(&memory)).await?,
+            Some(sender) => {
+                sender
+                    .lock()
+                    .await
+                    .send(batch, Arc::clone(&forwarded))
+                    .await?;
+            }
             None => held.push(batch),
         }
     }
@@ -614,17 +662,16 @@ async fn sweep_partition(
             },
         };
         probe_held(
-            &facts,
             &mut partial,
             &plan,
             &held,
             &mut unprobed,
             system_columns,
             &sets,
-            &mut scratch_rows,
         )?;
-        send_held(&forward, &memory, &waiting, &mut held).await?;
+        send_held(&forward, &forwarded, &waiting, &mut held).await?;
     }
+    facts.push(holding);
     Ok(Swept {
         held,
         rows,
@@ -633,29 +680,40 @@ async fn sweep_partition(
     })
 }
 
-/// Probe the held batches that arrived before the sets, in order.
-#[allow(clippy::too_many_arguments)]
-fn probe_held(
+/// What a batch's validation facts cost, charged on `facts` before the batch
+/// is swept: the facts, the probe scratch past `probed_rows` when the plan
+/// sweeps endpoints, and the entry of a batch a `holding` drain keeps.
+fn admit_facts(
     facts: &WorkMemory,
+    judge: &LoadJudge,
+    plan: &SweepPlan,
+    holding: bool,
+    batch: &RecordBatch,
+    probed_rows: &mut usize,
+) -> DfResult<()> {
+    admit_validation(facts, judge, std::slice::from_ref(batch))?;
+    let rows = batch.num_rows();
+    if plan.sweeps_endpoints() && rows > *probed_rows {
+        facts.grow(parse_scratch_bytes(rows - *probed_rows).map_err(external)?)?;
+        *probed_rows = rows;
+    }
+    if holding {
+        facts.entries::<RecordBatch>(1)?;
+    }
+    Ok(())
+}
+
+/// Probe the held batches that arrived before the sets, in order.
+fn probe_held(
     partial: &mut SweepPartial,
     plan: &SweepPlan,
     held: &[RecordBatch],
     unprobed: &mut Vec<(usize, u64)>,
     system_columns: SystemColumns,
     sets: &SweptSets,
-    scratch_rows: &mut usize,
 ) -> DfResult<()> {
     for (index, base) in unprobed.drain(..) {
-        probe_batch(
-            facts,
-            partial,
-            plan,
-            &held[index],
-            system_columns,
-            base,
-            sets,
-            scratch_rows,
-        )?;
+        probe_batch(partial, plan, &held[index], system_columns, base, sets)?;
     }
     Ok(())
 }
@@ -680,10 +738,10 @@ async fn send_held(
 }
 
 /// The shared unique holders sized from the source's row estimate once it has
-/// one, each check's tables charged to `facts` only while the pool has room
-/// ([`WorkMemory::grow_if_free`]); `true` once sized, by any partition.
+/// one, each check's tables charged to the holders share only while it has
+/// room ([`WorkMemory::grow_if_free`]); `true` once sized, by partition 0.
 fn size_unique_holders(
-    facts: &WorkMemory,
+    memory: &WorkMemory,
     plan: &SweepPlan,
     source: &dyn ExecutionPlan,
 ) -> DfResult<bool> {
@@ -699,8 +757,8 @@ fn size_unique_holders(
         rows,
         WorkMemory::entry_bytes::<(Vec<String>, String)>(),
         &mut |bytes| {
-            let table = match facts.child("load unique holders table") {
-                Ok(table) => table,
+            let table = match memory.child("load unique holders table") {
+                Ok(table) => table.in_share(ShareClass::Holders),
                 Err(error) => {
                     failed = Some(error);
                     return None;
@@ -722,24 +780,15 @@ fn size_unique_holders(
     }
 }
 
-/// Probe one held batch; the partition's parse scratch grows under `facts`
-/// to the largest batch it has probed.
-#[allow(clippy::too_many_arguments)]
+/// Probe one held batch; its parse scratch was charged with its facts.
 fn probe_batch(
-    facts: &WorkMemory,
     partial: &mut SweepPartial,
     plan: &SweepPlan,
     batch: &RecordBatch,
     system_columns: SystemColumns,
     base: u64,
     sets: &SweptSets,
-    scratch_rows: &mut usize,
 ) -> DfResult<()> {
-    let rows = batch.num_rows();
-    if rows > *scratch_rows {
-        facts.grow(parse_scratch_bytes(rows - *scratch_rows).map_err(external)?)?;
-        *scratch_rows = rows;
-    }
     partial
         .probe_endpoints(plan, batch, system_columns, base, sets)
         .map_err(external)
@@ -942,6 +991,7 @@ mod tests {
 
     use super::super::csv_source::CSV_SLICE_METADATA;
     use super::super::fixtures;
+    use super::super::load_budget::LoadBudget;
     use super::*;
     use crate::loader::csv::{
         CSV_READ_BATCH_ROWS, CsvBytes, CsvLoadRequest, NormalizeStep, RangeScanner, ResolvedCsv,
@@ -1017,6 +1067,18 @@ mod tests {
         partitions: usize,
         streams: bool,
     ) -> (Arc<CsvSourceExec>, DfResult<Vec<RecordBatch>>) {
+        let (_pool, ctx) = fixtures::context(64 << 20, CSV_READ_BATCH_ROWS);
+        validate_over(schema, source, partitions, streams, ctx).await
+    }
+
+    /// [`validate_as`] under `ctx`, whose pool and limit the caller chose.
+    async fn validate_over(
+        schema: &str,
+        source: &str,
+        partitions: usize,
+        streams: bool,
+        ctx: Arc<TaskContext>,
+    ) -> (Arc<CsvSourceExec>, DfResult<Vec<RecordBatch>>) {
         let dir = tempfile::tempdir().unwrap();
         let db = crate::Session::from_defaults(
             Arc::new(
@@ -1074,7 +1136,6 @@ mod tests {
         };
         let validate =
             ValidateExec::new(Arc::clone(&exec) as Arc<dyn ExecutionPlan>, judge, streams);
-        let (_pool, ctx) = fixtures::context(64 << 20, CSV_READ_BATCH_ROWS);
         let judged = validate
             .execute(0, ctx)
             .unwrap()
@@ -1083,6 +1144,110 @@ mod tests {
             .into_iter()
             .collect::<DfResult<Vec<_>>>();
         (exec, judged)
+    }
+
+    /// Every charge of a partition is its producer's, in source order: two
+    /// runs charge the same consumers the same bytes (the registry's growth
+    /// aside) and only the shared set charges, a thread fact GQT cannot see.
+    #[tokio::test]
+    async fn a_partitioned_load_charges_the_same_bytes_on_every_run() {
+        let mut source = String::from("key,score\n");
+        for row in 0..600 {
+            writeln!(&mut source, "{row},1.5").unwrap();
+        }
+        let mut runs = Vec::new();
+        for _ in 0..2 {
+            let ledger = Arc::new(ChargeLedger::new(64 << 20));
+            let ctx = fixtures::context_over(
+                Arc::clone(&ledger) as Arc<dyn MemoryPool>,
+                64 << 20,
+                CSV_READ_BATCH_ROWS,
+            );
+            let (exec, judged) = validate_over(PERSON, &source, 2, false, ctx).await;
+            assert_eq!(
+                judged
+                    .unwrap()
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>(),
+                600
+            );
+            assert!(!exec.refused());
+            assert!(exec.executed_slices().len() > 2);
+            let mut charges: Vec<(String, usize)> = ledger
+                .charges()
+                .into_iter()
+                .filter(|(name, _)| name != "graph allocation registry")
+                .collect();
+            charges.sort();
+            runs.push(charges);
+        }
+        assert_eq!(runs[0], runs[1]);
+        let shared = [
+            "CsvSourceExec",
+            "CSV source bytes",
+            "CSV decoding",
+            "load validation facts",
+            "load unique holders table",
+            "load held batches",
+            "load batches before the sets",
+            "load forwarded batches",
+            "queued producer batch",
+            "graph Arrow allocation",
+            "graph batch handles",
+            "ValidateExec",
+            "load removed and retained rows",
+            "load removed input",
+            "load integer endpoint keys",
+            "load read reuse",
+        ];
+        let strangers: Vec<&str> = runs[0]
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .filter(|name| !shared.contains(name))
+            .collect();
+        assert!(strangers.is_empty(), "{strangers:?}");
+    }
+
+    /// A share under the admission floor (the source admission plus one
+    /// slice) refuses before any partition is polled, `actual` the smallest
+    /// admitting limit, and marks the rerun; a share at the floor admits.
+    #[tokio::test]
+    async fn a_share_under_the_admission_floor_refuses_before_any_partition_is_polled() {
+        let mut source = String::from("key,score\n");
+        for row in 0..200 {
+            writeln!(&mut source, "{row},1.5").unwrap();
+        }
+        let floor = source.len() + 64;
+        let refusing = 2048;
+        let expected = LoadBudget::carve(refusing, 0, 2, true)
+            .admit(floor)
+            .unwrap_err();
+        assert!(expected > refusing, "{expected}");
+        let (_pool, ctx) = fixtures::context(refusing as usize, CSV_READ_BATCH_ROWS);
+        let (exec, judged) = validate_over(PERSON, &source, 2, false, ctx).await;
+        assert_eq!(exec.admission_floor(), floor);
+        let refused = judged.unwrap_err().to_string();
+        assert!(
+            refused.contains(&format!(
+                "query_memory_bytes: actual {expected}, limit {refusing}"
+            )),
+            "{refused}"
+        );
+        assert_eq!(polls(&exec), 0, "no partition was polled");
+        assert!(exec.refused(), "two partitions mark the rerun");
+
+        let admitting = usize::try_from(expected).unwrap();
+        let (_pool, ctx) = fixtures::context(admitting, CSV_READ_BATCH_ROWS);
+        let (exec, judged) = validate_over(PERSON, &source, 2, false, ctx).await;
+        assert!(polls(&exec) > 0, "the partitions ran: {judged:?}");
+    }
+
+    /// How often the source's partition streams were polled.
+    fn polls(exec: &CsvSourceExec) -> usize {
+        exec.metrics()
+            .and_then(|metrics| metrics.sum_by_name(super::super::shape::POLLS))
+            .map_or(0, |metric| metric.as_usize())
     }
 
     fn keys(batches: &[RecordBatch]) -> Vec<i64> {
@@ -1476,6 +1641,7 @@ mod tests {
                     memory
                         .blocking(move |memory| {
                             sweep_partition(
+                                0,
                                 partition_input(batches, ended),
                                 memory,
                                 source,
