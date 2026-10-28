@@ -106,7 +106,9 @@ paths; each records the failure's class.
 
 - `engine failure without definite completion evidence`: the failure's class,
   the status its response sends, and whether its uncertainty is scoped to its
-  storage keys.
+  storage keys. When the failure is a publication whose outcome is unknown, its
+  `publication` field names the graph commit, so you can look the commit up
+  later and see whether it landed.
 - `owned write ended without a definite outcome`: the status its response
   sends, 500 for `outcome_unknown`, and whether it contained the process.
 - `manifest request outcome unknown; re-issuing the identical conditional
@@ -115,3 +117,17 @@ paths; each records the failure's class.
 - `took over a silent owner's cluster lock` when a restarted server takes over
   its predecessor's lock, and an error when an owner's lease lapses or another
   server claims it.
+
+## Rust error API
+
+Rust embedders updating from 0.14.0 must pass the publication's graph commit ID
+before the diagnostic message to
+`OmniError::manifest_publish_in_doubt(graph_commit_id, message)`. The ID must
+name the attempted publication; do not substitute a storage path or invent an
+ID when the outcome is unknown.
+
+`ManifestError.publication_in_doubt` changes from `bool` to
+`Option<Box<String>>`: `Some` carries that commit ID, and `None` means this is
+not an in-doubt publication. Prefer the constructor over struct literals, and
+use `is_manifest_publish_in_doubt()` or `publication_id()` to inspect an
+`OmniError`. HTTP error responses and CLI syntax are unchanged.

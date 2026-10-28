@@ -600,7 +600,10 @@ mod tests {
 
         for (error, outcome, effects, action) in [
             (
-                OmniError::manifest_publish_in_doubt("PRIVATE_PUBLICATION_DETAIL"),
+                OmniError::manifest_publish_in_doubt(
+                    "01JCOMMITUNKNOWN",
+                    "PRIVATE_PUBLICATION_DETAIL",
+                ),
                 "uncertain",
                 crate::api::DispositionEffects::Unknown,
                 crate::api::DispositionAction::Reconcile,

@@ -1520,6 +1520,9 @@ impl ApiError {
     /// the body agree on both paths.
     fn from_omni_settled(err: OmniError, settle: impl FnOnce(Self) -> Self) -> Self {
         let cause = redacted_cause::RedactedCause::of(&err);
+        // An in-doubt publication's graph commit, logged as its own field: the
+        // message that also names it can carry storage paths.
+        let publication = err.publication_id().map(str::to_owned);
         // Every translation leaves through this one exit, an internal
         // replacement included, so the warning reads each one's settled facts.
         let response = settle(Self::translated(err));
@@ -1532,6 +1535,7 @@ impl ApiError {
             tracing::warn!(
                 status = %response.status(),
                 ?cause,
+                publication = publication.as_deref(),
                 scoped = response.scoped_unknown,
                 "engine failure without definite completion evidence"
             );
@@ -3565,6 +3569,56 @@ pub(crate) mod test_log_capture {
 #[cfg(test)]
 mod log_filter_tests {
     use super::test_log_capture::Capture;
+
+    /// An unknown publication's log line names its graph commit in its own
+    /// field, so an operator can look the commit up, and never the message,
+    /// which can carry storage paths. Another uncertain failure names none.
+    #[test]
+    fn an_unknown_publication_logs_its_commit_and_no_message_issue_1067() {
+        for json in [false, true] {
+            let capture = Capture::default();
+            let subscriber: Box<dyn tracing::Subscriber + Send + Sync> = if json {
+                Box::new(capture.json_subscriber("debug"))
+            } else {
+                Box::new(capture.subscriber("debug"))
+            };
+            let logs = tracing::subscriber::set_default(subscriber);
+            let error =
+                super::ApiError::from_omni(omnigraph::error::OmniError::manifest_publish_in_doubt(
+                    "01JCOMMITUNKNOWN",
+                    "graph commit 01JCOMMITUNKNOWN may be durable: \
+                     s3://bucket/private/__manifest/_versions/7.manifest",
+                ));
+            assert!(error.completion_uncertain());
+            let storage = super::ApiError::from_omni(omnigraph::error::OmniError::Storage(
+                omnigraph::error::StorageFailure::new(
+                    omnigraph::error::StorageFailureKind::Unknown,
+                    "storage: s3://bucket/private/node/data/1.lance",
+                ),
+            ));
+            assert!(storage.completion_uncertain());
+            drop(logs);
+            let output = capture.output();
+            let lines: Vec<&str> = output
+                .lines()
+                .filter(|line| line.contains("engine failure without definite completion evidence"))
+                .collect();
+            assert_eq!(lines.len(), 2, "{output}");
+            if json {
+                let publication: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+                let storage: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+                assert_eq!(publication["publication"], "01JCOMMITUNKNOWN", "{output}");
+                assert!(storage.get("publication").is_none(), "{output}");
+            } else {
+                assert!(
+                    lines[0].contains(r#"publication="01JCOMMITUNKNOWN""#),
+                    "{output}"
+                );
+                assert!(!lines[1].contains("publication="), "{output}");
+            }
+            assert!(!output.contains("s3://bucket"), "{output}");
+        }
+    }
 
     #[test]
     fn restricted_dependency_logs_remain_filtered_under_specific_directives() {
