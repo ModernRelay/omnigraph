@@ -237,7 +237,7 @@ omnigraph skill export ~/.claude/skills/omnigraph --force --json
 omnigraph skill show references/queries.md
 ```
 
-The binary carries the agent skill matching its commands and HTTP contract.
+Running `omnigraph` or `omnigraph help` says to call that skill before a first schema or query. The binary carries the agent skill matching its commands and HTTP contract.
 Export refuses existing files unless `--force`; a later forced export removes
 obsolete recorded files only while their bytes remain unchanged. Neither
 command reads operator configuration or contacts a server.
