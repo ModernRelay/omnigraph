@@ -105,12 +105,12 @@ async fn recovery_ensure_indices_steady_state_no_sidecar() {
 {"type":"Company","data":{"name":"acme"}}
 "#;
     db.load_jsonl(test_data, LoadMode::Append).await.unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     drop(db);
 
     let db = Omnigraph::open(uri).await.unwrap();
     let before = snapshot_main(&db).await.unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     let after = snapshot_main(&db).await.unwrap();
     assert_eq!(
         after.graph_manifest_version(),
@@ -153,7 +153,7 @@ async fn recovery_ensure_indices_handles_empty_tables() {
     let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     // Don't load any data — every table is empty.
     let before = snapshot_main(&db).await.unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     let after = snapshot_main(&db).await.unwrap();
     assert_eq!(
         after.graph_manifest_version(),
@@ -173,7 +173,7 @@ async fn recovery_ensure_indices_handles_empty_tables() {
     drop(db);
     let db = Omnigraph::open(uri).await.unwrap();
     let before = snapshot_main(&db).await.unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     let after = snapshot_main(&db).await.unwrap();
     assert_eq!(
         after.graph_manifest_version(),

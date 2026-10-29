@@ -22,6 +22,14 @@ targets accept local files only; an inline [S3 cluster root](s3-cluster-roots.md
 is the one cloud-direct exception. See
 [operator configuration](../cli/targets.md#transport-and-capability-boundaries).
 
+Each command acts as the operator configuration's `operator.actor`, and the
+commit it publishes records that actor; `index build` and `index rebuild` also
+accept `--as` in its place. Direct CLI access, including `--target`, does not
+load the server's Cedar policy; storage permissions are its trust boundary. An
+embedded host that installs a policy checker enforces the
+[policy actions](policy.md#actions) before any effect: `maintain` for optimize,
+index builds, the full-text rebuild and repair, and `reclaim` for cleanup.
+
 ## Optimize
 
 ```bash
@@ -38,58 +46,56 @@ dropped-value rewrite and the traversal artifact stay with optimize. Optimize
 does not delete old versions or collect unused table forks. Use `cleanup` for
 storage reclamation.
 
-Dropping a property removes it from the schema without rewriting its table
-(see [schema changes](../schema/index.md#schema-changes)), so its values stay
-in the table's data files. Every optimize rewrites each fragment that still
-holds them, whatever its size, copying only the remaining properties; the
-dropped values are not read. A `cleanup` then deletes the old files, Blob
-values included, once nothing it retains references them: no commit its
-retention keeps, no live branch created from a commit before that optimize,
-and no tag naming such a commit. Merging a branch does not release its files;
-deleting it does. A table holding no dropped values and nothing else to
-compact is left alone.
+Dropping a property removes it from the schema without rewriting its table (see
+[schema changes](../schema/index.md#schema-changes)), so its values stay in the
+table's data files. Every optimize rewrites each fragment that still holds them,
+whatever its size, copying only the remaining properties; the dropped values are
+not read. A `cleanup` then deletes the old files, Blob values included, once
+nothing it retains references them: no commit its retention keeps, no live
+branch created from a commit before that optimize, and no tag naming such a
+commit. Merging a branch does not release its files; deleting it does. A table
+holding no dropped values and nothing else to compact is left alone.
 
 Each table's work is staged as detached Lance versions of the table's current
-pin and published in one graph commit, like any other write. A run
-that fails before that commit leaves the graph unchanged and no recovery
-state; after it the published pins are the tables' versions, with nothing
-left to finish. Optimize runs beside
-live writers: a write that lands on a table while its compaction is staged
-fails the run with a read-set conflict, and the next run re-plans from the
-new state. An update or delete prepared before an optimize published reports
-the same conflict and is retried by its caller. Lance compacts neighbouring
-fragments only when the same indexes cover them, so a table whose index
-coverage was uneven before a run may coalesce fully only on the next run,
+pin and published in one graph commit, like any other write. A run that fails
+before that commit leaves the graph unchanged and no recovery state; after it
+the published pins are the tables' versions, with nothing left to finish.
+Optimize runs beside live writers: a write that lands on a table while its
+compaction is staged fails the run with a read-set conflict, and the next run
+re-plans from the new state. An update or delete prepared before an optimize
+published reports the same conflict and is retried by its caller. Lance compacts
+neighbouring fragments only when the same indexes cover them, so a table whose
+index coverage was uneven before a run may coalesce fully only on the next run,
 after the rebuilt coverage is in place.
 
 Compacting a table with Blob properties reads each managed Blob value into
-memory to rewrite it. Optimize sizes the read batches of each compaction task
-(a group of neighbouring fragments compacted together) from the task's largest
-row, summing that row's managed Blob values, so one batch materializes at most
-32 MiB of managed Blob payload whatever the fragment sizes. External Blob
-references are carried without reading the referenced object and count
-nothing. A task holding a row over 16 MiB compacts one row per batch, and a
-single row over 32 MiB is materialized whole. This bounds the payload of a
-batch, not the process heap: Lance's writer copies each inline payload into
-the arrays it prepares while it still holds the batch, so memory use exceeds
-the payload. Every task of a Blob table gets this batch size explicitly, 1 to
-8192 rows, so it takes precedence over `LANCE_DEFAULT_BATCH_SIZE` there,
-including when the variable is smaller. When a fragment being compacted holds
-a Blob descriptor the engine's decoder rejects, sizing can refuse the
-compaction with a Blob integrity error before that table is rewritten, and
-nothing is committed; a table with nothing to compact is not scanned.
-Optimize works on up to
-`OMNIGRAPH_MAINTENANCE_CONCURRENCY` tables at once (default 8), so budget for
-that many Blob tables compacting together.
+memory. Optimize sizes each compaction batch from its largest row, whatever
+`LANCE_DEFAULT_BATCH_SIZE` says, so one batch holds at most 32 MiB of managed
+Blob payload; a larger row is read whole, external references are not read,
+and the writer's own copies come on top. A Blob descriptor the decoder rejects
+refuses the compaction before that table is rewritten. Optimize plans up to
+`OMNIGRAPH_MAINTENANCE_CONCURRENCY` tables ahead (default 8) and rewrites up to
+that many at once, so budget for that many Blob tables compacting together.
+
+### Bounding a run
+
+Writes to `main` wait while optimize holds its writer gates. A run given
+`--max-gate-hold 30s` starts no table after that long except the first: the
+rest are `deferred`, finished tables publish, and a writer waits at most the
+bound plus one rewrite. Tables run in type-key order; `resume_at` names the
+first deferred one, and `--tables` runs only the listed tables, in order. Each
+table's `outcome` is `optimized`, `unchanged`, `deferred`, `skipped` or
+`failed` (with its `error`; the other tables still publish). The report adds
+`input_commit`, `graph_commit_id`, `gate_hold_ms` and the `configuration_clear`
+and `artifact` outcomes, which never fail a published run.
 
 Optimize also persists the traversal-adjacency artifact
 (`__graph_index/csr-current.bin`), which cold traversal builds load instead of
-scanning every edge dataset. The artifact is derived and regenerable: optimize
-is its only writer, every load is verified and falls back to the in-memory
-build, and a failed write is a warning, not an optimize error. The artifact is
-rewritten by optimize runs that advance an edge dataset; on a store with no
-edge work it is left as-is, and a stale copy costs only the artifact's speedup,
-never correctness.
+scanning every edge dataset. It is derived: every load is verified and falls
+back to the in-memory build, so a stale copy or a failed write costs only its
+speedup, and a failed write is reported as the `artifact` outcome. Optimize
+builds it after releasing the writer gates, and only when the run advanced an
+edge dataset or no artifact exists.
 
 Existing full-text indexes are preserved rather than incrementally merged.
 Unindexed rows remain searchable, but a growing uncovered tail can cost more to
@@ -115,15 +121,15 @@ BTREE or vector index that leaves rows uncovered. Every table publishes in one
 graph commit on that branch; other branches and snapshots keep their indexes,
 and a branch with nothing to do publishes nothing. The default branch is `main`.
 As with optimize, a write that lands on a table while its batch is staged fails
-the run with a read-set conflict; run the command again. A vector property with no vectors yet and full-text coverage stay pending: only
-`index rebuild --kind full-text` refreshes a full-text index's coverage, and
-queries match uncovered rows with the index's analyzer meanwhile.
+the run with a read-set conflict; run the command again. A vector property with
+no vectors yet and full-text coverage stay pending: only `index rebuild --kind
+full-text` refreshes a full-text index's coverage, and queries match uncovered
+rows with the index's analyzer meanwhile.
 
 JSON reports `branch`, `graph_commit_id` (null for a no-op), `indexes` with each
 `type_key`, `property` (the indexed column, `__id` for the identity index),
 `kind` (`btree`, `full_text` or `vector`) and `action` (`built` or `refreshed`),
-and `pending_indexes` with each `type_key`, `property` and `reason`. `--as` and
-the trust boundary are as for the full-text rebuild below.
+and `pending_indexes` with each `type_key`, `property` and `reason`.
 
 ## Rebuild full-text indexes
 
@@ -134,7 +140,8 @@ omnigraph index rebuild --kind full-text --target ./cluster-root \
 ```
 
 `--kind` is required. The deprecated spelling `rebuild-full-text-indexes` still
-works for one release.
+works for one release, and so does admitting the rebuild under `change` on the
+selected branch instead of `maintain`.
 
 The command fully replaces text-search indexes from current entities using the
 engine's default English analyzer, including already indexed entities. It builds
@@ -148,11 +155,6 @@ All rebuilt datasets become visible in one graph commit. JSON reports `branch`,
 Success means the selected branch's planned rebuild was published, or an explicit
 no-op with an empty index list, null commit, and empty `warnings` array. The default
 branch is `main`.
-
-`--as` supplies actor attribution for this command. Direct CLI access, including
-`--target`, does not load the server's Cedar policy; storage permissions are its
-trust boundary. An embedded host that installs a policy checker also enforces
-the Change permission on the selected branch before building or rebuilding.
 
 Other branches and historical snapshots are not rewritten. Rebuild every live
 branch that needs full-text search; restoring an older snapshot may require
@@ -194,18 +196,17 @@ export the graph and load it into a new one; see
 
 ## Cleanup
 
-Cleanup is a tracing collector over the graph's table storage. Every table
-write is a detached Lance commit that a graph commit pins, so what a table
-keeps is decided by which graph commits the run retains. Per live branch
-the run computes the graph commits its policy keeps, takes the table
-versions those commits pin as roots, marks every file the root manifests
-reference (base and overlay data files, deletion files, index directories,
-transaction files), and deletes unretained table versions and the files only
-they reference. Selected merge bases and native tagged snapshots are retained
-in addition to the versions selected by the policy.
-Historical table lifetimes participate even after a type is dropped or its
-name is re-added under a new identity. Blob sidecars follow their parent data
-file's reachability.
+Cleanup is a tracing collector over the graph's table storage. Every table write
+is a detached Lance commit that a graph commit pins, so what a table keeps is
+decided by which graph commits the run retains. Per live branch the run computes
+the graph commits its policy keeps, takes the table versions those commits pin
+as roots, marks every file the root manifests reference (base and overlay data
+files, deletion files, index directories, transaction files), and deletes
+unretained table versions and the files only they reference. Selected merge
+bases and native tagged snapshots are retained in addition to the versions
+selected by the policy. Historical table lifetimes participate even after a type
+is dropped or its name is re-added under a new identity. Blob sidecars follow
+their parent data file's reachability.
 
 `omnigraph cleanup` is the only cleanup to run against a graph root. Lance's
 own cleanup (`cleanup_old_versions`, and every vacuum or retention tool built

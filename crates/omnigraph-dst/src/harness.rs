@@ -1578,6 +1578,17 @@ fn sample_op(rng: &mut SplitMix64, model: &Model, next_ver: &mut i64, hostile: b
     }
 }
 
+/// One full optimize run, whose failed table is the run's failure to the
+/// oracles: an op must finish every table it considers.
+pub(crate) async fn optimize_to_completion(db: &Session) -> OmniResult<()> {
+    let report = Box::pin(db.optimize_as(None, omnigraph::db::OptimizeRequest::default())).await?;
+    match report.tables.into_iter().find_map(|stat| stat.failure) {
+        Some(failure) => Err(std::sync::Arc::try_unwrap(failure)
+            .unwrap_or_else(|shared| OmniError::manifest_internal(shared.to_string()))),
+        None => Ok(()),
+    }
+}
+
 async fn exec_op(db: &Session, branch: &str, op: &Op) -> OmniResult<()> {
     match op {
         Op::InsertV { name, age, ver } => mutate_on(
@@ -1634,12 +1645,15 @@ async fn exec_op(db: &Session, branch: &str, op: &Op) -> OmniResult<()> {
         )
         .await
         .map(|_| ()),
-        Op::Optimize => Box::pin(db.optimize()).await.map(|_| ()),
+        Op::Optimize => optimize_to_completion(db).await,
         Op::Cleanup => {
-            let stats = Box::pin(db.cleanup(omnigraph::db::CleanupPolicyOptions {
-                keep_versions: Some(1),
-                older_than: None,
-            }))
+            let stats = Box::pin(db.cleanup_as(
+                omnigraph::db::CleanupPolicyOptions {
+                    keep_versions: Some(1),
+                    older_than: None,
+                },
+                None,
+            ))
             .await?;
             let deferred: BTreeMap<String, String> = stats
                 .iter()
@@ -1655,7 +1669,7 @@ async fn exec_op(db: &Session, branch: &str, op: &Op) -> OmniResult<()> {
                 .insert(db.uri().to_string(), deferred);
             Ok(())
         }
-        Op::EnsureIndices => Box::pin(db.ensure_indices()).await.map(|_| ()),
+        Op::EnsureIndices => Box::pin(db.ensure_indices_as(None)).await.map(|_| ()),
         Op::SchemaAddProperty { count } => Box::pin(db.apply_schema(&schema_with_extras(*count)))
             .await
             .map(|_| ()),
@@ -6432,7 +6446,7 @@ impl UniverseScenario<RustResources> for Scenario {
         tokio::time::resume();
         let lively = tokio::time::timeout(
             std::time::Duration::from_secs(120),
-            Box::pin(db.ensure_indices()),
+            Box::pin(db.ensure_indices_as(None)),
         )
         .await;
         tokio::time::pause();

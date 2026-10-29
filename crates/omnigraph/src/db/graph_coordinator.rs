@@ -12,8 +12,10 @@ use super::commit_graph::{
     CommitGraph, FirstParentPage, GraphCommit, HistoryCache, Lineage,
     graph_commit_from_manifest_row,
 };
+#[cfg(any(test, feature = "failpoints"))]
+use super::manifest::DatasetUpdate;
 use super::manifest::{
-    BranchRecords, CapturedManifestProbe, CommitBuffer, DatasetUpdate, ExpectedTableVersions,
+    BranchRecords, CapturedManifestProbe, CommitBuffer, ExpectedTableVersions,
     GenesisManifestAttempt, GraphHeadExpectation, HistoryRecord, HistoryReleaseBytes,
     LineageIntent, ManifestChange, ManifestCoordinator, ManifestIncarnation, ManifestInitError,
     PublishPrecondition, SchemaContractRow, UnattachedCommit, UnattachedIntent,
@@ -896,7 +898,10 @@ impl GraphCoordinator {
     /// each immutable table identity matches what the caller observed before
     /// writing; the diagnostic alias is checked as part of the expectation.
     /// Mismatches surface as `OmniError::Manifest` with
-    /// `ManifestConflictDetails::PublishedDatasetVersionMismatch`.
+    /// `ManifestConflictDetails::PublishedDatasetVersionMismatch`. It publishes
+    /// over whatever head the branch has (`PublishPrecondition::Any`), so no
+    /// production writer uses it; tests and failpoint fixtures do.
+    #[cfg(any(test, feature = "failpoints"))]
     pub(crate) async fn commit_updates_with_actor_with_expected(
         &mut self,
         updates: &[DatasetUpdate],
@@ -915,6 +920,7 @@ impl GraphCoordinator {
     /// no separate write, no `commit_graph.refresh()` to pick a parent (the
     /// publisher resolves it under the CAS). The in-memory commit cache is then
     /// updated from the intent + the resolved parent without a re-read.
+    #[cfg(any(test, feature = "failpoints"))]
     async fn commit_changes_with_actor_with_expected(
         &mut self,
         changes: &[ManifestChange],
@@ -1104,6 +1110,7 @@ pub(crate) fn commit_not_found(snapshot_id: &SnapshotId) -> OmniError {
 }
 
 /// Wrap each `DatasetUpdate` as a `ManifestChange::Update` for the publisher.
+#[cfg(any(test, feature = "failpoints"))]
 fn updates_to_changes(updates: &[DatasetUpdate]) -> Vec<ManifestChange> {
     updates
         .iter()

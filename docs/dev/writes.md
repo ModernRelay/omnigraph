@@ -266,6 +266,41 @@ unpublished staging the collector reclaims once it is dead. A strict mutation
 prepared before Optimize's publication reports the same read-set conflict as
 it would after any other writer.
 
+A run with `max_gate_hold` defers every table whose turn comes after the
+deadline, measured from gate acquisition, and publishes the tables it finished
+(`run_table_pipeline`). A table whose own planning or staging fails with
+definite evidence is reported `failed` and the others still publish; a
+failure whose evidence stays uncertain fails the run. A cancellation
+(`OptimizeRequest::with_cancellation`) is checked before every table's plan
+and rewrite and before the publication: it drops the tables in progress,
+defers every table as `cancelled` and publishes nothing; one that arrives
+after the last check lets the run finish and skips only the artifact scan.
+Per-table ceilings (`TableCeilings`) are measured from the table's compaction
+plan before its first write, fragments first, and only when set: rows from
+fragment metadata, bytes from recorded data-file sizes or a HEAD resolved by
+the collector's base rule (`collector::data_file_location`,
+`deletion_file_location`; Lance 13 records no deletion-file size), managed Blob
+bytes from the descriptor scan compaction sizing uses, and the table's rows
+when an index would be rebuilt or built. A table over one, or one whose size
+cannot be read, is `deferred(resource_limit)` with nothing written. The run
+byte budget (`run_source_bytes`, also the default table byte ceiling) defers
+the first table that would pass it, and every later one, as `byte_budget`.
+With `artifact_bytes`, the adjacency artifact is bounded twice: before the
+edge scan by a lower bound (`persist::fixed_bytes` at the shortest header plus
+8 bytes per live edge row), and during it by `GraphIndex::build_counted`, which
+reads one batch at a time, adds each batch's growth of the object to
+`persist::ArtifactCount` (from the widest header), and stops before keeping
+another batch or allocating the adjacency arrays. Either stop is
+`skipped(size_limit)` and writes nothing. The artifact write runs in a spawned
+task the run awaits, so a dropped run cannot drop an issued write on the
+mutable key. A caller's before-publish hook
+(`OptimizeRequest::with_before_publish`) belongs to the shared publication
+helper, `table_ops::commit_updates_on_branch_with_expected`: it runs once,
+after the updates are prepared and before the coordinator lock and the
+publisher's first attempt, with the lineage intent's nonce and the captured
+head. Its failure publishes nothing and is `Unpublished`. The helper's other
+callers pass no hook.
+
 The index writer (`ensure_indices`, which `omnigraph index build` runs on any
 branch, and the explicit full-text rebuild) follows the same protocol: it
 opens each productive table at its pin, stages the complete BTREE/FTS/vector
@@ -558,7 +593,7 @@ carried stored external reference the policy refuses fails as
 | Retryable authority movement before effects on a replay-safe adapter | Discard the complete attempt and reprepare boundedly |
 | Strict read-set movement | `ReadSetChanged` |
 | Exact duplicate on strict insert | `KeyConflict` |
-| Mutation, load, Blob write or merge fails before publication, after detached effects | Typed error; no graph movement; the detached staging is unpublished and the collector reclaims it once its recorded authority is gone. The table store marks an opaque error (storage, I/O, internal) of a staged write or a detached commit `CompletionEvidence::Unpublished` at the source, and the mutation, load, Blob and merge writers mark the steps between, so a server does not treat that logical error as uncertain; native storage settlement is checked independently, and a typed refusal keeps its shape |
+| Mutation, load, Blob write, merge or optimize fails before publication, after detached effects | Typed error; no graph movement; the detached staging is unpublished and the collector reclaims it once its recorded authority is gone. The table store marks an opaque error (storage, I/O, internal) of a staged write or a detached commit `CompletionEvidence::Unpublished` at the source, and the mutation, load, Blob, merge and optimize writers mark the steps between (an optimize table's own failure, `BeforeEffect` in planning and `Unpublished` in staging, fails only that table), so a server does not treat that logical error as uncertain; native storage settlement is checked independently, and a typed refusal keeps its shape |
 | A manifest request no re-issue settles | The write is reported in doubt and nothing records it. The version is created only if absent, so the request lands before the branch's next publication or never: that publication either loads it as the head and builds on it, or takes the version first, after which the late request fails its precondition (a race between the two is the ordinary version-CAS retry). The attempt's detached effects stay unreachable unless it lands, and the collector keeps them while their recorded publication authority is current |
 | The publisher fails | Every publisher failure carries its evidence. Its reads, preparation and history archiving, and a manifest request that was never sent (a failed transaction-file put precedes it) or that the store refused outright, are `Unpublished`. A manifest request with an ambiguous answer is re-issued unchanged by the dataset's commit handler until the store answers it; Lance reads a held version back by its transaction. Lance deletes the attempt's transaction file only on a missing version the commit's own request record calls definitive, so a request that may still land keeps the file its manifest would name. A version that may hold the commit after that is read back, and only an outcome the read-back cannot settle is reported in doubt |
 | Schema apply or the system-column upgrade reports an error after proven publication | `RecoveryRequired` can name the committed outcome; its tables and contract are durable, and refresh/reopen rebuilds only the in-memory view |
@@ -586,6 +621,15 @@ gate in the engine. The trusted server resolves the actor; direct embedded
 callers must pass one when a policy checker is installed. Actor attribution
 travels with the pre-minted graph lineage and is published with the same
 manifest CAS.
+
+Maintenance has no actor-less public form. `optimize_as`, `ensure_indices_as`,
+`ensure_indices_on_as` and `rebuild_full_text_indices_on_as` check `maintain`
+on the branch they maintain, `main` for optimize; the full-text rebuild also
+admits `change`, its grant before `maintain` existed (`Omnigraph::enforce_any`,
+`PolicyChecker::check_any`). `cleanup_as` checks `reclaim` with no branch, and
+the read-only `repair_report_as` checks `maintain` on `main`.
+`forbidden_apis.rs::maintenance_entry_points_take_an_actor` keeps every
+registered maintenance surface an `_as` form with an `actor` parameter.
 
 Bearer authentication (`401 unauthorized`), the HTTP contract check
 (`400 api_contract_mismatch`) and policy (`403 forbidden`) refuse a served

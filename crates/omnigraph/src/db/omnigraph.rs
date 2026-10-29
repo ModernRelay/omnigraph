@@ -50,12 +50,16 @@ pub use export::{EXPORT_CHUNK_MAX_BYTES, ExportCut};
 pub(crate) use export::{
     LogicalBlobValue, RangedExternalBlobs, logical_row_image, row_blob_values,
 };
-pub use optimize::{CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, SkipReason};
+pub use optimize::{
+    ArtifactRefresh, ArtifactSkip, CleanupPolicyOptions, ConfigurationClear, DatasetCleanupStats,
+    DatasetOptimizeStats, DeferReason, OptimizeBeforePublish, OptimizeCancellation,
+    OptimizeConcurrency, OptimizeLimits, OptimizePublication, OptimizeReport, OptimizeRequest,
+    ResourceExceeded, ResourceMeasure, RunCancellation, SkipReason, TableCeilings,
+    TableOptimizeOutcome,
+};
 use prepared_create::initial_schema_ir;
 pub use prepared_create::{GraphCreateReconciliation, PreparedGraphCreate};
-pub use repair::{
-    DatasetRepairStats, RepairAction, RepairClassification, RepairOptions, RepairStats,
-};
+pub use repair::{DatasetRepairStats, RepairAction, RepairClassification, RepairStats};
 pub use schema_apply::{
     PreparedSchemaApply, PreparedSchemaSettlement, SchemaApplyReconciliation,
     SchemaApplySettlement, SchemaContractDigest, SchemaNonPublicationProof,
@@ -1134,6 +1138,19 @@ impl Omnigraph {
         scope: &omnigraph_policy::ResourceScope,
         actor: Option<&str>,
     ) -> Result<()> {
+        self.enforce_any(&[action], scope, actor)
+    }
+
+    /// [`Self::enforce`] for an operation that any one of `actions` admits on
+    /// `scope`, decided by [`omnigraph_policy::PolicyChecker::check_any`]: the
+    /// first allowed action admits it, an evaluation failure refuses it, and a
+    /// refusal names every denied action.
+    pub(crate) fn enforce_any(
+        &self,
+        actions: &[omnigraph_policy::PolicyAction],
+        scope: &omnigraph_policy::ResourceScope,
+        actor: Option<&str>,
+    ) -> Result<()> {
         let (branch, target_branch) = scope.to_branch_pair();
         for name in [branch, target_branch].into_iter().flatten() {
             ensure_canonical_branch_name(name)?;
@@ -1150,7 +1167,7 @@ impl Omnigraph {
             ));
         };
         checker
-            .check(action, scope, actor)
+            .check_any(actions, scope, actor)
             .map_err(|err| OmniError::Policy(err.to_string()))
     }
 
@@ -1462,6 +1479,12 @@ impl Omnigraph {
     /// Engine-level access to the object-store adapter (S3 / local fs).
     pub(crate) fn storage_adapter(&self) -> &dyn crate::storage::StorageAdapter {
         self.storage.as_ref()
+    }
+
+    /// A shared handle on the storage adapter, for work that must outlive the
+    /// call that starts it.
+    pub(crate) fn storage_adapter_handle(&self) -> Arc<dyn crate::storage::StorageAdapter> {
+        Arc::clone(&self.storage)
     }
 
     /// Root-scoped writer queues (schema, branch, and `(table, branch)` gates).
@@ -3514,15 +3537,10 @@ impl Omnigraph {
         table_ops::graph_index_for_resolved(self, resolved, edge_types, system_columns).await
     }
 
-    /// [`Self::ensure_indices_on`] on this handle's current branch.
-    pub async fn ensure_indices(&self) -> Result<Vec<PendingIndex>> {
-        Ok(table_ops::ensure_indices(self).await?.pending)
-    }
-
-    /// [`Self::ensure_indices_on_as`] with no actor, returning only what it
-    /// left pending. With a policy installed, use the actor-aware counterpart.
-    pub async fn ensure_indices_on(&self, branch: &str) -> Result<Vec<PendingIndex>> {
-        Ok(self.ensure_indices_on_as(branch, None).await?.pending)
+    /// [`Self::ensure_indices_on_as`] on this handle's current branch,
+    /// returning only what it left pending.
+    pub async fn ensure_indices_as(&self, actor: Option<&str>) -> Result<Vec<PendingIndex>> {
+        Ok(table_ops::ensure_indices_as(self, actor).await?.pending)
     }
 
     /// Bring the selected branch's declared indexes up to its rows: build
@@ -3534,7 +3552,7 @@ impl Omnigraph {
     /// keep their indexes. Idempotent: a branch with nothing to do publishes
     /// nothing.
     ///
-    /// Requires `Change` on the selected branch before any effect and
+    /// Requires `maintain` on the selected branch before any effect and
     /// records the actor in the publication. Plans from one graph-manifest
     /// and schema token and builds the artifacts before taking the schema →
     /// branch → sorted table gates, then revalidates that authority under
@@ -3560,19 +3578,13 @@ impl Omnigraph {
     /// Rebuilt full-text indexes use the engine's default analyzer, including
     /// indexes originally created externally with custom tokenizer settings.
     ///
-    /// Unlike [`Self::ensure_indices_on`], this replaces existing FTS indexes
-    /// even when their row coverage is complete. It establishes the supported
-    /// analyzer generation after an upgrade; it does not rewrite old history.
-    /// With a policy installed, use the actor-aware counterpart.
-    pub async fn rebuild_full_text_indices_on(
-        &self,
-        branch: &str,
-    ) -> Result<FullTextIndexRebuildResult> {
-        self.rebuild_full_text_indices_on_as(branch, None).await
-    }
-
-    /// Actor-aware full-text rebuilding. Requires `Change` on the selected
-    /// branch before any effects and records the actor in the graph publication.
+    /// Unlike [`Self::ensure_indices_on_as`], this replaces existing FTS
+    /// indexes even when their row coverage is complete. It establishes the
+    /// supported analyzer generation after an upgrade; it does not rewrite old
+    /// history.
+    ///
+    /// Requires `maintain` or `change` on the selected branch before any
+    /// effect and records the actor in the graph publication.
     pub async fn rebuild_full_text_indices_on_as(
         &self,
         branch: &str,
@@ -3598,27 +3610,36 @@ impl Omnigraph {
         .await
     }
 
-    /// Compact small Lance fragments into fewer larger ones across every
-    /// backing dataset for a node or edge type on `main`. See [`optimize`] for details.
-    pub async fn optimize(&self) -> Result<Vec<optimize::DatasetOptimizeStats>> {
-        optimize::optimize_all_datasets(self).await
+    /// Compact small Lance fragments into fewer larger ones across the
+    /// backing datasets `request` selects on `main`, and catch up their
+    /// indexes. See [`optimize`] for details. Requires `maintain` on `main`
+    /// before any effect and records `actor` in the publication.
+    pub async fn optimize_as(
+        &self,
+        actor: Option<&str>,
+        request: optimize::OptimizeRequest,
+    ) -> Result<optimize::OptimizeReport> {
+        optimize::optimize_all_datasets(self, actor, request).await
     }
 
-    /// Classify and explicitly repair uncovered graph-manifest/Lance-HEAD drift. See
-    /// [`repair`] for the distinction between safe maintenance drift and
-    /// suspicious/unverifiable drift.
-    pub async fn repair(&self, options: repair::RepairOptions) -> Result<repair::RepairStats> {
-        repair::repair_all_datasets(self, options).await
+    /// Report, per table on `main`, how its Lance linear history stands
+    /// against its registration. See [`repair`] for the classifications. The
+    /// report publishes nothing and adopts no drift. Requires `maintain` on
+    /// `main`.
+    pub async fn repair_report_as(&self, actor: Option<&str>) -> Result<repair::RepairStats> {
+        repair::repair_report(self, actor).await
     }
 
     /// Remove Lance manifests (and the fragments they uniquely own) per the
     /// given [`optimize::CleanupPolicyOptions`]. Destructive to version
-    /// history. See [`optimize`] for details.
-    pub async fn cleanup(
+    /// history. See [`optimize`] for details. Requires `reclaim` before any
+    /// effect; a run covers every branch, so the check names none.
+    pub async fn cleanup_as(
         &self,
         options: optimize::CleanupPolicyOptions,
+        actor: Option<&str>,
     ) -> Result<Vec<optimize::DatasetCleanupStats>> {
-        optimize::cleanup_all_datasets(self, options).await
+        optimize::cleanup_all_datasets(self, options, actor).await
     }
 
     /// The tracing collector's plan for `options`, deleting nothing and taking
@@ -4731,6 +4752,7 @@ impl Omnigraph {
             txn,
             lineage_intent,
             publication,
+            None,
         )
         .await
     }
@@ -6200,7 +6222,7 @@ edge WorksAt: Person -> Company
         );
 
         // The reconciler materializes it (Person has a row).
-        db.ensure_indices().await.unwrap();
+        db.ensure_indices_as(None).await.unwrap();
         let snapshot = db.snapshot().await;
         let ds = db
             .storage()
@@ -6232,7 +6254,7 @@ edge WorksAt: Person -> Company
         db.apply_schema(&desired).await.unwrap();
 
         // After the rewrite the reconciler restores index coverage.
-        db.ensure_indices().await.unwrap();
+        db.ensure_indices_as(None).await.unwrap();
         let snapshot = db.snapshot().await;
         let ds = db
             .storage()
