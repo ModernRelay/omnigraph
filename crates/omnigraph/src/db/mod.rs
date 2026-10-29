@@ -25,12 +25,12 @@ pub use omnigraph::{
     OptimizeBeforePublish, OptimizeCancellation, OptimizeConcurrency, OptimizeLimits,
     OptimizePublication, OptimizeReport, OptimizeRequest, PendingIndex, PreparedGraphCreate,
     PreparedSchemaApply, PreparedSchemaSettlement, ReadCheck, RebuiltFullTextIndex, RepairAction,
-    RepairClassification, RepairStats, RetainedManifestVersions, RunCancellation,
-    SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyReconciliation, SchemaApplyResult, SchemaApplySettlement,
-    SchemaContractDigest, SchemaNonPublicationProof, SkipReason, StagingVerdict,
-    SystemColumnUpgradeFinding, SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome,
-    SystemColumnUpgradeReport, TableCollectionPlan, TableOptimizeOutcome, UnattachedTagRecord,
-    UnpublishedManifest, unattached_release_order,
+    RepairClassification, RepairStats, ResourceExceeded, ResourceMeasure, RetainedManifestVersions,
+    RunCancellation, SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyReconciliation, SchemaApplyResult,
+    SchemaApplySettlement, SchemaContractDigest, SchemaNonPublicationProof, SkipReason,
+    StagingVerdict, SystemColumnUpgradeFinding, SystemColumnUpgradeOptions,
+    SystemColumnUpgradeOutcome, SystemColumnUpgradeReport, TableCeilings, TableCollectionPlan,
+    TableOptimizeOutcome, UnattachedTagRecord, UnpublishedManifest, unattached_release_order,
 };
 pub(crate) use omnigraph::{
     LogicalBlobValue, RangedExternalBlobs, logical_row_image, row_blob_values,

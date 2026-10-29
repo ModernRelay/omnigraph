@@ -274,7 +274,17 @@ failure whose evidence stays uncertain fails the run. A cancellation
 (`OptimizeRequest::with_cancellation`) is checked before every table's plan
 and rewrite and before the publication: it drops the tables in progress,
 defers every table as `cancelled` and publishes nothing; one that arrives
-after the last check lets the run finish and skips only the artifact scan. A caller's before-publish hook
+after the last check lets the run finish and skips only the artifact scan.
+Per-table ceilings (`TableCeilings`) are measured from the table's compaction
+plan before its first write, fragments first, and only when set: rows from
+fragment metadata, bytes from recorded data-file sizes or a HEAD resolved by
+the collector's base rule (`collector::data_file_location`,
+`deletion_file_location`; Lance 13 records no deletion-file size), managed Blob
+bytes from the descriptor scan compaction sizing uses, and the table's rows
+when an index would be rebuilt or built. A table over one, or one whose size
+cannot be read, is `deferred(resource_limit)` with nothing written. The run
+byte budget (`run_source_bytes`, also the default table byte ceiling) defers
+the first table that would pass it, and every later one, as `byte_budget`. A caller's before-publish hook
 (`OptimizeRequest::with_before_publish`) belongs to the shared publication
 helper, `table_ops::commit_updates_on_branch_with_expected`: it runs once,
 after the updates are prepared and before the coordinator lock and the

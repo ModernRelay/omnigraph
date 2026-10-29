@@ -140,6 +140,54 @@ pub enum DeferReason {
     GateHoldLimit,
     /// The run was cancelled before this table's work could land.
     Cancelled,
+    /// The table's plan passed a per-table ceiling, measured before its first
+    /// write; nothing was written for it, and later tables still run.
+    ResourceLimit(ResourceExceeded),
+    /// The table's source bytes would pass the run's remaining byte budget.
+    /// This table and every later one wait for a later run, which
+    /// [`OptimizeReport::resume_at`] starts at.
+    ByteBudget,
+}
+
+/// What a per-table ceiling measures, all from the table's plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResourceMeasure {
+    /// The fragments the compaction plan rewrites.
+    SourceFragments,
+    /// Their rows.
+    SourceRows,
+    /// The bytes of their data, overlay and deletion files.
+    SourceBytes,
+    /// Their managed Blob payload, from descriptors; external references
+    /// count nothing.
+    BlobBytes,
+    /// The table's rows, when the run would rebuild or build an index over it.
+    IndexRows,
+}
+
+impl ResourceMeasure {
+    /// Stable machine-readable token for serialized output. Once emitted this
+    /// is part of the output contract — keep it stable.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ResourceMeasure::SourceFragments => "source_fragments",
+            ResourceMeasure::SourceRows => "source_rows",
+            ResourceMeasure::SourceBytes => "source_bytes",
+            ResourceMeasure::BlobBytes => "blob_bytes",
+            ResourceMeasure::IndexRows => "index_rows",
+        }
+    }
+}
+
+/// A table's plan against one ceiling. `measured` is `None` when the size
+/// could not be measured; otherwise counting stopped once it passed the
+/// ceiling, so it is a lower bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceExceeded {
+    pub measure: ResourceMeasure,
+    pub measured: Option<u64>,
+    pub ceiling: u64,
 }
 
 impl DeferReason {
@@ -149,6 +197,8 @@ impl DeferReason {
         match self {
             DeferReason::GateHoldLimit => "gate_hold_limit",
             DeferReason::Cancelled => "cancelled",
+            DeferReason::ResourceLimit(_) => "resource_limit",
+            DeferReason::ByteBudget => "byte_budget",
         }
     }
 }
@@ -158,6 +208,25 @@ impl std::fmt::Display for DeferReason {
         f.write_str(match self {
             DeferReason::GateHoldLimit => "the run reached its writer-gate hold limit",
             DeferReason::Cancelled => "the run was cancelled",
+            DeferReason::ResourceLimit(ResourceExceeded {
+                measure,
+                measured: Some(measured),
+                ceiling,
+            }) => {
+                return write!(
+                    f,
+                    "{} of at least {measured} pass the table ceiling of {ceiling}",
+                    measure.as_str()
+                );
+            }
+            DeferReason::ResourceLimit(ResourceExceeded {
+                measure,
+                measured: None,
+                ..
+            }) => {
+                return write!(f, "{} could not be measured", measure.as_str());
+            }
+            DeferReason::ByteBudget => "the run's byte budget is spent",
         })
     }
 }
@@ -186,6 +255,9 @@ pub struct DatasetOptimizeStats {
     /// The error of a [`TableOptimizeOutcome::Failed`] table, carrying its
     /// completion evidence (`BeforeEffect` or `Unpublished`).
     pub failure: Option<Arc<OmniError>>,
+    /// The plan's source bytes, when a byte ceiling or the run's byte budget
+    /// measured them; what the table spent of the budget.
+    pub source_bytes: Option<u64>,
 }
 
 impl DatasetOptimizeStats {
@@ -202,6 +274,7 @@ impl DatasetOptimizeStats {
             pending_indexes: Vec::new(),
             duration: Duration::ZERO,
             failure: None,
+            source_bytes: None,
         }
     }
 
@@ -214,6 +287,7 @@ impl DatasetOptimizeStats {
             pending_indexes: Vec::new(),
             duration: Duration::ZERO,
             failure: None,
+            source_bytes: None,
         }
     }
 
@@ -226,6 +300,7 @@ impl DatasetOptimizeStats {
             pending_indexes: Vec::new(),
             duration,
             failure: Some(failure),
+            source_bytes: None,
         }
     }
 
@@ -460,11 +535,71 @@ pub struct OptimizeLimits {
     /// writer wait is at most this, plus that table, the publication and the
     /// configuration clear.
     pub max_gate_hold: Option<Duration>,
+    /// Ceilings on one table's plan, checked before its first write.
+    pub table: TableCeilings,
+    /// Total source bytes across the tables the run starts. It is also the
+    /// table byte ceiling when that is unset, and refuses a larger one, so a
+    /// first table within its ceilings always fits.
+    pub run_source_bytes: Option<u64>,
 }
 
 impl OptimizeLimits {
     pub fn with_max_gate_hold(mut self, hold: Duration) -> Self {
         self.max_gate_hold = Some(hold);
+        self
+    }
+
+    pub fn with_table_ceilings(mut self, ceilings: TableCeilings) -> Self {
+        self.table = ceilings;
+        self
+    }
+
+    pub fn with_run_source_bytes(mut self, budget: u64) -> Self {
+        self.run_source_bytes = Some(budget);
+        self
+    }
+
+    /// The table byte ceiling in force: the explicit one, else the budget.
+    fn table_source_bytes(&self) -> Option<u64> {
+        self.table.source_bytes.or(self.run_source_bytes)
+    }
+}
+
+/// Ceilings on one table's plan; an absent one is not measured. A table over
+/// any of them is `deferred(resource_limit)` and nothing is written for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TableCeilings {
+    pub source_fragments: Option<u64>,
+    pub source_rows: Option<u64>,
+    pub source_bytes: Option<u64>,
+    pub blob_bytes: Option<u64>,
+    pub index_rows: Option<u64>,
+}
+
+impl TableCeilings {
+    pub fn with_source_fragments(mut self, ceiling: u64) -> Self {
+        self.source_fragments = Some(ceiling);
+        self
+    }
+
+    pub fn with_source_rows(mut self, ceiling: u64) -> Self {
+        self.source_rows = Some(ceiling);
+        self
+    }
+
+    pub fn with_source_bytes(mut self, ceiling: u64) -> Self {
+        self.source_bytes = Some(ceiling);
+        self
+    }
+
+    pub fn with_blob_bytes(mut self, ceiling: u64) -> Self {
+        self.blob_bytes = Some(ceiling);
+        self
+    }
+
+    pub fn with_index_rows(mut self, ceiling: u64) -> Self {
+        self.index_rows = Some(ceiling);
         self
     }
 }
@@ -575,6 +710,14 @@ impl OptimizeRequest {
                 "optimize concurrency must be at least 1 for planning and rewriting",
             ));
         }
+        if let (Some(table), Some(budget)) =
+            (self.limits.table.source_bytes, self.limits.run_source_bytes)
+            && table > budget
+        {
+            return Err(OmniError::manifest(format!(
+                "optimize table byte ceiling {table} exceeds the run byte budget {budget}"
+            )));
+        }
         let Some(tables) = &self.tables else {
             let start = self
                 .start_at
@@ -647,6 +790,9 @@ struct PreparedOptimizeTable {
     initial_snapshot: crate::storage_layer::SnapshotHandle,
     witness: crate::table_store::StagingWitness,
     last_linear_version: Option<u64>,
+    /// The plan's source bytes, measured when a byte ceiling or the run's
+    /// byte budget is set.
+    source_bytes: Option<u64>,
 }
 
 enum OptimizePreparation {
@@ -766,6 +912,7 @@ pub async fn optimize_all_datasets(
         table_tasks,
         concurrency,
         deadline,
+        request.limits,
         cancellation,
     )
     .await?;
@@ -895,9 +1042,9 @@ struct VisitedTables {
 /// Why the pipeline stopped starting tables.
 #[derive(Clone, Copy)]
 enum PipelineStop {
-    /// The gate hold reached its deadline at this table's turn; rewrites
-    /// already started finish.
-    GateHold(usize),
+    /// A run-wide bound (the gate hold or the byte budget) stopped the run at
+    /// this table's turn; rewrites already started finish.
+    Bound(usize, DeferReason),
     /// A cancellation: every table in progress is dropped where it stands.
     Cancelled,
 }
@@ -920,6 +1067,7 @@ async fn run_table_pipeline(
     tasks: Vec<OptimizeTableTask>,
     concurrency: OptimizeConcurrency,
     deadline: Option<Instant>,
+    limits: OptimizeLimits,
     cancellation: Option<&OptimizeCancellation>,
 ) -> Result<VisitedTables> {
     let keys = tasks
@@ -932,7 +1080,7 @@ async fn run_table_pipeline(
         let catalog = std::sync::Arc::clone(catalog);
         async move {
             let started = Instant::now();
-            let result = prepare_optimize_table(db, catalog.as_ref(), task).await;
+            let result = prepare_optimize_table(db, catalog.as_ref(), task, &limits).await;
             (index, started, result)
         }
     };
@@ -949,6 +1097,7 @@ async fn run_table_pipeline(
     let mut ready: VecDeque<PlannedTable> = VecDeque::new();
     let mut staging = FuturesUnordered::new();
     let mut turns = 0usize;
+    let mut spent = 0_u64;
     let mut stop = None;
     let cancel_requested = || cancellation.is_some_and(OptimizeCancellation::is_cancelled);
 
@@ -973,7 +1122,16 @@ async fn run_table_pipeline(
                     break;
                 }
                 if turns > 0 && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    stop = Some(PipelineStop::GateHold(index));
+                    stop = Some(PipelineStop::Bound(index, DeferReason::GateHoldLimit));
+                    break;
+                }
+                // A table's bytes never pass the budget alone, so the first
+                // table with work always fits.
+                if let (Some(budget), Ok(OptimizePreparation::Work(work))) =
+                    (limits.run_source_bytes, &result)
+                    && spent.saturating_add(work.source_bytes.unwrap_or(0)) > budget
+                {
+                    stop = Some(PipelineStop::Bound(index, DeferReason::ByteBudget));
                     break;
                 }
                 turns += 1;
@@ -983,6 +1141,7 @@ async fn run_table_pipeline(
                         visited[index] = Some((stat, None));
                     }
                     Ok(OptimizePreparation::Work(work)) => {
+                        spent = spent.saturating_add(work.source_bytes.unwrap_or(0));
                         staging.push(stage(index, started, work));
                     }
                     // Planning only reads.
@@ -1000,7 +1159,7 @@ async fn run_table_pipeline(
                 }
             }
             match stop {
-                Some(PipelineStop::GateHold(_)) => {
+                Some(PipelineStop::Bound(..)) => {
                     planning.clear();
                     ready.clear();
                 }
@@ -1044,7 +1203,7 @@ async fn run_table_pipeline(
                 ready.push_back(planned);
             }
             () = tokio::time::sleep_until(timer.unwrap_or_else(Instant::now)), if timer.is_some() => {
-                stop = Some(PipelineStop::GateHold(turns));
+                stop = Some(PipelineStop::Bound(turns, DeferReason::GateHoldLimit));
                 planning.clear();
                 ready.clear();
             }
@@ -1062,9 +1221,7 @@ async fn run_table_pipeline(
     }
 
     let (resume_at, unvisited) = match stop {
-        Some(PipelineStop::GateHold(index)) => {
-            (Some(keys[index].clone()), DeferReason::GateHoldLimit)
-        }
+        Some(PipelineStop::Bound(index, reason)) => (Some(keys[index].clone()), reason),
         Some(PipelineStop::Cancelled) => (None, DeferReason::Cancelled),
         None => (None, DeferReason::GateHoldLimit),
     };
@@ -1178,6 +1335,7 @@ async fn prepare_optimize_table(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
     task: OptimizeTableTask,
+    limits: &OptimizeLimits,
 ) -> Result<OptimizePreparation> {
     let snapshot = db
         .open_pinned_for_write(&task.full_path, &task.entry)
@@ -1187,10 +1345,8 @@ async fn prepare_optimize_table(
     // dropped property's values is compaction work even when Lance's planner
     // would leave the table alone.
     let options = CompactionOptions::default();
-    let will_compact = TableStore::plan_table_compaction(snapshot.dataset(), &options)
-        .await?
-        .num_tasks()
-        > 0;
+    let plan = TableStore::plan_table_compaction(snapshot.dataset(), &options).await?;
+    let will_compact = plan.num_tasks() > 0;
     let needs_reindex = TableStore::has_foldable_unindexed_fragments(snapshot.dataset()).await?;
     let index_work = super::table_ops::index_work_status_on_dataset_for_catalog(
         db,
@@ -1214,6 +1370,22 @@ async fn prepare_optimize_table(
         return Ok(OptimizePreparation::Stat(stat));
     }
 
+    let source = plan
+        .tasks
+        .iter()
+        .flat_map(|task| task.fragments.iter().cloned())
+        .collect::<Vec<_>>();
+    let index_work = needs_reindex || index_work.needs_commit;
+    let source_bytes = match measure_plan(snapshot.dataset(), &source, index_work, limits).await? {
+        Ok(source_bytes) => source_bytes,
+        Err(exceeded) => {
+            return Ok(OptimizePreparation::Stat(DatasetOptimizeStats::deferred(
+                task.table_key,
+                DeferReason::ResourceLimit(exceeded),
+            )));
+        }
+    };
+
     Ok(OptimizePreparation::Work(PreparedOptimizeTable {
         identity: task.identity,
         table_key: task.table_key,
@@ -1222,7 +1394,121 @@ async fn prepare_optimize_table(
         initial_snapshot: snapshot,
         witness: task.witness,
         last_linear_version: task.entry.version_metadata.last_linear_version(),
+        source_bytes,
     }))
+}
+
+/// Measure a table's plan against its ceilings, in order, and stop at the
+/// first one it passes; the fragment count comes first, so it bounds the size
+/// requests. Only a set ceiling is measured. On success, the source bytes when
+/// a byte ceiling or the run's byte budget needs them.
+async fn measure_plan(
+    ds: &lance::Dataset,
+    source: &[lance_table::format::Fragment],
+    index_work: bool,
+    limits: &OptimizeLimits,
+) -> Result<std::result::Result<Option<u64>, ResourceExceeded>> {
+    let ceilings = &limits.table;
+    let over = |measure, measured, ceiling| {
+        Ok(Err(ResourceExceeded {
+            measure,
+            measured,
+            ceiling,
+        }))
+    };
+    if let Some(ceiling) = ceilings.source_fragments
+        && source.len() as u64 > ceiling
+    {
+        return over(
+            ResourceMeasure::SourceFragments,
+            Some(source.len() as u64),
+            ceiling,
+        );
+    }
+    if let Some(ceiling) = ceilings.source_rows {
+        let mut rows = 0_u64;
+        for fragment in source {
+            let Some(physical) = fragment.physical_rows else {
+                return over(ResourceMeasure::SourceRows, None, ceiling);
+            };
+            rows = rows.saturating_add(physical as u64);
+            if rows > ceiling {
+                return over(ResourceMeasure::SourceRows, Some(rows), ceiling);
+            }
+        }
+    }
+    let mut source_bytes = None;
+    if let Some(ceiling) = limits.table_source_bytes() {
+        match source_file_bytes(ds, source, ceiling).await {
+            Some(bytes) if bytes > ceiling => {
+                return over(ResourceMeasure::SourceBytes, Some(bytes), ceiling);
+            }
+            Some(bytes) => source_bytes = Some(bytes),
+            None => return over(ResourceMeasure::SourceBytes, None, ceiling),
+        }
+    }
+    if let Some(ceiling) = ceilings.blob_bytes
+        && !source.is_empty()
+    {
+        match TableStore::managed_blob_bytes(ds, source.to_vec(), ceiling).await? {
+            Some(bytes) if bytes > ceiling => {
+                return over(ResourceMeasure::BlobBytes, Some(bytes), ceiling);
+            }
+            Some(_) => {}
+            None => return over(ResourceMeasure::BlobBytes, None, ceiling),
+        }
+    }
+    if let Some(ceiling) = ceilings.index_rows
+        && index_work
+    {
+        match ds.count_rows(None).await {
+            Ok(rows) if rows as u64 > ceiling => {
+                return over(ResourceMeasure::IndexRows, Some(rows as u64), ceiling);
+            }
+            Ok(_) => {}
+            Err(_) => return over(ResourceMeasure::IndexRows, None, ceiling),
+        }
+    }
+    Ok(Ok(source_bytes))
+}
+
+/// The bytes of `source`'s data, overlay and deletion files: a data file's
+/// recorded size, or a HEAD of the file when none is recorded, and a HEAD of
+/// each deletion file, which records no size in Lance 13. Each file resolves
+/// through the collector's base rule. Counting stops once it passes
+/// `ceiling`. `None` when a size cannot be read.
+async fn source_file_bytes(
+    ds: &lance::Dataset,
+    source: &[lance_table::format::Fragment],
+    ceiling: u64,
+) -> Option<u64> {
+    let mut total = 0_u64;
+    for fragment in source {
+        for file in fragment.referenced_lance_files() {
+            let size = match file.file_size_bytes.get() {
+                Some(size) => size.get(),
+                None => {
+                    let (store, path) =
+                        super::collector::data_file_location(ds, file).await.ok()?;
+                    store.size(&path).await.ok()?
+                }
+            };
+            total = total.saturating_add(size);
+            if total > ceiling {
+                return Some(total);
+            }
+        }
+        if let Some(deletion) = &fragment.deletion_file {
+            let (store, path) = super::collector::deletion_file_location(ds, fragment.id, deletion)
+                .await
+                .ok()?;
+            total = total.saturating_add(store.size(&path).await.ok()?);
+            if total > ceiling {
+                return Some(total);
+            }
+        }
+    }
+    Some(total)
 }
 
 decide_seam! {
@@ -1250,6 +1536,7 @@ async fn apply_optimize_table_effects(
     let full_path = work.full_path;
     let base = work.initial_snapshot;
     let witness = work.witness;
+    let source_bytes = work.source_bytes;
     let declared_full_text = super::table_ops::declared_full_text_columns(catalog, &table_key);
     fail(&OPTIMIZE_BEFORE_COMPACT)?;
     let options = CompactionOptions::default();
@@ -1321,6 +1608,7 @@ async fn apply_optimize_table_effects(
     }
     let Some(identity) = tip_identity else {
         let mut stat = DatasetOptimizeStats::planned(table_key, &metrics, false);
+        stat.source_bytes = source_bytes;
         stat.pending_indexes = index_work.pending;
         super::table_ops::append_deferred_full_text_indexes(
             &tip,
@@ -1333,6 +1621,7 @@ async fn apply_optimize_table_effects(
         return Ok(OptimizeEffectOutcome { stat, effect: None });
     };
     let mut stat = DatasetOptimizeStats::planned(table_key.clone(), &metrics, true);
+    stat.source_bytes = source_bytes;
     stat.pending_indexes = index_work.pending;
     super::table_ops::append_deferred_full_text_indexes(
         &tip,

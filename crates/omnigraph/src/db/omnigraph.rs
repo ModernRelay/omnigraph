@@ -54,7 +54,8 @@ pub use optimize::{
     ArtifactRefresh, ArtifactSkip, CleanupPolicyOptions, ConfigurationClear, DatasetCleanupStats,
     DatasetOptimizeStats, DeferReason, OptimizeBeforePublish, OptimizeCancellation,
     OptimizeConcurrency, OptimizeLimits, OptimizePublication, OptimizeReport, OptimizeRequest,
-    RunCancellation, SkipReason, TableOptimizeOutcome,
+    ResourceExceeded, ResourceMeasure, RunCancellation, SkipReason, TableCeilings,
+    TableOptimizeOutcome,
 };
 use prepared_create::initial_schema_ir;
 pub use prepared_create::{GraphCreateReconciliation, PreparedGraphCreate};

@@ -521,6 +521,42 @@ fn probe_directory(
     })
 }
 
+/// The store and path of one data or overlay file of `dataset`, under the
+/// directory Lance's base rule gives it.
+pub(crate) async fn data_file_location(
+    dataset: &lance::Dataset,
+    file: &lance_table::format::DataFile,
+) -> Result<(
+    std::sync::Arc<lance::io::ObjectStore>,
+    object_store::path::Path,
+)> {
+    let store = dataset
+        .object_store(file.base_id)
+        .await
+        .map_err(OmniError::storage)?;
+    let path = probe_directory(dataset, file.base_id, "data")?.join(file.path.as_str());
+    Ok((store, path))
+}
+
+/// The store and path of fragment `fragment_id`'s deletion file, under the
+/// dataset root or its base, which must be a dataset root.
+pub(crate) async fn deletion_file_location(
+    dataset: &lance::Dataset,
+    fragment_id: u64,
+    deletion: &lance_table::format::DeletionFile,
+) -> Result<(
+    std::sync::Arc<lance::io::ObjectStore>,
+    object_store::path::Path,
+)> {
+    let store = dataset
+        .object_store(deletion.base_id)
+        .await
+        .map_err(OmniError::storage)?;
+    let base = probe_directory(dataset, deletion.base_id, "")?;
+    let path = lance_table::io::deletion::deletion_file_path(&base, fragment_id, deletion);
+    Ok((store, path))
+}
+
 async fn capture_index_paths(
     snapshot: &mut CollectorPathSnapshot,
     dataset: &lance::Dataset,
@@ -576,20 +612,11 @@ pub(crate) async fn capture_dataset_paths(
     );
     for fragment in dataset.manifest().fragments.iter() {
         for file in fragment.referenced_lance_files() {
-            let store = dataset
-                .object_store(file.base_id)
-                .await
-                .map_err(OmniError::storage)?;
-            let path = probe_directory(dataset, file.base_id, "data")?.join(file.path.as_str());
+            let (store, path) = data_file_location(dataset, file).await?;
             snapshot.insert(location, store, path);
         }
         if let Some(deletion) = &fragment.deletion_file {
-            let store = dataset
-                .object_store(deletion.base_id)
-                .await
-                .map_err(OmniError::storage)?;
-            let base = probe_directory(dataset, deletion.base_id, "")?;
-            let path = lance_table::io::deletion::deletion_file_path(&base, fragment.id, deletion);
+            let (store, path) = deletion_file_location(dataset, fragment.id, deletion).await?;
             snapshot.insert(location, store, path);
         }
     }

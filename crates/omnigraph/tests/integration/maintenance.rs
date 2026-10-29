@@ -17,8 +17,8 @@ use lance_core::datatypes::BlobHandling;
 use omnigraph::IndexCoverage;
 use omnigraph::db::{
     ArtifactRefresh, ArtifactSkip, ConfigurationClear, DeferReason, OptimizeBeforePublish,
-    OptimizeCancellation, OptimizeLimits, OptimizePublication, OptimizeRequest, RunCancellation,
-    TableOptimizeOutcome,
+    OptimizeCancellation, OptimizeLimits, OptimizePublication, OptimizeRequest, ResourceMeasure,
+    RunCancellation, TableCeilings, TableOptimizeOutcome,
 };
 use omnigraph::db::{
     CleanupPolicyOptions, MergeOutcome, Omnigraph, ReadTarget, RepairAction, RepairClassification,
@@ -309,6 +309,11 @@ async fn optimize_table_list_runs_only_those_tables_and_refuses_bad_requests() {
             .with_start_at(keys[1].clone()),
         omnigraph::db::OptimizeRequest::default()
             .with_concurrency(omnigraph::db::OptimizeConcurrency::new(0, 1)),
+        omnigraph::db::OptimizeRequest::default().with_limits(
+            OptimizeLimits::default()
+                .with_table_ceilings(TableCeilings::default().with_source_bytes(2))
+                .with_run_source_bytes(1),
+        ),
     ] {
         let error = db.optimize_as(None, request.clone()).await.unwrap_err();
         assert_eq!(
@@ -503,6 +508,196 @@ async fn optimize_finishes_a_cancellation_that_arrives_after_its_last_check() {
         ArtifactRefresh::Skipped(ArtifactSkip::Cancelled),
         "the edge scan starts only without a cancellation"
     );
+}
+
+async fn person_pin(db: &Omnigraph) -> u64 {
+    db.snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .dataset("node:Person")
+        .unwrap()
+        .published_dataset_version
+}
+
+/// Each per-table ceiling defers a table over it with nothing written; the
+/// plan holds a deletion file, which records no size, so the byte measure
+/// reads it from storage.
+#[tokio::test]
+async fn optimize_defers_a_table_over_a_ceiling_and_writes_nothing_for_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    add_person_fragments(&db).await;
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "remove_person",
+        &helpers::params(&[("$name", "Eve")]),
+    )
+    .await
+    .unwrap();
+    let pin = person_pin(&db).await;
+
+    for (ceilings, measure) in [
+        (
+            TableCeilings::default().with_source_fragments(1),
+            ResourceMeasure::SourceFragments,
+        ),
+        (
+            TableCeilings::default().with_source_rows(1),
+            ResourceMeasure::SourceRows,
+        ),
+        (
+            TableCeilings::default().with_source_bytes(1),
+            ResourceMeasure::SourceBytes,
+        ),
+        (
+            TableCeilings::default().with_index_rows(1),
+            ResourceMeasure::IndexRows,
+        ),
+    ] {
+        let report = db
+            .optimize_as(
+                None,
+                OptimizeRequest::default()
+                    .with_limits(OptimizeLimits::default().with_table_ceilings(ceilings)),
+            )
+            .await
+            .unwrap();
+        let person = report
+            .tables
+            .iter()
+            .find(|stat| stat.type_key == "node:Person")
+            .unwrap();
+        let TableOptimizeOutcome::Deferred(DeferReason::ResourceLimit(exceeded)) = person.outcome
+        else {
+            panic!("{measure:?}: {person:?}");
+        };
+        assert_eq!(exceeded.measure, measure);
+        assert_eq!(exceeded.ceiling, 1);
+        assert!(
+            exceeded.measured.is_some_and(|measured| measured > 1),
+            "{exceeded:?}"
+        );
+        assert_eq!(
+            report.resume_at, None,
+            "a resource limit never moves the resume position"
+        );
+        assert_eq!(person_pin(&db).await, pin, "{measure:?} wrote nothing");
+    }
+
+    // Measured whole, including the deletion file's size, the plan fits.
+    let report = db
+        .optimize_as(
+            None,
+            OptimizeRequest::default()
+                .with_limits(OptimizeLimits::default().with_run_source_bytes(u64::MAX)),
+        )
+        .await
+        .unwrap();
+    let person = report
+        .tables
+        .iter()
+        .find(|stat| stat.type_key == "node:Person")
+        .unwrap();
+    assert!(person.committed(), "{person:?}");
+    assert!(
+        person.source_bytes.is_some_and(|bytes| bytes > 0),
+        "{person:?}"
+    );
+}
+
+/// The run budget stops the run at the first table that would pass it:
+/// that table and every later one are deferred, and the next run resumes
+/// there.
+#[tokio::test]
+async fn optimize_byte_budget_defers_the_tables_after_it_and_resumes_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    add_person_fragments(&db).await;
+    for name in ["Acme", "Beta", "Cygnus", "Delta"] {
+        db.load_jsonl(
+            &serde_json::json!({"type": "Company", "data": {"name": name}}).to_string(),
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    }
+
+    // Measure every table's source bytes in a run whose hook refuses to
+    // publish it.
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = std::sync::Arc::clone(&seen);
+    let probe = OptimizeBeforePublish::new(move |publication| {
+        recorded.lock().unwrap().push(publication);
+        async { Err(OmniError::manifest("measuring only")) }
+    });
+    db.optimize_as(
+        None,
+        OptimizeRequest::default()
+            .with_limits(OptimizeLimits::default().with_run_source_bytes(u64::MAX))
+            .with_before_publish(probe),
+    )
+    .await
+    .unwrap_err();
+    let measured = seen.lock().unwrap()[0]
+        .tables
+        .iter()
+        .filter_map(|stat| Some((stat.type_key.clone(), stat.source_bytes?)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        measured
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        ["node:Company", "node:Person"],
+        "{measured:?}"
+    );
+    // Each table fits alone, both together do not.
+    let budget = measured[0].1.max(measured[1].1);
+    let limits = OptimizeLimits::default().with_run_source_bytes(budget);
+
+    let report = db
+        .optimize_as(None, OptimizeRequest::default().with_limits(limits))
+        .await
+        .unwrap();
+    let outcome = |report: &omnigraph::db::OptimizeReport, key: &str| {
+        report
+            .tables
+            .iter()
+            .find(|stat| stat.type_key == key)
+            .unwrap()
+            .outcome
+    };
+    assert!(
+        matches!(
+            outcome(&report, "node:Company"),
+            TableOptimizeOutcome::Optimized
+        ),
+        "{report:?}"
+    );
+    assert_eq!(
+        outcome(&report, "node:Person"),
+        TableOptimizeOutcome::Deferred(DeferReason::ByteBudget)
+    );
+    assert_eq!(report.resume_at.as_deref(), Some("node:Person"));
+
+    let next = db
+        .optimize_as(
+            None,
+            OptimizeRequest::default()
+                .with_limits(limits)
+                .with_start_at("node:Person"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome(&next, "node:Person"),
+            TableOptimizeOutcome::Optimized
+        ),
+        "{next:?}"
+    );
+    assert_eq!(next.resume_at, None);
 }
 
 #[tokio::test]
@@ -1570,6 +1765,33 @@ async fn optimize_does_not_size_a_blob_batch_by_external_references() {
     assert!(
         matches!(external.content, omnigraph::BlobContent::External(_)),
         "test precondition: the load keeps the external reference as a descriptor"
+    );
+
+    // Nor toward the Blob ceiling: only the 3 managed bytes count.
+    let bounded = db
+        .optimize_as(
+            None,
+            omnigraph::db::OptimizeRequest::default().with_limits(
+                OptimizeLimits::default()
+                    .with_table_ceilings(TableCeilings::default().with_blob_bytes(2)),
+            ),
+        )
+        .await
+        .unwrap();
+    let doc = bounded
+        .tables
+        .iter()
+        .find(|stat| stat.type_key == "node:Doc")
+        .unwrap();
+    assert_eq!(
+        doc.outcome,
+        TableOptimizeOutcome::Deferred(DeferReason::ResourceLimit(
+            omnigraph::db::ResourceExceeded {
+                measure: ResourceMeasure::BlobBytes,
+                measured: Some(3),
+                ceiling: 2,
+            }
+        ))
     );
 
     let probes = omnigraph::instrumentation::MergeWriteProbes::default();

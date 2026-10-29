@@ -907,7 +907,7 @@ gateway_surfaces! {
         "predicted_materialized_blob_batch_bytes",
         "materialize_blob_batch_bounded_with_preflight_cache", "managed_blob_payloads",
         "can_fold_index", "has_foldable_unindexed_fragments", "index_is_vector",
-        "plan_table_compaction",
+        "plan_table_compaction", "managed_blob_bytes",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::StageOnly => [
         "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
@@ -1146,7 +1146,7 @@ durable_calls! {
     ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     // The sixth accessor reports deferred FTS coverage from an immutable
     // snapshot; it only reads index metadata and never stages or publishes.
-    ("db/omnigraph/optimize.rs", ".dataset()", 10, WriteProtocol::Composed("Optimize planning + read-only coverage and native-fork inventory + the configuration clear's read-back after a failed removal + physical cleanup, including the release of expired proposal tags and of expired unattached tags descendants first, each confirmed by a readback")),
+    ("db/omnigraph/optimize.rs", ".dataset()", 11, WriteProtocol::Composed("Optimize planning, including each plan's measure against its table ceilings, + read-only coverage and native-fork inventory + the configuration clear's read-back after a failed removal + physical cleanup, including the release of expired proposal tags and of expired unattached tags descendants first, each confirmed by a readback")),
     ("db/omnigraph/optimize.rs", ".into_dataset()", 1, WriteProtocol::PhysicalOnly),
     ("exec/merge.rs", "SnapshotHandle::new(", 4, MERGE_V9),
 }
