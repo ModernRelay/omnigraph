@@ -17,21 +17,52 @@ pub(crate) fn graph_type_subject(type_key: &str) -> String {
 
 pub(crate) fn write_optimize(
     uri: &str,
-    stats: &[omnigraph::db::DatasetOptimizeStats],
+    report: &omnigraph::db::OptimizeReport,
     json: bool,
     stdout: &mut dyn Write,
 ) -> Result<()> {
+    use omnigraph::db::{ArtifactRefresh, ConfigurationClear, TableOptimizeOutcome};
+    let stats = &report.tables;
+    let reason = |outcome: &TableOptimizeOutcome| match outcome {
+        TableOptimizeOutcome::Deferred(reason) => Some(reason.as_str()),
+        TableOptimizeOutcome::Skipped(reason) => Some(reason.as_str()),
+        _ => None,
+    };
+    let clear_error = match &report.configuration_clear {
+        ConfigurationClear::Failed(error) | ConfigurationClear::Unknown(error) => Some(error),
+        _ => None,
+    };
+    let (artifact_reason, artifact_error) = match &report.artifact {
+        ArtifactRefresh::Skipped(reason) => (Some(reason.as_str()), None),
+        ArtifactRefresh::Failed(error) => (None, Some(error)),
+        _ => (None, None),
+    };
     if json {
         let value = serde_json::json!({
             "uri": uri,
+            "input_commit": report.input_commit,
+            "graph_commit_id": report.graph_commit_id,
+            "resume_at": report.resume_at,
+            "gate_hold_ms": report.gate_hold.as_millis() as u64,
+            "configuration_clear": {
+                "outcome": report.configuration_clear.as_str(),
+                "error": clear_error,
+            },
+            "artifact": {
+                "outcome": report.artifact.as_str(),
+                "reason": artifact_reason,
+                "error": artifact_error,
+            },
             "datasets": stats.iter().map(|s| serde_json::json!({
                 "type_key": s.type_key,
+                "outcome": s.outcome.as_str(),
+                "reason": reason(&s.outcome),
                 "fragments_removed": s.fragments_removed,
                 "fragments_added": s.fragments_added,
-                "committed": s.committed,
-                "skipped": s.skipped.map(|r| r.as_str()),
-                "published_dataset_version": s.published_dataset_version,
-                "lance_head_version": s.lance_head_version,
+                "committed": s.committed(),
+                "skipped": s.skipped().map(|r| r.as_str()),
+                "duration_ms": s.duration.as_millis() as u64,
+                "error": s.failure.as_ref().map(|error| error.to_string()),
                 "pending_indexes": s.pending_indexes.iter().map(|p| serde_json::json!({
                     "property": p.property,
                     "reason": p.reason,
@@ -43,16 +74,29 @@ pub(crate) fn write_optimize(
         writeln!(stdout, "optimize {} — {} datasets", uri, stats.len())?;
         for s in stats {
             let subject = graph_type_subject(&s.type_key);
-            if let Some(reason) = s.skipped {
-                writeln!(stdout, "  {subject:<40} skipped ({reason})")?;
-            } else if s.committed {
-                writeln!(
-                    stdout,
-                    "  {:<40} frags {} → {} ✓",
-                    subject, s.fragments_removed, s.fragments_added
-                )?;
-            } else {
-                writeln!(stdout, "  {subject:<40} no-op")?;
+            match s.outcome {
+                TableOptimizeOutcome::Skipped(reason) => {
+                    writeln!(stdout, "  {subject:<40} skipped ({reason})")?;
+                }
+                TableOptimizeOutcome::Deferred(reason) => {
+                    writeln!(stdout, "  {subject:<40} deferred ({reason})")?;
+                }
+                TableOptimizeOutcome::Optimized => {
+                    writeln!(
+                        stdout,
+                        "  {:<40} frags {} → {} ✓",
+                        subject, s.fragments_removed, s.fragments_added
+                    )?;
+                }
+                TableOptimizeOutcome::Failed => {
+                    let error = s.failure.as_ref().map(|error| error.to_string());
+                    let first = error
+                        .as_deref()
+                        .and_then(|error| error.lines().next())
+                        .unwrap_or("unknown error");
+                    writeln!(stdout, "  {subject:<40} failed ({first})")?;
+                }
+                _ => writeln!(stdout, "  {subject:<40} no-op")?,
             }
             for p in &s.pending_indexes {
                 writeln!(
@@ -61,6 +105,28 @@ pub(crate) fn write_optimize(
                     p.property, p.reason
                 )?;
             }
+        }
+        if let Some(commit) = &report.graph_commit_id {
+            writeln!(stdout, "graph commit: {commit}")?;
+        }
+        if let Some(key) = &report.resume_at {
+            writeln!(stdout, "resume at: {}", graph_type_subject(key))?;
+        }
+        match clear_error {
+            Some(error) => writeln!(
+                stdout,
+                "configuration clear: {} ({error})",
+                report.configuration_clear.as_str()
+            )?,
+            None if report.configuration_clear == ConfigurationClear::Cleared => {
+                writeln!(stdout, "configuration clear: cleared")?
+            }
+            None => {}
+        }
+        match (&report.artifact, artifact_error) {
+            (_, Some(error)) => writeln!(stdout, "adjacency artifact: failed ({error})")?,
+            (ArtifactRefresh::Refreshed, _) => writeln!(stdout, "adjacency artifact: refreshed")?,
+            _ => {}
         }
     }
     Ok(())
@@ -199,7 +265,6 @@ pub(crate) fn write_repair(
     if json {
         let value = serde_json::json!({
             "uri": uri,
-            "graph_manifest_version": stats.graph_manifest_version,
             "datasets": stats.datasets.iter().map(|s| serde_json::json!({
                 "type_key": s.type_key,
                 "published_dataset_version": s.published_dataset_version,
@@ -1933,7 +1998,8 @@ mod tests {
     #[tokio::test]
     async fn maintenance_optimize_and_repair_reports_preserve_all_result_fields() {
         use omnigraph::db::{
-            Omnigraph, PendingIndex, RepairAction, RepairClassification, RepairOptions, SkipReason,
+            ArtifactRefresh, ArtifactSkip, ConfigurationClear, DeferReason, Omnigraph,
+            PendingIndex, RepairAction, RepairClassification, SkipReason, TableOptimizeOutcome,
         };
         // These engine result types are non_exhaustive. Obtain one valid value
         // from a tiny graph, then set its public presentation fields; no engine
@@ -1947,14 +2013,16 @@ mod tests {
         let db = Omnigraph::init(&uri, "node Person {\n    slug: String @key\n}\n")
             .await
             .unwrap();
-        let mut compacted = db.optimize().await.unwrap().pop().unwrap();
+        let mut report = db
+            .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+            .unwrap();
+        let mut compacted = report.tables.pop().unwrap();
         compacted.type_key = "node:Person".into();
         compacted.fragments_removed = 3;
         compacted.fragments_added = 1;
-        compacted.committed = true;
-        compacted.skipped = None;
-        compacted.published_dataset_version = None;
-        compacted.lance_head_version = None;
+        compacted.outcome = TableOptimizeOutcome::Optimized;
+        compacted.duration = std::time::Duration::from_millis(12);
         compacted.pending_indexes = vec![PendingIndex {
             type_key: "node:Person".into(),
             property: "embedding".into(),
@@ -1964,42 +2032,89 @@ mod tests {
         skipped.type_key = "edge:Knows".into();
         skipped.fragments_removed = 0;
         skipped.fragments_added = 0;
-        skipped.committed = false;
-        skipped.skipped = Some(SkipReason::DriftNeedsRepair);
-        skipped.published_dataset_version = Some(4);
-        skipped.lance_head_version = Some(5);
+        skipped.outcome = TableOptimizeOutcome::Skipped(SkipReason::DriftNeedsRepair);
+        skipped.duration = std::time::Duration::from_millis(3);
         skipped.pending_indexes.clear();
+        let mut deferred = skipped.clone();
+        deferred.type_key = "node:Zebra".into();
+        deferred.outcome = TableOptimizeOutcome::Deferred(DeferReason::GateHoldLimit);
+        deferred.duration = std::time::Duration::ZERO;
         let mut noop = skipped.clone();
-        noop.type_key = "__manifest".into();
-        noop.skipped = None;
-        noop.published_dataset_version = None;
-        noop.lance_head_version = None;
-        let optimize = [compacted, skipped, noop];
+        noop.type_key = "node:Yak".into();
+        noop.outcome = TableOptimizeOutcome::Unchanged;
+        let mut failed = skipped.clone();
+        failed.type_key = "node:Xerus".into();
+        failed.outcome = TableOptimizeOutcome::Failed;
+        failed.duration = std::time::Duration::from_millis(5);
+        failed.failure = Some(std::sync::Arc::new(omnigraph::error::OmniError::manifest(
+            "rewrite lost",
+        )));
+        let failure = failed.failure.as_ref().unwrap().to_string();
+        report.tables = vec![compacted, skipped, noop, failed, deferred];
+        report.input_commit = Some("hb1.parent".into());
+        report.graph_commit_id = Some("hb1.child".into());
+        report.resume_at = Some("node:Zebra".into());
+        report.gate_hold = std::time::Duration::from_millis(40);
+        report.configuration_clear = ConfigurationClear::Unknown("timed out".into());
+        report.artifact = ArtifactRefresh::Skipped(ArtifactSkip::NoEdgeTypes);
         assert_maintenance_report(
-            concat!(
-                "optimize graph — 3 datasets\n",
-                "  node type 'Person'                       frags 3 → 1 ✓\n",
-                "    ↳ index pending on property 'embedding': no trainable vectors\n",
-                "  edge type 'Knows'                        skipped (published dataset/Lance HEAD drift — run omnigraph repair)\n",
-                "  dataset '__manifest'                     no-op\n",
+            &format!(
+                concat!(
+                    "optimize graph — 5 datasets\n",
+                    "  node type 'Person'                       frags 3 → 1 ✓\n",
+                    "    ↳ index pending on property 'embedding': no trainable vectors\n",
+                    "  edge type 'Knows'                        skipped (published dataset/Lance HEAD drift — run omnigraph repair)\n",
+                    "  node type 'Yak'                          no-op\n",
+                    "  node type 'Xerus'                        failed ({failure})\n",
+                    "  node type 'Zebra'                        deferred (the run reached its writer-gate hold limit)\n",
+                    "graph commit: hb1.child\n",
+                    "resume at: node type 'Zebra'\n",
+                    "configuration clear: unknown (timed out)\n",
+                ),
+                failure = failure
             ),
             serde_json::json!({
                 "uri":"graph",
+                "input_commit":"hb1.parent",
+                "graph_commit_id":"hb1.child",
+                "resume_at":"node:Zebra",
+                "gate_hold_ms":40,
+                "configuration_clear":{"outcome":"unknown","error":"timed out"},
+                "artifact":{"outcome":"skipped","reason":"no_edge_types","error":null},
                 "datasets":[
-                    {"type_key":"node:Person","fragments_removed":3,"fragments_added":1,"committed":true,"skipped":null,"published_dataset_version":null,"lance_head_version":null,"pending_indexes":[{"property":"embedding","reason":"no trainable vectors"}]},
-                    {"type_key":"edge:Knows","fragments_removed":0,"fragments_added":0,"committed":false,"skipped":"drift_needs_repair","published_dataset_version":4,"lance_head_version":5,"pending_indexes":[]},
-                    {"type_key":"__manifest","fragments_removed":0,"fragments_added":0,"committed":false,"skipped":null,"published_dataset_version":null,"lance_head_version":null,"pending_indexes":[]},
+                    {"type_key":"node:Person","outcome":"optimized","reason":null,"fragments_removed":3,"fragments_added":1,"committed":true,"skipped":null,"duration_ms":12,"error":null,"pending_indexes":[{"property":"embedding","reason":"no trainable vectors"}]},
+                    {"type_key":"edge:Knows","outcome":"skipped","reason":"drift_needs_repair","fragments_removed":0,"fragments_added":0,"committed":false,"skipped":"drift_needs_repair","duration_ms":3,"error":null,"pending_indexes":[]},
+                    {"type_key":"node:Yak","outcome":"unchanged","reason":null,"fragments_removed":0,"fragments_added":0,"committed":false,"skipped":null,"duration_ms":3,"error":null,"pending_indexes":[]},
+                    {"type_key":"node:Xerus","outcome":"failed","reason":null,"fragments_removed":0,"fragments_added":0,"committed":false,"skipped":null,"duration_ms":5,"error":failure,"pending_indexes":[]},
+                    {"type_key":"node:Zebra","outcome":"deferred","reason":"gate_hold_limit","fragments_removed":0,"fragments_added":0,"committed":false,"skipped":null,"duration_ms":0,"error":null,"pending_indexes":[]},
                 ],
             }),
-            |json, writer| super::write_optimize("graph", &optimize, json, writer),
+            |json, writer| super::write_optimize("graph", &report, json, writer),
         );
+        let mut empty = report.clone();
+        empty.tables.clear();
+        empty.input_commit = None;
+        empty.graph_commit_id = None;
+        empty.resume_at = None;
+        empty.gate_hold = std::time::Duration::ZERO;
+        empty.configuration_clear = ConfigurationClear::NothingToClear;
+        empty.artifact = ArtifactRefresh::Unchanged;
         assert_maintenance_report(
             "optimize graph — 0 datasets\n",
-            serde_json::json!({"uri":"graph","datasets":[]}),
-            |json, writer| super::write_optimize("graph", &[], json, writer),
+            serde_json::json!({
+                "uri":"graph",
+                "input_commit":null,
+                "graph_commit_id":null,
+                "resume_at":null,
+                "gate_hold_ms":0,
+                "configuration_clear":{"outcome":"nothing_to_clear","error":null},
+                "artifact":{"outcome":"unchanged","reason":null,"error":null},
+                "datasets":[],
+            }),
+            |json, writer| super::write_optimize("graph", &empty, json, writer),
         );
 
-        let mut repair = db.repair(RepairOptions::default()).await.unwrap();
+        let mut repair = db.repair_report_as(None).await.unwrap();
         let mut clean = repair.datasets.pop().unwrap();
         clean.type_key = "node:Person".into();
         clean.published_dataset_version = 4;
@@ -2016,7 +2131,6 @@ mod tests {
         refused.operations = vec!["Append".into(), "Delete".into()];
         refused.error = Some("foreign write".into());
         repair.datasets = vec![clean, refused];
-        repair.graph_manifest_version = Some(9);
         assert_maintenance_report(
             concat!(
                 "repair graph — 2 datasets\n",
@@ -2024,7 +2138,7 @@ mod tests {
                 "  edge type 'Knows'                        refused      foreign_drift          4 → 6 [Append, Delete] (foreign write)\n",
             ),
             serde_json::json!({
-                "uri":"graph", "graph_manifest_version":9,
+                "uri":"graph",
                 "datasets":[
                     {"type_key":"node:Person","published_dataset_version":4,"lance_head_version":4,"classification":"no_drift","action":"no_op","operations":[],"error":null},
                     {"type_key":"edge:Knows","published_dataset_version":4,"lance_head_version":6,"classification":"foreign_drift","action":"refused","operations":["Append","Delete"],"error":"foreign write"},
@@ -2033,10 +2147,9 @@ mod tests {
             |json, writer| super::write_repair("graph", &repair, json, writer),
         );
         repair.datasets.clear();
-        repair.graph_manifest_version = None;
         assert_maintenance_report(
             "repair graph — 0 datasets\n",
-            serde_json::json!({"uri":"graph","graph_manifest_version":null,"datasets":[]}),
+            serde_json::json!({"uri":"graph","datasets":[]}),
             |json, writer| super::write_repair("graph", &repair, json, writer),
         );
     }

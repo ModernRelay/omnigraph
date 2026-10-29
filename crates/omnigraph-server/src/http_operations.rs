@@ -173,7 +173,16 @@ pub(crate) fn graph() -> HttpRoutes {
         .route("commit changes", handlers::server_commit_changes)
         .route("diff", handlers::server_diff)
         .route("changes poll", handlers::server_changes_feed)
-        .route("changes baseline", handlers::server_changes_baseline);
+        .route("changes baseline", handlers::server_changes_baseline)
+        .route("start optimize", crate::maintenance::start_optimize)
+        .route(
+            "get maintenance operation",
+            crate::maintenance::get_maintenance_operation,
+        )
+        .route(
+            "cancel maintenance operation",
+            crate::maintenance::cancel_maintenance_operation,
+        );
     #[cfg(test)]
     let routes = {
         let mut routes = routes;

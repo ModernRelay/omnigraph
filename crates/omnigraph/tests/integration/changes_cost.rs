@@ -26,14 +26,10 @@
 
 use crate::helpers;
 
-use std::sync::Arc;
-
 use crate::helpers::cost::{IoCounts, assert_flat, assert_grows, cost_harness, measure};
-use lance::Dataset;
-use lance::dataset::UpdateBuilder;
 use omnigraph::IndexCoverage;
 use omnigraph::changes::ChangeFeedScope;
-use omnigraph::db::{Omnigraph, ReadTarget, RepairOptions};
+use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
 
@@ -93,7 +89,7 @@ node Company {
                     // Build full coverage, then append a new parent fragment.
                     // The measured update therefore runs with a normal partial
                     // / stale index state. The false arm never builds an index.
-                    db.ensure_indices().await.unwrap();
+                    db.ensure_indices_as(None).await.unwrap();
                     db.load_with_receipt(
                         "main",
                         r#"{"type":"Person","data":{"name":"stale-index-tail","age":1}}"#,
@@ -298,123 +294,6 @@ node Document {
             }
             assert_eq!(first.block.changes[0].op, op);
             assert_eq!(second.block.changes[0].op, op);
-        }
-    })
-    .await;
-}
-
-/// Multi-version graph intervals are intentionally outside the candidate
-/// contract. The fixture advances one physical dataset twice, then adopts both
-/// logical updates in one forced repair graph commit. Two stateless
-/// `max_changes=1` pages must each fall back before reading either transaction;
-/// the page count cannot multiply a transaction-history walk.
-#[tokio::test]
-#[ignore = "the multi-version interval is built by `repair`, which promotes at head; phase 4 of RFC \"Detached-only tables\" restates it over a detached chain"]
-async fn changes_page_size_one_skips_transaction_history_for_multi_version_intervals() {
-    cost_harness(async {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Omnigraph::init(
-            dir.path().to_str().unwrap(),
-            "node Person {\n    name: String @key\n    age: I32?\n}",
-        )
-        .await
-        .unwrap();
-        let db = helpers::session(db);
-        db.load_with_receipt(
-            "main",
-            concat!(
-                r#"{"type":"Person","data":{"name":"alice","age":1}}"#,
-                "\n",
-                r#"{"type":"Person","data":{"name":"bob","age":1}}"#,
-            ),
-            LoadMode::Merge,
-        )
-        .await
-        .unwrap();
-        let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-        let entry = snapshot.dataset("node:Person").unwrap();
-        let before = entry.published_dataset_version;
-        let dataset_uri = format!(
-            "{}/{}",
-            db.uri().trim_end_matches('/'),
-            entry.dataset_path.trim_start_matches('/')
-        );
-
-        let dataset = Dataset::open(&dataset_uri).await.unwrap();
-        let dataset = UpdateBuilder::new(Arc::new(dataset))
-            .update_where("name = 'alice'")
-            .unwrap()
-            .set("age", "2")
-            .unwrap()
-            .build()
-            .unwrap()
-            .execute()
-            .await
-            .unwrap()
-            .new_dataset;
-        let dataset = UpdateBuilder::new(dataset)
-            .update_where("name = 'bob'")
-            .unwrap()
-            .set("age", "3")
-            .unwrap()
-            .build()
-            .unwrap()
-            .execute()
-            .await
-            .unwrap()
-            .new_dataset;
-        assert_eq!(dataset.version().version, before + 2);
-
-        let repair = db
-            .repair(RepairOptions {
-                confirm: true,
-                force: true,
-            })
-            .await
-            .unwrap();
-        assert!(repair.graph_manifest_version.is_some());
-        let repair_commit = db
-            .list_commits(None)
-            .await
-            .unwrap()
-            .first()
-            .expect("repair publishes a graph lineage commit")
-            .graph_commit_id
-            .clone();
-
-        let (first, first_io) = measure(db.commit_changes_page(
-            &repair_commit,
-            &ChangeFeedScope::default(),
-            None,
-            Some(1),
-            None,
-        ))
-        .await;
-        let first = first.unwrap();
-        assert_eq!(first.block.changes.len(), 1);
-        let token = first.next_page_token.expect("two updates need two pages");
-        assert_eq!(
-            first_io.candidate_transaction_reads, 0,
-            "first multi-version page must fall back before transaction-history I/O"
-        );
-
-        let (second, second_io) = measure(db.commit_changes_page(
-            &repair_commit,
-            &ChangeFeedScope::default(),
-            Some(&token),
-            Some(1),
-            None,
-        ))
-        .await;
-        let second = second.unwrap();
-        assert_eq!(second.block.changes.len(), 1);
-        assert!(second.next_page_token.is_none());
-        assert_ne!(first.block.changes[0].id, second.block.changes[0].id);
-        for io in [first_io, second_io] {
-            assert_eq!(
-                io.candidate_transaction_reads, 0,
-                "every stateless multi-version page must skip transaction-history I/O"
-            );
         }
     })
     .await;

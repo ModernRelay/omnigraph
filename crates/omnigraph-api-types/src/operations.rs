@@ -145,6 +145,10 @@ const PROBE: &str = "Process probe, not a graph command.";
 const OAUTH: &str = "Protocol-defined OAuth discovery, not a graph operation.";
 const DEPLOYMENT: &str = "Deployment control is not an MCP agent tool.";
 const BYTE_STREAM: &str = "MCP tools do not carry this byte-stream contract.";
+const MAINTENANCE: &str =
+    "Served maintenance runs under a durable operation record, not as an MCP agent tool.";
+const MAINTENANCE_CANCEL_CLI: &str =
+    "The CLI does not cancel a served maintenance operation; a scheduler or an HTTP client does.";
 
 /// Every operation in the generated HTTP specification. Protocol endpoints
 /// (`/mcp`, `/openapi.json`) and the catalogue's reserved-id dispatch retain
@@ -411,6 +415,36 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         Surface::bound(&["commit publish"]),
     ),
     operation(
+        "start optimize",
+        HttpMethod::Post,
+        "/graphs/{graph_id}/maintenance/optimize",
+        Capability::Write,
+        None,
+        Surface::absent(MAINTENANCE),
+        Surface::bound(&["optimize"]),
+    ),
+    operation(
+        "get maintenance operation",
+        HttpMethod::Get,
+        "/graphs/{graph_id}/maintenance/{maintenance_id}",
+        Capability::Read,
+        None,
+        Surface::absent(MAINTENANCE),
+        Surface::restricted(
+            &["optimize"],
+            "--operation observes an existing operation, and the wait polls it.",
+        ),
+    ),
+    operation(
+        "cancel maintenance operation",
+        HttpMethod::Post,
+        "/graphs/{graph_id}/maintenance/{maintenance_id}/cancel",
+        Capability::Write,
+        None,
+        Surface::absent(MAINTENANCE),
+        Surface::absent(MAINTENANCE_CANCEL_CLI),
+    ),
+    operation(
         "diff",
         HttpMethod::Get,
         "/graphs/{graph_id}/diff",
@@ -621,7 +655,6 @@ pub const CLI_ONLY_OPERATIONS: &[CliOnlyOperation] = &[
     cli_only("schema upgrade-system-columns", STORAGE),
     cli_only("init", STORAGE),
     cli_only("upgrade", STORAGE),
-    cli_only("optimize", STORAGE),
     cli_only("index build", STORAGE),
     cli_only("index rebuild", STORAGE),
     cli_only("repair", STORAGE),

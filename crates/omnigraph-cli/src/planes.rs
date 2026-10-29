@@ -78,7 +78,9 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
                 CommitCommand::Publish { .. }
                 | CommitCommand::Drop { .. }
                 | CommitCommand::Changes { .. },
-        } => Graph {
+        }
+        // A server target runs it through served maintenance.
+        | Command::Optimize(_) => Graph {
             direct_only: false,
             root: true,
 
@@ -92,7 +94,6 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
         Command::Schema {
             command: SchemaCommand::Plan { .. },
         }
-        | Command::Optimize(_)
         | Command::Index { .. }
         | Command::RebuildFullTextIndexes(_)
         | Command::Repair(_)

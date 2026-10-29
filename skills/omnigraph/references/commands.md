@@ -303,7 +303,10 @@ indexes are preserved and any uncovered tail is scanned; use the explicit
 rebuild command when full-text coverage or analyzer compatibility must change.
 `optimize` also persists the derived traversal adjacency used to speed up
 traversal startup; it does not collect unused forks (that is `cleanup`). It
-works on `main`; use `index build` for another branch.
+works on `main`; use `index build` for another branch. Against a server
+target it runs through served maintenance: it prints a maintenance id, waits
+for the operation's record (`--no-wait`, `--timeout`), and `--operation <id>`
+observes one; after a lost response it looks the id up and never resubmits.
 
 ### `index build` — a branch's missing and lagging indexes
 

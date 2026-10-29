@@ -28,7 +28,7 @@ pub async fn initialize_local_fixture(
     let optimized_user_tables = match plan.compaction_recency {
         CompactionRecency::Optimized => {
             let outcomes = db
-                .optimize()
+                .optimize_as(None, omnigraph::db::OptimizeRequest::default())
                 .await
                 .map_err(|error| fixture_error(format!("optimize fixture main branch: {error}")))?;
             let intended_keys = (0..plan.node_tables())
@@ -36,6 +36,7 @@ pub async fn initialize_local_fixture(
                 .chain((0..plan.edge_tables()).map(edge_table_key));
             for key in intended_keys {
                 let outcome = outcomes
+                    .tables
                     .iter()
                     .find(|outcome| outcome.type_key == key)
                     .ok_or_else(|| {
@@ -43,17 +44,17 @@ pub async fn initialize_local_fixture(
                             "optimized fixture returned no outcome for intended user table {key}"
                         ))
                     })?;
-                if outcome.skipped.is_some()
-                    || !outcome.committed
+                if outcome.skipped().is_some()
+                    || !outcome.committed()
                     || outcome.fragments_removed == 0
                     || outcome.fragments_added == 0
                 {
                     return Err(fixture_error(format!(
                         "optimized fixture did not productively compact {key}: committed={}, fragments_removed={}, fragments_added={}, skipped={:?}",
-                        outcome.committed,
+                        outcome.committed(),
                         outcome.fragments_removed,
                         outcome.fragments_added,
-                        outcome.skipped
+                        outcome.skipped()
                     )));
                 }
             }

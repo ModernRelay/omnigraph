@@ -71,7 +71,7 @@ async fn legacy_graph_with_data(dir: &tempfile::TempDir) -> Session {
     db.load_jsonl(LEGACY_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     db
 }
 
@@ -226,7 +226,7 @@ async fn assert_upgraded(db: &Session, dir: &tempfile::TempDir, expected_export:
     .await
     .expect_err("the respelled @unique(@src, @dst) still refuses a duplicate endpoint pair");
     assert_eq!(count_rows(db, "edge:WorksAt").await, 3);
-    db.ensure_indices()
+    db.ensure_indices_as(None)
         .await
         .expect("index reconciliation after the rename is a no-op by field id");
 }
@@ -407,7 +407,7 @@ async fn system_column_upgrade_history_survives_unrelated_reclaimed_tables() {
         main.retained.contains(&company_moved) && main.would_prune.contains(&version_before),
         "the run keeps the Company write's `__manifest` version and drops the pre-write one: {main:?}"
     );
-    let stats = db.cleanup(keep).await.unwrap();
+    let stats = db.cleanup_as(keep, None).await.unwrap();
     let row = stats.iter().find(|row| row.type_key == first).unwrap();
     assert!(row.error.is_none(), "{row:?}");
     assert!(

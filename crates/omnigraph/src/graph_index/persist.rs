@@ -638,29 +638,165 @@ pub(crate) async fn load(
     }
 }
 
-/// Persist `index` (covering `edge_types`) for this snapshot. Called by
-/// `optimize` only (see the module contract). `Ok(None)` when any covered
-/// edge table is absent from the snapshot — a partially-materialized store
-/// has no complete identity to stamp. Errors are the caller's to log; a
-/// failed write costs nothing but the next cold build.
+/// One stamp per covered edge type, sorted; `None` when any covered edge
+/// table is absent from the snapshot, which has then no complete identity to
+/// stamp.
+fn snapshot_stamps(
+    snapshot: &Snapshot,
+    edge_types: &HashMap<String, (String, String)>,
+) -> Option<Vec<TableStamp>> {
+    let mut tables = Vec::with_capacity(edge_types.len());
+    for (edge_name, (from_type, to_type)) in edge_types {
+        tables.push(snapshot_stamp(snapshot, edge_name, from_type, to_type)?);
+    }
+    tables.sort_by(|a, b| a.edge_name.cmp(&b.edge_name));
+    Some(tables)
+}
+
+/// The artifact's URI and bytes for `index` (covering `edge_types`) at this
+/// snapshot; `Ok(None)` when any covered edge table is absent from the
+/// snapshot.
+pub(crate) fn artifact_body(
+    snapshot: &Snapshot,
+    edge_types: &HashMap<String, (String, String)>,
+    index: &GraphIndex,
+) -> Result<Option<(String, Vec<u8>)>> {
+    let Some(tables) = snapshot_stamps(snapshot, edge_types) else {
+        return Ok(None);
+    };
+    Ok(Some((
+        artifact_uri(snapshot.root_uri()),
+        serialize(index, tables)?,
+    )))
+}
+
+/// Persist `index` (covering `edge_types`) for this snapshot in one call.
+/// `Ok(None)` when any covered edge table is absent from the snapshot — a
+/// partially-materialized store has no complete identity to stamp. Tests
+/// only: `optimize`, the one writer (see the module contract), writes
+/// [`artifact_body`] from a task it awaits, so a dropped run cannot drop the
+/// write.
+#[cfg(test)]
 pub(crate) async fn save(
     snapshot: &Snapshot,
     adapter: &dyn StorageAdapter,
     edge_types: &HashMap<String, (String, String)>,
     index: &GraphIndex,
 ) -> Result<Option<String>> {
-    let mut tables = Vec::with_capacity(edge_types.len());
-    for (edge_name, (from_type, to_type)) in edge_types {
-        match snapshot_stamp(snapshot, edge_name, from_type, to_type) {
-            Some(stamp) => tables.push(stamp),
-            None => return Ok(None),
-        }
-    }
-    tables.sort_by(|a, b| a.edge_name.cmp(&b.edge_name));
-    let uri = artifact_uri(snapshot.root_uri());
-    let body = serialize(index, tables)?;
+    let Some((uri, body)) = artifact_body(snapshot, edge_types, index)? else {
+        return Ok(None);
+    };
     adapter.write_bytes(&uri, &body).await?;
     Ok(Some(uri))
+}
+
+/// The bytes `serialize` writes for `edge_types` at this snapshot before any
+/// edge: the 20-byte prefix, every section prelude, one extra `u32` per offset
+/// array, and the header. The first value has the header's count and length
+/// fields at their shortest, a lower bound on the object; the second at their
+/// widest, a safe start for [`ArtifactCount`]. `None` when any covered edge
+/// table is absent.
+pub(crate) fn fixed_bytes(
+    snapshot: &Snapshot,
+    edge_types: &HashMap<String, (String, String)>,
+) -> Result<Option<(u64, u64)>> {
+    let Some(tables) = snapshot_stamps(snapshot, edge_types) else {
+        return Ok(None);
+    };
+    fixed_bytes_for(&tables).map(Some)
+}
+
+fn fixed_bytes_for(tables: &[TableStamp]) -> Result<(u64, u64)> {
+    let mut type_names = tables
+        .iter()
+        .flat_map(|table| [table.from_type.as_str(), table.to_type.as_str()])
+        .collect::<Vec<_>>();
+    type_names.sort_unstable();
+    type_names.dedup();
+    let mut fixed = (MAGIC.len() + 4 + 8) as u64;
+    for name in &type_names {
+        fixed += 1 + 4 + name.len() as u64;
+    }
+    for table in tables {
+        let stamp_json = serde_json::to_vec(table).map_err(|e| {
+            OmniError::manifest(format!("graph index artifact stamp serialize: {e}"))
+        })?;
+        // The prelude, then the extra offset entry of the CSR and the CSC.
+        fixed += 1 + 4 + table.edge_name.len() as u64 + 4 + stamp_json.len() as u64 + 2 * 4;
+    }
+    let header = |field: u64| -> Result<u64> {
+        serde_json::to_vec(&Header {
+            tables: tables.to_vec(),
+            payload_sha256_b64: base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+            dicts: type_names
+                .iter()
+                .map(|name| DictMeta {
+                    type_name: (*name).to_string(),
+                    count: field,
+                    len: field,
+                })
+                .collect(),
+            adjacencies: tables
+                .iter()
+                .map(|table| AdjMeta {
+                    edge_name: table.edge_name.clone(),
+                    lens: [field; 4],
+                })
+                .collect(),
+        })
+        .map(|header| header.len() as u64)
+        .map_err(|e| OmniError::manifest(format!("graph index artifact header serialize: {e}")))
+    };
+    Ok((fixed + header(0)?, fixed + header(u64::MAX)?))
+}
+
+/// A running upper bound on the artifact a counting build would write. It
+/// starts at the fixed bytes with the widest header and only grows: each new
+/// id of a node type adds its dictionary entry and one `u32` in every CSR
+/// offset array whose source type it is and every CSC offset array whose
+/// destination type it is; each edge adds its two targets.
+pub(crate) struct ArtifactCount {
+    counted: u64,
+    limit: u64,
+    per_id: HashMap<String, u64>,
+}
+
+impl ArtifactCount {
+    pub(crate) fn new(
+        fixed_widest: u64,
+        limit: u64,
+        edge_types: &HashMap<String, (String, String)>,
+    ) -> Self {
+        let mut per_id = HashMap::new();
+        for (from_type, to_type) in edge_types.values() {
+            *per_id.entry(from_type.clone()).or_insert(0) += 4;
+            *per_id.entry(to_type.clone()).or_insert(0) += 4;
+        }
+        Self {
+            counted: fixed_widest,
+            limit,
+            per_id,
+        }
+    }
+
+    pub(crate) fn add_ids(&mut self, type_name: &str, ids: &[String]) {
+        let widen = self.per_id.get(type_name).copied().unwrap_or(0);
+        for id in ids {
+            self.counted = self.counted.saturating_add(4 + id.len() as u64 + widen);
+        }
+    }
+
+    pub(crate) fn add_edges(&mut self, edges: u64) {
+        self.counted = self.counted.saturating_add(edges.saturating_mul(8));
+    }
+
+    pub(crate) fn passed(&self) -> bool {
+        self.counted > self.limit
+    }
+
+    pub(crate) fn counted(&self) -> u64 {
+        self.counted
+    }
 }
 
 #[cfg(test)]
@@ -711,6 +847,37 @@ mod tests {
             from_type: "Person".to_string(),
             to_type: "Person".to_string(),
         }
+    }
+
+    /// The pre-check's lower bound and the counting build's bound bracket the
+    /// bytes `serialize` writes.
+    #[test]
+    fn size_bounds_bracket_the_serialized_artifact() {
+        let index = sample_index();
+        let tables = vec![sample_stamp()];
+        let actual = serialize(&index, tables.clone()).unwrap().len() as u64;
+        let (shortest, widest) = fixed_bytes_for(&tables).unwrap();
+        let edges = 3;
+        assert!(
+            shortest + 8 * edges <= actual,
+            "{shortest} + edges vs {actual}"
+        );
+        let mut edge_types = HashMap::new();
+        edge_types.insert(
+            "Knows".to_string(),
+            ("Person".to_string(), "Person".to_string()),
+        );
+        let mut count = ArtifactCount::new(widest, u64::MAX, &edge_types);
+        count.add_ids("Person", index.parts().0["Person"].ids());
+        count.add_edges(edges);
+        assert!(actual <= count.counted(), "{actual} vs {}", count.counted());
+        // Exact apart from the header's count and length digits.
+        let digits = 19 * (2 + 4);
+        assert!(
+            count.counted() - actual <= digits,
+            "{}",
+            count.counted() - actual
+        );
     }
 
     /// Header/payload halves round-trip. Stamp verification against a live
