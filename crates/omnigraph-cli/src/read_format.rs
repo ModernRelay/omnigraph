@@ -15,7 +15,7 @@ pub enum ReadOutputFormat {
     Csv,
     Jsonl,
     Json,
-    /// The same document as [`Self::Json`], encoded as TOON (specification 4.4).
+    /// Same document as json, in TOON (specification 4.4).
     Toon,
     /// The result as an Arrow IPC stream on stdout.
     Arrow,
@@ -394,6 +394,42 @@ row_count: 1
 columns[2]: name,age
 rows[1]{name,age}:
   Alice,30"
+        );
+    }
+
+    #[test]
+    fn toon_format_repeats_keys_when_a_null_cell_is_omitted() {
+        let mut output = sample_output();
+        output.row_count = 2;
+        output.columns = vec!["name".to_string(), "score".to_string()];
+        output.rows = serde_json::value::RawValue::from_string(
+            r#"[{"name":"Ada, Lovelace","score":1.0},{"name":"Grace"}]"#.to_string(),
+        )
+        .unwrap();
+
+        let rendered = render_read(
+            &output,
+            ReadOutputFormat::Toon,
+            &ReadRenderOptions {
+                max_column_width: 80,
+                cell_layout: TableCellLayout::Truncate,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            rendered,
+            "\
+query_name: get_person
+target:
+  branch: main
+  snapshot: null
+row_count: 2
+columns[2]: name,score
+rows[2]:
+  - name: \"Ada, Lovelace\"
+    score: 1
+  - name: Grace"
         );
     }
 

@@ -102,11 +102,12 @@ stable machine-readable form for commands that do not use `--format`. Result
 cells use the [JSON result spelling](../queries/index.md#json-result-spelling);
 `table`, `csv`, and `kv` print strings unquoted. `--format json` prints the
 envelope pretty and the `rows` array compact. `--format toon` encodes that same
-document as [TOON](https://github.com/toon-format/toon) (specification 4.4,
-comma delimiter, two-space indent): an array of uniform objects, such as
-`rows`, declares its fields once. Numbers use TOON's canonical spelling, so an
-integral value is `1` where the JSON writer may spell `1.0`. The CLI ends the
-TOON document with a newline. The HTTP API returns JSON. A refusal follows
+document as [TOON](https://github.com/toon-format/spec) (specification 4.4,
+comma delimiter, two-space indent). `rows` declares its fields once when every
+row has the same keys. A null cell omits its key, so one null makes the rows
+non-uniform and TOON repeats every key. Numbers use TOON's canonical spelling,
+so an integral value is `1` where the JSON writer may spell `1.0`. The CLI ends
+the TOON document with a newline. The HTTP API returns JSON. A refusal follows
 [Diagnostics](../queries/diagnostics.md).
 
 ### Machine-readable read and write positions

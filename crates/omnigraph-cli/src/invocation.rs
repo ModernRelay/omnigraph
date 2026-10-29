@@ -130,6 +130,19 @@ mod tests {
     }
 
     #[test]
+    fn query_help_names_toon_in_plain_words() {
+        let error = command()
+            .try_get_matches_from(["omnigraph", "query", "--help"])
+            .expect_err("help");
+        let help = error.to_string();
+        assert!(
+            help.contains("Same document as json, in TOON (specification 4.4)"),
+            "{help}"
+        );
+        assert!(!help.contains("Self::Json"), "{help}");
+    }
+
+    #[test]
     fn machine_error_format_is_captured_from_the_leaf() {
         for (args, expected) in [
             (vec!["query", "q"], None),
