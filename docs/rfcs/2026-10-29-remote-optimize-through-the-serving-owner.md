@@ -139,7 +139,7 @@ durable before any effect and before the response. From then on:
 | The request, its acceptance, principal and options | Server | the operation record |
 | Whether the graph changed, and how | Engine | the one `__manifest` publication (invariant 2) |
 | The intent nonce of the commit the run will publish, and the head it builds on | Engine, recorded by the server | the operation record, written before any manifest request |
-| Whether that commit exists | Engine | main's history, matched with `commit_id_answers` |
+| Whether that commit exists | Engine | main's history (its head row, the commit buffer its `__manifest` holds, and `__history` for released commits), read through `GraphCoordinator::published_record` and matched with `commit_id_answers` |
 | Per-table outcomes and the post-commit tail | Engine, recorded by the server | the operation record |
 | Where the next full-catalog run starts | Server | the operation record's resume position for the graph |
 | Progress of a running operation | Server | memory, and the record's state at its transitions |
@@ -277,7 +277,7 @@ table's first write:
 |---|---|
 | Source fragments | the compaction plan's tasks, counted until the ceiling is passed |
 | Source rows | the plan's fragment row counts |
-| Source bytes | each data file's recorded size (`DataFile::file_size_bytes`, a `CachedFileSize`), with a HEAD request when `get()` is empty; and a HEAD request for each deletion file, since Lance 13's `DeletionFile` records no size. A HEAD goes to the store and path Lance resolves for that file, including its `base_id`: `Dataset::object_store(base_id)` and the manifest's `base_paths`, as the collector resolves a borrowed origin (Lance's own directory helpers are crate-private). A path under the table's own root would miss an inherited file, and the table would stay deferred on every run. The source-fragment ceiling is checked first, so it bounds those requests. |
+| Source bytes | each data file's recorded size (`DataFile::file_size_bytes`, a `CachedFileSize`), with a HEAD request when `get()` is empty; and a HEAD request for each deletion file, since Lance 13's `DeletionFile` records no size. A HEAD goes to the file itself, in the store `Dataset::object_store(base_id)` returns. A data file is `DataFile.path` under its directory: the dataset root joined with `data` when `base_id` is absent, the base's path (`BasePath::extract_path`) joined with `data` when that base `is_dataset_root`, and the base's path alone when the base holds data only. A deletion file is `lance_table::io::deletion::relative_deletion_file_path` (`_deletions/{fragment}-{read_version}-{id}.{suffix}`) under the dataset root, or under its base, which must be a dataset root. This is the rule of Lance's crate-private `data_file_dir_for_base` and `dataset_dir_for_deletion`. A base's root alone, which the collector's borrowed-origin walk returns, is not the file. A HEAD that misses an inherited file would defer the table on every run. The source-fragment ceiling is checked first, so it bounds those requests. |
 | Managed Blob payload bytes | the descriptor-only scan that compaction sizing already performs (`compaction_blob_batch_rows`). External references count nothing and are never fetched. |
 | Index rebuild rows | the table's row count, when a lagging index would be rebuilt whole |
 
@@ -449,18 +449,27 @@ hook.
      are fixed in advance: one `u32` per edge in each direction. The
      pre-check reads each pinned edge table's live row count from Lance
      (`Dataset::count_rows(None)`: physical rows less deleted rows, from
-     fragment metadata), which is the number of rows the scan returns. Eight
-     bytes per edge plus the framing is therefore a lower bound on the
-     object. If it exceeds the limit, no scan starts.
+     fragment metadata, or the deletion vector when a fragment records no
+     deleted count), which is the number of rows the scan returns, since a
+     scan excludes deleted rows. The pre-check adds to 8 bytes per edge only
+     bytes `serialize` always writes: the 20-byte prefix, every section's
+     prelude, one extra `u32` per offset array, and the header with its
+     count and length fields at their shortest encoding. The sum is a lower
+     bound on the object. If it exceeds the limit, no scan starts. The
+     widest header is a safe stop for the counting build, not a lower bound,
+     so the pre-check never adds it or `MAX_HEADER_BYTES`.
    - **Counting build.** The build reads each edge table's scan one batch at
      a time. After each batch it adds the bytes that batch adds to the
-     object: 4 bytes plus the UTF-8 length for each new distinct endpoint;
-     4 bytes in every offset array over that endpoint's node type, since a
-     dictionary is shared by every edge type and direction that ends at its
-     type; and 8 bytes per edge. The preludes, each offset array's extra
-     entry and the header are known before the scan, except the header's
-     count and length fields, which are counted at their widest. The count
-     only grows. Once it passes the limit, the build drops what it holds and
+     object: 4 bytes plus the UTF-8 length for each new distinct endpoint
+     of node type T; 4 bytes in every CSR whose source type is T and in
+     every CSC whose destination type is T; and 8 bytes per edge.
+     `CsrIndex::build` sizes each offset array as `num_nodes + 1`, and
+     `GraphIndex::build` passes the full dictionary of the source type for
+     the CSR and of the destination type for the CSC, so an id seen on one
+     side only still widens both kinds of array over its type. The preludes,
+     each offset array's extra entry and the header are known before the
+     scan, except the header's count and length fields, which the counting
+     build counts at their widest. The count only grows. Once it passes the limit, the build drops what it holds and
      stops before it keeps another batch and before `CsrIndex::build`
      allocates.
    - **Memory.** Beyond one scan batch, the build holds structures that are
@@ -595,32 +604,43 @@ server applies it before it admits maintenance:
 - **Main's graph head has moved.** Under the exact head expectation, only the
   commit on main whose parent is the input head can be this run's. The server
   reads main's `parent_commit_id` chain from its tip back toward the input
-  head through history. `read_commit` follows an id into its archived block,
-  so a commit that a later publication archived is still found. Every commit
-  on main is written on main, a fast-forward merge included, so each step's
-  `graph_manifest_version` is below the one before it. The walk therefore
+  head. It starts at the head row of a fresh read of main's `__manifest` and
+  looks up each parent with `GraphCoordinator::published_record`, the lookup
+  a commit-addressed read already uses. That lookup reads the head row and
+  the commit buffer first, with no request, then `__history`, then the
+  latest version of the live branches. A new commit is the head row, and it
+  stays in the buffer until a later publish releases the buffer
+  (`HISTORY_RELEASE_BYTES`, 256 KiB), so `history::read_commit`, which reads
+  `__history` alone, would not find the commit this rule must judge. The
+  buffer stores a null parent on a settled row for "the previous buffered
+  commit", and `ManifestRows::finish` restores it on load, so the walk sees
+  every parent. Every commit on main is written on main, a fast-forward
+  merge included, so each step's `graph_manifest_version` is below the one
+  before it. The walk therefore
   stops at the input head, or at the first link whose version is not above
   the input head's recorded version. It ends in one of three ways:
-  - **The input head's child was read and answers the nonce**
+  - **The lookup returned the input head's child, and it answers the nonce**
     (`commit_id_answers`). The run is `succeeded`. The resolution write
     stores that child's history id (`hb1.…`) as the published commit, with
     the recorded outcomes. The id cannot be stored earlier: the callback
     runs before `attempt_commit_id` chooses the block and slot.
-  - **The child was read and does not answer the nonce.** The run is
-    `failed` with `not_committed`. Every `__manifest` version an attempt of
-    this run could have taken is occupied, since a later attempt would have
-    read the moved head and refused before its request. Its staging becomes
-    collectible.
-  - **Neither.** A history read fails, a link is absent (`read_commit`
-    returns `Ok(None)`), or the walk passes the input head's version without
-    meeting it. None of these shows that the commit is absent, and a terminal
-    record is never rewritten, so the record stays `publishing`. A lookup
-    reports where the walk stopped.
+  - **The lookup returned the child, and it does not answer the nonce.**
+    The run is `failed` with `not_committed`. Every `__manifest` version an
+    attempt of this run could have taken is occupied, since a later attempt
+    would have read the moved head and refused before its request. Its
+    staging becomes collectible.
+  - **Neither.** A lookup fails, `published_record` returns nothing for a
+    link, or the walk passes the input head's version without meeting it.
+    `Ok(None)` from `read_commit` alone would not show a link is absent.
+    None of these shows that the commit is absent, and a terminal record is
+    never rewritten, so the record stays `publishing`. A lookup of the
+    operation reports where the walk stopped.
 
 Only a commit on this graph's main settles the record. A commit on another
 graph of the cluster or on another branch does not, and a run that publishes
-nothing does not move main. The walk reads one history entry per commit
-published on main since the doubt arose.
+nothing does not move main. A commit still in main's buffer costs no
+request; a released one costs one `__history` read. The walk visits one
+commit per commit published on main since the doubt arose.
 
 The rule is later than the storage-outcomes RFC's test, under which the
 branch's next publication settles an unknown one by taking or finding its
@@ -905,10 +925,10 @@ Every row extends an existing owner in [testing](../dev/testing.md).
 | A failed `before_publish` publishes nothing | failpoint | `failpoints.rs` |
 | Writers that pass no callback make no control-object request | unchanged rows for mutate, load and merge | DST storage-cost golden |
 | The recorded nonce resolves a published run through `commit_id_answers`, including an `hb1` id in a new block, and the terminal record stores the child's history id | publish across a block boundary, then resolve | server `maintenance_routes`, cluster `failpoints.rs` |
-| A failed history read, an absent link, or a walk that passes the input head's version without meeting it leaves the record `publishing`; only a read child that does not answer the nonce records `not_committed` | history read faults and a fabricated chain under the resolver | server `maintenance_routes` |
+| A run whose commit is still main's head row or in its commit buffer resolves to `succeeded` with no `__history` read, and one whose commit was released resolves through `__history`; a failed lookup, a link `published_record` does not return, or a walk that passes the input head's version without meeting it leaves the record `publishing`; only a returned child that does not answer the nonce records `not_committed` | resolve right after the in-doubt publish, again after enough publishes to release the buffer, then under history read faults and a fabricated chain | server `maintenance_routes`, `omnigraph-catalog` tests |
 | An in-doubt publication stays `publishing`, leaves the active slot, and is settled by the next move of main's graph head either way; a configuration-only `__manifest` version, a commit on another graph and a no-op run do not settle it; a cancellation leaves it `publishing` | the catalog's unresolved-manifest seam, then each later write | `omnigraph-catalog` tests, server `boot_settings`, `maintenance_routes` |
 | A post-commit failure in the configuration clear or the artifact does not fail the operation, and the clear reports `cleared`, `nothing_to_clear`, `failed` or `unknown` | failpoints after the publication | `integration/maintenance.rs` |
-| The pre-check refuses a build whose target arrays and framing alone pass `artifact_write_limit`, before any scan; the counting build stops before it keeps another batch and before `CsrIndex::build`; under the limit, the count is never below the bytes `serialize` writes | a small limit over a fixture with edges, a scan seam that counts batches, and a comparison of the count with the written object | `integration/maintenance.rs`, in-source `graph_index` tests |
+| The pre-check refuses a build whose target arrays and framing alone pass `artifact_write_limit`, before any scan; the counting build stops before it keeps another batch and before `CsrIndex::build`; under the limit, the count is never below the bytes `serialize` writes, and the pre-check never above them | a small limit over a fixture with edges, including edge types whose source and destination types differ and ids seen on one side only, a scan seam that counts batches, and a comparison of both figures with the written object | `integration/maintenance.rs`, in-source `graph_index` tests |
 | A main write proceeds during the artifact scan | seam that holds the scan | `integration/maintenance.rs` |
 | An issued artifact write completes before release; SIGTERM during the scan releases cleanly | served shutdown journey | `boot_settings` (`owned_shutdown`) |
 | Cancellation stops at a safe boundary; a publication in progress completes and the run is `succeeded` | engine and server tests | `integration/maintenance.rs`, `boot_settings` |
@@ -1010,3 +1030,15 @@ dated pending entry in its decision log:
     allocates the CSR arrays.
   - **Sizing.** A HEAD for a data or deletion file goes to the location its
     `base_id` names.
+- 2026-10-29: Revised after the fourth review:
+  - **Resolution lookup.** The walk starts at main's head row and looks up
+    each parent with `GraphCoordinator::published_record`: the head and the
+    commit buffer first, then `__history`. `read_commit` reads `__history`
+    alone and cannot see a commit the buffer still holds.
+  - **Offset count.** A new id of type T widens every CSR whose source type
+    is T and every CSC whose destination type is T.
+  - **Pre-check framing.** Only bytes `serialize` always writes, with the
+    header's numeric fields at their shortest; the widest header stays in
+    the counting build.
+  - **Sizing paths.** A HEAD names the file: `data` or `_deletions` under
+    the location Lance resolves from `base_id`.
