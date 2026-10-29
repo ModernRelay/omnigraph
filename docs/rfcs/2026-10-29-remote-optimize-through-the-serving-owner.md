@@ -277,7 +277,7 @@ table's first write:
 |---|---|
 | Source fragments | the compaction plan's tasks, counted until the ceiling is passed |
 | Source rows | the plan's fragment row counts |
-| Source bytes | each data file's recorded size (`DataFile::file_size_bytes`, a `CachedFileSize`), with a HEAD request when `get()` is empty; and a HEAD request for each deletion file, since Lance 13's `DeletionFile` records no size. A HEAD goes to the file itself, in the store `Dataset::object_store(base_id)` returns. A data file is `DataFile.path` under its directory: the dataset root joined with `data` when `base_id` is absent, the base's path (`BasePath::extract_path`) joined with `data` when that base `is_dataset_root`, and the base's path alone when the base holds data only. A deletion file is `lance_table::io::deletion::relative_deletion_file_path` (`_deletions/{fragment}-{read_version}-{id}.{suffix}`) under the dataset root, or under its base, which must be a dataset root. This is the rule of Lance's crate-private `data_file_dir_for_base` and `dataset_dir_for_deletion`. A base's root alone, which the collector's borrowed-origin walk returns, is not the file. A HEAD that misses an inherited file would defer the table on every run. The source-fragment ceiling is checked first, so it bounds those requests. |
+| Source bytes | each data file's recorded size (`DataFile::file_size_bytes`, a `CachedFileSize`), with a HEAD request when `get()` is empty; and a HEAD request for each deletion file, since Lance 13's `DeletionFile` records no size. A HEAD goes to the file itself, in the store `Dataset::object_store(base_id)` returns. A data file is `DataFile.path` under its directory: the dataset root joined with `data` when `base_id` is absent, the base's path (`BasePath::extract_path`) joined with `data` when that base `is_dataset_root`, and the base's path alone when the base holds data only. A deletion file is `lance_table::io::deletion::relative_deletion_file_path` (`_deletions/{fragment}-{read_version}-{id}.{suffix}`) under the dataset root, or under its base, which must be a dataset root. This is the rule of Lance's crate-private `data_file_dir_for_base` and `dataset_dir_for_deletion`. The collector already resolves files by it: `probe_directory` returns the directory and `capture_dataset_paths` joins each file to it. The ceiling calls that resolution, not a second copy of Lance's rule. A base's root alone, which the collector's borrowed-origin walk returns, is not the file. A HEAD that misses an inherited file would defer the table on every run. The source-fragment ceiling is checked first, so it bounds those requests. |
 | Managed Blob payload bytes | the descriptor-only scan that compaction sizing already performs (`compaction_blob_batch_rows`). External references count nothing and are never fetched. |
 | Index rebuild rows | the table's row count, when a lagging index would be rebuilt whole |
 
@@ -639,8 +639,12 @@ server applies it before it admits maintenance:
 Only a commit on this graph's main settles the record. A commit on another
 graph of the cluster or on another branch does not, and a run that publishes
 nothing does not move main. A commit still in main's buffer costs no
-request; a released one costs one `__history` read. The walk visits one
-commit per commit published on main since the doubt arose.
+request. A released commit resolves through `__history`, whose cost depends
+on its block: a GET of `blocks/{block}/all.lance` for a closed block written
+as one object, and otherwise that GET's `NotFound`, a list of the block and
+a GET of the range extent, since an ordinary buffer release writes an open
+block as `blocks/{block}/{start}-{end}.lance`. The walk visits one commit
+per commit published on main since the doubt arose.
 
 The rule is later than the storage-outcomes RFC's test, under which the
 branch's next publication settles an unknown one by taking or finding its
@@ -1042,3 +1046,9 @@ dated pending entry in its decision log:
     the counting build.
   - **Sizing paths.** A HEAD names the file: `data` or `_deletions` under
     the location Lance resolves from `base_id`.
+- 2026-10-29: Revised after the fifth review:
+  - **Resolution cost.** A released commit resolves through `__history`; an
+    open block costs a missed GET of `all.lance`, a list and a range GET.
+    The evidence row pins no request count.
+  - **Sizing paths.** The ceiling reuses the collector's `probe_directory`
+    resolution instead of restating Lance's rule.
