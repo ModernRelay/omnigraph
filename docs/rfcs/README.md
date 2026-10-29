@@ -256,4 +256,3 @@ then dated RFCs by date.
 | [2026-10-20](2026-10-20-operator-connections-and-credential-providers.md) | Operator profiles and credential providers | maintainer | draft | in-progress |
 | [2026-10-28](2026-10-28-gq-3-grammar.md) | GQ 3 grammar: the one break and the slots it freezes | maintainer | draft | not-started |
 | [2026-10-29](2026-10-29-remote-optimize-through-the-serving-owner.md) | Remote optimize through the serving owner | maintainer | draft | not-started |
-||||||| ea895066
