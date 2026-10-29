@@ -277,7 +277,7 @@ table's first write:
 |---|---|
 | Source fragments | the compaction plan's tasks, counted until the ceiling is passed |
 | Source rows | the plan's fragment row counts |
-| Source bytes | each data file's recorded size (`DataFile::file_size_bytes`, a `CachedFileSize`), with a HEAD request when `get()` is empty; and a HEAD request for each deletion file, since Lance 13's `DeletionFile` records no size. The source-fragment ceiling is checked first, so it bounds those requests. |
+| Source bytes | each data file's recorded size (`DataFile::file_size_bytes`, a `CachedFileSize`), with a HEAD request when `get()` is empty; and a HEAD request for each deletion file, since Lance 13's `DeletionFile` records no size. A HEAD goes to the store and path Lance resolves for that file, including its `base_id`: `Dataset::object_store(base_id)` and the manifest's `base_paths`, as the collector resolves a borrowed origin (Lance's own directory helpers are crate-private). A path under the table's own root would miss an inherited file, and the table would stay deferred on every run. The source-fragment ceiling is checked first, so it bounds those requests. |
 | Managed Blob payload bytes | the descriptor-only scan that compaction sizing already performs (`compaction_blob_batch_rows`). External references count nothing and are never fetched. |
 | Index rebuild rows | the table's row count, when a lagging index would be rebuilt whole |
 
@@ -401,8 +401,8 @@ hook.
 - **The publication.** The publisher's own outcome stands: committed, not
   committed, or `outcome_unknown` when a manifest request has no definite
   answer after every re-issue. Under the accepted storage-outcomes RFC, an
-  unknown publication keeps the server serving. The branch's next
-  publication settles it.
+  unknown publication keeps the server serving. A later move of main's graph
+  head settles it (§2.4).
 - **After the graph commit.** Nothing fails the operation once the commit is
   durable. The configuration clear and the artifact are reported as tail
   outcomes (§1.8). Today `clear_manifest_auto_cleanup` runs after the
@@ -432,17 +432,47 @@ hook.
      changes an answer.
    - The full edge scan starts only if no cancellation, shutdown or deployment
      drain is pending. The scan reads only, so it may be abandoned.
-   - The served path bounds the artifact before it builds it, against a
-     serve setting (`artifact_write_limit`, default 512 MiB, to be confirmed
-     by qualification). Today `GraphIndex::build` allocates the whole index
-     over every edge type and `save` serializes it before any size is known.
-     First, the fixed-width part of the body, exact from the manifest's row
-     counts (each id's 4-byte length prefix, and each edge type's offsets and
-     targets in both directions), is compared with the limit; over it, the
-     build does not start. Then the build counts the bytes it would serialize
-     as it adds each id and edge, and stops once the count passes the limit.
-     Either way the outcome is `skipped(size_limit)`, and a load rebuilds the
-     adjacency in memory. `MAX_ARTIFACT_BYTES` (4 GiB) still bounds loads.
+   - The served path bounds the artifact before and during its build,
+     against a serve setting (`artifact_write_limit`, default 512 MiB, to be
+     confirmed by qualification). The limit covers the whole object
+     `serialize` writes: the magic, format version and header length (20
+     bytes), the JSON header (at most `MAX_HEADER_BYTES`, 16 MiB), every
+     section's prelude, the id dictionaries, and each edge type's offsets and
+     targets in both directions. Today no size is known until the end:
+     `GraphIndex::build` collects every scan batch of an edge table
+     (`try_collect`) before it inserts an id, `CsrIndex::build` allocates the
+     offsets and targets, and `save` serializes after that.
+   - **Pre-check, a lower bound.** The dictionaries hold the distinct
+     endpoint strings of the edges' `src` and `dst`, so neither their count
+     nor their bytes is known before the scan, and each offset array has one
+     entry per distinct endpoint of its node type, plus one. Only the targets
+     are fixed in advance: one `u32` per edge in each direction. The
+     pre-check reads each pinned edge table's live row count from Lance
+     (`Dataset::count_rows(None)`: physical rows less deleted rows, from
+     fragment metadata), which is the number of rows the scan returns. Eight
+     bytes per edge plus the framing is therefore a lower bound on the
+     object. If it exceeds the limit, no scan starts.
+   - **Counting build.** The build reads each edge table's scan one batch at
+     a time. After each batch it adds the bytes that batch adds to the
+     object: 4 bytes plus the UTF-8 length for each new distinct endpoint;
+     4 bytes in every offset array over that endpoint's node type, since a
+     dictionary is shared by every edge type and direction that ends at its
+     type; and 8 bytes per edge. The preludes, each offset array's extra
+     entry and the header are known before the scan, except the header's
+     count and length fields, which are counted at their widest. The count
+     only grows. Once it passes the limit, the build drops what it holds and
+     stops before it keeps another batch and before `CsrIndex::build`
+     allocates.
+   - **Memory.** Beyond one scan batch, the build holds structures that are
+     a constant multiple of the counted bytes: each id in two allocations
+     (the map key and the dense vector), each edge as a pair and then in the
+     CSR and CSC arrays, and `serialize` copies its payload once after the
+     header. A traversal read that finds no artifact builds the same
+     structure today with no limit. The in-region qualification measures the
+     multiple before the default is confirmed.
+   - Either way the outcome is `skipped(size_limit)`, with the counted bytes
+     and the limit, and a load rebuilds the adjacency in memory.
+     `MAX_ARTIFACT_BYTES` (4 GiB) still bounds loads.
    - Once the single object write is issued, it is awaited and never dropped.
      The artifact key is a mutable key, so a dropped write would leave its
      outcome unknown.
@@ -505,7 +535,7 @@ its report synchronously, as today.
 | Section | Holds |
 |---|---|
 | Header | the ledger id; at most one **active** operation; the **unresolved** operations (§2.4); a bounded list of **terminal** operations, newest first; and each graph's resume position |
-| Per operation | the operation id; the request digest; graph and branch; kind; exact options; principal; acceptance time; state; the intent nonce and input head (from §1.6); per-table outcomes; tail outcomes; timings (queued, gates held, computing); the terminal reason |
+| Per operation | the operation id; the request digest; graph and branch; kind; exact options; principal; acceptance time; state; the intent nonce and input head (from §1.6); the published commit's history id, written by the terminal write (from the publisher's answer) or by resolution (§2.4); per-table outcomes; tail outcomes; timings (queued, gates held, computing); the terminal reason |
 
 Terminal records are bounded by count (32), per-record size (1 MiB) and total
 size (4 MiB). The oldest is evicted first, and an unresolved record is never
@@ -564,24 +594,42 @@ server applies it before it admits maintenance:
   the version after it can still be in flight.
 - **Main's graph head has moved.** Under the exact head expectation, only the
   commit on main whose parent is the input head can be this run's. The server
-  walks main's `parent_commit_id` chain from its tip back to the input head
-  through history; `read_commit` follows an id into its archived block, so a
-  commit that a later publication archived is still found. If the input
-  head's child answers the nonce (`commit_id_answers`), the run is
-  `succeeded` with its recorded outcomes. Otherwise it is `failed` with
-  `not_committed`: every `__manifest` version an attempt of this run could
-  have taken is occupied, since a later attempt would have read the moved
-  head and refused before its request. Its staging becomes collectible.
+  reads main's `parent_commit_id` chain from its tip back toward the input
+  head through history. `read_commit` follows an id into its archived block,
+  so a commit that a later publication archived is still found. Every commit
+  on main is written on main, a fast-forward merge included, so each step's
+  `graph_manifest_version` is below the one before it. The walk therefore
+  stops at the input head, or at the first link whose version is not above
+  the input head's recorded version. It ends in one of three ways:
+  - **The input head's child was read and answers the nonce**
+    (`commit_id_answers`). The run is `succeeded`. The resolution write
+    stores that child's history id (`hb1.…`) as the published commit, with
+    the recorded outcomes. The id cannot be stored earlier: the callback
+    runs before `attempt_commit_id` chooses the block and slot.
+  - **The child was read and does not answer the nonce.** The run is
+    `failed` with `not_committed`. Every `__manifest` version an attempt of
+    this run could have taken is occupied, since a later attempt would have
+    read the moved head and refused before its request. Its staging becomes
+    collectible.
+  - **Neither.** A history read fails, a link is absent (`read_commit`
+    returns `Ok(None)`), or the walk passes the input head's version without
+    meeting it. None of these shows that the commit is absent, and a terminal
+    record is never rewritten, so the record stays `publishing`. A lookup
+    reports where the walk stopped.
 
 Only a commit on this graph's main settles the record. A commit on another
 graph of the cluster or on another branch does not, and a run that publishes
-nothing does not move main. The walk stops at the input head, so it reads one
-history entry per commit published on main since the doubt arose.
+nothing does not move main. The walk reads one history entry per commit
+published on main since the doubt arose.
 
-The rule matches the storage-outcomes RFC: an unknown publication is
-settled by the branch's next commit. A record that was `accepted` or
-`running`, with no live run in this process, is `interrupted`. The callback
-precedes every manifest request, so no attempt sent one.
+The rule is later than the storage-outcomes RFC's test, under which the
+branch's next publication settles an unknown one by taking or finding its
+`__manifest` version. Here only a move of main's graph head settles the
+record. A later version that only changes configuration (`UpdateConfig`)
+leaves it `publishing`. Waiting for the graph head is the safe test. A record
+that was `accepted` or `running`, with no live run in this process, is
+`interrupted`. The callback precedes every manifest request, so no attempt
+sent one.
 
 A run that ends with its publication in doubt leaves the active slot and
 moves to the unresolved list. Other maintenance can then run, and its own
@@ -850,16 +898,17 @@ Every row extends an existing owner in [testing](../dev/testing.md).
 | `optimize_as` enforces `maintain`; `admin` does not grant it | allow and deny cases | `policy_engine_chassis.rs` |
 | The run stops starting tables at `max_gate_hold`, publishes once and reports every table | integration test with a fake clock | `integration/maintenance.rs` |
 | A full-catalog run resumes at the first table the time bound or the run budget deferred, visiting it first; a `resource_limit` deferral neither sets the position nor stops later tables; a run whose no-op prefix exceeds the bound still reaches the tail over successive runs | many-table fixture with a fake clock | `integration/maintenance.rs`, server `maintenance_routes` |
-| A table over a ceiling, the first table included, is deferred with its measure and nothing is written for it; counting stops at the ceiling; deletion files are counted | fixtures over each ceiling, including a large managed Blob, an external reference and a fragment with a deletion file | `integration/maintenance.rs` |
+| A table over a ceiling, the first table included, is deferred with its measure and nothing is written for it; counting stops at the ceiling; deletion files are counted; an inherited data or deletion file is sized at its `base_id` location | fixtures over each ceiling, including a large managed Blob, an external reference, a fragment with a deletion file and a table whose files sit under another base | `integration/maintenance.rs` |
 | A table-local failure fails only that table, and the other tables publish | failpoint in one table's rewrite | `failpoints.rs`, `detached_commit_matrix.rs` |
 | Partial full-text coverage and an untrainable vector stay pending with their remedy | existing pending-index fixtures | `integration/maintenance.rs` |
 | A failure before the publication is labelled, and the server keeps serving | failpoints in the per-table loop and in `before_publish` | `failpoints.rs`, server `boot_settings` |
 | A failed `before_publish` publishes nothing | failpoint | `failpoints.rs` |
 | Writers that pass no callback make no control-object request | unchanged rows for mutate, load and merge | DST storage-cost golden |
-| The recorded nonce resolves a published run through `commit_id_answers`, including an `hb1` id in a new block | publish across a block boundary, then resolve | server `maintenance_routes`, cluster `failpoints.rs` |
-| An in-doubt publication stays `publishing`, leaves the active slot, and is settled by the next main commit either way; a configuration-only `__manifest` version, a commit on another graph and a no-op run do not settle it; a cancellation leaves it `publishing` | the catalog's unresolved-manifest seam, then each later write | `omnigraph-catalog` tests, server `boot_settings`, `maintenance_routes` |
+| The recorded nonce resolves a published run through `commit_id_answers`, including an `hb1` id in a new block, and the terminal record stores the child's history id | publish across a block boundary, then resolve | server `maintenance_routes`, cluster `failpoints.rs` |
+| A failed history read, an absent link, or a walk that passes the input head's version without meeting it leaves the record `publishing`; only a read child that does not answer the nonce records `not_committed` | history read faults and a fabricated chain under the resolver | server `maintenance_routes` |
+| An in-doubt publication stays `publishing`, leaves the active slot, and is settled by the next move of main's graph head either way; a configuration-only `__manifest` version, a commit on another graph and a no-op run do not settle it; a cancellation leaves it `publishing` | the catalog's unresolved-manifest seam, then each later write | `omnigraph-catalog` tests, server `boot_settings`, `maintenance_routes` |
 | A post-commit failure in the configuration clear or the artifact does not fail the operation, and the clear reports `cleared`, `nothing_to_clear`, `failed` or `unknown` | failpoints after the publication | `integration/maintenance.rs` |
-| The artifact build is refused from row counts, or stops once its serialized size passes `artifact_write_limit` | a small limit over a fixture with edges | `integration/maintenance.rs` |
+| The pre-check refuses a build whose target arrays and framing alone pass `artifact_write_limit`, before any scan; the counting build stops before it keeps another batch and before `CsrIndex::build`; under the limit, the count is never below the bytes `serialize` writes | a small limit over a fixture with edges, a scan seam that counts batches, and a comparison of the count with the written object | `integration/maintenance.rs`, in-source `graph_index` tests |
 | A main write proceeds during the artifact scan | seam that holds the scan | `integration/maintenance.rs` |
 | An issued artifact write completes before release; SIGTERM during the scan releases cleanly | served shutdown journey | `boot_settings` (`owned_shutdown`) |
 | Cancellation stops at a safe boundary; a publication in progress completes and the run is `succeeded` | engine and server tests | `integration/maintenance.rs`, `boot_settings` |
@@ -923,8 +972,8 @@ dated pending entry in its decision log:
   - **Boundary.** The cluster lock, not local storage, is the boundary.
   - **Commit identity.** The record stores the intent nonce, and resolution
     matches history with `commit_id_answers`.
-  - **In-doubt publications.** They stay non-terminal until main's next
-    version settles them, in the live process and after restart.
+  - **In-doubt publications.** They stay non-terminal until a move of main's
+    graph head settles them, in the live process and after restart.
   - **Writer gates.** They are released before the artifact scan, and the
     configuration clear is reported truthfully.
   - **Coverage.** A resume position lets successive runs reach the tail.
@@ -949,3 +998,15 @@ dated pending entry in its decision log:
     is bounded before and during its build, not after it.
   - **Callback.** An optional argument of the publication helper; writers
     that pass none are unchanged.
+- 2026-10-29: Revised after the third review:
+  - **Resolution.** `not_committed` needs a read of the input head's child
+    that does not answer the nonce. A failed read, an absent link, or a walk
+    that passes the input head's version without meeting it leaves the
+    record `publishing`. Success stores the child's history id.
+  - **Artifact.** The pre-check is a lower bound from the edge tables' live
+    row counts: the target arrays and the framing. The build reads one batch
+    at a time and counts the bytes `serialize` would write, including the
+    header and preludes, and stops before it keeps another batch or
+    allocates the CSR arrays.
+  - **Sizing.** A HEAD for a data or deletion file goes to the location its
+    `base_id` names.
