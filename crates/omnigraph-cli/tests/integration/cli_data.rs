@@ -1025,8 +1025,7 @@ fn optimize_json_succeeds_on_local_graph() {
     let rows_before = output_success(cli().arg("export").arg("--target").arg(&graph)).stdout;
     let rebuilt = parse_stdout_json(&output_success(
         cli()
-            .arg("rebuild-full-text-indexes")
-            .arg("--target")
+            .args(["index", "rebuild", "--kind", "full-text", "--target"])
             .arg(&graph)
             .args(["--as", "act-cli-rebuild", "--json"]),
     ));
@@ -1059,8 +1058,7 @@ fn optimize_json_succeeds_on_local_graph() {
     let feature_before = resolved_snapshot_id(&graph, "search-upgrade");
     let human_output = output_success(
         cli()
-            .arg("rebuild-full-text-indexes")
-            .arg("--target")
+            .args(["index", "rebuild", "--kind", "full-text", "--target"])
             .arg(&graph)
             .args(["--branch", "search-upgrade"]),
     );
@@ -1095,19 +1093,179 @@ fn optimize_json_succeeds_on_local_graph() {
     );
 }
 
+/// The physical `Scan` access the explain document records for `query` on
+/// `branch`: `index_probe` names the indexes Lance's own scanner would probe.
+fn scan_access(graph: &std::path::Path, query: &std::path::Path, branch: &str) -> (String, Value) {
+    let explain = parse_stdout_json(&output_success(
+        cli()
+            .arg("query")
+            .arg("--query")
+            .arg(query)
+            .args(["--branch", branch, "--format", "json", "--target"])
+            .arg(graph),
+    ));
+    let scan = explain["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["tree"] == "physical" && row["node"] == "Scan")
+        .expect("the explain document has a physical scan");
+    let detail: Value = serde_json::from_str(scan["detail"].as_str().unwrap()).unwrap();
+    (
+        detail["access"].as_str().unwrap().to_string(),
+        detail["index"].clone(),
+    )
+}
+
+/// `index build` builds the declared indexes a branch lacks (a type whose
+/// first rows land on the branch) and refreshes a BTREE whose coverage lags
+/// the branch's new rows, in one publication on that branch only. Full-text
+/// coverage is reported pending with the rebuild that refreshes it, and a
+/// second run publishes nothing.
+#[test]
+fn index_build_builds_missing_and_lagging_indexes_on_a_branch_issue_840() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    let schema = temp.path().join("schema.pg");
+    fs::write(
+        &schema,
+        format!(
+            "{}\nnode Tag {{\n    slug: String @key\n    rank: I64 @index\n}}\n",
+            fs::read_to_string(fixture("test.pg")).unwrap()
+        ),
+    )
+    .unwrap();
+    output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&graph));
+    load_fixture(&graph);
+    let on_main = parse_stdout_json(&output_success(
+        cli()
+            .args(["index", "build", "--json", "--target"])
+            .arg(&graph),
+    ));
+    assert_eq!(on_main["branch"], "main");
+    assert!(on_main["graph_commit_id"].is_string(), "{on_main}");
+    assert!(
+        on_main["indexes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|index| index["action"] == "built" && index["type_key"] != "node:Tag"),
+        "an empty table has nothing to index: {on_main}"
+    );
+
+    output_success(
+        cli()
+            .args(["branch", "create", "feature", "--target"])
+            .arg(&graph),
+    );
+    let rows = temp.path().join("feature.jsonl");
+    fs::write(
+        &rows,
+        concat!(
+            "{\"type\":\"Tag\",\"data\":{\"slug\":\"graphs\",\"rank\":1}}\n",
+            "{\"type\":\"Tag\",\"data\":{\"slug\":\"search\",\"rank\":2}}\n",
+            "{\"type\":\"Person\",\"data\":{\"name\":\"Eve\",\"age\":41}}\n",
+        ),
+    )
+    .unwrap();
+    output_success(
+        cli()
+            .args(["load", "--mode", "merge", "--branch", "feature", "--data"])
+            .arg(&rows)
+            .arg("--target")
+            .arg(&graph),
+    );
+    let by_rank = temp.path().join("by_rank.gq");
+    fs::write(
+        &by_rank,
+        "explain query by_rank() {\n  match {\n    $t: Tag\n    $t.rank > 1\n  }\n  return { $t.slug }\n}\n",
+    )
+    .unwrap();
+    assert_eq!(scan_access(&graph, &by_rank, "feature").0, "sequential");
+    let main_before = resolved_snapshot_id(&graph, "main");
+    let feature_before = resolved_snapshot_id(&graph, "feature");
+
+    let built = parse_stdout_json(&output_success(
+        cli()
+            .args([
+                "index", "build", "--branch", "feature", "--json", "--target",
+            ])
+            .arg(&graph)
+            .args(["--as", "act-cli-index"]),
+    ));
+    assert_eq!(built["branch"], "feature");
+    assert_eq!(
+        built["indexes"],
+        serde_json::json!([
+            {"type_key": "node:Person", "property": "__id", "kind": "btree", "action": "refreshed"},
+            {"type_key": "node:Tag", "property": "__id", "kind": "btree", "action": "built"},
+            {"type_key": "node:Tag", "property": "rank", "kind": "btree", "action": "built"},
+            {"type_key": "node:Tag", "property": "slug", "kind": "full_text", "action": "built"},
+        ])
+    );
+    let pending = built["pending_indexes"].as_array().unwrap();
+    assert_eq!(pending.len(), 1, "{built}");
+    assert_eq!(pending[0]["type_key"], "node:Person");
+    assert_eq!(pending[0]["property"], "name");
+    let reason = pending[0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(
+            "omnigraph index rebuild --kind full-text --target <target> --branch feature"
+        ),
+        "{reason}"
+    );
+    let commit_id = built["graph_commit_id"].as_str().unwrap();
+    let commit = parse_stdout_json(&output_success(
+        cli()
+            .args(["commit", "show", commit_id, "--target"])
+            .arg(&graph)
+            .arg("--json"),
+    ));
+    assert_eq!(commit["actor_id"], "act-cli-index");
+    assert_eq!(commit["graph_branch"], "feature");
+    assert_eq!(resolved_snapshot_id(&graph, "feature"), commit_id);
+    assert_ne!(commit_id, feature_before);
+    assert_eq!(resolved_snapshot_id(&graph, "main"), main_before);
+    let (access, index) = scan_access(&graph, &by_rank, "feature");
+    assert_eq!(access, "index_probe");
+    assert_eq!(index, serde_json::json!(["rank_idx"]));
+
+    let again = output_success(
+        cli()
+            .args(["index", "build", "--branch", "feature", "--target"])
+            .arg(&graph),
+    );
+    let human = stdout_string(&again);
+    assert!(
+        human.contains("branch feature, 0 indexes built or refreshed"),
+        "{human}"
+    );
+    assert!(
+        human.contains("index pending on node type 'Person', property 'name'"),
+        "{human}"
+    );
+    assert!(
+        human.contains("no-op; no graph commit published"),
+        "{human}"
+    );
+    assert_eq!(resolved_snapshot_id(&graph, "feature"), commit_id);
+}
+
 #[test]
 fn maintenance_refuses_server_targets_before_network() {
     let server = crate::support::managed_http::IntentApiFixture::graph(Vec::new());
     for command in [
-        "optimize",
-        "rebuild-full-text-indexes",
-        "repair",
-        "cleanup",
-        "upgrade",
+        &["optimize"][..],
+        &["index", "build"],
+        &["index", "rebuild", "--kind", "full-text"],
+        &["rebuild-full-text-indexes"],
+        &["repair"],
+        &["cleanup"],
+        &["upgrade"],
     ] {
         let output = output_failure(
             cli()
-                .arg(command)
+                .args(command)
                 .args(["--target"])
                 .fixture_target(&server.origin),
         );
@@ -1187,10 +1345,25 @@ fn query_by_name_against_a_store_needs_a_server() {
 
 #[test]
 fn maintenance_positional_address_is_removed() {
-    for command in ["optimize", "rebuild-full-text-indexes"] {
-        let output = output_failure(cli().args([command, "https://graph.example.invalid"]));
+    for command in [
+        &["optimize"][..],
+        &["index", "build"],
+        &["index", "rebuild", "--kind", "full-text"],
+        &["rebuild-full-text-indexes"],
+    ] {
+        let output = output_failure(cli().args(command).arg("https://graph.example.invalid"));
         assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
     }
+}
+
+/// `--kind` is required, so a later kind cannot change what a bare
+/// `index rebuild` means.
+#[test]
+fn index_rebuild_requires_a_kind_issue_840() {
+    let output = output_failure(cli().args(["index", "rebuild", "--target", "./graph.omni"]));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--kind"), "{stderr}");
+    assert!(output.stdout.is_empty());
 }
 
 #[test]
@@ -1229,7 +1402,7 @@ fn repair_json_reports_noop_on_clean_graph() {
 }
 
 #[test]
-fn rebuild_full_text_indexes_json_noops_without_full_text_properties() {
+fn index_rebuild_json_noops_without_full_text_properties_issue_840() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     let schema = temp.path().join("scalar.pg");
@@ -1240,8 +1413,7 @@ fn rebuild_full_text_indexes_json_noops_without_full_text_properties() {
     let version_before = manifest_dataset_version(&graph);
     let rebuilt = parse_stdout_json(&output_success(
         cli()
-            .arg("rebuild-full-text-indexes")
-            .arg("--target")
+            .args(["index", "rebuild", "--kind", "full-text", "--target"])
             .arg(&graph)
             .arg("--json"),
     ));
@@ -1249,10 +1421,25 @@ fn rebuild_full_text_indexes_json_noops_without_full_text_properties() {
     assert_eq!(rebuilt["graph_commit_id"], Value::Null);
     assert_eq!(rebuilt["rebuilt_indexes"], serde_json::json!([]));
     assert_eq!(rebuilt["warnings"], serde_json::json!([]));
-    let human_output = output_success(
+    // The retired spelling still runs the same operation for one release and
+    // says so on stderr, leaving stdout the same JSON.
+    let alias = output_success(
         cli()
             .arg("rebuild-full-text-indexes")
             .arg("--target")
+            .arg(&graph)
+            .arg("--json"),
+    );
+    assert_eq!(parse_stdout_json(&alias), rebuilt);
+    let alias_stderr = String::from_utf8(alias.stderr).unwrap();
+    assert!(
+        alias_stderr.contains("`rebuild-full-text-indexes` is deprecated")
+            && alias_stderr.contains("omnigraph index rebuild --kind full-text"),
+        "{alias_stderr}"
+    );
+    let human_output = output_success(
+        cli()
+            .args(["index", "rebuild", "--kind", "full-text", "--target"])
             .arg(&graph),
     );
     let human = stdout_string(&human_output);
@@ -5741,8 +5928,8 @@ fn studio_opens_a_server_target_whose_digests_target_inspect_reports() {
 /// without a policy allows everything once it opens; a store that holds no
 /// graph refuses, a damaged one keeps its own failure; a server target
 /// answers through its access route with the target's token, `--as` riding
-/// as the actor assertion; and a catalogue or managed target refuses before
-/// any I/O.
+/// as the actor assertion; managed targets use the same route with an issued
+/// identity, and catalogue access refuses before any I/O.
 #[test]
 fn access_reports_what_the_caller_may_do_at_a_target() {
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
@@ -6027,20 +6214,65 @@ fn access_reports_what_the_caller_may_do_at_a_target() {
     );
     served.assert_complete();
 
-    // The catalogue carries no policy and managed data qualifies each
-    // operation separately: both refuse before any I/O.
-    for (target, code) in [
-        ("og_catalog", "target_unknown"),
-        ("cloud", "target_incompatible"),
-    ] {
-        let refused = output_failure(
-            cli()
-                .env("OMNIGRAPH_HOME", home)
-                .args(["access", "--target", target, "--json"]),
-        );
-        let refusal = parse_stdout_json(&refused);
-        assert_eq!(refusal["code"], code, "{target}: {refusal}");
-    }
+    // The catalogue carries no policy and refuses before any I/O.
+    let refused = output_failure(cli().env("OMNIGRAPH_HOME", home).args([
+        "access",
+        "--target",
+        "og_catalog",
+        "--json",
+    ]));
+    let refusal = parse_stdout_json(&refused);
+    assert_eq!(refusal["code"], "target_unknown", "{refusal}");
+}
+
+#[test]
+fn managed_access_uses_the_selected_identity_and_preserves_branch_scope() {
+    use crate::support::managed_http::{IntentApiFixture, IntentReply};
+    let data = IntentApiFixture::graph(vec![IntentReply::json(
+        200,
+        json!({
+            "actor_id":"principal:principal-one","graph_id":"knowledge","graph_wide":["read"],
+            "branch":"feature","target_branch":"main","actions":["read","branch_merge"]
+        }),
+    )]);
+    let (api, tokens) = IntentApiFixture::identity_issuer(&data.origin, 1);
+    let config = tempdir().unwrap();
+    write_managed_data_target(config.path(), &api.origin, &data.origin);
+    let output = output_success(
+        managed_command(config.path(), &api.origin, "managed-test").args([
+            "access",
+            "--branch",
+            "feature",
+            "--target-branch",
+            "main",
+            "--json",
+        ]),
+    );
+    let body = parse_stdout_json(&output);
+    assert_eq!(body["protocol"], 2);
+    assert_eq!(body["actor_id"], "principal:principal-one");
+    assert_eq!(body["target"], "managed-test");
+    assert_eq!(body["source"], "server");
+    let requests = data.workflow_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].path,
+        "/graphs/knowledge/access?branch=feature&target_branch=main"
+    );
+    assert_eq!(
+        requests[0].headers.get("authorization"),
+        Some(&format!("Bearer {}", tokens[0]))
+    );
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("omnigraph-http-api")
+            .map(String::as_str),
+        Some("0.14")
+    );
+    assert!(!stdout_string(&output).contains(&tokens[0]));
+    api.assert_complete();
+    data.assert_complete();
 }
 
 #[test]

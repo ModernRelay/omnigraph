@@ -1,5 +1,5 @@
 //! `omnigraph mcp`: MCP over stdio for an agent that starts its tools as
-//! child processes, relayed to an existing server target's `/mcp`.
+//! child processes, relayed to an existing server or managed target's `/mcp`.
 //!
 //! The agent's configuration names only the target; its token stays in this
 //! process. Each line on stdin is one JSON-RPC message, sent as one POST;
@@ -109,7 +109,7 @@ pub(crate) async fn run(
     let graph = crate::scope::graph_selection(scope.target, scope.graph)?
         .ok_or_else(|| eyre!("the MCP bridge relays only to a server target"))?
         .to_string();
-    let upstream = Upstream::open(scope.operator, scope.target, scope.actor)?;
+    let upstream = Upstream::open(scope.operator, scope.target, scope.actor).await?;
     let target = scope.target.label().to_string();
     let mut shutdown = Shutdown::register()?;
     let mut lines = stdin_lines()?;

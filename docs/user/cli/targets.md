@@ -103,10 +103,12 @@ Each profile or server target chooses one provider:
 | Environment token | `{provider: token, source: {env: OG_SERVICE_TOKEN}}` |
 | Mounted token | `{provider: token, source: {file: /var/run/omnigraph/token}}` |
 | Credential helper | `{provider: exec, command: [/usr/local/bin/credential-helper, get], timeout: 30s}` |
+| Managed OAuth client credentials | `{provider: oauth_client_credentials, token_endpoint: https://auth.example.com/oauth2/token, client_id: client_example, client_secret: {env: OG_CLIENT_SECRET}}` |
 | Explicit anonymous server | `{provider: anonymous}` |
 
-`omnigraph` is managed-only; `anonymous` is standalone-only. Names grant no privileges,
-and token/exec sources do not qualify arbitrary workload federation.
+`omnigraph` and `oauth_client_credentials` are managed-only; `anonymous` is
+standalone-only. Names grant no privileges, and token/exec sources do not qualify
+arbitrary workload federation.
 
 Token profiles declare exactly one source. `store` uses secure local custody;
 `env` reads only the named variable; `file` reads one bounded regular-file
@@ -124,10 +126,9 @@ The helper receives one version-1 JSON request on stdin with purpose, endpoint,
 `interactive: false` and applicable identity constraints. It returns one object
 with `version: 1`, `credential: {type: bearer, token: ...}` and optional RFC 3339
 `expires_at`. Unknown fields, expired results and unsupported types refuse.
-Expiry is checked again immediately before an authenticated request is sent,
-including after discovery. An expired credential refuses before submission;
-the CLI does not replay a mutation to refresh credentials. Managed control and
-data credentials retain their independent expiry times.
+Expiry is rechecked before authenticated dispatch, including after discovery.
+Renewal can precede submission but never replay a mutation. Managed control and
+data credentials have independent expiry times.
 Without expiry the result is not cached across invocations. Timeout terminates
 the helper process group; stderr is not echoed in routine errors.
 Output cannot change routing or prove identity. Helpers inherit the process
@@ -144,11 +145,10 @@ profile credential for a cluster-bound data credential; control and refresh
 tokens never go to the graph endpoint. Service and graph policy still authorize
 operations independently of credential acquisition.
 
-For managed resource commands and managed-target credential export, env/file/exec
-profiles keep exchanged credentials only in invocation memory, without requiring
-an OS store. This is explicit source-based custody, not a store-failure fallback.
-Human profiles, stored tokens and explicit `cluster token` administration retain
-secure-store requirements.
+For managed resource commands and managed-target credential export, env/file/exec/OAuth
+profiles keep exchanged credentials in invocation memory. Human profiles, stored
+tokens and existing providers' explicit `cluster token` require secure storage.
+OAuth always uses invocation memory ([workload setup](managed-team.md#configure-an-unattended-workload-profile)); store failure never changes custody.
 
 ## Login and registration
 
@@ -209,9 +209,9 @@ credentials without rerouting existing operations.
 omnigraph access --target standalone --graph knowledge --branch main --json
 ```
 
-`access` reports your actor and permissions for direct graphs and registered
-server targets; managed targets do not support this command. Use `--branch`
-for branch permissions and `--target-branch` for create/merge permissions. JSON uses `protocol: 2` and `actor_id`; see
+`access` reports your actor and permissions for direct, server and managed graphs.
+Use `--branch` for branch permissions and `--target-branch` for create/merge
+permissions. JSON uses `protocol: 2` and `actor_id`; see
 [access semantics](../operations/policy.md#learn-your-access) and [JSON protocols](../install.md#verify).
 
 ## Rename registrations and profiles

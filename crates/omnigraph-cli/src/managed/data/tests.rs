@@ -129,6 +129,53 @@ async fn loaded_data_credential_expiry_is_rechecked_after_discovery() {
     }
 }
 
+#[tokio::test]
+async fn managed_mcp_credential_expiry_is_rechecked_after_discovery() {
+    let expiry = OffsetDateTime::now_utc().unix_timestamp() + 2;
+    let data = IntentApiFixture::graph_with_discovery_hook(vec![], move || {
+        while OffsetDateTime::now_utc().unix_timestamp() < expiry {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+    let mut context = context();
+    context.endpoint = Some(data.origin.clone());
+    let mut credential = identity_credential(&context, &data.origin);
+    set_identity_expiry(&mut credential, expiry);
+    crate::operator_routing::test_transport_scope(&[&data.origin], async {
+        let GraphClient::Remote { http, token, .. } =
+            resolve_loaded(None, &context, credential).unwrap()
+        else {
+            unreachable!()
+        };
+        let request = http
+            .request(Method::POST, format!("{}/mcp", data.origin))
+            .unwrap()
+            .bearer_auth(token.unwrap())
+            .body("{}");
+        let error = http.send_mcp(request).await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<crate::credential_sources::CredentialError>(),
+            Some(&crate::credential_sources::CredentialError::Expired)
+        );
+        assert_eq!(data.requests().len(), 1);
+        assert!(!data.requests()[0].headers.contains_key("authorization"));
+        data.assert_complete();
+    })
+    .await;
+}
+
+#[test]
+fn refused_credential_removal_preserves_a_concurrent_replacement() {
+    let context = context();
+    let store = MemoryStore::default();
+    let credential = identity_credential(&context, "https://data.example");
+    save(&store, &context, &credential);
+    remove_refused(&store, &context, "another-refused-token").unwrap();
+    assert!(store.get(&key(&context)).unwrap().is_some());
+    remove_refused(&store, &context, &credential.token).unwrap();
+    assert!(store.get(&key(&context)).unwrap().is_none());
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn valid_data_credential_remains_usable_when_control_expires_during_discovery() {
@@ -199,6 +246,11 @@ async fn valid_data_credential_remains_usable_when_control_expires_during_discov
                 assert_eq!(data.requests().len(), 2);
                 assert_eq!(data.requests()[1].headers["authorization"], expected);
                 assert_eq!(
+                    std::fs::read_to_string(&calls).unwrap(),
+                    "called\n",
+                    "the valid data request does not renew its expired control credential",
+                );
+                assert_eq!(
                     authentication
                         .token()
                         .await
@@ -206,7 +258,11 @@ async fn valid_data_credential_remains_usable_when_control_expires_during_discov
                         .downcast_ref::<crate::credential_sources::CredentialError>(),
                     Some(&crate::credential_sources::CredentialError::Expired)
                 );
-                assert_eq!(std::fs::read_to_string(&calls).unwrap(), "called\n");
+                assert_eq!(
+                    std::fs::read_to_string(&calls).unwrap(),
+                    "called\ncalled\n",
+                    "explicit control acquisition retries the helper, which still returns an expired credential",
+                );
                 data.assert_complete();
             })
             .await;
@@ -312,6 +368,7 @@ async fn stored_token_cache_survives_control_outage_but_not_expiry_or_generation
                     &auth.profile,
                     &auth.derived_credentials,
                     &persistent,
+                    false,
                 );
                 let api = Api::new(context.api.clone(), Some("test-control-token".into())).unwrap();
                 mint_for_principal(&store, &context, &api, 3600, Some("alice"))
@@ -370,6 +427,7 @@ async fn stored_token_cache_survives_control_outage_but_not_expiry_or_generation
                     &fresh.profile,
                     &fresh.derived_credentials,
                     &persistent,
+                    false,
                 );
                 assert!(store.get(&key(&context)).unwrap().is_none());
                 let failure = acquire_resource(
@@ -442,6 +500,37 @@ async fn token_clear_skips_unavailable_transport_and_removes_local_credential() 
                     assert_eq!(result["data"]["local_credential_removed"], true);
                     assert_eq!(result["data"]["revocation_performed"], false);
                     assert!(store.get(&key(&context)).unwrap().is_none());
+                    // Invocation-only profiles cannot claim to have removed a
+                    // credential from a previous process or persistent source.
+                    let invocation = InvocationCredentials::default();
+                    let unavailable = UnavailablePersistentStore::default();
+                    let profile = crate::operator_schema::AuthProfile::OauthClientCredentials {
+                        token_endpoint: "https://provider.example/token".into(),
+                        client_id: "client_one".into(),
+                        client_secret: crate::operator_schema::ClientSecretSource::Env {
+                            env: "UNUSED_CLIENT_SECRET".into(),
+                        },
+                        scope: None,
+                    };
+                    let selected =
+                        ResourceStore::for_profile(&profile, &invocation, &unavailable, true);
+                    let cleared = token_with_store(&cli, &context, None, true, &selected)
+                        .await
+                        .unwrap();
+                    assert_eq!(cleared["data"]["local_credential_removed"], false);
+                    invocation
+                        .put(&key(&context), "invocation-only-credential")
+                        .unwrap();
+                    let cleared = token_with_store(&cli, &context, None, true, &selected)
+                        .await
+                        .unwrap();
+                    assert_eq!(cleared["data"]["local_credential_removed"], true);
+                    assert!(invocation.get(&key(&context)).unwrap().is_none());
+                    assert_eq!(
+                        unavailable.0.get(),
+                        0,
+                        "OAuth clear never probes prior persistent custody"
+                    );
                     assert!(api.requests().is_empty());
                 },
             )
@@ -508,8 +597,9 @@ async fn external_resource_and_export_acquire_only_invocation_credentials_withou
         crate::operator_routing::test_transport_scope(&[&cp.origin], async {
         let unavailable = UnavailablePersistentStore::default();
         let memory = InvocationCredentials::default();
-        let store = ResourceStore::for_profile(&profile, &memory, &unavailable);
+        let store = ResourceStore::for_profile(&profile, &memory, &unavailable, false);
         assert!(!store.persistent());
+        assert!(ResourceStore::for_profile(&profile, &memory, &unavailable, true).persistent());
         let exported = acquire_resource(
             None,
             &context,
@@ -559,7 +649,7 @@ async fn external_source_failure_never_falls_back_or_submits_an_exchange() {
     for profile in external_profiles() {
         let unavailable = UnavailablePersistentStore::default();
         let memory = InvocationCredentials::default();
-        let store = ResourceStore::for_profile(&profile, &memory, &unavailable);
+        let store = ResourceStore::for_profile(&profile, &memory, &unavailable, false);
         let context = context();
         let failure = acquire_resource(
             Some("knowledge"),
@@ -595,7 +685,7 @@ async fn persistent_profiles_do_not_fall_back_to_invocation_custody() {
     ] {
         let unavailable = UnavailablePersistentStore::default();
         let memory = InvocationCredentials::default();
-        let store = ResourceStore::for_profile(&profile, &memory, &unavailable);
+        let store = ResourceStore::for_profile(&profile, &memory, &unavailable, false);
         assert!(store.persistent());
         let context = context();
         let failure = acquire_resource(
@@ -654,7 +744,7 @@ async fn invocation_credentials_require_verified_identity_and_exact_resource_exc
             let unavailable = UnavailablePersistentStore::default();
             let memory = InvocationCredentials::default();
             let profile = external_profiles().remove(0);
-            let store = ResourceStore::for_profile(&profile, &memory, &unavailable);
+            let store = ResourceStore::for_profile(&profile, &memory, &unavailable, false);
             assert!(
                 acquire_resource(
                     Some("knowledge"),
@@ -686,7 +776,7 @@ async fn invocation_credentials_require_verified_identity_and_exact_resource_exc
     let profile = external_profiles().remove(0);
     let memory = InvocationCredentials::default();
     let unavailable = UnavailablePersistentStore::default();
-    let store = ResourceStore::for_profile(&profile, &memory, &unavailable);
+    let store = ResourceStore::for_profile(&profile, &memory, &unavailable, false);
     assert!(
         acquire_resource(
             None,
@@ -1530,7 +1620,18 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
         let mut chunked = format!("{:x}\r\n", 8 * 1024 * 1024 + 1).into_bytes();
         chunked.extend(vec![b' '; 8 * 1024 * 1024 + 1]);
         chunked.extend_from_slice(b"\r\n0\r\n\r\n");
-        let operations = ["query", "load", "commit-list", "commit-show"];
+        let operations = [
+            "query",
+            "load",
+            "commit-list",
+            "commit-show",
+            "access",
+            "queries",
+            "branch-list",
+            "snapshot",
+            "schema",
+            "graph-list",
+        ];
         let cases = [
             (
                 IntentReply {
@@ -1587,6 +1688,12 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
                             .unwrap_err(),
                         "commit-list" => client.list_commits(Some("main")).await.unwrap_err(),
                         "commit-show" => client.get_commit("commit-a").await.unwrap_err(),
+                        "access" => client.access(None, None).await.unwrap_err(),
+                        "queries" => client.list_queries().await.unwrap_err(),
+                        "branch-list" => client.branch_list().await.unwrap_err(),
+                        "snapshot" => client.snapshot("main").await.unwrap_err(),
+                        "schema" => client.schema_source().await.unwrap_err(),
+                        "graph-list" => client.list_graphs().await.unwrap_err(),
                         _ => client
                             .query(
                                 Some(ReadTarget::Branch("main".into())),
@@ -1612,11 +1719,99 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
 }
 
 #[tokio::test]
+async fn managed_stream_and_bodyless_refusals_remain_bounded_and_redacted() {
+    let refused = IntentReply::json(403, json!({"error": format!("refused {DATA_TOKEN}")}));
+    let oversized = IntentReply {
+        status: 403,
+        headers: vec![("Content-Length".into(), (8 * 1024 * 1024 + 1).to_string())],
+        body: vec![],
+    };
+    let export_size = 8 * 1024 * 1024 + 1;
+    let server = IntentApiFixture::graph(vec![
+        refused.clone(),
+        refused.clone(),
+        refused,
+        oversized.clone(),
+        oversized.clone(),
+        oversized,
+        IntentReply {
+            status: 200,
+            headers: vec![],
+            body: vec![b' '; export_size],
+        },
+        IntentReply {
+            status: 204,
+            headers: vec![],
+            body: vec![],
+        },
+    ]);
+    crate::operator_routing::test_transport_scope(&[&server.origin], async {
+        let client = GraphClient::managed(
+            &server.origin,
+            "knowledge",
+            crate::credential_sources::test_credential(&server.origin, DATA_TOKEN),
+        )
+        .unwrap();
+        for oversized in [false, true] {
+            for operation in ["export", "baseline", "drop"] {
+                let error = match operation {
+                    "export" => client
+                        .export("main", &[], &mut Vec::new())
+                        .await
+                        .unwrap_err(),
+                    "baseline" => client
+                        .change_baseline(
+                            Some("main"),
+                            &crate::client::ChangeFilterArgs {
+                                kinds: &[],
+                                types: &[],
+                                ops: &[],
+                            },
+                            &mut Vec::new(),
+                        )
+                        .await
+                        .unwrap_err(),
+                    _ => client
+                        .commit_drop("commit-a", &mut Vec::new())
+                        .await
+                        .unwrap_err(),
+                };
+                assert!(!format!("{error:?}").contains(DATA_TOKEN));
+                if oversized {
+                    assert!(error.to_string().contains("8 MiB"), "{error}");
+                }
+            }
+        }
+        // Successful exports retain streaming size freedom; 204 decodes no body.
+        let mut output = Vec::new();
+        client.export("main", &[], &mut output).await.unwrap();
+        assert_eq!(output.len(), export_size);
+        client
+            .commit_drop("commit-a", &mut Vec::new())
+            .await
+            .unwrap();
+    })
+    .await;
+    server.assert_complete();
+}
+
+#[tokio::test]
 async fn managed_data_errors_redact_reflected_credentials_including_preconditions() {
     let encoded = DATA_TOKEN.replace('h', "\\u0068");
     let batch = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(batch.path(), "{}\n").unwrap();
-    let operations = ["mutate", "load", "commit-list", "commit-show"];
+    let operations = [
+        "mutate",
+        "load",
+        "commit-list",
+        "commit-show",
+        "access",
+        "queries",
+        "branch-list",
+        "snapshot",
+        "schema",
+        "graph-list",
+    ];
     let cases = [
         (200, json!(DATA_TOKEN).to_string()),
         (401, format!("{{\"error\":\"rejected {encoded}\"}}")),
@@ -1665,6 +1860,12 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
                             .unwrap_err(),
                         "commit-list" => client.list_commits(Some("main")).await.unwrap_err(),
                         "commit-show" => client.get_commit("commit-a").await.unwrap_err(),
+                        "access" => client.access(None, None).await.unwrap_err(),
+                        "queries" => client.list_queries().await.unwrap_err(),
+                        "branch-list" => client.branch_list().await.unwrap_err(),
+                        "snapshot" => client.snapshot("main").await.unwrap_err(),
+                        "schema" => client.schema_source().await.unwrap_err(),
+                        "graph-list" => client.list_graphs().await.unwrap_err(),
                         _ => client
                             .mutate(
                                 Some("main"),
@@ -1976,4 +2177,109 @@ async fn token_bootstrap_reports_endpoint_without_configuring_a_data_destination
         issuer.assert_complete();
     })
     .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn workload_near_expiry_renews_once_only_before_native_issuance() {
+    for (status, problem, second_refusal, calls, renewable) in [
+        (409, "credential_near_expiry", false, 2, true),
+        (409, "credential_near_expiry", true, 2, true),
+        (401, "credential_near_expiry", false, 1, true),
+        (409, "other_refusal", false, 1, true),
+        (409, "credential_near_expiry", false, 1, false),
+    ] {
+        let mut context = context();
+        context.control_auth = super::super::ControlAuth::AutomationEnv;
+        let cp = IntentApiFixture::with_origin(|origin| {
+            context.api = origin.to_owned();
+            let response_credential = credential(&context, "https://data.example");
+            let mut response = response_credential.metadata();
+            response["token"] = json!(response_credential.token);
+            let session = || crate::managed::auth::tests::metadata(120, "alice");
+            let refusal = || {
+                IntentReply::json(
+                    status,
+                    json!({"type":problem,"detail":"issuance preflight refused"}),
+                )
+            };
+            let mut replies = vec![session(), refusal()];
+            if calls == 2 {
+                let mut renewed = session();
+                let mut body: Value = serde_json::from_slice(&renewed.body).unwrap();
+                body["data"]["subject"] = json!("rotated-key-subject");
+                body["data"]["provider_client_id"] = json!("rotated-client");
+                body["meta"]["assurance"] = json!("verified_workload");
+                renewed.body = serde_json::to_vec(&body).unwrap();
+                replies.push(renewed);
+                replies.push(if second_refusal {refusal()} else {IntentReply::json(200, json!({"data":response,"meta":{"cluster_id":context.cluster,"incarnation":"incarnation-a"}}))});
+            }
+            replies
+        });
+        let home = tempfile::tempdir().unwrap();
+        let helper = home.path().join("helper.sh");
+        let count = home.path().join("calls");
+        std::fs::write(&helper, "IFS= read -r request\nprintf 'called\\n' >> \"$1\"\nprintf '%s\\n' '{\"version\":1,\"credential\":{\"type\":\"bearer\",\"token\":\"test-control-token\"}}'\n").unwrap();
+        let profile = if renewable {
+            json!({"provider":"exec","command":["/bin/sh", helper, count]})
+        } else {
+            std::fs::write(home.path().join("token"), "test-control-token").unwrap();
+            json!({"provider":"token","source":{"file":"./token"}})
+        };
+        std::fs::write(home.path().join("config.yaml"), json!({"version":1,"profiles":{"work":{"api":cp.origin,"organization_id":"org_test","auth":profile}}}).to_string()).unwrap();
+        let input = crate::operator::InvocationConfig::at(Some(home.path().to_owned()), None);
+        let cli =
+            crate::invocation::parse_from(["omnigraph", "cluster", "list", "--profile", "work"])
+                .unwrap()
+                .cli;
+        let target = crate::scope::resolve(&cli, &input, home.path(), false, &mut Vec::new())
+            .unwrap()
+            .unwrap();
+        let auth = crate::operator_routing::authentication(&cli, &input, Some(&target)).unwrap();
+        crate::operator_routing::test_transport_scope(&[&cp.origin], async {
+            crate::operator_routing::AUTH
+                .scope(auth, async {
+                    let api = context.client().await.unwrap();
+                    let result = issue_for_principal(
+                        &MemoryStore::default(),
+                        &context,
+                        &api,
+                        3600,
+                        Some("alice"),
+                    )
+                    .await;
+                    assert_eq!(
+                        result.is_ok(),
+                        calls == 2 && !second_refusal,
+                        "{status}/{problem}"
+                    );
+                    if renewable {
+                        assert_eq!(
+                            std::fs::read_to_string(&count).unwrap(),
+                            "called\n".repeat(calls)
+                        );
+                    } else {
+                        assert!(!count.exists());
+                        let failure = result.err().unwrap();
+                        assert_eq!(failure.body["type"], problem);
+                        assert_eq!(failure.body["detail"], "issuance preflight refused");
+                        assert_eq!(failure.response_status, Some(reqwest::StatusCode::CONFLICT));
+                    }
+                    let requests: Vec<_> = cp
+                        .requests()
+                        .into_iter()
+                        .filter(|request| request.path.ends_with("/tokens"))
+                        .collect();
+                    assert_eq!(requests.len(), calls, "token acquisition is bounded");
+                    assert!(
+                        requests
+                            .iter()
+                            .all(|request| request.body == json!({"version":2,"ttl_seconds":3600}))
+                    );
+                })
+                .await;
+        })
+        .await;
+        cp.assert_complete();
+    }
 }

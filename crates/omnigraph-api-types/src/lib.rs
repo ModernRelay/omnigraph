@@ -2042,6 +2042,11 @@ pub struct AccessOutput {
     /// The actor the credential resolves to. Absent only on a server that runs
     /// without authentication.
     pub actor_id: Option<String>,
+    /// The OAuth client the credential was issued to, when it is a verified
+    /// OIDC access token. The actor stays the person's principal across
+    /// clients. Opaque text the client chose: render it escaped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
     pub graph_id: String,
     /// Actions allowed with no branch named: the graph-scoped ones, and the
     /// branch-scoped ones a single rule allows on every branch (a rule with no
@@ -2108,6 +2113,7 @@ impl AccessOutput {
         }
         Ok(Self {
             actor_id: actor,
+            client_id: None,
             graph_id,
             graph_wide,
             branch,
@@ -2640,8 +2646,8 @@ pub struct FullTextIndexRebuildRequiredOutput {
 /// A full-text call read a declared full-text index that has no segment at
 /// the query's snapshot (HTTP 409), so no segment carries its analyzer. This
 /// is not a retryable conflict: an operator builds the branch's index
-/// (`omnigraph optimize` on main, `omnigraph rebuild-full-text-indexes
-/// --branch` elsewhere). Historical snapshots stay unchanged.
+/// (`omnigraph index build --branch <branch>`). Historical snapshots stay
+/// unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct FullTextIndexRequiredOutput {
     /// The index's property as `Type.property`.

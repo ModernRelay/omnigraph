@@ -12917,6 +12917,13 @@
             ],
             "description": "The branch asked about, when one was."
           },
+          "client_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The OAuth client the credential was issued to, when it is a verified\nOIDC access token. The actor stays the person's principal across\nclients. Opaque text the client chose: render it escaped."
+          },
           "graph_id": {
             "type": "string"
           },
@@ -14521,7 +14528,7 @@
       },
       "FullTextIndexRequiredOutput": {
         "type": "object",
-        "description": "A full-text call read a declared full-text index that has no segment at\nthe query's snapshot (HTTP 409), so no segment carries its analyzer. This\nis not a retryable conflict: an operator builds the branch's index\n(`omnigraph optimize` on main, `omnigraph rebuild-full-text-indexes\n--branch` elsewhere). Historical snapshots stay unchanged.",
+        "description": "A full-text call read a declared full-text index that has no segment at\nthe query's snapshot (HTTP 409), so no segment carries its analyzer. This\nis not a retryable conflict: an operator builds the branch's index\n(`omnigraph index build --branch <branch>`). Historical snapshots stay\nunchanged.",
         "required": [
           "index"
         ],

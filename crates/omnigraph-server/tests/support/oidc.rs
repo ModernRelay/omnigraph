@@ -23,9 +23,14 @@ pub fn now() -> u64 {
 }
 
 pub fn token(subject: &str, audience: &str) -> String {
+    token_for_client(subject, audience, "oauth-client")
+}
+
+/// A token for `subject` issued to the OAuth client `client_id`.
+pub fn token_for_client(subject: &str, audience: &str, client_id: &str) -> String {
     let now = now();
     let claims = json!({"iss":ISSUER,"aud":audience,"org_id":"org_example",
-        "client_id":"oauth-client","sub":subject,"iat":now,"exp":now+300,
+        "client_id":client_id,"sub":subject,"iat":now,"exp":now+300,
         "roles":["admin"],"permissions":["everything"]});
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some("key-1".into());

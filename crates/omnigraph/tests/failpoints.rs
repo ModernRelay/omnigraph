@@ -3117,7 +3117,7 @@ async fn merge_refuses_a_target_recreated_by_another_process_issue_643() {
         matches!(
             &error,
             OmniError::Manifest(manifest)
-                if !manifest.publication_in_doubt
+                if manifest.publication_in_doubt.is_none()
                     && matches!(
                         &manifest.details,
                         Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged { member, .. })
@@ -4683,7 +4683,10 @@ node Embedding {
     );
     assert!(
         embedding.pending_indexes.iter().any(|index| {
-            index.property == "name" && index.reason.contains("rebuild-full-text-indexes")
+            index.property == "name"
+                && index
+                    .reason
+                    .contains("omnigraph index rebuild --kind full-text")
         }),
         "the deferred FTS tail must name its explicit rebuild remedy"
     );

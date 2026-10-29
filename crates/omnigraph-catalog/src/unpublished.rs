@@ -837,16 +837,23 @@ impl ManifestCoordinator {
         let name = candidate.tag_name();
         release_unpublished_tag(&main, &name).await?;
         match main.tags().get(&name).await {
-            Ok(_) => Err(OmniError::manifest_publish_in_doubt(format!(
-                "the tag of unpublished commit '{}' is still listed after its deletion",
-                candidate.property.graph_commit_id
-            ))),
+            Ok(_) => Err(OmniError::manifest_publish_in_doubt(
+                &candidate.property.graph_commit_id,
+                format!(
+                    "the tag of unpublished commit '{}' is still listed after its deletion",
+                    candidate.property.graph_commit_id
+                ),
+            )),
             Err(lance::Error::RefNotFound { .. }) => Ok(()),
             Err(error) if error.is_not_found() => Ok(()),
-            Err(error) => Err(OmniError::manifest_publish_in_doubt(format!(
-                "the deletion of the tag of unpublished commit '{}' could not be confirmed: {error}",
-                candidate.property.graph_commit_id
-            ))),
+            Err(error) => Err(OmniError::manifest_publish_in_doubt(
+                &candidate.property.graph_commit_id,
+                format!(
+                    "the deletion of the tag of unpublished commit '{}' could not be confirmed: \
+                     {error}",
+                    candidate.property.graph_commit_id
+                ),
+            )),
         }
     }
 

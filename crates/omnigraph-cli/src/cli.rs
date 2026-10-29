@@ -15,6 +15,7 @@ use clap::{Parser, Subcommand};
 
 pub(crate) use crate::commands::history::{BranchCommand, ChangesCommand, CommitCommand};
 use crate::commands::history::{DiffArgs, SnapshotArgs};
+pub(crate) use crate::commands::maintenance::IndexCommand;
 use crate::commands::maintenance::{
     CleanupArgs, OptimizeArgs, RebuildFullTextIndexesArgs, RepairArgs, UpgradeArgs,
 };
@@ -147,9 +148,13 @@ pub(crate) enum Command {
     Upgrade(UpgradeArgs),
     /// Compact small Lance fragments in every backing dataset of the graph
     Optimize(OptimizeArgs),
-    /// Rebuild all full-text indexes from one branch's current rows
-    ///
-    /// Uses the default English analyzer; replaces any custom tokenizer settings.
+    /// Build or rebuild one branch's declared indexes
+    Index {
+        #[command(subcommand)]
+        command: IndexCommand,
+    },
+    /// Deprecated spelling of `index rebuild --kind full-text`
+    #[command(hide = true)]
     RebuildFullTextIndexes(RebuildFullTextIndexesArgs),
     /// Diagnose foreign Lance HEAD movement without adopting it.
     Repair(RepairArgs),
@@ -212,7 +217,7 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: CredentialCommand,
     },
-    /// Relay an agent's MCP over stdio to an existing server target's `/mcp`.
+    /// Relay an agent's MCP over stdio to an existing server or managed target's `/mcp`.
     ///
     /// For agents that start their tools as child processes. The bridge sends
     /// the target's stored credential, which the agent never sees, and is

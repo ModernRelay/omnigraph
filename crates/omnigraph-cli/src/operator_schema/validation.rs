@@ -219,6 +219,43 @@ fn auth_provider(
                 ));
             }
         }
+        AuthProfile::OauthClientCredentials {
+            token_endpoint,
+            client_id,
+            client_secret,
+            scope,
+        } => {
+            if !managed {
+                return Err(invalid(
+                    path,
+                    "oauth_client_credentials requires a managed profile",
+                ));
+            }
+            crate::credential_sources::validate_client_credentials(
+                token_endpoint,
+                client_id,
+                scope.as_deref(),
+            )
+            .map_err(|_| {
+                invalid(
+                    path,
+                    "invalid client-credentials endpoint, client ID or scope",
+                )
+            })?;
+            match client_secret {
+                ClientSecretSource::Env { env } => {
+                    let mut bytes = env.bytes();
+                    if !bytes
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
+                        || !bytes.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                    {
+                        return Err(invalid(path, "env must match [A-Za-z_][A-Za-z0-9_]*"));
+                    }
+                }
+                ClientSecretSource::File { file } => filesystem_path(file, base, path)?,
+            }
+        }
         AuthProfile::Omnigraph | AuthProfile::Anonymous => {}
     }
     Ok(())

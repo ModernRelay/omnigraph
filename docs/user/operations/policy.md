@@ -182,6 +182,9 @@ With the example graph policy above, `act-alice` gets:
  "branch":"feature","target_branch":"main","actions":["read"]}
 ```
 
+- `client_id` appears when the credential is a verified OIDC access token: the
+  OAuth client it was issued to. The actor stays the person's
+  `principal:<id>`, so policy decides alike for every client a person uses.
 - `graph_wide` is the decision with no branch named: `invoke_query`, and an
   action one rule allows on every branch, with no branch scope, `branch_scope:
   any` or `target_branch_scope: any`. Rules that cover every branch only
@@ -208,7 +211,7 @@ token on a graph without a policy gets `read` alone, and a signed data
 credential without one nothing, as those routes decide; a server without
 authentication allows every graph action and reports `actor_id: null`. The MCP
 `access` tool returns the same body, and `omnigraph access` prints it for a
-server target ([what you may do at a target](../cli/targets.md#what-you-may-do-at-a-target)).
+server or managed target ([what you may do at a target](../cli/targets.md#what-you-may-do-at-a-target)).
 
 It reports policy actions, not actor views, so a view can still refuse a
 `change` the policy allows.

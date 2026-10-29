@@ -1,0 +1,68 @@
+# Builds the Nix flake (flake.nix) on each of its systems: on a change to the
+# flake or the toolchain it reads, and weekly, since a Cargo.lock bump can add
+# a native build dependency the flake does not provide. Nothing waits on it;
+# a red run is the signal to fix the flake.
+name: Nix
+
+on:
+  pull_request:
+    paths:
+      - flake.nix
+      - flake.lock
+      - rust-toolchain.toml
+      - .github/workflows/nix.yml
+  push:
+    branches: [main]
+    paths:
+      - flake.nix
+      - flake.lock
+      - rust-toolchain.toml
+      - .github/workflows/nix.yml
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nix_build:
+    name: Nix build (${{ matrix.system }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            system: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+          - runner: macos-14
+            system: aarch64-darwin
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+
+      - name: Build
+        # The checkout is shallow; `shallow=1` lets Nix read it as a clean
+        # tree, so the build is stamped with its commit.
+        run: nix build -L "git+file://$PWD?shallow=1#packages.${{ matrix.system }}.default"
+
+      - name: Check the binaries and their commit stamp
+        run: |
+          ./result/bin/omnigraph version
+          ./result/bin/omnigraph-server --help > /dev/null
+          ./result/bin/omnigraph-azure-admission --help > /dev/null
+          commit=$(./result/bin/omnigraph version --json | jq -r .commit)
+          test "$commit" = "$(git rev-parse HEAD)" || {
+            echo "::error::omnigraph reports commit '$commit', expected $(git rev-parse HEAD)"
+            exit 1
+          }

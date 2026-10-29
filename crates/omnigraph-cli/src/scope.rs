@@ -1,5 +1,7 @@
 //! Capture exactly one destination. Command inputs never participate in routing.
-use crate::cli::{BlobCommand, BranchCommand, Cli, Command, CommitCommand, SchemaCommand};
+use crate::cli::{
+    BlobCommand, BranchCommand, Cli, Command, CommitCommand, IndexCommand, SchemaCommand,
+};
 use crate::operator::InvocationConfig;
 use crate::planes::{self, Requirement};
 use crate::targets::{self, ResolvedTarget, StorageProvider, TargetBinding, TargetProvenance};
@@ -295,6 +297,10 @@ pub(crate) fn command_write_scope(command: &Command) -> Option<WriteScope<'_>> {
         Command::Blob {
             command: BlobCommand::Put { branch, .. } | BlobCommand::Clear { branch, .. },
         } => Some(WriteScope::Branch(branch.as_deref().unwrap_or("main"))),
+        Command::Index { command } => Some(WriteScope::Branch(match command {
+            IndexCommand::Build(args) => &args.branch,
+            IndexCommand::Rebuild(args) => &args.branch,
+        })),
         Command::RebuildFullTextIndexes(args) => Some(WriteScope::Branch(&args.branch)),
         Command::Init(_)
         | Command::Schema {
@@ -567,6 +573,9 @@ defaults: {target: local, profile: work}
             vec!["commit", "show", "commit-one"],
             vec!["graphs", "list"],
             vec!["changes", "poll"],
+            vec!["access"],
+            vec!["queries", "list"],
+            vec!["mcp"],
         ] {
             for target in ["server", "cluster"] {
                 let mut args = args.clone();
@@ -574,15 +583,17 @@ defaults: {target: local, profile: work}
                 assert!(selected(&args, &input, dir.path()).is_ok(), "{args:?}");
             }
         }
-        assert!(selected(&["optimize", "--target", "cluster"], &input, dir.path()).is_err());
-        assert!(
-            selected(
-                &["queries", "list", "--target", "cluster"],
-                &input,
-                dir.path()
-            )
-            .is_err()
-        );
+        for args in [
+            vec!["optimize"],
+            vec!["queries", "validate"],
+            vec!["policy", "validate"],
+        ] {
+            for target in ["server", "cluster"] {
+                let mut args = args.clone();
+                args.extend(["--target", target]);
+                assert!(selected(&args, &input, dir.path()).is_err(), "{args:?}");
+            }
+        }
     }
 
     #[test]

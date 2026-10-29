@@ -15,6 +15,7 @@ mod mcp;
 pub mod operations;
 mod redacted_cause;
 mod settings;
+pub mod telemetry;
 use extract::{ApiJson, ApiPath, ApiQuery};
 use handlers::*;
 use settings::*;
@@ -87,7 +88,6 @@ use sha2::{Digest, Sha256};
 use std::io::{self, Write};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
-use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use utoipa::OpenApi;
@@ -1520,6 +1520,9 @@ impl ApiError {
     /// the body agree on both paths.
     fn from_omni_settled(err: OmniError, settle: impl FnOnce(Self) -> Self) -> Self {
         let cause = redacted_cause::RedactedCause::of(&err);
+        // An in-doubt publication's graph commit, logged as its own field: the
+        // message that also names it can carry storage paths.
+        let publication = err.publication_id().map(str::to_owned);
         // Every translation leaves through this one exit, an internal
         // replacement included, so the warning reads each one's settled facts.
         let response = settle(Self::translated(err));
@@ -1532,6 +1535,7 @@ impl ApiError {
             tracing::warn!(
                 status = %response.status(),
                 ?cause,
+                publication = publication.as_deref(),
                 scoped = response.scoped_unknown,
                 "engine failure without definite completion evidence"
             );
@@ -2074,7 +2078,11 @@ mod api_error_tests {
         let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
         assert_eq!(error.code, Some(ErrorCode::Conflict));
         assert!(error.error.contains("requires rebuild"));
-        assert!(error.error.contains("rebuild-full-text-indexes"));
+        assert!(
+            error
+                .error
+                .contains("omnigraph index rebuild --kind full-text")
+        );
         let details = error.full_text_index_rebuild_required.unwrap();
         assert_eq!(details.index, "title_idx");
         assert_eq!(details.reason, "analyzer certificate is missing");
@@ -2110,7 +2118,7 @@ mod api_error_tests {
         assert_eq!(error.code, Some(ErrorCode::Conflict));
         assert!(error.error.contains("has no segment"), "{}", error.error);
         assert!(
-            error.error.contains("rebuild-full-text-indexes"),
+            error.error.contains("omnigraph index build"),
             "{}",
             error.error
         );
@@ -3468,23 +3476,17 @@ fn server_log_subscriber<W>(filter: EnvFilter, writer: W) -> impl tracing::Subsc
 where
     W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
 {
-    use tracing_subscriber::layer::SubscriberExt as _;
+    telemetry::subscriber(filter, writer, false, None)
+}
 
-    tracing_subscriber::registry()
-        .with(filter)
-        // This independent metadata filter cannot be overridden by a more
-        // specific RUST_LOG directive, and keeps graph values, storage URIs
-        // and entity IDs out of dependency logs.
-        .with(tracing_subscriber::filter::filter_fn(|metadata| {
-            let target = metadata.target();
-            let restricted = RESTRICTED_LOG_TARGETS.iter().any(|restricted| {
-                target
-                    .strip_prefix(restricted)
-                    .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
-            });
-            !restricted || *metadata.level() <= tracing::Level::WARN
-        }))
-        .with(tracing_subscriber::fmt::layer().with_writer(writer))
+fn safe_log_metadata(metadata: &tracing::Metadata<'_>) -> bool {
+    let target = metadata.target();
+    let restricted = RESTRICTED_LOG_TARGETS.iter().any(|restricted| {
+        target
+            .strip_prefix(restricted)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+    });
+    !restricted || *metadata.level() <= tracing::Level::WARN
 }
 
 /// Install native server logging with MCP protocol payload logs and Lance's
@@ -3519,6 +3521,19 @@ pub(crate) mod test_log_capture {
         ) -> impl tracing::Subscriber + Send + Sync {
             let writer = self.clone();
             super::server_log_subscriber(EnvFilter::new(directives), move || writer.clone())
+        }
+
+        pub(crate) fn json_subscriber(
+            &self,
+            directives: &str,
+        ) -> impl tracing::Subscriber + Send + Sync {
+            let writer = self.clone();
+            super::telemetry::subscriber(
+                EnvFilter::new(directives),
+                move || writer.clone(),
+                true,
+                None,
+            )
         }
 
         /// Everything written so far, with ANSI styling removed so a test can
@@ -3559,19 +3574,76 @@ pub(crate) mod test_log_capture {
 mod log_filter_tests {
     use super::test_log_capture::Capture;
 
+    /// An unknown publication's log line names its graph commit in its own
+    /// field, so an operator can look the commit up, and never the message,
+    /// which can carry storage paths. Another uncertain failure names none.
+    #[test]
+    fn an_unknown_publication_logs_its_commit_and_no_message_issue_1067() {
+        for json in [false, true] {
+            let capture = Capture::default();
+            let subscriber: Box<dyn tracing::Subscriber + Send + Sync> = if json {
+                Box::new(capture.json_subscriber("debug"))
+            } else {
+                Box::new(capture.subscriber("debug"))
+            };
+            let logs = tracing::subscriber::set_default(subscriber);
+            let error =
+                super::ApiError::from_omni(omnigraph::error::OmniError::manifest_publish_in_doubt(
+                    "01JCOMMITUNKNOWN",
+                    "graph commit 01JCOMMITUNKNOWN may be durable: \
+                     s3://bucket/private/__manifest/_versions/7.manifest",
+                ));
+            assert!(error.completion_uncertain());
+            let storage = super::ApiError::from_omni(omnigraph::error::OmniError::Storage(
+                omnigraph::error::StorageFailure::new(
+                    omnigraph::error::StorageFailureKind::Unknown,
+                    "storage: s3://bucket/private/node/data/1.lance",
+                ),
+            ));
+            assert!(storage.completion_uncertain());
+            drop(logs);
+            let output = capture.output();
+            let lines: Vec<&str> = output
+                .lines()
+                .filter(|line| line.contains("engine failure without definite completion evidence"))
+                .collect();
+            assert_eq!(lines.len(), 2, "{output}");
+            if json {
+                let publication: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+                let storage: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+                assert_eq!(publication["publication"], "01JCOMMITUNKNOWN", "{output}");
+                assert!(storage.get("publication").is_none(), "{output}");
+            } else {
+                assert!(
+                    lines[0].contains(r#"publication="01JCOMMITUNKNOWN""#),
+                    "{output}"
+                );
+                assert!(!lines[1].contains("publication="), "{output}");
+            }
+            assert!(!output.contains("s3://bucket"), "{output}");
+        }
+    }
+
     #[test]
     fn restricted_dependency_logs_remain_filtered_under_specific_directives() {
         // Each directive set, and whether it enables DEBUG on unrestricted targets.
-        for (directives, debug) in [
+        for ((directives, debug), json) in [
             ("trace", true),
             ("debug,rmcp::service=trace", true),
             (
                 "info,lance::dataset_events=trace,lance::file_audit=trace",
                 false,
             ),
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|case| [false, true].map(|json| (case, json)))
+        {
             let captured = Capture::default();
-            let subscriber = captured.subscriber(directives);
+            let subscriber: Box<dyn tracing::Subscriber + Send + Sync> = if json {
+                Box::new(captured.json_subscriber(directives))
+            } else {
+                Box::new(captured.subscriber(directives))
+            };
             tracing::subscriber::with_default(subscriber, || {
                 tracing::debug!(target: "rmcp::service", request = "PRIVATE_REQUEST_MARKER", "received request");
                 tracing::trace!(target: "rmcp::transport::streamable_http_server::tower", message = "PRIVATE_RESULT_MARKER");
@@ -3781,7 +3853,7 @@ pub fn build_app(state: AppState) -> Router {
         .layer(middleware::from_fn(http_contract::identify_response))
         .layer(middleware::from_fn_with_state(challenge, challenge::answer))
         .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
-        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(telemetry::http_request))
         .with_state(state)
 }
 

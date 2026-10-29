@@ -86,6 +86,9 @@ struct Snapshot {
 #[derive(Debug, Clone)]
 pub(crate) struct VerifiedIdentity {
     pub principal_id: String,
+    /// The OAuth client the token was issued to: opaque, signed text of at
+    /// most 512 bytes without control characters.
+    pub client_id: String,
 }
 
 /// Public trust validated against the same canonical root as the serving
@@ -321,7 +324,7 @@ impl OidcIdentityTrust {
         now: i64,
     ) -> Result<AuthenticatedActor, OidcRefusal> {
         let snapshot = self.current.load();
-        let subject = accepted_subject(&snapshot, token, now).ok_or(OidcRefusal::Invalid)?;
+        let accepted = accepted_claims(&snapshot, token, now).ok_or(OidcRefusal::Invalid)?;
         if now < 0
             || snapshot.expires_at <= now
             || snapshot.generated_at > now.saturating_add(CLOCK_SKEW_SECONDS)
@@ -330,11 +333,12 @@ impl OidcIdentityTrust {
         }
         let principal_id = snapshot
             .principals
-            .get(&subject)
+            .get(&accepted.subject)
             .ok_or(OidcRefusal::NotAdmitted)?
             .clone();
         Ok(AuthenticatedActor::oidc_identity(VerifiedIdentity {
             principal_id,
+            client_id: accepted.client_id,
         }))
     }
 }
@@ -357,7 +361,13 @@ pub(crate) enum OidcRefusal {
 
 /// The subject of a token that passes every check of its own against the
 /// snapshot's keys and binding, whatever the snapshot's lifetime.
-fn accepted_subject(snapshot: &Snapshot, token: &str, now: i64) -> Option<String> {
+/// The claims an accepted token contributes to its identity.
+struct AcceptedClaims {
+    subject: String,
+    client_id: String,
+}
+
+fn accepted_claims(snapshot: &Snapshot, token: &str, now: i64) -> Option<AcceptedClaims> {
     if token.is_empty() || token.len() > MAX_TOKEN_BYTES {
         return None;
     }
@@ -409,7 +419,10 @@ fn accepted_subject(snapshot: &Snapshot, token: &str, now: i64) -> Option<String
     {
         return None;
     }
-    Some(claims.get("sub")?.as_str()?.to_owned())
+    Some(AcceptedClaims {
+        subject: claims.get("sub")?.as_str()?.to_owned(),
+        client_id: claims.get("client_id")?.as_str()?.to_owned(),
+    })
 }
 
 #[cfg(test)]
