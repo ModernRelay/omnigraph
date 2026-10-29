@@ -15835,6 +15835,15 @@
             "description": "the partition cap per index delta of a `nearest` scan; `0` is no cap",
             "minimum": 0
           },
+          "change_lineage": {
+            "type": "string",
+            "description": "how a graph diff or commit page finds the entities it compares across a window with no adjacent transaction: the exact ordered merge of both versions, the entities paired by stable identity, or both compared",
+            "enum": [
+              "off",
+              "on",
+              "verify"
+            ]
+          },
           "engine": {
             "type": "string",
             "description": "the engine a read query runs on; `v2`, the plan runner, is the one value; this setting does not change change-feed or merge execution",
