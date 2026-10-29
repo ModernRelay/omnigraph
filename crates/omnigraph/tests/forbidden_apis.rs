@@ -4295,6 +4295,47 @@ fn lance_batched_blob_read_call_counts_are_pinned() {
     );
 }
 
+/// Pins the vector index the engine builds to IVF_FLAT, which scores every
+/// row of a partition it searches exactly. A read reports its `nearest`
+/// search exhaustive when it searched every partition; a quantized or graph
+/// sub-index (PQ, SQ, RQ, HNSW) would make that report false.
+#[test]
+fn vector_indexes_are_ivf_flat() {
+    let src = engine_src_root();
+    let mut sites = Vec::new();
+    for (relative, file) in labeled_scan_files(&src, true) {
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        let ast = parse_rust_source(&contents, &relative);
+        let inventory = call_inventory(&ast);
+        for constructor in [
+            "ivf_flat",
+            "with_ivf_flat_params",
+            "ivf_pq",
+            "with_ivf_pq_params",
+            "with_ivf_sq_params",
+            "ivf_rq",
+            "ivf_rq_with_rotation",
+            "with_ivf_rq_params",
+            "ivf_hnsw",
+            "with_ivf_hnsw_pq_params",
+            "with_ivf_hnsw_sq_params",
+        ] {
+            let count = inventory.counts.get(constructor).copied().unwrap_or(0);
+            if count > 0 {
+                sites.push((constructor, relative.clone(), count));
+            }
+        }
+    }
+    sites.sort();
+    assert_eq!(
+        sites,
+        vec![("ivf_flat", "table_store.rs".to_string(), 2)],
+        "the engine's vector index constructors changed: every vector index \
+         is IVF_FLAT, which a read's exhaustive report depends on"
+    );
+}
+
 #[test]
 fn omni_error_has_only_reviewed_global_error_conversions() {
     use syn::{GenericArgument, PathArguments};

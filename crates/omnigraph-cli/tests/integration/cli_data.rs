@@ -2052,6 +2052,39 @@ fn read_json_outputs_rows_for_named_query() {
 }
 
 #[test]
+fn read_toon_format_encodes_the_same_rows_as_json() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+    let queries = fixture("test.gq");
+
+    let output = output_success(
+        cli()
+            .arg("query")
+            .arg("--target")
+            .arg(&graph)
+            .arg("--query")
+            .arg(&queries)
+            .arg("get_person")
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--format")
+            .arg("toon"),
+    );
+    let stdout = stdout_string(&output);
+
+    assert!(stdout.starts_with("query_name: get_person\n"), "{stdout}");
+    assert!(stdout.contains("row_count: 1\n"), "{stdout}");
+    assert!(stdout.contains("columns[2]: p.name,p.age\n"), "{stdout}");
+    assert!(
+        stdout.contains("rows[1]{p.name,p.age}:\n  Alice,"),
+        "{stdout}"
+    );
+    assert!(stdout.ends_with('\n'), "{stdout}");
+}
+
+#[test]
 fn read_named_and_default_targets_match_the_inline_target() {
     // Inline, named and default selection must preserve the same graph read.
     let temp = tempdir().unwrap();
@@ -2373,6 +2406,72 @@ fn read_jsonl_format_outputs_metadata_header_first() {
     let mut lines = stdout.lines();
     assert!(lines.next().unwrap().contains("\"kind\":\"metadata\""));
     assert!(lines.next().unwrap().contains("\"p.name\":\"Alice\""));
+}
+
+/// A ranked read reports its ranking in the `--json` envelope and in the
+/// `jsonl` metadata record alike, without the query text it searched for.
+#[test]
+fn ranked_read_reports_its_ranking_in_json_and_jsonl() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    output_success(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(fixture("search.pg"))
+            .arg(&graph),
+    );
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
+            .arg("--data")
+            .arg(fixture("search.jsonl"))
+            .arg("--target")
+            .arg(&graph),
+    );
+    let queries = temp.path().join("scored.gq");
+    write_query_file(
+        &queries,
+        r#"
+query scored($q: String) {
+    match { $d: Doc }
+    return { $d.slug, bm25($d.title, $q) as relevance }
+    order { bm25($d.title, $q) }
+    limit 2
+}
+"#,
+    );
+    let read = |format: &[&str]| {
+        let mut command = cli();
+        command
+            .arg("query")
+            .arg("--target")
+            .arg(&graph)
+            .arg("--query")
+            .arg(&queries)
+            .arg("scored")
+            .arg("--params")
+            .arg(r#"{"q":"learning"}"#)
+            .args(format);
+        stdout_string(&output_success(&mut command))
+    };
+    let ranking = serde_json::json!({
+        "by": "bm25",
+        "order": "descending",
+        "exhaustive": true,
+        "score_columns": ["relevance"]
+    });
+
+    let envelope: Value = serde_json::from_str(&read(&["--json"])).unwrap();
+    assert_eq!(envelope["ranking"], ranking);
+
+    let jsonl = read(&["--format", "jsonl"]);
+    let metadata: Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
+    assert_eq!(metadata["kind"], "metadata");
+    assert_eq!(metadata["ranking"], ranking);
+    assert!(!jsonl.lines().next().unwrap().contains("learning"));
 }
 
 #[test]
@@ -4657,8 +4756,9 @@ fn cleanup_against_non_local_scope_refuses_without_yes() {
         ]);
         command
     };
-    // Cloud-direct selection is not in the version-1 grammar, with or without
-    // either confirmation flag. Refusal must precede credential/storage I/O.
+    // An inline S3 address reaches cleanup only as a cluster root with
+    // --graph (#1163); a graph URI refuses before any storage I/O, with or
+    // without either confirmation flag.
     for flags in [vec![], vec!["--confirm"], vec!["--confirm", "--yes"]] {
         let output = output_failure(
             s3().args([
@@ -4677,7 +4777,7 @@ fn cleanup_against_non_local_scope_refuses_without_yes() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            diagnostic.contains("inline access supports local storage only"),
+            diagnostic.contains("cluster root; select its graph with --graph"),
             "{diagnostic}"
         );
     }
@@ -4698,7 +4798,7 @@ fn cleanup_against_non_local_scope_refuses_without_yes() {
         String::from_utf8_lossy(&refused.stderr)
     );
     assert!(
-        diagnostic.contains("inline access supports local storage only")
+        diagnostic.contains("cluster root; select its graph with --graph")
             || diagnostic.contains("invalid duration 'invalid'"),
         "{diagnostic}"
     );

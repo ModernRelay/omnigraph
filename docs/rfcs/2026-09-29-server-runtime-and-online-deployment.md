@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - OmniGraph maintainers
 created: 2026-09-29
-updated: 2026-10-20
+updated: 2026-10-29
 discussion: https://github.com/ModernRelay/omnigraph/pull/799
 supersedes:
   - "0034"
@@ -1655,3 +1655,12 @@ Before enabling an affected increment, its owners must implement and qualify:
   The [HTTP admission decision](2026-09-30-v012-http-admission.md) owns the
   discriminator change and refusal rules; historical decision-log entries retain
   their original release scope. No storage-format change follows from the wire bump.
+
+- 2026-10-29: Pending amendment. [Remote optimize through the serving
+  owner](2026-10-29-remote-optimize-through-the-serving-owner.md), a draft, adds one bounded durable
+  record for maintenance operations, `__cluster/maintenance.json`, written
+  only by the lock holder. Once it is accepted, it supersedes the sentence "No
+  job queue, background poller or second durable operation record is
+  introduced." for maintenance operations only: one durable record is added,
+  but no job queue or background poller. The sentence still holds for
+  deployment. The body stands unchanged until acceptance.

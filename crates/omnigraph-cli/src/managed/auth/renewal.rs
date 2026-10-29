@@ -1,9 +1,16 @@
 //! Provider credentials and their exact identity remain in the OS keychain.
 use super::*;
+use crate::managed::{MAX_BODY, ResponseLimits};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest as _, Sha256};
 
 const MAX_CACHE: usize = 64 * 1024;
+const HUMAN_SESSION_LIFETIME: time::Duration = time::Duration::days(30);
+const REFRESH_BUDGET: Duration = Duration::from_secs(20);
+const REFRESH_ATTEMPT: Duration = Duration::from_secs(6);
+const VERIFY_BUDGET: Duration = Duration::from_secs(15);
+const VERIFY_ATTEMPT: Duration = Duration::from_secs(4);
+const RETRY_BACKOFF: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(1)];
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -149,7 +156,7 @@ fn parse(raw: &str, origin: &str) -> Result<Session> {
             .any(|c| c.is_control() || c.is_whitespace())
         || expiry > OffsetDateTime::from_unix_timestamp(decoded.exp).map_err(|_| invalid())?
         || expiry > refresh_expiry
-        || refresh_expiry > now + time::Duration::hours(8) + MAX_METADATA_CLOCK_SKEW
+        || refresh_expiry > now + HUMAN_SESSION_LIFETIME + MAX_METADATA_CLOCK_SKEW
     {
         return Err(invalid());
     }
@@ -395,8 +402,7 @@ pub(super) async fn verify(
     if expected_user.is_some_and(|id| id != decoded.sub) {
         return Err(invalid());
     }
-    let body = Api::new(origin.into(), Some(token.into()))?
-        .request(Method::GET, "/v1/auth/session", None, None)
+    let body = verify_session_response(&Api::new(origin.into(), Some(token.into()))?)
         .await
         .map_err(|error| scrub(error, token))?;
     let data = &body["data"];
@@ -456,7 +462,7 @@ pub(super) async fn accept(
             }
             previous.refresh_expires_at.clone()
         }
-        None => (OffsetDateTime::now_utc() + time::Duration::hours(8))
+        None => (OffsetDateTime::now_utc() + HUMAN_SESSION_LIFETIME)
             .format(&Rfc3339)
             .map_err(|_| invalid())?,
     };
@@ -487,6 +493,152 @@ pub(super) fn unknown() -> Failure {
     )
 }
 
+fn retry_delay(
+    retry_after: &[reqwest::header::HeaderValue],
+    mut delay: Duration,
+) -> Option<Duration> {
+    match retry_after {
+        [] => {}
+        [value] => {
+            let Ok(value) = value.to_str() else {
+                return None;
+            };
+            let provider_delay = if let Ok(seconds) = value.trim().parse::<u64>() {
+                Duration::from_secs(seconds)
+            } else if let Ok(date) =
+                OffsetDateTime::parse(value.trim(), &time::format_description::well_known::Rfc2822)
+            {
+                (date - OffsetDateTime::now_utc())
+                    .max(time::Duration::ZERO)
+                    .unsigned_abs()
+            } else {
+                return None;
+            };
+            delay = delay.max(provider_delay);
+        }
+        _ => return None,
+    }
+    Some(delay)
+}
+
+async fn retry_pause(
+    attempt: usize,
+    retry_after: &[reqwest::header::HeaderValue],
+    deadline: Instant,
+    next_attempt: Duration,
+) -> bool {
+    let Some(delay) = RETRY_BACKOFF
+        .get(attempt)
+        .and_then(|delay| retry_delay(retry_after, *delay))
+    else {
+        return false;
+    };
+    if Instant::now()
+        .checked_add(delay)
+        .and_then(|next| next.checked_add(next_attempt))
+        .is_none_or(|next| next > deadline)
+    {
+        return false;
+    }
+    tokio::time::sleep(delay).await;
+    true
+}
+
+// AuthKit's replay grace applies only to this exact token/organization pair in
+// this invocation. Keep the whole loop comfortably inside its 30-second window.
+async fn refresh_tokens(
+    provider: &provider::Provider,
+    saved: &Session,
+) -> Result<workos::AuthenticateResponse> {
+    let deadline = Instant::now() + REFRESH_BUDGET;
+    for attempt in 0..3 {
+        if Instant::now() + REFRESH_ATTEMPT > deadline {
+            return Err(unknown());
+        }
+        let outcome = tokio::time::timeout(
+            REFRESH_ATTEMPT,
+            provider.refresh(&saved.refresh_token, &saved.identity.account_id),
+        )
+        .await;
+        let headers = match outcome {
+            Ok(Ok(tokens)) => return Ok(tokens),
+            Ok(Err(error)) if provider::transient(&error) => error
+                .api()
+                .map(|error| {
+                    error
+                        .headers
+                        .get_all(reqwest::header::RETRY_AFTER)
+                        .iter()
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Ok(Err(error)) => return Err(provider::failure(&error)),
+            Err(_) => Vec::new(),
+        };
+        if !retry_pause(attempt, &headers, deadline, REFRESH_ATTEMPT).await {
+            return Err(unknown());
+        }
+    }
+    Err(unknown())
+}
+
+// A successful rotation must never be repeated to recover a failed read. Reuse
+// the returned bearer for bounded verification; only accept() installs the pair.
+async fn verify_session_response(api: &Api) -> Result<Value> {
+    let deadline = Instant::now() + VERIFY_BUDGET;
+    for attempt in 0..3 {
+        if Instant::now() + VERIFY_ATTEMPT > deadline {
+            return Err(unknown());
+        }
+        let outcome = tokio::time::timeout(
+            VERIFY_ATTEMPT,
+            api.raw_bounded(
+                Method::GET,
+                "/v1/auth/session",
+                None,
+                None,
+                ResponseLimits {
+                    timeout: VERIFY_ATTEMPT,
+                    max_body: MAX_BODY,
+                    preserve_contents: false,
+                    auth_verification_status: true,
+                },
+            ),
+        )
+        .await;
+        let (failure, headers, transient) = match outcome {
+            Ok(Ok(response)) if response.status.is_success() => return Ok(response.body),
+            Ok(Ok(response)) => {
+                let transient = matches!(response.status.as_u16(), 408 | 429 | 500..=599);
+                (
+                    Failure {
+                        body: response.body,
+                        exit: if response.status.is_client_error() {
+                            2
+                        } else {
+                            1
+                        },
+                        response_status: Some(response.status),
+                    },
+                    response.retry_after,
+                    transient,
+                )
+            }
+            Ok(Err(error)) => {
+                let transient =
+                    error.response_status.is_none() && error.body["type"] == "transport_failed";
+                (error, Vec::new(), transient)
+            }
+            Err(_) => (unknown(), Vec::new(), true),
+        };
+        if !transient || !retry_pause(attempt, &headers, deadline, VERIFY_ATTEMPT).await {
+            return Err(failure);
+        }
+    }
+    Err(unknown())
+}
+
 async fn refresh(
     store: &dyn Store,
     saved: &mut Session,
@@ -495,10 +647,7 @@ async fn refresh(
     saved.state = RefreshState::Pending;
     save(store, saved)?;
     let outcome = tokio::time::timeout(Duration::from_secs(35), async {
-        let tokens = provider
-            .refresh(&saved.refresh_token, &saved.identity.account_id)
-            .await
-            .map_err(|error| provider::failure(&error))?;
+        let tokens = refresh_tokens(provider, saved).await?;
         accept(&saved.origin, saved.config.clone(), tokens, Some(saved)).await
     })
     .await;

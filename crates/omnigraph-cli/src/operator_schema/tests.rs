@@ -86,6 +86,42 @@ fn server(endpoint: &str, profile: &str) -> String {
 }
 
 #[test]
+fn client_credentials_are_explicit_managed_only_and_never_inline() {
+    let profile = r#"{provider: oauth_client_credentials, token_endpoint: https://auth.example/oauth2/token, client_id: client_one, client_secret: {file: secrets/client}}"#;
+    let text = format!(
+        "version: 1\nprofiles:\n  machine:\n    api: https://api.example\n    organization_id: org_one\n    auth: {profile}\n"
+    );
+    let config = decode(&text).unwrap();
+    let AuthProfile::OauthClientCredentials {
+        client_secret: ClientSecretSource::File { file },
+        scope,
+        ..
+    } = &config.profiles["machine"].auth
+    else {
+        panic!("wrong provider")
+    };
+    assert_eq!(file, Path::new("/operator/secrets/client"));
+    assert!(scope.is_none());
+    reject(&server("https://api.example", profile));
+    for replacement in [
+        "{store: {}}",
+        "{literal: secret}",
+        "{env: 1INVALID}",
+        "{file: client, env: CLIENT_SECRET}",
+    ] {
+        reject(&text.replace("{file: secrets/client}", replacement));
+    }
+    reject(&text.replace(
+        "https://auth.example/oauth2/token",
+        "http://auth.example/token",
+    ));
+    reject(&text.replace(
+        "client_id: client_one",
+        "client_id: client_one, client_secret_basic: true",
+    ));
+}
+
+#[test]
 fn managed_id_boundaries_match_execution_issue_1115() {
     for (field, original, max_len) in [
         ("organization_id", "org_issued-123", 128),
@@ -279,7 +315,7 @@ fn minimal_document_and_output_defaults() {
     assert_eq!(config.defaults.output, OutputFormat::Table);
     assert!(config.defaults.target.is_none());
     assert!(config.defaults.profile.is_none());
-    for output in ["table", "json", "jsonl", "csv", "kv"] {
+    for output in ["table", "json", "jsonl", "csv", "kv", "toon"] {
         assert!(decode(&format!("version: 1\ndefaults: {{output: {output}}}")).is_ok());
     }
     for output in ["yaml", "JSON", "null", "''", "3", "[]"] {

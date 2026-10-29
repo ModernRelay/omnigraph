@@ -17,10 +17,10 @@ omnigraph optimize --target ./graph.omni
 omnigraph optimize --target ./cluster-root --graph knowledge
 ```
 
-Follow the command-specific concurrency requirements below. Operator version 1
-accepts local-file direct targets only; cloud-direct maintenance is not exposed
-by this CLI. Engine/server cloud support does not change that client boundary.
-See [operator configuration](../cli/targets.md#transport-and-capability-boundaries).
+Follow the command-specific concurrency requirements below. Registered direct
+targets accept local files only; an inline [S3 cluster root](s3-cluster-roots.md)
+is the one cloud-direct exception. See
+[operator configuration](../cli/targets.md#transport-and-capability-boundaries).
 
 Each command acts as the operator configuration's `operator.actor`, and the
 commit it publishes records that actor; `index build` and `index rebuild` also

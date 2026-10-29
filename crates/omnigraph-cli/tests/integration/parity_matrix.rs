@@ -263,6 +263,36 @@ fn parity_query() {
     assert_parity("query", &l, &r);
 }
 
+/// A ranked read reports its ranking alike on both arms: the remote arm
+/// prints the ranking it decoded from the server.
+#[test]
+fn parity_ranked_query_ranking() {
+    let p = parity();
+    let queries = p._temp.path().join("ranked.gq");
+    std::fs::write(
+        &queries,
+        "query ranked($q: String) {\n    match { $p: Person }\n    return { $p.name, bm25($p.name, $q) as relevance }\n    order { bm25($p.name, $q) }\n    limit 2\n}\n",
+    )
+    .unwrap();
+    let (l, r) = p.run(&[
+        "query",
+        "--query",
+        queries.to_str().unwrap(),
+        "ranked",
+        "--params",
+        r#"{"q":"Alice"}"#,
+        "--json",
+    ]);
+    assert_parity("ranked query", &l, &r);
+    let local: serde_json::Value = serde_json::from_slice(&l.stdout).unwrap();
+    assert_eq!(local["ranking"]["by"], "bm25", "{local}");
+    assert_eq!(
+        local["ranking"]["score_columns"],
+        serde_json::json!(["relevance"]),
+        "{local}"
+    );
+}
+
 #[test]
 fn parity_schema_show() {
     let ca = tls_gateway::ca_path().display();
