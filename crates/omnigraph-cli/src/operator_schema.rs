@@ -247,6 +247,7 @@ pub(crate) enum OutputFormat {
     Jsonl,
     Csv,
     Kv,
+    Toon,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

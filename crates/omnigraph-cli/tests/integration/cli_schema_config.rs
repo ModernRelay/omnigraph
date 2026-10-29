@@ -349,7 +349,10 @@ fn help_groups_commands_by_capability() {
                 .contains("Select resources with --target and account operations with --profile")
             && !stdout.contains("--auth")
             && stdout.contains("--operator-config selects one operator file")
-            && stdout.contains("--config supplies deployment sources"),
+            && stdout.contains("--config supplies deployment sources")
+            && stdout.contains(
+                "First time using Omnigraph: call the omnigraph skill (`omnigraph skill show`) before a schema or query."
+            ),
         "target/capability guidance missing from --help:\n{stdout}"
     );
 

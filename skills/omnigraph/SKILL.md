@@ -207,7 +207,8 @@ destination line. Legacy `--server`, `--store`, `--cluster`,
 
 `query` and `mutate` invoke stored queries by positional name, or accept
 `--query FILE` / `-e SOURCE`. Use `--params` or `--params-file`, never interpolate
-values into query source. Reads support `--format table|json|jsonl|csv|kv`;
+values into query source. Reads support `--format table|json|jsonl|csv|kv|toon`;
+`--format toon` encodes the same document as `--format json` in TOON;
 `--json` preserves exact receipt/error structure. Inspect `commit` and
 `graph_commit_id` after uncertain writes; do not infer safe retry from a timeout.
 
@@ -411,7 +412,7 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | Using `data.id` for identity on a new graph | `unknown input field 'id': move data.id to the top-level 'id' field` | Put identity in top-level JSONL `id`; `data` contains user properties |
 | Re-running a `--mode merge` load with unkeyed edges | duplicate edges | Supply stable top-level edge `id`s, or declare `@key(@src, @dst)` when creating the edge type |
 | Assuming every JSON result cell has a key | absent keys for null values | Query/export JSON omits null cells; change images retain explicit nulls |
-| `defaults.output: arrow` | configuration refusal | Use `table`, `json`, `jsonl`, `csv` or `kv` |
+| `defaults.output: arrow` | configuration refusal | Use `table`, `json`, `jsonl`, `csv`, `kv`, or `toon` |
 | `..` or a symlink in a `cluster.yaml` relative path | `config_path_escape` / `config_path_symlink` | Keep referenced files inside the config directory with plain relative paths |
 | Old operator format | configuration refusal | Replace it with `version: 1`; preserve journals and reconcile unresolved work before retiring old tooling |
 | Policy commands with both a graph and a `cluster` bundle applied | `matches 2 policy bundles` | Current limitation of `policy validate/test/explain --graph`; inspect each bundle file directly |
