@@ -328,8 +328,10 @@ omnigraph credentials status --profile work --json
 
 Never put secrets in configuration. Providers are `omnigraph` (managed device
 login), `token` (exactly one `store`, `env` or `file` source), `exec` (absolute
-argv, bounded JSON protocol), and standalone-only `anonymous`. No fallback is
-allowed. Static installation uses `credentials set --stdin`, not login; existing
+argv, bounded JSON protocol), managed-only `oauth_client_credentials` (explicit
+HTTPS token endpoint, client ID and env/file client secret), and standalone-only
+`anonymous`. No fallback is allowed. Static installation uses
+`credentials set --stdin`, not login; existing
 entries require `--replace`. Managed credentials require `--profile NAME`; standalone
 credentials require `--target NAME`. Status never uses network/helpers or prompts; secure-store availability
 and identity remain unknown without reading secrets. Export is raw bearer-plus-newline to a pipe
