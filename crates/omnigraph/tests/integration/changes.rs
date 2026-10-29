@@ -17,10 +17,13 @@ use crate::helpers::*;
 /// name).
 async fn reclaim_person_history(db: &Session) {
     let stats = db
-        .cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        })
+        .cleanup_as(
+            omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            },
+            None,
+        )
         .await
         .unwrap();
     let person = stats
@@ -550,7 +553,7 @@ async fn diff_after_merge_reports_actual_changes() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let main = init_and_load(&dir).await;
-    main.ensure_indices().await.unwrap();
+    main.ensure_indices_as(None).await.unwrap();
     let v_before_branch = snapshot_id(&main, "main").await.unwrap();
 
     main.branch_create("feature").await.unwrap();
@@ -2056,11 +2059,15 @@ node Document {
     // touching logical rows. The moved descriptors force the payload
     // tie-break, which must classify every row as unchanged: the maintenance
     // commit is an empty block, not a phantom full-table update.
-    let stats = db.optimize().await.unwrap();
+    let stats = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap()
+        .tables;
     assert!(
         stats
             .iter()
-            .any(|table| table.fragments_removed > 0 && table.committed),
+            .any(|table| table.fragments_removed > 0 && table.committed()),
         "the fixture must actually compact so descriptors move"
     );
     let optimize_commit = head_commit_id(uri, None).await;
@@ -2158,11 +2165,15 @@ async fn physical_only_commit_over_a_large_fragment_reads_as_empty_issue_705() {
     )
     .await
     .unwrap();
-    let stats = main.optimize().await.unwrap();
+    let stats = main
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap()
+        .tables;
     assert!(
         stats
             .iter()
-            .any(|table| table.fragments_removed > 0 && table.committed),
+            .any(|table| table.fragments_removed > 0 && table.committed()),
         "the fixture must actually compact: {stats:?}"
     );
     let optimize_commit = head_commit_id(dir.path().to_str().unwrap(), None).await;
@@ -3186,7 +3197,7 @@ async fn change_feed_merge_commit_is_first_parent_relative_with_merged_parent_on
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let main = init_and_load(&dir).await;
-    main.ensure_indices().await.unwrap();
+    main.ensure_indices_as(None).await.unwrap();
     let pre_merge_head = snapshot_id(&main, "main").await.unwrap();
 
     main.branch_create("side").await.unwrap();

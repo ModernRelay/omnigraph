@@ -648,7 +648,9 @@ edge Likes: Person -> Person {}
         db.load_jsonl(DATA, crate::loader::LoadMode::Overwrite)
             .await
             .unwrap();
-        db.optimize().await.unwrap();
+        db.optimize_as(None, crate::db::OptimizeRequest::default())
+            .await
+            .unwrap();
         // Fresh handle: cold in-memory caches, the artifact stays on the store.
         let db = crate::db::Omnigraph::open(dir.path().to_str().unwrap())
             .await

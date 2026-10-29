@@ -1132,6 +1132,65 @@ impl ClusterStore {
         Ok(())
     }
 
+    // ---- maintenance record ----
+
+    /// The record and its backend version token, or `None` when the root has
+    /// none yet. One bounded GET; a read error stays loud.
+    pub(crate) async fn read_maintenance(
+        &self,
+    ) -> Result<Option<(crate::maintenance::MaintenanceLedger, String)>, Diagnostic> {
+        let uri = self.uri(crate::maintenance::CLUSTER_MAINTENANCE_FILE);
+        match self.read_versioned_opt(&uri).await {
+            Ok(Some((text, version))) => Ok(Some((crate::maintenance::decode(&text)?, version))),
+            Ok(None) => Ok(None),
+            Err(error) => Err(Diagnostic::error(
+                "maintenance_record_read_error",
+                crate::maintenance::CLUSTER_MAINTENANCE_FILE,
+                format!("could not read the maintenance record: {error}"),
+            )),
+        }
+    }
+
+    /// One conditional put of the record against the version the writer read
+    /// (`None`: the record must not exist yet). A backend error is no definite
+    /// answer, so it is reported in doubt, never as a conflict.
+    pub(crate) async fn write_maintenance(
+        &self,
+        ledger: &crate::maintenance::MaintenanceLedger,
+        expected_version: Option<&str>,
+    ) -> Result<crate::maintenance::MaintenanceWrite, Diagnostic> {
+        use crate::maintenance::MaintenanceWrite;
+        let payload = crate::maintenance::encode(ledger)?;
+        let uri = self.uri(crate::maintenance::CLUSTER_MAINTENANCE_FILE);
+        let answer = match expected_version {
+            None => self
+                .adapter
+                .write_text_if_absent(&uri, &payload)
+                .await
+                .map(|created| created.then_some(None)),
+            Some(version) => self
+                .adapter
+                .write_text_if_match(&uri, &payload, version)
+                .await
+                .map(|written| written.map(Some)),
+        };
+        Ok(match answer {
+            Ok(Some(Some(version))) => MaintenanceWrite::Written { version },
+            // A create answers no token; the next write reads one back.
+            Ok(Some(None)) => match self.read_versioned_opt(&uri).await {
+                Ok(Some((text, version))) if text == payload => {
+                    MaintenanceWrite::Written { version }
+                }
+                Ok(_) => MaintenanceWrite::Conflict,
+                Err(error) => MaintenanceWrite::InDoubt { error },
+            },
+            Ok(None) => MaintenanceWrite::Conflict,
+            Err(error) => MaintenanceWrite::InDoubt {
+                error: error.to_string(),
+            },
+        })
+    }
+
     // ---- lock ----
 
     pub(crate) async fn acquire_lock(

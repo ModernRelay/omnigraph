@@ -158,6 +158,60 @@ impl ClusterAdmission {
         Ok(())
     }
 
+    /// The cluster ledger id and the outstanding deployment's id, for
+    /// maintenance admission. Reading them needs no configuration grant: they
+    /// decide whether a maintenance operation may start, and say nothing about
+    /// the deployment beyond its id.
+    pub async fn maintenance_context(&self) -> Result<(String, Option<String>), Diagnostic> {
+        let snapshot = self
+            .owner()
+            .store
+            .read_state(&mut self.owner().store.observations())
+            .await?;
+        let state = snapshot.state.ok_or_else(|| {
+            Diagnostic::error(
+                "state_missing",
+                CLUSTER_STATE_FILE,
+                "a served cluster has a ledger",
+            )
+        })?;
+        let ledger_id = state.ledger_id.clone().ok_or_else(|| {
+            Diagnostic::error(
+                "ledger_upgrade_required",
+                CLUSTER_STATE_FILE,
+                "maintenance requires a v2 ledger",
+            )
+        })?;
+        Ok((
+            ledger_id,
+            state
+                .outstanding
+                .as_ref()
+                .map(|outstanding| outstanding.id.clone()),
+        ))
+    }
+
+    /// The maintenance record and its version token.
+    pub async fn read_maintenance(
+        &self,
+    ) -> Result<Option<(crate::MaintenanceLedger, String)>, Diagnostic> {
+        self.owner().store.read_maintenance().await
+    }
+
+    /// One conditional put of the maintenance record. Only this admission's
+    /// exact lock holder writes it, so the lock is checked first.
+    pub async fn write_maintenance(
+        &self,
+        ledger: &crate::MaintenanceLedger,
+        expected_version: Option<&str>,
+    ) -> Result<crate::MaintenanceWrite, Diagnostic> {
+        self.validate_current_lock().await?;
+        self.owner()
+            .store
+            .write_maintenance(ledger, expected_version)
+            .await
+    }
+
     /// A recovery/deployment owner cannot be reinterpreted as a serving owner.
     pub fn validate_serving(&self) -> Result<(), Diagnostic> {
         if self.owner().purpose != ClusterAdmissionPurpose::Serve {

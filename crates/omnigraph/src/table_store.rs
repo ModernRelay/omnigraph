@@ -4499,6 +4499,41 @@ impl TableStore {
     /// nothing); after an early stop, a lower bound that already derives one-row batches.
     /// `None` when a nested or non-Blob-v2 Blob field cannot be sized.
     async fn max_row_blob_bytes(ds: &Dataset, fragments: Vec<Fragment>) -> Result<Option<u64>> {
+        let mut max = 0_u64;
+        let sized = Self::visit_row_blob_bytes(ds, fragments, |rows| {
+            max = rows.iter().copied().fold(max, u64::max);
+            compaction_blob_batch_rows(max) != 1
+        })
+        .await?;
+        Ok(sized.then_some(max))
+    }
+
+    /// Managed Blob bytes in `fragments`, from descriptors (externals count nothing and
+    /// are never fetched); the count stops once it passes `ceiling`, so a value above
+    /// `ceiling` is a lower bound. `None` when a nested or non-Blob-v2 Blob field cannot
+    /// be sized.
+    pub(crate) async fn managed_blob_bytes(
+        ds: &Dataset,
+        fragments: Vec<Fragment>,
+        ceiling: u64,
+    ) -> Result<Option<u64>> {
+        let mut total = 0_u64;
+        let sized = Self::visit_row_blob_bytes(ds, fragments, |rows| {
+            total = rows.iter().fold(total, |sum, row| sum.saturating_add(*row));
+            total <= ceiling
+        })
+        .await?;
+        Ok(sized.then_some(total))
+    }
+
+    /// Scan the Blob descriptors of `fragments` and hand each batch's per-row managed
+    /// bytes to `visit`, which returns false to stop. Returns false, scanning nothing,
+    /// when a nested or non-Blob-v2 Blob field cannot be sized.
+    async fn visit_row_blob_bytes(
+        ds: &Dataset,
+        fragments: Vec<Fragment>,
+        mut visit: impl FnMut(&[u64]) -> bool,
+    ) -> Result<bool> {
         if nested_blob_field(ds.schema()).is_some()
             || ds
                 .schema()
@@ -4506,7 +4541,7 @@ impl TableStore {
                 .iter()
                 .any(|field| field.is_blob() && !field.is_blob_v2())
         {
-            return Ok(None);
+            return Ok(false);
         }
         let blob_columns = ds
             .schema()
@@ -4515,13 +4550,15 @@ impl TableStore {
             .filter(|field| field.is_blob())
             .map(|field| field.name.as_str())
             .collect::<Vec<_>>();
+        if blob_columns.is_empty() {
+            return Ok(true);
+        }
         let mut stream =
             Self::scan_stream_with(ds, Some(&blob_columns), None, None, false, |scanner| {
                 scanner.with_fragments(fragments);
                 Ok(())
             })
             .await?;
-        let mut max = 0_u64;
         while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
             let mut row_bytes = vec![0_u64; batch.num_rows()];
             for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
@@ -4542,12 +4579,11 @@ impl TableStore {
                     }
                 }
             }
-            max = row_bytes.into_iter().fold(max, u64::max);
-            if compaction_blob_batch_rows(max) == 1 {
+            if !visit(&row_bytes) {
                 break;
             }
         }
-        Ok(Some(max))
+        Ok(true)
     }
 
     /// Stage creation of a new dataset without publishing its first manifest.

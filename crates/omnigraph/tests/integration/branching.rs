@@ -150,7 +150,7 @@ async fn init_search_db(dir: &tempfile::TempDir) -> Session {
     db.load_jsonl(SEARCH_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     db
 }
 
@@ -2261,10 +2261,13 @@ fn assert_native_version_case(
         );
         let maintenance = Omnigraph::open(uri).await.unwrap();
         maintenance
-            .cleanup(omnigraph::db::CleanupPolicyOptions {
-                keep_versions: Some(100),
-                older_than: None,
-            })
+            .cleanup_as(
+                omnigraph::db::CleanupPolicyOptions {
+                    keep_versions: Some(100),
+                    older_than: None,
+                },
+                None,
+            )
             .await
             .unwrap();
         main.mutate(
@@ -3602,7 +3605,7 @@ async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_ne
     .unwrap();
     // The insert leaves feature's identity index lagging; building it here
     // leaves the child below nothing to index.
-    feature.ensure_indices_on("feature").await.unwrap();
+    feature.ensure_indices_on_as("feature", None).await.unwrap();
     feature
         .branch_create_from(ReadTarget::branch("feature"), "experiment")
         .await
@@ -3626,7 +3629,10 @@ async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_ne
         "the child branch inherits feature's pin"
     );
 
-    experiment.ensure_indices_on("experiment").await.unwrap();
+    experiment
+        .ensure_indices_on_as("experiment", None)
+        .await
+        .unwrap();
 
     let experiment_snap = snapshot_branch(&experiment, "experiment").await.unwrap();
     assert_eq!(
@@ -4213,10 +4219,13 @@ async fn branch_delete_defers_pin_collection_and_allows_recreate() {
         "recreated writes leave the former pin intact"
     );
     assert!(detached.contains(&second_pin));
-    main.cleanup(omnigraph::db::CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    main.cleanup_as(
+        omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
     let detached = helpers::collector::detached_versions(&person_uri).await;
@@ -4412,10 +4421,13 @@ async fn branch_delete_retires_legacy_physical_path_parents() {
         "{refused}"
     );
     let rows = db
-        .cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        })
+        .cleanup_as(
+            omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            },
+            None,
+        )
         .await
         .unwrap();
     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
@@ -4598,10 +4610,13 @@ async fn branch_delete_retires_native_parent_and_cleanup_preserves_live_child() 
             "{invalid}"
         );
         assert!(
-            main.cleanup(omnigraph::db::CleanupPolicyOptions {
-                keep_versions: Some(1),
-                older_than: None,
-            })
+            main.cleanup_as(
+                omnigraph::db::CleanupPolicyOptions {
+                    keep_versions: Some(1),
+                    older_than: None,
+                },
+                None
+            )
             .await
             .is_err(),
             "{invalid}"
@@ -4635,10 +4650,13 @@ async fn branch_delete_retires_native_parent_and_cleanup_preserves_live_child() 
     .await
     .unwrap();
     reopened
-        .cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        })
+        .cleanup_as(
+            omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            },
+            None,
+        )
         .await
         .unwrap();
     assert!(manifest.branches().get(&native).await.is_err());
@@ -4652,10 +4670,13 @@ async fn branch_delete_retires_native_parent_and_cleanup_preserves_live_child() 
     );
     reopened.branch_delete("experiment").await.unwrap();
     reopened
-        .cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        })
+        .cleanup_as(
+            omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            },
+            None,
+        )
         .await
         .unwrap();
     assert!(manifest.branches().get(&native).await.is_err());
@@ -4684,7 +4705,7 @@ async fn merged_table_preserves_row_version_for_unchanged_rows() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let main = init_and_load(&dir).await;
-    main.ensure_indices().await.unwrap();
+    main.ensure_indices_as(None).await.unwrap();
 
     main.branch_create("feature").await.unwrap();
     let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
@@ -4767,7 +4788,7 @@ async fn merged_table_preserves_row_version_for_unchanged_rows() {
 async fn edge_tables_have_id_btree_after_ensure_indices() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open_dataset("edge:Knows").await.unwrap();
@@ -4789,7 +4810,7 @@ async fn merge_delta_only_bumps_changed_rows() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let main = init_and_load(&dir).await;
-    main.ensure_indices().await.unwrap();
+    main.ensure_indices_as(None).await.unwrap();
 
     main.branch_create("feature").await.unwrap();
     let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
