@@ -33,6 +33,7 @@ use lance::dataset::optimize::{CompactionMetrics, CompactionOptions};
 use tokio::time::Instant;
 
 use super::*;
+use crate::error::CompletionEvidence;
 use crate::seams::{decide_seam, fail};
 
 /// How many datasets to optimize/cleanup concurrently. Each has separate
@@ -109,6 +110,10 @@ pub enum TableOptimizeOutcome {
     Deferred(DeferReason),
     /// Deliberately left alone.
     Skipped(SkipReason),
+    /// A failure of this table's own planning or staging, with definite
+    /// evidence: its staging is unreachable and the other tables still
+    /// publish. [`DatasetOptimizeStats::failure`] holds the error.
+    Failed,
 }
 
 impl TableOptimizeOutcome {
@@ -120,6 +125,7 @@ impl TableOptimizeOutcome {
             TableOptimizeOutcome::Unchanged => "unchanged",
             TableOptimizeOutcome::Deferred(_) => "deferred",
             TableOptimizeOutcome::Skipped(_) => "skipped",
+            TableOptimizeOutcome::Failed => "failed",
         }
     }
 }
@@ -173,6 +179,9 @@ pub struct DatasetOptimizeStats {
     /// Time from the start of the table's planning to the end of its staging;
     /// zero for a table the run did not start.
     pub duration: Duration,
+    /// The error of a [`TableOptimizeOutcome::Failed`] table, carrying its
+    /// completion evidence (`BeforeEffect` or `Unpublished`).
+    pub failure: Option<Arc<OmniError>>,
 }
 
 impl DatasetOptimizeStats {
@@ -188,6 +197,7 @@ impl DatasetOptimizeStats {
             fragments_added: metrics.fragments_added,
             pending_indexes: Vec::new(),
             duration: Duration::ZERO,
+            failure: None,
         }
     }
 
@@ -199,6 +209,19 @@ impl DatasetOptimizeStats {
             fragments_added: 0,
             pending_indexes: Vec::new(),
             duration: Duration::ZERO,
+            failure: None,
+        }
+    }
+
+    fn failed(type_key: String, failure: Arc<OmniError>, duration: Duration) -> Self {
+        Self {
+            type_key,
+            outcome: TableOptimizeOutcome::Failed,
+            fragments_removed: 0,
+            fragments_added: 0,
+            pending_indexes: Vec::new(),
+            duration,
+            failure: Some(failure),
         }
     }
 
@@ -754,8 +777,9 @@ type PlannedTable = (usize, Instant, Result<OptimizePreparation>);
 /// every earlier table's has, with at most `concurrency.rewrite` at once.
 /// When a table's turn comes after `deadline`, that table and every later
 /// one are deferred and their plans, which only read, are dropped; the first
-/// table always starts. A failure fails the run before its publication:
-/// `BeforeEffect` until a table's staging starts, `Unpublished` after.
+/// table always starts. A table's planning failure is `BeforeEffect` and its
+/// staging failure `Unpublished`: either fails only that table. A failure
+/// whose evidence stays uncertain fails the run.
 async fn run_table_pipeline(
     db: &Omnigraph,
     catalog: &std::sync::Arc<omnigraph_compiler::catalog::Catalog>,
@@ -791,14 +815,6 @@ async fn run_table_pipeline(
     let mut staging = FuturesUnordered::new();
     let mut turns = 0usize;
     let mut stopped_at = None;
-    let mut staged_any = false;
-    let label = |error: OmniError, staged_any: bool| {
-        if staged_any {
-            error.unpublished()
-        } else {
-            error.before_effect()
-        }
-    };
 
     loop {
         if stopped_at.is_none() {
@@ -817,14 +833,25 @@ async fn run_table_pipeline(
                     break;
                 }
                 turns += 1;
-                match result.map_err(|error| label(error, staged_any))? {
-                    OptimizePreparation::Stat(mut stat) => {
+                match result {
+                    Ok(OptimizePreparation::Stat(mut stat)) => {
                         stat.duration = started.elapsed();
                         visited[index] = Some((stat, None));
                     }
-                    OptimizePreparation::Work(work) => {
-                        staged_any = true;
+                    Ok(OptimizePreparation::Work(work)) => {
                         staging.push(stage(index, started, work));
+                    }
+                    // Planning only reads.
+                    Err(error) => {
+                        let failure = table_failure(&keys[index], error.before_effect())?;
+                        visited[index] = Some((
+                            DatasetOptimizeStats::failed(
+                                keys[index].clone(),
+                                failure,
+                                started.elapsed(),
+                            ),
+                            None,
+                        ));
                     }
                 }
             }
@@ -843,9 +870,21 @@ async fn run_table_pipeline(
         tokio::select! {
             biased;
             Some((index, started, result)) = staging.next(), if !staging.is_empty() => {
-                let mut outcome = result.map_err(OmniError::unpublished)?;
-                outcome.stat.duration = started.elapsed();
-                visited[index] = Some((outcome.stat, outcome.effect));
+                visited[index] = Some(match result {
+                    Ok(mut outcome) => {
+                        outcome.stat.duration = started.elapsed();
+                        (outcome.stat, outcome.effect)
+                    }
+                    // Staging writes only detached links no manifest names.
+                    Err(error) => {
+                        let error = error.with_completion_evidence(CompletionEvidence::Unpublished);
+                        let failure = table_failure(&keys[index], error)?;
+                        (
+                            DatasetOptimizeStats::failed(keys[index].clone(), failure, started.elapsed()),
+                            None,
+                        )
+                    }
+                });
             }
             Some(planned) = planning.next(), if !planning.is_empty() && stopped_at.is_none() => {
                 ready.push_back(planned);
@@ -872,6 +911,23 @@ async fn run_table_pipeline(
         })
         .collect();
     Ok(VisitedTables { tables, resume_at })
+}
+
+/// Keep a table's failure with its table when its evidence is definite; any
+/// other failure, an uncertain one above all, fails the run.
+fn table_failure(table_key: &str, error: OmniError) -> Result<Arc<OmniError>> {
+    match error.completion_evidence() {
+        Some(CompletionEvidence::BeforeEffect | CompletionEvidence::Unpublished) => {
+            tracing::warn!(
+                target: "omnigraph::optimize",
+                table = table_key,
+                error = %error,
+                "optimize left a table unchanged after its own failure"
+            );
+            Ok(Arc::new(error))
+        }
+        _ => Err(error),
+    }
 }
 
 /// Build the full-catalog graph index from a fresh main snapshot and write it

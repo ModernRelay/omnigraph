@@ -62,6 +62,7 @@ pub(crate) fn write_optimize(
                 "committed": s.committed(),
                 "skipped": s.skipped().map(|r| r.as_str()),
                 "duration_ms": s.duration.as_millis() as u64,
+                "error": s.failure.as_ref().map(|error| error.to_string()),
                 "pending_indexes": s.pending_indexes.iter().map(|p| serde_json::json!({
                     "property": p.property,
                     "reason": p.reason,
@@ -86,6 +87,14 @@ pub(crate) fn write_optimize(
                         "  {:<40} frags {} → {} ✓",
                         subject, s.fragments_removed, s.fragments_added
                     )?;
+                }
+                TableOptimizeOutcome::Failed => {
+                    let error = s.failure.as_ref().map(|error| error.to_string());
+                    let first = error
+                        .as_deref()
+                        .and_then(|error| error.lines().next())
+                        .unwrap_or("unknown error");
+                    writeln!(stdout, "  {subject:<40} failed ({first})")?;
                 }
                 _ => writeln!(stdout, "  {subject:<40} no-op")?,
             }
@@ -2033,7 +2042,15 @@ mod tests {
         let mut noop = skipped.clone();
         noop.type_key = "node:Yak".into();
         noop.outcome = TableOptimizeOutcome::Unchanged;
-        report.tables = vec![compacted, skipped, noop, deferred];
+        let mut failed = skipped.clone();
+        failed.type_key = "node:Xerus".into();
+        failed.outcome = TableOptimizeOutcome::Failed;
+        failed.duration = std::time::Duration::from_millis(5);
+        failed.failure = Some(std::sync::Arc::new(omnigraph::error::OmniError::manifest(
+            "rewrite lost",
+        )));
+        let failure = failed.failure.as_ref().unwrap().to_string();
+        report.tables = vec![compacted, skipped, noop, failed, deferred];
         report.input_commit = Some("hb1.parent".into());
         report.graph_commit_id = Some("hb1.child".into());
         report.resume_at = Some("node:Zebra".into());
@@ -2041,16 +2058,20 @@ mod tests {
         report.configuration_clear = ConfigurationClear::Unknown("timed out".into());
         report.artifact = ArtifactRefresh::Skipped(ArtifactSkip::NoEdgeTypes);
         assert_maintenance_report(
-            concat!(
-                "optimize graph — 4 datasets\n",
-                "  node type 'Person'                       frags 3 → 1 ✓\n",
-                "    ↳ index pending on property 'embedding': no trainable vectors\n",
-                "  edge type 'Knows'                        skipped (published dataset/Lance HEAD drift — run omnigraph repair)\n",
-                "  node type 'Yak'                          no-op\n",
-                "  node type 'Zebra'                        deferred (the run reached its writer-gate hold limit)\n",
-                "graph commit: hb1.child\n",
-                "resume at: node type 'Zebra'\n",
-                "configuration clear: unknown (timed out)\n",
+            &format!(
+                concat!(
+                    "optimize graph — 5 datasets\n",
+                    "  node type 'Person'                       frags 3 → 1 ✓\n",
+                    "    ↳ index pending on property 'embedding': no trainable vectors\n",
+                    "  edge type 'Knows'                        skipped (published dataset/Lance HEAD drift — run omnigraph repair)\n",
+                    "  node type 'Yak'                          no-op\n",
+                    "  node type 'Xerus'                        failed ({failure})\n",
+                    "  node type 'Zebra'                        deferred (the run reached its writer-gate hold limit)\n",
+                    "graph commit: hb1.child\n",
+                    "resume at: node type 'Zebra'\n",
+                    "configuration clear: unknown (timed out)\n",
+                ),
+                failure = failure
             ),
             serde_json::json!({
                 "uri":"graph",
@@ -2061,10 +2082,11 @@ mod tests {
                 "configuration_clear":{"outcome":"unknown","error":"timed out"},
                 "artifact":{"outcome":"skipped","reason":"no_edge_types","error":null},
                 "datasets":[
-                    {"type_key":"node:Person","outcome":"optimized","reason":null,"fragments_removed":3,"fragments_added":1,"committed":true,"skipped":null,"duration_ms":12,"pending_indexes":[{"property":"embedding","reason":"no trainable vectors"}]},
-                    {"type_key":"edge:Knows","outcome":"skipped","reason":"drift_needs_repair","fragments_removed":0,"fragments_added":0,"committed":false,"skipped":"drift_needs_repair","duration_ms":3,"pending_indexes":[]},
-                    {"type_key":"node:Yak","outcome":"unchanged","reason":null,"fragments_removed":0,"fragments_added":0,"committed":false,"skipped":null,"duration_ms":3,"pending_indexes":[]},
-                    {"type_key":"node:Zebra","outcome":"deferred","reason":"gate_hold_limit","fragments_removed":0,"fragments_added":0,"committed":false,"skipped":null,"duration_ms":0,"pending_indexes":[]},
+                    {"type_key":"node:Person","outcome":"optimized","reason":null,"fragments_removed":3,"fragments_added":1,"committed":true,"skipped":null,"duration_ms":12,"error":null,"pending_indexes":[{"property":"embedding","reason":"no trainable vectors"}]},
+                    {"type_key":"edge:Knows","outcome":"skipped","reason":"drift_needs_repair","fragments_removed":0,"fragments_added":0,"committed":false,"skipped":"drift_needs_repair","duration_ms":3,"error":null,"pending_indexes":[]},
+                    {"type_key":"node:Yak","outcome":"unchanged","reason":null,"fragments_removed":0,"fragments_added":0,"committed":false,"skipped":null,"duration_ms":3,"error":null,"pending_indexes":[]},
+                    {"type_key":"node:Xerus","outcome":"failed","reason":null,"fragments_removed":0,"fragments_added":0,"committed":false,"skipped":null,"duration_ms":5,"error":failure,"pending_indexes":[]},
+                    {"type_key":"node:Zebra","outcome":"deferred","reason":"gate_hold_limit","fragments_removed":0,"fragments_added":0,"committed":false,"skipped":null,"duration_ms":0,"error":null,"pending_indexes":[]},
                 ],
             }),
             |json, writer| super::write_optimize("graph", &report, json, writer),

@@ -775,6 +775,14 @@ async fn run_cell(
                 Writer::BlobClear => clear_photo(&db).await,
             };
             acknowledged = outcome.is_ok();
+            // A failure after one table's detached effect fails only that
+            // table, so the run itself succeeds.
+            if writer == Writer::Optimize && matches!(window, Window::PostDetached(_)) {
+                assert!(
+                    acknowledged,
+                    "{cell}: a table-local failure does not fail the run: {outcome:?}"
+                );
+            }
             if let Err(error) = outcome {
                 // A data writer that fails after a detached effect and before
                 // its publication never reports an outcome it cannot

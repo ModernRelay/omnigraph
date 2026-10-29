@@ -4768,100 +4768,110 @@ node Embedding {
     );
 }
 
-/// RFC 0067: a failure after one table's detached rewrite and before the
-/// batch publishes leaves no residue: no pin moves, no lineage is added,
-/// no linear HEAD moves, and the retry compacts every table.
+/// A failure after one table's detached rewrite fails only that table: its
+/// pin stays, the other table's rewrite publishes in the run's one commit, no
+/// linear HEAD moves, and the next run compacts the failed table.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial(optimize)]
-async fn optimize_partial_table_effect_leaves_no_residue() {
+async fn optimize_table_failure_fails_only_that_table_and_publishes_the_rest() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
     seed_two_productive_optimize_tables(&uri).await;
     let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    let pin = |snapshot: &omnigraph::db::Snapshot, key: &str| {
+        snapshot.dataset(key).unwrap().published_dataset_version
+    };
     let snapshot_before = db
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap();
-    let person_pin = snapshot_before
-        .dataset("node:Person")
-        .unwrap()
-        .published_dataset_version;
-    let company_pin = snapshot_before
-        .dataset("node:Company")
-        .unwrap()
-        .published_dataset_version;
     let commits_before = db.list_commits(Some("main")).await.unwrap().len();
-    let person_uri = node_table_uri(&db, "Person").await;
-    let company_uri = node_table_uri(&db, "Company").await;
-    let person_head = helpers::open_dataset_head_exact(&person_uri, None)
-        .await
-        .version()
-        .version;
-    let company_head = helpers::open_dataset_head_exact(&company_uri, None)
-        .await
-        .version()
-        .version;
-    let _failpoint = catalog::OPTIMIZE_POST_TABLE_EFFECT.fire_once_at(1);
-    let error = db
-        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
-        .await
-        .unwrap_err();
-    assert!(
-        !matches!(error, OmniError::RecoveryRequired { .. }),
-        "a partial batch before publication needs no recovery: {error}"
+    let mut heads = Vec::new();
+    for type_name in ["Company", "Person"] {
+        let table_uri = node_table_uri(&db, type_name).await;
+        let head = helpers::open_dataset_head_exact(&table_uri, None)
+            .await
+            .version()
+            .version;
+        heads.push((table_uri, head));
+    }
+
+    let report = {
+        let _failpoint = catalog::OPTIMIZE_POST_TABLE_EFFECT.fire_once_at(1);
+        db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+            .unwrap()
+    };
+    let failed = report
+        .tables
+        .iter()
+        .filter(|stat| stat.outcome == omnigraph::db::TableOptimizeOutcome::Failed)
+        .collect::<Vec<_>>();
+    assert_eq!(failed.len(), 1, "{report:?}");
+    let failed = failed[0];
+    assert_eq!(
+        failed.failure.as_ref().unwrap().completion_evidence(),
+        Some(omnigraph::error::CompletionEvidence::Unpublished),
+        "{failed:?}"
     );
-    assert_no_recovery_sidecars(dir.path());
+    let published = report
+        .tables
+        .iter()
+        .find(|stat| stat.committed())
+        .expect("the other table publishes");
+    assert_ne!(published.type_key, failed.type_key);
+    assert!(report.graph_commit_id.is_some(), "{report:?}");
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        commits_before + 1,
+        "the finished table publishes in one commit"
+    );
     let snapshot_after = db
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap();
     assert_eq!(
-        snapshot_after
-            .dataset("node:Person")
+        pin(&snapshot_after, &failed.type_key),
+        pin(&snapshot_before, &failed.type_key),
+        "the failed table's pin stays"
+    );
+    assert_ne!(
+        pin(&snapshot_after, &published.type_key),
+        pin(&snapshot_before, &published.type_key),
+        "the other table's rewrite is published"
+    );
+    assert_no_recovery_sidecars(dir.path());
+    for (table_uri, head_before) in &heads {
+        let head = lance::Dataset::open(table_uri)
+            .await
             .unwrap()
-            .published_dataset_version,
-        person_pin
-    );
-    assert_eq!(
-        snapshot_after
-            .dataset("node:Company")
-            .unwrap()
-            .published_dataset_version,
-        company_pin
-    );
-    assert_eq!(
-        db.list_commits(Some("main")).await.unwrap().len(),
-        commits_before,
-        "a partial Optimize publishes no lineage"
-    );
-    for (uri, head_before) in [(&person_uri, person_head), (&company_uri, company_head)] {
-        let head = lance::Dataset::open(uri).await.unwrap().version().version;
+            .version()
+            .version;
         assert_eq!(
-            head, head_before,
+            head, *head_before,
             "a detached rewrite never moves the linear HEAD"
         );
     }
+
     drop(db);
     let recovered = helpers::session(Omnigraph::open(&uri).await.unwrap());
     assert_eq!(helpers::count_rows(&recovered, "node:Person").await, 4);
     assert_eq!(helpers::count_rows(&recovered, "node:Company").await, 4);
-    assert_eq!(
-        recovered.list_commits(Some("main")).await.unwrap().len(),
-        commits_before
-    );
-    let stats = recovered
+    let retry = recovered
         .optimize_as(None, omnigraph::db::OptimizeRequest::default())
         .await
-        .unwrap()
-        .tables;
+        .unwrap();
+    let compacted = retry
+        .tables
+        .iter()
+        .filter(|stat| stat.committed())
+        .map(|stat| stat.type_key.as_str())
+        .collect::<Vec<_>>();
     assert_eq!(
-        stats
-            .iter()
-            .filter(|stat| stat.type_key != "__manifest" && stat.committed())
-            .count(),
-        2,
-        "the retry compacts both tables: {stats:?}"
+        compacted,
+        [failed.type_key.as_str()],
+        "the next run compacts the failed table: {retry:?}"
     );
 }
 
