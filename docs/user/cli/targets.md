@@ -82,11 +82,11 @@ implicit single-profile selection. A direct graph rejects a separate graph selec
 the first graph. Graph IDs are exact API identifiers, not display-name lookups; cluster incarnation pinning
 does not protect against recreation of a graph with the same ID.
 
-Inline targets are local paths or `file://` URIs only, such as
-`--target ./graph.omni`. Bare names select registered targets. Remote endpoints
-must be registered. `init ./graph.omni --schema schema.pg` retains its positional
-local creation shorthand. Defaults and aliases require registered names.
-There are no environment overrides for destination fields.
+Inline targets are local paths or `file://` URIs, such as `--target ./graph.omni`,
+and an [S3 cluster root](../operations/s3-cluster-roots.md) for deployment,
+recovery and maintenance commands. Bare names select registered targets. Remote endpoints
+must be registered. `init ./graph.omni --schema schema.pg` keeps its local shorthand.
+Defaults and aliases require registered names. Registered destinations have no environment overrides.
 
 `defaults.output` accepts only `table`, `json`, `jsonl`, `csv`, `kv`, or `toon` and
 applies to supported read-result formatting. Action receipts retain their own
@@ -295,7 +295,7 @@ borrow credentials from, or carry the parent's token into, a more-specific
 registered endpoint. Targets at the same root do not override the selected
 owner. These boundaries are captured for the invocation.
 
-Version 1 does not support cloud-direct targets, catalogue targets, Unix sockets,
+Version 1 does not support other cloud-direct targets, catalogue targets, Unix sockets,
 mTLS, tunnels or arbitrary private identity-provider transport. Server storage
 and deployment retain separate contracts. This rewrite does not qualify BYOC
 private routes or workload federation. Managed and standalone targets share

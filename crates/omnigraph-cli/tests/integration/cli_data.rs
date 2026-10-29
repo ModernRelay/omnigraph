@@ -4755,8 +4755,9 @@ fn cleanup_against_non_local_scope_refuses_without_yes() {
         ]);
         command
     };
-    // Cloud-direct selection is not in the version-1 grammar, with or without
-    // either confirmation flag. Refusal must precede credential/storage I/O.
+    // An inline S3 address reaches cleanup only as a cluster root with
+    // --graph (#1163); a graph URI refuses before any storage I/O, with or
+    // without either confirmation flag.
     for flags in [vec![], vec!["--confirm"], vec!["--confirm", "--yes"]] {
         let output = output_failure(
             s3().args([
@@ -4775,7 +4776,7 @@ fn cleanup_against_non_local_scope_refuses_without_yes() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            diagnostic.contains("inline access supports local storage only"),
+            diagnostic.contains("cluster root; select its graph with --graph"),
             "{diagnostic}"
         );
     }
@@ -4796,7 +4797,7 @@ fn cleanup_against_non_local_scope_refuses_without_yes() {
         String::from_utf8_lossy(&refused.stderr)
     );
     assert!(
-        diagnostic.contains("inline access supports local storage only")
+        diagnostic.contains("cluster root; select its graph with --graph")
             || diagnostic.contains("invalid duration 'invalid'"),
         "{diagnostic}"
     );

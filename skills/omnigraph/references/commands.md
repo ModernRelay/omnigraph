@@ -474,12 +474,18 @@ profiles cannot override it. Standalone targets own one auth provider; different
 identities use different targets. There is no `--auth` selector or last-used identity.
 `--config DIR` supplies deployment source and never routes a command.
 
-Direct graph/root targets use local files only. Inline local paths and `file://`
+Direct graph/root targets use local files, except an inline `s3://` cluster root
+for stopped-writer `cluster plan/apply/status/force-unlock/upgrade-ledger` and
+`optimize`/`index build`/`index rebuild`/`cleanup`/`repair --graph`, with region
+and endpoint captured from the environment
+([S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)).
+Each direct writer keeps its admission lock; `cluster force-unlock` it before
+starting the server. Inline local paths and `file://`
 URIs are accepted; remote endpoints must be registered. Server targets own auth;
 managed targets reference a profile and pin cluster identity/incarnation.
 Graph operations need `--graph` or target `default_graph`; direct graphs reject
 `--graph`. `init --schema schema.pg ./graph.omni` retains its creation shorthand.
-Catalogue/cloud-direct/Unix targets are unsupported. `--as` attributes direct
+Other cloud-direct, catalogue and Unix targets are unsupported. `--as` attributes direct
 operations or asserts a served actor. Diagnostics use stderr.
 
 For query source (`query`/`mutate`):
