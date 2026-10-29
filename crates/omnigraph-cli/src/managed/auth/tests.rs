@@ -593,17 +593,18 @@ async fn official_sdk_uses_public_client_device_and_refresh_without_secret_or_re
             .to_string()
             .contains("secret-provider-reflection")
     );
-    let requests = transport.requests.lock().unwrap();
-    assert_eq!(requests.len(), 3);
-    for request in requests.iter() {
-        assert!(!request.headers.contains_key(reqwest::header::AUTHORIZATION));
-        let body: Value = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
-        assert_eq!(body["client_id"], "client_test");
-        assert!(body.get("client_secret").is_none());
+    {
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in requests.iter() {
+            assert!(!request.headers.contains_key(reqwest::header::AUTHORIZATION));
+            let body: Value = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+            assert_eq!(body["client_id"], "client_test");
+            assert!(body.get("client_secret").is_none());
+        }
+        assert_eq!(requests[0].url, config().device_authorization_endpoint);
+        assert_eq!(requests[1].url, config().token_endpoint);
     }
-    assert_eq!(requests[0].url, config().device_authorization_endpoint);
-    assert_eq!(requests[1].url, config().token_endpoint);
-    drop(requests);
     for (status, code, transient) in [
         (408, "unavailable", true),
         (429, "unavailable", true),
