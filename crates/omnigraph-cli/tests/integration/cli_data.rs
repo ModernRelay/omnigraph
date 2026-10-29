@@ -2051,6 +2051,39 @@ fn read_json_outputs_rows_for_named_query() {
 }
 
 #[test]
+fn read_toon_format_encodes_the_same_rows_as_json() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+    let queries = fixture("test.gq");
+
+    let output = output_success(
+        cli()
+            .arg("query")
+            .arg("--target")
+            .arg(&graph)
+            .arg("--query")
+            .arg(&queries)
+            .arg("get_person")
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--format")
+            .arg("toon"),
+    );
+    let stdout = stdout_string(&output);
+
+    assert!(stdout.starts_with("query_name: get_person\n"), "{stdout}");
+    assert!(stdout.contains("row_count: 1\n"), "{stdout}");
+    assert!(stdout.contains("columns[2]: p.name,p.age\n"), "{stdout}");
+    assert!(
+        stdout.contains("rows[1]{p.name,p.age}:\n  Alice,"),
+        "{stdout}"
+    );
+    assert!(stdout.ends_with('\n'), "{stdout}");
+}
+
+#[test]
 fn read_named_and_default_targets_match_the_inline_target() {
     // Inline, named and default selection must preserve the same graph read.
     let temp = tempdir().unwrap();

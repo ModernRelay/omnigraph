@@ -56,6 +56,7 @@ mod targets;
 #[cfg(test)]
 #[path = "../tests/support/tls_gateway.rs"]
 mod tls_gateway;
+mod toon;
 #[cfg(all(test, unix))]
 #[path = "../tests/support/unix_gateway.rs"]
 mod unix_gateway_fixture;

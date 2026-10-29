@@ -15,6 +15,8 @@ pub enum ReadOutputFormat {
     Csv,
     Jsonl,
     Json,
+    /// Same document as json, in TOON (specification 4.4).
+    Toon,
     /// The result as an Arrow IPC stream on stdout.
     Arrow,
 }
@@ -40,6 +42,10 @@ pub fn render_read(
 ) -> Result<String> {
     match format {
         ReadOutputFormat::Json => Ok(serde_json::to_string_pretty(output)?),
+        ReadOutputFormat::Toon => {
+            let value = serde_json::to_value(output)?;
+            Ok(crate::toon::encode(&value))
+        }
         ReadOutputFormat::Jsonl => render_jsonl(output),
         ReadOutputFormat::Csv => render_csv(output),
         ReadOutputFormat::Kv => Ok(render_kv(output)? + &page_footer(output)),
@@ -367,6 +373,71 @@ mod tests {
 
         assert!(rendered.lines().next().unwrap().contains("name,age"));
         assert!(rendered.contains("Alice,30"));
+    }
+
+    #[test]
+    fn toon_format_encodes_the_same_document_as_json() {
+        let output = sample_output();
+        let document = serde_json::to_value(&output).unwrap();
+        let rendered = render_read(
+            &output,
+            ReadOutputFormat::Toon,
+            &ReadRenderOptions {
+                max_column_width: 80,
+                cell_layout: TableCellLayout::Truncate,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(rendered, crate::toon::encode(&document));
+        assert_eq!(
+            rendered,
+            "\
+query_name: get_person
+target:
+  branch: main
+  snapshot: null
+row_count: 1
+columns[2]: name,age
+rows[1]{name,age}:
+  Alice,30"
+        );
+    }
+
+    #[test]
+    fn toon_format_repeats_keys_when_a_null_cell_is_omitted() {
+        let mut output = sample_output();
+        output.row_count = 2;
+        output.columns = vec!["name".to_string(), "score".to_string()];
+        output.rows = serde_json::value::RawValue::from_string(
+            r#"[{"name":"Ada, Lovelace","score":1.0},{"name":"Grace"}]"#.to_string(),
+        )
+        .unwrap();
+
+        let rendered = render_read(
+            &output,
+            ReadOutputFormat::Toon,
+            &ReadRenderOptions {
+                max_column_width: 80,
+                cell_layout: TableCellLayout::Truncate,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            rendered,
+            "\
+query_name: get_person
+target:
+  branch: main
+  snapshot: null
+row_count: 2
+columns[2]: name,score
+rows[2]:
+  - name: \"Ada, Lovelace\"
+    score: 1
+  - name: Grace"
+        );
     }
 
     #[test]
