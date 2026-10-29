@@ -460,8 +460,14 @@ impl ServerHost {
             }
             ToolCall::BranchesList(args) => {
                 let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let output =
-                    handlers::server_branch_list(Extension(handle), Some(Extension(actor))).await?;
+                let output = handlers::server_branch_list(
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    ApiQuery(crate::api::BranchListQuery {
+                        detailed: args.detailed,
+                    }),
+                )
+                .await?;
                 bounded_result(&output.0)
             }
             ToolCall::CommitsList(args) => {
@@ -835,8 +841,12 @@ impl ServerHost {
             }
             ResourceRequest::Branches(name) => {
                 let (handle, actor) = self.graph(&name, actor, &graph)?;
-                let output =
-                    handlers::server_branch_list(Extension(handle), Some(Extension(actor))).await?;
+                let output = handlers::server_branch_list(
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    ApiQuery(Default::default()),
+                )
+                .await?;
                 Ok(("application/json", pretty(&output.0)?))
             }
         }

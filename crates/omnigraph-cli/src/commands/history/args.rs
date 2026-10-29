@@ -57,6 +57,10 @@ pub(crate) enum BranchCommand {
     },
     /// List branches
     List {
+        /// Also report each branch's head, the branch and commit it started
+        /// from, when it was created, and when it last moved
+        #[arg(long)]
+        detailed: bool,
         #[arg(long)]
         json: bool,
     },
