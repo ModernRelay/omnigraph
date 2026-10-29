@@ -164,6 +164,97 @@ async fn write_receipts_identify_exact_commits_and_mutation_noops() {
     );
 }
 
+/// A chain commit `__history` no longer holds answers the ancestry question
+/// `false`: a two-point diff whose walk from the head meets the missing block
+/// before `from`'s generation takes the exact merge instead of refusing.
+#[tokio::test]
+async fn graph_diff_takes_the_exact_merge_below_a_missing_history_block() {
+    use crate::helpers::cost::measure;
+    use omnigraph::changes::{GraphDiffRequest, GraphDiffSides};
+    use omnigraph_core::graph_commit_id::parse_history_block_id;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(root, "node Person {\n    name: String @key\n}\n")
+        .await
+        .unwrap();
+    let db = with_setting(&helpers::session(db), "history_release_bytes", "2048");
+    let block_of = |id: &str| parse_history_block_id(id).unwrap().unwrap().block;
+    let mut published: Vec<String> = Vec::new();
+    let mut blocks = Vec::new();
+    for load in 0..256 {
+        let line = format!(r#"{{"type":"Person","data":{{"name":"p{load:03}"}}}}"#);
+        let receipt = db
+            .load_with_receipt("main", &line, LoadMode::Append)
+            .await
+            .unwrap();
+        published.push(receipt.commit.graph_commit_id);
+        blocks = published.iter().map(|id| block_of(id)).collect();
+        blocks.dedup();
+        if blocks.len() == 4 {
+            break;
+        }
+    }
+    assert_eq!(
+        blocks.len(),
+        4,
+        "256 loads under 2048 bytes opened fewer than four blocks, and a block reaches \
+         `__history` once the block after it has closed: {published:?}"
+    );
+    let released = dir
+        .path()
+        .join("__history")
+        .join("blocks")
+        .join(blocks[1].to_string());
+    let extents: Vec<_> = std::fs::read_dir(&released)
+        .map(|entries| entries.map(|entry| entry.unwrap().file_name()).collect())
+        .unwrap_or_default();
+    fn files_under(path: &std::path::Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
+            if entry.path().is_dir() {
+                files_under(&entry.path(), out);
+            } else {
+                out.push(entry.path().display().to_string());
+            }
+        }
+    }
+    let mut history = Vec::new();
+    files_under(&dir.path().join("__history"), &mut history);
+    assert!(
+        !extents.is_empty(),
+        "the second block was released to `__history`: {released:?}; blocks {blocks:?}; \
+         history holds {history:#?}"
+    );
+    std::fs::remove_dir_all(&released).unwrap();
+
+    let request = GraphDiffRequest {
+        sides: GraphDiffSides::Between {
+            from: published[0].clone(),
+            to: "main".to_string(),
+        },
+        scope: ChangeFeedScope::default(),
+        page_token: None,
+        max_changes: None,
+        max_bytes: None,
+    };
+    let (page, io) = measure(db.diff_page(&request)).await;
+    let page = page.unwrap();
+    assert_eq!(page.changes.len(), published.len() - 1);
+    assert!(
+        page.changes
+            .iter()
+            .all(|change| change.op == ChangeOpKind::Insert)
+    );
+    assert_eq!(
+        (
+            io.change_intervals_row_identity,
+            io.change_intervals_exact_merge
+        ),
+        (0, 1),
+        "the missing page answers `false` and the exact merge runs"
+    );
+}
+
 #[tokio::test]
 async fn diff_empty_when_nothing_changed() {
     let dir = tempfile::tempdir().unwrap();

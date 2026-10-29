@@ -502,6 +502,7 @@ impl GraphClient {
             match id {
                 SettingId::Engine => request.engine = Some(given.engine()),
                 SettingId::MergeLineage => request.merge_lineage = Some(given.merge_lineage()),
+                SettingId::ChangeLineage => request.change_lineage = Some(given.change_lineage()),
                 SettingId::AnnNprobes => {
                     request.ann_nprobes = Some(given.get(SettingId::AnnNprobes).parse()?)
                 }

@@ -14,7 +14,7 @@ use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::query::ast::Param;
 use omnigraph_compiler::result::{QueryResult, Ranking, SearchFunction as ResultSearchFunction};
 use omnigraph_compiler::settings::{
-    Engine, MergeLineage, SettingId, SettingKind, SettingRow, SettingValue,
+    ChangeLineage, Engine, MergeLineage, SettingId, SettingKind, SettingRow, SettingValue,
 };
 use omnigraph_compiler::types::{PropType, ScalarType};
 use serde::{Deserialize, Serialize};
@@ -176,6 +176,10 @@ pub struct SettingsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = merge_lineage_schema)]
     pub merge_lineage: Option<MergeLineage>,
+    /// `change_lineage`: `off`, `on` or `verify`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(schema_with = change_lineage_schema)]
+    pub change_lineage: Option<ChangeLineage>,
     /// `ann_nprobes`: the partition cap per index delta of a `nearest` scan, `0`
     /// is no cap. An `i64`, the settings model's integer: a value above its
     /// range fails to decode, a negative one is refused by the settings
@@ -229,6 +233,12 @@ impl SettingsRequest {
                 SettingValue::Ident(merge_lineage.as_str().to_string()),
             ));
         }
+        if let Some(change_lineage) = self.change_lineage {
+            assignments.push((
+                SettingId::ChangeLineage,
+                SettingValue::Ident(change_lineage.as_str().to_string()),
+            ));
+        }
         if let Some(ann_nprobes) = self.ann_nprobes {
             assignments.push((SettingId::AnnNprobes, SettingValue::Integer(ann_nprobes)));
         }
@@ -276,6 +286,10 @@ fn engine_schema() -> utoipa::openapi::schema::Object {
 
 fn merge_lineage_schema() -> utoipa::openapi::schema::Object {
     setting_schema(SettingId::MergeLineage)
+}
+
+fn change_lineage_schema() -> utoipa::openapi::schema::Object {
+    setting_schema(SettingId::ChangeLineage)
 }
 
 fn ann_nprobes_schema() -> utoipa::openapi::schema::Object {
@@ -3948,6 +3962,7 @@ mod tests {
         let populated = SettingsRequest {
             engine: Some(Engine::V2),
             merge_lineage: Some(MergeLineage::Off),
+            change_lineage: Some(ChangeLineage::Off),
             ann_nprobes: Some(7),
             traversal_work_limit: Some(123),
             write_max_bytes: Some(4093),
@@ -3956,7 +3971,7 @@ mod tests {
             history_release_bytes: Some(2048),
         };
         let expected = format!(
-            "{{\"{}\":\"v2\",\"{}\":\"off\",\"{}\":7,\"{}\":123,\"{}\":4093,\"{}\":8186,\"{}\":524288,\"{}\":2048}}",
+            "{{\"{}\":\"v2\",\"{}\":\"off\",\"{}\":\"off\",\"{}\":7,\"{}\":123,\"{}\":4093,\"{}\":8186,\"{}\":524288,\"{}\":2048}}",
             request_rows[0],
             request_rows[1],
             request_rows[2],
@@ -3964,9 +3979,10 @@ mod tests {
             request_rows[4],
             request_rows[5],
             request_rows[6],
-            request_rows[7]
+            request_rows[7],
+            request_rows[8]
         );
-        assert_eq!(request_rows.len(), 8);
+        assert_eq!(request_rows.len(), 9);
         assert_eq!(serde_json::to_string(&populated).unwrap(), expected);
         assert_eq!(
             populated

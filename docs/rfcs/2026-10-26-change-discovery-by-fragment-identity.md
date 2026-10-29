@@ -1,54 +1,68 @@
 ---
 rfc: "2026-10-26-change-discovery-by-fragment-identity"
-title: "Change discovery by fragment identity"
+title: "Change discovery by fragment and row identity"
 track: maintainer
 status: draft
-implementation: not-started
+implementation: in-progress
 authors:
   - Ragnor Comerford
 created: 2026-10-26
-updated: 2026-10-26
+updated: 2026-10-29
 discussion: https://github.com/ModernRelay/omnigraph/pull/1171
 supersedes: []
 superseded_by: []
 blocked_on: []
 ---
 
-# RFC: Change discovery by fragment identity
+# RFC: Change discovery by fragment and row identity
+
+> A term set in ***bold italics*** is being defined at that exact spot; it is
+> plain text everywhere after.
 
 ## Summary
 
-Commit changes, the change feed and the graph diff find a changed type's
-candidate rows by comparing the fragment metadata of its two pinned table
-versions, the way branch merge has done since
-[#540](https://github.com/ModernRelay/omnigraph/pull/540). A fragment whose
-data files and deletion file are the same in both versions holds the same live
-rows and is never read. A fragment present in one version only, or backed by
-different data files, contributes its live rows. A fragment whose only
-difference is its deletion file contributes the rows in the deletion-vector
-difference. The candidates then go through the typed equality the enumerator
-already uses. The exact ordered comparison stays the fallback and becomes the
-test oracle.
+Commit changes, the change feed and the graph diff compare a changed type's two
+pinned table versions. [RFC 0030](0030-cdc-time-travel.md) prunes that
+comparison only when the two pins are one proving transaction apart; every
+wider window took the ***exact ordered merge***, the walk that sorts every
+live id of both versions, hydrates every row and compares them, so a diff of
+ten changed rows read both whole tables.
 
-Discovery stops requiring the two pins to be one transaction apart. A diff
-across several commits, a merge commit whose target moved, and a two-point
-diff of diverged heads then cost what changed between their pins, plus a pass
-over both manifests' fragment lists. Nothing new is persisted. Results, order,
-page tokens, feed cursors, errors and authorization do not change. A
-request-scoped setting, `change_lineage`, selects `on`, `off` or `verify`, as
-`merge_lineage` does for merge.
+This RFC adds one discovery rule in front of that merge, for a window with no
+adjacency proof. Pair the two manifests' fragments by fragment id and skip the
+pairs whose data files, overlay files and deletion file are identical. For the
+rest, decode each fragment's inline ***row identity***, the stable `_rowid`
+and the `_row_last_updated_at_version` stamp Lance keeps per physical row, with
+the deletion vector applied, and pair the live rows of the two versions by
+`_rowid`. A row id live on both sides with equal stamps is one unchanged row and
+is never read. Every other row id is a candidate, and each side then runs the
+exact ordered merge over its touched fragments narrowed to its candidate ids.
+Results, order, page tokens, feed cursors, errors and authorization do not
+change; nothing is persisted; the exact merge stays as the fallback and as the
+oracle.
 
-The change feed also gains a deterministic work ceiling per page, and its
-commit ceiling becomes a request parameter.
+One Lance 13 fact bounds the rule: the stamp a commit writes is its read
+manifest's version plus one, not the detached version the commit receives, so
+two sibling first commits after a fork stamp a row they both update alike. Stamp
+equality therefore proves two copies to be one unchanged row only where the
+`from` side lies on the `to` side's first-parent chain, which the diff decides
+from lineage the `to`
+branch's coordinator already holds. A diff of two diverged heads takes the exact
+merge.
+
+The `change_lineage` session setting (`off`, `on`, `verify`; `on` by default,
+`verify` in a debug build) selects the rule for all four readers. Measured on
+the issue's fixture, ten updates on a table of 4,000, 20,000 and 100,000 rows:
+both wider diffs read 14 table-data requests and 27,152 bytes at every extent,
+down from 277 requests and 6.9 MB at 100,000 rows, and flat across a compaction.
 
 ## Motivation
 
 [RFC 0030](0030-cdc-time-travel.md) §8.2 and §14 let a changed type prune its
 comparison only when the `to` pin is one proving transaction past the `from`
-pin. Every other changed type takes the exact ordered comparison: it sorts
-every id of both versions, hydrates every row in full and compares them. The
-user guide states the consequence: cost grows with the size of each changed
-type, and apart from a single commit every changed type is compared in full.
+pin. Every other changed type takes the exact ordered merge. The user guide
+stated the consequence: cost grows with the size of each changed type, and
+apart from a single commit every changed type is compared in full.
 
 Under [detached-only tables](2026-09-21-detached-only-tables.md), each write is
 its own detached commit, so a pin is one transaction past its parent only for
@@ -76,15 +90,23 @@ on S3-compatible storage, with client wall time
 OmniGraph Studio reads a branch review through the change feed with a 60 s
 request timeout, so these reviews fail or succeed depending on cache state.
 
+Reproduced deterministically on
+[#969](https://github.com/ModernRelay/omnigraph/issues/969)'s fixture with the
+GQT runner's `--measure` (a `Person` type with a key, an integer and a 256-byte
+string, seeded with 4,000, 20,000 and 100,000 rows, ten identical updates on a
+branch): the two-commit diff and the branch review read 17, 57 and 277
+table-data requests and 287,492, 1,405,044 and 6,922,180 bytes, growing with
+the table, while the adjacent diff stayed at 12 requests and 83,106 bytes.
+
 Merge had the same problem and fixed it without new storage.
 [#540](https://github.com/ModernRelay/omnigraph/pull/540) replaced the merge's
-full scans with candidate discovery from fragment and deletion metadata, and
-measured 9.5x to 22.4x on a 100,000-row table, with the whole merge suite run
-as a scan-against-lineage oracle in debug builds. The detached-only RFC's
-change-discovery comparison did not list this design among its candidates.
-
-An issue and a local change are not enough. The adjacency rule and the §4.3
-delete rules are accepted RFC text, and this design replaces them.
+full scans with candidate discovery from fragment and deletion metadata. The
+first draft of this RFC proposed that rule alone for change discovery. It
+leaves one window table-sized that the issue's shapes meet: a window across an
+`optimize`, where compaction rewrites every fragment's data files, so every
+live row of every rewritten fragment is a candidate on both sides. Row identity
+closes it, because compaction carries each row's `_rowid` and stamp into the
+rewritten fragment unchanged.
 
 ## User and operational behavior
 
@@ -92,338 +114,395 @@ Results do not change. Every surface returns the same entity changes in the
 same RFC 0030 §4.4 order, with the same page token and cursor contents, the
 same errors and the same authorization.
 
-Cost changes. A changed type costs:
+Cost changes. For a window with no adjacency proof, a changed type costs:
 
-- one CPU pass over the fragment lists of its two manifests, which opening
-  both versions already loads;
-- one deletion-vector read per fragment whose deletion file differs;
-- one narrow `id` read per candidate row;
-- full images only for the rows a page emits.
+- one pass over the fragment lists of its two manifests, which opening both
+  versions already loads, and the decode of the inline row-id and stamp
+  sequences of the fragments whose files differ;
+- one deletion-vector read per such fragment that has a deletion file;
+- the exact ordered merge over each side's touched fragments, narrowed to the
+  rows whose stamp differs or that are live on that side alone, so the rows
+  read are the changed rows plus the id column of the fragments that hold
+  them.
 
-Unchanged fragments are never read. Two shapes stay larger than the number of
-changes, and the user guide states both:
+Unchanged fragments are never read. A window across a compaction stays flat:
+the rewritten fragments differ by files, their rows pair by `_rowid` with equal
+stamps, and none is read. Two shapes stay larger than the number of changes,
+and the user guide states both:
 
-- a window that crosses a compaction costs the live rows of the fragments the
-  compaction rewrote, on both sides;
-- a window that crosses an overwrite costs the whole type, as today.
+- a window across an overwrite costs the whole type, since an overwrite
+  allocates fresh row ids;
+- a two-point diff of two diverged heads takes the exact merge (Design, The
+  ancestry restriction).
 
-The cost sentence in `docs/user/branching/changes.md` changes to say this.
+The cost paragraph in `docs/user/branching/changes.md` says this.
 
-The `change_lineage` session setting has `request` scope and the process
-default `OMNIGRAPH_CHANGE_LINEAGE`:
+The `change_lineage` setting has `request` scope and the process default
+`OMNIGRAPH_CHANGE_LINEAGE`:
 
-- `on` uses fragment-identity discovery and falls back to the exact comparison
-  when the gate refuses. It is the release default once rollout step 5 lands.
-- `verify` runs both and fails the request loudly on any difference. It is the
-  debug-build default.
-- `off` uses today's path. A mistyped value warns and behaves as `off`, so the
-  kill switch cannot misfire on, as with `merge_lineage`.
+- `on` pairs rows by identity where the rule applies and takes the exact merge
+  elsewhere. It is the definition's default.
+- `verify` runs both and refuses the page on the first change where they
+  disagree (Design, Verify). It is the default of a debug build, as
+  `merge_lineage` is.
+- `off` takes today's path for every window, the ancestry answer included: the
+  adjacency proofs, then the exact merge, with no lineage read for the rule it
+  does not run. It stays a performance fallback, since the adjacency path is
+  kept.
 
-A feed request can pass the setting with `set=change_lineage=off`.
-
-Change-feed pages gain two bounds (Design, Change feed pages). Callers see
-smaller pages when a commit is expensive. Cursors keep their meaning.
+A value outside the three spellings is refused by the settings registry, as
+for `merge_lineage`; the kill switch cannot misfire on. A GQ session carries
+the setting through `set change_lineage = …`, which covers the CLI, embedded
+use, the query route's `settings` field (`SettingsRequest.change_lineage`,
+applied before the source's own `set` lines) and the `branch diff` statement
+that route serves. The REST routes `/diff`, `/branches/diff`, `/changes` and
+`/commits/{id}/changes` run under the process default; their `set=` parameter
+stays validated and selects nothing, as before this RFC.
 
 ## Design
 
 ### Inherited from Lance
 
-OmniGraph relies on these Lance 13.0.0 behaviors. The merge classifier relies
-on all of them today.
+OmniGraph relies on these Lance 13.0.0 behaviors, pinned by
+`lance_surface_guards::row_identity_discovery_stamps_row_ids_and_rewrites_lance_13`
+through the engine's own writers and recorded in the "Row version stamps" row
+of `docs/dev/lance.md`.
 
 - A data file is never rewritten behind its name. Data files have UUID names,
   so the same resolved path in two manifests means the same bytes.
-- A fragment's live rows change only through a new deletion file, new data or
-  overlay files, or a new fragment. Fragment metadata (`files`, `overlays`,
-  `deletion_file`, `physical_rows`) is part of the manifest that opening a
-  version loads.
-- A deletion vector is read per fragment. A row is read by its position in a
-  fragment at a pinned version.
+- Every graph-table write keeps a fragment's `_rowid` and
+  `_row_last_updated_at_version` sequences inline in the manifest
+  (`RowIdMeta::Inline`, `RowDatasetVersionMeta::Inline`), one entry per
+  physical row, the deletion vector masking the deleted ones. Lance writes them
+  to a file only under its spill configuration, which no graph write sets.
+- A `merge_insert` update keeps the row's `_rowid` and stamps it with the read
+  manifest's version plus one (`src/dataset/write/merge_insert.rs` passes
+  `manifest.version + 1` to the fragment update; an append is built with
+  `current_manifest.version + 1` in `src/dataset/transaction.rs`). The stamp is
+  assigned before the detached commit receives its random version, so two
+  sibling first commits over one parent stamp a row they both update with the
+  same value.
+- A deletion-only commit restamps nothing.
+- Compaction (`Operation::Rewrite`) carries every live row's id and stamp into
+  the rewritten fragments.
+- An overwrite allocates fresh row ids.
+
+### Where the rule sits
+
+`changes::candidate_scan::interval_candidate_plan` keeps RFC 0030's ladder and
+adds one rung:
+
+1. Both pins stable-row-id tables of one identity on one native branch, else
+   the exact merge.
+2. An adjacency proof (the Stamp or Commit proof of RFC 0030 §14): the one
+   transaction is read and the existing `Upserts` or `Deletes` plan is built,
+   as today.
+3. No adjacency proof, `change_lineage` not `off`, and `from` on `to`'s
+   first-parent chain: the row-identity plan below.
+4. Otherwise the exact ordered merge.
 
 ### The discovery rule
 
-For one changed type lifetime with pins `from` and `to` that pass the gate:
+`changes::candidate_scan::row_identity_plan`, for one changed type lifetime
+with pinned datasets `from` and `to`:
 
 1. Pair fragments by fragment id across the two manifests.
 2. Same resolved data and overlay files, same deletion file: skip. Nothing is
-   read.
-3. Same resolved data and overlay files, different deletion file: read both
-   deletion vectors. Offsets deleted in `to` and live in `from` are candidates
-   on the `from` side. Offsets deleted in `from` and live in `to` are
-   candidates on the `to` side.
-4. Different data or overlay files, or a fragment present on one side only:
-   every live row of that fragment is a candidate on its side.
-5. Read each candidate's `id` at the version where it is live. Retain the keys
-   under a fixed budget, `LINEAGE_CANDIDATE_MAX_BYTES` (32 MiB) as the merge
-   does. A budget miss sends that type to the exact comparison.
+   read. (`fragment_data_identical` and `deletion_file_identical`, the merge
+   classifier's tests since
+   [#540](https://github.com/ModernRelay/omnigraph/pull/540).)
+3. For every other fragment, on either side: decode its inline `_rowid` and
+   `_row_last_updated_at_version` sequences, require both lengths to equal the
+   fragment's physical row count, read its deletion vector when it has a
+   deletion file and mask both sequences with it. The result is the fragment's
+   live `(_rowid, stamp)` pairs. The fragment is a ***touched fragment*** of
+   its side.
+4. Pair the live rows of the two sides by `_rowid`. A row id live on both
+   sides with equal stamps is one unchanged row: skipped. A row id live on both
+   sides with different stamps is a candidate on both. A row id live on one
+   side only is a candidate on that side.
+5. Each side runs the exact ordered merge of RFC 0030 §4.2 over its touched
+   fragments, with the scan narrowed by a structured `_rowid IN (...)`
+   expression over its candidate ids (DataFusion's `in_list`; no string is
+   built) unless the candidates are every live row of that side. Order,
+   images, equality, grouping by `id` and paging are the merge's own.
 
-Resolved file identity is the owning root plus the relative path, with
-`base_id` resolved through each manifest's base paths. An unresolvable
-reference makes its fragment fully changed. This is `fragment_data_identical`
-and `lineage_side_candidates` in `crates/omnigraph/src/exec/merge.rs`. This RFC
-moves that code into one module that merge and the change enumerator share.
-Merge pairs a base with each side; the enumerator pairs `from` with `to`.
+Any miss sends the type to the exact ordered merge: a sequence absent, spilled
+to a file, undecodable or shorter than the fragment; more than 8,388,608 live
+rows whose stamps the interval would hold; more than 65,536 candidate ids on
+one side.
 
 ### Why the candidates are complete
 
-Call a live row *shared* when it sits in a rule-2 fragment, or in a rule-3
-fragment at an offset outside the deletion-vector difference. A shared row is
-the same physical row, with the same bytes, at the same position in both
-versions, because neither its data files nor its deletion state changed.
-Every live row that is not shared is a candidate on its side.
+Call a live row ***shared*** when its `_rowid` is live on both sides with equal
+stamps. A commit that changes a row's bytes stamps the row with its own
+version, a deletion restamps nothing, and a rewrite carries both id and stamp,
+so equal stamps on one `_rowid` mean the same commit last wrote both copies.
+Where the `from` side's lineage is a prefix of the `to` side's, one commit has
+one place in that lineage, so the two copies are the same bytes. A shared row
+is therefore unchanged and may be skipped; every other live row is a candidate
+on its side, and the exact merge over the candidates decides insert, delete,
+update or nothing by the `id` it reads, exactly as the unnarrowed merge does.
 
-Take a logical id `L` whose state differs between the pins.
+Pairing is by `_rowid`, whose uniqueness per version is Lance's own row-id
+protocol, not by the unenforced primary key. The `id` is read for order and
+output as today, so a duplicate `id` degrades the output, never the pruning.
 
-- If `L` is live on one side only, its row there is not shared, since a shared
-  row is live on both sides. So it is a candidate.
-- If `L` is live on both sides and both rows were shared, they would be the
-  same row with the same image. Ids are unique within one version, so that
-  row is `L`'s only row on each side, and `L` would be unchanged. So at least
-  one of `L`'s rows is a candidate.
+### The ancestry restriction
 
-Every changed id is therefore found. A candidate that did not change, such as
-a row a compaction moved, is dropped by equality.
+The completeness argument needs one lineage. Across a fork it fails: two
+sibling branches that each update one row in their first commit after the fork
+both stamp it with the fork's version plus one, so the pair looks shared and
+the update is lost (`changes::cross_branch_diff_detects_same_length_blob_update_between_sibling_branches`
+found this on the first implementation). The rule therefore applies only when
+`from` lies on `to`'s first-parent chain:
 
-### Images and pairing
+- the branch form when its merge base is on the source head's first-parent
+  chain. A source that merged its target holds the base as the merge commit's
+  second parent, off that chain; two sibling first commits after the fork that
+  each inserted a row gave both rows one `_rowid` and one stamp, so the review
+  takes the exact merge there
+  (`issue_969_branch_review_after_a_merge_from_target.gqt`);
+- a two-point diff whose `to` names a branch whose chain holds `from`;
+- a commit page and a feed commit always, since their window is parent to
+  child.
 
-Each candidate is read in full at the position where it is live, from that
-side's pinned dataset, in fragment-scoped batches (the shape
-`HydrateExec::fragment_rows` already uses). Candidates are grouped by logical
-id. An id found only on the `from` side is a delete, only on the `to` side an
-insert, and on both sides an update or nothing, by the existing
-`rows_equal_across_vintages` and `emitted_image`.
+Both diff forms decide it from lineage already held, with no commit listing.
+The branch form walks the source's captured commit graph, which computing the
+merge base loaded. The two-point form (`Omnigraph::diff_from_is_ancestor`)
+takes `to` resolved to `from` itself as an ancestor; otherwise the `to`
+branch's `GraphCoordinator` answers `first_parent_chain_holds`, from its head
+and buffered commits with no read, then a first-parent page walk down to
+`from`'s generation. The coordinator is the handle's own when `to` is its
+branch and the merge-authority cache's otherwise. A `to` spelled as a commit
+id, a `from` of unknown generation, or a commit of the chain below the
+buffered commits that `__history` no longer holds answers `false` and takes
+the exact merge, which needs no lineage.
 
-An id found on one side only is absent from the other side. Were `L` live
-there, its row would be a candidate, which contradicts the premise, or shared.
-A shared row is also live on the first side, at its shared position, so the
-first side would hold two live rows for `L`. The gate requires the exact-id
-primary-key contract on both pins, as the merge gate does, so that cannot
-happen. No `id IN` probe of the other side is needed, and no `__id` index is
-needed.
+Drop the restriction at the Lance bump whose stamp is the commit's own version;
+diverged heads then pair directly.
 
-### Order and paging
+### Verify
 
-Candidate ids are kept sorted per type. A page walks types in the frozen
-`(kind, type id, id, operation rank)` order, takes the ids after the resume
-key, and hydrates only the rows it emits. Page tokens keep their v1 contents.
+Under `verify`, an interval the row-identity plan serves also runs the exact
+ordered merge of the same interval, and the two emitters are compared change
+by change (`EmitSource::Verified`, `verify_emit_agreement`): the same end, the
+same operation, the same `id`, and equal images through the enumerator's own
+`rows_equal`. The first disagreement refuses the page with an internal
+manifest error that names the type and both changes and says how to run the
+exact merge alone (`set change_lineage = off`); the HTTP routes return it as
+their `internal` error. Nothing is advanced: no page is returned, so no token
+or cursor moves.
 
-A continuation runs discovery again for the resume type and the types after
-it. That costs metadata, changed deletion vectors and the candidates' `id`
-reads, with no sort of the type and no full hydration. The restart cost of
-[#970](https://github.com/ModernRelay/omnigraph/issues/970) shrinks to the
-size of the change. A cache of discovery results keyed by pin would be allowed
-by invariant 12; this RFC does not propose one.
+### Observability
 
-### The gate
-
-Any miss sends the type to the exact ordered comparison:
-
-- the same table identity and dataset path at both pins;
-- both datasets opened at their recorded pins;
-- stable row ids on both pins;
-- the exact-id primary-key contract on both pins;
-- the same user schema at both pins, which the schema-boundary refusal
-  already requires;
-- the candidate key budget.
-
-The merge gate also refuses Blob schemas. Discovery reads only `id`, and
-equality already compares Blob descriptors with an exact payload tie-break, so
-this RFC does not carry that condition over. Unresolved question 1 asks
-reviewers to confirm.
-
-### What it replaces
-
-The adjacency admission (the Commit and Stamp proofs), the
-`_row_last_updated_at_version` window, the transaction-footprint plans and the
-`CandidateUpserts` and `CandidateDeletes` emitters go once rollout reaches step
-6. Discovery reads no transaction file and depends on no provenance marker. A
-by-source delete inside an unmarked `Update` appears as a deletion-vector
-difference and is found, so `no_by_source_delete` and `insert_absence` stop
-being needed for change discovery. A delete's ids are read at the `from` pin,
-so `omnigraph.deleted_ids` is not needed either, and deletes over the 16 MiB
-record limit no longer fall back. Writers keep stamping all three; merge still
-uses `insert_absence`. Removing them is out of scope.
-
-For a single-transaction interval, the new rule does O(F) work over the two
-fragment lists instead of O(log F). It reads fewer rows: the shipped path's
-data work covers the new fragments plus the rows of every touched parent
-fragment (RFC 0030 §14), while rule 3 reads only the deletion-vector
-difference.
-
-### Change feed pages
-
-A feed page stops before a commit only on its commit ceiling (128, at most
-512) or an exhausted change or byte budget. HTTP passes no commit ceiling,
-and nothing bounds a page's work
-([#1157](https://github.com/ModernRelay/omnigraph/issues/1157)).
-
-- **Work ceiling.** Discovery knows each commit's candidate count before any
-  row is read: the live rows of rule-4 fragments plus the sizes of rule-3
-  differences. A fourth page ceiling, candidate rows examined, stops a page at
-  a block boundary before a commit that would exceed it. The first commit of a
-  page is always admitted. The same cut always splits the same way, so RFC
-  0030 §4.4 replay holds.
-- **Commit ceiling.** HTTP, the MCP `changes_poll` tool and the CLI pass a
-  caller's commit ceiling, 1 to 512, through to `max_commits`.
-- **Handle reuse.** Commit `k`'s child pins are commit `k + 1`'s parent pins.
-  A poll opens each pinned dataset once and reuses it across commits.
-  Immutable, version-pinned state may be cached (invariant 12).
+Two counters in `omnigraph-core`'s request instrumentation name the route an
+interval took, `change_intervals_row_identity` and
+`change_intervals_exact_merge`, beside the existing candidate counters. The
+cost tests assert them, so a window that silently fell back fails the gate
+that expected the flat line.
 
 ### Out of scope
 
+- The change feed's work ceiling and the commit-ceiling request parameter
+  ([#1157](https://github.com/ModernRelay/omnigraph/issues/1157)). Discovery
+  knows each interval's candidate count before any row is read, which a
+  ceiling could consume; that is a separate change to the feed's page
+  contract.
 - Commit-id lookup ([#972](https://github.com/ModernRelay/omnigraph/issues/972)).
-  A side spelled as a branch-held commit id still scans live branches. Its fix,
-  resolving each side once and locating a block's branch, is separate.
 - Change sets recorded on the commit
   ([RFC 0068](0068-graph-commit-record.md)). Nothing measured here needs them.
-- Skipping the fragments a compaction rewrote. A `Rewrite` transaction maps
-  old fragments to new ones with row ids and content preserved, so a later
-  change could skip those pairs while the transaction is retained.
+- Removing the adjacency candidate path. It stays the first rung and `off`'s
+  behavior.
 - Cross-request caches of discovery results or images.
 
 ## Invariants
 
-- **1, respect the substrate.** Discovery uses Lance manifest and fragment
-  metadata, deletion vectors and positional reads, through the same surfaces
-  the merge classifier uses. It adds no parallel storage machinery.
+- **1, respect the substrate.** Discovery reads Lance manifest and fragment
+  metadata, the inline row-id and stamp sequences, deletion vectors and
+  fragment-scoped scans, through the surfaces the merge classifier and the
+  exact merge already use. It adds no parallel storage machinery.
 - **3, one coherent view.** Discovery and images read only the two pinned
-  versions the enumerator already opens.
+  versions the enumerator already opens; the ancestry answer reads lineage the
+  `to` branch's coordinator holds.
 - **6, stable identity.** Types pair by stable graph identity, as today.
-  Fragment ids and positions locate data; they are never treated as entity
-  identity. Entities are keyed by the `id` read at the pinned version.
+  `_rowid` locates a physical row and decides what to read; entities are keyed
+  by the `id` read at the pinned version, never by a row id or a position.
 - **7, physical acceleration is derived.** Correctness does not depend on an
-  index, on fragment count or on layout. Layout changes cost only, which is
-  why compaction is a documented cost term. No `__id` index is required.
-- **8, integrity failures are loud.** `verify` fails the request on any
-  difference from the exact comparison.
-- **11, bounded and observable.** The key budget, the existing page ceilings
-  and the new work ceiling bound each request. Hot-path work scales with the
-  change plus the fragment-list length of the changed types, not with history
-  or table rows.
+  index, on fragment count or on layout. No `__id` index is required.
+- **8, integrity failures are loud.** `verify` refuses the page on any
+  difference from the exact merge, with the type and both changes named.
+- **9, typed semantics.** The candidate narrowing is a structured expression,
+  not a built string.
+- **11, bounded and observable.** The candidate cap, the held-stamps cap and
+  the existing page ceilings bound each request; the route counters make the
+  path observable. Hot-path work scales with the changed rows plus the
+  fragment lists and sequences of the changed types, not with table rows.
 - **12, one source of truth.** Nothing is persisted. Every fact comes from the
-  two pinned manifests and their files.
-- **13, evidence.** Cost claims go into `changes_cost.rs`, and `verify` makes
-  the existing suites the oracle.
+  two pinned manifests, their files and the held lineage.
+- **13, evidence.** The Lance facts are guards; the cost claims are tests with
+  route assertions; `verify` makes the existing suites the oracle.
 
 Deny-list: no logical precondition depends on index coverage, fragment count
-or layout; there is no ad-hoc `IN (...)` string, since images are positional
-reads; and no parallel truth is maintained.
+or layout; no `IN (...)` string is generated; no parallel truth is maintained.
 
-RFC 0030 §4.3 forbids four delete shortcuts. This design uses none of them:
+RFC 0030 §4.3 forbids four delete shortcuts. This design uses none of them. A
+deletion vector only masks the stamp sequence; which rows are deletes is
+decided by the exact merge over the candidates, which reads the `id` at the
+`from` pin as today. No key is inferred from a fragment id or row address, no
+transaction predicate is parsed, no tombstone is persisted.
 
-- It does not treat a deletion-vector scan as a complete delete feed.
-  Completeness comes from comparing both pinned manifests, as argued above.
-- It does not infer keys from fragment ids or row addresses. It reads `id` at
-  the pinned version, and positions only locate the row.
-- It does not parse a transaction predicate. It reads no transaction.
-- It persists no tombstone.
-
-On acceptance, RFC 0030 gets a disposition note replacing the §4.2
-row-version classification, the §4.3 delete rules and the §8.2 and §14
-adjacency cost rule. The detached-only RFC gets one for its change-discovery
-decision. The feed contract, the exact comparison as authority, cursors and
-retention gaps stay.
+RFC 0030's decision log carries the amendment of 2026-10-28: §4.2's "an
+interval wider than one version falls back before any transaction read" still
+holds for the transaction read, and the row-identity rule runs after it; the
+§9 cost evidence row "every changed type is compared in full" for a
+multi-commit window no longer holds.
 
 ## Compatibility and reversibility
 
 There is no storage, wire, token or result change. A page token minted by one
 build continues on another, since contents and order are unchanged. The new
-setting and environment variable are additive. `off` restores today's path
-exactly. Reverting the code leaves nothing behind.
+setting, its environment variable and the `SettingsRequest.change_lineage`
+field are additive. `off` restores today's path exactly, adjacency proofs
+included. Reverting the code leaves nothing behind.
 
 ## Alternatives
 
-1. **Chain proof**, the recommendation on
+1. **Fragment identity alone**, this RFC's first draft: skip identical
+   fragments, take the deletion-vector difference of fragments whose deletion
+   file changed, take every live row of a fragment whose files differ. It is
+   the minus-one-mechanism design, without the stamp sequences, and it is
+   change-sized for a `merge_insert` update, whose new fragment holds only
+   changed rows. It fails the compaction window: `optimize` rewrites every
+   fragment's files, so every live row of every rewritten fragment is read on
+   both sides. The cost gate
+   `graph_diff_across_a_compaction_reads_data_flat_in_table_extent` is that
+   scenario; under this rule its data reads are flat (3 at 4,096 rows). Rules
+   1 and 2 of that draft survive as the first skip.
+2. **Chain proof**, the recommendation on
    [#969](https://github.com/ModernRelay/omnigraph/issues/969): walk
    `read_version` links from `to` back to `from`, proving each link and taking
    the union of touched fragments. It reads one transaction file per link, up
-   to 1,024 per merge. It breaks across compaction, overwrite and any unproven
-   link, and once cleanup reclaims an intermediate merge chunk that no graph
-   commit pins. It keeps the marker machinery. Fragment identity needs only
-   the two end manifests, so none of these limits apply.
-2. **Change sets recorded at commit**
+   to 1,024 per merge, and breaks across compaction, overwrite, any unproven
+   link, and once cleanup reclaims an intermediate merge chunk no graph commit
+   pins.
+3. **Change sets recorded at commit**
    ([RFC 0068](0068-graph-commit-record.md), and a candidate in the
-   detached-only RFC). This adds a second record beside the rows that
-   invariant 12 has to police, plus a format change. Its main advantage over
-   this design is a compaction window, which is not one of the measured
-   failures.
-3. **Writer-set row-lineage versions**, an upstream Lance option that stamps
+   detached-only RFC). A second record beside the rows that invariant 12 has to
+   police, plus a format change, for a cost this rule reaches from existing
+   metadata.
+4. **Writer-set row-lineage versions**, an upstream Lance option that stamps
    rows with the published version. It waits on a Lance release and a pin
-   bump, and stamps order one lineage only, so a two-point diff of diverged
-   heads would still need another rule.
-4. **Larger pages and longer client timeouts.** These hide the cost. The first
-   page still compares whole tables.
-5. **A plan cache across pages**
-   ([#970](https://github.com/ModernRelay/omnigraph/issues/970)). It helps
-   continuations only. The first page stays table-sized.
-6. **A wall-clock page budget.** Where a page ends would depend on timing, so
-   replay and DST lose determinism. The work ceiling bounds the same thing
-   deterministically.
-7. **Do nothing.** Branch review, merge-commit inspection and multi-commit
+   bump. It is also the bump at which this RFC's ancestry restriction is
+   dropped.
+5. **Ordered stamp tests against the fork version** (`stamp > fork`, `created
+   <= fork`): unsound on graph tables, since the stamp is the read version
+   plus one and both lineages after a fork count from the same base.
+6. **A live `_rowid` set difference alone**: unsound, since an update keeps
+   its `_rowid`, so an updated row is live on both sides.
+7. **Larger pages, longer client timeouts, a wall-clock page budget, a plan
+   cache across pages.** Each hides or defers the cost; the first page still
+   compares whole tables, and a wall-clock budget costs replay its
+   determinism.
+8. **Do nothing.** Branch review, merge-commit inspection and multi-commit
    diffs stay table-sized, and clients time out.
 
 ## Evidence and tests
 
-- **Oracle.** `change_lineage = verify` is the debug-build default. Every
-  commit-changes, feed and diff enumeration in the engine, server, GQT and DST
-  suites runs both classifiers and fails on any difference, as #540 did for 72
-  merge tests.
-- **Cost owner.** `crates/omnigraph/tests/integration/changes_cost.rs`:
-  - a branch diff over `k` commits on a type of `N` rows reads data that is
-    flat in `N` and grows with the changes;
-  - a three-way merge commit's own changes are flat in `N`;
-  - a two-point diff of diverged heads is flat in `N`;
-  - a window across optimize grows with the rewritten rows, the documented
-    term;
-  - a window across an overwrite grows with `N`, as today.
-- **Merge.** `crates/omnigraph/tests/integration/merge_cost.rs` stays flat
-  after the module move.
-- **Lance guards.** `crates/omnigraph/tests/lance_surface_guards.rs` gains
-  guards that a data file path never names different bytes in two versions of
-  a detached chain, and that a deletion change produces a new deletion-file
-  identity. Merge already relies on both.
-- **Witness seams.** `CHANGE_FEED_PRE_TABLE_OPEN` and
-  `CHANGE_FEED_POST_HEAD_WITNESS` keep refusing a branch delete and recreate
-  under `on` and `verify`.
+- **Lance guard.**
+  `lance_surface_guards::row_identity_discovery_stamps_row_ids_and_rewrites_lance_13`
+  pins, through the engine's writers on Lance 13.0.0: inline sequences on
+  every fragment of every graph write; an update's stamp equal to the read
+  version plus one and unequal to the detached version; the sibling-commit
+  collision; a deletion-only commit restamping nothing; compaction carrying
+  every live row's id and stamp. A bump that moves one of these is a design
+  review of the rule, not a test to weaken.
+- **Cost owner**, `crates/omnigraph/tests/integration/changes_cost.rs`, each
+  asserting the route counters:
+  - `graph_diff_over_several_commits_reads_data_flat_in_table_extent`: a
+    two-point diff and a branch review over several commits, at 64 and 1,024
+    rows per load, data reads flat, route row identity;
+  - `graph_diff_across_a_compaction_reads_data_flat_in_table_extent`: four
+    loads, `optimize` (every fragment rewritten, asserted), ten updates, a
+    two-point diff across the window at 256 and 4,096 rows, the exact ten
+    updates on one page, data reads flat;
+  - `graph_diff_of_diverged_heads_takes_the_exact_merge`: diverged heads take
+    the exact merge; the same two-commit window takes the exact merge under
+    `off` and row identity under `on` and `verify`, with the same rows, and
+    `off` opens no coordinator for the ancestry answer.
+- **Missing history.**
+  `integration/changes.rs::graph_diff_takes_the_exact_merge_below_a_missing_history_block`:
+  a `__history` block removed below the buffered commits; the two-point diff
+  across it answers `false` to the ancestry question and takes the exact merge.
+- **Served routes.**
+  `data_routes::changes_routes_run_under_the_process_change_lineage`:
+  `OMNIGRAPH_CHANGE_LINEAGE=off` takes the exact merge on `GET /diff`,
+  `GET /branches/diff` and the `branch diff` statement, and the query route's
+  `settings` field selects `on` over it, read through the route counters.
+- **Logic.** `crates/omnigraph-gqt/cases/issue_969_graph_diff_wider_windows.gqt`,
+  on the engine, DST seeds 0 and 42 and the served runner: a window that
+  folds two updates of one row, a delete, a delete and reinsert, an insert and
+  a keyed edge insert; `off` answering the same rows; the diff of two sibling
+  heads that updated one row alike; a window from a commit before the fork
+  into a sibling. `issue_969_branch_review_after_a_merge_from_target.gqt`, the
+  same targets: main and feature each insert one row in their first commit
+  after the fork, feature merges main, and the review of feature into main
+  reports feature's insert alone, as the two-point diff from main's head does.
+- **Oracle.** `change_lineage = verify` is the debug default, so every change
+  read in the engine's `changes` suites, the GQT corpus and the DST suite runs
+  both emitters and fails on any difference.
+- **Storage-cost golden**, `crates/omnigraph-dst/cost_table.txt`, the
+  `DiffPage*` and `BranchDiffPage*` rows (a two-commit window on a reopened
+  handle, under `verify`): the branch form's first page and continuation each
+  gain two reads, the row-identity emitter's candidate reads beside the exact
+  merge's; the two-point form's first page gains 14 reads and 3 listings, one
+  coordinator open of the `to` branch for the ancestry answer, and its
+  continuation loses 6 reads and 3 listings, since that coordinator then
+  serves the side resolution from the cache.
+- **Measured.** The issue's fixture under `on`, GQT `--measure` on the
+  in-memory DST store: both wider diffs read 14 table-data requests and 27,152
+  bytes at 4,000, 20,000 and 100,000 rows, from 17/57/277 requests and
+  287,492/1,405,044/6,922,180 bytes; the adjacent diff unchanged at 12 and
+  83,106. Total requests of the branch form 53/55/59 (from 56/98/322); of the
+  two-point form 67/70/74 (from 54/96/320), the difference to the branch form
+  being the coordinator open above.
 - **Hosted re-measure.** The five reads in Motivation after deployment.
 
 Lance reviewed: 13.0.0, the workspace pin. Surfaces: `Fragment` (`files`,
-`overlays`, `deletion_file`, `physical_rows`, `row_id_meta`), fragment
-deletion-vector reads, and fragment-scoped positional reads.
+`overlays`, `deletion_file`, `physical_rows`, `row_id_meta`,
+`last_updated_at_version_meta`), fragment deletion-vector reads, and
+fragment-scoped scans with a `_rowid` filter.
 
 ## Rollout
 
-1. Move discovery into a shared module. Merge uses it unchanged, and
-   `merge_cost.rs` stays flat.
-2. Commit changes and each commit of a feed poll use it behind
-   `change_lineage`: `verify` in debug builds, `off` in release builds.
-   `implementation` becomes `in-progress`.
-3. The graph diff, two-point and branch form, uses it.
-4. Feed bounds: the work ceiling, the commit-ceiling parameter and handle
-   reuse.
-5. Release default `on` after one edge cycle with `verify` clean in CI and DST.
-   The user guide and the RFC 0030 and detached-only dispositions land here.
-6. Remove the adjacency candidate path once a stable release has shipped `on`.
-   `implementation` becomes `complete`.
+The rule, the setting, the guard, the cost gates, the logic case, the user
+docs and the RFC 0030 amendment land in one change beside this RFC; the
+`implementation` field moves to `complete` when it merges. Release builds
+default to `on`, debug builds to `verify`. Before that change, release builds
+behave as today.
 
-Each step can ship alone. Before step 5, release builds behave as today.
+Follow-ups, each its own change:
+
+1. Fold the two-point form's two opens of the `to` branch into one, so its
+   first page costs what the branch form's costs (Unresolved question 1).
+2. The feed's work ceiling and commit-ceiling parameter
+   ([#1157](https://github.com/ModernRelay/omnigraph/issues/1157)).
+3. Drop the ancestry restriction at the Lance bump named in Design, The
+   ancestry restriction.
 
 ## Unresolved questions
 
-1. **Blob tables.** Is there a reason beyond merge staging for the merge
-   gate's Blob refusal that change discovery must inherit?
-2. **Positions or `id IN`.** Images are read at candidate positions, which
-   relies on per-version id uniqueness under the exact-id primary-key
-   contract. Does that contract hold for every edge table? If not, read by
-   chunked exact `id IN` at both pins, as merge does, at the cost of an index
-   or a narrow scan.
-3. **Budget miss granularity.** Does a type over the key budget fall back to
-   the exact comparison, or does discovery page by fragment range?
-4. **Witness frequency.** Can the branch-head re-prove run once per feed poll,
-   after the last table open, instead of once per commit?
-5. **Defaults and names.** The work ceiling's default, and the request
-   parameter names under the [HTTP API
-   conventions](2026-10-19-http-api-conventions.md).
+1. **The two-point form's second coordinator open.** On a fresh handle the
+   side classification resolves the `to` branch cold and the ancestry answer
+   opens it again into the merge-authority cache (14 reads and 3 listings in
+   the golden). Classify a non-current `to` through that cache, or accept the
+   cost. Decided by the implementer before the change merges.
+2. **`set=` on the REST change routes.** The routes validate `set=` and
+   select nothing, so `change_lineage` reaches them only as the process
+   default. Decided at the Session settings RFC's step that makes the routes
+   read their `set=` values.
+3. **The feed bounds of #1157.** Whether they take a separate RFC or an
+   amendment here. Decided by the author once this RFC is accepted.
 
 ## Decision log
 
@@ -432,3 +511,19 @@ Each step can ship alone. Before step 5, release builds behave as today.
   [#972](https://github.com/ModernRelay/omnigraph/issues/972) and
   [#1157](https://github.com/ModernRelay/omnigraph/issues/1157), and the merge
   classifier of [#540](https://github.com/ModernRelay/omnigraph/pull/540).
+- 2026-10-28: rewritten from the implementation. Fragment identity stays as
+  the first skip; discovery pairs live rows by `_rowid` and skips equal stamps,
+  which keeps a window across a compaction flat; the exact ordered merge over
+  the candidates replaces the first draft's positional image reads and
+  deletion-vector difference, so RFC 0030 §4.3 is untouched; the rule is
+  restricted to a `from` on `to`'s first-parent chain after the sibling-stamp
+  collision surfaced in the existing cross-branch update test; the feed's work
+  ceiling and commit ceiling moved out of scope; the adjacency path stays, so
+  `off` is today's path.
+- 2026-10-29: the branch form checks its merge base against the source head's
+  first-parent chain instead of assuming it, since a source that has merged
+  its target holds the base as a second parent and its sibling inserts would
+  pair; the REST change routes and
+  the `branch diff` statement read `change_lineage` from the process default
+  and the request session; a chain commit `__history` no longer holds answers
+  `false`; `off` skips the ancestry answer.

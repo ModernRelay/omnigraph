@@ -499,6 +499,7 @@ impl ServerHost {
                 let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
                 let query = change_query(&[], &args.filters);
                 let output = handlers::server_commit_changes(
+                    state(),
                     Extension(handle),
                     Some(Extension(actor)),
                     ApiPath(handlers::CommitPath {
@@ -520,6 +521,7 @@ impl ServerHost {
                     &args.filters,
                 );
                 let output = handlers::server_changes_feed(
+                    state(),
                     Extension(handle),
                     Some(Extension(actor)),
                     RawQuery(query),
@@ -537,6 +539,7 @@ impl ServerHost {
                     &args.filters,
                 );
                 let output = handlers::server_diff(
+                    state(),
                     Extension(handle),
                     Some(Extension(actor)),
                     RawQuery(query),
@@ -554,6 +557,7 @@ impl ServerHost {
                     &args.filters,
                 );
                 let output = handlers::server_branch_diff(
+                    state(),
                     Extension(handle),
                     Some(Extension(actor)),
                     RawQuery(query),

@@ -13,7 +13,7 @@ use crate::workload::{AdmissionGuard, IngressLease};
 use futures::StreamExt;
 use omnigraph::Session;
 use omnigraph::db::{BranchCreated, MergeResult, SnapshotId};
-use omnigraph::settings::{SettingId, SettingValue};
+use omnigraph::settings::{ChangeLineage, SettingId, SettingValue};
 use omnigraph_compiler::Literal;
 use omnigraph_compiler::query::ast::{
     BranchStmt, EmptyFile, FileBody, MutationWriteMode, QueryDecl, QueryFile, UnattachedBase,
@@ -4332,6 +4332,7 @@ pub(crate) fn parse_change_query(
 /// a large commit continues via the opaque `page_token`. `set=` values are
 /// validated and select nothing in this release.
 pub(crate) async fn server_commit_changes(
+    State(state): State<AppState>,
     Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     ApiPath(CommitPath { commit_id }): ApiPath<CommitPath>,
@@ -4374,12 +4375,13 @@ pub(crate) async fn server_commit_changes(
     }
     let scope = api::change_scope(&params.kinds, &params.types, &params.ops);
     let page = db
-        .commit_changes_page(
+        .commit_changes_page_under(
             &commit_id,
             &scope,
             params.page_token.as_deref(),
             params.limit,
             None,
+            state.change_lineage(),
         )
         .await
         .map_err(change_route_error)?;
@@ -4449,6 +4451,7 @@ fn required_diff_param(value: Option<String>, name: &str) -> std::result::Result
 /// commits and names them; a large result continues via the opaque
 /// `page_token`, and every page answers for those same commits.
 pub(crate) async fn server_diff(
+    State(state): State<AppState>,
     Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
@@ -4465,6 +4468,7 @@ pub(crate) async fn server_diff(
         api::change_scope(&params.kinds, &params.types, &params.ops),
         params.page_token,
         params.limit,
+        state.change_lineage(),
     )
     .await?;
     Ok(Json(api::diff_output(&page)))
@@ -4477,7 +4481,10 @@ pub(crate) async fn server_diff(
 /// classifies that side, before it looks at the next side or opens a
 /// snapshot. A side the actor cannot read is the 404 of a side that names
 /// nothing, whichever side it is: the route is not an existence oracle for
-/// branches or commits the actor cannot read.
+/// branches or commits the actor cannot read. `lineage` is the caller's
+/// `change_lineage`: the process default on the REST route, the request
+/// session's on the statement.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn two_point_diff_page(
     handle: &GraphRequest,
     actor: Option<&AuthenticatedActor>,
@@ -4486,6 +4493,7 @@ pub(crate) async fn two_point_diff_page(
     scope: omnigraph::changes::ChangeFeedScope,
     page_token: Option<String>,
     max_changes: Option<usize>,
+    lineage: ChangeLineage,
 ) -> std::result::Result<omnigraph::changes::GraphDiffPage, ApiError> {
     readable_diff_page(
         handle,
@@ -4497,27 +4505,29 @@ pub(crate) async fn two_point_diff_page(
             max_changes,
             max_bytes: None,
         },
+        lineage,
     )
     .await
 }
 
-/// One diff page read under `actor`'s `read` decisions, which the engine asks
-/// for each branch a two-point side reads and for each commit a continuation
-/// names that its side no longer resolves to. A policy failure (a missing
-/// bearer, an evaluation error) is not a denial: it stops the read, and its
-/// own error answers.
+/// One diff page under the caller's `change_lineage` and `actor`'s `read`
+/// decisions on each branch a side reads or a continuation names. A policy
+/// failure (a missing bearer, an evaluation error) answers with its own error.
 async fn readable_diff_page(
     handle: &GraphRequest,
     actor: Option<&AuthenticatedActor>,
     request: omnigraph::changes::GraphDiffRequest,
+    lineage: ChangeLineage,
 ) -> std::result::Result<omnigraph::changes::GraphDiffPage, ApiError> {
     let policy = handle.policy.as_deref();
     let mut failure = None;
     let page = handle
         .engine
-        .diff_page_readable(&request, &mut |branch| {
-            read_decision(actor, policy, &mut failure, branch)
-        })
+        .diff_page_readable_under(
+            &request,
+            &mut |branch| read_decision(actor, policy, &mut failure, branch),
+            lineage,
+        )
         .await;
     if let Some(error) = failure {
         return Err(error);
@@ -4594,6 +4604,7 @@ pub(crate) fn authorize_branch_reads(
 /// against; it and the source head are captured together. Changes the target
 /// made after the base do not appear. Paged like `GET /diff`.
 pub(crate) async fn server_branch_diff(
+    State(state): State<AppState>,
     Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
@@ -4609,6 +4620,7 @@ pub(crate) async fn server_branch_diff(
         api::change_scope(&params.kinds, &params.types, &params.ops),
         params.page_token,
         params.limit,
+        state.change_lineage(),
     )
     .await?;
     Ok(Json(api::diff_output(&page)))
@@ -4618,7 +4630,8 @@ pub(crate) async fn server_branch_diff(
 /// (`main` when absent), for `GET /branches/diff` and the `branch diff`
 /// statement: `read` on both named branches before any lineage is read, and on
 /// the branch of each commit a continuation names that the branches no longer
-/// resolve to.
+/// resolve to. `lineage` as for [`two_point_diff_page`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn branch_diff_page(
     handle: &GraphRequest,
     actor: Option<&AuthenticatedActor>,
@@ -4627,6 +4640,7 @@ pub(crate) async fn branch_diff_page(
     scope: omnigraph::changes::ChangeFeedScope,
     page_token: Option<String>,
     max_changes: Option<usize>,
+    lineage: ChangeLineage,
 ) -> std::result::Result<omnigraph::changes::GraphDiffPage, ApiError> {
     let source = requested_branch(Some(source))?;
     let target = requested_branch(target)?;
@@ -4641,6 +4655,7 @@ pub(crate) async fn branch_diff_page(
             max_changes,
             max_bytes: None,
         },
+        lineage,
     )
     .await
 }
@@ -4844,6 +4859,7 @@ fn parse_change_feed_start(
 /// terminal cursor together with its blocks. The server holds no consumer
 /// state. `set=` values are validated and select nothing in this release.
 pub(crate) async fn server_changes_feed(
+    State(state): State<AppState>,
     Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
@@ -4881,14 +4897,17 @@ pub(crate) async fn server_changes_feed(
     let scope = api::change_scope(&params.kinds, &params.types, &params.ops);
     let page = {
         let db = &handle.engine;
-        db.poll_change_feed(omnigraph::changes::ChangeFeedRequest {
-            branch: Some(branch.clone()),
-            position,
-            scope,
-            max_changes: params.limit,
-            max_bytes: None,
-            max_commits: None,
-        })
+        db.poll_change_feed_under(
+            omnigraph::changes::ChangeFeedRequest {
+                branch: Some(branch.clone()),
+                position,
+                scope,
+                max_changes: params.limit,
+                max_bytes: None,
+                max_commits: None,
+            },
+            state.change_lineage(),
+        )
         .await
         .map_err(change_route_error)?
     };

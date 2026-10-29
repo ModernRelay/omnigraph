@@ -482,7 +482,8 @@ impl ReadObserver {
     ///
     /// The task serves a request, or a part of one such as an MCP tool call,
     /// so it keeps its own record of the writes that request submits, and an
-    /// error leaving it carries that record to the waiter.
+    /// error leaving it carries that record to the waiter. The caller's engine
+    /// io probes, a test's, cross with it: a Tokio task local does not.
     pub(crate) fn spawn_read<T, R, F>(self, reservation: R, operation: F) -> OwnedReadResponse<T>
     where
         T: Send + 'static,
@@ -493,10 +494,20 @@ impl ReadObserver {
 
         let (sender, receiver) = oneshot::channel();
         let response_observer = self.clone();
+        let callers_probes = omnigraph::instrumentation::capture_query_io_probes();
         tokio::spawn(
             async move {
                 let _observer = self;
                 let _reservation = reservation;
+                let operation = async move {
+                    match callers_probes {
+                        Some(probes) => {
+                            omnigraph::instrumentation::with_query_io_probes(probes, operation)
+                                .await
+                        }
+                        None => operation.await,
+                    }
+                };
                 let result = scope_request(async move {
                     // Catch completed future Drop panics too.
                     #[allow(clippy::redundant_async_block)]
