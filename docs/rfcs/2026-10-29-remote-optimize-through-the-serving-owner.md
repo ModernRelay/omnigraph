@@ -58,9 +58,10 @@ This replaces the closed proposal in
 [PR #1168](https://github.com/ModernRelay/omnigraph/pull/1168) in the form its
 closing review asked for. [PR #1186](https://github.com/ModernRelay/omnigraph/pull/1186)
 proposes the same operation as a synchronous call with no record. This RFC
-takes #1186's ceilings, result rules and input-commit rule, and differs on
-one decision, the durable record (§[Alternatives](#alternatives)). Only one
-of the two should be accepted.
+adapts #1186's ceilings, result rules and input-commit rule, and differs
+from it in several places, chiefly the durable record
+(§[Relationship to open work](#relationship-to-open-work) and
+§[Alternatives](#alternatives)). Only one of the two should be accepted.
 
 ## Motivation
 
@@ -391,13 +392,25 @@ The helper owns the hook, so a later maintenance kind that publishes passes
 the same argument and uses the same resolution rule. It does not add a second
 hook.
 
+A two-phase engine API was considered instead: one call prepares the tables
+and returns the nonce and input head, and a second call publishes. It would
+keep even the callback out of the engine, but it would hold the writer gates
+across two calls owned by two layers, and the one publication would depend
+on the server making the second call. The optional callback keeps the gates,
+the attempt loop and the publication inside one engine call. The engine
+learns nothing about control objects: it awaits one caller-supplied future
+before its first manifest request, and an embedded or direct caller passes
+none.
+
 #### 1.7 Failures and completion evidence
 
 - **Before the publication.** Every failure carries `BeforeEffect` when
   nothing durable happened, and `Unpublished` after detached commits or
-  staged index files. Today a DataFusion or internal error inside optimize
-  carries no evidence, and the server reads that as uncertain and contains
-  the process (`ApiError::translated`). This slice labels them.
+  staged index files. Today a DataFusion error or a `RecoveryRequired` inside optimize
+  carries no completion evidence, and the server reads either as uncertain
+  and contains the process (`ApiError::translated`); any other internal
+  error is reported under its own code, also without evidence. This slice
+  labels them all.
 - **The publication.** The publisher's own outcome stands: committed, not
   committed, or `outcome_unknown` when a manifest request has no definite
   answer after every re-issue. Under the accepted storage-outcomes RFC, an
@@ -434,7 +447,8 @@ hook.
      drain is pending. The scan reads only, so it may be abandoned.
    - The served path bounds the artifact before and during its build,
      against a serve setting (`artifact_write_limit`, default 512 MiB, to be
-     confirmed by qualification). The limit covers the whole object
+     confirmed by qualification against the shutdown grace, §3.4). The
+     limit covers the whole object
      `serialize` writes: the magic, format version and header length (20
      bytes), the JSON header (at most `MAX_HEADER_BYTES`, 16 MiB), every
      section's prelude, the id dictionaries, and each edge type's offsets and
@@ -548,8 +562,12 @@ its report synchronously, as today.
 
 Terminal records are bounded by count (32), per-record size (1 MiB) and total
 size (4 MiB). The oldest is evicted first, and an unresolved record is never
-evicted. These limits belong to this record. Deployment receipt limits do not
-apply to it.
+evicted. These are the deployment receipts' values (`MAX_RESULTS`,
+`MAX_RESULT_BYTES` and `MAX_RESULTS_BYTES` in `omnigraph-cluster`'s
+`deployment.rs`), and the implementation shares those constants rather than
+restating them, so the two records cannot drift apart. The deployment
+ledger's own retention, eviction and lookup still apply to deployments only;
+this record is counted and evicted on its own.
 
 A record describes the graph that held the graph id at acceptance. Deleting
 and re-adding a graph does not rewrite past records. A lookup returns what
@@ -644,7 +662,18 @@ on its block: a GET of `blocks/{block}/all.lance` for a closed block written
 as one object, and otherwise that GET's `NotFound`, a list of the block and
 a GET of the range extent, since an ordinary buffer release writes an open
 block as `blocks/{block}/{start}-{end}.lance`. The walk visits one commit
-per commit published on main since the doubt arose.
+per commit published on main since the doubt arose, and that count is not
+bounded by the record. One resolution attempt therefore walks at most
+`resolution_walk_limit` commits (a serve setting, default 256). A walk that
+reaches the limit stops, stores the id of the commit it stopped at in the
+record, leaves the record `publishing`, and the next attempt resumes the
+walk below that commit instead of from the tip. Every commit below the stop
+point is immutable history, and the commit the walk looks for is the input
+head's child, so resuming below the stop point loses nothing. A lookup of
+such a record reports `resolution: walking` with the stop commit and how
+many commits the walk has covered. A record thus stays `publishing` for as
+many attempts as main's growth since the doubt divides by the limit, and
+each attempt's cost is bounded.
 
 The rule is later than the storage-outcomes RFC's test, under which the
 branch's next publication settles an unknown one by taking or finding its
@@ -661,6 +690,16 @@ publication on main settles the doubt. At most four unresolved records are
 kept. A fifth refuses admission with 409 `conflict` until a write on main
 settles the earlier ones. The work is never executed again. A caller who
 still wants it submits a new id.
+
+The exit from a full unresolved list is a move of main's graph head, and
+nothing else: a cancellation does not clear an unresolved record (§1.9),
+and there is no administrative override, because the record would then
+assert a fact history has not settled. Where no ordinary write arrives, an
+operator makes one. Any mutation, load or merge that publishes on main
+settles every unresolved record at once, by the walk above. A later slice
+may add an explicit fence, an empty commit on main of the kind the
+schema-apply settlement publishes, so that an operator can settle doubt
+without changing data; it is not in this RFC.
 
 #### 2.5 Lookup outcomes
 
@@ -745,6 +784,15 @@ and the registry agree on what is running.
   boundary, or finishes a publication or configuration clear in progress. An
   artifact scan in progress is abandoned. An issued artifact write is awaited
   within the shutdown grace (`OMNIGRAPH_SHUTDOWN_GRACE_SECONDS`, default 25).
+  The write is issued only if no shutdown is pending at that moment; a
+  shutdown that arrives first skips it, since the artifact is derived and the
+  next run rebuilds it. A 512 MiB write inside a 25 s grace needs a sustained
+  20 MiB/s, which a slow link does not give, so qualification (§Rollout,
+  step 4) measures the serving host's write throughput and sets the
+  `artifact_write_limit` default so that one write of that size completes
+  well inside the grace; 512 MiB stands only where that holds, and the
+  default is lowered where it does not. A limit an operator raises above the
+  qualified default is theirs to carry: the grace does not grow with it.
   The server then writes the terminal record and releases as today. If the
   artifact write or the terminal put is still unsettled when the grace ends,
   the storage-outcomes rule applies to that key. The server exits nonzero
@@ -815,12 +863,29 @@ Each of these needs its own requirements and evidence:
 ## Relationship to open work
 
 - **PR #1186** (served optimization, a synchronous call): the same operation
-  with a different result contract. This RFC brings across four of its rules:
+  with a different result contract. This RFC adapts four of its rules:
   ceilings before a rewrite (§1.4), the deferred full-text and drift outcomes
   as their own results (§1.5), full-text rebuild as its own operation, and the
-  input commit captured while the gates hold it (§1.6). It differs on the
-  durable record. #1186's separate `optimize` policy action would be a second
-  name for `maintain`. Two accepted optimize RFCs would leave two contracts.
+  input commit captured while the gates hold it (§1.6). The ceilings are
+  adapted, not copied: #1186 refuses the whole request before any effect when
+  a ceiling is exceeded and rejects "silently optimizing only a prefix";
+  here a per-table ceiling defers that table with its measure, the other
+  tables publish, and the stored resume position carries the rest to the
+  next run, so the prefix is reported, never silent. The two drafts also
+  differ on: the durable record and lookup (§2); cancellation (§1.9, §3.1); the
+  gate-hold bound, the run byte budget and the resume position (§1.2, §1.3);
+  caller options within the server's ceilings (§1.1, §3.1), where #1186
+  accepts none; the policy action; the three-route shape with a
+  caller-chosen id (§3.1), where #1186 has one route and a correlation id
+  for diagnosis only; planning read-ahead (§1.2); and the post-commit tail
+  (§1.8), which #1186 leaves as it is today. #1186 argues for a separate,
+  narrow `optimize` action so that the right to manage configuration or
+  membership never implies the right to run expensive maintenance. `maintain`
+  keeps that property, since `admin` does not grant it either, and is broader
+  only over content-preserving maintenance (index build, full-text rebuild,
+  the repair report); the destructive grant, `reclaim`, stays separate. A
+  per-verb action would add a name for every later kind. Two accepted
+  optimize RFCs would leave two contracts.
 - **PR #1175** (the `maintain` and `reclaim` actions, `_as` entry points,
   report-only repair): this RFC needs `maintain` and `optimize_as`, and
   `ensure_indices{,_on}_as` where they share optimize's index writer.
@@ -1052,3 +1117,21 @@ dated pending entry in its decision log:
     The evidence row pins no request count.
   - **Sizing paths.** The ceiling reuses the collector's `probe_directory`
     resolution instead of restating Lance's rule.
+- 2026-10-29: Reopened as a new pull request after the first one merged
+  before its review had closed and was reverted (#1203). Adjusted in the
+  reopening:
+  - **#1186.** "Takes" became "adapts": its ceilings refuse the whole
+    request, this RFC defers per table and resumes. The differences are now
+    listed in full, and its narrow-grant argument is answered.
+  - **Record bounds.** The 32 / 1 MiB / 4 MiB limits share the deployment
+    receipts' constants instead of restating them.
+  - **Resolution walk.** Bounded per attempt by `resolution_walk_limit`,
+    resumed below the stop commit, reported by lookup.
+  - **Unresolved list.** The only exit is a move of main's graph head; no
+    override, and a fence commit is named as a later slice.
+  - **Callback.** Why it was preferred over a two-phase engine API.
+  - **Containment.** Only DataFusion and `RecoveryRequired` are contained
+    today; other internal errors carry no evidence either.
+  - **Artifact and shutdown.** The write is skipped when a shutdown is
+    already pending, and the default limit is sized against the grace at
+    qualification.
