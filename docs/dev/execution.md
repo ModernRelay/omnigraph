@@ -977,6 +977,23 @@ required first hop of the query. The execution report records each gate's
 verdict with the counts it read and each probe attempt per overfetch rung
 (`search` decisions), and a replay must record the same.
 
+A ranked read reports its ranking (`QueryResult::ranking`). The planner
+derives what the accepted plan says of it (`omnigraph_planner::planned_ranking`):
+the search function of the one ranked `Scan` in the query's order or of the
+`RankFuse`, the return columns of the root's return list (a `return
+distinct`'s `Aggregate`) that read the ranking's `_distance`, `_score` or
+`_rrf` column on the ranked binding, and the ranked `nearest` scans; a stored
+property of a score column's name on a schema older than the reservation is
+no score column. The run supplies `exhaustive`: each `nearest` scan's
+`ScanReport::exact` says whether its last attempt in the pass whose rows the
+read returns ranked exactly (proven empty, flat, every partition of the
+IVF_FLAT index searched, or every admitted row returned, none at `+inf`).
+`engine::execute` attaches the ranking after the run from that pass's reports,
+so every door, replay included, reports the same ranking for one run, and
+`read_output` renders it as the envelope's `ranking`. Every vector index the
+engine builds is IVF_FLAT (`forbidden_apis.rs::vector_indexes_are_ivf_flat`),
+which is what makes a search of every partition exact.
+
 Lance 13 V2 row-stream payload hydration preserves input order and the valid
 prefixes of its ordering metadata. `WorkMemory` uses that metadata for the final
 sorted merge, so nearest keeps parallel output. Supported graph writers and

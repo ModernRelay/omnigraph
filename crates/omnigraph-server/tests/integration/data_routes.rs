@@ -6354,6 +6354,87 @@ query vector_search_string($q: String) {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["row_count"], 3);
     assert_eq!(body["rows"][0]["d.slug"], "alpha-doc");
+    // The ranking carries no trace of the text it embedded, and no column
+    // returns the distance. Three unindexed rows are scored flat.
+    assert_eq!(
+        body["ranking"],
+        json!({
+            "by": "nearest",
+            "order": "ascending",
+            "exhaustive": true,
+            "score_columns": []
+        })
+    );
+}
+
+/// A ranked read's envelope reports its ranking: the fusion, the direction
+/// its score orders, that two `bm25` arms score every match, and both
+/// columns that read the fused score; since the object is compared whole, no
+/// parameter value appears. An unranked read carries none.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_envelope_reports_its_ranking() {
+    const SCHEMA: &str = "node Doc {\n    slug: String @key\n    title: String @index\n}\n";
+    const QUERIES: &str = r#"
+query fused($a: String, $b: String) {
+    match { $d: Doc }
+    return {
+        $d.slug,
+        rrf(bm25($d.title, $a), bm25($d.title, $b)) as fused,
+        rrf(bm25($d.title, $a), bm25($d.title, $b)) as again
+    }
+    order { rrf(bm25($d.title, $a), bm25($d.title, $b)) }
+    limit 2
+}
+query unranked() {
+    match { $d: Doc }
+    return { $d.slug }
+    order { $d.slug }
+}
+"#;
+    let data = [
+        r#"{"type":"Doc","data":{"slug":"a","title":"needle guide"}}"#,
+        r#"{"type":"Doc","data":{"slug":"b","title":"needle"}}"#,
+        r#"{"type":"Doc","data":{"slug":"c","title":"handbook"}}"#,
+    ]
+    .join("\n");
+    let temp = init_graph_with_schema_and_data(SCHEMA, &data).await;
+    let graph = graph_path(temp.path());
+    let app = build_app(
+        AppState::open(graph.to_string_lossy().to_string())
+            .await
+            .unwrap(),
+    );
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({
+                "query": QUERIES,
+                "name": "fused",
+                "params": {"a": "needle", "b": "guide"}
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["ranking"],
+        json!({
+            "by": "rrf",
+            "order": "descending",
+            "exhaustive": true,
+            "score_columns": ["fused", "again"]
+        })
+    );
+
+    let (status, body) = json_response(
+        &app,
+        json_post("/query", &json!({"query": QUERIES, "name": "unranked"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("ranking").is_none(), "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

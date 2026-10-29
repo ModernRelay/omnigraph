@@ -15448,6 +15448,45 @@
         },
         "additionalProperties": false
       },
+      "RankOrder": {
+        "type": "string",
+        "description": "The direction a ranking's score orders rows.",
+        "enum": [
+          "ascending",
+          "descending"
+        ]
+      },
+      "RankingOutput": {
+        "type": "object",
+        "description": "The ranking a read ordered its rows by.",
+        "required": [
+          "by",
+          "order",
+          "exhaustive",
+          "score_columns"
+        ],
+        "properties": {
+          "by": {
+            "$ref": "#/components/schemas/SearchFunction",
+            "description": "The search function the leading `order` key names."
+          },
+          "exhaustive": {
+            "type": "boolean",
+            "description": "Whether no row the search admitted and did not return outranks a\nreturned one. `bm25` scores every match, so it is always exhaustive.\n`nearest` is exhaustive when the run searched every partition of the\nvector index, scored every row flat or returned every row it\nadmitted, and `false` when a probe cap left partitions unsearched, so\na nearer row may exist. `rrf` is exhaustive when its `nearest` arms\nare."
+          },
+          "order": {
+            "$ref": "#/components/schemas/RankOrder",
+            "description": "`ascending` for a `nearest` distance (smaller is nearer),\n`descending` for a `bm25` or `rrf` score (larger is more relevant)."
+          },
+          "score_columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The returned columns that hold the ranking's own score, in return\norder; empty when the read returns none. A column computed from the\nscore is not one."
+          }
+        }
+      },
       "ReadOutput": {
         "type": "object",
         "required": [
@@ -15483,6 +15522,17 @@
           },
           "query_name": {
             "type": "string"
+          },
+          "ranking": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RankingOutput",
+                "description": "How the read ordered its rows when its order is a search: the\nsearch function, the direction its score ranks, whether the run's\nsearch was exhaustive, and the returned columns holding the score.\nAbsent when the order is no search."
+              }
+            ]
           },
           "row_count": {
             "type": "integer",
@@ -15699,6 +15749,15 @@
             ]
           }
         }
+      },
+      "SearchFunction": {
+        "type": "string",
+        "description": "The search function a ranked read orders by.",
+        "enum": [
+          "nearest",
+          "bm25",
+          "rrf"
+        ]
       },
       "SettingsRequest": {
         "type": "object",
