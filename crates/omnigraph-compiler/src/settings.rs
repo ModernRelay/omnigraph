@@ -88,7 +88,7 @@ pub const DEFINITIONS: &[SettingSpec] = &[
         default: "on",
         scope: SettingScope::Request,
         env: "OMNIGRAPH_CHANGE_LINEAGE",
-        doc: "how a graph diff or commit page finds the rows it compares across a window with no adjacent transaction: the exact ordered merge of both versions, the rows paired by stable row id, or both compared",
+        doc: "how a graph diff or commit page finds the entities it compares across a window with no adjacent transaction: the exact ordered merge of both versions, the entities paired by stable identity, or both compared",
     },
     SettingSpec {
         name: "ann_nprobes",
