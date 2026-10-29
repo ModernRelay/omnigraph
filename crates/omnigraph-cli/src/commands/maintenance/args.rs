@@ -69,6 +69,18 @@ pub(crate) struct OptimizeArgs {
     /// Accepts Go-style durations: `30s`, `5m`.
     #[arg(long)]
     pub(crate) max_gate_hold: Option<String>,
+    /// Server targets: return once the server has accepted the run, without
+    /// waiting for its terminal record.
+    #[arg(long)]
+    pub(crate) no_wait: bool,
+    /// Server targets: observe the operation with this id instead of
+    /// submitting a new one.
+    #[arg(long, value_name = "ID")]
+    pub(crate) operation: Option<String>,
+    /// Server targets: stop waiting after this long (`10m`); the operation
+    /// keeps running and `--operation` observes it.
+    #[arg(long)]
+    pub(crate) timeout: Option<String>,
     #[arg(long)]
     pub(crate) json: bool,
 }

@@ -62,7 +62,7 @@ pub use maintenance::{
     MAX_MAINTENANCE_TERMINAL, MAX_MAINTENANCE_UNRESOLVED, MaintenanceKind, MaintenanceLedger,
     MaintenanceOperation, MaintenanceRefusal, MaintenanceState, MaintenanceTableOutcome,
     MaintenanceTailOutcome, MaintenanceTimings, MaintenanceWrite, OptimizeOptions, Resolution,
-    canonical_maintenance_id, maintenance_request_digest,
+    canonical_maintenance_id, maintenance_request_digest, new_maintenance_id,
 };
 #[cfg(any(test, feature = "test-util"))]
 pub use serve::read_serving_snapshot_with_display_root;

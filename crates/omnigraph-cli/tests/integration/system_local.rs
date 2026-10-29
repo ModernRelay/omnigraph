@@ -1210,6 +1210,93 @@ fn local_cli_policy_tooling_is_end_to_end() {
     assert!(explain_stdout.contains("branch: main"));
 }
 
+const MAINTAIN_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  operators: [act-ragnor]
+rules:
+  - id: operators-maintain
+    allow:
+      actors: { group: operators }
+      actions: [maintain, read]
+      branch_scope: any
+"#;
+
+/// `optimize` against a server target runs served maintenance: it prints
+/// the id it minted, waits for the terminal record, observes a submitted
+/// operation by id, answers `unknown` with exit 2, and returns after
+/// acceptance with `--no-wait`. A direct target refuses the served flags.
+#[test]
+fn local_cli_optimize_runs_served_maintenance() {
+    if skip_system_e2e("local_cli_optimize_runs_served_maintenance") {
+        return;
+    }
+    let cluster = converged_loaded_cluster("knowledge", Some(MAINTAIN_POLICY_YAML));
+    let server = spawn_server_with_cluster_env(
+        cluster.path(),
+        &[
+            ("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", POLICY_TOKENS_JSON),
+            ("OMNIGRAPH_MAINTENANCE_ROUTES", "true"),
+        ],
+    );
+    let optimize = |extra: &[&str]| {
+        let mut command = cli();
+        command
+            .envs(server.credential("ragnor-tok"))
+            .arg("optimize")
+            .arg("--target")
+            .fixture_target(&server.base_url)
+            .arg("--graph")
+            .arg("knowledge")
+            .arg("--json");
+        command.args(extra);
+        command.output().unwrap()
+    };
+
+    let run = optimize(&["--timeout", "60s"]);
+    assert_eq!(run.status.code(), Some(0), "{run:?}");
+    let record = parse_stdout_json(&run);
+    assert_eq!(record["operation"]["state"], "succeeded", "{record}");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    let id = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("maintenance id: "))
+        .unwrap_or_else(|| panic!("the id is printed before the request: {stderr}"))
+        .to_string();
+    assert_eq!(record["operation"]["maintenance_id"], id.as_str());
+
+    let observed = optimize(&["--operation", &id]);
+    assert_eq!(observed.status.code(), Some(0), "{observed:?}");
+    assert_eq!(
+        parse_stdout_json(&observed)["operation"],
+        record["operation"]
+    );
+
+    let unknown = optimize(&["--operation", "01JC0000000000000000000009"]);
+    assert_eq!(unknown.status.code(), Some(2), "{unknown:?}");
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("holds no record"),
+        "{unknown:?}"
+    );
+
+    let accepted = optimize(&["--no-wait"]);
+    assert_eq!(accepted.status.code(), Some(0), "{accepted:?}");
+    assert_eq!(parse_stdout_json(&accepted)["lookup"], "found");
+
+    let direct = cli()
+        .arg("optimize")
+        .arg("--target")
+        .arg(cluster.path().join("graphs/knowledge.omni"))
+        .arg("--no-wait")
+        .output()
+        .unwrap();
+    assert!(!direct.status.success(), "{direct:?}");
+    assert!(
+        String::from_utf8_lossy(&direct.stderr).contains("apply to a server target only"),
+        "{direct:?}"
+    );
+}
+
 /// Token→actor map for the served-policy tests: the bearer tokens the
 /// cluster server resolves to `act-bruno` / `act-ragnor`.
 const POLICY_TOKENS_JSON: &str = r#"{"act-bruno":"bruno-tok","act-ragnor":"ragnor-tok"}"#;

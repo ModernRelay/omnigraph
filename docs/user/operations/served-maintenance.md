@@ -56,6 +56,23 @@ reason to resubmit the same work under the same id.
 | The routes are off, or the server is draining | 503 `service_unavailable` |
 | A record write without a definite answer | 500 `outcome_unknown`; look the id up |
 
+## From the CLI
+
+`omnigraph optimize --target <server>` runs the same route. It prints the id
+it minted before it sends, waits for the terminal record, and after a lost
+response looks the id up instead of submitting again. `--no-wait` returns
+once the run is accepted, `--operation <id>` observes an existing operation,
+and `--timeout` bounds the wait, not the operation. `--tables` and
+`--max-gate-hold` map to the request.
+
+| Outcome | Exit |
+|---|---|
+| `succeeded`, or accepted or observed with `--no-wait` | 0 |
+| Refused before acceptance, or `failed`, `cancelled` or `interrupted` | 1 |
+| Still `publishing` or running when the wait ended, or `unknown` after a lost response | 2 |
+| The same id with a different request | 4 |
+| Another maintenance operation is active | 75 |
+
 ## States
 
 An operation moves through `accepted`, `running` and `publishing` to one

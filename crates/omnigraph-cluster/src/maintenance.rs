@@ -230,6 +230,11 @@ pub fn canonical_maintenance_id(id: &str) -> bool {
     canonical_ulid(id)
 }
 
+/// A fresh maintenance id, which a caller mints before it submits.
+pub fn new_maintenance_id() -> String {
+    ulid::Ulid::new().to_string()
+}
+
 impl MaintenanceOperation {
     /// A new `accepted` operation, stamped now, with its request digest.
     pub fn accepted(
