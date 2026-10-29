@@ -52,13 +52,17 @@ pub fn render_read(
 
 fn render_jsonl(output: &ReadOutput) -> Result<String> {
     let mut lines = Vec::new();
-    lines.push(serde_json::to_string(&serde_json::json!({
+    let mut metadata = serde_json::json!({
         "kind": "metadata",
         "query_name": output.query_name,
         "target": output.target,
         "row_count": output.row_count,
         "page": output.page,
-    }))?);
+    });
+    if let Some(ranking) = &output.ranking {
+        metadata["ranking"] = serde_json::to_value(ranking)?;
+    }
+    lines.push(serde_json::to_string(&metadata)?);
     for row in rows(output)? {
         lines.push(serde_json::to_string(&row)?);
     }
@@ -324,7 +328,9 @@ fn csv_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use omnigraph_server::api::{ReadOutput, ReadTargetOutput};
+    use omnigraph_server::api::{
+        RankOrder, RankingOutput, ReadOutput, ReadTargetOutput, SearchFunction,
+    };
 
     use super::*;
 
@@ -343,6 +349,7 @@ mod tests {
             .unwrap(),
             graph_commit_id: None,
             page: None,
+            ranking: None,
         }
     }
 
@@ -395,12 +402,37 @@ mod tests {
 
         let first = rendered.lines().next().unwrap();
         assert!(first.contains("\"kind\":\"metadata\""));
+        assert!(!first.contains("ranking"));
         assert!(
             rendered
                 .lines()
                 .nth(1)
                 .unwrap()
                 .contains("\"name\":\"Alice\"")
+        );
+
+        // A ranked read's ranking rides in the metadata record, as in the
+        // `--json` envelope.
+        let mut ranked = sample_output();
+        ranked.ranking = Some(RankingOutput {
+            by: SearchFunction::Bm25,
+            order: RankOrder::Descending,
+            exhaustive: true,
+            score_columns: vec!["score".to_string()],
+        });
+        let rendered = render_read(
+            &ranked,
+            ReadOutputFormat::Jsonl,
+            &ReadRenderOptions {
+                max_column_width: 80,
+                cell_layout: TableCellLayout::Truncate,
+            },
+        )
+        .unwrap();
+        let metadata: Value = serde_json::from_str(rendered.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            metadata["ranking"],
+            serde_json::to_value(&ranked.ranking).unwrap()
         );
     }
 

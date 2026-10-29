@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use color_eyre::Result;
+use color_eyre::{Result, eyre::bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -46,7 +46,7 @@ pub(crate) fn binding_digest(target: &Target) -> Result<Option<String>> {
     let identity = ServerIdentity {
         kind: "server",
         endpoint: canonical_endpoint(endpoint)?,
-        auth: AuthIdentity::of(auth),
+        auth: AuthIdentity::of(auth)?,
         transport: TransportIdentity::of(transport.as_ref()),
     };
     Ok(Some(digest(
@@ -120,8 +120,8 @@ enum SourceIdentity<'a> {
 }
 
 impl<'a> AuthIdentity<'a> {
-    fn of(auth: &'a AuthProfile) -> Self {
-        match auth {
+    fn of(auth: &'a AuthProfile) -> Result<Self> {
+        Ok(match auth {
             AuthProfile::Anonymous => Self::Anonymous,
             AuthProfile::Omnigraph => Self::Omnigraph,
             AuthProfile::Token { source } => Self::Token {
@@ -132,7 +132,10 @@ impl<'a> AuthIdentity<'a> {
                 },
             },
             AuthProfile::Exec { command, .. } => Self::Exec { command },
-        }
+            AuthProfile::OauthClientCredentials { .. } => {
+                bail!("OAuth client credentials require a managed profile")
+            }
+        })
     }
 }
 
@@ -220,6 +223,17 @@ mod tests {
         assert_eq!(
             binding("{kind: direct, scope: graph, uri: 'file:///srv/graphs/g.omni'}"),
             None
+        );
+        // Validation normally rejects this before target inspection. A direct
+        // caller must not manufacture a standalone binding for managed auth.
+        let invalid: Target = yaml_serde::from_str(&server(
+            "https://graph.example.com",
+            "auth: {provider: oauth_client_credentials, token_endpoint: 'https://auth.example/token', client_id: private-client, client_secret: {env: PRIVATE_SECRET_SOURCE}}",
+        ))
+        .unwrap();
+        assert_eq!(
+            binding_digest(&invalid).unwrap_err().to_string(),
+            "OAuth client credentials require a managed profile"
         );
     }
 

@@ -172,8 +172,8 @@ async fn automation_credential_expiry_is_rechecked_before_each_control_request()
                 );
                 assert_eq!(
                     std::fs::read_to_string(&calls).unwrap(),
-                    "called\n",
-                    "expiry must not rerun the helper"
+                    "called\ncalled\n",
+                    "an expired helper is read once again, but cannot dispatch with expired authority"
                 );
             })
             .await;
@@ -385,7 +385,7 @@ pub(super) fn tokens(seconds: i64, user: &str) -> Value {
         "organization_id":"org_test","access_token":jwt(seconds,user),"refresh_token":"rotated-refresh"})
 }
 
-pub(super) fn metadata(seconds: i64, principal: &str) -> IntentReply {
+pub(in crate::managed) fn metadata(seconds: i64, principal: &str) -> IntentReply {
     metadata_for(seconds, principal, "org_test")
 }
 
@@ -1412,5 +1412,190 @@ async fn target_mechanism_never_falls_back_to_another_credential_class() {
         .await
         .unwrap(),
         None
+    );
+}
+
+#[tokio::test]
+async fn workload_session_requires_verified_class_client_and_immutable_identity() {
+    let expires = (OffsetDateTime::now_utc() + time::Duration::minutes(5))
+        .replace_nanosecond(0)
+        .unwrap();
+    let original = json!({"data":{"account_id":"org_test","principal_id":"principal_one","kind":"automation","subject":"oauth:issuer:client_one","provider_client_id":"client_one","expires_at":expires.format(&Rfc3339).unwrap(),"service_permissions":["source_read"]},"meta":{"assurance":"verified_workload"}});
+    for (profile, strict) in [
+        (
+            json!({"provider":"oauth_client_credentials","token_endpoint":"https://auth.example/oauth2/token","client_id":"client_one","client_secret":{"env":"UNUSED_TEST_SECRET"}}),
+            true,
+        ),
+        (
+            json!({"provider":"exec","command":["/unused/helper"]}),
+            false,
+        ),
+        (
+            json!({"provider":"token","source":{"env":"UNUSED_TEST_TOKEN"}}),
+            false,
+        ),
+    ] {
+        for (pointer, changed, expected) in [
+            (
+                "/data/account_id",
+                json!("org_other"),
+                "organization_mismatch",
+            ),
+            (
+                "/data/principal_id",
+                json!("principal_other"),
+                "session_identity_mismatch",
+            ),
+            (
+                "/data/subject",
+                json!("oauth:other:client_one"),
+                "session_identity_mismatch",
+            ),
+            (
+                "/data/provider_client_id",
+                json!("client_other"),
+                "workload_identity_mismatch",
+            ),
+            ("/data/kind", json!("human"), "workload_identity_mismatch"),
+            (
+                "/meta/assurance",
+                json!("verified_human"),
+                "workload_identity_mismatch",
+            ),
+            (
+                "/data/expires_at",
+                Value::Null,
+                "workload_identity_mismatch",
+            ),
+            ("/data/service_permissions", json!(["source_write"]), ""),
+        ] {
+            let api = IntentApiFixture::with_session(vec![], original.clone());
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("config.yaml"), json!({"version":1,"profiles":{"work":{"api":api.origin,"organization_id":"org_test","auth":profile}}}).to_string()).unwrap();
+            let input =
+                crate::operator::InvocationConfig::at(Some(directory.path().to_owned()), None);
+            let cli = crate::invocation::parse_from([
+                "omnigraph",
+                "cluster",
+                "list",
+                "--profile",
+                "work",
+            ])
+            .unwrap()
+            .cli;
+            let target =
+                crate::scope::resolve(&cli, &input, directory.path(), false, &mut Vec::new())
+                    .unwrap()
+                    .unwrap();
+            let auth =
+                crate::operator_routing::authentication(&cli, &input, Some(&target)).unwrap();
+            crate::operator_routing::test_transport_scope(&[&api.origin], async {
+                crate::operator_routing::AUTH
+                    .scope(auth, async {
+                        let (_, credential) = verify_external(
+                            &api.origin,
+                            Some("org_test"),
+                            automation_credential(&api.origin, "test-token"),
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(credential.expires_at(), Some(expires));
+                        let mut altered = original.clone();
+                        *altered.pointer_mut(pointer).unwrap() = changed;
+                        api.set_session(altered.clone());
+                        let result = verify_external(
+                            &api.origin,
+                            Some("org_test"),
+                            automation_credential(&api.origin, "rotated-test-token"),
+                        )
+                        .await;
+                        if !expected.is_empty()
+                            && (strict
+                                || matches!(pointer, "/data/account_id" | "/data/principal_id"))
+                        {
+                            let failure = result.unwrap_err();
+                            assert_eq!(
+                                failure.body["type"], expected,
+                                "{pointer}: {}",
+                                failure.body
+                            );
+                        } else {
+                            let (identity, _) = result.unwrap();
+                            assert_eq!(
+                                identity.subject.as_deref(),
+                                altered["data"]["subject"].as_str()
+                            );
+                            assert_eq!(
+                                identity.assurance.as_deref(),
+                                altered["meta"]["assurance"].as_str()
+                            );
+                        }
+                        assert_eq!(
+                            api.requests().len(),
+                            2,
+                            "only session verification is allowed"
+                        );
+                    })
+                    .await;
+            })
+            .await;
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn concurrent_preissuance_refusals_share_one_new_control_acquisition() {
+    let home = tempfile::tempdir().unwrap();
+    let helper = home.path().join("helper.sh");
+    let response = home.path().join("response.json");
+    let calls = home.path().join("calls");
+    std::fs::write(
+        &helper,
+        "IFS= read -r request\nprintf 'called\\n' >> \"$2\"\ncat \"$1\"\n",
+    )
+    .unwrap();
+    let write = |token| {
+        std::fs::write(
+            &response,
+            json!({"version":1,"credential":{"type":"bearer","token":token}}).to_string(),
+        )
+        .unwrap()
+    };
+    write("initial-token");
+    std::fs::write(home.path().join("config.yaml"), json!({"version":1,"profiles":{"work":{"api":"https://api.example","organization_id":"org_test","auth":{"provider":"exec","command":["/bin/sh", helper, response, calls]}}}}).to_string()).unwrap();
+    let input = crate::operator::InvocationConfig::at(Some(home.path().to_owned()), None);
+    let cli = crate::invocation::parse_from(["omnigraph", "cluster", "list", "--profile", "work"])
+        .unwrap()
+        .cli;
+    let target = crate::scope::resolve(&cli, &input, home.path(), false, &mut Vec::new())
+        .unwrap()
+        .unwrap();
+    let auth = crate::operator_routing::authentication(&cli, &input, Some(&target))
+        .unwrap()
+        .unwrap();
+    let refused = auth.acquire_credential().await.unwrap().unwrap();
+    write("renewed-token");
+    let (first, second) = tokio::join!(
+        auth.renew_control_credential(&refused),
+        auth.renew_control_credential(&refused)
+    );
+    for credential in [first.unwrap(), second.unwrap()] {
+        assert_eq!(
+            acquired_bearer(&credential, "https://api.example").unwrap(),
+            "renewed-token"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap(),
+        "called\ncalled\n",
+        "one initial and one renewal acquisition"
+    );
+    auth.invalidate().unwrap();
+    assert!(auth.renew_control_credential(&refused).await.is_err());
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap(),
+        "called\ncalled\n",
+        "stale owners must not acquire again"
     );
 }
