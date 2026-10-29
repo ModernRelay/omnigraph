@@ -3606,7 +3606,7 @@ fn organization_members() -> Value {
 }
 
 fn team_invitation(state: &str) -> Value {
-    serde_json::json!({"id":"inv_one","email":"avery@example.com","state":state,"organization_id":"account-one","accepted_user_id":null,"created_at":"2026-10-15T00:00:00Z","expires_at":"2026-10-22T00:00:00Z"})
+    serde_json::json!({"id":"inv_one","email":"avery@example.com","state":state,"role":"member","organization_id":"account-one","accepted_user_id":null,"created_at":"2026-10-15T00:00:00Z","expires_at":"2026-10-22T00:00:00Z"})
 }
 
 fn team_offboard(
@@ -3693,7 +3693,8 @@ fn managed_organization_writes_send_exact_identity_and_required_key_once() {
         let temp = tempdir().unwrap();
         let response = serde_json::json!({"data":{"organization_id":"account-one","action":action,"invitation":team_invitation(if action=="revoke" {"revoked"} else {"pending"})},"meta":{}});
         let api = lifecycle_fixture(vec![IntentReply::json(200, response.clone())]);
-        let output = output_success(organization_cli(temp.path(), &api.origin).args([
+        let mut command = organization_cli(temp.path(), &api.origin);
+        command.args([
             "invitations",
             action,
             if action == "send" {
@@ -3704,12 +3705,16 @@ fn managed_organization_writes_send_exact_identity_and_required_key_once() {
             "--idempotency-key",
             "invite-key",
             "--json",
-        ]));
+        ]);
+        if action == "send" {
+            command.args(["--role", "member"]);
+        }
+        let output = output_success(&mut command);
         assert_eq!(parse_stdout_json(&output), response);
         let (path, input) = if action == "send" {
             (
                 "/v1/organization/invitations".to_owned(),
-                serde_json::json!({"organization_id":"account-one","email":"avery@example.com"}),
+                serde_json::json!({"organization_id":"account-one","email":"avery@example.com","role":"member"}),
             )
         } else {
             (
@@ -3791,6 +3796,26 @@ fn managed_organization_refuses_invalid_targets_and_retired_grants_before_extern
         ],
         vec![
             "members",
+            "set",
+            "avery@example.com",
+            "--role",
+            "writer",
+            "--role",
+            "writer",
+            "--idempotency-key",
+            "duplicate-key",
+        ],
+        vec![
+            "invitations",
+            "send",
+            "avery@example.com",
+            "--role",
+            "INVALID ROLE",
+            "--idempotency-key",
+            "invalid-role-key",
+        ],
+        vec![
+            "members",
             "offboard",
             "avery@example.com",
             "--expected-membership",
@@ -3828,6 +3853,8 @@ fn managed_organization_refuses_invalid_targets_and_retired_grants_before_extern
             "avery@example.com",
             "--idempotency-key",
             "space key",
+            "--role",
+            "member",
         ],
     ] {
         let output = organization_cli(temp.path(), &api.origin)
@@ -3980,7 +4007,21 @@ fn managed_organization_refuses_foreign_malformed_and_uncertain_results_without_
         assert_eq!(api.workflow_requests().len(), 1);
         api.assert_complete();
     }
+    let role_receipt = |role: Option<&str>| {
+        let mut invitation = team_invitation("pending");
+        if let Some(role) = role {
+            invitation["role"] = serde_json::json!(role);
+        } else {
+            invitation.as_object_mut().unwrap().remove("role");
+        }
+        IntentReply::json(
+            200,
+            serde_json::json!({"data":{"organization_id":"account-one","action":"send","invitation":invitation},"meta":{}}),
+        )
+    };
     for reply in [
+        role_receipt(None),
+        role_receipt(Some("writer")),
         IntentReply::json(
             403,
             serde_json::json!({"type":"scope_missing","detail":"not permitted"}),
@@ -4008,6 +4049,8 @@ fn managed_organization_refuses_foreign_malformed_and_uncertain_results_without_
                 "avery@example.com",
                 "--idempotency-key",
                 "same-key",
+                "--role",
+                "member",
                 "--json",
             ])
             .output()
@@ -4016,6 +4059,7 @@ fn managed_organization_refuses_foreign_malformed_and_uncertain_results_without_
         assert_eq!(parse_stdout_json(&output)["idempotency_key"], "same-key");
         assert!(!String::from_utf8_lossy(&output.stdout).contains("must-never-print"));
         assert_eq!(api.workflow_requests().len(), 1);
+        assert!(organization_record(temp.path()).exists());
         api.assert_complete();
     }
 }
@@ -4047,7 +4091,7 @@ fn managed_organization_requires_an_account_target_and_write_keys() {
 }
 
 fn team_role_result(outcome: &str) -> Value {
-    serde_json::json!({"data":{"organization_id":"account-one","user_id":"user_one","membership_id":"om_one","previous_roles":["member"],"requested_role":"writer","role_update":outcome,"roles":[if outcome == "updated" {"writer"} else {"member"}],"service_permissions":["source_read","status"],"provider_observed_at":"2026-10-27T10:00:00Z","graph_policy_changed":false},"meta":{}})
+    serde_json::json!({"data":{"organization_id":"account-one","user_id":"user_one","membership_id":"om_one","previous_roles":["member"],"requested_roles":["writer"],"role_update":outcome,"roles":[if outcome == "updated" {"writer"} else {"member"}],"service_permissions":["source_read","status"],"provider_observed_at":"2026-10-27T10:00:00Z","graph_policy_changed":false},"meta":{}})
 }
 
 fn organization_record(root: &std::path::Path) -> std::path::PathBuf {
@@ -4061,11 +4105,20 @@ fn organization_record(root: &std::path::Path) -> std::path::PathBuf {
 
 #[test]
 fn managed_organization_resolves_members_once_and_retains_exact_role_and_offboard_requests() {
-    for action in ["set", "offboard"] {
+    for (action, roles) in [
+        ("set", &["writer"][..]),
+        ("set", &["writer", "source-reader"][..]),
+        ("offboard", &[][..]),
+    ] {
         for selector in ["AVERY@example.com", "user_one"] {
             let temp = tempdir().unwrap();
             let receipt = if action == "set" {
-                team_role_result("updated")
+                let mut roles = roles.to_vec();
+                roles.sort();
+                let mut receipt = team_role_result("updated");
+                receipt["data"]["requested_roles"] = serde_json::json!(roles);
+                receipt["data"]["roles"] = serde_json::json!(roles);
+                receipt
             } else {
                 team_offboard(Some("om_one"), "removed", "complete", 2)
             };
@@ -4074,7 +4127,7 @@ fn managed_organization_resolves_members_once_and_retains_exact_role_and_offboar
                 IntentReply::json(200, receipt.clone()),
                 IntentReply::json(200, receipt.clone()),
             ]);
-            let mut arguments = vec![
+            let arguments = vec![
                 "members",
                 action,
                 selector,
@@ -4082,10 +4135,15 @@ fn managed_organization_resolves_members_once_and_retains_exact_role_and_offboar
                 "member-key",
                 "--json",
             ];
-            if action == "set" {
-                arguments.extend(["--role", "writer"]);
-            }
-            for _ in 0..2 {
+            for retry in 0..2 {
+                let mut arguments = arguments.clone();
+                let mut selected = roles.to_vec();
+                if retry == 1 {
+                    selected.reverse();
+                }
+                for role in selected {
+                    arguments.extend(["--role", role]);
+                }
                 let output =
                     output_success(organization_cli(temp.path(), &api.origin).args(&arguments));
                 assert_eq!(parse_stdout_json(&output), receipt);
@@ -4098,6 +4156,13 @@ fn managed_organization_resolves_members_once_and_retains_exact_role_and_offboar
             assert_eq!(requests[1].body, requests[2].body);
             assert_eq!(requests[1].body["user_id"], "user_one");
             assert_eq!(requests[1].body["expected_membership_id"], "om_one");
+            if action == "set" {
+                assert_eq!(
+                    requests[1].body["roles"],
+                    receipt["data"]["requested_roles"]
+                );
+                assert!(requests[1].body.get("role").is_none());
+            }
             let records: Value =
                 serde_json::from_slice(&fs::read(organization_record(temp.path())).unwrap())
                     .unwrap();
@@ -4122,6 +4187,91 @@ fn managed_organization_resolves_members_once_and_retains_exact_role_and_offboar
             assert_no_core_effects(temp.path());
             api.assert_complete();
         }
+    }
+}
+
+#[test]
+fn managed_organization_preserves_archived_roleless_invitations_without_new_sends() {
+    for uncertain in [false, true] {
+        let temp = tempdir().unwrap();
+        let receipt = serde_json::json!({"data":{"organization_id":"account-one","action":"send","invitation":team_invitation("pending")},"meta":{}});
+        let mut archived = receipt.clone();
+        archived["data"]["invitation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("role");
+        let replay = if uncertain {
+            IntentReply::json(
+                409,
+                serde_json::json!({"type":"team_operation_uncertain","detail":"retain original request"}),
+            )
+        } else {
+            IntentReply::json(200, archived.clone())
+        };
+        let api = lifecycle_fixture(vec![IntentReply::json(200, receipt), replay]);
+        let arguments = [
+            "invitations",
+            "send",
+            "avery@example.com",
+            "--idempotency-key",
+            "saved-key",
+            "--json",
+        ];
+        output_success(
+            organization_cli(temp.path(), &api.origin)
+                .args(arguments)
+                .args(["--role", "member"]),
+        );
+        // Reproduce the exact pre-role custody format, without inventing a role
+        // for an invitation that may already have been sent by an older CLI.
+        let path = organization_record(temp.path());
+        let mut records: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        records[0]["operation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("role");
+        records[0]["request"]["body"]
+            .as_object_mut()
+            .unwrap()
+            .remove("role");
+        let original = serde_json::to_vec(&records).unwrap();
+        fs::write(&path, &original).unwrap();
+        let output = organization_cli(temp.path(), &api.origin)
+            .args(arguments)
+            .output()
+            .unwrap();
+        if uncertain {
+            assert!(!output.status.success());
+            assert_eq!(
+                parse_stdout_json(&output)["type"],
+                "team_operation_uncertain"
+            );
+        } else {
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(parse_stdout_json(&output), archived);
+        }
+        assert_eq!(
+            api.workflow_requests()[1].body,
+            records[0]["request"]["body"]
+        );
+        assert!(api.workflow_requests()[1].body.get("role").is_none());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let changed = output_failure(
+            organization_cli(temp.path(), &api.origin)
+                .args(arguments)
+                .args(["--role", "member"]),
+        );
+        assert_eq!(
+            parse_stdout_json(&changed)["type"],
+            "organization_request_conflict"
+        );
+        let mut fresh = arguments;
+        fresh[4] = "fresh-key";
+        let missing = output_failure(organization_cli(temp.path(), &api.origin).args(fresh));
+        assert_eq!(parse_stdout_json(&missing)["type"], "role_required");
+        assert_eq!(api.workflow_requests().len(), 2);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        api.assert_complete();
     }
 }
 
@@ -4298,7 +4448,7 @@ fn managed_organization_preserves_uncertain_requests_and_validates_role_receipts
     for (pointer, value) in [
         ("/data/user_id", serde_json::json!("user_other")),
         ("/data/membership_id", serde_json::json!("om_other")),
-        ("/data/requested_role", serde_json::json!("admin")),
+        ("/data/requested_roles", serde_json::json!(["admin"])),
         ("/data/role_update", serde_json::json!("unsupported")),
         ("/data/roles", serde_json::json!(["admin"])),
         ("/data/previous_roles", serde_json::json!([])),
@@ -4381,6 +4531,8 @@ fn managed_organization_custody_refuses_capacity_corruption_and_rebinding_withou
             "avery@example.com",
             "--idempotency-key",
             "invite-key",
+            "--role",
+            "member",
             "--json",
         ];
         output_success(organization_cli(temp.path(), &api.origin).args(arguments));
@@ -4470,6 +4622,8 @@ fn managed_organization_profile_rename_preserves_retry_and_other_profiles_have_s
         "avery@example.com",
         "--idempotency-key",
         "invite-key",
+        "--role",
+        "member",
         "--json",
     ];
     output_success(
@@ -4560,6 +4714,8 @@ fn managed_organization_keeps_exact_custody_when_stdout_is_closed_and_lock_is_bu
         "avery@example.com",
         "--idempotency-key",
         "invite-key",
+        "--role",
+        "member",
         "--json",
     ];
     let (reader, writer) = UnixStream::pair().unwrap();

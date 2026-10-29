@@ -315,7 +315,7 @@ fn minimal_document_and_output_defaults() {
     assert_eq!(config.defaults.output, OutputFormat::Table);
     assert!(config.defaults.target.is_none());
     assert!(config.defaults.profile.is_none());
-    for output in ["table", "json", "jsonl", "csv", "kv"] {
+    for output in ["table", "json", "jsonl", "csv", "kv", "toon"] {
         assert!(decode(&format!("version: 1\ndefaults: {{output: {output}}}")).is_ok());
     }
     for output in ["yaml", "JSON", "null", "''", "3", "[]"] {

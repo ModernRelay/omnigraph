@@ -103,6 +103,7 @@ pub(crate) fn parse(text: &str, base: &Path) -> Result<crate::operator::Operator
         schema::OutputFormat::Jsonl => crate::read_format::ReadOutputFormat::Jsonl,
         schema::OutputFormat::Csv => crate::read_format::ReadOutputFormat::Csv,
         schema::OutputFormat::Kv => crate::read_format::ReadOutputFormat::Kv,
+        schema::OutputFormat::Toon => crate::read_format::ReadOutputFormat::Toon,
     };
     Ok(crate::operator::OperatorConfig {
         targets,

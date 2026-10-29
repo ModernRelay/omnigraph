@@ -632,12 +632,14 @@ struct Api {
 struct Response {
     status: StatusCode,
     body: Value,
+    retry_after: Vec<reqwest::header::HeaderValue>,
 }
 
 struct ResponseLimits {
     timeout: Duration,
     max_body: usize,
     preserve_contents: bool,
+    auth_verification_status: bool,
 }
 
 impl Api {
@@ -769,6 +771,7 @@ impl Api {
                 timeout,
                 max_body: MAX_BODY,
                 preserve_contents: false,
+                auth_verification_status: false,
             },
         )
         .await
@@ -786,7 +789,11 @@ impl Api {
             timeout,
             max_body,
             preserve_contents,
+            auth_verification_status,
         } = limits;
+        if auth_verification_status && (method != Method::GET || path != "/v1/auth/session") {
+            return Err(Failure::protocol());
+        }
         let url = self.url(path)?;
         let mut request = self.client.request(method, url).timeout(timeout);
         if let Some(key) = key {
@@ -824,6 +831,27 @@ impl Api {
         };
         let mut response = request.send().await.map_err(|_| transport())?;
         let status = response.status();
+        let retry_after = response
+            .headers()
+            .get_all(reqwest::header::RETRY_AFTER)
+            .iter()
+            .cloned()
+            .collect();
+        // This read-only verification path may see a proxy's HTML error or a
+        // disconnected body. Retry authority is its status/header, never that body.
+        // Ordinary requests retain their exact response validation and no retries.
+        if auth_verification_status && matches!(status.as_u16(), 408 | 429 | 500..=599) {
+            return Ok(Response {
+                status,
+                body: Failure::new(
+                    "identity_verification_unavailable",
+                    "the session verification service is temporarily unavailable",
+                    1,
+                )
+                .body,
+                retry_after,
+            });
+        }
         if status.is_redirection() {
             return Err(Failure::new(
                 "api_redirect_refused",
@@ -903,7 +931,11 @@ impl Api {
             error.response_status = Some(status);
             error
         })?;
-        Ok(Response { status, body })
+        Ok(Response {
+            status,
+            body,
+            retry_after,
+        })
     }
 
     async fn request(

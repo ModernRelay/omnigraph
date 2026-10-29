@@ -126,7 +126,10 @@ pub(crate) fn resolve(
             "this selection requires a registered target name",
         ));
     }
+    let inline_s3 =
+        inline && selection.starts_with("s3://") && planes::admits_inline_s3_root(&cli.command);
     if inline
+        && !inline_s3
         && (crate::graph_http::server_scheme(selection).is_some()
             || selection.contains("://") && !selection.starts_with("file://"))
     {
@@ -134,10 +137,23 @@ pub(crate) fn resolve(
     }
     let target = if inline {
         let binding = {
+            let root =
+                init_uri.is_none() && (planes::root_input(&cli.command) || cli.graph.is_some());
+            if inline_s3 && !root {
+                return Err(targets::refusal(
+                    "target_invalid",
+                    "an inline s3:// target is a cluster root; select its graph with --graph",
+                ));
+            }
             let uri = targets::normalize_storage_uri(selection, cwd)
                 .map_err(|error| targets::refusal("target_invalid", error.to_string()))?;
-            let provider = StorageProvider::Local;
-            if init_uri.is_none() && (planes::root_input(&cli.command) || cli.graph.is_some()) {
+            let provider = if inline_s3 {
+                StorageProvider::capture(&uri)
+                    .map_err(|error| targets::refusal("target_invalid", error.to_string()))?
+            } else {
+                StorageProvider::Local
+            };
+            if root {
                 TargetBinding::DirectRoot {
                     uri,
                     provider,
@@ -592,5 +608,126 @@ defaults: {target: local, profile: work}
         );
         assert!(selected(&["version", "--target", "cluster"], &input, dir.path()).is_err());
         assert!(selected(&["version", "--auth", "me"], &input, dir.path()).is_err());
+    }
+
+    #[test]
+    fn inline_s3_root_reaches_only_stopped_writer_and_maintenance_commands_issue_1163() {
+        let (dir, input) = fixture();
+        let root = "s3://bucket/cluster";
+        let id = "01K00000000000000000000000:1:01K00000000000000000000001";
+        for args in [
+            vec!["cluster", "plan", "--config", "."],
+            vec!["cluster", "apply", "--config", "."],
+            vec![
+                "cluster",
+                "apply",
+                "--deployment-id",
+                id,
+                "--writers-stopped",
+            ],
+            vec!["cluster", "status", "--deployment-id", id],
+            vec!["cluster", "force-unlock", "lock-one"],
+            vec!["cluster", "upgrade-ledger", "--writers-stopped"],
+            vec!["optimize", "--graph", "knowledge"],
+            vec!["index", "build", "--graph", "knowledge"],
+            vec![
+                "index",
+                "rebuild",
+                "--kind",
+                "full-text",
+                "--graph",
+                "knowledge",
+            ],
+            vec![
+                "cleanup",
+                "--graph",
+                "knowledge",
+                "--keep",
+                "1",
+                "--confirm",
+            ],
+            vec!["repair", "--graph", "knowledge"],
+            vec!["rebuild-full-text-indexes", "--graph", "knowledge"],
+        ] {
+            let mut args = args;
+            args.extend(["--target", root]);
+            let parsed =
+                parse_from(std::iter::once("omnigraph").chain(args.iter().copied())).unwrap();
+            assert!(
+                planes::admits_inline_s3_root(&parsed.cli.command),
+                "{args:?}"
+            );
+            // Applicability of an S3 root, independent of the environment.
+            let s3_root = ResolvedTarget::new(
+                TargetBinding::DirectRoot {
+                    uri: root.into(),
+                    provider: StorageProvider::S3 {
+                        region: "us-east-1".into(),
+                        endpoint: None,
+                        virtual_hosted_style: false,
+                    },
+                    default_graph: None,
+                },
+                TargetProvenance::Inline {
+                    address: root.into(),
+                },
+            );
+            planes::validate_target(&parsed.cli, &s3_root, parsed.explicit_config)
+                .unwrap_or_else(|error| panic!("{args:?}: {error}"));
+            if planes::selects_graph(&parsed.cli.command, &s3_root) {
+                graph_selection(&s3_root, parsed.cli.graph.as_deref()).unwrap();
+            }
+            // The resolver captures the ambient AWS settings, so the only
+            // refusal it may return here is that capture.
+            match selected(&args, &input, dir.path()) {
+                Ok(target) => assert!(
+                    matches!(
+                        target.unwrap().binding,
+                        TargetBinding::DirectRoot { ref uri, provider: StorageProvider::S3 { .. }, .. }
+                            if uri.starts_with(root)
+                    ),
+                    "{args:?}"
+                ),
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(
+                        error
+                            .downcast_ref::<targets::TargetError>()
+                            .is_some_and(|e| e.code == "target_invalid")
+                            && !message.contains("cluster root"),
+                        "{args:?}: {message}"
+                    );
+                }
+            }
+        }
+        for args in [
+            vec!["query", "-e", "q", "--graph", "knowledge", "--target", root],
+            vec!["snapshot", "--graph", "knowledge", "--target", root],
+            vec!["branch", "list", "--graph", "knowledge", "--target", root],
+            vec!["schema", "show", "--graph", "knowledge", "--target", root],
+            vec!["cluster", "observe", "--target", root],
+            vec!["policy", "validate", "--target", root],
+            vec!["init", "s3://bucket/graph", "--schema", "schema.pg"],
+            vec![
+                "optimize",
+                "--graph",
+                "knowledge",
+                "--target",
+                "az://container/cluster",
+            ],
+        ] {
+            let error = selected(&args, &input, dir.path()).unwrap_err();
+            assert!(
+                error.to_string().contains("local storage only"),
+                "{args:?}: {error}"
+            );
+        }
+        let error = selected(&["optimize", "--target", root], &input, dir.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cluster root; select its graph with --graph"),
+            "{error}"
+        );
     }
 }

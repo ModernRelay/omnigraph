@@ -5518,6 +5518,7 @@ dependencies = [
 name = "omnigraph-api-types"
 version = "0.14.1"
 dependencies = [
+ "arrow-schema",
  "omnigraph-compiler",
  "omnigraph-engine",
  "omnigraph-policy",

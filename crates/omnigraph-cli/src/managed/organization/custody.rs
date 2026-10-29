@@ -22,11 +22,11 @@ impl ExactRequest {
         let membership = self.body["expected_membership_id"].as_str();
         let selector_matches = |selector: &str, id: &str| email(selector) || selector == id;
         match operation {
-            Operation::Set { selector, role } => user.is_some_and(|user| {
+            Operation::Set { selector, roles } => user.is_some_and(|user| {
                 identity(user) && selector_matches(selector, user)
                     && membership.is_some_and(valid_membership)
                     && self.path == format!("/v1/organization/members/{user}:set-role")
-                    && self.body == json!({"version":1,"organization_id":organization,"user_id":user,"expected_membership_id":membership,"role":role})
+                    && self.body == json!({"version":1,"organization_id":organization,"user_id":user,"expected_membership_id":membership,"roles":roles})
             }),
             Operation::Offboard { selector, expected_membership } => user.is_some_and(|user| {
                 identity(user) && selector_matches(selector, user)
@@ -38,8 +38,8 @@ impl ExactRequest {
                     && self.path == format!("/v1/organization/members/{user}:offboard")
                     && self.body == json!({"version":2,"organization_id":organization,"user_id":user,"expected_membership_id":membership})
             }),
-            Operation::Send { email } => self.path == "/v1/organization/invitations"
-                && self.body == json!({"organization_id":organization,"email":email}),
+            Operation::Send { email, role } => self.path == "/v1/organization/invitations"
+                && self.body == invitation_body(organization, email, role.as_deref()),
             Operation::Resend { selector } | Operation::Revoke { selector } => {
                 let suffix = if matches!(operation, Operation::Resend { .. }) { ":resend" } else { ":revoke" };
                 self.path.strip_prefix("/v1/organization/invitations/")
