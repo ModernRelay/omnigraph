@@ -730,6 +730,11 @@ async fn replayed(db: &Session, source: &str, name: &str, params: &ParamMap) -> 
             .await
             .unwrap();
         assert_eq!(rows_of(&replay.result), result);
+        assert_eq!(
+            replay.result.ranking(),
+            run.result.ranking(),
+            "the replayed plan reports the run's ranking"
+        );
         assert_same_trace(&rows, &report_rows(&replay.report));
         assert_eq!(search_decisions(&replay.report), search);
     }
@@ -1351,6 +1356,127 @@ async fn a_fusion_replays() {
         probed[0], probed[1],
         "each arm records under its own scan: {search:#?}"
     );
+}
+
+/// A read reports the ranking its order names: the search function, whether
+/// the run's search was exhaustive, and every returned column holding the
+/// ranking's own score, including two columns that read one fused score and
+/// a `distinct` group key, while a column computed from a score is none. The
+/// fixture's vectors carry no index, so Lance scores every row and each
+/// `nearest` is exhaustive; the partitioned-index cases in `search.rs` own
+/// the inexact run. An inspected run, an ordinary run and a replay report
+/// one ranking alike.
+#[tokio::test]
+async fn a_read_reports_its_ranking() {
+    use omnigraph_compiler::result::{Ranking, SearchFunction};
+
+    const RANKED: &str = r#"
+query two_texts($a: String, $b: String) {
+    match { $d: Doc }
+    return {
+        $d.slug,
+        rrf(bm25($d.text, $a), bm25($d.text, $b)) as fused,
+        rrf(bm25($d.text, $a), bm25($d.text, $b)) as again
+    }
+    order { rrf(bm25($d.text, $a), bm25($d.text, $b)) }
+    limit 3
+}
+query closest($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug, nearest($d.embedding, $q) }
+    order { nearest($d.embedding, $q) }
+    limit 2
+}
+query distinct_scores($a: String) {
+    match { $d: Doc }
+    return distinct { $d.slug, bm25($d.text, $a) as relevance }
+    order { bm25($d.text, $a) }
+    limit 3
+}
+query computed_score($a: String) {
+    match { $d: Doc }
+    return { $d.slug, bm25($d.text, $a) as relevance, bm25($d.text, $a) > 0.0 as hit }
+    order { bm25($d.text, $a) }
+    limit 3
+}
+query unranked() {
+    match { $d: Doc }
+    return { $d.slug }
+    order { $d.slug }
+    limit 2
+}
+"#;
+    let ranking = |by, score_columns: &[&str]| {
+        Some(Ranking {
+            by,
+            exhaustive: true,
+            score_columns: score_columns.iter().map(ToString::to_string).collect(),
+        })
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = docs(&dir).await;
+    let vector = Literal::List(vec![Literal::Float(0.0); 4]);
+    let texts = ParamMap::from([
+        ("a".to_string(), Literal::String("needle".to_string())),
+        ("b".to_string(), Literal::String("3".to_string())),
+    ]);
+    let needle = ParamMap::from([("a".to_string(), Literal::String("needle".to_string()))]);
+    let closest = ParamMap::from([("q".to_string(), vector.clone())]);
+    let mixed = ParamMap::from([
+        ("t".to_string(), Literal::String("needle".to_string())),
+        ("q".to_string(), vector),
+    ]);
+    for (source, name, params, expected) in [
+        (
+            RANKED,
+            "two_texts",
+            &texts,
+            ranking(SearchFunction::Rrf, &["fused", "again"]),
+        ),
+        (
+            RANKED,
+            "closest",
+            &closest,
+            ranking(SearchFunction::Nearest, &["d._distance"]),
+        ),
+        (
+            DOC_QUERIES,
+            "fused",
+            &mixed,
+            ranking(SearchFunction::Rrf, &[]),
+        ),
+        (
+            RANKED,
+            "distinct_scores",
+            &needle,
+            ranking(SearchFunction::Bm25, &["relevance"]),
+        ),
+        // A column computed from a score is no score column; the score is.
+        (
+            RANKED,
+            "computed_score",
+            &needle,
+            ranking(SearchFunction::Bm25, &["relevance"]),
+        ),
+        (RANKED, "unranked", &ParamMap::new(), None),
+    ] {
+        let run = db
+            .query_inspected(ReadTarget::branch("main"), source, name, params)
+            .await
+            .unwrap();
+        assert_eq!(run.result.ranking(), expected.as_ref(), "{name}");
+        let ordinary = db
+            .query(ReadTarget::branch("main"), source, name, params)
+            .await
+            .unwrap();
+        assert_eq!(
+            ordinary.ranking(),
+            expected.as_ref(),
+            "{name}: the ordinary door"
+        );
+        replayed(&db, source, name, params).await;
+    }
 }
 
 /// A top-k whose output alone reads `text` replays with its `HydrateColumns`

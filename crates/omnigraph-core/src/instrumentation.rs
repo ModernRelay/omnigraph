@@ -21,7 +21,7 @@
 //! module stays generic over the `lance::io`-re-exported trait, so it adds no
 //! production dependency.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -538,12 +538,16 @@ where
     QUERY_MEMORY_PROBES.scope(probes, fut).await
 }
 
+/// One checkpoint pause. The first body to reach it claims it, marks it
+/// waiting and only then marks it entered, so a test that has seen
+/// `entered()` also sees `is_paused()` until it releases the pause.
 #[derive(Debug, Default)]
 struct QueryBlockingPause {
     released: Mutex<bool>,
     wake: std::sync::Condvar,
-    entered: AtomicU64,
-    waiting: AtomicU64,
+    claimed: AtomicBool,
+    entered: AtomicBool,
+    waiting: AtomicBool,
 }
 
 /// Releases the test checkpoint even when an assertion unwinds.
@@ -552,11 +556,11 @@ pub struct QueryBlockingPauseGuard(Arc<QueryBlockingPause>);
 
 impl QueryBlockingPauseGuard {
     pub fn entered(&self) -> bool {
-        self.0.entered.load(Ordering::SeqCst) > 0
+        self.0.entered.load(Ordering::SeqCst)
     }
 
     pub fn is_paused(&self) -> bool {
-        self.0.waiting.load(Ordering::SeqCst) > 0
+        self.0.waiting.load(Ordering::SeqCst)
     }
 
     pub fn release(&self) {
@@ -679,15 +683,11 @@ impl QueryBlockingWorkGuard {
         else {
             return;
         };
-        // A later checkpoint does not park again. Publish the wait before the
-        // entry count: a test that observes `entered` must also observe the pause.
-        if pause.entered.load(Ordering::SeqCst) > 0 {
+        if pause.claimed.swap(true, Ordering::SeqCst) {
             return;
         }
-        pause.waiting.store(1, Ordering::SeqCst);
-        if pause.entered.fetch_add(1, Ordering::SeqCst) > 0 {
-            return;
-        }
+        pause.waiting.store(true, Ordering::SeqCst);
+        pause.entered.store(true, Ordering::SeqCst);
         let released = pause
             .released
             .lock()
@@ -700,7 +700,7 @@ impl QueryBlockingWorkGuard {
                 })
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
-        pause.waiting.store(0, Ordering::SeqCst);
+        pause.waiting.store(false, Ordering::SeqCst);
     }
 
     pub fn started(&mut self) {

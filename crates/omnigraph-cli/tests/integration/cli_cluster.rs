@@ -4602,3 +4602,133 @@ fn managed_organization_keeps_exact_custody_when_stdout_is_closed_and_lock_is_bu
     assert_eq!(fs::read(&path).unwrap(), original);
     api.assert_complete();
 }
+
+#[test]
+fn managed_workload_explicit_token_and_clear_use_only_invocation_custody() {
+    let temp = tempdir().unwrap();
+    let endpoint = "https://graph.example.invalid";
+    let (api, tokens) = IntentApiFixture::workload_identity_issuer(endpoint, 1);
+    let provider = IntentApiFixture::new(vec![IntentReply::json(
+        200,
+        serde_json::json!({"access_token":"oauth-initial","token_type":"Bearer","expires_in":600}),
+    )]);
+    write_managed_data_target(temp.path(), &api.origin, endpoint);
+    let home = managed_home(temp.path());
+    let config = home.join("config.yaml");
+    let mut document: Value = yaml_serde::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    document["profiles"]["managed-account"]["auth"] = serde_json::json!({
+        "provider":"oauth_client_credentials",
+        "token_endpoint":format!("{}/oauth2/token", provider.origin),
+        "client_id":"client-one","client_secret":{"env":"OG_FIXTURE_CLIENT_SECRET"}});
+    fs::write(&config, yaml_serde::to_string(&document).unwrap()).unwrap();
+    let output = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", &home)
+            .env("SSL_CERT_FILE", crate::support::tls_gateway::ca_path())
+            .env("OG_FIXTURE_CLIENT_SECRET", "fixture-private-secret")
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/nonexistent/omnigraph-no-keyring",
+            )
+            .current_dir(temp.path())
+            .timeout(std::time::Duration::from_secs(15))
+            .args(["cluster", "token", "--target", "managed-test", "--json"]),
+    );
+    let result = parse_stdout_json(&output);
+    assert_eq!(result["data"]["actor"], "principal:principal-one");
+    assert!(result["data"].get("token").is_none());
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for secret in ["fixture-private-secret", "oauth-initial", &tokens[0]] {
+        assert!(!printed.contains(secret));
+    }
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(api.workflow_requests().len(), 1);
+    assert_eq!(
+        api.workflow_requests()[0].path,
+        "/v1/clusters/managed-test/tokens"
+    );
+    provider.assert_complete();
+    api.assert_complete();
+
+    // Clear is local even when the provider is unreachable and no secret exists.
+    document["profiles"]["managed-account"]["auth"]["token_endpoint"] =
+        serde_json::json!("https://provider.example.invalid/oauth2/token");
+    fs::write(&config, yaml_serde::to_string(&document).unwrap()).unwrap();
+    let cleared = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", &home)
+            .env_remove("OG_FIXTURE_CLIENT_SECRET")
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/nonexistent/omnigraph-no-keyring",
+            )
+            .timeout(std::time::Duration::from_secs(5))
+            .args([
+                "cluster",
+                "token",
+                "--clear",
+                "--target",
+                "managed-test",
+                "--json",
+            ]),
+    );
+    assert_eq!(
+        parse_stdout_json(&cleared)["data"]["local_credential_removed"],
+        false
+    );
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(api.workflow_requests().len(), 1);
+}
+
+#[test]
+fn managed_workload_token_exchange_refuses_redirects_and_errors_without_secret_output() {
+    for status in [302, 401] {
+        let temp = tempdir().unwrap();
+        let api = lifecycle_fixture(vec![]);
+        let provider = IntentApiFixture::new(vec![IntentReply {
+            status,
+            headers: vec![(
+                "Location".into(),
+                "https://other.example.invalid/redirected".into(),
+            )],
+            body: br#"{"error":"fixture-provider-private-response"}"#.to_vec(),
+        }]);
+        write_managed_target(temp.path(), &api.origin);
+        let home = managed_home(temp.path());
+        let config = home.join("config.yaml");
+        let mut document: Value =
+            yaml_serde::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        document["profiles"]["managed-account"]["auth"] = serde_json::json!({
+            "provider":"oauth_client_credentials", "token_endpoint":format!("{}/oauth2/token", provider.origin),
+            "client_id":"client-one", "client_secret":{"env":"OG_FIXTURE_CLIENT_SECRET"}});
+        fs::write(&config, yaml_serde::to_string(&document).unwrap()).unwrap();
+        let output = output_failure(
+            cli()
+                .env("OMNIGRAPH_HOME", &home)
+                .env("SSL_CERT_FILE", crate::support::tls_gateway::ca_path())
+                .env("OG_FIXTURE_CLIENT_SECRET", "fixture-private-secret")
+                .timeout(std::time::Duration::from_secs(10))
+                .args(["cluster", "token", "--target", "managed-test", "--json"]),
+        );
+        let printed = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for secret in [
+            "fixture-private-secret",
+            "fixture-provider-private-response",
+        ] {
+            assert!(!printed.contains(secret));
+        }
+        assert_eq!(provider.requests().len(), 1);
+        assert!(api.requests().is_empty());
+        provider.assert_complete();
+        api.assert_complete();
+        assert_no_core_effects(temp.path());
+    }
+}

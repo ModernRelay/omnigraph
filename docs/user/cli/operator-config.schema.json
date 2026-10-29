@@ -209,7 +209,8 @@
       "properties": {
         "store": {
           "type": "object",
-          "properties": {},
+          "properties": {
+          },
           "additionalProperties": false
         }
       },
@@ -253,6 +254,9 @@
         },
         {
           "$ref": "#/$defs/execAuth"
+        },
+        {
+          "$ref": "#/$defs/oauthClientCredentialsAuth"
         }
       ]
     },
@@ -653,6 +657,51 @@
           }
         }
       ]
+    },
+    "clientSecretSource": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/envSource"
+        },
+        {
+          "$ref": "#/$defs/fileSource"
+        }
+      ]
+    },
+    "oauthClientCredentialsAuth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "token_endpoint",
+        "client_id",
+        "client_secret"
+      ],
+      "properties": {
+        "provider": {
+          "const": "oauth_client_credentials"
+        },
+        "token_endpoint": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://",
+          "maxLength": 4096,
+          "description": "Explicit HTTPS token endpoint without userinfo, query or fragment. No discovery or redirects."
+        },
+        "client_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "client_secret": {
+          "$ref": "#/$defs/clientSecretSource"
+        },
+        "scope": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        }
+      }
     }
   }
 }

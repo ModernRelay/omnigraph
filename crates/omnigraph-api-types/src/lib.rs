@@ -12,7 +12,7 @@ use omnigraph_compiler::SchemaMigrationStep;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::query::ast::Param;
-use omnigraph_compiler::result::QueryResult;
+use omnigraph_compiler::result::{QueryResult, Ranking, SearchFunction as ResultSearchFunction};
 use omnigraph_compiler::settings::{
     Engine, MergeLineage, SettingId, SettingKind, SettingRow, SettingValue,
 };
@@ -604,6 +604,51 @@ pub struct ReadOutput {
     /// other answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page: Option<ReadPageOutput>,
+    /// How the read ordered its rows when its order is a search: the
+    /// search function, the direction its score ranks, whether the run's
+    /// search was exhaustive, and the returned columns holding the score.
+    /// Absent when the order is no search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranking: Option<RankingOutput>,
+}
+
+/// The ranking a read ordered its rows by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RankingOutput {
+    /// The search function the leading `order` key names.
+    pub by: SearchFunction,
+    /// `ascending` for a `nearest` distance (smaller is nearer),
+    /// `descending` for a `bm25` or `rrf` score (larger is more relevant).
+    pub order: RankOrder,
+    /// Whether no row the search admitted and did not return outranks a
+    /// returned one. `bm25` scores every match, so it is always exhaustive.
+    /// `nearest` is exhaustive when the run searched every partition of the
+    /// vector index, scored every row flat or returned every row it
+    /// admitted, and `false` when a probe cap left partitions unsearched, so
+    /// a nearer row may exist. `rrf` is exhaustive when its `nearest` arms
+    /// are.
+    pub exhaustive: bool,
+    /// The returned columns that hold the ranking's own score, in return
+    /// order; empty when the read returns none. A column computed from the
+    /// score is not one.
+    pub score_columns: Vec<String>,
+}
+
+/// The search function a ranked read orders by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchFunction {
+    Nearest,
+    Bm25,
+    Rrf,
+}
+
+/// The direction a ranking's score orders rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RankOrder {
+    Ascending,
+    Descending,
 }
 
 /// The page state a `branch diff` answer carries: the exact commits it
@@ -2042,6 +2087,11 @@ pub struct AccessOutput {
     /// The actor the credential resolves to. Absent only on a server that runs
     /// without authentication.
     pub actor_id: Option<String>,
+    /// The OAuth client the credential was issued to, when it is a verified
+    /// OIDC access token. The actor stays the person's principal across
+    /// clients. Opaque text the client chose: render it escaped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
     pub graph_id: String,
     /// Actions allowed with no branch named: the graph-scoped ones, and the
     /// branch-scoped ones a single rule allows on every branch (a rule with no
@@ -2108,6 +2158,7 @@ impl AccessOutput {
         }
         Ok(Self {
             actor_id: actor,
+            client_id: None,
             graph_id,
             graph_wide,
             branch,
@@ -3183,6 +3234,7 @@ pub fn read_output(
     let rows = RawValue::from_string(rows).map_err(|err| {
         CompilerError::Execution(format!("query result rendered invalid JSON: {err}"))
     })?;
+    let ranking = result.ranking().map(ranking_output);
     Ok(ReadOutput {
         query_name,
         target: read_target_output(target),
@@ -3191,7 +3243,25 @@ pub fn read_output(
         rows,
         graph_commit_id,
         page: None,
+        ranking,
     })
+}
+
+fn ranking_output(ranking: &Ranking) -> RankingOutput {
+    RankingOutput {
+        by: match ranking.by {
+            ResultSearchFunction::Nearest => SearchFunction::Nearest,
+            ResultSearchFunction::Bm25 => SearchFunction::Bm25,
+            ResultSearchFunction::Rrf => SearchFunction::Rrf,
+        },
+        order: if ranking.by.descending() {
+            RankOrder::Descending
+        } else {
+            RankOrder::Ascending
+        },
+        exhaustive: ranking.exhaustive,
+        score_columns: ranking.score_columns.clone(),
+    }
 }
 
 /// The `branch list` answer: one `{"name": ..}` row per branch in the order
@@ -3214,6 +3284,7 @@ pub fn branch_list_read_output(branches: &[String]) -> Result<ReadOutput, serde_
         rows: serde_json::value::to_raw_value(&rows)?,
         graph_commit_id: None,
         page: None,
+        ranking: None,
     })
 }
 
@@ -3236,6 +3307,7 @@ fn branch_read_rows_output(
         rows: serde_json::value::to_raw_value(&rows)?,
         graph_commit_id: None,
         page,
+        ranking: None,
     })
 }
 
@@ -3371,6 +3443,7 @@ pub fn show_read_output(rows: &[SettingRow]) -> Result<ReadOutput, serde_json::E
         rows: serde_json::value::to_raw_value(&rendered)?,
         graph_commit_id: None,
         page: None,
+        ranking: None,
     })
 }
 
@@ -3801,6 +3874,65 @@ mod tests {
             serde_json::from_value::<DiagnosticOutput>(json).unwrap(),
             reviewed
         );
+    }
+
+    /// A read's ranking renders in the RFC 0047 wire shape, its order read
+    /// off the search function; the envelope reads back unchanged (the
+    /// remote CLI prints what it decoded), and an envelope without one stays
+    /// without one.
+    #[test]
+    fn read_ranking_renders_and_round_trips() {
+        use omnigraph_compiler::result::{Ranking, SearchFunction};
+        let result =
+            || QueryResult::new(std::sync::Arc::new(arrow_schema::Schema::empty()), vec![]);
+        let rendered = |ranking| {
+            let output = read_output(
+                "q".to_string(),
+                &ReadTarget::branch("main"),
+                result().with_ranking(Some(ranking)),
+                None,
+            )
+            .unwrap();
+            let json = serde_json::to_value(&output).unwrap();
+            let decoded: ReadOutput = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&decoded).unwrap(), json);
+            json["ranking"].clone()
+        };
+        assert_eq!(
+            rendered(Ranking {
+                by: SearchFunction::Nearest,
+                exhaustive: false,
+                score_columns: vec!["d._distance".to_string(), "again".to_string()],
+            }),
+            json!({
+                "by": "nearest", "order": "ascending", "exhaustive": false,
+                "score_columns": ["d._distance", "again"]
+            })
+        );
+        assert_eq!(
+            rendered(Ranking {
+                by: SearchFunction::Bm25,
+                exhaustive: true,
+                score_columns: Vec::new(),
+            }),
+            json!({"by": "bm25", "order": "descending", "exhaustive": true, "score_columns": []})
+        );
+        assert_eq!(
+            rendered(Ranking {
+                by: SearchFunction::Rrf,
+                exhaustive: true,
+                score_columns: vec!["score".to_string()],
+            }),
+            json!({"by": "rrf", "order": "descending", "exhaustive": true, "score_columns": ["score"]})
+        );
+
+        let unranked = serde_json::to_value(
+            read_output("q".to_string(), &ReadTarget::branch("main"), result(), None).unwrap(),
+        )
+        .unwrap();
+        assert!(unranked.get("ranking").is_none());
+        let decoded: ReadOutput = serde_json::from_value(unranked).unwrap();
+        assert!(decoded.ranking.is_none());
     }
 
     /// `SettingsRequest` has one field per `request` row of the definition,

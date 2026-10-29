@@ -135,6 +135,7 @@ mod tests {
                 .unwrap(),
             graph_commit_id: None,
             page: None,
+            ranking: None,
         }
     }
 

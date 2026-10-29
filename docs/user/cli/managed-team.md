@@ -176,3 +176,65 @@ service operator reconciles the retained attempt; a new key cannot bypass it.
 Human progress and the key go to stderr; `--json` keeps one response on stdout.
 Permission refusals exit 2 and malformed/transport failures exit 1, with no
 storage fallback.
+
+## Configure an unattended workload profile
+
+The managed service must support workload sessions. Ask its administrator to
+configure an organization-owned client application and its service permissions.
+Obtain and rotate its secret through your identity provider's administration
+tools. Add a profile to
+`~/.omnigraph/config.yaml` (or `$OMNIGRAPH_HOME/config.yaml`):
+
+```yaml
+version: 1
+profiles:
+  ops:
+    api: https://control.example.com
+    organization_id: org_example
+    auth:
+      provider: oauth_client_credentials
+      token_endpoint: https://auth.example.com/oauth2/token
+      client_id: client_example
+      client_secret: {env: OG_OPS_CLIENT_SECRET}
+      # Optional provider scope, not graph permissions:
+      scope: "read write"
+```
+
+The secret may instead use `{file: /var/run/secrets/ops-client-secret}`.
+Environment values are exact; files allow one final LF or CRLF and atomic
+symlink rotation. Sources are bounded to 64 KiB. Literal YAML secrets and
+secure-store client secrets are unsupported.
+
+```sh
+omnigraph cluster list --profile ops
+omnigraph target add ops-cluster --profile ops --cluster CLUSTER_ID
+omnigraph --target ops-cluster --graph knowledge query -e 'query q() { return { 1 as ok } }'
+omnigraph mcp --target ops-cluster
+```
+
+Acquisition makes one form-encoded `client_credentials` request using
+`client_secret_post` at the explicit HTTPS endpoint. It uses system trust,
+direct networking and a 25-second total bound, without endpoint discovery,
+redirects, browser login or refresh tokens. The verified service session must
+identify the configured client as a verified workload in the selected
+organization. Provider service permissions govern organization operations;
+applied Cedar governs graph and deployment operations. Provider scopes do not
+replace either authority.
+
+The token response must include a positive `expires_in`; providers that omit it
+are unsupported. The profile's proxy and custom-CA settings apply to managed
+service requests, not this token exchange.
+
+Tokens stay in invocation memory. Long-running commands renew expired control
+credentials before their next request and keep the same verified organization,
+principal, kind, subject, client ID and assurance. A typed native-credential
+issuance preflight refusal may trigger one renewal and one new issuance request. A
+submitted operation, HTTP 401 or uncertain delivery is never replayed for
+authentication. Secret rotation takes effect on the next acquisition; a
+different client or identity needs a separate profile.
+
+OAuth `cluster token` reports issuance metadata without persisting the credential;
+in a fresh invocation, `--clear` reports `local_credential_removed: false` because
+there is no persisted OAuth credential to remove. It does not clear credentials
+saved by a previous provider. Ordinary resource commands acquire their own
+credential.
