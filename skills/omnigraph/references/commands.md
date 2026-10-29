@@ -539,7 +539,7 @@ Use a profile for `organization` (`org`):
 
 ```bash
 omnigraph organization members list --profile work --json
-omnigraph organization invitations send person@example.com --profile work --idempotency-key invite-person
+omnigraph organization invitations send person@example.com --role member --profile work --idempotency-key invite-person
 omnigraph organization members set person@example.com --profile work --role member --idempotency-key role-person
 omnigraph organization members offboard person@example.com --profile work --idempotency-key offboard-person --json
 ```

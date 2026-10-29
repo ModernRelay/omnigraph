@@ -1,0 +1,1 @@
+- Repeat `--role` to replace a member's service roles. New invitations require `--role`; saved older requests retain their exact retry behavior.

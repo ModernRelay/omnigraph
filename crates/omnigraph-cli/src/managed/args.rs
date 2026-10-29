@@ -26,13 +26,13 @@ pub(crate) enum OrganizationCommand {
 pub(crate) enum OrganizationMembersCommand {
     /// List members, stable identities, service roles and permissions.
     List,
-    /// Set an existing active member's service role; graph policy is unchanged.
+    /// Replace an existing active member's service roles; graph policy is unchanged.
     Set {
         /// Organization member email or exact user ID.
         selector: String,
-        /// Existing organization service-role slug.
-        #[arg(long)]
-        role: String,
+        /// Existing service-role slug; repeat for every role the member should retain.
+        #[arg(long = "role", value_name = "ROLE", required = true)]
+        roles: Vec<String>,
         /// Stable request key; retain it if the result is uncertain.
         #[arg(long)]
         idempotency_key: String,
@@ -62,6 +62,9 @@ pub(crate) enum OrganizationInvitationsCommand {
     /// Email an invitation to join this organization.
     Send {
         email: String,
+        /// Existing service-role slug; required for new invitations.
+        #[arg(long)]
+        role: Option<String>,
         /// Stable request key; retain it if the result is uncertain.
         #[arg(long)]
         idempotency_key: String,
