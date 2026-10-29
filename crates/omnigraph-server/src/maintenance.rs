@@ -546,7 +546,7 @@ pub(crate) async fn start_optimize(
             Ok(output(&state, Some(existing.clone())))
         } else {
             Err(ApiError::conflict(format!(
-                "maintenance id {} names a different request",
+                "[maintenance_request_mismatch] maintenance id {} names a different request",
                 input.maintenance_id
             )))
         };
@@ -562,7 +562,7 @@ pub(crate) async fn start_optimize(
         Ok(Admitted::Existing(existing)) => return Ok(output(&state, Some(*existing))),
         Err(MaintenanceRefusal::DifferentRequest) => {
             return Err(ApiError::conflict(format!(
-                "maintenance id {} names a different request",
+                "[maintenance_request_mismatch] maintenance id {} names a different request",
                 input.maintenance_id
             )));
         }

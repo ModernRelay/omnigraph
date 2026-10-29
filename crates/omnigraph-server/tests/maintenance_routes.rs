@@ -337,6 +337,13 @@ async fn served_optimize_keeps_a_record_a_caller_reads_by_id() {
         )
         .await;
     assert_eq!(status, 409, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("[maintenance_request_mismatch]"),
+        "{refused}"
+    );
 
     let (status, unknown) = client.lookup("01JC0000000000000000000009").await;
     assert_eq!(status, 200, "{unknown}");

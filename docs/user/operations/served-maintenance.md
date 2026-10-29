@@ -50,7 +50,7 @@ reason to resubmit the same work under the same id.
 
 | Refusal | Status |
 |---|---|
-| The same id with a different request; an outstanding deployment; four unresolved publications; a record from another ledger at this root | 409 `conflict` |
+| The same id with a different request (message prefix `[maintenance_request_mismatch]`); an outstanding deployment; four unresolved publications; a record from another ledger at this root | 409 `conflict` |
 | Another maintenance operation is active in the cluster (its id is in the message) | 429 `too_many_requests` |
 | A gate hold above the server's ceiling | 413 `payload_too_large` |
 | The routes are off, or the server is draining | 503 `service_unavailable` |
