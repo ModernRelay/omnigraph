@@ -16,7 +16,8 @@ use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance_core::datatypes::BlobHandling;
 use omnigraph::IndexCoverage;
 use omnigraph::db::{
-    ArtifactRefresh, ConfigurationClear, DeferReason, OptimizeLimits, TableOptimizeOutcome,
+    ArtifactRefresh, ConfigurationClear, DeferReason, OptimizeBeforePublish, OptimizeLimits,
+    OptimizePublication, OptimizeRequest, TableOptimizeOutcome,
 };
 use omnigraph::db::{
     CleanupPolicyOptions, MergeOutcome, Omnigraph, ReadTarget, RepairAction, RepairClassification,
@@ -320,6 +321,103 @@ async fn optimize_table_list_runs_only_those_tables_and_refuses_bad_requests() {
         head,
         "a refused request publishes nothing"
     );
+}
+
+fn recording_hook() -> (
+    OptimizeBeforePublish,
+    std::sync::Arc<std::sync::Mutex<Vec<OptimizePublication>>>,
+) {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = std::sync::Arc::clone(&seen);
+    let hook = OptimizeBeforePublish::new(move |publication| {
+        recorded.lock().unwrap().push(publication);
+        async { Ok(()) }
+    });
+    (hook, seen)
+}
+
+#[tokio::test]
+async fn optimize_calls_before_publish_once_with_the_nonce_its_commit_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    add_person_fragments(&db).await;
+    let head = db.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+
+    let (hook, seen) = recording_hook();
+    let report = db
+        .optimize_as(None, OptimizeRequest::default().with_before_publish(hook))
+        .await
+        .unwrap();
+    let commit = report.graph_commit_id.clone().expect("the run published");
+    let seen = std::mem::take(&mut *seen.lock().unwrap());
+    assert_eq!(seen.len(), 1, "the hook runs once: {seen:?}");
+    let publication = &seen[0];
+    assert!(
+        omnigraph_core::graph_commit_id::commit_id_answers(&commit, &publication.nonce).unwrap(),
+        "{commit} answers {}",
+        publication.nonce
+    );
+    assert_eq!(publication.input_commit.as_deref(), Some(head.as_str()));
+    assert_eq!(publication.input_commit, report.input_commit);
+    assert_eq!(
+        publication.input_manifest_version,
+        report.input_manifest_version
+    );
+    let outcomes = |tables: &[omnigraph::db::DatasetOptimizeStats]| {
+        tables
+            .iter()
+            .map(|stat| (stat.type_key.clone(), stat.outcome))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(outcomes(&publication.tables), outcomes(&report.tables));
+
+    // A run that stages no table publishes nothing and never calls the hook.
+    let (hook, seen) = recording_hook();
+    let idle = db
+        .optimize_as(None, OptimizeRequest::default().with_before_publish(hook))
+        .await
+        .unwrap();
+    assert_eq!(idle.graph_commit_id, None, "{idle:?}");
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn optimize_publishes_nothing_when_before_publish_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    add_person_fragments(&db).await;
+    let head = db.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+
+    // The hook's own evidence claims no effect; the staged rewrites exist, so
+    // the run must report them unpublished instead.
+    let hook = OptimizeBeforePublish::new(|_| async {
+        Err(OmniError::manifest("the operation record was not written").before_effect())
+    });
+    let error = db
+        .optimize_as(None, OptimizeRequest::default().with_before_publish(hook))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.completion_evidence(),
+        Some(CompletionEvidence::Unpublished),
+        "{error}"
+    );
+    assert_eq!(
+        db.list_commits(None).await.unwrap()[0].graph_commit_id,
+        head,
+        "a failed hook publishes nothing"
+    );
+
+    // The staged rewrites are unreachable; the next run re-plans and publishes.
+    let retry = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(retry.graph_commit_id.is_some(), "{retry:?}");
 }
 
 #[tokio::test]

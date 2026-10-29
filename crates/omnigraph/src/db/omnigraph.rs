@@ -52,8 +52,8 @@ pub(crate) use export::{
 };
 pub use optimize::{
     ArtifactRefresh, ArtifactSkip, CleanupPolicyOptions, ConfigurationClear, DatasetCleanupStats,
-    DatasetOptimizeStats, DeferReason, OptimizeConcurrency, OptimizeLimits, OptimizeReport,
-    OptimizeRequest, SkipReason, TableOptimizeOutcome,
+    DatasetOptimizeStats, DeferReason, OptimizeBeforePublish, OptimizeConcurrency, OptimizeLimits,
+    OptimizePublication, OptimizeReport, OptimizeRequest, SkipReason, TableOptimizeOutcome,
 };
 use prepared_create::initial_schema_ir;
 pub use prepared_create::{GraphCreateReconciliation, PreparedGraphCreate};
@@ -4744,6 +4744,7 @@ impl Omnigraph {
             txn,
             lineage_intent,
             publication,
+            None,
         )
         .await
     }

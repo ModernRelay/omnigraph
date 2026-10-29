@@ -24,8 +24,10 @@
 //!   explicit confirm flag at the CLI layer.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use futures::stream::{FuturesOrdered, FuturesUnordered, StreamExt};
 use lance::dataset::optimize::{CompactionMetrics, CompactionOptions};
 use tokio::time::Instant;
@@ -362,6 +364,47 @@ impl OptimizeLimits {
     }
 }
 
+/// What a run's before-publish hook receives.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct OptimizePublication {
+    /// The nonce of the commit's lineage intent. History stores the commit
+    /// under an id chosen per publish attempt (`hb1.{block}.{slot}.{nonce}`);
+    /// `omnigraph_core::graph_commit_id::commit_id_answers` matches such an id
+    /// to this nonce.
+    pub nonce: String,
+    /// The graph head every publish attempt reads: the commit's parent.
+    pub input_commit: Option<String>,
+    /// The `__manifest` version of that head.
+    pub input_manifest_version: u64,
+    /// One outcome for every table the run considered, as the report lists them.
+    pub tables: Vec<DatasetOptimizeStats>,
+}
+
+/// Called once, after the run's tables are staged and prepared and before the
+/// publisher's first attempt; a run that stages no table never calls it. An
+/// error publishes nothing and fails the run with `Unpublished` evidence.
+#[derive(Clone)]
+pub struct OptimizeBeforePublish(
+    Arc<dyn Fn(OptimizePublication) -> BoxFuture<'static, Result<()>> + Send + Sync>,
+);
+
+impl OptimizeBeforePublish {
+    pub fn new<F, Fut>(hook: F) -> Self
+    where
+        F: Fn(OptimizePublication) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        Self(Arc::new(move |publication| Box::pin(hook(publication))))
+    }
+}
+
+impl std::fmt::Debug for OptimizeBeforePublish {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OptimizeBeforePublish(..)")
+    }
+}
+
 /// What one optimize run is asked to do. The default is the direct run as it
 /// has always been: every table on main, no bound, and both concurrencies from
 /// `OMNIGRAPH_MAINTENANCE_CONCURRENCY`.
@@ -378,6 +421,7 @@ pub struct OptimizeRequest {
     pub limits: OptimizeLimits,
     /// `None` reads [`OptimizeConcurrency::from_env`].
     pub concurrency: Option<OptimizeConcurrency>,
+    pub before_publish: Option<OptimizeBeforePublish>,
 }
 
 impl OptimizeRequest {
@@ -402,6 +446,11 @@ impl OptimizeRequest {
 
     pub fn with_concurrency(mut self, concurrency: OptimizeConcurrency) -> Self {
         self.concurrency = Some(concurrency);
+        self
+    }
+
+    pub fn with_before_publish(mut self, hook: OptimizeBeforePublish) -> Self {
+        self.before_publish = Some(hook);
         self
     }
 
@@ -627,6 +676,18 @@ pub async fn optimize_all_datasets(
             .new_lineage_intent_for_branch(None, actor, HistoryReleaseBytes::PRODUCTION)
             .await
             .map_err(OmniError::unpublished)?;
+        let before_publish = request.before_publish.as_ref().map(|hook| {
+            let hook = hook.0.clone();
+            let tables = tables.clone();
+            move |intent: super::table_ops::PublicationIntent| {
+                hook(OptimizePublication {
+                    nonce: intent.nonce,
+                    input_commit: intent.input_commit,
+                    input_manifest_version: intent.input_manifest_version,
+                    tables: tables.clone(),
+                })
+            }
+        });
         let commit = super::table_ops::commit_updates_on_branch_with_expected(
             db,
             None,
@@ -636,6 +697,9 @@ pub async fn optimize_all_datasets(
             &authority_txn,
             lineage,
             super::table_ops::Publication::Publish,
+            before_publish
+                .as_ref()
+                .map(|hook| hook as super::table_ops::BeforePublishHook<'_>),
         )
         .await?;
         graph_commit_id = Some(commit.graph_commit_id);

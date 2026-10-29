@@ -625,6 +625,7 @@ async fn maintain_indices_for_branch(
             &txn,
             lineage,
             Publication::Publish,
+            None,
         )
         .await?;
         Some(published.graph_commit_id)
@@ -1586,10 +1587,28 @@ async fn publish_prepared(
     }
 }
 
+/// What a publication's before-publish hook learns: the lineage intent's
+/// nonce, which every attempt's history id carries
+/// (`omnigraph_core::graph_commit_id::commit_id_answers` matches one to it),
+/// and the head every attempt must read.
+#[derive(Debug, Clone)]
+pub(crate) struct PublicationIntent {
+    pub(crate) nonce: String,
+    pub(crate) input_commit: Option<String>,
+    pub(crate) input_manifest_version: u64,
+}
+
+/// A hook the shared publication helper calls once before publishing.
+pub(crate) type BeforePublishHook<'a> = &'a (
+        dyn Fn(PublicationIntent) -> futures::future::BoxFuture<'static, Result<()>> + Send + Sync
+    );
+
 /// Commit updates with a publisher-level OCC fence. The
 /// `expected_table_versions` map asserts the manifest's pre-write per-table
 /// versions; mismatches surface as `ManifestConflictDetails::PublishedDatasetVersionMismatch`.
 /// `publication` chooses the head-advancing publish or an unpublished commit.
+/// `before_publish`, when given, runs once after the updates are prepared and
+/// before the publisher's first attempt; its failure publishes nothing.
 pub(super) async fn commit_updates_on_branch_with_expected(
     db: &Omnigraph,
     branch: Option<&str>,
@@ -1599,6 +1618,7 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     txn: &crate::db::WriteTxn,
     lineage_intent: crate::db::manifest::LineageIntent,
     publication: Publication,
+    before_publish: Option<BeforePublishHook<'_>>,
 ) -> Result<crate::db::GraphCommit> {
     if branch != txn.branch.as_deref() {
         return Err(OmniError::manifest_internal(
@@ -1611,6 +1631,25 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     let prepared = prepare_updates_for_commit(db, branch, updates, Some(txn))
         .await
         .map_err(OmniError::unpublished)?;
+
+    // Once, not per attempt: every attempt reads the same head and carries
+    // the same nonce, so another call would record no new fact. The hook runs
+    // before the coordinator lock, and the publisher has not been called, so
+    // whatever the hook's own error says, the graph did not move.
+    if let Some(before_publish) = before_publish {
+        before_publish(PublicationIntent {
+            nonce: lineage_intent.graph_commit_id.clone(),
+            input_commit: txn.authority.graph_head.clone(),
+            input_manifest_version: txn.base.graph_manifest_version(),
+        })
+        .await
+        .map_err(|error| {
+            error
+                .into_completion_evidence()
+                .0
+                .with_completion_evidence(crate::error::CompletionEvidence::Unpublished)
+        })?;
+    }
 
     debug_assert_eq!(lineage_intent.actor_id.as_deref(), actor_id);
     let changes = prepared
