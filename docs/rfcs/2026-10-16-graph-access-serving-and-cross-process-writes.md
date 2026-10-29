@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-16
-updated: 2026-10-30
+updated: 2026-10-31
 discussion: https://github.com/ModernRelay/omnigraph/pull/1017
 supersedes: []
 superseded_by: []
@@ -1605,3 +1605,11 @@ proposal.
   write tools". The gap table's "write tools stay behind `--mcp-allow-writes`"
   and "Admit them as write tools behind `--mcp-allow-writes`" are history of
   the change this RFC closed, not the current ceiling.
+- 2026-10-31: Pending amendment. [Remote optimize through the serving
+  owner](2026-10-29-remote-optimize-through-the-serving-owner.md), a draft, runs a served
+  cluster root's `optimize` in the process that holds the cluster lock,
+  through graph-scoped routes with a durable operation record. Once it is
+  accepted, `optimize` leaves the "Runs where the storage is" row of the
+  exception table for served cluster roots and stays there for direct
+  targets. The other commands in that row are unchanged. The table stands
+  unchanged until acceptance.
