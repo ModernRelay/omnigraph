@@ -37,8 +37,9 @@ publishes that graph**. Direct optimize stays as it is for a stopped server,
 on local and object storage.
 
 - **Engine.** The run keeps today's writer gates and its one graph
-  publication. It works table by table from a resumable position and stops
-  starting tables at a time bound and at resource ceilings. It reports an
+  publication. It works table by table from a resumable position, stops
+  starting tables at a time bound and a run byte budget, and defers a table
+  over a resource ceiling without writing it. It reports an
   exact outcome for every table, and it releases every writer gate before the
   adjacency-artifact scan.
 - **Server.** The server stores the request under a caller-chosen operation id
@@ -63,9 +64,11 @@ of the two should be accepted.
 
 ## Motivation
 
-The maintenance gap is real. Writes never build or fold indexes (invariant 7),
-`ensure_indices` has no production caller, and a served graph can be optimized
-only by stopping its server.
+The maintenance gap is real. Writes never build or fold indexes (invariant 7).
+`optimize` and `omnigraph index build`, which calls `ensure_indices_on_as`, are
+direct-only and meet the same cluster lock, so a served graph can be optimized
+or indexed only by stopping its server. This RFC serves `optimize`; the
+index-build route stays out of scope.
 
 The closed proposal failed as a system design for three reasons. This RFC
 answers each one:
@@ -119,7 +122,9 @@ durable before any effect and before the response. From then on:
   not hold the id. It proves neither that the operation never ran nor that it
   may be replayed.
 - **Cancellation.** A cancellation request takes effect at the next safe
-  boundary. A publication that has started always finishes.
+  boundary. A publication that has started always finishes, and a record whose
+  publication is in doubt stays `publishing`: a cancellation never hides a
+  commit that may still land.
 - **Disconnection** stops waiting, not execution.
 - **Restart.** An unfinished record is resolved from main's history, and the
   run is never executed again.
@@ -184,18 +189,19 @@ grant it. The request carries:
 - `tables`: optional. When present, only these node and edge tables are
   considered, in the given order. A name that does not exist is refused
   before any effect.
-- `start_after`: optional, for a full-catalog request. This is the type key the
-  run resumes from (§1.3). The server supplies it from the record. Direct
-  callers usually omit it.
+- `start_at`: optional, for a full-catalog request. The run starts at this
+  type key, or at the first key after it when no table has it (§1.3). The
+  server supplies the graph's resume position. Direct callers usually omit it.
 - `limits`: `max_gate_hold` and the resource ceilings of §1.4. Every limit
   is optional, and an absent limit does not bound the run.
 - `concurrency`: how many tables are planned at once, and how many are
   rewritten at once.
 - a cancellation handle (§1.9);
-- a `before_publish` callback (§1.6).
+- an optional `before_publish` callback (§1.6).
 
-The served path sets every limit from serve settings and rewrites one table
-at a time. The direct path keeps today's behavior: no time bound, no
+The served path sets every limit from serve settings, plans
+`maintenance_planning_concurrency` tables ahead (a serve setting; planning only
+reads) and rewrites one table at a time. The direct path keeps today's behavior: no time bound, no
 ceilings, and both concurrencies from `OMNIGRAPH_MAINTENANCE_CONCURRENCY`
 (default 8). `--max-gate-hold` and `--tables` let a direct caller bound a run.
 The served path does not read that variable.
@@ -229,8 +235,8 @@ stall finite. A new way to share the gates with writers is a second design.
 #### 1.3 Order, stopping and the resume position
 
 - **Order.** A request with `tables` works in that order. A full-catalog
-  request works in type-key order, starting after `start_after`. It wraps to
-  the beginning and stops before the starting table, so a run never visits a
+  request works in type-key order, starting at `start_at`. It wraps to the
+  beginning and stops before the starting table, so a run never visits a
   table twice.
 - **Planning and rewriting.** The run plans up to `concurrency.planning`
   tables ahead of the one it is rewriting. Planning opens the table at its pin,
@@ -238,14 +244,21 @@ stall finite. A new way to share the gates with writers is a second design.
   one at a time on the served path, in order.
 - **Stopping.** Before it starts each table's rewrite, the run checks the
   elapsed gate-hold time and the run budget (§1.4). Once either is reached,
-  that table and every later one are reported `deferred` with the reason, and
-  the run publishes what it finished. The first table always starts, so every
-  run makes progress.
-- **Resuming.** The report names the first deferred table. On the served
-  path, the server stores it as the graph's resume position. The next
-  full-catalog request starts there under a new operation id, and the writer
-  gates are released between the two runs. A run that defers nothing clears
-  the position. A request with `tables` neither reads nor moves it. A run that
+  that table and every later one are reported `deferred` with the reason
+  (`gate_hold_limit` or `byte_budget`), and the run publishes what it
+  finished. Neither stops the first table, so every run makes progress
+  against them. A per-table ceiling (§1.4) is different: it defers only the
+  table over it, the first table included, and the run continues with the
+  next table.
+- **Resuming.** The report names the first table deferred by
+  `gate_hold_limit` or `byte_budget`. On the served path, the server stores
+  that key as the graph's resume position, and the next full-catalog request,
+  under a new operation id, passes it as `start_at`, so that table is the
+  first the next run visits. With keys A, B and C and a stop before C, the
+  next run starts at C and wraps through A and B. The writer gates are
+  released between the two runs. A `resource_limit` deferral does not set the
+  position: that table stays deferred until its ceiling or its size changes.
+  A run that stops on neither bound clears the position. A request with `tables` neither reads nor moves it. A run that
   ends without a terminal report keeps the previous position. Over a sequence
   of runs, every table is planned, including the tail of a catalog whose no-op
   prefix alone takes longer than one bound.
@@ -264,7 +277,7 @@ table's first write:
 |---|---|
 | Source fragments | the compaction plan's tasks, counted until the ceiling is passed |
 | Source rows | the plan's fragment row counts |
-| Source bytes | the recorded size of each data and deletion file (Lance's `DataFile::file_size_bytes`), with a HEAD request for a file whose size is not recorded |
+| Source bytes | each data file's recorded size (`DataFile::file_size_bytes`, a `CachedFileSize`), with a HEAD request when `get()` is empty; and a HEAD request for each deletion file, since Lance 13's `DeletionFile` records no size. The source-fragment ceiling is checked first, so it bounds those requests. |
 | Managed Blob payload bytes | the descriptor-only scan that compaction sizing already performs (`compaction_blob_batch_rows`). External references count nothing and are never fetched. |
 | Index rebuild rows | the table's row count, when a lagging index would be rebuilt whole |
 
@@ -277,7 +290,8 @@ too. The run never falls back to an unbounded rewrite.
 The run budget is a ceiling on total source bytes across the tables the run
 starts. A table that would exceed the remaining budget is deferred with
 `byte_budget`, together with every later table. A per-table byte ceiling may
-not exceed the run budget, so the first table always fits.
+not exceed the run budget, so a first table within its per-table ceilings
+always fits the budget.
 
 These are source ceilings. They are not limits on peak memory, CPU, temporary
 space or I/O rate. Rewriting one table at a time keeps allocations from
@@ -352,8 +366,11 @@ parent and commit buffer. The nonce is the one identity that is stable across
 attempts. `commit_id_answers` matches a history id to its nonce.
 
 **The callback.** The shared publication helper
-(`table_ops::commit_updates_on_branch_with_expected`) calls `before_publish`
-once:
+(`table_ops::commit_updates_on_branch_with_expected`) takes `before_publish`
+as an optional argument. Optimize passes it. The helper's other callers
+(mutate, load, merge and the index writers) pass none and publish as today,
+with no control-object put and no new failure. When it is present, the
+helper calls it once:
 
 - after the updates are prepared, and before the publisher's first attempt;
 - with the intent nonce, the input head (its commit id and `__manifest`
@@ -370,8 +387,9 @@ call per attempt would add a control-object put per retry and would record
 no new fact. If the callback fails, nothing publishes, and the run fails with
 `Unpublished` evidence.
 
-The helper owns the hook, so a later maintenance kind that publishes uses the
-same callback and the same resolution rule. It does not add its own.
+The helper owns the hook, so a later maintenance kind that publishes passes
+the same argument and uses the same resolution rule. It does not add a second
+hook.
 
 #### 1.7 Failures and completion evidence
 
@@ -400,8 +418,11 @@ same callback and the same resolution rule. It does not add its own.
    keys exist, removes them with `update_config`. That is a linear catalog
    commit outside the graph publication. It stays under the gates, so no
    reasoning about its interleaving with publications is needed. Its outcome
-   is reported truthfully: `cleared`, `nothing_to_clear` or `failed`. Today's
-   stat hard-codes `committed: false` even when the commit happened.
+   is reported truthfully: `cleared`, `nothing_to_clear`, `failed` when the
+   keys are still present, or `unknown` when its commit has no definite
+   answer. Neither of the last two fails the graph operation, and the next
+   run clears keys that are still present. Today's stat hard-codes
+   `committed: false` even when the commit happened.
 2. **Release.** The table gates, the main branch gate and the schema permit
    are released.
 3. **Adjacency artifact, outside the writer gates.** After a publication that
@@ -411,10 +432,17 @@ same callback and the same resolution rule. It does not add its own.
      changes an answer.
    - The full edge scan starts only if no cancellation, shutdown or deployment
      drain is pending. The scan reads only, so it may be abandoned.
-   - The served path writes the artifact only when the serialized body is
-     within a serve setting (`artifact_write_limit`, default 512 MiB, to be
-     confirmed by qualification). Otherwise it reports `skipped(size_limit)`.
-     The load ceiling stays `MAX_ARTIFACT_BYTES` (4 GiB).
+   - The served path bounds the artifact before it builds it, against a
+     serve setting (`artifact_write_limit`, default 512 MiB, to be confirmed
+     by qualification). Today `GraphIndex::build` allocates the whole index
+     over every edge type and `save` serializes it before any size is known.
+     First, the fixed-width part of the body, exact from the manifest's row
+     counts (each id's 4-byte length prefix, and each edge type's offsets and
+     targets in both directions), is compared with the limit; over it, the
+     build does not start. Then the build counts the bytes it would serialize
+     as it adds each id and edge, and stops once the count passes the limit.
+     Either way the outcome is `skipped(size_limit)`, and a load rebuilds the
+     adjacency in memory. `MAX_ARTIFACT_BYTES` (4 GiB) still bounds loads.
    - Once the single object write is issued, it is awaited and never dropped.
      The artifact key is a mutable key, so a dropped write would leave its
      outcome unknown.
@@ -434,8 +462,11 @@ publication. A table in progress is dropped where it stands. Its effects are
 detached commits and staged files that nothing references (invariant 5). Once
 the publication starts, it finishes, and so do the configuration clear and an
 issued artifact write. A cancellation that arrives after the publication
-started leaves the run `succeeded`, and the report notes it. `cancelled`
-therefore always means unpublished.
+started leaves the run `succeeded`, and the report notes it. A cancellation
+of a record whose publication is in doubt changes nothing: it stays
+`publishing` until §2.4 resolves it, because its manifest request may still
+land. `cancelled` is written only when no manifest request has been sent, so
+it always means unpublished.
 
 #### 1.10 Readers
 
@@ -505,7 +536,8 @@ A put that stays in doubt after #1176's re-issue is handled at each point:
 
 - **Acceptance in doubt.** No work runs. The response is 500 `outcome_unknown`
   with the operation id. If the record lands late, it shows `accepted` with no
-  live run, and the next maintenance write marks it `interrupted`.
+  live run, and the next admission or lookup resolves it to `interrupted`
+  before it checks the active slot (§3.2).
 - **`running` in doubt.** No table work starts. The run ends `interrupted`.
 - **`publishing` in doubt.** Nothing publishes, and the run fails
   `Unpublished`. A late landing shows `publishing` with a nonce that no
@@ -525,17 +557,29 @@ resolves it. The live process applies the rule when its run ends with the
 publication in doubt, and at every later lookup and admission. A restarted
 server applies it before it admits maintenance:
 
-- **Main has not moved past the input head.** Main's latest `__manifest`
-  version is still the input head's version. The publication stays in doubt,
-  and the record stays `publishing`.
-- **Main has moved.** If main's history holds a commit that answers the
-  nonce (`commit_id_answers`), the run is `succeeded` with its recorded
-  outcomes. Otherwise it is `failed` with `not_committed`. The version the
-  publication needed is taken, so its manifest request can never land, and
-  its staging becomes collectible.
+- **Main's graph head is still the input head.** The publication stays in
+  doubt, and the record stays `publishing`. The test is the graph head, not
+  the latest `__manifest` version: a configuration commit, such as the clear
+  in §1.8, adds a version without a graph commit, and a publisher attempt at
+  the version after it can still be in flight.
+- **Main's graph head has moved.** Under the exact head expectation, only the
+  commit on main whose parent is the input head can be this run's. The server
+  walks main's `parent_commit_id` chain from its tip back to the input head
+  through history; `read_commit` follows an id into its archived block, so a
+  commit that a later publication archived is still found. If the input
+  head's child answers the nonce (`commit_id_answers`), the run is
+  `succeeded` with its recorded outcomes. Otherwise it is `failed` with
+  `not_committed`: every `__manifest` version an attempt of this run could
+  have taken is occupied, since a later attempt would have read the moved
+  head and refused before its request. Its staging becomes collectible.
+
+Only a commit on this graph's main settles the record. A commit on another
+graph of the cluster or on another branch does not, and a run that publishes
+nothing does not move main. The walk stops at the input head, so it reads one
+history entry per commit published on main since the doubt arose.
 
 The rule matches the storage-outcomes RFC: an unknown publication is
-settled by the branch's next version. A record that was `accepted` or
+settled by the branch's next commit. A record that was `accepted` or
 `running`, with no live run in this process, is `interrupted`. The callback
 precedes every manifest request, so no attempt sent one.
 
@@ -568,7 +612,7 @@ principal, the options and the outcomes, and cancel stops a run.
 |---|---|---|
 | `POST /graphs/{graph_id}/maintenance/optimize` (`startOptimize`) | Submit. The body (`OptimizeRequest`) carries `maintenance_id` (a canonical ULID the caller chose), optional `tables` and optional limits. | 202 with the record (`MaintenanceOperationOutput`) while it is non-terminal, including for a repeated POST of the same id and request; 200 once it is terminal |
 | `GET /graphs/{graph_id}/maintenance/{maintenance_id}` (`getMaintenanceOperation`) | Look up by original id. | 200 with the record, or 200 with `lookup: unknown` |
-| `POST /graphs/{graph_id}/maintenance/{maintenance_id}/cancel` (`cancelMaintenanceOperation`) | Ask the run to stop at its next safe boundary. | 202 with the record while it is non-terminal; 200 with a terminal record, unchanged |
+| `POST /graphs/{graph_id}/maintenance/{maintenance_id}/cancel` (`cancelMaintenanceOperation`) | Ask the run to stop at its next safe boundary. | 202 with the record while it is non-terminal, and a `publishing` record unchanged (§1.9); 200 with a terminal record, unchanged |
 
 This is deployment's split (`deployment.rs`): 202 until the work is terminal
 and 200 when it is done, so a running record never looks complete.
@@ -594,10 +638,14 @@ cannot widen it. Admission then checks, in order:
 
 1. the route is enabled, the graph is served, and admission is open;
 2. the record's ledger id matches;
-3. no deployment is outstanding;
-4. no other maintenance operation is active in the cluster, and fewer than
+3. records without a live run are resolved first (§2.4): an `accepted` or
+   `running` one becomes `interrupted`, and a `publishing` one follows the
+   history rule, so a record that landed after an in-doubt acceptance never
+   holds the active slot;
+4. no deployment is outstanding;
+5. no other maintenance operation is active in the cluster, and fewer than
    four are unresolved;
-5. the request's limits are within the server's ceilings.
+6. the request's limits are within the server's ceilings.
 
 The server's ceilings are serve settings, held by the existing server
 settings owner. The route is off until an operator enables it, and the
@@ -801,20 +849,22 @@ Every row extends an existing owner in [testing](../dev/testing.md).
 |---|---|---|
 | `optimize_as` enforces `maintain`; `admin` does not grant it | allow and deny cases | `policy_engine_chassis.rs` |
 | The run stops starting tables at `max_gate_hold`, publishes once and reports every table | integration test with a fake clock | `integration/maintenance.rs` |
-| A full-catalog run resumes at the first deferred table, and a run whose no-op prefix exceeds the bound still reaches the tail over successive runs | many-table fixture with a fake clock | `integration/maintenance.rs`, server `maintenance_routes` |
-| A table over a ceiling is deferred with its measure and nothing is written for it; counting stops at the ceiling | fixtures over each ceiling, including a large managed Blob and an external reference | `integration/maintenance.rs` |
+| A full-catalog run resumes at the first table the time bound or the run budget deferred, visiting it first; a `resource_limit` deferral neither sets the position nor stops later tables; a run whose no-op prefix exceeds the bound still reaches the tail over successive runs | many-table fixture with a fake clock | `integration/maintenance.rs`, server `maintenance_routes` |
+| A table over a ceiling, the first table included, is deferred with its measure and nothing is written for it; counting stops at the ceiling; deletion files are counted | fixtures over each ceiling, including a large managed Blob, an external reference and a fragment with a deletion file | `integration/maintenance.rs` |
 | A table-local failure fails only that table, and the other tables publish | failpoint in one table's rewrite | `failpoints.rs`, `detached_commit_matrix.rs` |
 | Partial full-text coverage and an untrainable vector stay pending with their remedy | existing pending-index fixtures | `integration/maintenance.rs` |
 | A failure before the publication is labelled, and the server keeps serving | failpoints in the per-table loop and in `before_publish` | `failpoints.rs`, server `boot_settings` |
 | A failed `before_publish` publishes nothing | failpoint | `failpoints.rs` |
+| Writers that pass no callback make no control-object request | unchanged rows for mutate, load and merge | DST storage-cost golden |
 | The recorded nonce resolves a published run through `commit_id_answers`, including an `hb1` id in a new block | publish across a block boundary, then resolve | server `maintenance_routes`, cluster `failpoints.rs` |
-| An in-doubt publication stays `publishing`, leaves the active slot, and is settled by the next main publication either way | the catalog's unresolved-manifest seam, then a later write | `omnigraph-catalog` tests, server `boot_settings` |
-| A post-commit failure in the configuration clear or the artifact does not fail the operation, and the clear reports whether it committed | failpoints after the publication | `integration/maintenance.rs` |
+| An in-doubt publication stays `publishing`, leaves the active slot, and is settled by the next main commit either way; a configuration-only `__manifest` version, a commit on another graph and a no-op run do not settle it; a cancellation leaves it `publishing` | the catalog's unresolved-manifest seam, then each later write | `omnigraph-catalog` tests, server `boot_settings`, `maintenance_routes` |
+| A post-commit failure in the configuration clear or the artifact does not fail the operation, and the clear reports `cleared`, `nothing_to_clear`, `failed` or `unknown` | failpoints after the publication | `integration/maintenance.rs` |
+| The artifact build is refused from row counts, or stops once its serialized size passes `artifact_write_limit` | a small limit over a fixture with edges | `integration/maintenance.rs` |
 | A main write proceeds during the artifact scan | seam that holds the scan | `integration/maintenance.rs` |
 | An issued artifact write completes before release; SIGTERM during the scan releases cleanly | served shutdown journey | `boot_settings` (`owned_shutdown`) |
 | Cancellation stops at a safe boundary; a publication in progress completes and the run is `succeeded` | engine and server tests | `integration/maintenance.rs`, `boot_settings` |
 | Acceptance is durable before the response; a repeated POST answers 202 while non-terminal and 200 when terminal; a different request under the same id is refused; GET and cancel require `maintain` | route tests | server integration, new `maintenance_routes` module |
-| A put in doubt starts no table work and no publication | control-object fault injection over #1176's resolver | server `maintenance_routes` |
+| A put in doubt starts no table work and no publication; an `accepted` record that lands after an in-doubt acceptance is resolved to `interrupted` before the active-slot check | control-object fault injection over #1176's resolver | server `maintenance_routes` |
 | Lookup after a lost response, after restart and for an evicted id answers `unknown` without replay, with the stated CLI exits | lost-delivery matrix and restart journey | CLI `system_remote`, `cli_cluster_e2e` |
 | Restart resolves `publishing` by history, and `accepted` or `running` to `interrupted` | failpoints before and after publication, with a killed process | cluster `failpoints.rs`, server `boot_settings` |
 | A record from another ledger is refused, never overwritten | route test | `maintenance_routes` |
@@ -884,3 +934,18 @@ dated pending entry in its decision log:
     until the record is terminal.
   - **Record.** A record from another ledger is refused, the record depends
     on #1176, and evicted ids answer `unknown`.
+- 2026-10-29: Revised after the second review:
+  - **Resume.** `start_after` became `start_at`, so the stored position, the
+    first table the time bound or the run budget deferred, is the next run's
+    first table. A `resource_limit` deferral does not move it.
+  - **Ceilings.** They defer the first table too; only the time bound and the
+    run budget never stop it. Deletion files are sized by HEAD, since Lance
+    13 records no size for them.
+  - **Resolution.** Settled by main's graph head, not its latest
+    `__manifest` version, and by the input head's child on main's parent
+    chain. A cancellation leaves an in-doubt record `publishing`, and
+    admission resolves ownerless records before the active-slot check.
+  - **Tail.** The configuration clear can report `unknown`, and the artifact
+    is bounded before and during its build, not after it.
+  - **Callback.** An optional argument of the publication helper; writers
+    that pass none are unchanged.
