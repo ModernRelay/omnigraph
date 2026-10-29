@@ -138,6 +138,8 @@ pub enum DeferReason {
     /// table's turn came. This table and every later one wait for a later
     /// run, which [`OptimizeReport::resume_at`] starts at.
     GateHoldLimit,
+    /// The run was cancelled before this table's work could land.
+    Cancelled,
 }
 
 impl DeferReason {
@@ -146,6 +148,7 @@ impl DeferReason {
     pub fn as_str(&self) -> &'static str {
         match self {
             DeferReason::GateHoldLimit => "gate_hold_limit",
+            DeferReason::Cancelled => "cancelled",
         }
     }
 }
@@ -154,6 +157,7 @@ impl std::fmt::Display for DeferReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             DeferReason::GateHoldLimit => "the run reached its writer-gate hold limit",
+            DeferReason::Cancelled => "the run was cancelled",
         })
     }
 }
@@ -256,6 +260,8 @@ pub enum ConfigurationClear {
     Failed(String),
     /// Whether the removal committed has no definite answer.
     Unknown(String),
+    /// The run was cancelled before its publication, so the clear did not run.
+    NotRun,
 }
 
 impl ConfigurationClear {
@@ -267,6 +273,7 @@ impl ConfigurationClear {
             ConfigurationClear::NothingToClear => "nothing_to_clear",
             ConfigurationClear::Failed(_) => "failed",
             ConfigurationClear::Unknown(_) => "unknown",
+            ConfigurationClear::NotRun => "not_run",
         }
     }
 }
@@ -309,6 +316,8 @@ pub enum ArtifactSkip {
     /// A declared edge type has no table yet, so the artifact has no complete
     /// identity to stamp.
     IncompleteEdgeTables,
+    /// The run was cancelled, so the edge scan did not start.
+    Cancelled,
 }
 
 impl ArtifactSkip {
@@ -318,6 +327,7 @@ impl ArtifactSkip {
         match self {
             ArtifactSkip::NoEdgeTypes => "no_edge_types",
             ArtifactSkip::IncompleteEdgeTables => "incomplete_edge_tables",
+            ArtifactSkip::Cancelled => "cancelled",
         }
     }
 }
@@ -346,6 +356,78 @@ pub struct OptimizeReport {
     pub configuration_clear: ConfigurationClear,
     /// The adjacency artifact refresh, after the gates are released.
     pub artifact: ArtifactRefresh,
+    /// Whether a cancellation stopped the run.
+    pub cancellation: RunCancellation,
+}
+
+/// What a run's cancellation handle did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RunCancellation {
+    /// No cancellation was requested.
+    NotRequested,
+    /// The run stopped at a boundary before its publication and published
+    /// nothing: every table it had not finished, and every staged one, is
+    /// `deferred(cancelled)`.
+    Cancelled,
+    /// The cancellation arrived after the run passed its last check before
+    /// the publication, so the run finished; only the artifact scan was
+    /// skipped.
+    ArrivedLate,
+}
+
+impl RunCancellation {
+    /// Stable machine-readable token for serialized output. Once emitted this
+    /// is part of the output contract — keep it stable.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RunCancellation::NotRequested => "not_requested",
+            RunCancellation::Cancelled => "cancelled",
+            RunCancellation::ArrivedLate => "arrived_late",
+        }
+    }
+}
+
+/// A request to stop a run at its next safe boundary: before a table's plan,
+/// before its rewrite, and before the publication. A table in progress is
+/// dropped where it stands; its detached effects stay unreachable. Clones
+/// share one request.
+#[derive(Debug, Clone, Default)]
+pub struct OptimizeCancellation(Arc<CancellationState>);
+
+#[derive(Debug, Default)]
+struct CancellationState {
+    requested: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl OptimizeCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0
+            .requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.0.notify.notify_waiters();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.requested.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.0.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// How many tables a run plans ahead of the ones it rewrites, and how many it
@@ -445,6 +527,7 @@ pub struct OptimizeRequest {
     /// `None` reads [`OptimizeConcurrency::from_env`].
     pub concurrency: Option<OptimizeConcurrency>,
     pub before_publish: Option<OptimizeBeforePublish>,
+    pub cancellation: Option<OptimizeCancellation>,
 }
 
 impl OptimizeRequest {
@@ -474,6 +557,11 @@ impl OptimizeRequest {
 
     pub fn with_before_publish(mut self, hook: OptimizeBeforePublish) -> Self {
         self.before_publish = Some(hook);
+        self
+    }
+
+    pub fn with_cancellation(mut self, cancellation: OptimizeCancellation) -> Self {
+        self.cancellation = Some(cancellation);
         self
     }
 
@@ -670,13 +758,29 @@ pub async fn optimize_all_datasets(
         .limits
         .max_gate_hold
         .map(|hold| gates_acquired + hold);
-    let visited = run_table_pipeline(db, &catalog, table_tasks, concurrency, deadline).await?;
+    let cancellation = request.cancellation.as_ref();
+    let cancel_requested = || cancellation.is_some_and(OptimizeCancellation::is_cancelled);
+    let visited = run_table_pipeline(
+        db,
+        &catalog,
+        table_tasks,
+        concurrency,
+        deadline,
+        cancellation,
+    )
+    .await?;
+    // The last cancellation point: once past it, the run publishes.
+    let cancelled = visited.cancelled || cancel_requested();
 
     let mut updates = Vec::new();
     let mut expected_versions = crate::db::manifest::ExpectedTableVersions::new();
     let mut tables = Vec::with_capacity(visited.tables.len());
-    for (stat, effect) in visited.tables {
-        if let Some(effect) = effect {
+    for (mut stat, effect) in visited.tables {
+        if cancelled && effect.is_some() {
+            let duration = stat.duration;
+            stat = DatasetOptimizeStats::deferred(stat.type_key, DeferReason::Cancelled);
+            stat.duration = duration;
+        } else if let Some(effect) = effect {
             expected_versions.insert(
                 effect.update.identity,
                 crate::db::manifest::TableVersionExpectation {
@@ -732,22 +836,36 @@ pub async fn optimize_all_datasets(
         }
     }
 
-    // The graph commit is durable from here: nothing below fails the run.
-    let configuration_clear = clear_manifest_auto_cleanup(db).await;
+    // The graph commit is durable from here: nothing below fails the run. A
+    // cancelled run published nothing and leaves the configuration as is.
+    let configuration_clear = if cancelled {
+        ConfigurationClear::NotRun
+    } else {
+        clear_manifest_auto_cleanup(db).await
+    };
     let gate_hold = gates_acquired.elapsed();
     drop(table_guards);
     drop(main_branch_guard);
     drop(schema_permit);
 
-    let artifact = match persist_graph_index_artifact(db, &catalog, edge_tables_committed).await {
-        Ok(artifact) => artifact,
-        Err(error) => {
-            tracing::warn!(
-                target: "omnigraph::optimize",
-                error = %error,
-                "graph index artifact persist failed; traversals keep building in memory"
-            );
-            ArtifactRefresh::Failed(error.to_string())
+    let cancellation = match (cancelled, cancel_requested()) {
+        (true, _) => RunCancellation::Cancelled,
+        (false, true) => RunCancellation::ArrivedLate,
+        (false, false) => RunCancellation::NotRequested,
+    };
+    let artifact = if cancellation != RunCancellation::NotRequested {
+        ArtifactRefresh::Skipped(ArtifactSkip::Cancelled)
+    } else {
+        match persist_graph_index_artifact(db, &catalog, edge_tables_committed).await {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                tracing::warn!(
+                    target: "omnigraph::optimize",
+                    error = %error,
+                    "graph index artifact persist failed; traversals keep building in memory"
+                );
+                ArtifactRefresh::Failed(error.to_string())
+            }
         }
     };
 
@@ -756,18 +874,32 @@ pub async fn optimize_all_datasets(
         input_manifest_version,
         graph_commit_id,
         tables,
-        resume_at: visited.resume_at.filter(|_| full_catalog),
+        // A cancelled run moved nothing, so the next run starts where this one did.
+        resume_at: visited.resume_at.filter(|_| full_catalog && !cancelled),
         gate_hold,
         configuration_clear,
         artifact,
+        cancellation,
     })
 }
 
 /// The tables a run visited, in visit order, each with its staged effect if
-/// it has one, and the first table a run-wide bound deferred.
+/// it has one, the first table the gate hold deferred, and whether a
+/// cancellation stopped the pipeline.
 struct VisitedTables {
     tables: Vec<(DatasetOptimizeStats, Option<OptimizeTableEffect>)>,
     resume_at: Option<String>,
+    cancelled: bool,
+}
+
+/// Why the pipeline stopped starting tables.
+#[derive(Clone, Copy)]
+enum PipelineStop {
+    /// The gate hold reached its deadline at this table's turn; rewrites
+    /// already started finish.
+    GateHold(usize),
+    /// A cancellation: every table in progress is dropped where it stands.
+    Cancelled,
 }
 
 type PlannedTable = (usize, Instant, Result<OptimizePreparation>);
@@ -777,15 +909,18 @@ type PlannedTable = (usize, Instant, Result<OptimizePreparation>);
 /// every earlier table's has, with at most `concurrency.rewrite` at once.
 /// When a table's turn comes after `deadline`, that table and every later
 /// one are deferred and their plans, which only read, are dropped; the first
-/// table always starts. A table's planning failure is `BeforeEffect` and its
-/// staging failure `Unpublished`: either fails only that table. A failure
-/// whose evidence stays uncertain fails the run.
+/// table always starts. A cancellation, checked before every plan and every
+/// rewrite and awaited meanwhile, drops every table in progress. A table's
+/// planning failure is `BeforeEffect` and its staging failure `Unpublished`:
+/// either fails only that table. A failure whose evidence stays uncertain
+/// fails the run.
 async fn run_table_pipeline(
     db: &Omnigraph,
     catalog: &std::sync::Arc<omnigraph_compiler::catalog::Catalog>,
     tasks: Vec<OptimizeTableTask>,
     concurrency: OptimizeConcurrency,
     deadline: Option<Instant>,
+    cancellation: Option<&OptimizeCancellation>,
 ) -> Result<VisitedTables> {
     let keys = tasks
         .iter()
@@ -814,22 +949,31 @@ async fn run_table_pipeline(
     let mut ready: VecDeque<PlannedTable> = VecDeque::new();
     let mut staging = FuturesUnordered::new();
     let mut turns = 0usize;
-    let mut stopped_at = None;
+    let mut stop = None;
+    let cancel_requested = || cancellation.is_some_and(OptimizeCancellation::is_cancelled);
 
     loop {
-        if stopped_at.is_none() {
+        if stop.is_none() {
             while planning.len() + ready.len() < concurrency.planning {
+                if cancel_requested() {
+                    stop = Some(PipelineStop::Cancelled);
+                    break;
+                }
                 let Some((index, task)) = unplanned.next() else {
                     break;
                 };
                 planning.push_back(plan(index, task));
             }
-            while staging.len() < concurrency.rewrite {
+            while stop.is_none() && staging.len() < concurrency.rewrite {
                 let Some((index, started, result)) = ready.pop_front() else {
                     break;
                 };
+                if cancel_requested() {
+                    stop = Some(PipelineStop::Cancelled);
+                    break;
+                }
                 if turns > 0 && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    stopped_at = Some(index);
+                    stop = Some(PipelineStop::GateHold(index));
                     break;
                 }
                 turns += 1;
@@ -855,9 +999,17 @@ async fn run_table_pipeline(
                     }
                 }
             }
-            if stopped_at.is_some() {
-                planning.clear();
-                ready.clear();
+            match stop {
+                Some(PipelineStop::GateHold(_)) => {
+                    planning.clear();
+                    ready.clear();
+                }
+                Some(PipelineStop::Cancelled) => {
+                    planning.clear();
+                    ready.clear();
+                    staging.clear();
+                }
+                None => {}
             }
         }
         // Filling planning above leaves it non-empty while any table is
@@ -866,7 +1018,9 @@ async fn run_table_pipeline(
             break;
         }
         // The deadline stops only a table whose turn has not come.
-        let timer = deadline.filter(|_| turns > 0 && turns < keys.len() && stopped_at.is_none());
+        let timer = deadline.filter(|_| turns > 0 && turns < keys.len() && stop.is_none());
+        let awaiting_cancel =
+            cancellation.filter(|_| !matches!(stop, Some(PipelineStop::Cancelled)));
         tokio::select! {
             biased;
             Some((index, started, result)) = staging.next(), if !staging.is_empty() => {
@@ -886,31 +1040,46 @@ async fn run_table_pipeline(
                     }
                 });
             }
-            Some(planned) = planning.next(), if !planning.is_empty() && stopped_at.is_none() => {
+            Some(planned) = planning.next(), if !planning.is_empty() && stop.is_none() => {
                 ready.push_back(planned);
             }
             () = tokio::time::sleep_until(timer.unwrap_or_else(Instant::now)), if timer.is_some() => {
-                stopped_at = Some(turns);
+                stop = Some(PipelineStop::GateHold(turns));
                 planning.clear();
                 ready.clear();
+            }
+            () = async {
+                if let Some(cancellation) = awaiting_cancel {
+                    cancellation.cancelled().await;
+                }
+            }, if awaiting_cancel.is_some() => {
+                stop = Some(PipelineStop::Cancelled);
+                planning.clear();
+                ready.clear();
+                staging.clear();
             }
         }
     }
 
-    let resume_at = stopped_at.map(|index| keys[index].clone());
+    let (resume_at, unvisited) = match stop {
+        Some(PipelineStop::GateHold(index)) => {
+            (Some(keys[index].clone()), DeferReason::GateHoldLimit)
+        }
+        Some(PipelineStop::Cancelled) => (None, DeferReason::Cancelled),
+        None => (None, DeferReason::GateHoldLimit),
+    };
     let tables = visited
         .into_iter()
         .zip(keys)
         .map(|(entry, key)| {
-            entry.unwrap_or_else(|| {
-                (
-                    DatasetOptimizeStats::deferred(key, DeferReason::GateHoldLimit),
-                    None,
-                )
-            })
+            entry.unwrap_or_else(|| (DatasetOptimizeStats::deferred(key, unvisited), None))
         })
         .collect();
-    Ok(VisitedTables { tables, resume_at })
+    Ok(VisitedTables {
+        tables,
+        resume_at,
+        cancelled: matches!(stop, Some(PipelineStop::Cancelled)),
+    })
 }
 
 /// Keep a table's failure with its table when its evidence is definite; any

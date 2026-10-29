@@ -4875,6 +4875,76 @@ async fn optimize_table_failure_fails_only_that_table_and_publishes_the_rest() {
     );
 }
 
+/// A cancellation while a table's staging is under way publishes nothing:
+/// every staged and unstarted table is deferred as cancelled, no pin moves,
+/// and the next run publishes both tables.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(optimize)]
+async fn optimize_cancelled_mid_run_publishes_nothing_and_the_next_run_does() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    seed_two_productive_optimize_tables(&uri).await;
+    let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    let commits_before = db.list_commits(Some("main")).await.unwrap().len();
+
+    let cancellation = omnigraph::db::OptimizeCancellation::new();
+    let rendezvous = helpers::failpoint::Rendezvous::park_first(&catalog::OPTIMIZE_BEFORE_COMPACT);
+    let run = {
+        let uri = uri.clone();
+        let cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+            db.optimize_as(
+                None,
+                omnigraph::db::OptimizeRequest::default().with_cancellation(cancellation),
+            )
+            .await
+        })
+    };
+    rendezvous.wait_until_reached().await;
+    cancellation.cancel();
+    rendezvous.release();
+    let report = tokio::time::timeout(std::time::Duration::from_secs(20), run)
+        .await
+        .expect("optimize task hung")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        report.cancellation,
+        omnigraph::db::RunCancellation::Cancelled
+    );
+    assert_eq!(report.graph_commit_id, None, "{report:?}");
+    for key in ["node:Company", "node:Person"] {
+        let stat = report
+            .tables
+            .iter()
+            .find(|stat| stat.type_key == key)
+            .unwrap();
+        assert_eq!(
+            stat.outcome,
+            omnigraph::db::TableOptimizeOutcome::Deferred(omnigraph::db::DeferReason::Cancelled),
+            "{stat:?}"
+        );
+    }
+    assert!(report.tables.iter().all(|stat| !stat.committed()));
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        commits_before,
+        "a cancelled run publishes nothing"
+    );
+
+    let next = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        next.tables.iter().filter(|stat| stat.committed()).count(),
+        2,
+        "{next:?}"
+    );
+}
+
 /// Optimize captures a complete authority token before entering any writer
 /// gate, then revalidates it after schema -> main -> table (`optimize.rs`, the
 /// comment above `open_write_txn`). That revalidation is the only thing that

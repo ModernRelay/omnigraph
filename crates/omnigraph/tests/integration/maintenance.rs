@@ -16,8 +16,9 @@ use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance_core::datatypes::BlobHandling;
 use omnigraph::IndexCoverage;
 use omnigraph::db::{
-    ArtifactRefresh, ConfigurationClear, DeferReason, OptimizeBeforePublish, OptimizeLimits,
-    OptimizePublication, OptimizeRequest, TableOptimizeOutcome,
+    ArtifactRefresh, ArtifactSkip, ConfigurationClear, DeferReason, OptimizeBeforePublish,
+    OptimizeCancellation, OptimizeLimits, OptimizePublication, OptimizeRequest, RunCancellation,
+    TableOptimizeOutcome,
 };
 use omnigraph::db::{
     CleanupPolicyOptions, MergeOutcome, Omnigraph, ReadTarget, RepairAction, RepairClassification,
@@ -418,6 +419,90 @@ async fn optimize_publishes_nothing_when_before_publish_fails() {
         .await
         .unwrap();
     assert!(retry.graph_commit_id.is_some(), "{retry:?}");
+}
+
+#[tokio::test]
+async fn optimize_cancelled_before_it_starts_publishes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    add_person_fragments(&db).await;
+    let head = db.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+
+    let cancellation = OptimizeCancellation::new();
+    cancellation.cancel();
+    let (hook, seen) = recording_hook();
+    let report = db
+        .optimize_as(
+            None,
+            OptimizeRequest::default()
+                .with_cancellation(cancellation)
+                .with_before_publish(hook),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.cancellation, RunCancellation::Cancelled);
+    assert!(
+        report
+            .tables
+            .iter()
+            .all(|stat| stat.outcome == TableOptimizeOutcome::Deferred(DeferReason::Cancelled)),
+        "{report:?}"
+    );
+    assert_eq!(report.graph_commit_id, None);
+    assert_eq!(report.resume_at, None);
+    assert_eq!(report.configuration_clear, ConfigurationClear::NotRun);
+    assert_eq!(
+        report.artifact,
+        ArtifactRefresh::Skipped(ArtifactSkip::Cancelled)
+    );
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "a cancelled run never calls the hook"
+    );
+    assert_eq!(
+        db.list_commits(None).await.unwrap()[0].graph_commit_id,
+        head
+    );
+}
+
+#[tokio::test]
+async fn optimize_finishes_a_cancellation_that_arrives_after_its_last_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    add_person_fragments(&db).await;
+
+    // The hook runs after the last check, inside the publication helper.
+    let cancellation = OptimizeCancellation::new();
+    let late = cancellation.clone();
+    let hook = OptimizeBeforePublish::new(move |_| {
+        late.cancel();
+        async { Ok(()) }
+    });
+    let report = db
+        .optimize_as(
+            None,
+            OptimizeRequest::default()
+                .with_cancellation(cancellation)
+                .with_before_publish(hook),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.cancellation, RunCancellation::ArrivedLate);
+    assert!(report.graph_commit_id.is_some(), "{report:?}");
+    assert!(
+        report
+            .tables
+            .iter()
+            .any(|stat| stat.type_key == "node:Person" && stat.committed()),
+        "{report:?}"
+    );
+    assert_eq!(
+        report.artifact,
+        ArtifactRefresh::Skipped(ArtifactSkip::Cancelled),
+        "the edge scan starts only without a cancellation"
+    );
 }
 
 #[tokio::test]

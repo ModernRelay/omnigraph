@@ -52,8 +52,9 @@ pub(crate) use export::{
 };
 pub use optimize::{
     ArtifactRefresh, ArtifactSkip, CleanupPolicyOptions, ConfigurationClear, DatasetCleanupStats,
-    DatasetOptimizeStats, DeferReason, OptimizeBeforePublish, OptimizeConcurrency, OptimizeLimits,
-    OptimizePublication, OptimizeReport, OptimizeRequest, SkipReason, TableOptimizeOutcome,
+    DatasetOptimizeStats, DeferReason, OptimizeBeforePublish, OptimizeCancellation,
+    OptimizeConcurrency, OptimizeLimits, OptimizePublication, OptimizeReport, OptimizeRequest,
+    RunCancellation, SkipReason, TableOptimizeOutcome,
 };
 use prepared_create::initial_schema_ir;
 pub use prepared_create::{GraphCreateReconciliation, PreparedGraphCreate};

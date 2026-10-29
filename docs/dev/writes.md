@@ -270,7 +270,11 @@ A run with `max_gate_hold` defers every table whose turn comes after the
 deadline, measured from gate acquisition, and publishes the tables it finished
 (`run_table_pipeline`). A table whose own planning or staging fails with
 definite evidence is reported `failed` and the others still publish; a
-failure whose evidence stays uncertain fails the run. A caller's before-publish hook
+failure whose evidence stays uncertain fails the run. A cancellation
+(`OptimizeRequest::with_cancellation`) is checked before every table's plan
+and rewrite and before the publication: it drops the tables in progress,
+defers every table as `cancelled` and publishes nothing; one that arrives
+after the last check lets the run finish and skips only the artifact scan. A caller's before-publish hook
 (`OptimizeRequest::with_before_publish`) belongs to the shared publication
 helper, `table_ops::commit_updates_on_branch_with_expected`: it runs once,
 after the updates are prepared and before the coordinator lock and the
