@@ -130,7 +130,7 @@ do not run it to upgrade an existing graph. Local paths can be targets directly;
 remote endpoints need a named target. Folder context no longer selects a target.
 Old direct `az://` CLI routes have no inline `--target` equivalent, and old
 direct `s3://` routes keep one only for a cluster root's deployment, recovery
-and maintenance commands ([S3 cluster roots](maintenance.md#s3-cluster-roots)).
+and maintenance commands ([S3 cluster roots](s3-cluster-roots.md)).
 Use a configured server for other graph operations; direct-only maintenance
 does not gain a remote equivalent. See [capability boundaries](../cli/targets.md#transport-and-capability-boundaries).
 

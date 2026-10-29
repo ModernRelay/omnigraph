@@ -276,7 +276,7 @@ omnigraph --target file:///srv/company-brain \
 
 An S3 root works the same way inline, for example
 `--target s3://bucket/company-brain`; see
-[S3 cluster roots](../operations/maintenance.md#s3-cluster-roots).
+[S3 cluster roots](../operations/s3-cluster-roots.md).
 
 Reconciliation uses captured input and exact publication evidence; it never
 replays an uncertain schema or graph-creation invocation. Unstarted schema or

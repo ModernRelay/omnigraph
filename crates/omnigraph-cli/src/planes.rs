@@ -195,6 +195,7 @@ pub(crate) fn admits_inline_s3_root(command: &Command) -> bool {
                 | ClusterCommand::ForceUnlock { .. }
                 | ClusterCommand::UpgradeLedger { .. },
         } | Command::Optimize(_)
+            | Command::Index { .. }
             | Command::Cleanup(_)
             | Command::Repair(_)
             | Command::RebuildFullTextIndexes(_)

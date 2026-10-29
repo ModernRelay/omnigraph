@@ -83,7 +83,7 @@ the first graph. Graph IDs are exact API identifiers, not display-name lookups; 
 does not protect against recreation of a graph with the same ID.
 
 Inline targets are local paths or `file://` URIs, such as `--target ./graph.omni`,
-and an [S3 cluster root](../operations/maintenance.md#s3-cluster-roots) for deployment,
+and an [S3 cluster root](../operations/s3-cluster-roots.md) for deployment,
 recovery and maintenance commands. Bare names select registered targets. Remote endpoints
 must be registered. `init ./graph.omni --schema schema.pg` keeps its local shorthand.
 Defaults and aliases require registered names. Registered destinations have no environment overrides.

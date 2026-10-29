@@ -188,7 +188,7 @@ effects. Remote operations require an absolute path or `file://`, `s3://` or
 Registered direct targets accept local files only. The storage assertion above
 describes the deployment root; it does not select a target. An inline `s3://`
 root reaches only the commands listed in
-[S3 cluster roots](../operations/maintenance.md#s3-cluster-roots).
+[S3 cluster roots](../operations/s3-cluster-roots.md).
 Cloud storage credentials and provider settings belong to the server or embedded
 initializer. Azure remains a qualification preview and requires its admission
 wrapper for every writer; see [Deployment](../deployment.md#azure-blob-preview).

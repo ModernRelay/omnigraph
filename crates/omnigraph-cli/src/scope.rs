@@ -629,6 +629,15 @@ defaults: {target: local, profile: work}
             vec!["cluster", "force-unlock", "lock-one"],
             vec!["cluster", "upgrade-ledger", "--writers-stopped"],
             vec!["optimize", "--graph", "knowledge"],
+            vec!["index", "build", "--graph", "knowledge"],
+            vec![
+                "index",
+                "rebuild",
+                "--kind",
+                "full-text",
+                "--graph",
+                "knowledge",
+            ],
             vec![
                 "cleanup",
                 "--graph",

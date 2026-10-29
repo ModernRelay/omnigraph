@@ -174,7 +174,7 @@ backend. `--config DIR` is source input only.
 - Direct cluster root: `--target ./cluster --graph knowledge`; registered root targets can set `default_graph`.
 - Server: `--target production --graph knowledge`; the registered target owns endpoint and one auth provider.
 - Managed: `--profile work` for account operations; a managed target references that profile and pins cluster ID/incarnation. Graph operations need its endpoint and `--graph` or `default_graph`.
-- Direct targets support local files, plus an inline `s3://` cluster root for `cluster plan/apply/status/force-unlock/upgrade-ledger` and `optimize`/`cleanup`/`repair`/`rebuild-full-text-indexes --graph` while the server is stopped. Other cloud-direct, catalogue and Unix socket targets are unsupported. Remote inline URLs must be registered.
+- Direct targets support local files, plus an inline `s3://` cluster root for `cluster plan/apply/status/force-unlock/upgrade-ledger` and `optimize`/`index build`/`index rebuild`/`cleanup`/`repair --graph` once the server's lock is released. Each direct writer keeps its own admission lock; `cluster force-unlock` it before starting the server. Other cloud-direct, catalogue and Unix socket targets are unsupported. Remote inline URLs must be registered.
 
 Bare target names resolve from the operator file; use `./` for relative inline
 paths. `init --schema schema.pg ./graph.omni` is the sole positional backend

@@ -476,8 +476,11 @@ identities use different targets. There is no `--auth` selector or last-used ide
 
 Direct graph/root targets use local files, except an inline `s3://` cluster root
 for stopped-writer `cluster plan/apply/status/force-unlock/upgrade-ledger` and
-`optimize`/`cleanup`/`repair`/`rebuild-full-text-indexes --graph` (region and
-endpoint from `AWS_REGION`/`AWS_ENDPOINT_URL_S3`). Inline local paths and `file://`
+`optimize`/`index build`/`index rebuild`/`cleanup`/`repair --graph`, with region
+and endpoint captured from the environment
+([S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)).
+Each direct writer keeps its admission lock; `cluster force-unlock` it before
+starting the server. Inline local paths and `file://`
 URIs are accepted; remote endpoints must be registered. Server targets own auth;
 managed targets reference a profile and pin cluster identity/incarnation.
 Graph operations need `--graph` or target `default_graph`; direct graphs reject
