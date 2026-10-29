@@ -54,6 +54,7 @@ fn identity_is_local_stable_admission_without_token_permissions() {
     c["permissions"] = json!(["everything"]);
     let actor = trust.verify_at(&sign(&c), NOW).unwrap();
     assert_eq!(actor.actor_id_str(), "principal:stable_1");
+    assert_eq!(actor.client_id(), Some("oauth-client"));
     assert!(actor.is_identity());
     assert!(
         actor.identity_claims().is_none(),
@@ -97,6 +98,33 @@ fn exact_recipient_identity_and_profile_are_required() {
         let mut c = claims();
         c.as_object_mut().unwrap().remove(field);
         assert!(trust.verify_at(&sign(&c), NOW).is_none(), "missing {field}");
+    }
+}
+
+#[test]
+fn the_verified_client_is_kept_beside_one_stable_principal_issue_1173() {
+    let (_dir, trust) = setup(&document());
+    let mut actors = Vec::new();
+    for client in [
+        "https://studio.example/oauth/client",
+        "https://agent.example/oauth/client",
+        "<b>studio</b>",
+    ] {
+        let mut c = claims();
+        c["client_id"] = json!(client);
+        let actor = trust.verify_at(&sign(&c), NOW).unwrap();
+        assert_eq!(actor.client_id(), Some(client));
+        actors.push(actor);
+    }
+    // One person across clients: the actor, its policy principal and its
+    // admission budget key stay the local principal.
+    for actor in &actors {
+        assert_eq!(actor.actor_id_str(), "principal:stable_1");
+    }
+    for client in ["a".repeat(513), "ok\n".to_owned()] {
+        let mut c = claims();
+        c["client_id"] = json!(client);
+        assert!(trust.verify_at(&sign(&c), NOW).is_none(), "{client:?}");
     }
 }
 
