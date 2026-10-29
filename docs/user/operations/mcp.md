@@ -199,7 +199,7 @@ for a deployment whose policy was written with an LLM caller in mind.
 | `read` (opt-in) | `graph`, `query`, optional `name`, `params`, `branch`, `snapshot` | `POST /graphs/{graph_id}/query` | `read`; `change` for `explain load csv` |
 | `snapshot` | `graph`, optional `branch` | `GET /graphs/{graph_id}/snapshot` | `read` |
 | `access` | `graph`, optional `branch`, `target_branch` | `GET /graphs/{graph_id}/access` | none |
-| `branches_list` | `graph` | `GET /graphs/{graph_id}/branches` | `read` |
+| `branches_list` | `graph`, optional `detailed` | `GET /graphs/{graph_id}/branches` | `read`; with `detailed`, details only for branches the caller may `read` |
 | `branches_diff` | `graph`, `source`, optional `target`, `kind`, `type`, `op`, `page_token`, `limit` | `GET /graphs/{graph_id}/branches/diff` | `read` on both branches |
 | `branches_merge_base` | `graph`, `source`, optional `target` | `GET /graphs/{graph_id}/branches/merge-base` | `read` on both branches |
 | `commits_list` | `graph`, optional `branch`, `listing`, `limit`, `page_token` | `GET /graphs/{graph_id}/commits` | `read` |

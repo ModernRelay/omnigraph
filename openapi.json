@@ -3937,7 +3937,7 @@
           "branches"
         ],
         "summary": "List all branches.",
-        "description": "Returns branch names sorted by name in byte order. Read-only. The GQ statement\n`branch list` on `POST /query` runs the same body.",
+        "description": "Returns branch names sorted by name in byte order. Read-only. The GQ statement\n`branch list` on `POST /query` runs the same body.\n\n`detailed=true` adds `details`: for each branch the caller may `read`, its\nhead commit, the branch and commit it started from, when it was created,\nand when it last moved. Each listed branch costs a read of its latest\nversion, and of the version it was created from once it has written a\ncommit; no commit history is read.",
         "operationId": "branchList",
         "parameters": [
           {
@@ -3947,6 +3947,15 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "detailed",
+            "in": "query",
+            "description": "`true` adds `details`: each branch's head, the branch and commit it\nstarted from, when it was created, and when it last moved. Defaults\nto `false`. Reads each listed branch's latest version, and the version\nit was created from once it has written a commit, never its commit\nhistory; the names alone read neither.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           },
           {
@@ -3994,7 +4003,7 @@
             }
           },
           "400": {
-            "description": "api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "description": "Invalid `detailed`; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -13151,6 +13160,53 @@
           }
         }
       },
+      "BranchDetailOutput": {
+        "type": "object",
+        "description": "One live branch as `GET /branches?detailed=true` reports it. `from` and\n`from_commit_id` say where the branch started, as its `POST /branches`\nreceipt did. A branch deleted and created again under the same name is a\nnew lifetime: its start and creation time are the later creation's. The\noptional fields are absent on `main`.",
+        "required": [
+          "name",
+          "head",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the branch was created, as Unix epoch microseconds recorded to\nthe second.",
+            "example": 1714000000000000
+          },
+          "from": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The branch this one started from, as that branch was named then; it\nmay since have been deleted or recreated."
+          },
+          "from_commit_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The commit the branch started at. A later merge does not move it;\n`GET /branches/merge-base` answers where two branches last met."
+          },
+          "head": {
+            "$ref": "#/components/schemas/CommitOutput",
+            "description": "The commit a read of the branch sees: its newest commit, or the commit\nit started at while it has written none."
+          },
+          "name": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the head last moved, as Unix epoch microseconds: the time of the\nbranch's newest commit, or `created_at` while it has written none.",
+            "example": 1714000000000000
+          }
+        }
+      },
       "BranchListOutput": {
         "type": "object",
         "required": [
@@ -13161,7 +13217,18 @@
             "type": "array",
             "items": {
               "type": "string"
-            }
+            },
+            "description": "Every live branch, sorted by name in byte order."
+          },
+          "details": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/BranchDetailOutput"
+            },
+            "description": "Present only with `detailed=true`: one entry per branch the caller\nmay `read`, in the order of `branches`. A branch the caller may not\nread is listed in `branches` alone."
           }
         }
       },

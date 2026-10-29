@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::app::Completion;
-use omnigraph_api_types::CommitListOutput;
+use omnigraph_api_types::{BranchListOutput, CommitListOutput};
 
 pub(crate) fn graph_type_subject(type_key: &str) -> String {
     if let Some(type_name) = type_key.strip_prefix("node:") {
@@ -1035,6 +1035,32 @@ pub(crate) fn write_change_human(output: &ChangeOutput, writer: &mut dyn Write) 
     }
     if let Some(actor_id) = &output.actor_id {
         writeln!(writer, "actor_id: {}", actor_id)?;
+    }
+    Ok(())
+}
+
+/// One line per branch: its name, then with details its head, where it
+/// started, and its creation and last-move times, under the keys the JSON
+/// output uses. A branch without details (one the caller may not read) writes
+/// its name alone.
+pub(crate) fn write_branch_list_human(
+    list: &BranchListOutput,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let details = list.details.as_deref().unwrap_or_default();
+    for branch in &list.branches {
+        let Some(detail) = details.iter().find(|detail| &detail.name == branch) else {
+            writeln!(writer, "{branch}")?;
+            continue;
+        };
+        let mut line = format!("{branch} head={}", detail.head.graph_commit_id);
+        if let (Some(from), Some(from_commit_id)) = (&detail.from, &detail.from_commit_id) {
+            line.push_str(&format!(" from={from} from_commit_id={from_commit_id}"));
+        }
+        if let Some(created_at) = detail.created_at {
+            line.push_str(&format!(" created_at={created_at}"));
+        }
+        writeln!(writer, "{line} updated_at={}", detail.updated_at)?;
     }
     Ok(())
 }
