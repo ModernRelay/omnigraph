@@ -555,6 +555,127 @@ pub(crate) async fn load_deleted_ids(
     }
 }
 
+/// A data file's physical identity, `(owning root, relative path)`, with
+/// `base_id` resolved through the manifest's base paths; `None` when that base
+/// path is missing, which callers treat as a changed fragment.
+fn resolved_data_file_key<'a>(
+    dataset: &'a Dataset,
+    base_id: Option<u32>,
+    path: &'a str,
+) -> Option<(&'a str, &'a str)> {
+    let root = match base_id {
+        None => dataset.uri(),
+        Some(base_id) => dataset
+            .manifest
+            .base_paths
+            .get(&base_id)
+            .map(|base_path| base_path.path.as_str())?,
+    };
+    Some((scheme_free_root(root), path))
+}
+
+/// One local root spelled `file:///abs/path` by a dataset URI and `/abs/path`
+/// by a stored base path compares equal; a non-file scheme stays as it is.
+fn scheme_free_root(root: &str) -> &str {
+    root.strip_prefix("file://")
+        .unwrap_or(root)
+        .trim_end_matches('/')
+}
+
+/// Whether two fragment incarnations hold byte-identical row data: same
+/// resolved data files (base-path indirection resolved on each side) and the
+/// same overlay list. Deletion state is compared separately — a deletion-file
+/// mismatch is self-correcting through the deletion-vector content diff.
+/// Overlay data files carry the same `base_id` indirection, and one `base_id`
+/// can resolve to different roots in the two manifests, so overlays compare by
+/// resolved physical identity too, never by struct equality: a false `true`
+/// here is the one direction that breaks the candidate superset.
+pub(crate) fn fragment_data_identical(
+    base_dataset: &Dataset,
+    base_meta: &lance_table::format::Fragment,
+    side_dataset: &Dataset,
+    side_meta: &lance_table::format::Fragment,
+) -> bool {
+    if base_meta.files.len() != side_meta.files.len()
+        || base_meta.overlays.len() != side_meta.overlays.len()
+    {
+        return false;
+    }
+    let overlays_identical = base_meta
+        .overlays
+        .iter()
+        .zip(side_meta.overlays.iter())
+        .all(|(base_overlay, side_overlay)| {
+            base_overlay.coverage == side_overlay.coverage
+                && base_overlay.committed_version == side_overlay.committed_version
+                && data_file_identical(
+                    base_dataset,
+                    &base_overlay.data_file,
+                    side_dataset,
+                    &side_overlay.data_file,
+                )
+        });
+    if !overlays_identical {
+        return false;
+    }
+    base_meta
+        .files
+        .iter()
+        .zip(side_meta.files.iter())
+        .all(|(base_file, side_file)| {
+            data_file_identical(base_dataset, base_file, side_dataset, side_file)
+        })
+}
+
+/// Whether two data-file references name the same physical file with the same
+/// column layout, `base_id` indirection resolved on each side.
+fn data_file_identical(
+    base_dataset: &Dataset,
+    base_file: &lance_table::format::DataFile,
+    side_dataset: &Dataset,
+    side_file: &lance_table::format::DataFile,
+) -> bool {
+    base_file.fields == side_file.fields
+        && base_file.column_indices == side_file.column_indices
+        && match (
+            resolved_data_file_key(base_dataset, base_file.base_id, &base_file.path),
+            resolved_data_file_key(side_dataset, side_file.base_id, &side_file.path),
+        ) {
+            (Some(base_key), Some(side_key)) => base_key == side_key,
+            _ => false,
+        }
+}
+
+/// Whether two deletion-file references name the same physical deletion file.
+/// `(read_version, id, file_type, base_id)` pins the uniquely-named file; a
+/// false negative only costs two deletion-vector reads whose content diff
+/// comes back empty (superset-safe).
+pub(crate) fn deletion_file_identical(
+    base_meta: &lance_table::format::Fragment,
+    side_meta: &lance_table::format::Fragment,
+) -> bool {
+    match (&base_meta.deletion_file, &side_meta.deletion_file) {
+        (None, None) => true,
+        (Some(base_file), Some(side_file)) => {
+            base_file.read_version == side_file.read_version
+                && base_file.id == side_file.id
+                && base_file.file_type == side_file.file_type
+                && base_file.base_id == side_file.base_id
+        }
+        _ => false,
+    }
+}
+
+pub(crate) async fn fragment_deletion_vector(
+    fragment: &lance::dataset::fragment::FileFragment,
+) -> Result<Arc<lance_core::utils::deletion::DeletionVector>> {
+    Ok(fragment
+        .get_deletion_vector()
+        .await
+        .map_err(OmniError::storage)?
+        .unwrap_or_default())
+}
+
 /// Stamp [`NO_BY_SOURCE_DELETE_PROPERTY`] on a keyed-write transaction before it
 /// is committed. Unconditional: every OmniGraph keyed `merge_insert` is
 /// no-by-source-delete by construction. Mirrors `certify_insert_absence`'s

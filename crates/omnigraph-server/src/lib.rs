@@ -982,6 +982,12 @@ impl AppState {
             .min(omnigraph::BLOB_WRITE_MAX_BYTES)
     }
 
+    /// The process `change_lineage`, which the REST change routes read
+    /// under: they take no request settings (the Session settings RFC).
+    pub(crate) fn change_lineage(&self) -> omnigraph::settings::ChangeLineage {
+        self.process_defaults.settings.change_lineage()
+    }
+
     /// One session for one request: the process defaults, then the typed
     /// `settings` field with source `request`. The source's own `set` lines
     /// apply inside the session method that runs the text.

@@ -3952,6 +3952,16 @@ fn default_merge_lineage() -> &'static str {
     }
 }
 
+/// The `change_lineage` value the definition's defaults carry: `verify` in
+/// a debug build, the row's `on` otherwise.
+fn default_change_lineage() -> &'static str {
+    if cfg!(debug_assertions) {
+        "verify"
+    } else {
+        "on"
+    }
+}
+
 /// The head of `main`: the commit with the largest graph manifest version.
 async fn main_head_commit_id(app: &axum::Router) -> String {
     let (status, out) = get_json(app, g("/commits?branch=main")).await;
@@ -4193,6 +4203,13 @@ async fn settings_show_all_lists_the_definition_in_order() {
                 "default",
                 "request"
             ),
+            show_row(
+                "change_lineage",
+                default_change_lineage(),
+                "on",
+                "default",
+                "request"
+            ),
             show_row("ann_nprobes", "20", "20", "default", "request"),
             show_row("stage_write_concurrency", "8", "8", "default", "process"),
             show_row(
@@ -4348,7 +4365,7 @@ async fn settings_reset_all_at_the_http_door_returns_to_the_process_defaults() {
         &app,
         json_post(
             "/query",
-            &json!({"query": "set engine = v2;\nset merge_lineage = off;\nreset all;\nshow all;"}),
+            &json!({"query": "set engine = v2;\nset merge_lineage = off;\nset change_lineage = off;\nreset all;\nshow all;"}),
         ),
     )
     .await;
@@ -4371,6 +4388,17 @@ async fn settings_reset_all_at_the_http_door_returns_to_the_process_defaults() {
     );
     assert_eq!(
         body["rows"][3],
+        show_row(
+            "change_lineage",
+            default_change_lineage(),
+            "on",
+            "default",
+            "request"
+        ),
+        "{body}"
+    );
+    assert_eq!(
+        body["rows"][4],
         show_row("ann_nprobes", "5", "20", "env", "request"),
         "reset all returns to the process value, not the definition's: {body}"
     );
@@ -5700,6 +5728,31 @@ async fn remote_branch_list_create_merge_flow_works() {
     assert_eq!(change_status, StatusCode::OK);
     assert_eq!(change_body["branch"], "feature");
     assert_eq!(change_body["affected_nodes"], 1);
+
+    // `detailed=true` adds what `GET /commits?branch=` would otherwise be read
+    // for, per branch, and says where each branch started as its create
+    // receipt did; the plain listing stays names only.
+    assert!(list_body.get("details").is_none(), "{list_body}");
+    let (status, detailed) = get_json(&app, g("/branches?detailed=true")).await;
+    assert_eq!(status, StatusCode::OK, "{detailed}");
+    assert_eq!(detailed["branches"], json!(["feature", "main"]));
+    let (_, main_commits) = get_json(&app, g("/commits?branch=main")).await;
+    let main_head = &main_commits["commits"][0];
+    let main = &detailed["details"][1];
+    assert_eq!(main["name"], "main");
+    assert_eq!(&main["head"], main_head);
+    for absent in ["from", "from_commit_id", "created_at"] {
+        assert!(main.get(absent).is_none(), "{main}");
+    }
+    assert_eq!(main["updated_at"], main_head["created_at"]);
+    let feature = &detailed["details"][0];
+    assert_eq!(feature["name"], "feature");
+    assert_eq!(feature["head"], change_body["commit"]);
+    assert_eq!(feature["updated_at"], change_body["commit"]["created_at"]);
+    assert_eq!(feature["from"], create_body["from"]);
+    assert_eq!(feature["from_commit_id"], create_body["from_commit_id"]);
+    assert_eq!(feature["from_commit_id"], main_head["graph_commit_id"]);
+    assert!(feature["created_at"].as_i64().unwrap() > 0, "{feature}");
 
     let read_main_before = QueryRequest {
         query: fs::read_to_string(fixture("test.gq")).unwrap(),
@@ -7662,6 +7715,93 @@ async fn diff_routes_review_a_branch_against_its_merge_base() {
             "{statement}: {body}"
         );
     }
+}
+
+/// The route the change intervals of one served call took, read through the
+/// engine's request probes: (row identity, exact merge).
+async fn change_routes_taken<F: std::future::Future>(op: F) -> (F::Output, (u64, u64)) {
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+    let probes = QueryIoProbes::default();
+    let row_identity = Arc::clone(&probes.change_intervals_row_identity);
+    let exact_merge = Arc::clone(&probes.change_intervals_exact_merge);
+    let out = with_query_io_probes(probes, Box::pin(op)).await;
+    (
+        out,
+        (
+            row_identity.load(Ordering::Relaxed),
+            exact_merge.load(Ordering::Relaxed),
+        ),
+    )
+}
+
+/// `OMNIGRAPH_CHANGE_LINEAGE` is the process default every change route runs
+/// under, and the query route's `settings` field selects over it for the
+/// `branch diff` statement.
+#[tokio::test(flavor = "multi_thread")]
+async fn changes_routes_run_under_the_process_change_lineage() {
+    let (settings, sources) = omnigraph::settings::from_env_with(|variable| {
+        (variable == "OMNIGRAPH_CHANGE_LINEAGE").then(|| "off".to_string())
+    })
+    .unwrap();
+    let (_temp, app) =
+        app_for_loaded_graph_with_process_defaults(ProcessDefaults { settings, sources }).await;
+    let fork = main_head_commit_id(&app).await;
+    branch_one_commit_ahead(&app, "feature", "Featured").await;
+    insert_person_on(&app, "feature", "Second").await;
+    insert_person_on(&app, "main", "First").await;
+    insert_person_on(&app, "main", "Later").await;
+
+    let two_commits = format!("/diff?from={fork}&to=main");
+    let ((status, page), routes) = change_routes_taken(get_json(&app, g(&two_commits))).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        change_ids(&page),
+        vec![
+            ("First".to_string(), "insert".to_string()),
+            ("Later".to_string(), "insert".to_string()),
+        ]
+    );
+    assert_eq!(
+        routes,
+        (0, 1),
+        "`off` from the environment takes the exact merge on GET /diff"
+    );
+    let ((status, page), routes) =
+        change_routes_taken(get_json(&app, g("/branches/diff?source=feature"))).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(routes, (0, 1), "and on GET /branches/diff");
+    let ((status, rows), routes) =
+        change_routes_taken(query_statement(&app, "branch diff feature")).await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(routes, (0, 1), "and on the `branch diff` statement");
+
+    let ((status, rows), routes) = change_routes_taken(json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({"query": "branch diff feature", "settings": {"change_lineage": "on"}}),
+        ),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(
+        routes,
+        (1, 0),
+        "the request's `change_lineage` selects over the process default"
+    );
+
+    let (_temp, app) = app_for_loaded_graph().await;
+    let fork = main_head_commit_id(&app).await;
+    insert_person_on(&app, "main", "First").await;
+    insert_person_on(&app, "main", "Later").await;
+    let ((status, page), routes) =
+        change_routes_taken(get_json(&app, g(&format!("/diff?from={fork}&to=main")))).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        routes,
+        (1, 0),
+        "the definition's default pairs the two-commit window's rows by identity"
+    );
 }
 
 /// One statement at the read door, sent bare.
