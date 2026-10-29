@@ -30,6 +30,7 @@ mod deployment;
 mod diff;
 mod graph_read;
 mod lease;
+mod maintenance;
 mod serve;
 mod state_lock;
 mod store;
@@ -56,6 +57,13 @@ use config::{
 pub use deployment::*;
 use diff::{ResourceKind, compute_blast_radius, resource_kind};
 pub use graph_read::GraphReadAuthority;
+pub use maintenance::{
+    Admitted, CLUSTER_MAINTENANCE_FILE, MAX_MAINTENANCE_BYTES, MAX_MAINTENANCE_RECORD_BYTES,
+    MAX_MAINTENANCE_TERMINAL, MAX_MAINTENANCE_UNRESOLVED, MaintenanceKind, MaintenanceLedger,
+    MaintenanceOperation, MaintenanceRefusal, MaintenanceState, MaintenanceTableOutcome,
+    MaintenanceTailOutcome, MaintenanceTimings, MaintenanceWrite, OptimizeOptions, Resolution,
+    canonical_maintenance_id, maintenance_request_digest,
+};
 #[cfg(any(test, feature = "test-util"))]
 pub use serve::read_serving_snapshot_with_display_root;
 pub use serve::{

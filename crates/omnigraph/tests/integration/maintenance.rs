@@ -758,6 +758,64 @@ async fn optimize_skips_an_artifact_over_its_size_limit() {
     assert_eq!(std::fs::metadata(&artifact).unwrap().len(), size);
 }
 
+/// main's history settles a publication whose answer was lost: the input
+/// head's child answers the run's nonce, another nonce did not commit, a
+/// later commit on main changes neither, and an unmoved head stays in doubt.
+#[tokio::test]
+async fn resolve_publication_judges_the_input_heads_child() {
+    use omnigraph::db::PublicationLookup;
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    add_person_fragments(&db).await;
+    let (hook, seen) = recording_hook();
+    let report = db
+        .optimize_as(None, OptimizeRequest::default().with_before_publish(hook))
+        .await
+        .unwrap();
+    let commit = report.graph_commit_id.clone().expect("the run published");
+    let publication = seen.lock().unwrap()[0].clone();
+    let lookup = |nonce: String| {
+        let input = publication.input_commit.clone();
+        let version = publication.input_manifest_version;
+        let db = &db;
+        async move {
+            db.resolve_publication(&nonce, input.as_deref(), version)
+                .await
+                .unwrap()
+        }
+    };
+    let committed = PublicationLookup::Committed {
+        commit_id: commit.clone(),
+    };
+    assert_eq!(lookup(publication.nonce.clone()).await, committed);
+    assert_eq!(
+        lookup("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string()).await,
+        PublicationLookup::NotCommitted
+    );
+
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Zed")], &[("$age", 50)]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(lookup(publication.nonce.clone()).await, committed);
+
+    let head = db.list_commits(None).await.unwrap()[0].clone();
+    assert_eq!(
+        db.resolve_publication(
+            &publication.nonce,
+            Some(&head.graph_commit_id),
+            head.graph_manifest_version
+        )
+        .await
+        .unwrap(),
+        PublicationLookup::HeadUnchanged
+    );
+}
+
 #[tokio::test]
 async fn optimize_after_load_then_again_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();

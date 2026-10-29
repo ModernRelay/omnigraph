@@ -343,6 +343,8 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "get_commit"),
     ("db/omnigraph.rs", "commit_target_branch"),
     ("db/omnigraph.rs", "list_commits"),
+    // A fresh read of main's head and its parent chain; no write.
+    ("db/omnigraph/resolution.rs", "resolve_publication"),
     ("db/omnigraph.rs", "list_commits_page"),
     ("db/omnigraph.rs", "list_commits_page_readable"),
     ("db/omnigraph.rs", "list_unpublished_commits"),

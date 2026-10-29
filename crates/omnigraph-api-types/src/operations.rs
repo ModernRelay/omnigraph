@@ -145,6 +145,10 @@ const PROBE: &str = "Process probe, not a graph command.";
 const OAUTH: &str = "Protocol-defined OAuth discovery, not a graph operation.";
 const DEPLOYMENT: &str = "Deployment control is not an MCP agent tool.";
 const BYTE_STREAM: &str = "MCP tools do not carry this byte-stream contract.";
+const MAINTENANCE: &str =
+    "Served maintenance runs under a durable operation record, not as an MCP agent tool.";
+const MAINTENANCE_CLI: &str =
+    "The CLI's optimize runs against direct storage; served maintenance is submitted over HTTP.";
 
 /// Every operation in the generated HTTP specification. Protocol endpoints
 /// (`/mcp`, `/openapi.json`) and the catalogue's reserved-id dispatch retain
@@ -409,6 +413,33 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         None,
         Surface::bound(&["commits_publish"]),
         Surface::bound(&["commit publish"]),
+    ),
+    operation(
+        "start optimize",
+        HttpMethod::Post,
+        "/graphs/{graph_id}/maintenance/optimize",
+        Capability::Write,
+        None,
+        Surface::absent(MAINTENANCE),
+        Surface::absent(MAINTENANCE_CLI),
+    ),
+    operation(
+        "get maintenance operation",
+        HttpMethod::Get,
+        "/graphs/{graph_id}/maintenance/{maintenance_id}",
+        Capability::Read,
+        None,
+        Surface::absent(MAINTENANCE),
+        Surface::absent(MAINTENANCE_CLI),
+    ),
+    operation(
+        "cancel maintenance operation",
+        HttpMethod::Post,
+        "/graphs/{graph_id}/maintenance/{maintenance_id}/cancel",
+        Capability::Write,
+        None,
+        Surface::absent(MAINTENANCE),
+        Surface::absent(MAINTENANCE_CLI),
     ),
     operation(
         "diff",

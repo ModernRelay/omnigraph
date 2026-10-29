@@ -36,6 +36,7 @@ pub(crate) mod optimize;
 mod prepared_create;
 pub(crate) mod promotion;
 mod repair;
+mod resolution;
 pub(crate) mod schema_apply;
 pub(crate) mod system_column_upgrade;
 pub(crate) mod table_ops;
@@ -60,6 +61,7 @@ pub use optimize::{
 use prepared_create::initial_schema_ir;
 pub use prepared_create::{GraphCreateReconciliation, PreparedGraphCreate};
 pub use repair::{DatasetRepairStats, RepairAction, RepairClassification, RepairStats};
+pub use resolution::PublicationLookup;
 pub use schema_apply::{
     PreparedSchemaApply, PreparedSchemaSettlement, SchemaApplyReconciliation,
     SchemaApplySettlement, SchemaContractDigest, SchemaNonPublicationProof,
