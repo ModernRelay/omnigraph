@@ -566,10 +566,6 @@ async fn execute(
     // A maintenance run on an affected graph stops at its next safe boundary;
     // the drain then waits for at most one table's rewrite, the publication,
     // the configuration clear and an issued artifact write.
-    let affected = keys
-        .iter()
-        .map(|key| key.graph_id.to_string())
-        .collect::<Vec<_>>();
     state.maintenance.cancel(
         None,
         Some(&affected),
