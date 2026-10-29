@@ -30,12 +30,13 @@ the validated API envelope.
 
 ```sh
 omnigraph organization --profile work invitations send avery@example.com \
-  --idempotency-key invite-avery-20261015
+  --role member --idempotency-key invite-avery-20261015
 omnigraph organization --profile work invitations list --json
 omnigraph organization members list --profile work --json
 ```
 
-The invitation email lets the recipient join the organization. After
+Choose an existing service-role slug for every new invitation; there is no
+implicit default. The invitation email lets the recipient join the organization. After
 acceptance, active membership establishes identity eligibility for its
 clusters. There is no additional local enrollment step. Graph access still
 requires permission in the applied cluster policy.
@@ -66,7 +67,7 @@ tokens.
 
 ## Assign permissions and connect
 
-Assign an existing active member one of your configured service roles:
+Assign an existing active member one or more configured service roles:
 
 ```sh
 omnigraph org members set avery@example.com --role member --profile work \
@@ -76,8 +77,11 @@ omnigraph org members list --profile work
 
 Replace `member` with a role slug configured for your organization. `members
 list` shows current assignments and their permissions, not every available
-role. Use an exact user ID instead of email when needed. The command replaces
-the member's assigned role; it does not create the person, membership or role.
+role. Repeat `--role` to select multiple roles. The command replaces the complete
+assigned set, so include every role the member should retain. Duplicate flags
+are refused; changing their order does not change the request. Use an exact
+user ID instead of email when needed. The command does not create a person,
+membership or role.
 Directory-managed memberships must be changed through their directory.
 
 Service roles contain these organization-wide permissions:
@@ -168,6 +172,10 @@ write. A new key starts a new action, so do not change it merely to retry.
 A role-change receipt distinguishes a verified update from an uncertain
 provider outcome. An uncertain result exits 3 and shows the last verified
 roles and permissions; it does not claim that the requested role took effect.
+
+If an older CLI saved an invitation without a role, repeat its original
+arguments and key to retrieve the saved result or uncertainty. The CLI preserves
+that request unchanged; a new invitation always requires `--role`.
 
 A partial offboard result stays partial on replay. Inspect the current provider
 state and retained receipt before preparing a new request for remaining cleanup.
