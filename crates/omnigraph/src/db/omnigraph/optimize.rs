@@ -393,6 +393,10 @@ pub enum ArtifactSkip {
     IncompleteEdgeTables,
     /// The run was cancelled, so the edge scan did not start.
     Cancelled,
+    /// The artifact would pass `OptimizeLimits::artifact_bytes`: its lower
+    /// bound did before the scan, or the counting build's running bound did
+    /// during it. `counted` is that bound; nothing was written.
+    SizeLimit { counted: u64, limit: u64 },
 }
 
 impl ArtifactSkip {
@@ -403,6 +407,7 @@ impl ArtifactSkip {
             ArtifactSkip::NoEdgeTypes => "no_edge_types",
             ArtifactSkip::IncompleteEdgeTables => "incomplete_edge_tables",
             ArtifactSkip::Cancelled => "cancelled",
+            ArtifactSkip::SizeLimit { .. } => "size_limit",
         }
     }
 }
@@ -541,6 +546,10 @@ pub struct OptimizeLimits {
     /// table byte ceiling when that is unset, and refuses a larger one, so a
     /// first table within its ceilings always fits.
     pub run_source_bytes: Option<u64>,
+    /// The largest adjacency artifact the run writes, in bytes of the whole
+    /// object. Over it, the artifact is `skipped(size_limit)` and a load
+    /// rebuilds the adjacency in memory.
+    pub artifact_bytes: Option<u64>,
 }
 
 impl OptimizeLimits {
@@ -556,6 +565,11 @@ impl OptimizeLimits {
 
     pub fn with_run_source_bytes(mut self, budget: u64) -> Self {
         self.run_source_bytes = Some(budget);
+        self
+    }
+
+    pub fn with_artifact_bytes(mut self, limit: u64) -> Self {
+        self.artifact_bytes = Some(limit);
         self
     }
 
@@ -1003,7 +1017,14 @@ pub async fn optimize_all_datasets(
     let artifact = if cancellation != RunCancellation::NotRequested {
         ArtifactRefresh::Skipped(ArtifactSkip::Cancelled)
     } else {
-        match persist_graph_index_artifact(db, &catalog, edge_tables_committed).await {
+        match persist_graph_index_artifact(
+            db,
+            &catalog,
+            edge_tables_committed,
+            request.limits.artifact_bytes,
+        )
+        .await
+        {
             Ok(artifact) => artifact,
             Err(error) => {
                 tracing::warn!(
@@ -1277,6 +1298,7 @@ async fn persist_graph_index_artifact(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
     edge_tables_committed: bool,
+    limit: Option<u64>,
 ) -> Result<ArtifactRefresh> {
     if catalog.edge_types.is_empty() {
         return Ok(ArtifactRefresh::Skipped(ArtifactSkip::NoEdgeTypes));
@@ -1307,15 +1329,67 @@ async fn persist_graph_index_artifact(
         );
         return Ok(ArtifactRefresh::Skipped(ArtifactSkip::IncompleteEdgeTables));
     }
-    let index =
-        crate::graph_index::GraphIndex::build(&snapshot, &edge_types, db.catalog().system_columns)
-            .await?;
-    let written =
-        crate::graph_index::persist::save(&snapshot, db.storage_adapter(), &edge_types, &index)
-            .await?;
-    let Some(uri) = written else {
+    let mut count = None;
+    if let Some(limit) = limit {
+        let Some((shortest, widest)) =
+            crate::graph_index::persist::fixed_bytes(&snapshot, &edge_types)?
+        else {
+            return Ok(ArtifactRefresh::Skipped(ArtifactSkip::IncompleteEdgeTables));
+        };
+        // A lower bound: every edge is two `u32` targets, and the live row
+        // count is the number of rows the scan returns.
+        let mut lower = shortest;
+        for edge in edge_types.keys() {
+            let rows = snapshot
+                .open_lance_dataset(&format!("edge:{edge}"))
+                .await?
+                .count_rows(None)
+                .await
+                .map_err(OmniError::storage)?;
+            lower = lower.saturating_add((rows as u64).saturating_mul(8));
+        }
+        if lower > limit {
+            return Ok(ArtifactRefresh::Skipped(ArtifactSkip::SizeLimit {
+                counted: lower,
+                limit,
+            }));
+        }
+        count = Some(crate::graph_index::persist::ArtifactCount::new(
+            widest,
+            limit,
+            &edge_types,
+        ));
+    }
+    let Some(index) = crate::graph_index::GraphIndex::build_counted(
+        &snapshot,
+        &edge_types,
+        db.catalog().system_columns,
+        count.as_mut(),
+    )
+    .await?
+    else {
+        let counted = count.as_ref().map_or(0, |count| count.counted());
+        return Ok(ArtifactRefresh::Skipped(ArtifactSkip::SizeLimit {
+            counted,
+            limit: limit.unwrap_or(0),
+        }));
+    };
+    let Some((uri, body)) =
+        crate::graph_index::persist::artifact_body(&snapshot, &edge_types, &index)?
+    else {
         return Ok(ArtifactRefresh::Skipped(ArtifactSkip::IncompleteEdgeTables));
     };
+    drop(index);
+    // The artifact key is mutable, so a write dropped mid-request would leave
+    // its outcome unknown: once issued, the write runs to its end even when
+    // this run is dropped.
+    let adapter = db.storage_adapter_handle();
+    let write_uri = uri.clone();
+    tokio::spawn(async move { adapter.write_bytes(&write_uri, &body).await })
+        .await
+        .map_err(|error| {
+            OmniError::manifest_internal(format!("graph index artifact write task: {error}"))
+        })??;
     // A fresh artifact may serve scope keys whose earlier load attempt
     // failed; those negative verdicts are stamp-keyed, and when this
     // optimize advanced no table version the stamps (hence keys) are

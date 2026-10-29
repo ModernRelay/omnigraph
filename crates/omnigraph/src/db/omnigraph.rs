@@ -1481,6 +1481,12 @@ impl Omnigraph {
         self.storage.as_ref()
     }
 
+    /// A shared handle on the storage adapter, for work that must outlive the
+    /// call that starts it.
+    pub(crate) fn storage_adapter_handle(&self) -> Arc<dyn crate::storage::StorageAdapter> {
+        Arc::clone(&self.storage)
+    }
+
     /// Root-scoped writer queues (schema, branch, and `(table, branch)` gates).
     ///
     /// Engine-internal writers (mutation finalize, schema_apply,

@@ -700,6 +700,64 @@ async fn optimize_byte_budget_defers_the_tables_after_it_and_resumes_there() {
     assert_eq!(next.resume_at, None);
 }
 
+/// The artifact limit holds before the scan (a lower bound) and during it
+/// (the counting build), writes nothing when it stops, and admits the whole
+/// object once there is room for it.
+#[tokio::test]
+async fn optimize_skips_an_artifact_over_its_size_limit() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let artifact = dir.path().join("__graph_index/csr-current.bin");
+    let report = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(report.artifact, ArtifactRefresh::Refreshed);
+    let size = std::fs::metadata(&artifact).unwrap().len();
+    std::fs::remove_file(&artifact).unwrap();
+
+    let bounded = |limit: u64| {
+        let builds = std::sync::Arc::new(AtomicU64::new(0));
+        let probes = omnigraph::instrumentation::QueryIoProbes {
+            graph_build_count: std::sync::Arc::clone(&builds),
+            ..Default::default()
+        };
+        let run = omnigraph::instrumentation::with_query_io_probes(
+            probes,
+            db.optimize_as(
+                None,
+                OptimizeRequest::default()
+                    .with_limits(OptimizeLimits::default().with_artifact_bytes(limit)),
+            ),
+        );
+        async move { (run.await.unwrap().artifact, builds.load(Ordering::Relaxed)) }
+    };
+
+    let (outcome, builds) = bounded(1).await;
+    assert!(
+        matches!(outcome, ArtifactRefresh::Skipped(ArtifactSkip::SizeLimit { counted, limit: 1 }) if counted > 1),
+        "{outcome:?}"
+    );
+    assert_eq!(builds, 0, "a lower bound over the limit starts no scan");
+    assert!(!artifact.exists());
+
+    let (outcome, builds) = bounded(size - 1).await;
+    let ArtifactRefresh::Skipped(ArtifactSkip::SizeLimit { counted, limit }) = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(limit, size - 1);
+    assert!(counted > limit, "{counted} vs {limit}");
+    assert_eq!(builds, 1, "the counting build started and stopped");
+    assert!(!artifact.exists(), "a stopped build writes nothing");
+
+    // The counted header is the widest, so admitting the whole object needs
+    // room for its count and length digits.
+    let (outcome, _) = bounded(size + 4096).await;
+    assert_eq!(outcome, ArtifactRefresh::Refreshed);
+    assert_eq!(std::fs::metadata(&artifact).unwrap().len(), size);
+}
+
 #[tokio::test]
 async fn optimize_after_load_then_again_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();

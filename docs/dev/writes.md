@@ -284,7 +284,16 @@ bytes from the descriptor scan compaction sizing uses, and the table's rows
 when an index would be rebuilt or built. A table over one, or one whose size
 cannot be read, is `deferred(resource_limit)` with nothing written. The run
 byte budget (`run_source_bytes`, also the default table byte ceiling) defers
-the first table that would pass it, and every later one, as `byte_budget`. A caller's before-publish hook
+the first table that would pass it, and every later one, as `byte_budget`.
+With `artifact_bytes`, the adjacency artifact is bounded twice: before the
+edge scan by a lower bound (`persist::fixed_bytes` at the shortest header plus
+8 bytes per live edge row), and during it by `GraphIndex::build_counted`, which
+reads one batch at a time, adds each batch's growth of the object to
+`persist::ArtifactCount` (from the widest header), and stops before keeping
+another batch or allocating the adjacency arrays. Either stop is
+`skipped(size_limit)` and writes nothing. The artifact write runs in a spawned
+task the run awaits, so a dropped run cannot drop an issued write on the
+mutable key. A caller's before-publish hook
 (`OptimizeRequest::with_before_publish`) belongs to the shared publication
 helper, `table_ops::commit_updates_on_branch_with_expected`: it runs once,
 after the updates are prepared and before the coordinator lock and the

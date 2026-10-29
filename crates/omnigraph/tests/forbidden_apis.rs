@@ -1013,12 +1013,6 @@ durable_calls! {
     ("omnigraph-catalog/commit.rs", "InsertBuilder::new(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("omnigraph-catalog/commit.rs", ".execute_uncommitted(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("omnigraph-catalog/commit.rs", "CommitBuilder::new(", 2, WriteProtocol::Exact("lowest manifest publisher gateway: the linear version with zero retries, or a detached candidate version whose only retry is the random version id")),
-    // The persisted CSR/CSC adjacency artifact (`__graph_index/csr-current.bin`):
-    // derived, regenerable topology written ONLY from `optimize`'s tail (never
-    // the query path, which only loads), outside graph visibility — a stale or
-    // partial object is rejected by its identity stamps + payload digest and
-    // rebuilt in memory, so this write can never change a query's result.
-    ("graph_index/persist.rs", ".write_bytes(", 1, WriteProtocol::PhysicalOnly),
     ("omnigraph-core/instrumentation.rs", ".write_bytes(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("omnigraph-core/instrumentation.rs", ".write_text(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("omnigraph-core/instrumentation.rs", ".write_text_if_absent(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
@@ -1148,6 +1142,13 @@ durable_calls! {
     // snapshot; it only reads index metadata and never stages or publishes.
     ("db/omnigraph/optimize.rs", ".dataset()", 11, WriteProtocol::Composed("Optimize planning, including each plan's measure against its table ceilings, + read-only coverage and native-fork inventory + the configuration clear's read-back after a failed removal + physical cleanup, including the release of expired proposal tags and of expired unattached tags descendants first, each confirmed by a readback")),
     ("db/omnigraph/optimize.rs", ".into_dataset()", 1, WriteProtocol::PhysicalOnly),
+    // The persisted CSR/CSC adjacency artifact (`__graph_index/csr-current.bin`):
+    // derived, regenerable topology written ONLY from `optimize`'s tail (never
+    // the query path, which only loads), outside graph visibility — a stale or
+    // partial object is rejected by its identity stamps + payload digest and
+    // rebuilt in memory, so this write can never change a query's result. It
+    // runs in a task the run awaits, so a dropped run cannot drop it.
+    ("db/omnigraph/optimize.rs", ".write_bytes(", 1, WriteProtocol::PhysicalOnly),
     ("exec/merge.rs", "SnapshotHandle::new(", 4, MERGE_V9),
 }
 
@@ -2565,6 +2566,12 @@ const MUTABLE_KEY_REQUESTS: &[(&str, &str, usize, &str)] = &[
         "cleanup reclaims a pre-v11 table fork no registration names; fork names carry a commit ULID and are never reused",
     ),
     (
+        "db/omnigraph/optimize.rs",
+        ".write_bytes(",
+        1,
+        "derived topology artifact stamped with its snapshot identity; a late older copy fails the stamp check and the reader builds in memory",
+    ),
+    (
         "db/omnigraph/prepared_create.rs",
         ".delete(",
         1,
@@ -2575,12 +2582,6 @@ const MUTABLE_KEY_REQUESTS: &[(&str, &str, usize, &str)] = &[
         ".delete_prefix(",
         2,
         "reconciles an unpublished graph create: its tables and manifest have no published version, and nothing recreates them under this claim",
-    ),
-    (
-        "graph_index/persist.rs",
-        ".write_bytes(",
-        1,
-        "derived topology artifact stamped with its snapshot identity; a late older copy fails the stamp check and the reader builds in memory",
     ),
     (
         "omnigraph-catalog/retention.rs",
