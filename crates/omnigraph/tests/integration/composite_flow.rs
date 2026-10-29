@@ -309,7 +309,11 @@ async fn composite_flow_canonical_lifecycle() {
     // version, and this flow exercises exactly that previously-failing
     // write below.
     // ─────────────────────────────────────────────────────────────────
-    let optimize_stats = db.optimize_as(None).await.unwrap();
+    let optimize_stats = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap()
+        .tables;
     assert!(
         !optimize_stats.is_empty(),
         "optimize must return per-table stats"

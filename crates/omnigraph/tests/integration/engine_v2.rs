@@ -413,7 +413,9 @@ async fn indexed_single_hop_switches_to_the_csr_between_input_batches() {
     db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.optimize_as(None).await.unwrap();
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
     let v2 = with_setting(&db, "engine", "v2");
 
     let pinned = first_column_sorted(

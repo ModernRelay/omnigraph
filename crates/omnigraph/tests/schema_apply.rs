@@ -2124,7 +2124,9 @@ query strong($min: I32) {
         "an update carries the untouched Blob of an evolved row"
     );
 
-    db.optimize_as(None).await.unwrap();
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
     assert_eq!(
         read_managed_blob_bytes(
             &db,

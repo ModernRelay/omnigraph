@@ -305,7 +305,9 @@ async fn selected_cold_indexed_route_uses_persisted_members_without_building_csr
     )
     .await
     .unwrap();
-    db.optimize_as(None).await.unwrap();
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
     drop(db);
     let db = with_traversal(
         &session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap()),

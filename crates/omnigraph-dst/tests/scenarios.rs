@@ -3669,7 +3669,9 @@ fn reborn_branch_cache_poison_body() {
         .expect("op1");
         db.branch_create("b0").await.expect("op2");
         world_read(&db).await; // ARMING READ 1 (the universe's op-2 verify)
-        db.optimize_as(None).await.expect("op3");
+        db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+            .expect("op3");
         m!(
             db,
             "b0",
@@ -5204,7 +5206,7 @@ fn dst_classa_ablation_matrix_body() {
                 db.branch_create("b0").await.expect("bc b0 life1");
             }
             if o {
-                db.optimize_as(None).await.expect("optimize");
+                db.optimize_as(None, omnigraph::db::OptimizeRequest::default()).await.expect("optimize");
             }
             if r {
                 upsert(&db, "b0", "w6", 45, 2).await;
@@ -5291,7 +5293,7 @@ fn dst_classa_ablation_matrix_body() {
             m!(db, "main", "set_age_v", &[("$name", "w5")], &[("$age", 70), ("$ver", 1)]).expect("op0");
             m!(db, "main", "insert_person", &[("$name", "w6")], &[("$age", 7)]).expect("op1");
             db.branch_create("b0").await.expect("op2");
-            db.optimize_as(None).await.expect("op3");
+            db.optimize_as(None, omnigraph::db::OptimizeRequest::default()).await.expect("op3");
             m!(db, "b0", "set_age_v", &[("$name", "w6")], &[("$age", 45), ("$ver", 2)]).expect("op4");
             m!(db, "b0", "remove_friendships_from", &[("$from", "w6")], &[]).expect("op5");
             Box::pin(db.branch_merge("b0", "main")).await.expect("op6 merge");
@@ -6345,7 +6347,11 @@ fn dst_optimize_races_branch_delete_minimal_two_thread_negative() {
                                 let _ =
                                     mutate_main(&db, MUTATION_QUERIES, "set_age", &params).await;
                             }
-                            match Box::pin(db.optimize_as(None)).await {
+                            match Box::pin(
+                                db.optimize_as(None, omnigraph::db::OptimizeRequest::default()),
+                            )
+                            .await
+                            {
                                 Ok(_) => {}
                                 Err(err) => {
                                     let rendered = format!("{err:?}");

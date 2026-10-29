@@ -4487,7 +4487,10 @@ async fn optimize_pre_publish_failure_leaves_no_residue() {
         .version;
     {
         let _failpoint = catalog::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
-        let err = db.optimize_as(None).await.unwrap_err();
+        let err = db
+            .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains(
                 "injected failpoint triggered: optimize.post_phase_b_pre_manifest_commit"
@@ -4514,11 +4517,12 @@ async fn optimize_pre_publish_failure_leaves_no_residue() {
     assert_eq!(helpers::count_rows(&db, "node:Person").await, 4);
     assert_eq!(helpers::count_rows(&db, "node:Company").await, 4);
     let stats = db
-        .optimize_as(None)
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
         .await
-        .expect("the retry re-plans from the pins");
+        .expect("the retry re-plans from the pins")
+        .tables;
     assert!(
-        stats.iter().any(|stat| stat.committed),
+        stats.iter().any(|stat| stat.committed()),
         "the retry compacts what the failed attempt staged again"
     );
     assert_person_pin_detached(&db, "main", person_head).await;
@@ -4529,6 +4533,50 @@ async fn optimize_pre_publish_failure_leaves_no_residue() {
     db.apply_schema(&desired)
         .await
         .expect("schema apply after optimize must succeed");
+}
+
+/// Once Optimize's graph commit is durable, a failed configuration clear is
+/// reported beside it and fails nothing: the run returns its commit, and
+/// the writer gates are released for the next writer.
+#[tokio::test]
+#[serial(optimize)]
+async fn optimize_reports_a_failed_configuration_clear_after_its_publication() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    seed_two_productive_optimize_tables(&uri).await;
+    let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    let report = {
+        let _failpoint = catalog::OPTIMIZE_CONFIGURATION_CLEAR.fire_always();
+        db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+            .expect("a post-commit clear failure does not fail the run")
+    };
+    let published = report
+        .graph_commit_id
+        .clone()
+        .expect("the productive run published");
+    assert!(
+        matches!(
+            report.configuration_clear,
+            omnigraph::db::ConfigurationClear::Failed(_)
+        ),
+        "{:?}",
+        report.configuration_clear
+    );
+    assert_eq!(
+        db.list_commits(None).await.unwrap()[0].graph_commit_id,
+        published,
+        "the reported commit is main's head"
+    );
+    db.mutate(
+        "main",
+        OCC_DISJOINT_MUTATIONS,
+        "insert_company",
+        &params(&[("$name", "after-optimize")]),
+    )
+    .await
+    .expect("the run released its writer gates");
 }
 
 /// RFC 0067: a lost acknowledgement of Optimize's manifest commit reports
@@ -4545,7 +4593,7 @@ async fn optimize_lost_publish_acknowledgement_leaves_published_detached_pins() 
         let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
         let before = person_head_and_published(&db, "main").await;
         let _failpoint = catalog::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT.fire_once_at(1);
-        db.optimize_as(None)
+        db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
             .await
             .expect_err("a lost publish acknowledgement surfaces as an error");
         before
@@ -4561,11 +4609,15 @@ async fn optimize_lost_publish_acknowledgement_leaves_published_detached_pins() 
         before.1
     );
     assert_person_pin_detached(&recovered, "main", before.0).await;
-    let stats = recovered.optimize_as(None).await.unwrap();
+    let stats = recovered
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap()
+        .tables;
     assert!(
         stats
             .iter()
-            .all(|stat| stat.type_key == "__manifest" || !stat.committed),
+            .all(|stat| stat.type_key == "__manifest" || !stat.committed()),
         "nothing is left to compact after the published compaction: {stats:?}"
     );
 }
@@ -4610,7 +4662,9 @@ node Embedding {
     )
     .await
     .unwrap();
-    db.optimize_as(None).await.unwrap();
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
     let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     let embedding = snapshot.open_dataset("node:Embedding").await.unwrap();
     assert!(embedding.has_unindexed_fragments().await.unwrap());
@@ -4647,7 +4701,10 @@ node Embedding {
         .version;
     {
         let _failpoint = catalog::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_once_at(1);
-        let error = db.optimize_as(None).await.unwrap_err();
+        let error = db
+            .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+            .unwrap_err();
         assert!(
             !matches!(error, OmniError::RecoveryRequired { .. }),
             "{error}"
@@ -4675,17 +4732,24 @@ node Embedding {
     );
     drop(db);
     let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
-    let stats = db.optimize_as(None).await.unwrap();
+    let stats = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap()
+        .tables;
     let work = stats
         .iter()
         .find(|stat| stat.type_key == "node:Work")
         .expect("Work stat present");
-    assert!(work.committed, "the retry compacts Work");
+    assert!(work.committed(), "the retry compacts Work");
     let embedding = stats
         .iter()
         .find(|stat| stat.type_key == "node:Embedding")
         .expect("Embedding stat present");
-    assert!(!embedding.committed, "pending-only table must stay a no-op");
+    assert!(
+        !embedding.committed(),
+        "pending-only table must stay a no-op"
+    );
     assert!(
         embedding
             .pending_indexes
@@ -4739,7 +4803,10 @@ async fn optimize_partial_table_effect_leaves_no_residue() {
         .version()
         .version;
     let _failpoint = catalog::OPTIMIZE_POST_TABLE_EFFECT.fire_once_at(1);
-    let error = db.optimize_as(None).await.unwrap_err();
+    let error = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap_err();
     assert!(
         !matches!(error, OmniError::RecoveryRequired { .. }),
         "a partial batch before publication needs no recovery: {error}"
@@ -4783,11 +4850,15 @@ async fn optimize_partial_table_effect_leaves_no_residue() {
         recovered.list_commits(Some("main")).await.unwrap().len(),
         commits_before
     );
-    let stats = recovered.optimize_as(None).await.unwrap();
+    let stats = recovered
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap()
+        .tables;
     assert_eq!(
         stats
             .iter()
-            .filter(|stat| stat.type_key != "__manifest" && stat.committed)
+            .filter(|stat| stat.type_key != "__manifest" && stat.committed())
             .count(),
         2,
         "the retry compacts both tables: {stats:?}"
@@ -4831,7 +4902,11 @@ async fn optimize_refuses_when_graph_authority_moves_before_its_gates() {
         &catalog::OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES,
     );
     let optimize_task_db = std::sync::Arc::clone(&optimize_db);
-    let optimize = tokio::spawn(async move { optimize_task_db.optimize_as(None).await });
+    let optimize = tokio::spawn(async move {
+        optimize_task_db
+            .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+    });
     rendezvous.wait_until_reached().await;
 
     // Advance the graph head underneath it with an ordinary committed write, so
@@ -4927,7 +5002,8 @@ async fn optimize_holds_main_gate_through_disjoint_table_effects() {
     let uri_opt = uri.clone();
     let optimize = tokio::spawn(async move {
         let db = helpers::session(Omnigraph::open(&uri_opt).await.unwrap());
-        db.optimize_as(None).await
+        db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
     });
     rendezvous.wait_until_reached().await;
 
@@ -4971,7 +5047,7 @@ async fn optimize_holds_main_gate_through_disjoint_table_effects() {
         1,
         "queued table-disjoint Company insert must persist",
     );
-    db.optimize_as(None)
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
         .await
         .expect("graph must remain healthy / re-optimizable");
 }
@@ -5011,7 +5087,8 @@ async fn optimize_serializes_concurrent_delete_across_handles() {
     let uri_opt = uri.clone();
     let optimize = tokio::spawn(async move {
         let db = helpers::session(Omnigraph::open(&uri_opt).await.unwrap());
-        db.optimize_as(None).await
+        db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
     });
     rendezvous.wait_until_reached().await;
 
@@ -5071,7 +5148,7 @@ async fn optimize_serializes_concurrent_delete_across_handles() {
         3,
         "the concurrent delete must persist (alice removed)",
     );
-    db.optimize_as(None)
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
         .await
         .expect("graph must remain healthy / re-optimizable");
 }
@@ -7533,7 +7610,7 @@ async fn assert_optimize_detached_pin_survives_next_write(uri: &str) {
     {
         let _failpoint = catalog::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT.fire_once_at(1);
         let error = db
-            .optimize_as(None)
+            .optimize_as(None, omnigraph::db::OptimizeRequest::default())
             .await
             .expect_err("compaction published before its acknowledgement was lost");
         assert!(
@@ -9363,7 +9440,7 @@ async fn live_handle_writes_after_every_write_family_seam_failure() {
                     .map_err(|error| error.to_string())
             }
             Driver::Optimize => db
-                .optimize_as(None)
+                .optimize_as(None, omnigraph::db::OptimizeRequest::default())
                 .await
                 .map(|_| ())
                 .map_err(|error| error.to_string()),

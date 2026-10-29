@@ -69,32 +69,33 @@ index coverage was uneven before a run may coalesce fully only on the next run,
 after the rebuilt coverage is in place.
 
 Compacting a table with Blob properties reads each managed Blob value into
-memory to rewrite it. Optimize sizes the read batches of each compaction task (a
-group of neighbouring fragments compacted together) from the task's largest row,
-summing that row's managed Blob values, so one batch materializes at most 32 MiB
-of managed Blob payload whatever the fragment sizes. External Blob references
-are carried without reading the referenced object and count nothing. A task
-holding a row over 16 MiB compacts one row per batch, and a single row over 32
-MiB is materialized whole. This bounds the payload of a batch, not the process
-heap: Lance's writer copies each inline payload into the arrays it prepares
-while it still holds the batch, so memory use exceeds the payload. Every task of
-a Blob table gets this batch size explicitly, 1 to 8192 rows, so it takes
-precedence over `LANCE_DEFAULT_BATCH_SIZE` there, including when the variable is
-smaller. When a fragment being compacted holds a Blob descriptor the engine's
-decoder rejects, sizing can refuse the compaction with a Blob integrity error
-before that table is rewritten, and nothing is committed; a table with nothing
-to compact is not scanned. Optimize works on up to
-`OMNIGRAPH_MAINTENANCE_CONCURRENCY` tables at once (default 8), so budget for
-that many Blob tables compacting together.
+memory. Optimize sizes each compaction batch from its largest row, whatever
+`LANCE_DEFAULT_BATCH_SIZE` says, so one batch holds at most 32 MiB of managed
+Blob payload; a larger row is read whole, external references are not read,
+and the writer's own copies come on top. A Blob descriptor the decoder rejects
+refuses the compaction before that table is rewritten. Optimize plans up to
+`OMNIGRAPH_MAINTENANCE_CONCURRENCY` tables ahead (default 8) and rewrites up to
+that many at once, so budget for that many Blob tables compacting together.
+
+### Bounding a run
+
+Writes to `main` wait while optimize holds its writer gates. With
+`--max-gate-hold 30s` it starts no table after holding them that long, except
+the first: the rest are reported `deferred`, the finished tables are published,
+and a writer waits at most the bound plus one table's rewrite. Tables run in
+type-key order from the first; `resume_at` names the first deferred table, and
+`--tables` runs only the listed tables, in that order. In JSON each table has an
+`outcome` (`optimized`, `unchanged`, `deferred` or `skipped`); the report adds
+`input_commit`, `graph_commit_id`, `gate_hold_ms` and the `configuration_clear`
+and `artifact` outcomes, which never fail a published run.
 
 Optimize also persists the traversal-adjacency artifact
 (`__graph_index/csr-current.bin`), which cold traversal builds load instead of
-scanning every edge dataset. The artifact is derived and regenerable: optimize
-is its only writer, every load is verified and falls back to the in-memory
-build, and a failed write is a warning, not an optimize error. The artifact is
-rewritten by optimize runs that advance an edge dataset; on a store with no
-edge work it is left as-is, and a stale copy costs only the artifact's speedup,
-never correctness.
+scanning every edge dataset. It is derived: every load is verified and falls
+back to the in-memory build, so a stale copy or a failed write costs only its
+speedup, and a failed write is reported as the `artifact` outcome. Optimize
+builds it after releasing the writer gates, and only when the run advanced an
+edge dataset or no artifact exists.
 
 Existing full-text indexes are preserved rather than incrementally merged.
 Unindexed rows remain searchable, but a growing uncovered tail can cost more to

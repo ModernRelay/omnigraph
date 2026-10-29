@@ -2426,7 +2426,9 @@ async fn mutation_with_deferred_index_coverage_remains_searchable() {
     // Ordinary optimize must preserve certified postings, not silently replace
     // them with an uncertified incremental fold. Both old and tail rows remain
     // searchable after data compaction and unrelated index maintenance.
-    db.optimize_as(None).await.unwrap();
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
     for (term, slug) in [("Quasar", "quasar-notes"), ("Learning", "ml-intro")] {
         let result = query_main(&db, SEARCH_QUERIES, "text_search", &params(&[("$q", term)]))
             .await

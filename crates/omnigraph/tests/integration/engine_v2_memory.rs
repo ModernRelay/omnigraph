@@ -846,7 +846,9 @@ async fn hash_join_output_is_the_refusing_reservation() {
     db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.optimize_as(None).await.unwrap();
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
     let v2 = with_setting(&db, "engine", "v2");
 
     let limit = 8 * MIB;
@@ -929,7 +931,9 @@ async fn underestimated_hash_build_retries_id_lookup() {
     db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.optimize_as(None).await.unwrap();
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
     let v2 = with_setting(&db, "engine", "v2");
     let limit = 16 * MIB;
     let explain = with_query_memory_limit(

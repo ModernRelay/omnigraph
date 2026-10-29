@@ -2059,11 +2059,15 @@ node Document {
     // touching logical rows. The moved descriptors force the payload
     // tie-break, which must classify every row as unchanged: the maintenance
     // commit is an empty block, not a phantom full-table update.
-    let stats = db.optimize_as(None).await.unwrap();
+    let stats = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap()
+        .tables;
     assert!(
         stats
             .iter()
-            .any(|table| table.fragments_removed > 0 && table.committed),
+            .any(|table| table.fragments_removed > 0 && table.committed()),
         "the fixture must actually compact so descriptors move"
     );
     let optimize_commit = head_commit_id(uri, None).await;
@@ -2161,11 +2165,15 @@ async fn physical_only_commit_over_a_large_fragment_reads_as_empty_issue_705() {
     )
     .await
     .unwrap();
-    let stats = main.optimize_as(None).await.unwrap();
+    let stats = main
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap()
+        .tables;
     assert!(
         stats
             .iter()
-            .any(|table| table.fragments_removed > 0 && table.committed),
+            .any(|table| table.fragments_removed > 0 && table.committed()),
         "the fixture must actually compact: {stats:?}"
     );
     let optimize_commit = head_commit_id(dir.path().to_str().unwrap(), None).await;

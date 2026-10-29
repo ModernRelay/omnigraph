@@ -1754,7 +1754,9 @@ fn maintenance_life(
             loop {
                 let result = match kind {
                     0 => Box::pin(db.ensure_indices_as(None)).await.map(|_| ()),
-                    1 => Box::pin(db.optimize_as(None)).await.map(|_| ()),
+                    1 => Box::pin(db.optimize_as(None, omnigraph::db::OptimizeRequest::default()))
+                        .await
+                        .map(|_| ()),
                     _ => Box::pin(db.cleanup_as(
                         CleanupPolicyOptions {
                             keep_versions: Some(1),

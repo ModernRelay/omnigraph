@@ -50,7 +50,11 @@ pub use export::{EXPORT_CHUNK_MAX_BYTES, ExportCut};
 pub(crate) use export::{
     LogicalBlobValue, RangedExternalBlobs, logical_row_image, row_blob_values,
 };
-pub use optimize::{CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, SkipReason};
+pub use optimize::{
+    ArtifactRefresh, ArtifactSkip, CleanupPolicyOptions, ConfigurationClear, DatasetCleanupStats,
+    DatasetOptimizeStats, DeferReason, OptimizeConcurrency, OptimizeLimits, OptimizeReport,
+    OptimizeRequest, SkipReason, TableOptimizeOutcome,
+};
 use prepared_create::initial_schema_ir;
 pub use prepared_create::{GraphCreateReconciliation, PreparedGraphCreate};
 pub use repair::{DatasetRepairStats, RepairAction, RepairClassification, RepairStats};
@@ -3598,15 +3602,16 @@ impl Omnigraph {
         .await
     }
 
-    /// Compact small Lance fragments into fewer larger ones across every
-    /// backing dataset for a node or edge type on `main`. See [`optimize`] for
-    /// details. Requires `maintain` on `main` before any effect and records
-    /// `actor` in the publication.
+    /// Compact small Lance fragments into fewer larger ones across the
+    /// backing datasets `request` selects on `main`, and catch up their
+    /// indexes. See [`optimize`] for details. Requires `maintain` on `main`
+    /// before any effect and records `actor` in the publication.
     pub async fn optimize_as(
         &self,
         actor: Option<&str>,
-    ) -> Result<Vec<optimize::DatasetOptimizeStats>> {
-        optimize::optimize_all_datasets(self, actor).await
+        request: optimize::OptimizeRequest,
+    ) -> Result<optimize::OptimizeReport> {
+        optimize::optimize_all_datasets(self, actor, request).await
     }
 
     /// Report, per table on `main`, how its Lance linear history stands

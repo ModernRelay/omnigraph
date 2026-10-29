@@ -303,7 +303,9 @@ async fn bound_handle_workload_child() {
             .contains("Feature")
     );
 
-    db.optimize_as(None).await.unwrap();
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
     db.cleanup_as(
         CleanupPolicyOptions {
             keep_versions: Some(2),

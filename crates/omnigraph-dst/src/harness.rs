@@ -1634,7 +1634,9 @@ async fn exec_op(db: &Session, branch: &str, op: &Op) -> OmniResult<()> {
         )
         .await
         .map(|_| ()),
-        Op::Optimize => Box::pin(db.optimize_as(None)).await.map(|_| ()),
+        Op::Optimize => Box::pin(db.optimize_as(None, omnigraph::db::OptimizeRequest::default()))
+            .await
+            .map(|_| ()),
         Op::Cleanup => {
             let stats = Box::pin(db.cleanup_as(
                 omnigraph::db::CleanupPolicyOptions {

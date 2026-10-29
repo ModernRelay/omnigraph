@@ -1005,7 +1005,11 @@ async fn maintenance_entry_points_enforce_maintain_on_their_branch_before_effect
         "act-branch-maintainer",
     ] {
         let actor = Some(actor);
-        assert_denied(db.optimize_as(actor).await, "optimize_as");
+        assert_denied(
+            db.optimize_as(actor, omnigraph::db::OptimizeRequest::default())
+                .await,
+            "optimize_as",
+        );
         assert_denied(db.ensure_indices_as(actor).await, "ensure_indices_as");
         assert_denied(
             db.ensure_indices_on_as("main", actor).await,
@@ -1019,7 +1023,11 @@ async fn maintenance_entry_points_enforce_maintain_on_their_branch_before_effect
             "ensure_indices_on_as(feature)",
         );
     }
-    assert_no_actor(db.optimize_as(None).await, "optimize_as");
+    assert_no_actor(
+        db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await,
+        "optimize_as",
+    );
     assert_no_actor(db.ensure_indices_as(None).await, "ensure_indices_as");
     assert_no_actor(
         db.ensure_indices_on_as("feature", None).await,
@@ -1071,13 +1079,17 @@ async fn maintenance_entry_points_enforce_maintain_on_their_branch_before_effect
         .graph_commit_id
         .clone();
     let stats = db
-        .optimize_as(Some("act-maintainer"))
+        .optimize_as(
+            Some("act-maintainer"),
+            omnigraph::db::OptimizeRequest::default(),
+        )
         .await
-        .expect("maintain on main admits optimize");
+        .expect("maintain on main admits optimize")
+        .tables;
     assert!(
         stats
             .iter()
-            .any(|stat| stat.type_key == "node:Person" && stat.committed),
+            .any(|stat| stat.type_key == "node:Person" && stat.committed()),
         "{stats:?}"
     );
     let main_after = db.list_commits(None).await.unwrap();

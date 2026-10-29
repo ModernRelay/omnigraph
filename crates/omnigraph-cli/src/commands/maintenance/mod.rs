@@ -42,7 +42,20 @@ pub(crate) async fn run_optimize(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
-    let OptimizeArgs { json } = args;
+    let OptimizeArgs {
+        tables,
+        max_gate_hold,
+        json,
+    } = args;
+    let mut request = omnigraph::db::OptimizeRequest::default();
+    if !tables.is_empty() {
+        request = request.with_tables(tables);
+    }
+    if let Some(hold) = max_gate_hold {
+        request = request.with_limits(
+            omnigraph::db::OptimizeLimits::default().with_max_gate_hold(parse_duration_arg(&hold)?),
+        );
+    }
     let uri = crate::scope::direct_graph_uri(scope.target, scope.graph).await?;
     let binding = crate::scope::capture_storage_binding(scope.target)?.for_uri(&uri)?;
     let actor = resolve_actor(scope.operator, scope.actor, stderr)?;
@@ -52,8 +65,8 @@ pub(crate) async fn run_optimize(
         omnigraph::storage::storage_for_binding(&binding)?,
     )
     .await?;
-    let stats = db.optimize_as(actor.as_deref()).await?;
-    write_optimize(&uri, &stats, json, stdout)?;
+    let report = db.optimize_as(actor.as_deref(), request).await?;
+    write_optimize(&uri, &report, json, stdout)?;
     Ok(Completion::success())
 }
 

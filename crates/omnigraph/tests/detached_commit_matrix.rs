@@ -440,7 +440,10 @@ fn rfc0067_matrix_child_process() {
                     .unwrap();
                     db.apply_prepared_schema_as(&intent, None).await.map(|_| ())
                 }
-                "optimize" => db.optimize_as(None).await.map(|_| ()),
+                "optimize" => db
+                    .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+                    .await
+                    .map(|_| ()),
                 "load" => load_two(&db, &name).await,
                 "fts_rebuild" => db
                     .rebuild_full_text_indices_on_as("main", None)
@@ -755,7 +758,10 @@ async fn run_cell(
                     .apply_prepared_schema_as(prepared.as_ref().unwrap(), None)
                     .await
                     .map(|_| ()),
-                Writer::Optimize => db.optimize_as(None).await.map(|_| ()),
+                Writer::Optimize => db
+                    .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+                    .await
+                    .map(|_| ()),
                 Writer::Load => load_two(&db, &write_name).await,
                 Writer::FtsRebuild => db
                     .rebuild_full_text_indices_on_as("main", None)
@@ -985,9 +991,12 @@ async fn run_cell(
     if writer == Writer::Optimize && recovery != Recovery::ReadOnly {
         let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
         for run in 1..=2 {
-            fresh.optimize_as(None).await.unwrap_or_else(|error| {
-                panic!("{cell}: optimize run {run} after recovery failed: {error}")
-            });
+            fresh
+                .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{cell}: optimize run {run} after recovery failed: {error}")
+                });
             assert_pin_detached_and_head_unmoved(&cell, &fresh, &person_uri, head_before).await;
         }
         drop(fresh);
