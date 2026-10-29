@@ -19,6 +19,7 @@ mod deployment;
 mod lifecycle;
 mod members;
 mod organization;
+pub(crate) use auth::VerifiedIdentity;
 
 pub(crate) fn import_custody(
     source: &Path,
