@@ -186,6 +186,42 @@ directly or over several hops, is refused at type checking (`T59`): a ranking
 starts the traversal at the binding it ranks, and one traversal cannot start
 at both. Rank one binding in both arms, or bindings no traversal joins.
 
+## What a ranked read reports
+
+A read whose order is a search carries a `ranking` object in its JSON
+envelope (`POST /query`, a stored-query call, `omnigraph query --json`, and
+the metadata line of `--format jsonl`). For `hybrid` above, with
+`rrf(...) as score` in `return`:
+
+```json
+"ranking": {
+  "by": "rrf",
+  "order": "descending",
+  "exhaustive": true,
+  "score_columns": ["score"]
+}
+```
+
+`by` is the search function the order names: `nearest`, `bm25` or `rrf`.
+`order` says which way the score ranks: `ascending` for a `nearest` distance,
+where smaller is nearer, and `descending` for a `bm25` or fused score, where
+larger is more relevant.
+
+`exhaustive` says what this run did. When it is `true`, no row the search
+admitted and did not return ranks above a returned row. `bm25` scores every
+match, so it is always exhaustive. A `nearest` search is exhaustive when it
+searched every partition of the vector index, scored every row without one,
+or returned every row it admitted. It is `false` when the `ann_nprobes` cap
+left partitions unsearched, so a nearer row may exist; raising the cap
+searches more. An `rrf(...)` is exhaustive when its `nearest` arm is.
+
+`score_columns` lists the returned columns that hold the ranking's own
+score, in return order. Two columns that return one score both appear; a
+column computed from the score, such as `bm25(...) > 0.0 as hit`, does not.
+It is empty when the read returns no score. The object never carries a query
+text, vector or other parameter value, and a read whose order is no search
+has no `ranking`.
+
 ## Indexes
 
 `@index` and `@key` declare index intent. For a single-property node declaration,

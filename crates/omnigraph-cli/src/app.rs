@@ -343,6 +343,11 @@ fn write_machine<T: Serialize>(
             writeln!(writer, "{}", serde_json::to_string(value)?)?;
             Ok(())
         }
+        MachineErrors::Toon => {
+            let value = serde_json::to_value(value)?;
+            writeln!(writer, "{}", crate::toon::encode(&value))?;
+            Ok(())
+        }
     }
 }
 

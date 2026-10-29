@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-16
-updated: 2026-10-25
+updated: 2026-10-29
 discussion: https://github.com/ModernRelay/omnigraph/pull/1017
 supersedes: []
 superseded_by: []
@@ -1596,3 +1596,12 @@ proposal.
   credentials" for that case only: the rule stays in force for self-hosted
   OIDC servers and every other client, and the launcher's refusal of a managed
   target (the target table and Opening Studio) is unchanged.
+
+- 2026-10-29: Pending amendment. [Remote optimize through the serving
+  owner](2026-10-29-remote-optimize-through-the-serving-owner.md), a draft, runs a served
+  cluster root's `optimize` in the process that holds the cluster lock,
+  through graph-scoped routes with a durable operation record. Once it is
+  accepted, `optimize` leaves the "Runs where the storage is" row of the
+  exception table for served cluster roots and stays there for direct
+  targets. The other commands in that row are unchanged. The table stands
+  unchanged until acceptance.

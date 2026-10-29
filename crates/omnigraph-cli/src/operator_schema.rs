@@ -91,6 +91,13 @@ pub(crate) enum AuthProfile {
         command: Vec<String>,
         timeout: String,
     },
+    OauthClientCredentials {
+        token_endpoint: String,
+        client_id: String,
+        client_secret: ClientSecretSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+    },
     Anonymous,
 }
 
@@ -106,6 +113,13 @@ enum StrictAuthProfile {
         #[serde(default = "default_timeout")]
         timeout: String,
     },
+    OauthClientCredentials {
+        token_endpoint: String,
+        client_id: String,
+        client_secret: ClientSecretSource,
+        #[serde(default)]
+        scope: Option<String>,
+    },
     Anonymous {},
 }
 
@@ -115,9 +129,27 @@ impl From<StrictAuthProfile> for AuthProfile {
             StrictAuthProfile::Omnigraph {} => Self::Omnigraph,
             StrictAuthProfile::Token { source } => Self::Token { source },
             StrictAuthProfile::Exec { command, timeout } => Self::Exec { command, timeout },
+            StrictAuthProfile::OauthClientCredentials {
+                token_endpoint,
+                client_id,
+                client_secret,
+                scope,
+            } => Self::OauthClientCredentials {
+                token_endpoint,
+                client_id,
+                client_secret,
+                scope,
+            },
             StrictAuthProfile::Anonymous {} => Self::Anonymous,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub(crate) enum ClientSecretSource {
+    Env { env: String },
+    File { file: PathBuf },
 }
 
 fn default_timeout() -> String {
@@ -215,6 +247,7 @@ pub(crate) enum OutputFormat {
     Jsonl,
     Csv,
     Kv,
+    Toon,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

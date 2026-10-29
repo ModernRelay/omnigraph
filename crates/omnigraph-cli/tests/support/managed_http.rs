@@ -190,14 +190,38 @@ impl IntentApiFixture {
         count: usize,
         delay: Duration,
     ) -> (Self, Vec<String>) {
+        Self::identity_issuer_for(endpoint, count, delay, false)
+    }
+
+    /// The same resource issuer with a verified non-human session.
+    pub fn workload_identity_issuer(endpoint: &str, count: usize) -> (Self, Vec<String>) {
+        Self::identity_issuer_for(endpoint, count, Duration::ZERO, true)
+    }
+
+    fn identity_issuer_for(
+        endpoint: &str,
+        count: usize,
+        delay: Duration,
+        workload: bool,
+    ) -> (Self, Vec<String>) {
         assert!(delay <= Duration::from_secs(2));
         use base64::Engine;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use serde_json::json;
         use time::{OffsetDateTime, format_description::well_known::Rfc3339};
         let mut tokens = Vec::new();
-        let session = json!({"data":{"principal_id":"principal-one","account_id":"account-one"},
+        let mut session = json!({"data":{"principal_id":"principal-one","account_id":"account-one"},
             "meta":{"provenance":"service_db","assurance":"verified_workload"}});
+        if workload {
+            session["data"]["kind"] = json!("automation");
+            session["data"]["provider_client_id"] = json!("client-one");
+            session["data"]["subject"] = json!("oauth:issuer:client-one");
+            session["data"]["expires_at"] = json!(
+                (OffsetDateTime::now_utc() + time::Duration::minutes(10))
+                    .format(&Rfc3339)
+                    .unwrap()
+            );
+        }
         let api = Self::start_with_origin(
             |origin| {
                 (0..count)
@@ -207,12 +231,12 @@ impl IntentApiFixture {
                         let header = json!({"typ":"JWT","alg":"ES256","kid":kid});
                         let claims = json!({"version":2,"iss":origin,"aud":"urn:omnigraph:data:managed-test",
                             "sub":"principal-one","account_id":"account-one","cluster_id":"managed-test",
-                            "cluster_incarnation":"inc-one","principal_kind":"human","assurance":"verified_human",
-                            "iat":now.unix_timestamp(),"exp":now.unix_timestamp()+3600,"jti":format!("fixture-{index}")});
+                            "cluster_incarnation":"inc-one","principal_kind":if workload {"automation"} else {"human"},"assurance":if workload {"verified_workload"} else {"verified_human"},
+                            "iat":now.unix_timestamp(),"exp":now.unix_timestamp()+if workload {300} else {3600},"jti":format!("fixture-{index}")});
                         let token = format!("{}.{}.signature", URL_SAFE_NO_PAD.encode(header.to_string()), URL_SAFE_NO_PAD.encode(claims.to_string()));
                         tokens.push(token.clone());
                         IntentReply::json(200, json!({"data":{"version":2,"cluster_id":"managed-test",
-                            "endpoint":endpoint,"token":token,"expires_at":(now + time::Duration::hours(1)).format(&Rfc3339).unwrap(),
+                            "endpoint":endpoint,"token":token,"expires_at":(now + time::Duration::seconds(if workload {300} else {3600})).format(&Rfc3339).unwrap(),
                             "kid":kid,"actor":"principal:principal-one"},
                             "meta":{"cluster_id":"managed-test","incarnation":"inc-one"}}))
                     })
@@ -317,6 +341,9 @@ impl IntentApiFixture {
                 let raw = headers.get("content-type").is_some_and(|value| {
                     value == "application/x-ndjson" || value == "application/octet-stream"
                 });
+                let form = headers
+                    .get("content-type")
+                    .is_some_and(|value| value == "application/x-www-form-urlencoded");
                 if !raw {
                     assert!(length <= 1024 * 1024, "fixture JSON request body bound");
                 }
@@ -326,6 +353,13 @@ impl IntentApiFixture {
                     headers,
                     body: if body.is_empty() || raw {
                         Value::Null
+                    } else if form {
+                        serde_json::to_value(
+                            url::form_urlencoded::parse(&body)
+                                .into_owned()
+                                .collect::<std::collections::BTreeMap<_, _>>(),
+                        )
+                        .unwrap()
                     } else {
                         serde_json::from_slice(&body).unwrap()
                     },

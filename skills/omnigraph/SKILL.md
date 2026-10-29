@@ -174,7 +174,7 @@ backend. `--config DIR` is source input only.
 - Direct cluster root: `--target ./cluster --graph knowledge`; registered root targets can set `default_graph`.
 - Server: `--target production --graph knowledge`; the registered target owns endpoint and one auth provider.
 - Managed: `--profile work` for account operations; a managed target references that profile and pins cluster ID/incarnation. Graph operations need its endpoint and `--graph` or `default_graph`.
-- Direct targets support local files only. Cloud-direct, catalogue and Unix socket targets are unsupported. Remote inline URLs must be registered.
+- Direct targets support local files, plus an inline `s3://` cluster root for `cluster plan/apply/status/force-unlock/upgrade-ledger` and `optimize`/`index build`/`index rebuild`/`cleanup`/`repair --graph` once the server's lock is released. Each direct writer keeps its own admission lock; `cluster force-unlock` it before starting the server. Other cloud-direct, catalogue and Unix socket targets are unsupported. Remote inline URLs must be registered.
 
 Bare target names resolve from the operator file; use `./` for relative inline
 paths. `init --schema schema.pg ./graph.omni` is the sole positional backend
@@ -207,7 +207,8 @@ destination line. Legacy `--server`, `--store`, `--cluster`,
 
 `query` and `mutate` invoke stored queries by positional name, or accept
 `--query FILE` / `-e SOURCE`. Use `--params` or `--params-file`, never interpolate
-values into query source. Reads support `--format table|json|jsonl|csv|kv`;
+values into query source. Reads support `--format table|json|jsonl|csv|kv|toon`;
+`--format toon` encodes the same document as `--format json` in TOON;
 `--json` preserves exact receipt/error structure. Inspect `commit` and
 `graph_commit_id` after uncertain writes; do not infer safe retry from a timeout.
 
@@ -328,8 +329,10 @@ omnigraph credentials status --profile work --json
 
 Never put secrets in configuration. Providers are `omnigraph` (managed device
 login), `token` (exactly one `store`, `env` or `file` source), `exec` (absolute
-argv, bounded JSON protocol), and standalone-only `anonymous`. No fallback is
-allowed. Static installation uses `credentials set --stdin`, not login; existing
+argv, bounded JSON protocol), managed-only `oauth_client_credentials` (explicit
+HTTPS token endpoint, client ID and env/file client secret), and standalone-only
+`anonymous`. No fallback is allowed. Static installation uses
+`credentials set --stdin`, not login; existing
 entries require `--replace`. Managed credentials require `--profile NAME`; standalone
 credentials require `--target NAME`. Status never uses network/helpers or prompts; secure-store availability
 and identity remain unknown without reading secrets. Export is raw bearer-plus-newline to a pipe
@@ -409,7 +412,7 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | Using `data.id` for identity on a new graph | `unknown input field 'id': move data.id to the top-level 'id' field` | Put identity in top-level JSONL `id`; `data` contains user properties |
 | Re-running a `--mode merge` load with unkeyed edges | duplicate edges | Supply stable top-level edge `id`s, or declare `@key(@src, @dst)` when creating the edge type |
 | Assuming every JSON result cell has a key | absent keys for null values | Query/export JSON omits null cells; change images retain explicit nulls |
-| `defaults.output: arrow` | configuration refusal | Use `table`, `json`, `jsonl`, `csv` or `kv` |
+| `defaults.output: arrow` | configuration refusal | Use `table`, `json`, `jsonl`, `csv`, `kv`, or `toon` |
 | `..` or a symlink in a `cluster.yaml` relative path | `config_path_escape` / `config_path_symlink` | Keep referenced files inside the config directory with plain relative paths |
 | Old operator format | configuration refusal | Replace it with `version: 1`; preserve journals and reconcile unresolved work before retiring old tooling |
 | Policy commands with both a graph and a `cluster` bundle applied | `matches 2 policy bundles` | Current limitation of `policy validate/test/explain --graph`; inspect each bundle file directly |
