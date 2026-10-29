@@ -679,10 +679,15 @@ impl QueryBlockingWorkGuard {
         else {
             return;
         };
-        if pause.entered.fetch_add(1, Ordering::SeqCst) > 0 {
+        // A later checkpoint does not park again. Publish the wait before the
+        // entry count: a test that observes `entered` must also observe the pause.
+        if pause.entered.load(Ordering::SeqCst) > 0 {
             return;
         }
         pause.waiting.store(1, Ordering::SeqCst);
+        if pause.entered.fetch_add(1, Ordering::SeqCst) > 0 {
+            return;
+        }
         let released = pause
             .released
             .lock()
