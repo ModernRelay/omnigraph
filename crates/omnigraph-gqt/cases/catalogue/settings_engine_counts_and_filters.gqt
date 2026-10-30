@@ -30,6 +30,7 @@ query settings_with_defaults() {
 {"s.name":"engine","s.kind":"enum(v2)","s.default":"v2","s.scope":"request"}
 {"s.name":"rrf_plan","s.kind":"enum(auto, force_prefilter, force_postfilter)","s.default":"auto","s.scope":"process"}
 {"s.name":"merge_lineage","s.kind":"enum(off, on, verify)","s.default":"on","s.scope":"request"}
+{"s.name":"change_lineage","s.kind":"enum(off, on, verify)","s.default":"on","s.scope":"request"}
 {"s.name":"ann_nprobes","s.kind":"integer(0..)","s.default":"20","s.scope":"request"}
 {"s.name":"stage_write_concurrency","s.kind":"integer(1..=64)","s.default":"8","s.scope":"process"}
 {"s.name":"traversal_work_limit","s.kind":"integer(1..=9223372036854775807)","s.default":"1000000","s.scope":"request"}

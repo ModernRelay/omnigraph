@@ -3,7 +3,7 @@ use super::prepare::{ChangeFilter, Pagination};
 use super::{BranchCommand, HistoryScope, run_diff};
 use crate::client::{self, GraphClient};
 use crate::helpers::{confirm_destructive, resolve_branch};
-use crate::output::{write_json, write_merge_base_human};
+use crate::output::{write_branch_list_human, write_json, write_merge_base_human};
 use color_eyre::eyre::Result;
 use omnigraph::db::{ReadTarget, SnapshotId};
 use std::io::Write;
@@ -45,17 +45,19 @@ pub(crate) async fn run_branch(
                 )?;
             }
         }
-        BranchCommand::List { json } => {
+        BranchCommand::List { detailed, json } => {
             let client =
                 GraphClient::from_target(scope.operator, scope.target, scope.graph, None, stderr)
                     .await?;
-            let payload = client.branch_list().await?;
+            let payload = if detailed {
+                client.branch_list_detailed().await?
+            } else {
+                client.branch_list().await?
+            };
             if json {
                 write_json(&payload, stdout)?;
             } else {
-                for branch in payload.branches {
-                    writeln!(stdout, "{}", branch)?;
-                }
+                write_branch_list_human(&payload, stdout)?;
             }
         }
         BranchCommand::Delete { name, json } => {

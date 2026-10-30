@@ -10,8 +10,10 @@
 
 use std::collections::{HashMap, HashSet};
 
+use omnigraph_compiler::settings::ChangeLineage;
+
 use super::enumerate::{
-    self, CommitEnumeration, ContinuationKey, PageBudget, enumerate_commit_changes,
+    self, ChangeDiscovery, CommitEnumeration, ContinuationKey, PageBudget, enumerate_commit_changes,
 };
 use super::model::{
     CHANGE_FEED_DEFAULT_COMMITS_PER_POLL, CHANGE_FEED_MAX_COMMITS_PER_POLL,
@@ -222,6 +224,7 @@ pub(crate) async fn poll(
     graph_identity: &str,
     cut: &ChangeFeedCut,
     request: &ChangeFeedRequest,
+    lineage: ChangeLineage,
 ) -> Result<ChangeFeedPage> {
     let max_changes = request
         .max_changes
@@ -339,6 +342,7 @@ pub(crate) async fn poll(
             &child_snapshot,
             graph_identity,
             commit_id,
+            ChangeDiscovery::linear(lineage),
             &request.scope,
             resume.as_ref(),
             &mut budget,

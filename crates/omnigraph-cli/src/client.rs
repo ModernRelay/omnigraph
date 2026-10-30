@@ -16,11 +16,11 @@ use omnigraph_api_types::{
     ChangeOutput, ChangeRequest, CommitChangesOutput, CommitListOutput, CommitOutput, DiffOutput,
     EntityKind, ExportRequest, GraphBatchLoadOutput, GraphDiscoveryOutput, GraphListOutput,
     InvokeStoredQueryRequest, MergeBaseOutput, QueriesCatalogOutput, QueryRequest, ReadOutput,
-    SchemaApplyOutput, SchemaOutput, SettingsRequest, SnapshotOutput, branch_list_read_output,
-    branch_read_output, change_baseline_output, change_feed_output, change_scope,
-    commit_changes_output, commit_output, diff_output, graph_batch_load_receipt_output,
-    load_executed_output, merge_base_output, read_output, schema_apply_output, show_read_output,
-    snapshot_payload,
+    SchemaApplyOutput, SchemaOutput, SettingsRequest, SnapshotOutput, branch_list_output,
+    branch_list_read_output, branch_read_output, change_baseline_output, change_feed_output,
+    change_scope, commit_changes_output, commit_output, diff_output,
+    graph_batch_load_receipt_output, load_executed_output, merge_base_output, read_output,
+    schema_apply_output, show_read_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::query::ast::{BranchCreateFrom, BranchRead, BranchWrite, CommitWrite};
@@ -502,6 +502,7 @@ impl GraphClient {
             match id {
                 SettingId::Engine => request.engine = Some(given.engine()),
                 SettingId::MergeLineage => request.merge_lineage = Some(given.merge_lineage()),
+                SettingId::ChangeLineage => request.change_lineage = Some(given.change_lineage()),
                 SettingId::AnnNprobes => {
                     request.ann_nprobes = Some(given.get(SettingId::AnnNprobes).parse()?)
                 }
@@ -582,7 +583,41 @@ impl GraphClient {
                 let session = Self::open_read_session(uri, binding, &[]).await?;
                 let mut branches = session.branch_list().await?;
                 branches.sort();
-                Ok(BranchListOutput { branches })
+                Ok(BranchListOutput {
+                    branches,
+                    details: None,
+                })
+            }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("branch list")),
+        }
+    }
+
+    /// [`Self::branch_list`] with each readable branch's details
+    /// (`GET /branches?detailed=true`).
+    pub(crate) async fn branch_list_detailed(&self) -> Result<BranchListOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                response_limit,
+                ..
+            } => {
+                remote_json_bounded(
+                    http,
+                    Method::GET,
+                    remote_url(base_url, &["branches"], &[("detailed", "true")])?,
+                    None,
+                    token.as_deref(),
+                    None,
+                    *response_limit,
+                )
+                .await
+            }
+            GraphClient::Embedded { uri, binding, .. } => {
+                let session = Self::open_read_session(uri, binding, &[]).await?;
+                let listing = session.branch_list_detailed(&mut |_| true).await?;
+                Ok(branch_list_output(&listing))
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("branch list")),
         }

@@ -10,6 +10,7 @@ use lance::blob::blob_field;
 use lance::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::schema::parser::parse_schema;
+use omnigraph_compiler::settings::ChangeLineage;
 use omnigraph_compiler::types::PropType;
 use omnigraph_compiler::{
     SchemaIR, SchemaIdentityDomain, SchemaMigrationPlan, SchemaMigrationStep, SchemaShape,
@@ -19,6 +20,7 @@ use omnigraph_compiler::{
 
 use crate::db::graph_coordinator::{
     CapturedLineage, GraphCoordinator, PublishedSnapshot, commit_not_found,
+    first_parent_chain_holds_in,
 };
 use crate::error::{BranchStartRefusal, ManifestErrorKind, OmniError, Result, dataset_subject};
 use crate::runtime_cache::RuntimeCache;
@@ -2609,6 +2611,28 @@ impl Omnigraph {
         max_changes: Option<usize>,
         max_bytes: Option<u64>,
     ) -> Result<crate::changes::CommitChangesPage> {
+        self.commit_changes_page_under(
+            commit_id,
+            scope,
+            page_token,
+            max_changes,
+            max_bytes,
+            crate::changes::default_change_lineage(),
+        )
+        .await
+    }
+
+    /// [`Self::commit_changes_page`] under one session's `change_lineage`,
+    /// the door a [`crate::Session`] calls.
+    pub async fn commit_changes_page_under(
+        &self,
+        commit_id: &str,
+        scope: &crate::changes::ChangeFeedScope,
+        page_token: Option<&str>,
+        max_changes: Option<usize>,
+        max_bytes: Option<u64>,
+        lineage: ChangeLineage,
+    ) -> Result<crate::changes::CommitChangesPage> {
         use crate::changes::token;
 
         let max_changes = max_changes.unwrap_or(crate::changes::COMMIT_CHANGES_DEFAULT_CHANGES);
@@ -2682,6 +2706,7 @@ impl Omnigraph {
             &child.snapshot,
             &graph_identity,
             commit_id,
+            crate::changes::enumerate::ChangeDiscovery::linear(lineage),
             scope,
             resume.as_ref(),
             &mut budget,
@@ -2733,6 +2758,17 @@ impl Omnigraph {
     pub async fn poll_change_feed(
         &self,
         request: crate::changes::ChangeFeedRequest,
+    ) -> Result<crate::changes::ChangeFeedPage> {
+        self.poll_change_feed_under(request, crate::changes::default_change_lineage())
+            .await
+    }
+
+    /// [`Self::poll_change_feed`] under one session's `change_lineage`, the
+    /// door a [`crate::Session`] calls.
+    pub async fn poll_change_feed_under(
+        &self,
+        request: crate::changes::ChangeFeedRequest,
+        lineage: ChangeLineage,
     ) -> Result<crate::changes::ChangeFeedPage> {
         let branch = request
             .branch
@@ -2810,6 +2846,7 @@ impl Omnigraph {
             &graph_identity,
             &cut,
             &request,
+            lineage,
         )
         .await
     }
@@ -2824,8 +2861,19 @@ impl Omnigraph {
         &self,
         request: &crate::changes::GraphDiffRequest,
     ) -> Result<crate::changes::GraphDiffPage> {
-        let prepared = self.prepare_diff(request, None).await?;
-        self.run_diff_page(prepared).await
+        self.diff_page_under(request, crate::changes::default_change_lineage())
+            .await
+    }
+
+    /// [`Self::diff_page`] under one session's `change_lineage`, the door a
+    /// [`crate::Session`] calls.
+    pub async fn diff_page_under(
+        &self,
+        request: &crate::changes::GraphDiffRequest,
+        lineage: ChangeLineage,
+    ) -> Result<crate::changes::GraphDiffPage> {
+        let prepared = self.prepare_diff(request, None, lineage).await?;
+        self.run_diff_page(prepared, lineage).await
     }
 
     /// [`Self::diff_page`] for a caller that may read only some branches.
@@ -2847,16 +2895,29 @@ impl Omnigraph {
         request: &crate::changes::GraphDiffRequest,
         can_read: &mut ReadCheck<'_>,
     ) -> Result<crate::changes::GraphDiffPage> {
-        let prepared = self.prepare_diff(request, Some(can_read)).await?;
-        self.run_diff_page(prepared).await
+        self.diff_page_readable_under(request, can_read, crate::changes::default_change_lineage())
+            .await
     }
 
-    /// Resolve a graph diff page request, reading lineage only: its
-    /// endpoints and its continuation position.
+    /// [`Self::diff_page_readable`] under one session's `change_lineage`.
+    pub async fn diff_page_readable_under(
+        &self,
+        request: &crate::changes::GraphDiffRequest,
+        can_read: &mut ReadCheck<'_>,
+        lineage: ChangeLineage,
+    ) -> Result<crate::changes::GraphDiffPage> {
+        let prepared = self.prepare_diff(request, Some(can_read), lineage).await?;
+        self.run_diff_page(prepared, lineage).await
+    }
+
+    /// Resolve a graph diff page request, reading lineage only: its endpoints
+    /// and its continuation position. `ChangeLineage::Off` never pairs rows,
+    /// so it skips the ancestry answer and its lineage reads.
     async fn prepare_diff(
         &self,
         request: &crate::changes::GraphDiffRequest,
         can_read: Option<&mut ReadCheck<'_>>,
+        lineage: ChangeLineage,
     ) -> Result<PreparedDiffPage> {
         use crate::changes::token;
 
@@ -2873,7 +2934,7 @@ impl Omnigraph {
         let sides_digest = token::sides_digest(&request.sides);
         let (endpoints, resume) = match request.page_token.as_deref() {
             None => (
-                self.resolve_diff_endpoints(&request.sides, can_read)
+                self.resolve_diff_endpoints(&request.sides, can_read, lineage)
                     .await?,
                 None,
             ),
@@ -2899,7 +2960,7 @@ impl Omnigraph {
                     None => &mut read_all,
                 };
                 let endpoints = self
-                    .reopen_diff_continuation(&request.sides, &decoded, can_read)
+                    .reopen_diff_continuation(&request.sides, &decoded, can_read, lineage)
                     .await?;
                 let resume = crate::changes::enumerate::ContinuationKey {
                     type_id: decoded.type_id,
@@ -2926,6 +2987,7 @@ impl Omnigraph {
     async fn run_diff_page(
         &self,
         prepared: PreparedDiffPage,
+        lineage: ChangeLineage,
     ) -> Result<crate::changes::GraphDiffPage> {
         use crate::changes::token;
 
@@ -2957,6 +3019,10 @@ impl Omnigraph {
             &endpoints.to_snapshot,
             &graph_identity,
             &endpoints.to_commit_id,
+            crate::changes::enumerate::ChangeDiscovery {
+                lineage,
+                from_is_ancestor: endpoints.from_is_ancestor,
+            },
             &scope,
             resume.as_ref(),
             &mut budget,
@@ -3010,28 +3076,16 @@ impl Omnigraph {
         source: &str,
         target: &str,
     ) -> Result<crate::changes::MergeBase> {
-        let (source_head, target_head, merge_base, _, _) =
-            self.capture_merge_base(source, target).await?;
+        let captured = self.capture_merge_base(source, target).await?;
         Ok(crate::changes::MergeBase {
-            source_commit_id: source_head,
-            target_commit_id: target_head,
-            merge_base,
+            source_commit_id: captured.source_head,
+            target_commit_id: captured.target_head,
+            merge_base: captured.merge_base,
         })
     }
 
-    /// Capture both branches from one view each and resolve their merge base,
-    /// returning the heads, the base commit and the source head's snapshot.
-    async fn capture_merge_base(
-        &self,
-        source: &str,
-        target: &str,
-    ) -> Result<(
-        String,
-        String,
-        crate::db::commit_graph::GraphCommit,
-        Snapshot,
-        Snapshot,
-    )> {
+    /// Capture both branches from one view each and resolve their merge base.
+    async fn capture_merge_base(&self, source: &str, target: &str) -> Result<CapturedMergeBase> {
         let source_branch = normalize_branch_name(source)?;
         let target_branch = normalize_branch_name(target)?;
         let (source_txn, target_txn, source_commits, target_commits) = self
@@ -3052,42 +3106,62 @@ impl Omnigraph {
             &target_head,
         )
         .await?;
-        Ok((
+        Ok(CapturedMergeBase {
             source_head,
             target_head,
             merge_base,
-            source_txn.base,
-            target_txn.base,
-        ))
+            source_snapshot: source_txn.base,
+            target_snapshot: target_txn.base,
+            source_graph: source_commits.graph,
+        })
     }
 
-    /// Resolve a graph diff's sides to exact commits and their snapshots.
-    /// The two-point form takes its sides in order, each authorized by
-    /// `can_read` before the next is looked at; the branch form's caller
-    /// authorizes the two branches it names.
+    /// Resolve a graph diff's sides to exact commits and their snapshots, each
+    /// two-point side authorized by `can_read` before the next is looked at,
+    /// and whether `from` is on `to`'s first-parent chain unless `lineage` is `Off`.
     async fn resolve_diff_endpoints(
         &self,
         sides: &crate::changes::GraphDiffSides,
         mut can_read: Option<&mut ReadCheck<'_>>,
+        lineage: ChangeLineage,
     ) -> Result<DiffEndpoints> {
         match sides {
             crate::changes::GraphDiffSides::Between { from, to } => {
-                let (from_commit_id, from_snapshot) = self
-                    .resolve_diff_read_target(from, can_read.as_deref_mut())
+                let from_side = self
+                    .authorized_diff_side(from, can_read.as_deref_mut())
                     .await?;
-                let (to_commit_id, to_snapshot) =
-                    self.resolve_diff_read_target(to, can_read).await?;
+                let from_commit = match &from_side {
+                    DiffReadTarget::Commit(commit) => Some(commit.clone()),
+                    DiffReadTarget::Branch(_) => None,
+                };
+                let (from_commit_id, from_snapshot) = self.open_diff_side(from, from_side).await?;
+                let to_side = self.authorized_diff_side(to, can_read).await?;
+                let from_is_ancestor = lineage != ChangeLineage::Off
+                    && self
+                        .diff_from_is_ancestor(&from_commit_id, from_commit.as_ref(), &to_side)
+                        .await?;
+                let (to_commit_id, to_snapshot) = self.open_diff_side(to, to_side).await?;
                 Ok(DiffEndpoints {
                     from_commit_id,
                     to_commit_id,
                     base_commit_id: None,
+                    from_is_ancestor,
                     from_snapshot,
                     to_snapshot,
                 })
             }
             crate::changes::GraphDiffSides::Branch { source, target } => {
-                let (source_head, target_head, merge_base, source_snapshot, target_snapshot) =
-                    self.capture_merge_base(source, target).await?;
+                let captured = self.capture_merge_base(source, target).await?;
+                let from_is_ancestor =
+                    lineage != ChangeLineage::Off && captured.base_on_source_chain().await?;
+                let CapturedMergeBase {
+                    source_head,
+                    target_head,
+                    merge_base,
+                    source_snapshot,
+                    target_snapshot,
+                    ..
+                } = captured;
                 let base_commit_id = merge_base.graph_commit_id.clone();
                 // The base is usually an ancestor neither head is at; when it
                 // is one of the captured heads, its captured snapshot is the
@@ -3104,11 +3178,62 @@ impl Omnigraph {
                     from_commit_id: base_commit_id.clone(),
                     to_commit_id: source_head,
                     base_commit_id: Some(base_commit_id),
+                    from_is_ancestor,
                     from_snapshot: base_snapshot,
                     to_snapshot: source_snapshot,
                 })
             }
         }
+    }
+
+    /// Whether `from` is on the first-parent chain of the branch `to` names,
+    /// from the lineage that branch's coordinator holds; `to` spelled as a
+    /// commit, or a `from` of unknown generation, answers `false`.
+    async fn diff_from_is_ancestor(
+        &self,
+        from: &str,
+        from_commit: Option<&GraphCommit>,
+        to: &DiffReadTarget,
+    ) -> Result<bool> {
+        let DiffReadTarget::Branch(resolved) = to else {
+            return Ok(false);
+        };
+        if resolved.graph_commit_id.as_deref() == Some(from) {
+            return Ok(true);
+        }
+        let branch = resolved.branch.as_deref();
+        {
+            let coord = self.coordinator.read().await;
+            if branch == coord.current_branch() {
+                return Self::first_parent_chain_holds(&coord, from, from_commit).await;
+            }
+        }
+        let cache = self.validated_cached_coordinator(branch).await?;
+        let (_, coord) = cache
+            .as_ref()
+            .expect("validated authority cache entry is present");
+        Self::first_parent_chain_holds(coord, from, from_commit).await
+    }
+
+    /// [`GraphCoordinator::first_parent_chain_holds`] for `from`, whose
+    /// generation comes from its classified commit or from what the
+    /// coordinator already holds.
+    async fn first_parent_chain_holds(
+        coord: &GraphCoordinator,
+        from: &str,
+        from_commit: Option<&GraphCommit>,
+    ) -> Result<bool> {
+        if coord.holds_commit(from) {
+            return Ok(true);
+        }
+        let generation = match from_commit {
+            Some(commit) => commit.generation,
+            None => match coord.captured_commit(from)? {
+                Some(commit) => commit.generation,
+                None => return Ok(false),
+            },
+        };
+        coord.first_parent_chain_holds(from, generation).await
     }
 
     /// Reopen the commits a diff page token names, once its sides reach them.
@@ -3127,10 +3252,12 @@ impl Omnigraph {
         sides: &crate::changes::GraphDiffSides,
         decoded: &crate::changes::token::DiffPageTokenV1,
         can_read: &mut ReadCheck<'_>,
+        lineage: ChangeLineage,
     ) -> Result<DiffEndpoints> {
         use crate::changes::GraphDiffSides;
         let from = &decoded.from_commit_id;
         let to = &decoded.to_commit_id;
+        let from_is_ancestor;
         let (from_reach, to_reach) = match sides {
             GraphDiffSides::Between {
                 from: from_side,
@@ -3145,6 +3272,16 @@ impl Omnigraph {
                 let to_now = self
                     .authorized_diff_side(to_side, Some(&mut *can_read))
                     .await?;
+                let from_commit = match &from_now {
+                    DiffReadTarget::Commit(commit) if commit.graph_commit_id == *from => {
+                        Some(commit.clone())
+                    }
+                    _ => None,
+                };
+                from_is_ancestor = lineage != ChangeLineage::Off
+                    && self
+                        .diff_from_is_ancestor(from, from_commit.as_ref(), &to_now)
+                        .await?;
                 (
                     self.reach_side(from, from_side, from_now, can_read).await?,
                     self.reach_side(to, to_side, to_now, can_read).await?,
@@ -3156,8 +3293,17 @@ impl Omnigraph {
                 }
                 let source_branch = normalize_branch_name(source)?;
                 let target_branch = normalize_branch_name(target)?;
-                let (source_head, target_head, base, source_snapshot, target_snapshot) =
-                    self.capture_merge_base(source, target).await?;
+                let captured = self.capture_merge_base(source, target).await?;
+                from_is_ancestor =
+                    lineage != ChangeLineage::Off && captured.base_on_source_chain().await?;
+                let CapturedMergeBase {
+                    source_head,
+                    target_head,
+                    merge_base: base,
+                    source_snapshot,
+                    target_snapshot,
+                    ..
+                } = captured;
                 let from_reach = if *from == base.graph_commit_id {
                     if *from == source_head {
                         DiffReach::Resolved(Box::new(source_snapshot.clone()))
@@ -3182,6 +3328,7 @@ impl Omnigraph {
             from_commit_id: from.clone(),
             to_commit_id: to.clone(),
             base_commit_id: decoded.base_commit_id.clone(),
+            from_is_ancestor,
             from_snapshot: self.open_reached(from, from_reach).await?,
             to_snapshot: self.open_reached(to, to_reach).await?,
         })
@@ -3317,14 +3464,13 @@ impl Omnigraph {
             })
     }
 
-    /// Resolve one authorized diff endpoint to its commit and the graph as
-    /// of it.
-    async fn resolve_diff_read_target(
+    /// Open one classified and authorized diff endpoint: its commit and the
+    /// graph as of it.
+    async fn open_diff_side(
         &self,
         side: &str,
-        can_read: Option<&mut ReadCheck<'_>>,
+        classified: DiffReadTarget,
     ) -> Result<(String, Snapshot)> {
-        let classified = self.authorized_diff_side(side, can_read).await?;
         match classified {
             DiffReadTarget::Branch(resolved) => {
                 let commit_id = resolved.graph_commit_id.ok_or_else(|| {
@@ -4100,6 +4246,35 @@ impl Omnigraph {
     pub async fn branch_list(&self) -> Result<Vec<String>> {
         self.ensure_schema_state_valid().await?;
         self.coordinator.read().await.branch_list().await
+    }
+
+    /// [`Self::branch_list`] with the details of each branch `can_read`
+    /// admits: its head, the branch and commit its current lifetime started
+    /// from, and when that lifetime was created. One listing of the branch
+    /// refs; `can_read` is asked once per branch, before any read of that
+    /// branch. Each admitted branch costs a read of its
+    /// latest `__manifest` version and, when it has written a commit, of the
+    /// version it was created from; never a read of its lineage. A branch
+    /// deleted after the listing keeps its name and has no details.
+    pub async fn branch_list_detailed(
+        &self,
+        can_read: &mut ReadCheck<'_>,
+    ) -> Result<BranchListing> {
+        self.ensure_schema_state_valid().await?;
+        let listing = crate::db::manifest::list_graph_branches_detailed(
+            self.uri(),
+            &self.control_session(),
+            can_read,
+        )
+        .await?;
+        Ok(BranchListing {
+            branches: listing.branches,
+            details: listing
+                .details
+                .into_iter()
+                .map(BranchDetail::from_catalog)
+                .collect(),
+        })
     }
 
     pub async fn branch_delete(&self, name: &str) -> Result<()> {
@@ -5231,8 +5406,67 @@ pub(crate) fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result
 
 /// A caller's answer to "may it read this branch?", asked once per two-point
 /// graph diff side and, on a continuation, per commit the page token names
-/// that its side no longer resolves to; see [`Omnigraph::diff_page_readable`].
+/// that its side no longer resolves to ([`Omnigraph::diff_page_readable`]),
+/// and once per listed branch ([`Omnigraph::branch_list_detailed`]).
 pub type ReadCheck<'a> = dyn FnMut(&str) -> bool + Send + 'a;
+
+/// The live graph branches, as [`Omnigraph::branch_list_detailed`] lists them.
+#[derive(Debug, Clone)]
+pub struct BranchListing {
+    /// Every live branch, `main` first and the rest by name.
+    pub branches: Vec<String>,
+    /// One entry per branch the caller may read, in the order of `branches`.
+    pub details: Vec<BranchDetail>,
+}
+
+/// One live graph branch, as [`Omnigraph::branch_list_detailed`] reports it.
+/// `from` and `from_commit_id` name where the branch started, as its create
+/// receipt ([`BranchCreated`]) did. A branch deleted and created again under
+/// the same name is a new lifetime: its start and creation time are the new
+/// lifetime's.
+#[derive(Debug, Clone)]
+pub struct BranchDetail {
+    pub name: String,
+    /// The commit a read of the branch sees: its newest commit, or the commit
+    /// it started at while it has written none.
+    pub head: GraphCommit,
+    /// The branch this one started from, as that branch was named then; it
+    /// may since have been deleted or recreated. `None` on `main`.
+    pub from: Option<String>,
+    /// The commit the branch started at. Fixed for the branch's lifetime:
+    /// unlike the merge base, a later merge does not move it. `None` on
+    /// `main`.
+    pub from_commit_id: Option<String>,
+    /// When the branch was created, in Unix microseconds recorded to the
+    /// second; `None` on `main`.
+    pub created_at: Option<i64>,
+    /// When the head last moved, in Unix microseconds: the time of the
+    /// branch's newest commit, or `created_at` while it has written none.
+    pub updated_at: i64,
+}
+
+impl BranchDetail {
+    fn from_catalog(detail: crate::db::manifest::GraphBranchDetail) -> Self {
+        let head = crate::db::commit_graph::graph_commit_from_manifest_row(detail.head);
+        let created_at = detail.created_at_seconds.map(|seconds| {
+            i64::try_from(seconds)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1_000_000)
+        });
+        let updated_at = match created_at {
+            Some(created_at) if !detail.head_is_own => created_at,
+            _ => head.created_at,
+        };
+        Self {
+            name: detail.name,
+            head,
+            from: detail.from,
+            from_commit_id: detail.from_commit_id,
+            created_at,
+            updated_at,
+        }
+    }
+}
 
 /// How a diff continuation reached a commit its token names, which is how
 /// it opens the commit.
@@ -5288,12 +5522,41 @@ struct PreparedDiffPage {
     resume: Option<crate::changes::enumerate::ContinuationKey>,
 }
 
+/// Both branches of a branch diff or merge base, captured from one view each:
+/// the heads, their merge base and snapshots, and the source's commit graph.
+struct CapturedMergeBase {
+    source_head: String,
+    target_head: String,
+    merge_base: crate::db::commit_graph::GraphCommit,
+    source_snapshot: Snapshot,
+    target_snapshot: Snapshot,
+    source_graph: crate::db::commit_graph::CommitGraph,
+}
+
+impl CapturedMergeBase {
+    /// Whether the merge base is on the source head's first-parent chain: a
+    /// source that merged its target holds it as a merge commit's second
+    /// parent, where sibling first commits stamp their rows alike.
+    async fn base_on_source_chain(&self) -> Result<bool> {
+        first_parent_chain_holds_in(
+            &self.source_graph,
+            &self.merge_base.graph_commit_id,
+            self.merge_base.generation,
+        )
+        .await
+    }
+}
+
 /// A graph diff's two endpoints, resolved to exact commits and their
 /// snapshots.
 struct DiffEndpoints {
     from_commit_id: String,
     to_commit_id: String,
     base_commit_id: Option<String>,
+    /// `from` lies on `to`'s first-parent chain (the branch form's merge base
+    /// on the source head's chain, a two-point `to` whose chain holds `from`)
+    /// and the session pairs rows: never under `change_lineage = off`.
+    from_is_ancestor: bool,
     from_snapshot: Snapshot,
     to_snapshot: Snapshot,
 }
