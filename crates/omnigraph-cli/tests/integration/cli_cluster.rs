@@ -2002,6 +2002,86 @@ fn managed_plan_and_apply_submit_exact_native_intent_without_waiting() {
 }
 
 #[test]
+#[ignore = "nightly: holds plan and apply replies past the real 10 s control request bound"]
+fn managed_plan_and_apply_submissions_wait_until_their_local_deadline() {
+    // A submission is answered only after the service's own work, so
+    // `--timeout` bounds it, not the bound of an ordinary control call.
+    let slow = std::time::Duration::from_millis(10_500);
+    for (arguments, path, expected, body, delay, code) in [
+        (
+            vec!["plan", "--rev", MANAGED_REVISION, "--timeout", "30"],
+            "/v1/clusters/managed-test/plans",
+            serde_json::json!({"revision":MANAGED_REVISION}),
+            managed_preview("ready"),
+            slow,
+            0,
+        ),
+        (
+            vec![
+                "apply",
+                "--plan",
+                "saved-plan",
+                "--no-wait",
+                "--timeout",
+                "30",
+            ],
+            "/v1/clusters/managed-test/deployments",
+            serde_json::json!({"preview_id":"saved-plan"}),
+            managed_delivery("queued"),
+            slow,
+            0,
+        ),
+        (
+            vec!["plan", "--rev", MANAGED_REVISION, "--timeout", "1"],
+            "/v1/clusters/managed-test/plans",
+            serde_json::json!({"revision":MANAGED_REVISION}),
+            managed_preview("ready"),
+            std::time::Duration::from_millis(2_500),
+            5,
+        ),
+    ] {
+        let temp = tempdir().unwrap();
+        let api = IntentApiFixture::with_session_and_first_reply_delay(
+            vec![IntentReply::json(202, body.clone())],
+            lifecycle_session("principal-one", "account-one"),
+            delay,
+        );
+        write_managed_target(temp.path(), &api.origin);
+        let started = std::time::Instant::now();
+        let output = managed_cli(temp.path(), &api.origin)
+            .args(&arguments)
+            .args(["--idempotency-key", "slow-key", "--json"])
+            // The held reply alone outlasts most of the helper's 15 s bound.
+            .timeout(std::time::Duration::from_secs(40))
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{arguments:?}: {output:?}"
+        );
+        let result = parse_stdout_json(&output);
+        if code == 0 {
+            assert_eq!(result, body);
+            assert!(started.elapsed() >= slow);
+        } else {
+            assert_eq!(result["type"], "wait_timeout");
+            assert_eq!(result["submission"]["idempotency_key"], "slow-key");
+            assert_eq!(result["submission"]["acceptance"], "unknown");
+        }
+        assert_control_request(
+            &api.workflow_requests()[0],
+            "POST",
+            path,
+            expected,
+            Some("slow-key"),
+        );
+        api.assert_complete();
+        assert_no_core_effects(temp.path());
+    }
+}
+
+#[test]
 fn managed_plan_omitted_revision_captures_public_source_head_once() {
     for state in ["ready", "capturing", "failed", "expired"] {
         let temp = tempdir().unwrap();
