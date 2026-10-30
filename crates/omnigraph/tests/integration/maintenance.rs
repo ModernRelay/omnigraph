@@ -4467,11 +4467,11 @@ async fn cleanup_plans_from_the_manifest_listing_issue_644() {
             if branch.is_none() {
                 kept.insert(fork);
             }
-            let read = keep_read.get(branch).cloned().unwrap_or_default();
-            assert!(
-                read.is_subset(&kept),
-                "{branch:?}: --keep read the manifests of {read:?}, retained {retained:?} \
-                 and the merge base {fork}"
+            assert_eq!(
+                keep_read.get(branch).cloned().unwrap_or_default(),
+                kept,
+                "{branch:?}: --keep reads the manifests of the versions it retains \
+                 and of the merge base {fork}, and no other"
             );
             let read = aged_read.get(branch).cloned().unwrap_or_default();
             assert!(
@@ -4531,6 +4531,72 @@ async fn cleanup_plans_from_the_manifest_listing_issue_644() {
         time_reads[1],
         time_reads[0] + 6,
         "the cutoff's time reads grow with main's history, one per new commit"
+    );
+
+    // A manifest below the floor that is not the merge base is not read by
+    // `--keep`, so a broken one leaves its plan unchanged; the cutoff reads
+    // it for its time and refuses. Each plan opens a fresh handle, so no
+    // session cache stands in for the store.
+    let uri = dir.path().to_str().unwrap().to_string();
+    let plan = |options: CleanupPolicyOptions| {
+        let uri = uri.clone();
+        async move {
+            let fresh = Omnigraph::open(&uri).await.unwrap();
+            fresh.cleanup_plan(options).await
+        }
+    };
+    let outcome = |report: &omnigraph::db::CollectorReport| {
+        let rows = [None, Some("feature")].map(|branch| {
+            let row = retained_on(report, branch);
+            (row.retained.clone(), row.would_prune.clone())
+        });
+        let sweep = report
+            .tables
+            .iter()
+            .map(|plan| {
+                (
+                    plan.location.clone(),
+                    (plan.roots.clone(), plan.sweep.clone()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        (rows, sweep)
+    };
+    let main_manifest = |version: u64| {
+        std::fs::read_dir(dir.path().join("__manifest/_versions"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| attached_manifest_version(path.to_str().unwrap()) == Some((None, version)))
+            .unwrap()
+    };
+    let before = outcome(&plan(keep.clone()).await.unwrap());
+    let fork = *attached_manifests_on_disk(dir.path())[&Some("feature".to_string())]
+        .first()
+        .unwrap();
+    let (_, pruned) = &before.0[0];
+    let (body_swapped, garbage) = (pruned[1], pruned[0]);
+    assert!(
+        garbage < body_swapped && body_swapped < fork,
+        "{pruned:?}, fork {fork}"
+    );
+
+    std::fs::copy(main_manifest(body_swapped + 1), main_manifest(body_swapped)).unwrap();
+    assert_eq!(outcome(&plan(keep.clone()).await.unwrap()), before);
+    let error = plan(aged.clone()).await.unwrap_err();
+    assert!(
+        error.to_string().contains(&format!(
+            "__manifest version {body_swapped} holds a manifest of version {}",
+            body_swapped + 1
+        )),
+        "the cutoff refuses a manifest whose body names another version: {error}"
+    );
+
+    std::fs::write(main_manifest(garbage), b"not a manifest").unwrap();
+    assert_eq!(outcome(&plan(keep).await.unwrap()), before);
+    let error = plan(aged).await.unwrap_err();
+    assert!(
+        error.storage_failure().is_some(),
+        "the cutoff refuses a manifest it cannot decode: {error}"
     );
 }
 

@@ -746,11 +746,12 @@ async fn retained_versions(
     };
     cost.manifest_time_reads += undecided.len() as u64;
     let mut would_prune = Vec::new();
-    for version in opened.read_versions(&undecided).await? {
-        if version.timestamp >= cutoff {
-            retained.push(version.version);
+    let read = opened.read_versions(&undecided).await?;
+    for (listed, manifest) in undecided.into_iter().zip(read) {
+        if manifest.timestamp >= cutoff {
+            retained.push(listed);
         } else {
-            would_prune.push(version.version);
+            would_prune.push(listed);
         }
     }
     retained.sort_unstable();

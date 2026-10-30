@@ -1203,7 +1203,10 @@ impl CollectorBranch {
     /// the order given, as many at once as the store's I/O parallelism allows
     /// (Lance's own bound: 8 on a local store, 64 on object storage). Each
     /// read resolves the version's manifest path with a HEAD (V2, else V1),
-    /// then reads the manifest.
+    /// then reads the manifest. A manifest whose body names another version
+    /// than the listed path it was read from is refused: `checkout_version`
+    /// does not compare them, and a caller keyed by the body's number would
+    /// lose the listed version.
     pub async fn read_versions(&self, versions: &[u64]) -> Result<Vec<lance::dataset::Version>> {
         use futures::{StreamExt, TryStreamExt};
         let concurrency = self
@@ -1214,11 +1217,19 @@ impl CollectorBranch {
             .io_parallelism();
         futures::stream::iter(versions.iter().copied())
             .map(|version| async move {
-                self.dataset
+                let read = self
+                    .dataset
                     .checkout_version(version)
                     .await
-                    .map(|dataset| dataset.version())
-                    .map_err(OmniError::storage)
+                    .map_err(OmniError::storage)?
+                    .version();
+                if read.version != version {
+                    return Err(OmniError::manifest_internal(format!(
+                        "__manifest version {version} holds a manifest of version {}",
+                        read.version
+                    )));
+                }
+                Ok(read)
             })
             .buffered(concurrency.max(1))
             .try_collect()
