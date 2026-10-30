@@ -885,6 +885,61 @@ async fn static_token_app(settings: omnigraph_server::McpSettings) -> (tempfile:
     (temp, omnigraph_server::build_app(state))
 }
 
+/// A static token with no applied policy: every tool is listed, `read`
+/// answers, and a write is refused by the server's default deny with nothing
+/// written.
+#[tokio::test]
+async fn mcp_default_deny_lists_read_and_refuses_mutate_without_a_policy() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        graph.to_string_lossy().to_string(),
+        vec![("default".to_string(), "secret".to_string())],
+        None,
+    )
+    .await
+    .unwrap()
+    .with_mcp_settings(omnigraph_server::McpSettings::default());
+    let app = omnigraph_server::build_app(state);
+
+    let names: Vec<String> = tool_list(&app, "secret")
+        .await
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(names.iter().any(|name| name == "read"), "{names:?}");
+    assert!(names.iter().any(|name| name == "mutate"), "{names:?}");
+
+    let read = call(
+        &app,
+        "secret",
+        "read",
+        json!({"graph":"default","query":"query q() { match { $p: Person } return { $p.name } }"}),
+    )
+    .await;
+    assert_eq!(read["result"]["isError"], false, "{read}");
+    assert!(
+        read["result"]["structuredContent"]["row_count"]
+            .as_u64()
+            .is_some_and(|rows| rows > 0),
+        "{read}"
+    );
+
+    let before = manifest_dataset_version(&graph).await;
+    let refused = call(
+        &app,
+        "secret",
+        "mutate",
+        json!({"graph":"default","query":"query add($name: String) { insert Person { name: $name } }","params":{"name":"Mallory"}}),
+    )
+    .await;
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    let content = &refused["result"]["structuredContent"];
+    assert_eq!(content["status"], 403, "{refused}");
+    assert!(content.to_string().contains("default-deny"), "{refused}");
+    assert_eq!(manifest_dataset_version(&graph).await, before);
+}
+
 #[tokio::test]
 async fn static_token_server_serves_mcp_without_oauth_discovery() {
     let mut settings = omnigraph_server::McpSettings::default();

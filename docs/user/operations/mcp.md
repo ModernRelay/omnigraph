@@ -182,6 +182,11 @@ runs under the same policy action as its HTTP route, so a caller can do over
 MCP exactly what its credential may do over HTTP. To restrict what an agent
 may do, narrow the policy for the agent's credential.
 
+The removed `--mcp-allow-adhoc` and `--mcp-allow-writes` flags make
+`omnigraph-server` refuse to start; leftover `OMNIGRAPH_MCP_ALLOW_*` variables
+are ignored, so such a deployment lists every tool. A token with no applied
+policy still only reads: `read` answers, and a write tool returns 403.
+
 ## Tools
 
 ### Read tools

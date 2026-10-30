@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-06-01
-updated: 2026-10-29
+updated: 2026-10-30
 discussion: https://github.com/ModernRelay/omnigraph/issues/991
 supersedes: []
 superseded_by: []
@@ -313,8 +313,8 @@ The write tools keep the npm package's contract:
 ### One handler, many tools
 
 `GraphTools` implements the SDK's `ServerHandler`. Each tool is a static
-definition (name, description, input schema, optional output schema, annotations,
-the setting that enables it) and one dispatch arm that deserializes its arguments
+definition (name, description, input schema, optional output schema and
+annotations derived from its declared effect) and one dispatch arm that deserializes its arguments
 (`deny_unknown_fields`) and calls the HTTP handler function with the request's
 `AuthenticatedActor`. No business logic or authorization is duplicated.
 
@@ -405,7 +405,9 @@ token learns nothing about the admission file.
   `resource_metadata` parameter's presence instead.
 - Removing `--mcp-allow-adhoc` and `--mcp-allow-writes` lists every tool on
   every server. A server started with either flag refuses to start until the
-  flag is removed; a deployment that relied on them to keep agents read-only
+  flag is removed; the old `OMNIGRAPH_MCP_ALLOW_ADHOC` and
+  `OMNIGRAPH_MCP_ALLOW_WRITES` variables are ignored. A token with no applied
+  policy still only reads, and its listed write calls are refused 403. A deployment that relied on them to keep agents read-only
   narrows the policy for the agents' credentials instead.
 - Phase 3 adds tools and optional arguments. Two results change: `queries`
   lists stored mutations too, marked `mutation: true`, and `mutate` no longer
@@ -442,19 +444,21 @@ The owner is `crates/omnigraph-server/tests/integration/mcp.rs`, extended rather
 than duplicated:
 
 - discovery at both metadata paths, 404 for other suffixes, both challenge forms;
-- `tools/list` snapshot per setting combination (names, annotations, presence of
-  `outputSchema`, absence of disabled tools) and `initialize` instructions;
+- one `tools/list` snapshot (names, annotations, required arguments, presence of
+  `outputSchema`), compared with the shared operation inventory, and
+  `initialize` instructions;
 - `schema` and `read` results equal to the HTTP routes' bodies for an allowed actor;
   denied actors get the same refusal envelope as other tools; `read` refuses
   `insert`/`update`/`delete` and `branch create` with the manifest version
   unchanged; the 64 KiB, 1 MiB and deadline bounds hold;
 - phase 2: a static-token server answers with the token and 401 without it, refuses
   a foreign `Host` and any `Origin`; each parity tool equals its route; resources
-  list and read; write tools are absent by default, honour `if_graph_commit` (412
+  list and read; write tools are listed, refused 403 for a token with no applied
+  policy with the manifest version unchanged, honour `if_graph_commit` (412
   with no effect), and report `outcome_unknown` when the wait ends first;
 - phase 3: each new tool's result equals its route's for the same request, and
-  a policy denial equals the route's refusal; a stored mutation runs only with
-  writes enabled, refuses a stale or empty `if_graph_commit` without effect, and
+  a policy denial equals the route's refusal; a stored mutation runs through
+  `mutate` under `change`, refuses a stale or empty `if_graph_commit` without effect, and
   never reaches the unconditional route with a precondition.
 
 `openapi.json` and its drift test cover the new route. In-source `mcp.rs` tests keep
@@ -516,8 +520,11 @@ a deferred item or the existing allowed-origin rule.
   table's two opt-in rows; "Both opt-ins default off even when an applied
   Cedar policy would deny the actions: they are defence in depth that an
   operator turns on deliberately, independent of policy"; the catalog's
-  "opt-in" phase labels; "because MCP writes are opt-in"; and the rejected
-  alternative "Default the opt-ins on when a policy is applied".
+  "opt-in" phase labels; "because MCP writes are opt-in"; the rejected
+  alternative "Default the opt-ins on when a policy is applied"; Design's
+  "the setting that enables it"; and Evidence's "`tools/list` snapshot per
+  setting combination", "absence of disabled tools", "write tools are absent
+  by default" and "a stored mutation runs only with writes enabled".
 - 2026-10-27: An unadmitted subject and an expired admission snapshot no
   longer answer 401 `invalid_token` (issue
   [#1172](https://github.com/ModernRelay/omnigraph/issues/1172)); they answer

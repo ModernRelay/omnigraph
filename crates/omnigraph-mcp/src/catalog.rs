@@ -65,7 +65,7 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "queries",
         title: "List stored queries",
-        description: "List a graph's stored queries: each `name`, its description and instruction, whether it is a `mutation`, and typed `params` (`name`, `kind`, `nullable`; `item_kind` for lists, `vector_dim` for vectors). A non-nullable parameter is required. Run a stored read with `query`. When write tools are enabled, run a stored mutation with `mutate`, passing its `name` and no `query`. Invocation is authorized separately, so a listed query can still be refused.",
+        description: "List a graph's stored queries: each `name`, its description and instruction, whether it is a `mutation`, and typed `params` (`name`, `kind`, `nullable`; `item_kind` for lists, `vector_dim` for vectors). A non-nullable parameter is required. Run a stored read with `query`. Run a stored mutation with `mutate`, passing its `name` and no `query`. Invocation is authorized separately, so a listed query can still be refused.",
         input: graph_schema,
         output: Some(queries_output_schema),
         effect: Effect::Read,
@@ -73,7 +73,7 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "query",
         title: "Run a stored read",
-        description: "Run a stored read by `name` with `params` keyed by its declared parameter names (see `queries`). Reads `branch`, `main` when omitted. Returns `rows`, `row_count` and the read's `graph_commit_id`, plus `ranking` when the read orders by a search. Stored mutations are refused here; `mutate` runs them when write tools are enabled.",
+        description: "Run a stored read by `name` with `params` keyed by its declared parameter names (see `queries`). Reads `branch`, `main` when omitted. Returns `rows`, `row_count` and the read's `graph_commit_id`, plus `ranking` when the read orders by a search. Stored mutations are refused here; `mutate` runs them, and policy can still refuse it.",
         input: query_schema,
         output: None,
         effect: Effect::Read,
