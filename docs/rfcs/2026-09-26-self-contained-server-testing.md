@@ -209,7 +209,7 @@ that path.
 | Step header | Where the step goes under the `omnigraph-server` route |
 |---|---|
 | `via http` | The runner's real HTTP client, kernel TCP on loopback, the real server process and its listener, `axum::serve`, router, authorization, handler, the embedded engine, and the response back over the same socket. |
-| `via mcp` | The server's MCP surface at `/mcp` (`crates/omnigraph-server/src/mcp.rs`, streamable HTTP, mounted only when an OIDC resource is configured). A `--- query` step runs its authored GQ read through the `read` tool ([RFC 0003](0003-mcp-server-surface.md)), which every server lists; `via mcp` is admitted on `--- query` only. |
+| `via mcp` | The server's MCP surface at `/mcp` (`crates/omnigraph-server/src/mcp.rs`, streamable HTTP, mounted only when an OIDC resource is configured). A `--- query` step runs its authored GQ read through the `query` tool with source ([RFC 0003](0003-mcp-server-surface.md)); `via mcp` is admitted on `--- query` only. |
 | `--- cli` | The `omnigraph` binary spawned by the runner in served mode against the same listener, so the CLI's own HTTP client crosses the same socket path; its evidence is exit code, stdout and stderr. |
 | `via engine` | On a `--- query`, a read-only `Omnigraph` open of the owned root, admitted only after a lifecycle step has contained the serving process: the physical read. `--- mutate via engine` in such a file is refused as `invalid_case`. |
 

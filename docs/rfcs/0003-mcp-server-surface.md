@@ -39,7 +39,7 @@ transport:
 1. **Self-contained discovery and useful read tools.** Protected-resource
    metadata is served at the path the OAuth challenge advertises; a refused
    bearer gets `error="invalid_token"`; a `schema` tool and an ad-hoc
-   `read` tool let a model answer questions about a graph.
+   read through `query` let a model answer questions about a graph.
 2. **MCP for every authenticated deployment.** `/mcp` is mounted whenever the
    server has a bearer credential source (static tokens, signed data tokens or
    OIDC); read parity with the `@modernrelay/omnigraph-mcp` npm package;
@@ -177,9 +177,8 @@ request does (unknown and denied graphs are 404, an authorized unavailable graph
 |---|---|---|---|---|
 | `graphs` | shipped | `server_graphs_discovery` (`GET /graphs/discovery`) for an identity credential; otherwise `server_graphs_list` (`GET /graphs`) narrowed to ids and names | identity, or `graph_list` | read-only |
 | `queries` | shipped | `server_list_queries` (`GET /graphs/{id}/queries`) | `read` | read-only |
-| `query` | shipped | `server_invoke_query` (`POST /graphs/{id}/queries/{name}`), `expect_mutation: false` | `invoke_query`, then `read` | read-only |
+| `query` | shipped; source in 1 | with `name` only, `server_invoke_query` (`POST /graphs/{id}/queries/{name}`), `expect_mutation: false`; with `query`, `server_query` (`POST /graphs/{id}/query`) | `invoke_query`, then `read`; source: `read` | read-only |
 | `schema` | 1 | `server_schema_get` (`GET /graphs/{id}/schema`) | `read` | read-only |
-| `read` | 1 | `server_query` (`POST /graphs/{id}/query`) | `read` | read-only |
 | `health` | 2 | `server_health` (`GET /healthz`) | none | read-only |
 | `snapshot` | 2 | `server_snapshot` (`GET /graphs/{id}/snapshot`) | `read` | read-only |
 | `branches_list` | 2 | `server_branch_list` (`GET /graphs/{id}/branches`) | `read` | read-only |
@@ -206,16 +205,16 @@ every graph operation that is not a byte stream has a tool, and `commits_list`
 takes the route's `listing`.
 
 Names follow the shipped tools. The package's `schema_get` is `schema`; its ad-hoc
-`query` is `read`, because the shipped `query` already names the stored read; its
-`graphs_list` is the shipped `graphs`. Discovery admits only identity
+`query` is the shipped `query` given source, as `mutate` takes source or a
+stored name; its `graphs_list` is the shipped `graphs`. Discovery admits only identity
 credentials (OIDC or signed identity tokens), so for any other credential, such
 as a static token, `graphs` calls `GET /graphs` under `graph_list`, as the
 package did, and returns only ids and names. `graph_list` is server-scoped, and
 without an applied cluster policy every server-scoped action is denied, so on a
 default static-token server `graphs` returns 403. The tool description and the
 server instructions say so, and tell a model to ask for a `graph_list` permit or
-to use a graph id the user supplies. `read` also serves what `POST /query`
-serves: `branch list`, `branch diff`, `branch merge-base`, `branch merge … dry run`
+to use a graph id the user supplies. `query` with source also serves what
+`POST /query` serves: `branch list`, `branch diff`, `branch merge-base`, `branch merge … dry run`
 and `explain query …`. `mutate` serves the branch write statements `POST /mutate`
 serves. Stored mutations stay unavailable through `query`, which is read-only.
 `mutate` runs one when given `name` and no `query`, as `omnigraph mutate NAME`
@@ -249,7 +248,7 @@ valid only after its NDJSON snapshot is installed.
   can call `query` or `mutate` correctly.
 
 Server `instructions` and tool descriptions tell a model to call `schema` (or read
-the schema resource) first, then `read` or a stored `query`, and summarize the
+the schema resource) first, then `query` with source or a stored name, and summarize the
 write contract below.
 
 ### Resources (phase 2)
@@ -292,7 +291,7 @@ The write tools keep the npm package's contract:
   must treat that the same way. Atomic publication does not make a write
   exactly-once after a lost acknowledgement ([first-principles data systems,
   §B.1](../dev/systems.md#b1-a-guarantee-record)). Before replaying, reconcile: read the target with
-  `read` or `snapshot` and compare its `graph_commit_id` with the one the write was
+  `query` or `snapshot` and compare its `graph_commit_id` with the one the write was
   based on, or list the branch's commits with `commits_list` and look for the
   write's effect. A replay of `mutate` should carry `if_graph_commit` so a write
   that did land fails with 412 instead of applying twice.
@@ -447,8 +446,8 @@ than duplicated:
 - one `tools/list` snapshot (names, annotations, required arguments, presence of
   `outputSchema`), compared with the shared operation inventory, and
   `initialize` instructions;
-- `schema` and `read` results equal to the HTTP routes' bodies for an allowed actor;
-  denied actors get the same refusal envelope as other tools; `read` refuses
+- `schema` and `query` results equal to the HTTP routes' bodies for an allowed actor;
+  denied actors get the same refusal envelope as other tools; `query` refuses
   `insert`/`update`/`delete` and `branch create` with the manifest version
   unchanged; the 64 KiB, 1 MiB and deadline bounds hold;
 - phase 2: a static-token server answers with the token and 401 without it, refuses
@@ -513,6 +512,16 @@ a deferred item or the existing allowed-origin rule.
 
 ## Decision log
 
+- 2026-10-30: The ad-hoc `read` tool is folded into `query`, which takes GQ
+  source in `query` or a stored read's `name`, the shape `mutate` already has
+  for writes and the CLI's `query` has: one tool per effect, with the same
+  arguments meaning the same thing. A stored read now also accepts
+  `snapshot`, which its route already took. Superseded sentences: the catalog
+  row for `read`; "its ad-hoc `query` is `read`, because the shipped `query`
+  already names the stored read"; "`read` also serves what `POST /query`
+  serves"; "then `read` or a stored `query`"; "read the target with `read` or
+  `snapshot`"; and Evidence's "`schema` and `read` results" and "`read`
+  refuses".
 - 2026-10-29: The `--mcp-allow-adhoc` and `--mcp-allow-writes` boot settings
   are removed, and every tool is listed. Each tool already ran under its HTTP
   route's Cedar action, so the settings narrowed only the MCP route of an

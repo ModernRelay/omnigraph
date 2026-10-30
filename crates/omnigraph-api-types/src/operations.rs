@@ -521,7 +521,10 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         "/graphs/{graph_id}/query",
         Capability::Read,
         None,
-        Surface::bound(&["read"]),
+        Surface::restricted(
+            &["query"],
+            "query with source selects this route; with only a name it invokes a stored read.",
+        ),
         Surface::restricted(
             &["query"],
             "Ad-hoc source selects this route; a stored name selects query invoke.",

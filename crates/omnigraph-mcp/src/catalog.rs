@@ -65,24 +65,16 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "queries",
         title: "List stored queries",
-        description: "List a graph's stored queries: each `name`, its description and instruction, whether it is a `mutation`, and typed `params` (`name`, `kind`, `nullable`; `item_kind` for lists, `vector_dim` for vectors). A non-nullable parameter is required. Run a stored read with `query`. Run a stored mutation with `mutate`, passing its `name` and no `query`. Invocation is authorized separately, so a listed query can still be refused.",
+        description: "List a graph's stored queries: each `name`, its description and instruction, whether it is a `mutation`, and typed `params` (`name`, `kind`, `nullable`; `item_kind` for lists, `vector_dim` for vectors). A non-nullable parameter is required. Run a stored read with `query` and a stored mutation with `mutate`, each passing its `name` and no `query`. Invocation is authorized separately, so a listed query can still be refused.",
         input: graph_schema,
         output: Some(queries_output_schema),
         effect: Effect::Read,
     },
     ToolSpec {
         name: "query",
-        title: "Run a stored read",
-        description: "Run a stored read by `name` with `params` keyed by its declared parameter names (see `queries`). Reads `branch`, `main` when omitted. Returns `rows`, `row_count` and the read's `graph_commit_id`, plus `ranking` when the read orders by a search. Stored mutations are refused here; `mutate` runs them, and policy can still refuse it.",
+        title: "Run a read",
+        description: "Run a read: GQ source you write in `query`, or a stored read by `name` (see `queries`), with `params` keyed by the declared parameter names. Call `schema` before writing source. Declare every value as a typed parameter (`query people($min: I32) { match { $p: Person $p.age >= $min } return { $p.name } }`) and pass the values in `params`; with source, `name` picks one declared query when it declares several. Reads `branch` (default `main`) or a `snapshot`, never both. Search operators (`nearest`, `bm25`, `rrf`) need a trailing `limit`. Source may also be `branch list`, `branch diff <source> [into <target>]`, `branch merge-base …`, `branch merge … dry run` or `explain query …`, sent without `branch`, `snapshot`, `name` or `params`; or `explain load csv …`, which requires `change` permission before probing source metadata and answers the accepted load plan without reading payload bytes or publishing (`branch` allowed, never `snapshot`). Mutations, stored mutations and branch writes are refused here; `mutate` runs them. Returns `rows`, `row_count` and `graph_commit_id`, plus `ranking` for a search order: `exhaustive: false` means the vector search left index partitions unsearched, so a nearer row may exist.",
         input: query_schema,
-        output: None,
-        effect: Effect::Read,
-    },
-    ToolSpec {
-        name: "read",
-        title: "Run a GQ read",
-        description: "Run a GQ read query you write. Call `schema` first. Declare every value as a typed parameter (`query people($min: I32) { match { $p: Person $p.age >= $min } return { $p.name } }`) and pass the values in `params`; pick one declared query with `name` when the source declares several. Reads `branch` (default `main`) or a `snapshot`, never both. Search operators (`nearest`, `bm25`, `rrf`) need a trailing `limit`. Also answers `branch list`, `branch diff <source> [into <target>]`, `branch merge-base …`, `branch merge … dry run` and `explain query …`, sent without `branch`, `snapshot`, `name` or `params`; and `explain load csv …`, which requires `change` permission before probing source metadata and answers the accepted load plan without reading payload bytes or publishing (`branch` allowed, never `snapshot`). Mutations and branch writes are refused. Returns `rows`, `row_count` and `graph_commit_id`, plus `ranking` for a search order: `exhaustive: false` means the vector search left index partitions unsearched, so a nearer row may exist.",
-        input: read_schema,
         output: None,
         effect: Effect::Read,
     },
@@ -217,7 +209,7 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "branches_merge",
         title: "Merge a branch",
-        description: "Merge branch `source` into `target` (default `main`). A merge that publishes returns its exact commit; an already up-to-date merge returns none. A conflict fails with 409 and `merge_conflicts`, writing nothing. To preview, run `branch merge <source> into <target> dry run` with `read`.",
+        description: "Merge branch `source` into `target` (default `main`). A merge that publishes returns its exact commit; an already up-to-date merge returns none. A conflict fails with 409 and `merge_conflicts`, writing nothing. To preview, run `branch merge <source> into <target> dry run` with `query`.",
         input: branch_merge_schema,
         output: None,
         effect: Effect::Destructive { idempotent: false },
@@ -249,8 +241,8 @@ pub(super) const INSTRUCTIONS: &str = concat!(
     "OmniGraph serves typed property graphs. Every call runs under the applied policy for your credential; a listed tool or graph can still be refused.\n",
     "1. Call `graphs` for graph ids. With a credential that is not an identity, it needs a `graph_list` permit, which a server without a cluster policy refuses; then ask the user for the graph id.\n",
     "2. Call `schema` for the graph (or read `omnigraph://graphs/{graph}/schema`) before writing a query: it declares the types, properties, keys and edges a query may name.\n",
-    "3. Prefer a stored read: `queries` lists stored queries with typed parameters, and `query` runs a stored read.\n",
-    "4. Otherwise write a GQ read and run it with `read`, with every value passed as a declared, typed parameter. `read` refuses mutations.\n",
+    "3. Prefer a stored read: `queries` lists stored queries with typed parameters, and `query` runs one by `name`.\n",
+    "4. Otherwise write a GQ read and pass it to `query` as `query`, with every value passed as a declared, typed parameter. `query` refuses mutations.\n",
     "Writes: `mutate`, `load`, `blobs_clear`, `branches_create`, `branches_delete`, `branches_merge`, `commits_publish` and `commits_drop` each publish at most one commit. `mutate` with `name` and no `query` runs a stored mutation from `queries`. For read-modify-write, pass your read's `graph_commit_id` to `mutate` as `if_graph_commit`; a 412 means nothing was written. The server never retries a write. A result with `outcome_unknown`, or no response at all (a client timeout, a cancellation or a dropped connection), means the write may or may not have happened: read the target or list its commits and reconcile before replaying, and replay a `mutate` with `if_graph_commit`. Schema and deployment changes are operator-owned and not available here.\n",
     "Reads carry their `graph_commit_id`. A result is limited to 1 MiB and a read to 30 seconds; narrow the query with filters or `limit` when a result is too large. A refused call returns `isError` with the HTTP `status` and the server's `error` body, or an MCP `code` and `message`.",
 );
@@ -371,24 +363,13 @@ pub(super) fn commit_schema() -> Value {
 pub(super) fn query_schema() -> Value {
     arguments(
         json!({
-            "name": text_schema("Stored read name, from `queries`."),
-            "params": {"type": "object", "description": "Values keyed by the read's declared parameter names."},
-            "branch": text_schema("Branch to read. Defaults to `main`."),
-        }),
-        &["name"],
-    )
-}
-
-pub(super) fn read_schema() -> Value {
-    arguments(
-        json!({
-            "query": text_schema("GQ source declaring one or more read queries, or one branch read or `explain` statement (`explain query …` or `explain load csv …`)."),
-            "name": text_schema("Which declared query to run when `query` declares several."),
+            "query": text_schema("GQ source declaring one or more read queries, or one branch read or `explain` statement (`explain query …` or `explain load csv …`). Omit it to run the stored read `name`."),
+            "name": text_schema("With `query`, which declared query to run when it declares several. Without `query`, the stored read to run, from `queries`."),
             "params": {"type": "object", "description": "Values keyed by the query's declared parameter names, without `$`."},
             "branch": text_schema("Branch to read. Defaults to `main`. Not with `snapshot`."),
             "snapshot": text_schema("Graph commit id to read instead of a branch head."),
         }),
-        &["query"],
+        &[],
     )
 }
 

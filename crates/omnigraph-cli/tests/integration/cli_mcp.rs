@@ -397,7 +397,7 @@ impl Served {
     fn people(&self) -> Vec<String> {
         let read = self.rpc(&tool_call(
             99,
-            "read",
+            "query",
             json!({"graph": "knowledge", "query": PEOPLE}),
         ));
         read["result"]["structuredContent"]["rows"]
@@ -610,10 +610,10 @@ fn mcp_binds_one_graph_and_relays_its_reads_unchanged() {
     );
 
     // A call that omits its graph is the server's answer for the bound graph.
-    let read = bridge.tool(1, "read", json!({"query": PEOPLE}));
+    let read = bridge.tool(1, "query", json!({"query": PEOPLE}));
     let expected = served.rpc(&tool_call(
         1,
-        "read",
+        "query",
         json!({"graph": "knowledge", "query": PEOPLE}),
     ));
     assert_eq!(read, expected);
@@ -679,7 +679,7 @@ fn mcp_binds_one_graph_and_relays_its_reads_unchanged() {
     // `--as` asserts the actor on every request: a match changes nothing,
     // and another actor is refused by the server before anything runs.
     let mut bridge = home.bridge(&["--target", "staging", "--as", "act-agent"], &token);
-    let read = bridge.tool(1, "read", json!({"query": PEOPLE}));
+    let read = bridge.tool(1, "query", json!({"query": PEOPLE}));
     assert_eq!(
         read["result"]["structuredContent"]["row_count"], 4,
         "{read}"

@@ -292,6 +292,8 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
         json!({"graph":"default","name":"people","actor":"principal:stable_alice"}),
         json!({"graph":"default","name":"people","expect_mutation":true}),
         json!({"graph":"default","name":"people","query":"insert Person { name: 'x', age: 1 }"}),
+        // Neither source nor a stored name.
+        json!({"graph":"default"}),
     ] {
         let rejected = call(&app, &alice, "query", arguments).await;
         assert!(
@@ -626,8 +628,7 @@ async fn mcp_tool_list_describes_every_tool() {
         "graphs [] read_only output",
         "schema [graph] read_only output",
         "queries [graph] read_only output",
-        "query [graph,name] read_only",
-        "read [graph,query] read_only",
+        "query [graph] read_only",
         "snapshot [graph] read_only",
         "access [graph] read_only output",
         "branches_list [graph] read_only output",
@@ -702,7 +703,7 @@ async fn mcp_tool_list_describes_every_tool() {
     assert_eq!(lines, expected);
     let text = instructions(&app, &alice).await;
     assert!(text.contains("Call `schema`"), "{text}");
-    assert!(text.contains("`read`"), "{text}");
+    assert!(text.contains("pass it to `query`"), "{text}");
     assert!(text.contains("Writes:"), "{text}");
     // Compare the real tools/list response with the shared inventory,
     // without adding an engine dependency to the MCP crate.
@@ -745,14 +746,15 @@ async fn mcp_schema_and_adhoc_read_reuse_their_routes_and_policy() {
         json!([{"name":"name","kind":"string","nullable":false}])
     );
 
-    // `read` answers exactly `POST /query`'s body, including branch reads.
+    // `query` with source answers exactly `POST /query`'s body, including
+    // branch reads.
     let source = "query adults($min: I32) { match { $p: Person $p.age >= $min } return { $p.name } order { $p.name asc } }";
     for arguments in [
         json!({"graph":"default","query":source,"params":{"min":30}}),
         json!({"graph":"default","query":source,"params":{"min":30},"branch":"main"}),
         json!({"graph":"default","query":"branch list"}),
     ] {
-        let read = call(&app, &alice, "read", arguments.clone()).await;
+        let read = call(&app, &alice, "query", arguments.clone()).await;
         assert_eq!(read["result"]["isError"], false, "{read}");
         let mut body = arguments.clone();
         body.as_object_mut().unwrap().remove("graph");
@@ -771,7 +773,7 @@ async fn mcp_schema_and_adhoc_read_reuse_their_routes_and_policy() {
     for (tool, arguments) in [
         ("schema", json!({"graph":"default"})),
         (
-            "read",
+            "query",
             json!({"graph":"default","query":source,"params":{"min":1}}),
         ),
     ] {
@@ -795,7 +797,7 @@ async fn mcp_schema_and_adhoc_read_reuse_their_routes_and_policy() {
     ] {
         let bearer = token(subject, RESOURCE);
         let arguments = json!({"graph":"default","query":explain_load});
-        let refused = call(&app, &bearer, "read", arguments).await;
+        let refused = call(&app, &bearer, "query", arguments).await;
         assert_eq!(refused["result"]["isError"], true, "{refused}");
         assert_eq!(
             refused["result"]["structuredContent"]["status"],
@@ -822,7 +824,7 @@ async fn mcp_schema_and_adhoc_read_reuse_their_routes_and_policy() {
         }
     }
 
-    // Writes never pass through `read`, and leave the graph unchanged.
+    // Writes never pass through `query`, and leave the graph unchanged.
     let before = manifest_dataset_version(&graph_path(temp.path())).await;
     for query in [
         "query add() { insert Person { name: \"Mallory\", age: 1 } }",
@@ -833,7 +835,7 @@ async fn mcp_schema_and_adhoc_read_reuse_their_routes_and_policy() {
         let refused = call(
             &app,
             &alice,
-            "read",
+            "query",
             json!({"graph":"default","query":query}),
         )
         .await;
@@ -846,7 +848,7 @@ async fn mcp_schema_and_adhoc_read_reuse_their_routes_and_policy() {
     let unknown = call(
         &app,
         &alice,
-        "read",
+        "query",
         json!({"graph":"default","query":"branch list","settings":{}}),
     )
     .await;
@@ -860,7 +862,7 @@ async fn mcp_schema_and_adhoc_read_reuse_their_routes_and_policy() {
     let oversized = rpc(
         Some(&alice),
         "tools/call",
-        json!({"name":"read","arguments":{"graph":"default","query":format!("// {}\nbranch list", "x".repeat(64 * 1024))}}),
+        json!({"name":"query","arguments":{"graph":"default","query":format!("// {}\nbranch list", "x".repeat(64 * 1024))}}),
     );
     assert_eq!(
         app.clone().oneshot(oversized).await.unwrap().status(),
@@ -885,8 +887,8 @@ async fn static_token_app(settings: omnigraph_server::McpSettings) -> (tempfile:
     (temp, omnigraph_server::build_app(state))
 }
 
-/// A static token with no applied policy: every tool is listed, `read`
-/// answers, and a write is refused by the server's default deny with nothing
+/// A static token with no applied policy: every tool is listed, `query`
+/// answers source, and a write is refused by the server's default deny with nothing
 /// written.
 #[tokio::test]
 async fn mcp_default_deny_lists_read_and_refuses_mutate_without_a_policy() {
@@ -907,13 +909,13 @@ async fn mcp_default_deny_lists_read_and_refuses_mutate_without_a_policy() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap().to_owned())
         .collect();
-    assert!(names.iter().any(|name| name == "read"), "{names:?}");
+    assert!(names.iter().any(|name| name == "query"), "{names:?}");
     assert!(names.iter().any(|name| name == "mutate"), "{names:?}");
 
     let read = call(
         &app,
         "secret",
-        "read",
+        "query",
         json!({"graph":"default","query":"query q() { match { $p: Person } return { $p.name } }"}),
     )
     .await;
@@ -1451,7 +1453,7 @@ async fn mcp_write_tools_are_conditional_and_policy_gated() {
     let read = call(
         &app,
         "secret",
-        "read",
+        "query",
         json!({"graph":"default","query":"query n() { match { $p: Person } return { $p.name } }"}),
     )
     .await;
@@ -1533,7 +1535,7 @@ async fn mcp_write_tools_are_conditional_and_policy_gated() {
     let names = call(
         &app,
         "secret",
-        "read",
+        "query",
         json!({"graph":"default","query":"query names() { match { $p: Person } return { $p.name } order { $p.name asc } }"}),
     )
     .await;
