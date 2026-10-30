@@ -31,7 +31,11 @@ fn lifecycle_record(root: &std::path::Path, origin: &str, name: &str) -> std::pa
 const MANAGED_REVISION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 fn managed_preview(state: &str) -> Value {
-    serde_json::json!({"data":{"preview_id":"saved-plan","state":state,"revision":MANAGED_REVISION,"input_digest":"exact-input","generation":{"state_revision":3}},"meta":{"cluster_id":"managed-test","incarnation":"inc-one","provenance":"service_db"}})
+    let mut body = serde_json::json!({"data":{"preview_id":"saved-plan","state":state,"revision":MANAGED_REVISION,"first_attempt_deadline":"2026-10-30T00:44:57Z","failure_code":null,"input_digest":"exact-input","generation":{"state_revision":3}},"meta":{"cluster_id":"managed-test","incarnation":"inc-one","provenance":"service_db"}});
+    if state == "ready" {
+        body["data"]["native_plan"] = serde_json::json!({"ok":true,"changes":[]});
+    }
+    body
 }
 
 fn managed_delivery(delivery: &str) -> Value {
@@ -1959,7 +1963,7 @@ fn managed_plan_and_apply_submit_exact_native_intent_without_waiting() {
             vec!["plan", "--rev", MANAGED_REVISION],
             "/v1/clusters/managed-test/plans",
             serde_json::json!({"revision":MANAGED_REVISION}),
-            managed_preview("ready"),
+            managed_preview("capturing"),
         ),
         (
             vec!["apply", "--plan", "saved-plan"],
@@ -1978,7 +1982,11 @@ fn managed_plan_and_apply_submit_exact_native_intent_without_waiting() {
             "exact-key",
             "--json",
         ]));
-        assert_eq!(parse_stdout_json(&output), body);
+        let mut expected_output = body;
+        if path.ends_with("/plans") {
+            expected_output["idempotency_key"] = "exact-key".into();
+        }
+        assert_eq!(parse_stdout_json(&output), expected_output);
         assert!(String::from_utf8_lossy(&output.stderr).contains("exact-key"));
         assert!(!String::from_utf8_lossy(&output.stderr).contains("og_fixture_control"));
         assert_control_request(
@@ -2085,17 +2093,26 @@ fn managed_plan_omitted_revision_captures_public_source_head_once() {
         ]);
         write_managed_target(temp.path(), &api.origin);
         let output = managed_cli(temp.path(), &api.origin)
-            .args(["plan", "--idempotency-key", "snapshot", "--json"])
+            .args([
+                "plan",
+                "--no-wait",
+                "--idempotency-key",
+                "snapshot",
+                "--json",
+            ])
             .output()
             .unwrap();
         assert_eq!(
             output.status.code(),
             Some(match state {
-                "ready" => 0,
-                "capturing" => 5,
+                "ready" | "capturing" => 0,
                 _ => 1,
             })
         );
+        let mut expected = expected;
+        if state == "capturing" {
+            expected["idempotency_key"] = "snapshot".into();
+        }
         assert_eq!(parse_stdout_json(&output), expected);
         assert_control_request(
             &api.workflow_requests()[0],
@@ -2117,68 +2134,216 @@ fn managed_plan_omitted_revision_captures_public_source_head_once() {
 }
 
 #[test]
-#[ignore = "nightly: real 2 s delivery polling and a 1 s wait deadline"]
-fn managed_apply_polls_original_delivery_without_resubmission_or_cancellation() {
-    for timeout in [false, true] {
+fn managed_plan_replay_reads_only_the_original_authorized_preview() {
+    for case in [
+        "ready",
+        "denied",
+        "other-id",
+        "other-revision",
+        "other-deadline",
+        "missing-plan",
+    ] {
         let temp = tempdir().unwrap();
-        let queued = managed_delivery("queued");
-        let complete = managed_complete(true, true, "archived");
-        let replies = if timeout {
-            vec![IntentReply::json(202, queued.clone())]
-        } else {
-            vec![
-                IntentReply::json(202, queued.clone()),
-                IntentReply::json(200, complete.clone()),
-            ]
+        let mut accepted = managed_preview("ready");
+        accepted["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("native_plan");
+        let mut observed = managed_preview("ready");
+        let (status, exit) = match case {
+            "denied" => {
+                observed = serde_json::json!({"type":"native_authorization_denied","detail":"Current policy denies this preview"});
+                (403, 2)
+            }
+            "other-id" => {
+                observed["data"]["preview_id"] = "another-preview".into();
+                (200, 2)
+            }
+            "other-revision" => {
+                observed["data"]["revision"] = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+                (200, 2)
+            }
+            "other-deadline" => {
+                observed["data"]["first_attempt_deadline"] = "2026-10-30T00:45:57Z".into();
+                (200, 2)
+            }
+            "missing-plan" => {
+                observed["data"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("native_plan");
+                (200, 1)
+            }
+            _ => (200, 0),
         };
-        let api = lifecycle_fixture(replies);
+        let api = lifecycle_fixture(vec![
+            IntentReply::json(200, accepted),
+            IntentReply::json(status, observed.clone()),
+        ]);
         write_managed_target(temp.path(), &api.origin);
         let output = managed_cli(temp.path(), &api.origin)
             .args([
-                "apply",
-                "--plan",
-                "saved-plan",
-                "--timeout",
-                if timeout { "1" } else { "10" },
+                "plan",
+                "--rev",
+                MANAGED_REVISION,
                 "--idempotency-key",
-                "poll-key",
+                "original-plan-key",
                 "--json",
             ])
             .output()
             .unwrap();
-        assert_eq!(
-            output.status.code(),
-            Some(if timeout { 5 } else { 0 }),
-            "{output:?}"
-        );
-        assert_eq!(
-            parse_stdout_json(&output),
-            if timeout { queued } else { complete }
-        );
-        if timeout {
-            assert!(
-                String::from_utf8_lossy(&output.stderr)
-                    .contains("cluster status delivery-one --target NAME")
+        assert_eq!(output.status.code(), Some(exit), "{case}: {output:?}");
+        let body = parse_stdout_json(&output);
+        if exit == 0 {
+            assert_eq!(body, observed);
+        } else {
+            assert_eq!(body["accepted_preview"]["preview_id"], "saved-plan");
+            assert_eq!(body["accepted_preview"]["revision"], MANAGED_REVISION);
+            assert_eq!(body["idempotency_key"], "original-plan-key");
+            assert_eq!(
+                body["type"],
+                match case {
+                    "denied" => "native_authorization_denied",
+                    "missing-plan" => "api_response_invalid",
+                    _ => "context_mismatch",
+                }
             );
         }
         assert_control_request(
             &api.workflow_requests()[0],
             "POST",
-            "/v1/clusters/managed-test/deployments",
-            serde_json::json!({"preview_id":"saved-plan"}),
-            Some("poll-key"),
+            "/v1/clusters/managed-test/plans",
+            serde_json::json!({"revision":MANAGED_REVISION}),
+            Some("original-plan-key"),
         );
-        if !timeout {
-            assert_control_request(
-                &api.workflow_requests()[1],
-                "GET",
-                "/v1/clusters/managed-test/deployments/delivery-one",
-                Value::Null,
-                None,
-            );
-        }
+        assert_control_request(
+            &api.workflow_requests()[1],
+            "GET",
+            "/v1/clusters/managed-test/plans/saved-plan",
+            Value::Null,
+            None,
+        );
         api.assert_complete();
         assert_no_core_effects(temp.path());
+    }
+}
+
+#[test]
+#[ignore = "nightly: real 2 s delivery polling and a 1 s wait deadline"]
+fn managed_plan_and_apply_poll_original_identity_without_resubmission_or_cancellation() {
+    for (verb, selector, selected, queued, complete, path, lookup, request) in [
+        (
+            "plan",
+            "--rev",
+            MANAGED_REVISION,
+            managed_preview("capturing"),
+            managed_preview("ready"),
+            "/v1/clusters/managed-test/plans",
+            "/v1/clusters/managed-test/plans/saved-plan",
+            serde_json::json!({"revision":MANAGED_REVISION}),
+        ),
+        (
+            "apply",
+            "--plan",
+            "saved-plan",
+            managed_delivery("queued"),
+            managed_complete(true, true, "archived"),
+            "/v1/clusters/managed-test/deployments",
+            "/v1/clusters/managed-test/deployments/delivery-one",
+            serde_json::json!({"preview_id":"saved-plan"}),
+        ),
+    ] {
+        for outcome in ["ready", "timeout", "failed", "expired", "unavailable"] {
+            if verb == "apply" && !matches!(outcome, "ready" | "timeout") {
+                continue;
+            }
+            let timeout = outcome == "timeout";
+            let terminal_failure = matches!(outcome, "failed" | "expired");
+            let mut complete = complete.clone();
+            if terminal_failure {
+                complete = managed_preview(outcome);
+                complete["data"]["failure_code"] = format!("preview_{outcome}").into();
+            }
+            let temp = tempdir().unwrap();
+            let mut replies = if timeout {
+                vec![IntentReply::json(202, queued.clone())]
+            } else {
+                vec![
+                    IntentReply::json(202, queued.clone()),
+                    IntentReply::json(200, complete.clone()),
+                ]
+            };
+            if outcome == "unavailable" {
+                replies.insert(
+                    1,
+                    IntentReply::json(
+                        503,
+                        serde_json::json!({"type":"unavailable","detail":"retry this read"}),
+                    ),
+                );
+            }
+            let api = lifecycle_fixture(replies);
+            write_managed_target(temp.path(), &api.origin);
+            let output = managed_cli(temp.path(), &api.origin)
+                .args([
+                    verb,
+                    selector,
+                    selected,
+                    "--timeout",
+                    if timeout { "1" } else { "10" },
+                    "--idempotency-key",
+                    "poll-key",
+                    "--json",
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(if timeout {
+                    5
+                } else if terminal_failure {
+                    1
+                } else {
+                    0
+                }),
+                "{output:?}"
+            );
+            let mut expected = if timeout {
+                queued.clone()
+            } else {
+                complete.clone()
+            };
+            if timeout && verb == "plan" {
+                expected["idempotency_key"] = "poll-key".into();
+            }
+            assert_eq!(parse_stdout_json(&output), expected);
+            if timeout {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains(if verb == "plan" {
+                        "--idempotency-key KEY --target NAME"
+                    } else {
+                        "cluster status delivery-one --target NAME"
+                    })
+                );
+            }
+            if terminal_failure {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains(&format!("preview_{outcome}"))
+                );
+            }
+            assert_control_request(
+                &api.workflow_requests()[0],
+                "POST",
+                path,
+                request.clone(),
+                Some("poll-key"),
+            );
+            for observation in api.workflow_requests().iter().skip(1) {
+                assert_control_request(observation, "GET", lookup, Value::Null, None);
+            }
+            api.assert_complete();
+            assert_no_core_effects(temp.path());
+        }
     }
 }
 
