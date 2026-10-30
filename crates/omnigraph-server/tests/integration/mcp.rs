@@ -19,12 +19,6 @@ async fn fixture_app() -> (tempfile::TempDir, Router, AppState) {
     fixture_app_with(omnigraph_server::McpSettings::default()).await
 }
 
-fn adhoc() -> omnigraph_server::McpSettings {
-    let mut settings = omnigraph_server::McpSettings::default();
-    settings.allow_adhoc = true;
-    settings
-}
-
 async fn fixture_app_with(
     settings: omnigraph_server::McpSettings,
 ) -> (tempfile::TempDir, Router, AppState) {
@@ -185,38 +179,7 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
     assert_eq!(response.status(), StatusCode::OK);
     assert!(!response.headers().contains_key("mcp-session-id"));
     assert!(!response.headers().contains_key(HTTP_API_CONTRACT_HEADER));
-    let (status, list) = json_response(&app, rpc(Some(&alice), "tools/list", json!({}))).await;
-    assert_eq!(status, StatusCode::OK, "{list}");
-    let names: Vec<_> = list["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["name"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        names,
-        vec![
-            "health",
-            "graphs",
-            "schema",
-            "queries",
-            "query",
-            "snapshot",
-            "access",
-            "branches_list",
-            "branches_diff",
-            "branches_merge_base",
-            "commits_list",
-            "commits_get",
-            "commits_changes",
-            "diff",
-            "changes_poll",
-            "blobs_stat",
-        ]
-    );
-    for tool in list["result"]["tools"].as_array().unwrap() {
-        assert_eq!(tool["annotations"]["readOnlyHint"], true);
-    }
+    // `mcp_tool_list_describes_every_tool` owns the listing.
     let key = omnigraph_server::GraphKey::cluster(
         omnigraph_server::GraphId::try_from("default").unwrap(),
     );
@@ -653,40 +616,29 @@ async fn instructions(app: &Router, token: &str) -> String {
 }
 
 /// One line per tool: name, required arguments, read-only hint, whether an
-/// output schema is declared. The opt-in `read` tool appears only when the
-/// server enables it.
+/// output schema is declared. Every tool is listed; policy alone decides what
+/// a call may do.
 #[tokio::test]
-async fn mcp_tool_list_follows_the_adhoc_setting_and_describes_every_tool() {
-    let mut advertised = std::collections::BTreeSet::new();
+async fn mcp_tool_list_describes_every_tool() {
     let alice = token("alice", RESOURCE);
-    let reads = |adhoc: bool| {
-        let mut lines = vec![
-            "health [] read_only output",
-            "graphs [] read_only output",
-            "schema [graph] read_only output",
-            "queries [graph] read_only output",
-            "query [graph,name] read_only",
-        ];
-        if adhoc {
-            lines.push("read [graph,query] read_only");
-        }
-        lines.extend([
-            "snapshot [graph] read_only",
-            "access [graph] read_only output",
-            "branches_list [graph] read_only output",
-            "branches_diff [graph,source] read_only",
-            "branches_merge_base [graph,source] read_only",
-            "commits_list [graph] read_only",
-            "commits_get [graph,commit_id] read_only",
-            "commits_changes [graph,commit_id] read_only",
-            "diff [graph,from,to] read_only",
-            "changes_poll [graph] read_only",
-            "blobs_stat [graph,entity,type,id,property] read_only",
-        ]);
-        lines
-    };
-    let mut with_writes = reads(false);
-    with_writes.extend([
+    let expected = vec![
+        "health [] read_only output",
+        "graphs [] read_only output",
+        "schema [graph] read_only output",
+        "queries [graph] read_only output",
+        "query [graph,name] read_only",
+        "read [graph,query] read_only",
+        "snapshot [graph] read_only",
+        "access [graph] read_only output",
+        "branches_list [graph] read_only output",
+        "branches_diff [graph,source] read_only",
+        "branches_merge_base [graph,source] read_only",
+        "commits_list [graph] read_only",
+        "commits_get [graph,commit_id] read_only",
+        "commits_changes [graph,commit_id] read_only",
+        "diff [graph,from,to] read_only",
+        "changes_poll [graph] read_only",
+        "blobs_stat [graph,entity,type,id,property] read_only",
         "mutate [graph]",
         "load [graph,mode,data]",
         "blobs_clear [graph,entity,type,id,property]",
@@ -695,79 +647,65 @@ async fn mcp_tool_list_follows_the_adhoc_setting_and_describes_every_tool() {
         "branches_merge [graph,source]",
         "commits_publish [graph,commit_id]",
         "commits_drop [graph,commit_id]",
-    ]);
-    for (settings, expected) in [
-        (omnigraph_server::McpSettings::default(), reads(false)),
-        (adhoc(), reads(true)),
-        (
-            writes(omnigraph_server::McpSettings::default()),
-            with_writes,
-        ),
-    ] {
-        let enabled = settings.allow_adhoc;
-        let (_temp, app, _state) = fixture_app_with(settings).await;
-        let tools = tool_list(&app, &alice).await;
-        advertised.extend(
-            tools
-                .iter()
-                .map(|tool| tool["name"].as_str().unwrap().to_owned()),
-        );
-        let lines: Vec<String> = tools
-            .iter()
-            .map(|tool| {
-                let required: Vec<&str> = tool["inputSchema"]["required"]
-                    .as_array()
-                    .map(|names| names.iter().map(|n| n.as_str().unwrap()).collect())
-                    .unwrap_or_default();
-                assert_eq!(tool["inputSchema"]["additionalProperties"], false);
-                assert!(tool["title"].as_str().is_some_and(|t| !t.is_empty()));
-                assert!(tool["description"].as_str().unwrap().len() > 20);
-                assert_eq!(tool["annotations"]["openWorldHint"], false);
-                let mut line = format!(
-                    "{} [{}]{}",
-                    tool["name"].as_str().unwrap(),
-                    required.join(","),
-                    if tool["annotations"]["readOnlyHint"] == true {
-                        " read_only"
-                    } else {
-                        ""
-                    }
-                );
-                if let Some(output) = tool.get("outputSchema") {
-                    assert_eq!(output["type"], "object");
-                    assert_eq!(output["anyOf"].as_array().unwrap().len(), 2);
-                    if tool["name"] == "access" {
-                        let success = output["anyOf"]
+    ];
+    let (_temp, app, _state) = fixture_app().await;
+    let tools = tool_list(&app, &alice).await;
+    let advertised: std::collections::BTreeSet<String> = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect();
+    let lines: Vec<String> = tools
+        .iter()
+        .map(|tool| {
+            let required: Vec<&str> = tool["inputSchema"]["required"]
+                .as_array()
+                .map(|names| names.iter().map(|n| n.as_str().unwrap()).collect())
+                .unwrap_or_default();
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+            assert!(tool["title"].as_str().is_some_and(|t| !t.is_empty()));
+            assert!(tool["description"].as_str().unwrap().len() > 20);
+            assert_eq!(tool["annotations"]["openWorldHint"], false);
+            let mut line = format!(
+                "{} [{}]{}",
+                tool["name"].as_str().unwrap(),
+                required.join(","),
+                if tool["annotations"]["readOnlyHint"] == true {
+                    " read_only"
+                } else {
+                    ""
+                }
+            );
+            if let Some(output) = tool.get("outputSchema") {
+                assert_eq!(output["type"], "object");
+                assert_eq!(output["anyOf"].as_array().unwrap().len(), 2);
+                if tool["name"] == "access" {
+                    let success = output["anyOf"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|schema| schema["properties"].get("graph_id").is_some())
+                        .expect("access advertises its successful result");
+                    assert!(
+                        success["required"]
                             .as_array()
                             .unwrap()
-                            .iter()
-                            .find(|schema| schema["properties"].get("graph_id").is_some())
-                            .expect("access advertises its successful result");
-                        assert!(
-                            success["required"]
-                                .as_array()
-                                .unwrap()
-                                .contains(&json!("actor_id"))
-                        );
-                        assert!(success["properties"].get("actor_id").is_some());
-                        assert!(success["properties"].get("actor").is_none());
-                    }
-                    line.push_str(" output");
+                            .contains(&json!("actor_id"))
+                    );
+                    assert!(success["properties"].get("actor_id").is_some());
+                    assert!(success["properties"].get("actor").is_none());
                 }
-                line
-            })
-            .collect();
-        assert_eq!(lines, expected);
-        let text = instructions(&app, &alice).await;
-        assert!(text.contains("Call `schema`"), "{text}");
-        assert_eq!(text.contains("`read`"), enabled, "{text}");
-        if !enabled {
-            let refused = call(&app, &alice, "read", json!({"graph":"default","query":"query q() { match { $p: Person } return { $p.name } }"})).await;
-            assert!(refused.get("error").is_some(), "{refused}");
-        }
-    }
-    // Compare real tools/list responses across the boot gates with the shared
-    // inventory, without adding an engine dependency to the MCP crate.
+                line.push_str(" output");
+            }
+            line
+        })
+        .collect();
+    assert_eq!(lines, expected);
+    let text = instructions(&app, &alice).await;
+    assert!(text.contains("Call `schema`"), "{text}");
+    assert!(text.contains("`read`"), "{text}");
+    assert!(text.contains("Writes:"), "{text}");
+    // Compare the real tools/list response with the shared inventory,
+    // without adding an engine dependency to the MCP crate.
     let inventoried = omnigraph_server::api::operations::HTTP_OPERATIONS
         .iter()
         .flat_map(|operation| operation.mcp.names.iter().map(|name| (*name).to_owned()))
@@ -777,7 +715,7 @@ async fn mcp_tool_list_follows_the_adhoc_setting_and_describes_every_tool() {
 
 #[tokio::test]
 async fn mcp_schema_and_adhoc_read_reuse_their_routes_and_policy() {
-    let (temp, app, _state) = fixture_app_with(adhoc()).await;
+    let (temp, app, _state) = fixture_app().await;
     let alice = token("alice", RESOURCE);
     let bob = token("bob", RESOURCE);
 
@@ -930,11 +868,6 @@ async fn mcp_schema_and_adhoc_read_reuse_their_routes_and_policy() {
     );
 }
 
-fn writes(mut settings: omnigraph_server::McpSettings) -> omnigraph_server::McpSettings {
-    settings.allow_writes = true;
-    settings
-}
-
 /// A server with static bearer tokens only: actor `default` may do anything.
 async fn static_token_app(settings: omnigraph_server::McpSettings) -> (tempfile::TempDir, Router) {
     let temp = init_loaded_graph().await;
@@ -1038,7 +971,7 @@ async fn http_get(app: &Router, uri: &str, token: &str) -> Value {
 
 #[tokio::test]
 async fn mcp_read_parity_tools_equal_their_routes() {
-    let (_temp, app) = static_token_app(writes(omnigraph_server::McpSettings::default())).await;
+    let (_temp, app) = static_token_app(omnigraph_server::McpSettings::default()).await;
     // A commit to inspect, through the MCP write path.
     let written = call(
         &app,
@@ -1426,35 +1359,8 @@ async fn mcp_resources_read_graphs_schema_and_branches_under_policy() {
 }
 
 #[tokio::test]
-async fn mcp_write_tools_are_opt_in_conditional_and_policy_gated() {
-    // Off by default: absent and refused, with nothing written.
+async fn mcp_write_tools_are_conditional_and_policy_gated() {
     let (temp, app) = static_token_app(omnigraph_server::McpSettings::default()).await;
-    let before = manifest_dataset_version(&graph_path(temp.path())).await;
-    let names: Vec<String> = tool_list(&app, "secret")
-        .await
-        .iter()
-        .map(|tool| tool["name"].as_str().unwrap().to_owned())
-        .collect();
-    for write in [
-        "mutate",
-        "load",
-        "blobs_clear",
-        "branches_create",
-        "branches_delete",
-        "branches_merge",
-        "commits_publish",
-        "commits_drop",
-    ] {
-        assert!(!names.iter().any(|name| name == write), "{write}");
-        let refused = call(&app, "secret", write, json!({"graph":"default"})).await;
-        assert!(refused.get("error").is_some(), "{write}: {refused}");
-    }
-    assert_eq!(
-        manifest_dataset_version(&graph_path(temp.path())).await,
-        before
-    );
-
-    let (temp, app) = static_token_app(writes(adhoc())).await;
     let tools = tool_list(&app, "secret").await;
     for (name, destructive, idempotent) in [
         ("mutate", true, false),
@@ -1622,8 +1528,7 @@ async fn mcp_write_tools_are_opt_in_conditional_and_policy_gated() {
 
     // Each write keeps its route's policy action: `change` without
     // `branch_create` refuses branch creation.
-    let (_temp, app, _state) =
-        fixture_app_with(writes(omnigraph_server::McpSettings::default())).await;
+    let (_temp, app, _state) = fixture_app().await;
     let alice = token("alice", RESOURCE);
     let bob = token("bob", RESOURCE);
     let created = call(
@@ -1804,7 +1709,7 @@ fn assert_refusal(result: &Value, status: StatusCode, native: &Value) {
 /// precondition and the policy decision.
 #[tokio::test]
 async fn mcp_blob_commit_control_and_stored_mutation_tools_equal_their_routes() {
-    let (temp, app) = operations_app(writes(omnigraph_server::McpSettings::default())).await;
+    let (temp, app) = operations_app(omnigraph_server::McpSettings::default()).await;
     let graph = graph_path(temp.path());
 
     // `blobs_stat` is the HEAD answer's headers as `blob stat` JSON.

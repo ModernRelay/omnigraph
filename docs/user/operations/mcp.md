@@ -129,8 +129,7 @@ refusals stay the server's.
   call or resource URI naming another graph is refused with a JSON-RPC error, and
   `graphs` and `omnigraph://graphs` list only this graph. Run one bridge per
   graph.
-- **Two consents for writes.** The server lists write tools only with
-  `--mcp-allow-writes`. Without `--write`, the bridge lists and admits only the
+- **Writes need `--write`.** Without it, the bridge lists and admits only the
   tools the server annotates `readOnlyHint: true`, and refuses a call to any
   other before sending it. The applied policy still decides every call.
 - **Existing endpoints only.** A server or managed target must name its existing
@@ -176,14 +175,12 @@ including JSON-RPC tool errors, never expose a reflected resource credential.
 
 | Flag | Environment | Default | Effect |
 |---|---|---|---|
-| `--mcp-allow-adhoc` | `OMNIGRAPH_MCP_ALLOW_ADHOC=1` | off | Lists and admits the `read` tool |
-| `--mcp-allow-writes` | `OMNIGRAPH_MCP_ALLOW_WRITES=1` | off | Lists and admits the write tools |
 | `--mcp-allowed-host <host[:port]>`, repeatable | `OMNIGRAPH_MCP_ALLOWED_HOSTS=a,b` | none | Adds allowed `Host` values |
 
-Settings are read once at boot. They enable tools; they grant nothing. A tool
-that is off is absent from `tools/list`, and a call to it is refused as an
-unknown tool. The opt-ins stay off even when a policy is applied: turn them on
-for a deployment whose policy was written with an LLM caller in mind.
+Settings are read once at boot. `/mcp` lists every tool below, and each call
+runs under the same policy action as its HTTP route, so a caller can do over
+MCP exactly what its credential may do over HTTP. To restrict what an agent
+may do, narrow the policy for the agent's credential.
 
 ## Tools
 
@@ -196,7 +193,7 @@ for a deployment whose policy was written with an LLM caller in mind.
 | `schema` | `graph` | `GET /graphs/{graph_id}/schema` | `read` |
 | `queries` | `graph` | `GET /graphs/{graph_id}/queries` | `read` |
 | `query` | `graph`, `name`, optional `params`, `branch` | `POST /graphs/{graph_id}/queries/{query_name}` as a read | `invoke_query`, then `read` |
-| `read` (opt-in) | `graph`, `query`, optional `name`, `params`, `branch`, `snapshot` | `POST /graphs/{graph_id}/query` | `read`; `change` for `explain load csv` |
+| `read` | `graph`, `query`, optional `name`, `params`, `branch`, `snapshot` | `POST /graphs/{graph_id}/query` | `read`; `change` for `explain load csv` |
 | `snapshot` | `graph`, optional `branch` | `GET /graphs/{graph_id}/snapshot` | `read` |
 | `access` | `graph`, optional `branch`, `target_branch` | `GET /graphs/{graph_id}/access` | none |
 | `branches_list` | `graph`, optional `detailed` | `GET /graphs/{graph_id}/branches` | `read`; with `detailed`, details only for branches the caller may `read` |
@@ -215,13 +212,12 @@ token, `graphs` returns 403 until the cluster policy permits `graph_list`; the
 other tools still work with a graph id the user supplies.
 
 The server's `initialize` instructions tell a model to call `graphs`, then
-`schema`, then a stored read with `query` or, when enabled, its own GQ read with
-`read`.
+`schema`, then a stored read with `query` or its own GQ read with `read`.
 
 - `queries` lists every stored query with its typed parameters (`name`,
   `kind`, `nullable`, plus `item_kind` for lists and `vector_dim` for
   vectors). An entry with `mutation: true` is a stored mutation, which
-  `mutate` runs when write tools are enabled.
+  `mutate` runs.
 - `query` refuses stored mutations.
 - `commits_list` takes `listing`: `history` (the default), `unpublished` for
   proposals written `as commit` that await `commits_publish`, or `unattached`
@@ -242,7 +238,7 @@ The server's `initialize` instructions tell a model to call `graphs`, then
   `branch`, while refusing `snapshot`, `name` and `params`.
   The tool refuses `insert`, `update`, `delete` and branch writes with the route's 400.
 
-### Write tools (opt-in)
+### Write tools
 
 | Tool | Arguments | Runs | Policy action |
 |---|---|---|---|

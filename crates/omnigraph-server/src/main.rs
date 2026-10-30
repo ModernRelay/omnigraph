@@ -56,17 +56,6 @@ struct Cli {
     /// termination grace must be longer.
     #[arg(long)]
     shutdown_grace_seconds: Option<u64>,
-    /// List and admit the MCP `read` tool, which runs ad-hoc GQ reads under the
-    /// caller's applied `read` policy. Off by default. Equivalent to setting
-    /// `OMNIGRAPH_MCP_ALLOW_ADHOC=1`.
-    #[arg(long)]
-    mcp_allow_adhoc: bool,
-    /// List and admit the MCP write tools (`mutate`, `load`, `blobs_clear`,
-    /// `branches_create`, `branches_delete`, `branches_merge`,
-    /// `commits_publish`, `commits_drop`), each under its route's policy
-    /// action. Off by default. Equivalent to setting `OMNIGRAPH_MCP_ALLOW_WRITES=1`.
-    #[arg(long)]
-    mcp_allow_writes: bool,
     /// A `Host` value `/mcp` admits, as `host` or `host:port`, besides the
     /// loopback names and the OIDC resource authority. Repeatable; also read
     /// comma-separated from `OMNIGRAPH_MCP_ALLOWED_HOSTS`.
@@ -85,11 +74,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let mcp = McpSettings::resolve(
-        cli.mcp_allow_adhoc,
-        cli.mcp_allow_writes,
-        cli.mcp_allowed_hosts,
-    )?;
+    let mcp = McpSettings::resolve(cli.mcp_allowed_hosts)?;
     if let Some(receipt_path) = cli.bootstrap_handoff.as_deref() {
         let shutdown_grace = resolve_shutdown_grace(cli.shutdown_grace_seconds)?;
         let settings = load_server_settings_with_bootstrap_handoff(

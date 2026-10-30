@@ -444,8 +444,7 @@ with the target's credential, which the agent never sees. Managed targets
 exchange their pinned profile's credential for a resource identity. It is bound to one
 graph (`--graph` or `default_graph`): calls that omit `graph` get it, and calls
 or resource URIs naming another graph are refused. Without `--write` only tools
-the server annotates read-only are listed and admitted; the server lists write
-tools only with `--mcp-allow-writes`. On server targets, `--as` asserts the actor
+the server annotates read-only are listed and admitted. On server targets, `--as` asserts the actor
 on every request; managed targets refuse `--as`. Direct targets refuse with
 `target_kind_unsupported`; the
 bridge never starts a server. A lost answer is never resent: an

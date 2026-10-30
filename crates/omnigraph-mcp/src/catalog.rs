@@ -1,27 +1,8 @@
-//! MCP tool descriptions, gates, annotations and JSON schemas.
+//! MCP tool descriptions, annotations and JSON schemas.
 
-use crate::McpSettings;
 use rmcp::model::{Tool, ToolAnnotations};
 use serde_json::{Value, json};
 use std::sync::Arc;
-
-/// Which boot setting, if any, lists and admits a tool.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Gate {
-    Always,
-    Adhoc,
-    Writes,
-}
-
-impl Gate {
-    fn open(self, settings: &McpSettings) -> bool {
-        match self {
-            Gate::Always => true,
-            Gate::Adhoc => settings.allow_adhoc,
-            Gate::Writes => settings.allow_writes,
-        }
-    }
-}
 
 /// What a tool does to the graph, as MCP annotation hints.
 #[derive(Clone, Copy)]
@@ -44,7 +25,14 @@ pub(super) struct ToolSpec {
     /// content against it, including an `isError` result's.
     output: Option<fn() -> Value>,
     effect: Effect,
-    pub(super) gate: Gate,
+}
+
+impl ToolSpec {
+    /// Whether the tool can publish: it carries the write contract, the write
+    /// deadline and the write result disposition.
+    pub(super) fn writes(&self) -> bool {
+        !matches!(self.effect, Effect::Read)
+    }
 }
 
 const WRITE_CONTRACT: &str = " Never retried by the server. If the result says `outcome_unknown`, the write may or may not have happened: read the target and reconcile before replaying.";
@@ -57,7 +45,6 @@ const TOOLS: &[ToolSpec] = &[
         input: no_arguments_schema,
         output: Some(health_output_schema),
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "graphs",
@@ -66,7 +53,6 @@ const TOOLS: &[ToolSpec] = &[
         input: no_arguments_schema,
         output: Some(graphs_output_schema),
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "schema",
@@ -75,7 +61,6 @@ const TOOLS: &[ToolSpec] = &[
         input: graph_schema,
         output: Some(schema_output_schema),
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "queries",
@@ -84,7 +69,6 @@ const TOOLS: &[ToolSpec] = &[
         input: graph_schema,
         output: Some(queries_output_schema),
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "query",
@@ -93,7 +77,6 @@ const TOOLS: &[ToolSpec] = &[
         input: query_schema,
         output: None,
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "read",
@@ -102,7 +85,6 @@ const TOOLS: &[ToolSpec] = &[
         input: read_schema,
         output: None,
         effect: Effect::Read,
-        gate: Gate::Adhoc,
     },
     ToolSpec {
         name: "snapshot",
@@ -111,7 +93,6 @@ const TOOLS: &[ToolSpec] = &[
         input: branch_schema,
         output: None,
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "access",
@@ -120,7 +101,6 @@ const TOOLS: &[ToolSpec] = &[
         input: access_schema,
         output: Some(access_output_schema),
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "branches_list",
@@ -129,7 +109,6 @@ const TOOLS: &[ToolSpec] = &[
         input: branches_list_schema,
         output: Some(branches_output_schema),
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "branches_diff",
@@ -138,7 +117,6 @@ const TOOLS: &[ToolSpec] = &[
         input: branch_diff_schema,
         output: None,
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "branches_merge_base",
@@ -147,7 +125,6 @@ const TOOLS: &[ToolSpec] = &[
         input: merge_base_schema,
         output: None,
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "commits_list",
@@ -156,7 +133,6 @@ const TOOLS: &[ToolSpec] = &[
         input: commits_list_schema,
         output: None,
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "commits_get",
@@ -165,7 +141,6 @@ const TOOLS: &[ToolSpec] = &[
         input: commit_schema,
         output: None,
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "commits_changes",
@@ -174,7 +149,6 @@ const TOOLS: &[ToolSpec] = &[
         input: commit_changes_schema,
         output: None,
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "diff",
@@ -183,7 +157,6 @@ const TOOLS: &[ToolSpec] = &[
         input: diff_schema,
         output: None,
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "changes_poll",
@@ -192,7 +165,6 @@ const TOOLS: &[ToolSpec] = &[
         input: changes_poll_schema,
         output: None,
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "blobs_stat",
@@ -201,7 +173,6 @@ const TOOLS: &[ToolSpec] = &[
         input: blobs_stat_schema,
         output: None,
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "mutate",
@@ -210,7 +181,6 @@ const TOOLS: &[ToolSpec] = &[
         input: mutate_schema,
         output: None,
         effect: Effect::Destructive { idempotent: false },
-        gate: Gate::Writes,
     },
     ToolSpec {
         name: "load",
@@ -219,7 +189,6 @@ const TOOLS: &[ToolSpec] = &[
         input: load_schema,
         output: None,
         effect: Effect::Destructive { idempotent: false },
-        gate: Gate::Writes,
     },
     ToolSpec {
         name: "blobs_clear",
@@ -228,7 +197,6 @@ const TOOLS: &[ToolSpec] = &[
         input: blobs_clear_schema,
         output: None,
         effect: Effect::Destructive { idempotent: true },
-        gate: Gate::Writes,
     },
     ToolSpec {
         name: "branches_create",
@@ -237,7 +205,6 @@ const TOOLS: &[ToolSpec] = &[
         input: branch_create_schema,
         output: None,
         effect: Effect::Additive,
-        gate: Gate::Writes,
     },
     ToolSpec {
         name: "branches_delete",
@@ -246,7 +213,6 @@ const TOOLS: &[ToolSpec] = &[
         input: branch_delete_schema,
         output: None,
         effect: Effect::Destructive { idempotent: true },
-        gate: Gate::Writes,
     },
     ToolSpec {
         name: "branches_merge",
@@ -255,7 +221,6 @@ const TOOLS: &[ToolSpec] = &[
         input: branch_merge_schema,
         output: None,
         effect: Effect::Destructive { idempotent: false },
-        gate: Gate::Writes,
     },
     ToolSpec {
         name: "commits_publish",
@@ -264,7 +229,6 @@ const TOOLS: &[ToolSpec] = &[
         input: commit_schema,
         output: None,
         effect: Effect::Destructive { idempotent: true },
-        gate: Gate::Writes,
     },
     ToolSpec {
         name: "commits_drop",
@@ -273,43 +237,27 @@ const TOOLS: &[ToolSpec] = &[
         input: commit_schema,
         output: None,
         effect: Effect::Destructive { idempotent: true },
-        gate: Gate::Writes,
     },
 ];
 
-pub(super) fn spec(settings: &McpSettings, name: &str) -> Option<&'static ToolSpec> {
-    TOOLS
-        .iter()
-        .find(|spec| spec.name == name && spec.gate.open(settings))
+pub(super) fn spec(name: &str) -> Option<&'static ToolSpec> {
+    TOOLS.iter().find(|spec| spec.name == name)
 }
 
-pub(super) fn instructions(settings: &McpSettings) -> String {
-    let mut text = String::from(
-        "OmniGraph serves typed property graphs. Every call runs under the applied policy for your credential; a listed tool or graph can still be refused.\n\
-         1. Call `graphs` for graph ids. With a credential that is not an identity, it needs a `graph_list` permit, which a server without a cluster policy refuses; then ask the user for the graph id.\n\
-         2. Call `schema` for the graph (or read `omnigraph://graphs/{graph}/schema`) before writing a query: it declares the types, properties, keys and edges a query may name.\n\
-         3. Prefer a stored read: `queries` lists stored queries with typed parameters, and `query` runs a stored read.\n",
-    );
-    if settings.allow_adhoc {
-        text.push_str(
-            "4. Otherwise write a GQ read and run it with `read`, with every value passed as a declared, typed parameter. `read` refuses mutations.\n",
-        );
-    }
-    if settings.allow_writes {
-        text.push_str(
-            "Writes: `mutate`, `load`, `blobs_clear`, `branches_create`, `branches_delete`, `branches_merge`, `commits_publish` and `commits_drop` each publish at most one commit. `mutate` with `name` and no `query` runs a stored mutation from `queries`. For read-modify-write, pass your read's `graph_commit_id` to `mutate` as `if_graph_commit`; a 412 means nothing was written. The server never retries a write. A result with `outcome_unknown`, or no response at all (a client timeout, a cancellation or a dropped connection), means the write may or may not have happened: read the target or list its commits and reconcile before replaying, and replay a `mutate` with `if_graph_commit`. Schema and deployment changes are operator-owned and not available here.\n",
-        );
-    }
-    text.push_str(
-        "Reads carry their `graph_commit_id`. A result is limited to 1 MiB and a read to 30 seconds; narrow the query with filters or `limit` when a result is too large. A refused call returns `isError` with the HTTP `status` and the server's `error` body, or an MCP `code` and `message`.",
-    );
-    text
-}
+/// The instructions every MCP session receives.
+pub(super) const INSTRUCTIONS: &str = concat!(
+    "OmniGraph serves typed property graphs. Every call runs under the applied policy for your credential; a listed tool or graph can still be refused.\n",
+    "1. Call `graphs` for graph ids. With a credential that is not an identity, it needs a `graph_list` permit, which a server without a cluster policy refuses; then ask the user for the graph id.\n",
+    "2. Call `schema` for the graph (or read `omnigraph://graphs/{graph}/schema`) before writing a query: it declares the types, properties, keys and edges a query may name.\n",
+    "3. Prefer a stored read: `queries` lists stored queries with typed parameters, and `query` runs a stored read.\n",
+    "4. Otherwise write a GQ read and run it with `read`, with every value passed as a declared, typed parameter. `read` refuses mutations.\n",
+    "Writes: `mutate`, `load`, `blobs_clear`, `branches_create`, `branches_delete`, `branches_merge`, `commits_publish` and `commits_drop` each publish at most one commit. `mutate` with `name` and no `query` runs a stored mutation from `queries`. For read-modify-write, pass your read's `graph_commit_id` to `mutate` as `if_graph_commit`; a 412 means nothing was written. The server never retries a write. A result with `outcome_unknown`, or no response at all (a client timeout, a cancellation or a dropped connection), means the write may or may not have happened: read the target or list its commits and reconcile before replaying, and replay a `mutate` with `if_graph_commit`. Schema and deployment changes are operator-owned and not available here.\n",
+    "Reads carry their `graph_commit_id`. A result is limited to 1 MiB and a read to 30 seconds; narrow the query with filters or `limit` when a result is too large. A refused call returns `isError` with the HTTP `status` and the server's `error` body, or an MCP `code` and `message`.",
+);
 
-pub(super) fn tools(settings: &McpSettings) -> Vec<Tool> {
+pub(super) fn tools() -> Vec<Tool> {
     TOOLS
         .iter()
-        .filter(|spec| spec.gate.open(settings))
         .map(|spec| {
             let annotations = match spec.effect {
                 Effect::Read => ToolAnnotations::new().read_only(true),
@@ -322,7 +270,7 @@ pub(super) fn tools(settings: &McpSettings) -> Vec<Tool> {
                     .destructive(true)
                     .idempotent(idempotent),
             };
-            let description = if spec.gate == Gate::Writes {
+            let description = if spec.writes() {
                 format!("{}{WRITE_CONTRACT}", spec.description)
             } else {
                 spec.description.to_owned()
