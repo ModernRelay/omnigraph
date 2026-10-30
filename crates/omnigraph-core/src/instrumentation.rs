@@ -21,7 +21,7 @@
 //! module stays generic over the `lance::io`-re-exported trait, so it adds no
 //! production dependency.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -173,6 +173,13 @@ pub struct QueryIoProbes {
     /// over all-changing rows should inspect only the emitted row plus one
     /// continuation sentinel.
     pub candidate_rows_examined: Arc<AtomicU64>,
+    /// Change intervals with no adjacent-transaction proof that paired their
+    /// live rows by stable row id (`change_lineage` on or verify), and those
+    /// that ran the exact ordered merge of both versions. A cost test asserts
+    /// the route a window shape took, since the read counts alone cannot tell
+    /// a flat route from a small table.
+    pub change_intervals_row_identity: Arc<AtomicU64>,
+    pub change_intervals_exact_merge: Arc<AtomicU64>,
     /// Largest row/byte scanner target requested by a candidate emitter in the
     /// measured operation. Both are maxima (not sums) because parent and child
     /// streams use the same current-page target.
@@ -538,12 +545,16 @@ where
     QUERY_MEMORY_PROBES.scope(probes, fut).await
 }
 
+/// One checkpoint pause. The first body to reach it claims it, marks it
+/// waiting and only then marks it entered, so a test that has seen
+/// `entered()` also sees `is_paused()` until it releases the pause.
 #[derive(Debug, Default)]
 struct QueryBlockingPause {
     released: Mutex<bool>,
     wake: std::sync::Condvar,
-    entered: AtomicU64,
-    waiting: AtomicU64,
+    claimed: AtomicBool,
+    entered: AtomicBool,
+    waiting: AtomicBool,
 }
 
 /// Releases the test checkpoint even when an assertion unwinds.
@@ -552,11 +563,11 @@ pub struct QueryBlockingPauseGuard(Arc<QueryBlockingPause>);
 
 impl QueryBlockingPauseGuard {
     pub fn entered(&self) -> bool {
-        self.0.entered.load(Ordering::SeqCst) > 0
+        self.0.entered.load(Ordering::SeqCst)
     }
 
     pub fn is_paused(&self) -> bool {
-        self.0.waiting.load(Ordering::SeqCst) > 0
+        self.0.waiting.load(Ordering::SeqCst)
     }
 
     pub fn release(&self) {
@@ -679,10 +690,11 @@ impl QueryBlockingWorkGuard {
         else {
             return;
         };
-        if pause.entered.fetch_add(1, Ordering::SeqCst) > 0 {
+        if pause.claimed.swap(true, Ordering::SeqCst) {
             return;
         }
-        pause.waiting.store(1, Ordering::SeqCst);
+        pause.waiting.store(true, Ordering::SeqCst);
+        pause.entered.store(true, Ordering::SeqCst);
         let released = pause
             .released
             .lock()
@@ -695,7 +707,7 @@ impl QueryBlockingWorkGuard {
                 })
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
-        pause.waiting.store(0, Ordering::SeqCst);
+        pause.waiting.store(false, Ordering::SeqCst);
     }
 
     pub fn started(&mut self) {
@@ -1277,6 +1289,22 @@ pub fn record_candidate_fragment_metadata_steps(steps: u64) {
 
 pub fn record_candidate_row_examined() {
     let _ = current(|p| p.candidate_rows_examined.fetch_add(1, Ordering::Relaxed));
+}
+
+/// One change interval with no adjacency proof discovered by row identity.
+pub fn record_change_interval_row_identity() {
+    let _ = current(|p| {
+        p.change_intervals_row_identity
+            .fetch_add(1, Ordering::Relaxed)
+    });
+}
+
+/// One change interval with no adjacency proof read by the exact merge.
+pub fn record_change_interval_exact_merge() {
+    let _ = current(|p| {
+        p.change_intervals_exact_merge
+            .fetch_add(1, Ordering::Relaxed)
+    });
 }
 
 pub fn record_candidate_scan_targets(rows: usize, bytes: u64) {

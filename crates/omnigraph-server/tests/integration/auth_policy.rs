@@ -1034,6 +1034,54 @@ fn concrete_path(path: &str) -> String {
         .join("/")
 }
 
+/// Two OAuth clients acting for one admitted person resolve to the person's
+/// one actor, and the access answer names the client each credential was
+/// issued to. A static token names none.
+#[tokio::test(flavor = "multi_thread")]
+async fn issue_1173_the_access_answer_names_the_oidc_client() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path()).to_string_lossy().to_string();
+    let policy = temp.path().join("policy.yaml");
+    fs::write(
+        &policy,
+        permit_all_policy_yaml(&["principal:stable_alice", "default"]),
+    )
+    .unwrap();
+    let app = build_app(
+        AppState::open_with_bearer_tokens_and_policy(
+            graph,
+            vec![("default".into(), "secret".into())],
+            Some(&policy),
+        )
+        .await
+        .unwrap()
+        .with_oidc_identity_trust(oidc::trust(temp.path())),
+    );
+    for client in [
+        "https://studio.example/oauth/client",
+        "https://agent.example/oauth/client",
+    ] {
+        let token = oidc::token_for_client("alice", oidc::RESOURCE, client);
+        let (status, body) =
+            json_response(&app, get_request(&g("/access?branch=main"), &token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["actor_id"], "principal:stable_alice", "{body}");
+        assert_eq!(body["client_id"], client, "{body}");
+        assert!(
+            body["actions"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("change")),
+            "{body}"
+        );
+    }
+    let (status, body) =
+        json_response(&app, get_request(&g("/access?branch=main"), "secret")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["actor_id"], "default", "{body}");
+    assert!(body.get("client_id").is_none(), "{body}");
+}
+
 /// Every protected operation the served OpenAPI document declares answers a
 /// request without a usable credential with 401 and the server's one bearer
 /// challenge, and the document records that header on the 401. `/mcp` and the
@@ -3083,12 +3131,14 @@ async fn branch_list_is_denied_by_a_branch_scoped_read_rule_as_the_route_is() {
             &format!("{statement} under a protected-only read rule"),
         );
     }
-    let (status, body) = json_response(&app, get_request(&g("/branches"), "team-token")).await;
-    assert_forbidden(
-        status,
-        body,
-        "GET /branches under a protected-only read rule",
-    );
+    for route in ["/branches", "/branches?detailed=true"] {
+        let (status, body) = json_response(&app, get_request(&g(route), "team-token")).await;
+        assert_forbidden(
+            status,
+            body,
+            &format!("GET {route} under a protected-only read rule"),
+        );
+    }
 }
 
 const SHOW_SOURCES: [&str; 1] = ["show all;"];

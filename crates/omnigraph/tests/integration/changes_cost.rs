@@ -841,6 +841,102 @@ async fn graph_diff_side_resolution_is_flat_in_live_branches() {
     .await;
 }
 
+/// A two-point diff across a compaction: every rewritten fragment differs by
+/// files on the two sides, and the row-identity rule pairs their live rows by
+/// `_rowid`, so data reads stay flat in the table's extent for a fixed change set.
+#[tokio::test]
+async fn graph_diff_across_a_compaction_reads_data_flat_in_table_extent() {
+    use omnigraph::changes::{GraphDiffRequest, GraphDiffSides};
+
+    const COMMITS: u64 = 4;
+    cost_harness(async {
+        let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+        for rows_per_load in [64u64, 1024] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Omnigraph::init(
+                dir.path().to_str().unwrap(),
+                "node Person {\n    name: String @key\n    age: I32?\n}\n",
+            )
+            .await
+            .unwrap();
+            let db = helpers::session(db);
+            let mut from_commit = None;
+            for commit in 0..COMMITS {
+                let rows: Vec<String> = (0..rows_per_load)
+                    .map(|row| {
+                        let index = commit * rows_per_load + row;
+                        format!(r#"{{"type":"Person","data":{{"name":"p{index:06}","age":0}}}}"#)
+                    })
+                    .collect();
+                let receipt = db
+                    .load_with_receipt("main", &rows.join("\n"), LoadMode::Merge)
+                    .await
+                    .unwrap();
+                from_commit = Some(receipt.commit.graph_commit_id.clone());
+            }
+            let from_commit = from_commit.unwrap();
+            let stats = db.optimize().await.unwrap();
+            let person = stats
+                .iter()
+                .find(|stat| stat.type_key == "node:Person")
+                .expect("optimize reports the Person table");
+            assert!(
+                person.fragments_removed >= 2 && person.fragments_added >= 1,
+                "the window must cross a rewrite: removed {} added {}",
+                person.fragments_removed,
+                person.fragments_added,
+            );
+            let updates: Vec<String> = (0..10u64)
+                .map(|index| {
+                    format!(r#"{{"type":"Person","data":{{"name":"p{index:06}","age":1}}}}"#)
+                })
+                .collect();
+            db.load_with_receipt("main", &updates.join("\n"), LoadMode::Merge)
+                .await
+                .unwrap();
+
+            let request = GraphDiffRequest {
+                sides: GraphDiffSides::Between {
+                    from: from_commit.clone(),
+                    to: "main".to_string(),
+                },
+                scope: ChangeFeedScope::default(),
+                page_token: None,
+                max_changes: None,
+                max_bytes: None,
+            };
+            let (page, io) = measure(db.diff_page(&request)).await;
+            let page = page.unwrap();
+            assert_eq!(page.changes.len(), 10, "ten updates across the compaction");
+            assert!(page.next_page_token.is_none());
+            assert_eq!(
+                (
+                    io.change_intervals_row_identity,
+                    io.change_intervals_exact_merge
+                ),
+                (1, 0),
+                "the one changed type took the row-identity route"
+            );
+            eprintln!(
+                "DIFF across optimize rows_per_load={rows_per_load}: data_reads={} \
+                 data_scan_reads={} manifest_reads={} candidate_fragment_metadata_steps={}",
+                io.data_reads,
+                io.data_scan_reads,
+                io.manifest_reads,
+                io.candidate_fragment_metadata_steps,
+            );
+            curve.push((rows_per_load, io));
+        }
+        assert_flat(
+            &curve,
+            |io| io.data_reads,
+            1,
+            "a diff across a compaction must read data flat in the table's extent",
+        );
+    })
+    .await;
+}
+
 /// A backlog walk reads the records of the commits it examines in one scan of
 /// `__history`, so its manifest reads are flat in the backlog, and pays at
 /// most two data opens per effectful commit, a term that grows with it.
@@ -1026,6 +1122,264 @@ async fn change_feed_small_ceiling_poll_is_bounded_across_backlog_depths() {
             |io| io.data_open_count,
             0,
             "small-ceiling poll opens only its one commit's changed interval",
+        );
+    })
+    .await;
+}
+
+/// The issue 969 shape: a two-point diff and a branch review over several
+/// commits read data flat in the table's extent for a fixed change set, and
+/// the route counter pins that the row-identity rule drew the flat line.
+#[tokio::test]
+async fn graph_diff_over_several_commits_reads_data_flat_in_table_extent() {
+    use omnigraph::changes::{GraphDiffRequest, GraphDiffSides};
+
+    const COMMITS: u64 = 4;
+    cost_harness(async {
+        let mut two_point: Vec<(u64, IoCounts)> = Vec::new();
+        let mut review: Vec<(u64, IoCounts)> = Vec::new();
+        for rows_per_load in [64u64, 1024] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Omnigraph::init(
+                dir.path().to_str().unwrap(),
+                "node Person {\n    name: String @key\n    age: I32?\n}\n",
+            )
+            .await
+            .unwrap();
+            let db = helpers::session(db);
+            let mut from_commit = None;
+            for commit in 0..COMMITS {
+                let rows: Vec<String> = (0..rows_per_load)
+                    .map(|row| {
+                        let index = commit * rows_per_load + row;
+                        format!(r#"{{"type":"Person","data":{{"name":"p{index:06}","age":0}}}}"#)
+                    })
+                    .collect();
+                let receipt = db
+                    .load_with_receipt("main", &rows.join("\n"), LoadMode::Merge)
+                    .await
+                    .unwrap();
+                from_commit = Some(receipt.commit.graph_commit_id.clone());
+            }
+            let from_commit = from_commit.unwrap();
+            db.branch_create("review").await.unwrap();
+            for (branch, age, first) in [("main", 1, 0u64), ("review", 2, 10)] {
+                for half in 0..2u64 {
+                    let updates: Vec<String> = (first + half * 5..first + half * 5 + 5)
+                        .map(|index| {
+                            format!(
+                                r#"{{"type":"Person","data":{{"name":"p{index:06}","age":{age}}}}}"#
+                            )
+                        })
+                        .collect();
+                    db.load_with_receipt(branch, &updates.join("\n"), LoadMode::Merge)
+                        .await
+                        .unwrap();
+                }
+            }
+
+            let request = GraphDiffRequest {
+                sides: GraphDiffSides::Between {
+                    from: from_commit.clone(),
+                    to: "main".to_string(),
+                },
+                scope: ChangeFeedScope::default(),
+                page_token: None,
+                max_changes: None,
+                max_bytes: None,
+            };
+            let (page, io) = measure(db.diff_page(&request)).await;
+            let page = page.unwrap();
+            assert_eq!(page.changes.len(), 10, "ten updates on main");
+            assert!(page.next_page_token.is_none());
+            assert_eq!(
+                (
+                    io.change_intervals_row_identity,
+                    io.change_intervals_exact_merge
+                ),
+                (1, 0),
+                "a window of two update commits has no adjacency proof and took the \
+                 row-identity route"
+            );
+            eprintln!(
+                "DIFF two-point rows_per_load={rows_per_load}: data_reads={} \
+                 manifest_reads={} total_reads={}",
+                io.data_reads,
+                io.manifest_reads,
+                io.total_reads(),
+            );
+            two_point.push((rows_per_load, io));
+
+            let request = GraphDiffRequest {
+                sides: GraphDiffSides::Branch {
+                    source: "review".to_string(),
+                    target: "main".to_string(),
+                },
+                scope: ChangeFeedScope::default(),
+                page_token: None,
+                max_changes: None,
+                max_bytes: None,
+            };
+            let (page, io) = measure(db.diff_page(&request)).await;
+            let page = page.unwrap();
+            assert_eq!(page.changes.len(), 10, "ten updates on review");
+            assert!(page.next_page_token.is_none());
+            assert_eq!(
+                (
+                    io.change_intervals_row_identity,
+                    io.change_intervals_exact_merge
+                ),
+                (1, 0),
+                "the branch review took the row-identity route"
+            );
+            eprintln!(
+                "DIFF branch review rows_per_load={rows_per_load}: data_reads={} \
+                 manifest_reads={} total_reads={}",
+                io.data_reads,
+                io.manifest_reads,
+                io.total_reads(),
+            );
+            review.push((rows_per_load, io));
+        }
+        assert_flat(
+            &two_point,
+            |io| io.data_reads,
+            1,
+            "a two-point diff over several commits must read data flat in the table's extent",
+        );
+        assert_flat(
+            &review,
+            |io| io.data_reads,
+            1,
+            "a branch review over several commits must read data flat in the table's extent",
+        );
+    })
+    .await;
+}
+
+/// A diff of two diverged heads takes the exact merge, as does any window
+/// under `change_lineage = off`; the same window under `on` and `verify`
+/// takes the row-identity route, with the same answer.
+#[tokio::test]
+async fn graph_diff_of_diverged_heads_takes_the_exact_merge() {
+    use omnigraph::changes::{ChangeOpKind, GraphDiffRequest, GraphDiffSides};
+
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Omnigraph::init(
+            dir.path().to_str().unwrap(),
+            "node Person {\n    name: String @key\n    age: I32?\n}\n",
+        )
+        .await
+        .unwrap();
+        let db = helpers::session(db);
+        let rows: Vec<String> = (0..64u64)
+            .map(|index| format!(r#"{{"type":"Person","data":{{"name":"p{index:03}","age":0}}}}"#))
+            .collect();
+        let loaded = db
+            .load_with_receipt("main", &rows.join("\n"), LoadMode::Merge)
+            .await
+            .unwrap();
+        db.branch_create("side-a").await.unwrap();
+        db.branch_create("side-b").await.unwrap();
+        db.load_with_receipt(
+            "side-a",
+            r#"{"type":"Person","data":{"name":"p003","age":1}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+        let on_a = db
+            .load_with_receipt(
+                "side-a",
+                r#"{"type":"Person","data":{"name":"p001","age":1}}"#,
+                LoadMode::Merge,
+            )
+            .await
+            .unwrap();
+        let on_b = db
+            .load_with_receipt(
+                "side-b",
+                r#"{"type":"Person","data":{"name":"p002","age":2}}"#,
+                LoadMode::Merge,
+            )
+            .await
+            .unwrap();
+        let between = |from: &str, to: &str| GraphDiffRequest {
+            sides: GraphDiffSides::Between {
+                from: from.to_string(),
+                to: to.to_string(),
+            },
+            scope: ChangeFeedScope::default(),
+            page_token: None,
+            max_changes: None,
+            max_bytes: None,
+        };
+
+        let heads = between(&on_a.commit.graph_commit_id, &on_b.commit.graph_commit_id);
+        let (page, io) = measure(db.diff_page(&heads)).await;
+        let page = page.unwrap();
+        let ids: Vec<(&str, ChangeOpKind)> = page
+            .changes
+            .iter()
+            .map(|change| (change.id.as_str(), change.op))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("p001", ChangeOpKind::Update),
+                ("p002", ChangeOpKind::Update),
+                ("p003", ChangeOpKind::Update),
+            ]
+        );
+        assert_eq!(
+            (
+                io.change_intervals_row_identity,
+                io.change_intervals_exact_merge
+            ),
+            (0, 1),
+            "diverged heads take the exact merge"
+        );
+
+        let window = between(&loaded.commit.graph_commit_id, "side-a");
+        let mut lineage_io: Vec<(&str, IoCounts)> = Vec::new();
+        for (value, expected_routes) in [("off", (0, 1)), ("on", (1, 0)), ("verify", (1, 0))] {
+            let session = helpers::with_setting(&db, "change_lineage", value);
+            let (page, io) = measure(session.diff_page(&window)).await;
+            let page = page.unwrap();
+            let ids: Vec<&str> = page
+                .changes
+                .iter()
+                .map(|change| change.id.as_str())
+                .collect();
+            assert_eq!(ids, vec!["p001", "p003"], "change_lineage = {value}");
+            assert_eq!(
+                (
+                    io.change_intervals_row_identity,
+                    io.change_intervals_exact_merge
+                ),
+                expected_routes,
+                "change_lineage = {value} selects the route of a two-commit window, which \
+                 no adjacency proof covers"
+            );
+            eprintln!(
+                "DIFF change_lineage={value}: internal_open_count={} total_reads={}",
+                io.internal_open_count,
+                io.total_reads()
+            );
+            lineage_io.push((value, io));
+        }
+        let (off, on) = (&lineage_io[0].1, &lineage_io[1].1);
+        assert!(
+            off.internal_open_count < on.internal_open_count
+                && off.total_reads() < on.total_reads(),
+            "`off` opens no coordinator for the ancestry answer, which `on` opens right after \
+             it into the cold merge-authority cache: off {} opens / {} reads, on {} opens / {} \
+             reads",
+            off.internal_open_count,
+            off.total_reads(),
+            on.internal_open_count,
+            on.total_reads()
         );
     })
     .await;

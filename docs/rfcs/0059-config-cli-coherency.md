@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-06
-updated: 2026-10-27
+updated: 2026-10-29
 discussion: https://github.com/ModernRelay/omnigraph/pull/675
 supersedes: []
 superseded_by: []
@@ -37,22 +37,39 @@ Keep the existing `organization` command family and its `org` alias:
 
 ```text
 organization members list
-organization members set EMAIL|USER_ID --role ROLE --idempotency-key KEY
+organization members set EMAIL|USER_ID --role ROLE [--role ROLE ...]
+                         --idempotency-key KEY
 organization members offboard EMAIL|USER_ID [--expected-membership ID|absent]
                               --idempotency-key KEY
 organization invitations list [--after CURSOR]
-organization invitations send EMAIL --idempotency-key KEY
+organization invitations send EMAIL --role ROLE --idempotency-key KEY
 organization invitations resend EMAIL|INVITATION_ID --idempotency-key KEY
 organization invitations revoke EMAIL|INVITATION_ID --idempotency-key KEY
 ```
 
-`members set` changes the service role of one existing active organization
+`members set` replaces the service roles of one existing active organization
 membership. It does not invite, enroll, create a role or edit graph policy.
 The identity provider owns role definitions and organization service
 permissions; applied cluster configuration owns native graph and deployment
 permissions. Keep retired local grant commands removed. Do not add a roles
 catalog, a new administration hierarchy or managed `access` reporting in this
 amendment.
+
+The accepted role-selection extension (2026-10-29) keeps these command families.
+Member role flags select a nonempty set of at most 256 existing role slugs;
+reject duplicate flags and sort the set before retaining the exact request.
+Changing only flag order therefore reuses the same request and idempotency key.
+The service receives canonical `roles`, and its receipt must bind the exact
+`requested_roles` and verified resulting roles. No implicit default or additive
+role assignment is inferred.
+
+Every new invitation explicitly selects one service role with `--role`.
+Its receipt exposes the provider-observed role; a successful new send must match
+the selected role. Previously saved no-role invitation requests retain their
+original arguments, body and key for archived result or uncertainty lookup only.
+The CLI may parse an omitted role for that lookup, but a fresh no-role request
+refuses before submission. It never inserts a default role into old custody or
+reinterprets an uncertain invitation as a new send.
 
 Email is a subject selector inside the selected organization, never a
 destination or an authority. Compare email using ASCII case-insensitive equality;

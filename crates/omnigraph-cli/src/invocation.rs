@@ -23,6 +23,7 @@ pub(crate) struct ParsedInvocation {
 pub(crate) enum MachineErrors {
     Json,
     Jsonl,
+    Toon,
 }
 
 /// Clap propagates globals by replacing ancestor matches with the deepest one.
@@ -77,6 +78,8 @@ where
         Some(MachineErrors::Json)
     } else if format == Some(ReadOutputFormat::Jsonl) {
         Some(MachineErrors::Jsonl)
+    } else if format == Some(ReadOutputFormat::Toon) {
+        Some(MachineErrors::Toon)
     } else {
         None
     };
@@ -127,6 +130,19 @@ mod tests {
     }
 
     #[test]
+    fn query_help_names_toon_in_plain_words() {
+        let error = command()
+            .try_get_matches_from(["omnigraph", "query", "--help"])
+            .expect_err("help");
+        let help = error.to_string();
+        assert!(
+            help.contains("Same document as json, in TOON (specification 4.4)"),
+            "{help}"
+        );
+        assert!(!help.contains("Self::Json"), "{help}");
+    }
+
+    #[test]
     fn machine_error_format_is_captured_from_the_leaf() {
         for (args, expected) in [
             (vec!["query", "q"], None),
@@ -149,6 +165,10 @@ mod tests {
             (
                 vec!["query", "q", "--format", "jsonl"],
                 Some(MachineErrors::Jsonl),
+            ),
+            (
+                vec!["query", "q", "--format", "toon"],
+                Some(MachineErrors::Toon),
             ),
             (
                 vec!["alias", "unresolved", "--format", "jsonl"],

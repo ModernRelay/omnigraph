@@ -6,7 +6,7 @@ mod access;
 mod args;
 use crate::credential_sources::{self as credentials, SecretStore};
 use crate::operator::InvocationConfig;
-use crate::operator_schema::{AuthProfile, Target, TokenSource};
+use crate::operator_schema::{AuthProfile, ClientSecretSource, Target, TokenSource};
 use crate::targets::{self, ResolvedTarget, TargetBinding};
 pub(crate) use access::run_access;
 pub(crate) use args::{AccessArgs, ConfigCommand, CredentialCommand, TargetCommand};
@@ -495,6 +495,10 @@ pub(crate) async fn run_credential(
                 } => "unknown",
                 AuthProfile::Token {
                     source: TokenSource::Env { env },
+                }
+                | AuthProfile::OauthClientCredentials {
+                    client_secret: ClientSecretSource::Env { env },
+                    ..
                 } => {
                     if std::env::var_os(env).is_some() {
                         "present"
@@ -504,6 +508,10 @@ pub(crate) async fn run_credential(
                 }
                 AuthProfile::Token {
                     source: TokenSource::File { file },
+                }
+                | AuthProfile::OauthClientCredentials {
+                    client_secret: ClientSecretSource::File { file },
+                    ..
                 } => {
                     if std::fs::metadata(file).is_ok_and(|m| m.is_file()) {
                         "present"

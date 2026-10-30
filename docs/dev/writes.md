@@ -531,6 +531,17 @@ Cached write admission checks the ref's identifier and retirement metadata
 through the existing lookup, with no additional storage request. Cold branch
 enumeration reads active refs; creation does not scan retired histories.
 
+A detailed listing (`list_graph_branches_detailed` in `omnigraph-catalog`)
+derives every field from the same authority and writes nothing: each live
+ref's `BranchContents` (`parent_branch`, `parent_version`, `create_at`), the
+head row of the branch's latest `__manifest` version and, once the branch has
+written a commit, the head row of its clone at `parent_version`, the commit it
+started at (a start at a past commit clones that commit's version, so the
+same read answers it). It reads no lineage, so its cost per branch is flat in
+history (`branch_control_cost.rs`). The collector keeps each live branch's
+oldest own `__manifest` version (`retained_versions` with `keep_base`), which
+is that clone; a reclamation that dropped it would lose the start.
+
 Stable table/incarnation identity, not `table_key`, determines whether a
 registration, rename, tombstone, or pointer belongs to the same lifetime.
 

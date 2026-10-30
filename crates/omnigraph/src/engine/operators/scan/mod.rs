@@ -294,7 +294,7 @@ impl ExecutionPlan for ScanExec {
                     reservation.metric("nearest_exhausted", usize::from(nearest.exhausted));
                     reservation.metric("nearest_dataset_rows", nearest.dataset_rows as usize);
                 }
-                if scan_report.nearest_scan.is_some() {
+                if mode.nearest.is_some() {
                     report
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)

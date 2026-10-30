@@ -89,7 +89,7 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "query",
         title: "Run a stored read",
-        description: "Run a stored read by `name` with `params` keyed by its declared parameter names (see `queries`). Reads `branch`, `main` when omitted. Returns `rows`, `row_count` and the read's `graph_commit_id`. Stored mutations are refused here; `mutate` runs them when write tools are enabled.",
+        description: "Run a stored read by `name` with `params` keyed by its declared parameter names (see `queries`). Reads `branch`, `main` when omitted. Returns `rows`, `row_count` and the read's `graph_commit_id`, plus `ranking` when the read orders by a search. Stored mutations are refused here; `mutate` runs them when write tools are enabled.",
         input: query_schema,
         output: None,
         effect: Effect::Read,
@@ -98,7 +98,7 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "read",
         title: "Run a GQ read",
-        description: "Run a GQ read query you write. Call `schema` first. Declare every value as a typed parameter (`query people($min: I32) { match { $p: Person $p.age >= $min } return { $p.name } }`) and pass the values in `params`; pick one declared query with `name` when the source declares several. Reads `branch` (default `main`) or a `snapshot`, never both. Search operators (`nearest`, `bm25`, `rrf`) need a trailing `limit`. Also answers `branch list`, `branch diff <source> [into <target>]`, `branch merge-base …`, `branch merge … dry run` and `explain query …`, sent without `branch`, `snapshot`, `name` or `params`; and `explain load csv …`, which requires `change` permission before probing source metadata and answers the accepted load plan without reading payload bytes or publishing (`branch` allowed, never `snapshot`). Mutations and branch writes are refused. Returns `rows`, `row_count` and `graph_commit_id`.",
+        description: "Run a GQ read query you write. Call `schema` first. Declare every value as a typed parameter (`query people($min: I32) { match { $p: Person $p.age >= $min } return { $p.name } }`) and pass the values in `params`; pick one declared query with `name` when the source declares several. Reads `branch` (default `main`) or a `snapshot`, never both. Search operators (`nearest`, `bm25`, `rrf`) need a trailing `limit`. Also answers `branch list`, `branch diff <source> [into <target>]`, `branch merge-base …`, `branch merge … dry run` and `explain query …`, sent without `branch`, `snapshot`, `name` or `params`; and `explain load csv …`, which requires `change` permission before probing source metadata and answers the accepted load plan without reading payload bytes or publishing (`branch` allowed, never `snapshot`). Mutations and branch writes are refused. Returns `rows`, `row_count` and `graph_commit_id`, plus `ranking` for a search order: `exhaustive: false` means the vector search left index partitions unsearched, so a nearer row may exist.",
         input: read_schema,
         output: None,
         effect: Effect::Read,
@@ -125,8 +125,8 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "branches_list",
         title: "List branches",
-        description: "List a graph's branch names.",
-        input: graph_schema,
+        description: "List a graph's branch names. With `detailed`, also each readable branch's head commit, the branch and commit it started from, and when it was created and last moved.",
+        input: branches_list_schema,
         output: Some(branches_output_schema),
         effect: Effect::Read,
         gate: Gate::Always,
@@ -375,6 +375,13 @@ pub(super) fn no_arguments_schema() -> Value {
 
 pub(super) fn graph_schema() -> Value {
     arguments(json!({}), &[])
+}
+
+pub(super) fn branches_list_schema() -> Value {
+    arguments(
+        json!({"detailed": {"type": "boolean", "description": "`true` adds `details`: for each branch the caller may read, its `head` commit, the branch (`from`) and commit (`from_commit_id`) it started from, and `created_at` and `updated_at`. Defaults to `false`."}}),
+        &[],
+    )
 }
 
 pub(super) fn branch_schema() -> Value {
@@ -674,7 +681,21 @@ pub(super) fn access_output_schema() -> Value {
 pub(super) fn branches_output_schema() -> Value {
     json!({
         "type": "object",
-        "properties": {"branches": {"type": "array", "items": {"type": "string"}}},
+        "properties": {
+            "branches": {"type": "array", "items": {"type": "string"}},
+            "details": {"type": "array", "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "head": {"type": "object"},
+                    "from": {"type": "string"},
+                    "from_commit_id": {"type": "string"},
+                    "created_at": {"type": "integer"},
+                    "updated_at": {"type": "integer"},
+                },
+                "required": ["name", "head", "updated_at"],
+            }},
+        },
         "required": ["branches"],
     })
 }

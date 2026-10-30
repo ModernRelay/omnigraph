@@ -460,8 +460,14 @@ impl ServerHost {
             }
             ToolCall::BranchesList(args) => {
                 let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let output =
-                    handlers::server_branch_list(Extension(handle), Some(Extension(actor))).await?;
+                let output = handlers::server_branch_list(
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    ApiQuery(crate::api::BranchListQuery {
+                        detailed: args.detailed,
+                    }),
+                )
+                .await?;
                 bounded_result(&output.0)
             }
             ToolCall::CommitsList(args) => {
@@ -499,6 +505,7 @@ impl ServerHost {
                 let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
                 let query = change_query(&[], &args.filters);
                 let output = handlers::server_commit_changes(
+                    state(),
                     Extension(handle),
                     Some(Extension(actor)),
                     ApiPath(handlers::CommitPath {
@@ -520,6 +527,7 @@ impl ServerHost {
                     &args.filters,
                 );
                 let output = handlers::server_changes_feed(
+                    state(),
                     Extension(handle),
                     Some(Extension(actor)),
                     RawQuery(query),
@@ -537,6 +545,7 @@ impl ServerHost {
                     &args.filters,
                 );
                 let output = handlers::server_diff(
+                    state(),
                     Extension(handle),
                     Some(Extension(actor)),
                     RawQuery(query),
@@ -554,6 +563,7 @@ impl ServerHost {
                     &args.filters,
                 );
                 let output = handlers::server_branch_diff(
+                    state(),
                     Extension(handle),
                     Some(Extension(actor)),
                     RawQuery(query),
@@ -835,8 +845,12 @@ impl ServerHost {
             }
             ResourceRequest::Branches(name) => {
                 let (handle, actor) = self.graph(&name, actor, &graph)?;
-                let output =
-                    handlers::server_branch_list(Extension(handle), Some(Extension(actor))).await?;
+                let output = handlers::server_branch_list(
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    ApiQuery(Default::default()),
+                )
+                .await?;
                 Ok(("application/json", pretty(&output.0)?))
             }
         }

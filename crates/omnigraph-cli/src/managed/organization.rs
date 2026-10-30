@@ -18,7 +18,7 @@ const CREDENTIAL_LIFETIME: u64 = 86400;
 enum Operation {
     Set {
         selector: String,
-        role: String,
+        roles: Vec<String>,
     },
     Offboard {
         selector: String,
@@ -26,6 +26,8 @@ enum Operation {
     },
     Send {
         email: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
     },
     Resend {
         selector: String,
@@ -42,13 +44,17 @@ impl Operation {
                 command:
                     Members::Set {
                         selector,
-                        role,
+                        roles,
                         idempotency_key,
                     },
             } => (
                 Self::Set {
                     selector: selector.clone(),
-                    role: role.clone(),
+                    roles: {
+                        let mut roles = roles.clone();
+                        roles.sort();
+                        roles
+                    },
                 },
                 idempotency_key,
             ),
@@ -70,11 +76,13 @@ impl Operation {
                 command:
                     Invitations::Send {
                         email,
+                        role,
                         idempotency_key,
                     },
             } => (
                 Self::Send {
                     email: email.clone(),
+                    role: role.clone(),
                 },
                 idempotency_key,
             ),
@@ -108,11 +116,12 @@ impl Operation {
 
     fn validate(&self) -> Result<()> {
         let selector = match self {
-            Self::Set { selector, role } => {
-                if !role_slug(role) {
+            Self::Set { selector, roles } => {
+                if validate_roles(roles).is_err() || !roles.windows(2).all(|pair| pair[0] < pair[1])
+                {
                     return Err(Failure::refused(
-                        "role_invalid",
-                        "role must contain 1–128 lowercase ASCII letters, digits, underscores or hyphens",
+                        "roles_invalid",
+                        "select 1–256 distinct service roles; slugs contain 1–128 lowercase ASCII letters, digits, underscores or hyphens",
                     ));
                 }
                 selector
@@ -137,7 +146,16 @@ impl Operation {
                 }
                 selector
             }
-            Self::Send { email: address } => {
+            Self::Send {
+                email: address,
+                role,
+            } => {
+                if role.as_deref().is_some_and(|role| !role_slug(role)) {
+                    return Err(Failure::refused(
+                        "role_invalid",
+                        "select an existing service-role slug",
+                    ));
+                }
                 return if email(address) {
                     Ok(())
                 } else {
@@ -189,6 +207,7 @@ struct Invitation {
     accepted_user_id: Option<String>,
     created_at: String,
     expires_at: String,
+    role: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -227,6 +246,10 @@ fn validate_invitation(invitation: &Invitation, organization: &str) -> Result<()
         || !identity(&invitation.id)
         || !email(&invitation.email)
         || !optional_identity(&invitation.accepted_user_id)
+        || invitation
+            .role
+            .as_deref()
+            .is_some_and(|role| !role_slug(role))
         || !matches!(
             invitation.state.as_str(),
             "pending" | "accepted" | "revoked" | "expired"
@@ -575,7 +598,7 @@ async fn resolve_invitation(api: &Api, selector: &str) -> Result<String> {
 async fn resolve(api: &Api, operation: &Operation) -> Result<custody::ExactRequest> {
     let organization = api.account_id()?;
     let (path, body) = match operation {
-        Operation::Set { selector, role } => {
+        Operation::Set { selector, roles } => {
             let member = resolve_member(api, selector).await?;
             if member.membership_status != "active" {
                 return Err(Failure::refused(
@@ -585,7 +608,7 @@ async fn resolve(api: &Api, operation: &Operation) -> Result<custody::ExactReque
             }
             (
                 format!("/v1/organization/members/{}:set-role", member.user_id),
-                json!({"version":1,"organization_id":organization,"user_id":member.user_id,"expected_membership_id":member.membership_id,"role":role}),
+                json!({"version":1,"organization_id":organization,"user_id":member.user_id,"expected_membership_id":member.membership_id,"roles":roles}),
             )
         }
         Operation::Offboard {
@@ -619,10 +642,18 @@ async fn resolve(api: &Api, operation: &Operation) -> Result<custody::ExactReque
                 json!({"version":2,"organization_id":organization,"user_id":user,"expected_membership_id":membership}),
             )
         }
-        Operation::Send { email } => (
-            "/v1/organization/invitations".into(),
-            json!({"organization_id":organization,"email":email}),
-        ),
+        Operation::Send { email, role } => {
+            if role.is_none() {
+                return Err(Failure::refused(
+                    "role_required",
+                    "new invitations require --role; an omitted role can only retrieve an existing retained request",
+                ));
+            }
+            (
+                "/v1/organization/invitations".into(),
+                invitation_body(organization, email, role.as_deref()),
+            )
+        }
         Operation::Resend { selector } | Operation::Revoke { selector } => {
             let invitation = resolve_invitation(api, selector).await?;
             let action = if matches!(operation, Operation::Resend { .. }) {
@@ -639,13 +670,21 @@ async fn resolve(api: &Api, operation: &Operation) -> Result<custody::ExactReque
     Ok(custody::ExactRequest { path, body })
 }
 
+fn invitation_body(organization: &str, email: &str, role: Option<&str>) -> Value {
+    let mut body = json!({"organization_id":organization,"email":email});
+    if let Some(role) = role {
+        body["role"] = json!(role);
+    }
+    body
+}
+
 fn role_human(data: &Value, exact: &custody::ExactRequest) -> Result<(String, i32)> {
     #[derive(Deserialize)]
     struct Receipt {
         user_id: String,
         membership_id: String,
         previous_roles: Vec<String>,
-        requested_role: String,
+        requested_roles: Vec<String>,
         role_update: String,
         roles: Vec<String>,
         service_permissions: Vec<String>,
@@ -654,14 +693,15 @@ fn role_human(data: &Value, exact: &custody::ExactRequest) -> Result<(String, i3
     }
     let receipt: Receipt = parse(data)?;
     validate_roles(&receipt.previous_roles)?;
+    validate_roles(&receipt.requested_roles)?;
     validate_roles(&receipt.roles)?;
     validate_service_permissions(&receipt.service_permissions)?;
     let updated = receipt.role_update == "updated";
     if exact.body["user_id"].as_str() != Some(receipt.user_id.as_str())
         || exact.body["expected_membership_id"].as_str() != Some(receipt.membership_id.as_str())
-        || exact.body["role"].as_str() != Some(receipt.requested_role.as_str())
+        || exact.body["roles"] != json!(receipt.requested_roles)
         || !matches!(receipt.role_update.as_str(), "updated" | "uncertain")
-        || updated && receipt.roles != [receipt.requested_role.clone()]
+        || updated && receipt.roles != receipt.requested_roles
         || !updated && receipt.roles != receipt.previous_roles
         || receipt.graph_policy_changed
         || receipt.provider_observed_at.len() > 64
@@ -675,11 +715,11 @@ fn role_human(data: &Value, exact: &custody::ExactRequest) -> Result<(String, i3
     }
     Ok((
         format!(
-            "Service role for {}: {}\n{}: {}\nOrganization service permissions: {}\nGraph policy is unchanged; applied Cedar owns native permissions.\n",
+            "Service roles for {}: {}\n{}: {}\nOrganization service permissions: {}\nGraph policy is unchanged; applied Cedar owns native permissions.\n",
             receipt.user_id,
             receipt.role_update,
             if updated {
-                "Assigned role"
+                "Assigned roles"
             } else {
                 "Last verified roles (requested change is uncertain)"
             },
@@ -710,10 +750,10 @@ fn mutation_human(
             exact.body["expected_membership_id"].as_str(),
         ),
         Operation::Send { .. } | Operation::Resend { .. } | Operation::Revoke { .. } => {
-            let (action, address) = match operation {
-                Operation::Send { email } => ("send", Some(email.as_str())),
-                Operation::Resend { .. } => ("resend", None),
-                Operation::Revoke { .. } => ("revoke", None),
+            let (action, address, role) = match operation {
+                Operation::Send { email, role } => ("send", Some(email.as_str()), role.as_deref()),
+                Operation::Resend { .. } => ("resend", None, None),
+                Operation::Revoke { .. } => ("revoke", None, None),
                 _ => unreachable!(),
             };
             let invitation: Invitation = parse(&data["invitation"])?;
@@ -723,6 +763,7 @@ fn mutation_human(
                     && exact.path
                         != format!("/v1/organization/invitations/{}:{action}", invitation.id)
                 || address.is_some_and(|address| !address.eq_ignore_ascii_case(&invitation.email))
+                || role.is_some_and(|role| invitation.role.as_deref() != Some(role))
                 || action == "revoke" && invitation.state != "revoked"
             {
                 return Err(Failure::protocol());

@@ -73,7 +73,7 @@ Credential, helper and CA availability are checked only for selected operations.
 | Managed authentication | The selected profile's single `auth` provider |
 | Standalone authentication | The selected server target's single `auth` provider |
 | Graph | `--graph ID`, then target `default_graph`; otherwise graph-scoped operations refuse |
-| Read output | Explicit `--format`, then `defaults.output`, then `table`; `--json` selects JSON where offered |
+| Read output | Explicit `--format`, then `defaults.output`, then `table`; `--json` selects JSON where offered. `toon` encodes the same read document as `json` |
 
 Profile and target selectors are mutually exclusive; their defaults never infer each other. Managed targets
 always use their pinned `profile`; neither `defaults.profile` nor a global `--profile` can override that
@@ -82,13 +82,13 @@ implicit single-profile selection. A direct graph rejects a separate graph selec
 the first graph. Graph IDs are exact API identifiers, not display-name lookups; cluster incarnation pinning
 does not protect against recreation of a graph with the same ID.
 
-Inline targets are local paths or `file://` URIs only, such as
-`--target ./graph.omni`. Bare names select registered targets. Remote endpoints
-must be registered. `init ./graph.omni --schema schema.pg` retains its positional
-local creation shorthand. Defaults and aliases require registered names.
-There are no environment overrides for destination fields.
+Inline targets are local paths or `file://` URIs, such as `--target ./graph.omni`,
+and an [S3 cluster root](../operations/s3-cluster-roots.md) for deployment,
+recovery and maintenance commands. Bare names select registered targets. Remote endpoints
+must be registered. `init ./graph.omni --schema schema.pg` keeps its local shorthand.
+Defaults and aliases require registered names. Registered destinations have no environment overrides.
 
-`defaults.output` accepts only `table`, `json`, `jsonl`, `csv` or `kv` and
+`defaults.output` accepts only `table`, `json`, `jsonl`, `csv`, `kv`, or `toon` and
 applies to supported read-result formatting. Action receipts retain their own
 contracts. Unsupported formats refuse. Diagnostics go to stderr, results to stdout.
 
@@ -103,10 +103,12 @@ Each profile or server target chooses one provider:
 | Environment token | `{provider: token, source: {env: OG_SERVICE_TOKEN}}` |
 | Mounted token | `{provider: token, source: {file: /var/run/omnigraph/token}}` |
 | Credential helper | `{provider: exec, command: [/usr/local/bin/credential-helper, get], timeout: 30s}` |
+| Managed OAuth client credentials | `{provider: oauth_client_credentials, token_endpoint: https://auth.example.com/oauth2/token, client_id: client_example, client_secret: {env: OG_CLIENT_SECRET}}` |
 | Explicit anonymous server | `{provider: anonymous}` |
 
-`omnigraph` is managed-only; `anonymous` is standalone-only. Names grant no privileges,
-and token/exec sources do not qualify arbitrary workload federation.
+`omnigraph` and `oauth_client_credentials` are managed-only; `anonymous` is
+standalone-only. Names grant no privileges, and token/exec sources do not qualify
+arbitrary workload federation.
 
 Token profiles declare exactly one source. `store` uses secure local custody;
 `env` reads only the named variable; `file` reads one bounded regular-file
@@ -124,10 +126,9 @@ The helper receives one version-1 JSON request on stdin with purpose, endpoint,
 `interactive: false` and applicable identity constraints. It returns one object
 with `version: 1`, `credential: {type: bearer, token: ...}` and optional RFC 3339
 `expires_at`. Unknown fields, expired results and unsupported types refuse.
-Expiry is checked again immediately before an authenticated request is sent,
-including after discovery. An expired credential refuses before submission;
-the CLI does not replay a mutation to refresh credentials. Managed control and
-data credentials retain their independent expiry times.
+Expiry is rechecked before authenticated dispatch, including after discovery.
+Renewal can precede submission but never replay a mutation. Managed control and
+data credentials have independent expiry times.
 Without expiry the result is not cached across invocations. Timeout terminates
 the helper process group; stderr is not echoed in routine errors.
 Output cannot change routing or prove identity. Helpers inherit the process
@@ -144,11 +145,10 @@ profile credential for a cluster-bound data credential; control and refresh
 tokens never go to the graph endpoint. Service and graph policy still authorize
 operations independently of credential acquisition.
 
-For managed resource commands and managed-target credential export, env/file/exec
-profiles keep exchanged credentials only in invocation memory, without requiring
-an OS store. This is explicit source-based custody, not a store-failure fallback.
-Human profiles, stored tokens and explicit `cluster token` administration retain
-secure-store requirements.
+For managed resource commands and managed-target credential export, env/file/exec/OAuth
+profiles keep exchanged credentials in invocation memory. Human profiles, stored
+tokens and existing providers' explicit `cluster token` require secure storage.
+OAuth always uses invocation memory ([workload setup](managed-team.md#configure-an-unattended-workload-profile)); store failure never changes custody.
 
 ## Login and registration
 
@@ -295,7 +295,7 @@ borrow credentials from, or carry the parent's token into, a more-specific
 registered endpoint. Targets at the same root do not override the selected
 owner. These boundaries are captured for the invocation.
 
-Version 1 does not support cloud-direct targets, catalogue targets, Unix sockets,
+Version 1 does not support other cloud-direct targets, catalogue targets, Unix sockets,
 mTLS, tunnels or arbitrary private identity-provider transport. Server storage
 and deployment retain separate contracts. This rewrite does not qualify BYOC
 private routes or workload federation. Managed and standalone targets share

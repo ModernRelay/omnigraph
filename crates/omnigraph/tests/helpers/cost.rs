@@ -287,6 +287,10 @@ pub struct IoCounts {
     pub candidate_scan_target_rows_peak: u64,
     pub candidate_scan_target_bytes_peak: u64,
     pub change_images_materialized: u64,
+    /// Change intervals with no adjacency proof, by the route that read them:
+    /// rows paired by stable row id, or the exact ordered merge.
+    pub change_intervals_row_identity: u64,
+    pub change_intervals_exact_merge: u64,
     /// Incremental vs full merge-authority projection refreshes and the exact
     /// number of physical manifest rows hydrated to classify DV additions.
     pub projection_incremental_refreshes: u64,
@@ -583,6 +587,8 @@ struct OpProbes {
     candidate_scan_target_rows_peak: Arc<AtomicU64>,
     candidate_scan_target_bytes_peak: Arc<AtomicU64>,
     change_images_materialized: Arc<AtomicU64>,
+    change_intervals_row_identity: Arc<AtomicU64>,
+    change_intervals_exact_merge: Arc<AtomicU64>,
     projection_incremental_refreshes: Arc<AtomicU64>,
     projection_full_refreshes: Arc<AtomicU64>,
     projection_identity_rows: Arc<AtomicU64>,
@@ -612,6 +618,8 @@ impl OpProbes {
             candidate_scan_target_rows_peak: Arc::new(AtomicU64::new(0)),
             candidate_scan_target_bytes_peak: Arc::new(AtomicU64::new(0)),
             change_images_materialized: Arc::new(AtomicU64::new(0)),
+            change_intervals_row_identity: Arc::new(AtomicU64::new(0)),
+            change_intervals_exact_merge: Arc::new(AtomicU64::new(0)),
             projection_incremental_refreshes: Arc::new(AtomicU64::new(0)),
             projection_full_refreshes: Arc::new(AtomicU64::new(0)),
             projection_identity_rows: Arc::new(AtomicU64::new(0)),
@@ -630,6 +638,8 @@ impl OpProbes {
             candidate_scan_target_rows_peak: Arc::clone(&h.candidate_scan_target_rows_peak),
             candidate_scan_target_bytes_peak: Arc::clone(&h.candidate_scan_target_bytes_peak),
             change_images_materialized: Arc::clone(&h.change_images_materialized),
+            change_intervals_row_identity: Arc::clone(&h.change_intervals_row_identity),
+            change_intervals_exact_merge: Arc::clone(&h.change_intervals_exact_merge),
             projection_incremental_refreshes: Arc::clone(&h.projection_incremental_refreshes),
             projection_full_refreshes: Arc::clone(&h.projection_full_refreshes),
             projection_identity_rows: Arc::clone(&h.projection_identity_rows),
@@ -679,6 +689,10 @@ impl OpProbes {
                 .candidate_scan_target_bytes_peak
                 .load(Ordering::Relaxed),
             change_images_materialized: self.change_images_materialized.load(Ordering::Relaxed),
+            change_intervals_row_identity: self
+                .change_intervals_row_identity
+                .load(Ordering::Relaxed),
+            change_intervals_exact_merge: self.change_intervals_exact_merge.load(Ordering::Relaxed),
             projection_incremental_refreshes: self
                 .projection_incremental_refreshes
                 .load(Ordering::Relaxed),
