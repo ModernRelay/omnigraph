@@ -86,6 +86,7 @@ jobs:
             cli_cluster::core_live_apply_captures_server_file_root_without_local_storage_access \
             cli_cluster::managed_lifecycle_wait_reports_tombstone_and_checks_every_poll_identity \
             cli_cluster::managed_apply_polls_original_delivery_without_resubmission_or_cancellation \
+            cli_cluster::managed_plan_and_apply_submissions_wait_until_their_local_deadline \
             cli_cluster::managed_native_outcomes_preserve_activation_archive_and_uncertainty \
             cli_cluster::managed_poll_identity_mismatch_retains_original_delivery_and_native_ids \
             cli_cluster::managed_lifecycle_bad_acceptance_and_deadline_keep_recovery_identity \

@@ -125,6 +125,12 @@ omnigraph cluster plan --target production --rev NEW_COMMIT --json
 omnigraph cluster apply --target production --plan PREVIEW_ID --json
 ```
 
+`plan` and `apply` keep their submission open until the `--timeout` deadline
+(default 300 seconds, maximum 3600), since the service may answer a plan only
+once its preview is captured. Without `--no-wait`, reaching the deadline exits 5 and
+prints the idempotency key; acceptance is then unknown. Each source lookup and
+delivery poll keeps its own 10-second bound.
+
 `push` uploads only `cluster.yaml`, referenced schemas, stored queries and
 policy files. Query-directory declarations discover immediate `.gq` files;
 they do not recurse. Unrelated files, folder context and credentials are not

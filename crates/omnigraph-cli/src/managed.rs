@@ -945,7 +945,21 @@ impl Api {
         body: Option<&Value>,
         key: Option<&str>,
     ) -> Result<Value> {
-        let response = self.raw(method, path, body, key).await?;
+        self.request_with_timeout(method, path, body, key, REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+        key: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let response = self
+            .raw_with_timeout(method, path, body, key, timeout)
+            .await?;
         if response.status.is_success() {
             Ok(response.body)
         } else {
