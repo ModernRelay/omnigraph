@@ -2832,7 +2832,7 @@ canonical result.
 | Today | GQ 3 | Driver |
 |---|---|---|
 | `query` for reads and writes alike | `query` for reads, `mutation` for writes, `view` for derived relations, `batch` for several under one snapshot | agents trained on GraphQL write `mutation { }` (the skill's documented trap); lint classifies by keyword, not body |
-| `$p worksAt $c`, direction from the schema | `$p -worksAt-> $c`, `$c <-worksAt- $p`, `$a -knows- $b` undirected, `-$e:worksAt->` bound, `-(knows|likes){1,3}->` | direction visible to the reviewer and the model; `T5` becomes a reading error, not a schema lookup |
+| `$p worksAt $c`, direction from the schema | `$p -worksAt-> $c`, `$c <-worksAt- $p`, `$a -knows- $b` undirected, `-$e:worksAt->` bound, `-(knows|likes){1,3}->` | direction visible to the reviewer and the model; `T5` becomes a reading error, not a schema lookup. **Withdrawn 2026-10-30 (§13.3): the triple stays; the arrowhead carries nothing position and schema do not** |
 | Ranking functions as the leading `order` key | a `retrieve { }` clause that binds typed score columns; `order` sorts any expression | 2.10; Vespa; Bruch; thresholds, weights, more arms and rerank become expressions |
 | `rrf(a, b)` only | `rrf(...)`, `norm(...)`, weighted sums, `rerank(model, text) k` as a stage, `where $a.vec.distance < 0.4` | Bruch (+2–3 nDCG), BEIR (+11% rerank), LanceDB `distance_range` |
 | Blocks as predicates only, constant right side | blocks as values (`count { } as n`), any expression on the right | #1050, Cypher `COUNT {}`, Soufflé |
@@ -3072,7 +3072,7 @@ Most of §9.3 is additive and already in §4.3 and §7.7: blocks as values,
 bindings, annotations, catalogue types, paging, `returning`, pattern-scoped
 writes, notifications, `why_not`, editions. Only four items are incompatible
 with stored text and are the reason to ask the question at all: the arrow
-spelling for traversals, `mutation` as a keyword, `retrieve` replacing ranking
+spelling for traversals (withdrawn on 2026-10-30, §13.3), `mutation` as a keyword, `retrieve` replacing ranking
 functions in `order`, and `@valid`/`invalidate` as schema and verb. Under an
 edition line all four ship as GQ 3 beside a GQ 2 the compiler keeps compiling
 for one release, with `queries validate` printing the rewrite; the rewrite from
@@ -3523,7 +3523,7 @@ bounded union §7.6 wants. **A** waits for views (contracts bind to them).
 | **R Retrieve** (L) | `retrieve { }` clause binding typed score columns; arms with `k`; `norm()`, `rrf()` with n arms and weights, `rerank(model, text, k)` as a provider-backed stage; score columns usable in `having`/`order`/`return`; `@approximate(recall)` declaration; achieved recall in the envelope; 0048's laws, `exact: true`, `Vector(n, distance=…)` and recipes; rankings in `order` keep compiling for one release and lint prints the rewrite | E, F, 0047 (shipped) | no until X | the fusion and vector oracles 0048 names; GQT for windows, weights, thresholds, rerank, n arms; the discovery task in M0 answered by `rrf` over interface arms | hybrid search with weights, thresholds and a reranker; the end of two-query hybrids |
 | **W1 Writes** (M) | pattern-scoped `update $a … where { }` and `delete $e where { }` with one target type; `returning { }`; `@valid(from, to)` schema role and `invalidate`; `set { x: null }` in assignment position; bounded pattern-scoped `insert` | read planner under the write door (the shared expression RFC's "later RFC") | no | staging protocol unchanged (D2); GQT per form; affected receipts | invalidation as a verb; one round trip per write instead of read-then-write |
 | **W2 Computed writes** (S) | `set { visits: visits + 1 }` under `@if_commit` or a key equality; the read-set rule | F (arithmetic), W1 | no | contention case under DST; retry idempotence | the increment without a round trip |
-| **X Edition 3** (M) | `mutation` keyword; arrow traversal spelling (`-e->`, `<-e-`, `-e-`); `retrieve` as the only ranking position; removal of `search`/`fuzzy`/`match_text`, infix `contains`/`starts_with`, positional `rrf` `k`; the GQ 2 compiler kept for one more release; `queries validate` prints every rewrite as a machine-applicable suggestion | every deprecation above having lived one release | **yes, under the edition** | every stored query in the fleet rewritten by the suggestion tool and re-validated; the 45-task instrument re-run on the new spelling | one spelling per operation; direction visible; the novelty tax paid once |
+| **X Edition 3** (M) | `mutation` keyword; arrow traversal spelling (`-e->`, `<-e-`, `-e-`; withdrawn 2026-10-30, §13.3); `retrieve` as the only ranking position; removal of `search`/`fuzzy`/`match_text`, infix `contains`/`starts_with`, positional `rrf` `k`; the GQ 2 compiler kept for one more release; `queries validate` prints every rewrite as a machine-applicable suggestion | every deprecation above having lived one release | **yes, under the edition** | every stored query in the fleet rewritten by the suggestion tool and re-validated; the 45-task instrument re-run on the new spelling | one spelling per operation; direction visible; the novelty tax paid once |
 | **I + Poly** (L, own clock) | integer identity storage upgrade; polymorphic endpoints; unions `A \| B`; type tests; `@type_id`; interface-wide mutations; `rrf` over member arms as the interim cross-member search | storage upgrade RFC pair; C (interface bindings already shipped) | no (schema feature; old binaries refuse) | the RFC's prototype findings as regressions; upgrade journey tests | edge families collapse; discovery across types |
 | **A Permissions** (L) | actor views first scope (type and column visibility, per-row placement, reads); `contract` declarations in GQ bound to views and stored queries; Cedar grants on named capabilities; the fragment = kernel minus retrieval | C (views), S, both RFCs amended per §10.5 | no | #951's differential oracle for the first scope; #1197's adversarial matrix | query-only agents; shared graphs with audiences |
 | **Fed Federation** (L, later) | graph qualifier in type references; per-graph commit pins in the envelope; views over a foreign graph; change-feed-as-load for shares | E/S reservation; C (views); Poly (one-corpus search) | no | nothing until designed | cross-graph reads; shares kept current |
@@ -3617,7 +3617,7 @@ not on it is additive forever after, by construction.
 | Declaration kinds | `query`, `mutation`, `view`, `contract`, `batch`, plus the schema kinds `node`, `edge`, `interface` in the same grammar; one file type, `.pg` accepted as the same grammar | `view`, `contract`, `batch` parse and are refused with a stable code ("reserved; not yet served") until their stage |
 | Clause set and order | `match` → `retrieve`? → `return` → `having`? → `order`? → `limit`? → `returning`? (mutations: statements → `returning`?) | `retrieve` carries exactly today's power (`nearest`, `bm25`, two-arm `rrf`); `having` works immediately (one `Filter` over `Aggregate`); `returning` parses, refused until W1 |
 | Block kinds in `match` | `not`, `exists`, `count`/`sum`/… blocks, `optional` | `optional` parses, refused until C |
-| Traversal spelling | `-e->`, `<-e-`, `-e-`, `-$x:e->`, `-(a\|b){m,n}->`, `-*->` | today's semantics |
+| Traversal spelling | the triple stays (`$a e $b`, `<e>`); the first draft's arrow forms were withdrawn on 2026-10-30 (§13.3) | today's semantics |
 | Call syntax | `name(args, opt: v)`, generic, resolved against a registry; `contains()`, `starts_with()`, `terms()` reserved as names; no function in the grammar | today's functions become registry rows; `terms()` refused until L |
 | Reserved words | the logic set only: `and`, `or`, `not`, `is`, `null`, `in`; every clause and declaration keyword contextual (word-bounded, position-based, as today) | closed; the amendment's rule becomes a grammar test |
 | Null | no literal in reads; `null` legal in assignment position only | today's rules plus the assignment case |
@@ -3815,7 +3815,7 @@ MCP server, and a `given` stage sold as the anti-injection parameterisation.
 |---|---|---|---|
 | Closure (2.2) | Linear: every stage consumes the previous stage's rows, any order, kinds repeat; functions are named read pipelines | Non-closed kernel plus four reserved forms: `view` (a named pattern with typed columns, inlined), `optional`, block aggregates as values, `having` | Same demand, two mechanisms; see 12.3 |
 | Polymorphism (2.1, 10.4) | Type variables in every type position; `isa` includes subtypes, `isa!` does not; parametric queries "valid over any schema" | Interface bindings, `@type`/`@type_id`, `is`; catalogue types `@Type` for the schema as data | TypeQL is more uniform; GQ's split (bind by interface, read the schema by catalogue) is the same power with two spellings |
-| Direction (2.6) | None: relation ends are roles | Written arrow, checked against the schema | §13 |
+| Direction (2.6) | None: relation ends are roles | Triple, source on the left, checked against the schema | §13 |
 | Optional (2.5) | `try { }`; unbound optionals fail later stages; `require` filters them | `optional { }` slot | Same form, same rule; TypeDB's "may only occur in a single try-block" is the scoping rule the closure RFC needs |
 | Aggregation (2.8) | `reduce … groupby`, then any stage | `return` with aggregates, then `having` | GQ's is one fixed shape; TypeQL's allows re-matching on the reduced value, which `view` gives GQ |
 | Result shape (2.15) | Rows, or nested JSON from terminal `fetch` with sub-pipelines | Rows with node objects; a partial object projection and a nested block in `return` are additive (parse errors today) | No slot needed; the nested-document demand (#649) has a precedent |
@@ -3998,39 +3998,49 @@ post-processor can fix that case, because both orientations fit the schema.
 
 ### 13.3 What follows for GQ 3
 
-The RFC made direction visible (`$p -worksAt-> $c`) for the reader and for the
-model's prior, and made `T5` check the written arrow against the schema. The
-evidence sharpens that into four rules.
+The RFC's first draft made direction visible with an arrow
+(`$p -worksAt-> $c`) for the reader and for the model's prior, and made `T5`
+check the written arrow against the schema. The evidence above and the
+one-spelling test of §14 reversed that on 2026-10-30. Four rules remain.
 
-1. **Write the arrow once, source on the left: `->` only.** The left arrow
-   `$c <-worksAt- $p` is a second spelling of the same clause. GQ has no path
-   chains (a traversal is `variable edge variable`), so `<-` is never needed
-   to continue a line; it is pure redundancy, the Go test's first casualty
-   (§14). The parser knows it: `<-e-` is a parse error whose fix prints the
-   clause with the ends swapped, as the triple form's fix prints the arrow.
-2. **A wrong arrow is a typed error with a machine-applicable swap**, never
-   an empty result and never a silent rewrite. `$c: Company -worksAt-> $p` is
-   `T5` with `fix` = the swapped clause. This is LangChain's corrector moved
-   into the compiler, where it belongs, with the two differences the evidence
-   asks for: it is loud (the agent learns in one turn, which Olausson's
-   result in §8.3 says is worth more than the edit) and it never guesses when
-   both orientations fit.
+1. **The triple stays, source on the left, and gains no arrowhead.** The
+   arrowhead carries no information: when the endpoint types differ the
+   schema fixes the orientation (13.2's first conclusion), and when they are
+   the same the position does, in `$a subsidiaryOf $b` exactly as in
+   `$a -subsidiaryOf-> $b`. It is a decoration on the one spelling, and its
+   two justifications did not survive: `$p worksAt $c` reads in
+   source-to-target order as a sentence does, and the only in-context
+   measurement GQ has is on the triple (RFC 0047: 45 of 45, 37 first tries
+   valid, no direction error) while CypherBench shows the arrow form does not
+   prevent reversals. Dropping it also removes the break's largest rewrite,
+   since every stored query has a traversal, and the arithmetic-minus rule.
+   The arrow forms stay in the grammar as a recognizer only: `$p -worksAt->
+   $c`, `$c <-worksAt- $p` and `$a -knows- $b` are parse errors whose fix
+   prints the triple with the ends in schema order.
+2. **A triple written against the schema is a typed error with a
+   machine-applicable swap**, never an empty result and never a silent
+   rewrite. `$c: Company worksAt $p` is `T5` with `fix` = `$p worksAt $c`.
+   This is LangChain's corrector moved into the compiler, where it belongs,
+   with the two differences the evidence asks for: it is loud (the agent
+   learns in one turn, which Olausson's result in §8.3 says is worth more
+   than the edit) and it never guesses when both orientations fit.
 3. **Same-type edges are where direction is meaning, and position carries
-   it.** `$a -subsidiaryOf-> $b` means `$a` is the subsidiary. No rule can
-   check that against the schema; what GQ can do is make the schema say which
-   end is which in words, so the error is visible: `@description` on the edge
-   today, and the skill's schema card prints `Company -subsidiaryOf->
-   Company (subsidiary -> parent)`.
-4. **`-e-` means "whichever orientation the endpoint types admit".** For a
-   same-type edge that is both orientations, deduplicated, as `<knows>` is
-   today. For an alternation or wildcard over edges of differing orientation
-   (`$p: Person -(owns | ownedBy)- $d: Doc`, the issue 659 case, which today's
-   triple resolves per member) it is each member's declared orientation. The
-   only refusal left is the genuinely ambiguous one: an asymmetric edge whose
-   endpoints are not typed well enough to fix the orientation. Today's `T22`
-   ("undirected traversal needs a same-endpoint-type edge") narrows to that
-   case. The bound edge's `@src` and `@dst` keep reporting the stored
-   orientation, which is why they are not redundant with the pattern's ends.
+   it.** `$a subsidiaryOf $b` means `$a` is the subsidiary. No rule can check
+   that against the schema; what GQ can do is make the schema say which end
+   is which in words, so the error is visible: `@description` on the edge
+   today, and the skill's schema card prints `Company subsidiaryOf Company
+   (subsidiary -> parent)`.
+4. **`<e>` means "whichever orientation the endpoint types admit".** For a
+   same-type edge that is both orientations, deduplicated, as today. For an
+   alternation or wildcard over edges of differing orientation
+   (`$p: Person <owns | ownedBy> $d: Doc`, the issue 659 case, which the
+   directed triple resolves per member today) it is each member's declared
+   orientation. The only refusal left is the genuinely ambiguous one: an
+   asymmetric edge whose endpoints are not typed well enough to fix the
+   orientation. Today's `T22` ("undirected traversal needs a
+   same-endpoint-type edge") narrows to that case. The bound edge's `@src`
+   and `@dst` keep reporting the stored orientation, which is why they are
+   not redundant with the pattern's ends.
 
 What GQ 3 does not take from TypeQL is roles. For a binary edge, `employee`
 and `employer` are documentation of `src` and `dst`, and GQ puts
@@ -4080,8 +4090,8 @@ Every pair of forms in GQ 3 that could mean the same thing, and the ruling.
 
 | Pair | Same meaning? | Ruling |
 |---|---|---|
-| `$a -knows-> $b` and `$b <-knows- $a` | Yes, exactly | Grammar: `->` only; `<-` is a parse error with the swapped clause as its fix (§13.3) |
-| `$a knows $b` (triple) and the arrow | Yes | Grammar: arrow only; already in the RFC |
+| `$a knows $b` and a reversed arrow `$b <-knows- $a` | Yes, exactly | Grammar: the triple only, source on the left; every arrow form is a parse error with the swapped triple as its fix (§13.3) |
+| `$a knows $b` (triple) and `$a -knows-> $b` | Yes, and the arrowhead adds nothing | Grammar: triple only, decided 2026-10-30 (§13.3); the first draft had chosen the arrow |
 | `x contains y` and `contains(x, y)` | Yes | Grammar: the call only; already in the RFC |
 | `rrf(a, b, 60)` and `rrf(a, b, k: 60)` | Yes | Grammar: named option only; already in the RFC |
 | `exists { P }` and `count { P } > 0`; `not { P }` and `count { P } = 0` | Yes | The grammar cannot forbid the count form without forbidding `count { } > 2`. Formatter: `omnigraph queries fmt` (the rewriter's second job) canonicalises the two thresholds to `exists`/`not`, and lint names it. The grammar keeps `exists` because GQL has only `EXISTS` and the planner's semi-join is the honest plan |
@@ -4109,7 +4119,7 @@ A form enters the grammar only if no existing form has its meaning; a form
 that falls out of a general construct and has a canonical instance is
 rewritten to that instance by the formatter and named by lint; the
 diagnostics know every respelling an agent is likely to write (the triple,
-the left arrow, the infix operators, GraphQL's `mutation` for a read) and
+the arrow forms, the infix operators, GraphQL's `mutation` for a read) and
 print the one form as a machine-applicable fix. The freeze list is checked
 against the rule once, in this RFC, and every later RFC's "Alternatives"
 section answers it for the form it adds.
