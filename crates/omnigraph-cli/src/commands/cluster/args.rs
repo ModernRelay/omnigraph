@@ -225,7 +225,7 @@ pub(crate) enum ClusterMembersCommand {
 
 #[derive(Debug, Default, Args)]
 pub(crate) struct ClusterRunArgs {
-    /// Return without waiting for completion. Managed apply acknowledges durable delivery reservation only.
+    /// Return without waiting for completion. Managed plan/apply acknowledge durable reservation only.
     #[arg(long)]
     pub(crate) no_wait: bool,
     /// For served apply or managed operations, bound the local wait in seconds (default 300, maximum 3600).
