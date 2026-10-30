@@ -316,15 +316,14 @@ const WRITE_TOOLS: [&str; 8] = [
 
 /// A served two-graph cluster, `knowledge` loaded with the standard fixture
 /// and `other` empty, whose policy lets `act-agent` read, change and list
-/// graphs. The server admits the ad-hoc `read` tool, and its write tools
-/// only when `writes`.
+/// graphs. The server lists every tool.
 struct Served {
     _cluster: TempDir,
     server: TestServer,
 }
 
 impl Served {
-    fn start(writes: bool) -> Self {
+    fn start() -> Self {
         let cluster = tempdir().unwrap();
         let dir = cluster.path();
         std::fs::copy(fixture("test.pg"), dir.join("people.pg")).unwrap();
@@ -361,14 +360,10 @@ impl Served {
         );
         unlock_cluster_fixture(dir);
         let tokens = format!(r#"{{"act-agent":"{AGENT_TOKEN}","act-other":"{OTHER_TOKEN}"}}"#);
-        let mut envs = vec![
-            ("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", tokens.as_str()),
-            ("OMNIGRAPH_MCP_ALLOW_ADHOC", "1"),
-        ];
-        if writes {
-            envs.push(("OMNIGRAPH_MCP_ALLOW_WRITES", "1"));
-        }
-        let server = spawn_server_with_cluster_env(dir, &envs);
+        let server = spawn_server_with_cluster_env(
+            dir,
+            &[("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", tokens.as_str())],
+        );
         Self {
             _cluster: cluster,
             server,
@@ -402,7 +397,7 @@ impl Served {
     fn people(&self) -> Vec<String> {
         let read = self.rpc(&tool_call(
             99,
-            "read",
+            "query",
             json!({"graph": "knowledge", "query": PEOPLE}),
         ));
         read["result"]["structuredContent"]["rows"]
@@ -515,82 +510,67 @@ fn mcp_refuses_what_it_cannot_relay_to_before_any_request() {
     assert!(!probe.connected(), "an endpoint was contacted");
 }
 
-/// The server is the ceiling and `--write` the agent's consent: a server
-/// without `--mcp-allow-writes` lists no write tools, and a bridge without
-/// `--write` lists and admits only the tools the server annotates read-only,
-/// refusing any other call before it is relayed. With both, a write tool
-/// runs on the bridge's graph.
+/// `--write` is the agent's consent: the server lists every tool, and a
+/// bridge without `--write` lists and admits only the tools the server
+/// annotates read-only, refusing any other call before it is relayed. With
+/// it, a write tool runs on the bridge's graph.
 #[test]
-fn mcp_lists_and_admits_tools_under_the_server_ceiling_and_the_agents_consent() {
-    let servers = [Served::start(false), Served::start(true)];
-    for (allows_writes, served) in [false, true].into_iter().zip(&servers) {
-        let listed = served.rpc(&tools_list(1));
-        let names = tool_names(&listed);
-        for tool in WRITE_TOOLS {
-            assert_eq!(
-                names.contains(&tool.to_string()),
-                allows_writes,
-                "{tool}: {names:?}"
-            );
-        }
-        let home = Home::server(served.url());
-        for write in [false, true] {
-            let mut args = vec!["--target", "staging"];
-            if write {
-                args.push("--write");
-            }
-            let mut bridge = home.bridge(&args, &[("OMNIGRAPH_TOKEN_STAGING", AGENT_TOKEN)]);
-            bridge.initialize();
-            let list = bridge.call(tools_list(1));
-            let expected: Vec<&Value> = listed["result"]["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|tool| write || tool["annotations"]["readOnlyHint"] == true)
-                .collect();
-            let relayed: Vec<&Value> = list["result"]["tools"].as_array().unwrap().iter().collect();
-            assert_eq!(relayed, expected, "writes {allows_writes}, --write {write}");
-
-            let name = format!("Eve{}{}", u8::from(allows_writes), u8::from(write));
-            let insert = bridge.tool(
-                2,
-                "mutate",
-                json!({
-                    "query": "query add($name: String) { insert Person { name: $name } }",
-                    "params": {"name": name},
-                }),
-            );
-            if allows_writes && write {
-                assert_ne!(insert["result"]["isError"], true, "{insert}");
-                assert!(insert.get("error").is_none(), "{insert}");
-            } else {
-                assert!(insert.get("result").is_none(), "{insert}");
-                assert_eq!(insert["error"]["code"], -32602, "{insert}");
-                let message = insert["error"]["message"].as_str().unwrap();
-                if allows_writes {
-                    // The agent did not consent.
-                    assert!(message.contains("--write"), "{insert}");
-                } else {
-                    // The server lists no such tool: its ceiling.
-                    assert!(message.contains("unknown MCP tool `mutate`"), "{insert}");
-                }
-                assert_eq!(insert["error"]["data"]["error"]["code"], "bad_request");
-            }
-            let finished = bridge.finish();
-            finished.assert_success();
-            finished.assert_never_shows(&[AGENT_TOKEN]);
-        }
-        // Only the write both consents admitted reached the graph.
-        let people = served.people();
-        assert_eq!(
-            people.iter().filter(|name| name.starts_with("Eve")).count(),
-            usize::from(allows_writes),
-            "{people:?}"
-        );
-        if allows_writes {
-            assert!(people.contains(&"Eve11".to_string()), "{people:?}");
-        }
+fn mcp_lists_and_admits_write_tools_only_with_the_agents_consent() {
+    let served = Served::start();
+    let listed = served.rpc(&tools_list(1));
+    let names = tool_names(&listed);
+    for tool in WRITE_TOOLS {
+        assert!(names.contains(&tool.to_string()), "{tool}: {names:?}");
     }
+    let home = Home::server(served.url());
+    for write in [false, true] {
+        let mut args = vec!["--target", "staging"];
+        if write {
+            args.push("--write");
+        }
+        let mut bridge = home.bridge(&args, &[("OMNIGRAPH_TOKEN_STAGING", AGENT_TOKEN)]);
+        bridge.initialize();
+        let list = bridge.call(tools_list(1));
+        let expected: Vec<&Value> = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|tool| write || tool["annotations"]["readOnlyHint"] == true)
+            .collect();
+        let relayed: Vec<&Value> = list["result"]["tools"].as_array().unwrap().iter().collect();
+        assert_eq!(relayed, expected, "--write {write}");
+
+        let name = format!("Eve{}", u8::from(write));
+        let insert = bridge.tool(
+            2,
+            "mutate",
+            json!({
+                "query": "query add($name: String) { insert Person { name: $name } }",
+                "params": {"name": name},
+            }),
+        );
+        if write {
+            assert_ne!(insert["result"]["isError"], true, "{insert}");
+            assert!(insert.get("error").is_none(), "{insert}");
+        } else {
+            // The agent did not consent.
+            assert!(insert.get("result").is_none(), "{insert}");
+            assert_eq!(insert["error"]["code"], -32602, "{insert}");
+            let message = insert["error"]["message"].as_str().unwrap();
+            assert!(message.contains("--write"), "{insert}");
+            assert_eq!(insert["error"]["data"]["error"]["code"], "bad_request");
+        }
+        let finished = bridge.finish();
+        finished.assert_success();
+        finished.assert_never_shows(&[AGENT_TOKEN]);
+    }
+    // Only the consented write reached the graph.
+    let people = served.people();
+    let eves: Vec<&String> = people
+        .iter()
+        .filter(|name| name.starts_with("Eve"))
+        .collect();
+    assert_eq!(eves, [&"Eve1".to_string()], "{people:?}");
 }
 
 /// The bridge is bound to one graph: it fills `graph` where a call omits it,
@@ -601,7 +581,7 @@ fn mcp_lists_and_admits_tools_under_the_server_ceiling_and_the_agents_consent() 
 /// refuses before anything connects.
 #[test]
 fn mcp_binds_one_graph_and_relays_its_reads_unchanged() {
-    let served = Served::start(false);
+    let served = Served::start();
     let home = Home::server(served.url());
     let token = [("OMNIGRAPH_TOKEN_STAGING", AGENT_TOKEN)];
     let mut bridge = home.bridge(&["--target", "staging"], &token);
@@ -630,10 +610,10 @@ fn mcp_binds_one_graph_and_relays_its_reads_unchanged() {
     );
 
     // A call that omits its graph is the server's answer for the bound graph.
-    let read = bridge.tool(1, "read", json!({"query": PEOPLE}));
+    let read = bridge.tool(1, "query", json!({"query": PEOPLE}));
     let expected = served.rpc(&tool_call(
         1,
-        "read",
+        "query",
         json!({"graph": "knowledge", "query": PEOPLE}),
     ));
     assert_eq!(read, expected);
@@ -699,7 +679,7 @@ fn mcp_binds_one_graph_and_relays_its_reads_unchanged() {
     // `--as` asserts the actor on every request: a match changes nothing,
     // and another actor is refused by the server before anything runs.
     let mut bridge = home.bridge(&["--target", "staging", "--as", "act-agent"], &token);
-    let read = bridge.tool(1, "read", json!({"query": PEOPLE}));
+    let read = bridge.tool(1, "query", json!({"query": PEOPLE}));
     assert_eq!(
         read["result"]["structuredContent"]["row_count"], 4,
         "{read}"
