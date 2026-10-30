@@ -1,6 +1,8 @@
 //! Native managed previews and delivery: submit once, observe the original IDs.
 use super::*;
 
+mod preview;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct Identity {
     deployment_id: String,
@@ -341,7 +343,7 @@ pub(super) async fn dispatch(
                 ));
             }
             let request = json!({"revision":revision});
-            let (body, key) = submit(
+            let submission = submit(
                 api,
                 &format!("{base}/plans"),
                 &request,
@@ -350,9 +352,7 @@ pub(super) async fn dispatch(
                 stderr,
             )
             .await?;
-            let exit = preview_exit(&body, context, &revision)
-                .map_err(|error| retain_submission(error, &key, &request))?;
-            Ok((body, exit))
+            preview::finish(api, context, submission, &revision, run, deadline, stderr).await
         }
         ClusterCommand::Apply { plan, run, .. } => {
             let plan = plan.as_deref().ok_or_else(|| {
