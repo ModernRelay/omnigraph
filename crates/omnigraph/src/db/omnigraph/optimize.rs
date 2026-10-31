@@ -214,7 +214,15 @@ decide_seam! {
 /// with an exact pin CAS, so one public Optimize produces at most one graph
 /// commit. The publisher owns main's `__manifest` fragment layout; maintenance
 /// only removes obsolete automatic-cleanup configuration from that dataset.
-pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimizeStats>> {
+pub async fn optimize_all_datasets(
+    db: &Omnigraph,
+    actor: Option<&str>,
+) -> Result<Vec<DatasetOptimizeStats>> {
+    db.enforce(
+        omnigraph_policy::PolicyAction::Maintain,
+        &omnigraph_policy::ResourceScope::Branch("main".to_string()),
+        actor,
+    )?;
     let _export_exclusion = db.reserve_export_destructive_control()?;
     db.ensure_schema_state_valid().await?;
 
@@ -322,14 +330,14 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
             .any(|update| update.type_key.starts_with("edge:"));
         if any_committed {
             let lineage = db
-                .new_lineage_intent_for_branch(None, None, HistoryReleaseBytes::PRODUCTION)
+                .new_lineage_intent_for_branch(None, actor, HistoryReleaseBytes::PRODUCTION)
                 .await?;
             super::table_ops::commit_updates_on_branch_with_expected(
                 db,
                 None,
                 &updates,
                 &expected_versions,
-                None,
+                actor,
                 &authority_txn,
                 lineage,
                 super::table_ops::Publication::Publish,
@@ -717,7 +725,13 @@ decide_seam! {
 pub async fn cleanup_all_datasets(
     db: &Omnigraph,
     options: CleanupPolicyOptions,
+    actor: Option<&str>,
 ) -> Result<Vec<DatasetCleanupStats>> {
+    db.enforce(
+        omnigraph_policy::PolicyAction::Reclaim,
+        &omnigraph_policy::ResourceScope::Graph,
+        actor,
+    )?;
     if options.keep_versions.is_none() && options.older_than.is_none() {
         return Err(OmniError::manifest(
             "cleanup requires at least one of keep_versions or older_than",
@@ -1650,10 +1664,13 @@ mod tests {
         let bytes = store.inner.get(&path).await.unwrap().bytes().await.unwrap();
         store.delete(&path).await.unwrap();
         let rows = db
-            .cleanup(CleanupPolicyOptions {
-                keep_versions: Some(1),
-                older_than: None,
-            })
+            .cleanup_as(
+                CleanupPolicyOptions {
+                    keep_versions: Some(1),
+                    older_than: None,
+                },
+                None,
+            )
             .await
             .unwrap();
         assert!(
@@ -1667,10 +1684,13 @@ mod tests {
         );
         store.inner.put(&path, bytes.into()).await.unwrap();
         let rows = db
-            .cleanup(CleanupPolicyOptions {
-                keep_versions: Some(1),
-                older_than: None,
-            })
+            .cleanup_as(
+                CleanupPolicyOptions {
+                    keep_versions: Some(1),
+                    older_than: None,
+                },
+                None,
+            )
             .await
             .unwrap();
         assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");

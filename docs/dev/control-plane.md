@@ -618,6 +618,7 @@ server. Public actor construction cannot grant signed-token permissions.
 on `AuthenticatedActor` exposes only verified claims.
 
 Policy embedders must handle `PolicyAction::ConfigManage`,
+`PolicyAction::Maintain`, `PolicyAction::Reclaim`,
 `PolicyResourceKind::Cluster`, and `PolicyEngineKind::Cluster`. These public
 enums are exhaustive, so an external exhaustive match must add the relevant
 arm when upgrading. Preserving existing constructors and direct storage-holder

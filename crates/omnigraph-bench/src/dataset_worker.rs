@@ -803,7 +803,10 @@ pub(crate) async fn build_dataset(
                 Engine::V2,
             )?;
             if plan.needs_indices {
-                session.ensure_indices().await.map_err(|e| e.to_string())?;
+                session
+                    .ensure_indices_as(None)
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
             (session, case, Some(exact))
         }
