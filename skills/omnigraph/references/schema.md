@@ -57,9 +57,10 @@ key). Name rules depend on the graph's vintage:
   and may declare ordinary properties named `id`, `src`, or `dst`. Every
   property name beginning `_` is reserved.
 - **Legacy graphs** (spellings kept by `omnigraph upgrade`) retain physical
-  `id`/`src`/`dst` and refuse `id` on any type, `src`/`dst` on edges, and
-  `__id`/`__src`/`__dst`. Other `_` names are still accepted there, but they
-  block `schema upgrade-system-columns`.
+  `id`/`src`/`dst` and refuse `id` and `__id` on any type, `src`/`dst` and
+  `__src`/`__dst` on edges, and Lance's virtual column names (`_rowid`,
+  `_rowaddr`, …). Other `_` names are still accepted there, but they block
+  `schema upgrade-system-columns`.
 - **All vintages:** `from` and `to` are reserved edge property names (insert
   endpoints), and `_distance`/`_score` are refused as property names.
 
@@ -115,11 +116,17 @@ a code is present, match it rather than the free-form message text.
 
 **Drops reclaim nothing at apply.** Dropping a property or type removes it from
 the current schema; older commits still read the dropped data until
-`omnigraph cleanup` stops retaining them, and only then is it gone for good. No
-flag makes a drop destructive at apply: to reclaim the space, run `cleanup`
-with a retention that excludes the commits before the drop. The HTTP server
-has no `POST /graphs/{id}/schema/apply` route; evolve a served graph through
-`cluster plan` and `cluster apply`.
+`omnigraph cleanup` stops retaining them. A dropped type is then gone, but a
+dropped property's values also stay in the table's current data files until
+`omnigraph optimize` (which works on `main`) rewrites the fragments holding
+them. To erase a dropped property: run `optimize` after the drop, delete every
+branch created from a commit before that optimize and every tag naming such a
+commit (merging a branch releases nothing), then run `cleanup` with a
+retention that excludes the commits before the optimize, for example
+`--keep 1 --confirm`. No flag makes a drop destructive at apply. Re-adding a
+dropped name starts a new property, so historical reads never see the old
+values through it. The HTTP server has no `POST /graphs/{id}/schema/apply`
+route; evolve a served graph through `cluster plan` and `cluster apply`.
 
 ### Apply is main-only
 
@@ -179,7 +186,7 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 ## Supported Types
 
 - **Scalars:** `String`, `Bool`, `I32`, `I64`, `U32`, `U64`, `F32`, `F64`, `Date`, `DateTime`, `Blob`
-- **Collections:** `Vector(N)` (fixed-size float vector), `[ScalarType]` (list of scalar)
+- **Collections:** `Vector(N)` (fixed-size float vector), `[ScalarType]` (list of a non-Blob scalar; `[Blob]` is refused)
 - **Enums:** `enum(value1, value2, ...)` — inline only, values can contain alphanumerics, underscores, hyphens
 - **Optional:** any type + `?` suffix (`String?`, `[I32]?`, `Vector(4)?`)
 
@@ -188,7 +195,7 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 **Property-level shorthand:**
 - `@key` — single-property node key
 - `@unique` — single-property uniqueness constraint
-- `@index` — single-property index intent (currently materialized automatically only for node properties)
+- `@index` — single-property index intent (currently materialized automatically only for node properties). A String property used in `search`, `fuzzy`, `match_text` or `bm25` must declare it, or the call is refused at type check (`T27`); an enum takes no full-text index (compare it with `=`)
 - `@embed("source_prop")` — associates a node Vector property with a String source; does not populate it during writes
 - `@description("...")` — metadata (no migration impact)
 

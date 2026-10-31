@@ -218,6 +218,10 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   changed line ([testing](docs/dev/testing.md#dst-storage-cost-golden)).
 - Update user-visible docs in the same change as a flag, endpoint, format,
   schema construct, behavior, or limit.
+- Reconcile the agent skill in that same change: every statement in
+  `skills/omnigraph` (`SKILL.md` and `references/`) about what the change
+  adds, alters or removes. `omnigraph skill export` ships it with the binary,
+  so a stale skill instruction is a user-facing bug.
 - Update current developer guides when architecture or support boundaries
   change. Put rationale/history in one RFC, not a copied design note.
 - Add a permanent `changelog.d/<slug>.<category>.md` note for user-visible changes;

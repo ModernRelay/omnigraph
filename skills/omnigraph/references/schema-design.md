@@ -53,10 +53,12 @@ Ontologies Used for Knowledge Sharing* (Int. J. Human-Computer Studies
    name string) when both matter.
 5. **Minimal ontological commitment**: make as few claims about the world as
    the use case requires. In Omnigraph: no required properties, closed enums or
-   `@card(1..1)` "in case". Tightening later is a rebuild, not an in-place
-   `schema apply`: adding `@key`/`@unique`/`@range`/`@check`, changing
-   cardinality, and `T?` → `T` are refused; only `@index` additions, nullable
-   additions, enum widening, renames and drops apply in place.
+   `@card(1..1)` "in case". Changing a commitment later is a rebuild, not an
+   in-place `schema apply`: adding `@key`/`@unique`/`@range`/`@check`, changing
+   cardinality in either direction, removing a constraint from a property
+   that stays, and `T?` ↔ `T` are
+   refused; only `@index` additions, nullable additions, enum widening, renames
+   and drops apply in place.
 
 The criteria trade off: Clarity wants tight definitions, Minimal Commitment
 wants weak ones. Gruber's resolution is to decide conservatively what to model
@@ -96,10 +98,12 @@ between independent writers given the same input. Tightness shows up as
 content they report they could not express, or both forced into the same
 awkward shape (see [principle 15](#15-measure-convergence)).
 
-**In Omnigraph:** loosening applies in place (enum widening, nullable
-additions); tightening is a rebuild, and loose data written in the meantime
-must be reconciled first. When many agents write, lean tight where convergence
-matters and loosen deliberately when the evidence shows a real need.
+**In Omnigraph:** only some loosening applies in place (enum widening,
+nullable additions, drops); `T` → `T?`, removing a constraint from a property
+that stays and relaxing `@card` are refused like tightening, and both are
+rebuilds. Loose data written in the meantime must be reconciled first. When
+many agents write, lean tight where convergence matters, and add each
+constraint knowing it cannot be removed in place.
 
 ## Design flow
 
@@ -397,7 +401,7 @@ A closed vocabulary with crisp, testable definitions makes agents agree; free
 text guarantees they will not. Use the narrowest type that fits: `Date` over
 `String` for dates, `enum` over `String` for states. Keep a visible catch-all
 in open-ended enums and watch it: when the default bucket fills up, a category
-is missing. Decide optionality deliberately: `T?` → `T` later is a rebuild,
+is missing. Decide optionality deliberately: `T?` ↔ `T` later is a rebuild in either direction,
 and a new required property needs a backfill plan (see
 [`schema.md`](schema.md#required-properties-need-a-backfill-plan)).
 
