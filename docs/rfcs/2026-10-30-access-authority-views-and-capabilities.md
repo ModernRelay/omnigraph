@@ -336,6 +336,22 @@ label, actors fall into groups, and the label is one value per row, indexed,
 read with one `IN` lookup. The number of distinct labels is the number of
 distinct audiences, which the source systems already have.
 
+Isn't `folder` an edge? In meaning, yes: a document's placement is its
+containment relationship, and a securable key is a reference to a node. It
+is stored on the row for the same reason an edge row stores its endpoints as
+`__src` and `__dst` columns: the view filter has to be answerable from the
+row's own table. If placement were a separate edge table, every scan of a
+placed type would need a join before its filter, a traversal would need one
+at every hop, and a search prefilter, which Lance applies inside one dataset,
+could not see it at all. Keeping an edge and maintaining the column as its
+copy would be a second source of truth with a write coupling between two
+tables. So placement is a single-valued reference carried by the row. Today
+it is spelled as the securable's key, because the schema has no
+reference-typed property and keys are unique across securable types; a later
+phase of the actor views draft packs it as a node reference that is never
+reused, and a GQ form that walks a placement to its securable is an open
+question there.
+
 ### Linking them: grants and roles
 
 A ***grant*** is an edge from a subject to a securable carrying a ***role***:
