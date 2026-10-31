@@ -4,7 +4,7 @@
 # notes: 9007199254740992 to the same double, and above i64::MAX a U64 value and an I64 bound round to the same 2^63.
 # notes: A Float bound on an integer column, and an Integer bound on a float column, compare against the bound's exact value.
 # notes: A list property's @range bounds each element; the loader used to skip list columns without checking them.
-# notes: U64 values above i64::MAX reach @range through a load; mutation parameters stop at i64::MAX.
+# notes: U64 values above i64::MAX reach @range through a load and through a mutation parameter.
 # notes: Upper-only bounds are maxima for scalar and list properties; omitted minima permit negative values.
 # notes: The seed loads each boundary value; the final read shows that every refused write stored nothing.
 
@@ -65,6 +65,12 @@ tables:
     columns:
       name: {kind: literal, value: unsigned_above}
       unsigned: {kind: literal, value: 9223372036854775808}
+--- expect error: @range violation on Counter.unsigned: value 9223372036854775808 > max 9223372036854775807
+
+--- mutate
+query unsigned_above_max_by_parameter($unsigned: U64) { insert Counter { name: "unsigned_above_by_param", unsigned: $unsigned } }
+--- params
+{"unsigned": 9223372036854775808}
 --- expect error: @range violation on Counter.unsigned: value 9223372036854775808 > max 9223372036854775807
 
 --- mutate

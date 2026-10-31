@@ -23,8 +23,9 @@ use crate::physical::{NodeId, PhysicalPlan};
 /// coverage. Version 9 adds to version 8 every `AntiJoin`'s `strategy`
 /// (`correlated` or `key_set`). Version 10 adds to version 9 every table's
 /// `source` (`dataset` or `catalogue`) and the assumptions' catalogue
-/// fingerprints.
-pub const BOUND_PLAN_VERSION: u32 = 10;
+/// fingerprints. Version 11 adds to version 10 a literal arm for an integer
+/// outside the `i64` range, carried as its decimal text.
+pub const BOUND_PLAN_VERSION: u32 = 11;
 
 /// The envelope omits top-level `plan` and `values` so unversioned readers reject it.
 #[derive(Serialize, Deserialize)]

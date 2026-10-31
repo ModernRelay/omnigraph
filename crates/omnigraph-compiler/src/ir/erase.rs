@@ -471,7 +471,7 @@ mod tests {
                 PropType::scalar(ScalarType::String, false),
             ),
             (
-                Literal::Integer(i64::MIN),
+                Literal::Integer(i128::from(i64::MIN)),
                 PropType::scalar(ScalarType::I64, false),
             ),
             (

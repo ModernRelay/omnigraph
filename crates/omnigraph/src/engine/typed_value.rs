@@ -224,7 +224,7 @@ fn typed_scalar(literal: &Literal, scalar: ScalarType) -> Result<ScalarValue> {
             _ => integer(-2_f64.powi(31), 2_f64.powi(31))? as i32,
         })),
         ScalarType::I64 => ScalarValue::Int64(Some(match literal {
-            Literal::Integer(value) => *value,
+            Literal::Integer(value) => i64::try_from(*value).map_err(|_| out_of_range())?,
             _ => integer(-2_f64.powi(63), 2_f64.powi(63))? as i64,
         })),
         ScalarType::U32 => ScalarValue::UInt32(Some(match literal {
@@ -956,7 +956,7 @@ mod tests {
     #[test]
     fn direct_parameter_values_are_checked_even_without_a_consumer() {
         let invalid = [
-            (ScalarType::I32, Literal::Integer(i64::from(i32::MAX) + 1)),
+            (ScalarType::I32, Literal::Integer(i128::from(i32::MAX) + 1)),
             (ScalarType::U32, Literal::Integer(-1)),
             (ScalarType::U64, Literal::Integer(-1)),
             (ScalarType::I64, Literal::Float(2_f64.powi(63))),
@@ -995,9 +995,10 @@ mod tests {
             }
         }
         for (kind, value) in [
-            (ScalarType::I64, Literal::Integer(i64::MAX)),
-            (ScalarType::I64, Literal::Integer(i64::MIN)),
-            (ScalarType::U32, Literal::Integer(i64::from(u32::MAX))),
+            (ScalarType::I64, Literal::Integer(i128::from(i64::MAX))),
+            (ScalarType::I64, Literal::Integer(i128::from(i64::MIN))),
+            (ScalarType::U32, Literal::Integer(i128::from(u32::MAX))),
+            (ScalarType::U64, Literal::Integer(i128::from(u64::MAX))),
             (ScalarType::F32, Literal::Float(f64::from(f32::MAX))),
         ] {
             assert!(typed_literal_to_array(&value, &scalar(kind, false), 0).is_ok());
