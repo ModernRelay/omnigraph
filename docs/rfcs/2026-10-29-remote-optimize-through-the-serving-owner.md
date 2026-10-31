@@ -829,6 +829,31 @@ and the commit, so an operator can correlate the record with server logs.
 Per-writer wait is not measured in this slice. Gate-hold time is its upper
 bound.
 
+#### 3.6 Writers in other processes
+
+This RFC adds no cross-process mechanism. A served run is as safe across
+processes as the server is today, and each hazard has an owner elsewhere in
+this document or in an accepted RFC. Stated once:
+
+| Hazard | What protects against it | Where |
+|---|---|---|
+| A second process writes the same cluster root | The cluster lock. A direct `optimize`, `cleanup`, `index build`, mutate or load on a cluster root is refused with `state_lock_held` while a server holds it. Only the lock holder writes the record. | Summary; §2.1; [graph access](2026-10-16-graph-access-serving-and-cross-process-writes.md) |
+| The owner loses its S3 lease during a run | Storage requests are refused once the lease fences; the run ends unpublished or with its publication in doubt, and the successor resolves the record from main's history. | §3.4; §2.4; [storage outcomes](2026-10-19-storage-outcomes-and-restartable-ownership.md) |
+| A late manifest put from the previous owner | Every `__manifest` publish is a put-if-absent of the next version under an exact-version precondition, so a late put meets a held version and fails as a conflict. It never overwrites the successor's commit. | §1.6; [Lance fences](../dev/lance.md), "Catalog publication" |
+| A late record put from the previous owner | Each record write is a conditional put over the version it read; a late one fails its precondition. An ambiguous answer is re-issued and read back before it is believed. | §2.3; #1176 |
+| Table work that was durable before a handover | Every rewrite is a detached Lance commit the manifest never pinned: unreachable staging the collector reclaims. Nothing replays it, in either process. | §1.7; Invariants; [recovery](../dev/recovery.md) |
+| A reader in any process | Pinned immutable versions. Optimize deletes no file and no version. | §1.10 |
+| Writers in the owner's own process | The schema permit, the main-branch gate and the table gates, held for at most `max_gate_hold` plus one table, the publication and the configuration clear. | §1.2 |
+| A standalone root, with no cluster | No lock and no record. Two direct runs on one standalone graph are safe only because the exact-version CAS fails the loser closed, with its staging collectible. That is coordination by failure, not by design, and it stays a direct-only concern. | §2.1 |
+| A raw Lance writer or an older binary | Not excluded by anything here. An operator obligation, as the invariants state. | [invariants](../dev/invariants.md), support boundaries |
+| Schema apply, branch create and delete, cleanup from another process | Unchanged: each keeps its single-writer-process boundary. Their cross-process safety is #1018's design, not this RFC's. | [invariants](../dev/invariants.md), support boundaries |
+| A later worker process | Not in this slice. A worker slice must retain the input version while the worker reads it and validate each result against the plan before the owner stages it (§Alternatives). | §Alternatives; §Not in this RFC |
+
+One active maintenance operation per cluster is a coarser grain than a
+per-table claim, and it is the first rule a multi-graph cluster will want
+relaxed. It stays coarse here because the record's active slot, the
+deployment gate and the cluster lock then agree on one unit.
+
 ### 4. CLI and other surfaces
 
 `omnigraph optimize` keeps its command.
@@ -1174,3 +1199,5 @@ dated pending entry in its decision log:
   - **Worker.** Named as deferred, not rejected: Lance's task API already
     separates planning, `execute` and the commit, and a later slice moves
     `execute` alone while the owner keeps the plan and the publication.
+  - **Writers in other processes.** §3.6 states every cross-process hazard
+    once, with its mechanism and owner; no mechanism is added.
