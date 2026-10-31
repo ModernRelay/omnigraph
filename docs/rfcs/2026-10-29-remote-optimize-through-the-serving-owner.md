@@ -202,7 +202,13 @@ grant it. The request carries:
 
 The served path sets every limit from serve settings, plans
 `maintenance_planning_concurrency` tables ahead (a serve setting; planning only
-reads) and rewrites one table at a time. The direct path keeps today's behavior: no time bound, no
+reads) and rewrites one table at a time. Of these, an HTTP request can name
+only `tables` and `max_gate_hold`, and `max_gate_hold` only at or below the
+server's ceiling (§3.1). The resource ceilings and the run byte budget are
+serve settings alone, as #1186 has it: a caller tunes what the run covers and
+how long writers wait, never how much memory or storage traffic the server
+spends. Every request field is API surface for good, so the request starts
+with the two a scheduler and an operator need. The direct path keeps today's behavior: no time bound, no
 ceilings, and both concurrencies from `OMNIGRAPH_MAINTENANCE_CONCURRENCY`
 (default 8). `--max-gate-hold` and `--tables` let a direct caller bound a run.
 The served path does not read that variable.
@@ -573,6 +579,13 @@ A record describes the graph that held the graph id at acceptance. Deleting
 and re-adding a graph does not rewrite past records. A lookup returns what
 happened then, and nothing is replayed.
 
+The record is the smallest thing the contract needs, and it is keyed by
+`kind` so that a later maintenance kind adds a value, not a file. It holds no
+event history, no progress beyond the state and the per-table outcomes, and
+no pause or resume: a job registry with those belongs to the managed control
+plane, which consumes this record. Nothing in this RFC prevents one later;
+nothing in this RFC starts one.
+
 #### 2.3 Writes
 
 The record is written at four points, each a conditional put:
@@ -721,7 +734,7 @@ principal, the options and the outcomes, and cancel stops a run.
 
 | Route | Purpose | Answers |
 |---|---|---|
-| `POST /graphs/{graph_id}/maintenance/optimize` (`startOptimize`) | Submit. The body (`OptimizeRequest`) carries `maintenance_id` (a canonical ULID the caller chose), optional `tables` and optional limits. | 202 with the record (`MaintenanceOperationOutput`) while it is non-terminal, including for a repeated POST of the same id and request; 200 once it is terminal |
+| `POST /graphs/{graph_id}/maintenance/optimize` (`startOptimize`) | Submit. The body (`OptimizeRequest`) carries `maintenance_id` (a canonical ULID the caller chose), optional `tables` and an optional `max_gate_hold`; nothing else (§1.1). | 202 with the record (`MaintenanceOperationOutput`) while it is non-terminal, including for a repeated POST of the same id and request; 200 once it is terminal |
 | `GET /graphs/{graph_id}/maintenance/{maintenance_id}` (`getMaintenanceOperation`) | Look up by original id. | 200 with the record, or 200 with `lookup: unknown` |
 | `POST /graphs/{graph_id}/maintenance/{maintenance_id}/cancel` (`cancelMaintenanceOperation`) | Ask the run to stop at its next safe boundary. | 202 with the record while it is non-terminal, and a `publishing` record unchanged (§1.9); 200 with a terminal record, unchanged |
 
@@ -738,7 +751,7 @@ Refusals reuse the existing error codes:
 | A record from another ledger at this root | 409 `conflict` (`maintenance_record_foreign`) |
 | Another active maintenance operation in the cluster | 429 `too_many_requests`, with `Retry-After` and the active id |
 | Closed admission (draining), or the route not enabled | 503 `service_unavailable` |
-| A limit above the server's ceiling | 413 `payload_too_large` |
+| A `max_gate_hold` above the server's ceiling | 413 `payload_too_large` |
 | A denied grant | 403 `forbidden` |
 
 #### 3.2 Authorization and admission
@@ -756,14 +769,15 @@ cannot widen it. Admission then checks, in order:
 4. no deployment is outstanding;
 5. no other maintenance operation is active in the cluster, and fewer than
    four are unresolved;
-6. the request's limits are within the server's ceilings.
+6. the request's `max_gate_hold`, when given, is within the server's ceiling.
 
 The server's ceilings are serve settings, held by the existing server
 settings owner. The route is off until an operator enables it, and the
 ceilings' defaults ship with the release that enables it, from the
 qualification measurement. `max_gate_hold` is proposed at 60 s with a 300 s
-ceiling, subject to that measurement. Raising a ceiling is an operator
-decision on the server, never a request option.
+ceiling, subject to that measurement. Raising a ceiling, or any resource
+ceiling or the run budget, is an operator decision on the server, never a
+request option.
 
 One active maintenance operation per cluster means that other graphs in that
 cluster wait. That is a sound first slice: cleanup, repair and full-text
@@ -874,8 +888,9 @@ Each of these needs its own requirements and evidence:
   next run, so the prefix is reported, never silent. The two drafts also
   differ on: the durable record and lookup (§2); cancellation (§1.9, §3.1); the
   gate-hold bound, the run byte budget and the resume position (§1.2, §1.3);
-  caller options within the server's ceilings (§1.1, §3.1), where #1186
-  accepts none; the policy action; the three-route shape with a
+  the two request options, `tables` and a `max_gate_hold` within the
+  server's ceiling (§1.1, §3.1), where #1186 accepts none; the resource
+  ceilings are serve settings alone in both; the policy action; the three-route shape with a
   caller-chosen id (§3.1), where #1186 has one route and a correlation id
   for diagnosis only; planning read-ahead (§1.2); and the post-commit tail
   (§1.8), which #1186 leaves as it is today. #1186 argues for a separate,
@@ -959,10 +974,26 @@ Each of these needs its own requirements and evidence:
   the commit exists, so resolution needs no operator. A missing report must
   not become a serving dependency.
 - **An out-of-process worker** (RFC 0011 Decision 11's committed direction).
-  Rejected for the first slice: a worker first needs serialized plans,
-  protected inputs and native validation of its results. The serving process
-  already holds the lock and publishes. A later offload keeps it as the one
-  publisher.
+  Deferred, not rejected, and the path is already laid. Lance's compaction
+  API is split for it: `plan_compaction` plans on one read version, each
+  `CompactionTask` of the plan is serializable and pins that version,
+  `CompactionTask::execute` runs on whichever process holds a checkout, and
+  the planner commits the `RewriteResult`s that came back
+  (`rust/lance/src/dataset/optimize.rs`, "Distributed execution").
+  `TableStore::plan_table_compaction` and `stage_compaction` already use
+  the first three; only the commit is Omnigraph's own, a detached `Rewrite`
+  the graph manifest pins (invariant 2), in place of Lance's
+  `commit_compaction`. A worker slice therefore moves `execute` alone: the
+  serving owner still plans under the gates, still pins the input, still
+  publishes once, and the record, the routes and the resolution rule are
+  unchanged. What that slice must add is the transport for a task and its
+  result, retention of the input version while a worker reads it, and
+  validation of a result against the plan before the owner stages it. This
+  is LanceDB's own division for its managed service, where compaction runs
+  on dedicated workers off the request path: the planner and publisher stay
+  in one place, the rewrite moves. This RFC keeps the rewrite in the owner
+  because the gate-hold bound already limits what a writer waits for, and
+  because the first slice should carry one new contract, not two.
 - **A section in `__cluster/state.json`.** Rejected: older binaries would
   refuse the ledger (`deny_unknown_fields`). Deployment and maintenance are
   separate decisions with separate retention.
@@ -1135,3 +1166,11 @@ dated pending entry in its decision log:
   - **Artifact and shutdown.** The write is skipped when a shutdown is
     already pending, and the default limit is sized against the grace at
     qualification.
+  - **Request options.** The HTTP request carries `tables` and
+    `max_gate_hold` only; resource ceilings and the run budget are serve
+    settings alone, as #1186 has it.
+  - **Record scope.** Keyed by `kind`; no event history, progress, pause or
+    resume. A job registry is the control plane's.
+  - **Worker.** Named as deferred, not rejected: Lance's task API already
+    separates planning, `execute` and the commit, and a later slice moves
+    `execute` alone while the owner keeps the plan and the publication.
