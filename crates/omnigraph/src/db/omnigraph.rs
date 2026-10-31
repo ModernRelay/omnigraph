@@ -5596,6 +5596,10 @@ edge WorksAt: Person -> Company
         exists_checks: Mutex<Vec<String>>,
         renames: Mutex<Vec<(String, String)>>,
         deletes: Mutex<Vec<String>>,
+        /// Answer a create that meets an object as an unscoped S3 or Azure
+        /// adapter does: its client may have sent the request before, so
+        /// equal bytes are read as this call's own copy.
+        reads_back_creates: bool,
     }
 
     impl Default for RecordingStorageAdapter {
@@ -5607,6 +5611,7 @@ edge WorksAt: Person -> Company
                 exists_checks: Mutex::default(),
                 renames: Mutex::default(),
                 deletes: Mutex::default(),
+                reads_back_creates: false,
             }
         }
     }
@@ -5669,7 +5674,11 @@ edge WorksAt: Person -> Company
 
         async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {
             self.writes.lock().unwrap().push(uri.to_string());
-            self.inner.write_text_if_absent(uri, contents).await
+            let created = self.inner.write_text_if_absent(uri, contents).await?;
+            if !created && self.reads_back_creates {
+                return Ok(self.inner.read_text(uri).await? == contents);
+            }
+            Ok(created)
         }
 
         async fn exists(&self, uri: &str) -> Result<bool> {
@@ -5922,6 +5931,60 @@ edge WorksAt: Person -> Company
             !dir.path().join(INIT_CLAIM_FILENAME).exists(),
             "the completed winner must release its transient init claim"
         );
+    }
+
+    /// Two applies of one prepared token never both hold its init claim,
+    /// though the storage adapter reads a create's conflict back by the
+    /// stored bytes: each apply's claim names the apply. Settlement still
+    /// recognizes any apply's claim of the token, and the exact claim an
+    /// earlier release wrote, and no other token's.
+    #[tokio::test]
+    async fn one_prepared_token_has_one_init_claim_owner_issue_1067() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let prepared = Omnigraph::prepare_graph_create(uri, TEST_SCHEMA)
+            .await
+            .unwrap();
+        let other_token = Omnigraph::prepare_graph_create(uri, TEST_SCHEMA)
+            .await
+            .unwrap();
+        let storage = RecordingStorageAdapter {
+            reads_back_creates: true,
+            ..Default::default()
+        };
+
+        let _claim = acquire_init_claim(prepared.root(), &storage, Some(&prepared))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                acquire_init_claim(prepared.root(), &storage, Some(&prepared)).await,
+                Err(OmniError::InitializationClaimed { .. })
+            ),
+            "a second apply of the token is refused the claim the first holds"
+        );
+
+        let held = std::fs::read_to_string(dir.path().join(INIT_CLAIM_FILENAME)).unwrap();
+        assert!(prepared.holds_claim(&held).unwrap());
+        let another_apply = prepared.claim_payload().unwrap();
+        assert_ne!(another_apply, held, "each apply writes its own claim");
+        assert!(prepared.holds_claim(&another_apply).unwrap());
+        assert!(!other_token.holds_claim(&held).unwrap());
+
+        let mut legacy: Value = serde_json::from_str(&held).unwrap();
+        legacy["version"] = 2.into();
+        legacy.as_object_mut().unwrap().remove("attempt_id");
+        assert!(
+            prepared.holds_claim(&legacy.to_string()).unwrap(),
+            "the version-2 claim an earlier release wrote"
+        );
+        let mut mixed = legacy.clone();
+        mixed["attempt_id"] = "01J00000000000000000000000".into();
+        assert!(!prepared.holds_claim(&mixed.to_string()).unwrap());
+        let mut unnamed: Value = serde_json::from_str(&held).unwrap();
+        unnamed.as_object_mut().unwrap().remove("attempt_id");
+        assert!(!prepared.holds_claim(&unnamed.to_string()).unwrap());
+        assert!(!prepared.holds_claim("not a claim").unwrap());
     }
 
     const LEFT_RACE_SCHEMA: &str = "node Left { name: String @key }\n";

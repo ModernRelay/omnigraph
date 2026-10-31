@@ -19,21 +19,15 @@
 //! conflicting key by comparing the complete transaction it records.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use lance_core::Error;
+use omnigraph_storage::conditional::{self, RequestClient};
 
-/// How many times one manifest request is re-issued after an ambiguous
-/// answer, and the pause before each re-issue: 0.2 s doubling to 1.6 s, 3 s
-/// in all, beside each request's own client timeout. A store that answers
-/// nothing for that long is failing, not throttling one request.
-pub const MANIFEST_REQUEST_REISSUES: u32 = 4;
-const FIRST_REISSUE_PAUSE: Duration = Duration::from_millis(200);
-
-/// The pause before re-issue `attempt` (1-based).
-pub fn reissue_pause(attempt: u32) -> Duration {
-    FIRST_REISSUE_PAUSE * 2u32.saturating_pow(attempt.saturating_sub(1))
-}
+/// The re-issue budget, pauses and failure classes are the storage crate's
+/// one policy for conditional requests, shared with control-object writes.
+pub use omnigraph_storage::conditional::{
+    CONDITIONAL_REQUEST_REISSUES, FailedRequest, reissue_pause,
+};
 
 /// What a commit's manifest requests established by the time the commit
 /// returned. Ordered by what a caller may conclude: everything above
@@ -54,7 +48,9 @@ pub enum ManifestRequest {
     Landed,
     /// A request may have applied, or may still, and no later request for
     /// the key got an answer that settles it. The version may hold this
-    /// commit, now or later.
+    /// commit, now or later. A re-issue that meets a held version ends here
+    /// too: on S3 the conflict can answer the earlier copy, still in flight,
+    /// so Lance's read-back decides and a missing version proves nothing.
     Unresolved,
 }
 
@@ -126,17 +122,6 @@ impl Drop for ManifestRequestAttempt {
     }
 }
 
-/// How the store answered a manifest put that failed other than by holding
-/// the version.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FailedRequest {
-    /// The request was refused before it could apply, or never left the
-    /// process: no copy of it can land.
-    Refused,
-    /// The request may have applied, or may still.
-    Ambiguous,
-}
-
 /// A log-safe name for a failed request's error: its object-store variant,
 /// never its message, which can carry object paths.
 pub fn request_error_class(error: &Error) -> &'static str {
@@ -160,37 +145,23 @@ pub fn request_error_class(error: &Error) -> &'static str {
     }
 }
 
-/// Classify a manifest put's failure by the typed error the store returned.
+/// Classify a manifest put's failure by the typed error the store returned,
+/// with the storage crate's classification on a repeating client.
 ///
-/// A remote store's generic failure (a 5xx, a throttle, a timeout, a lost
-/// connection) is ambiguous, and so are an authorization failure and a join
-/// error, which can follow an earlier internal attempt of the same call that
-/// the server applied. A local filesystem failure is ambiguous too: Lance's
-/// Windows rename handler can create the manifest before deleting its staging
-/// file fails. A missing key or container, an invalid path, an unsupported
-/// operation, and a refusal by the owning storage scope, which sends nothing,
-/// are definite. Anything this function cannot recognise is ambiguous.
+/// Lance's own "not found" is a refusal. The handler cannot tell Lance's
+/// provider from a storage scope's single-attempt client, so it takes the
+/// client to repeat requests: an authorization failure and a join error can
+/// then follow an earlier internal attempt that the server applied. A local
+/// filesystem failure is ambiguous too, by the shared rule: Lance's Windows
+/// rename handler can create the manifest before deleting its staging file
+/// fails. An error that is not the store's is ambiguous.
 pub fn classify_failed_request(error: &Error) -> FailedRequest {
-    use object_store::Error as Store;
-
-    let store = match error {
-        Error::NotFound { .. } => return FailedRequest::Refused,
-        Error::IO { source, .. } => source.downcast_ref::<Store>(),
-        _ => None,
-    };
-    match store {
-        Some(Store::Generic { store, .. })
-            if *store == "InMemory" || *store == omnigraph_storage::OWNED_STORE_NAME =>
-        {
-            FailedRequest::Refused
-        }
-        Some(
-            Store::NotFound { .. }
-            | Store::InvalidPath { .. }
-            | Store::NotSupported { .. }
-            | Store::NotImplemented { .. }
-            | Store::UnknownConfigurationKey { .. },
-        ) => FailedRequest::Refused,
+    match error {
+        Error::NotFound { .. } => FailedRequest::Refused,
+        Error::IO { source, .. } => match source.downcast_ref::<object_store::Error>() {
+            Some(store) => conditional::classify_failed_request(store, RequestClient::Repeating),
+            None => FailedRequest::Ambiguous,
+        },
         _ => FailedRequest::Ambiguous,
     }
 }
@@ -286,14 +257,5 @@ mod tests {
             assert_eq!(request_error_class(&error), class, "{error}");
             assert!(!request_error_class(&error).contains("bucket"));
         }
-    }
-
-    #[test]
-    fn reissue_pauses_double_and_stay_bounded() {
-        let pauses: Vec<_> = (1..=MANIFEST_REQUEST_REISSUES).map(reissue_pause).collect();
-        assert_eq!(
-            pauses,
-            [200, 400, 800, 1600].map(Duration::from_millis).to_vec()
-        );
     }
 }
