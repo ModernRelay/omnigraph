@@ -48,13 +48,11 @@ proc-macro, a link or a build-script run, and those repeat in full.
 
 `scripts/seed-target.sh`, which Claude Code runs at session start through the
 checked-in `.claude/settings.json` hook and any other agent runs once in a new
-worktree before its first build, instead seeds its
-`target/` as an APFS copy-on-write clone (`cp -c -R -p`) of a warm checkout's
-`target/`: by default the repository's main worktree (the first
-`git worktree list` entry), or `$OMNIGRAPH_WARM_TARGET` when set. The clone
+worktree before its first build, instead seeds its `target/` as an APFS
+copy-on-write clone (`cp -c -R -p`) of a warm checkout's `target/`. The clone
 shares disk blocks with its source until either side rewrites a file. The
-script does nothing when `target/` already exists, when no source exists, off
-macOS, or when the source is on another or a non-APFS volume, where `cp -c`
+script does nothing when `target/` already exists, when no source qualifies,
+off macOS, or when the source is on another or a non-APFS volume, where `cp -c`
 would fall back to a full copy:
 
 ```bash
@@ -62,13 +60,24 @@ sh scripts/seed-target.sh
 OMNIGRAPH_WARM_TARGET=/path/to/warm/target sh scripts/seed-target.sh
 ```
 
+Without `$OMNIGRAPH_WARM_TARGET` the source is the most recently built
+`target/` among the repository's other worktrees whose ancestor Cargo configs
+are identical. Cargo joins array values such as `build.rustflags` from every
+`.cargo/config.toml` above a checkout, so a worktree nested inside another
+checkout, as `.claude/worktrees/*` is inside the main checkout, builds with
+`--cfg tokio_unstable` twice. Its artifact hashes then differ from the main
+checkout's, and a clone of the main checkout's `target/` rebuilds everything;
+a sibling nested worktree's `target/` matches. Spelling the flags as a string,
+which Cargo does not join, would break every checkout still holding the array
+form, because Cargo refuses to merge a string with an array.
+
 The clone keeps the source's mtimes. Cargo decides freshness by comparing an
 artifact's recorded time with its sources' mtimes; the new worktree's sources
 were just checked out, so every workspace crate rebuilds once and every
 registry dependency stays fresh. Cargo rewrites the build-script output paths
-recorded under the old `target/` itself. Keep the source warm by running
-`cargo dev-build-tests` on `main` in the main worktree; a source built with
-other features or another toolchain seeds less.
+recorded under the old `target/` itself. A source built with other features or
+another toolchain seeds less, so keep one worktree warm with
+`cargo dev-build-tests`.
 
 ## Shared sccache backend (optional)
 

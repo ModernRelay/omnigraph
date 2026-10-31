@@ -6,17 +6,45 @@
 #
 # Claude Code runs it at session start (`.claude/settings.json`); run it by
 # hand from any other new worktree. Source: $OMNIGRAPH_WARM_TARGET, else the
-# `target/` of the repository's main worktree (the first `git worktree list`
-# entry). Keep that source warm with `cargo dev-build-tests` on `main`.
+# most recently built `target/` among this repository's other worktrees whose
+# ancestor Cargo configs match this one's. Cargo joins array values such as
+# `build.rustflags` from every `.cargo/config.toml` above a checkout, so a
+# worktree nested inside another checkout (`.claude/worktrees/*`) builds with
+# the flags twice and gets different artifact hashes from that checkout; a
+# sibling nested worktree matches. Keep one warm with `cargo dev-build-tests`.
 #
 # Every failure is silent and leaves no partial `target/`: an existing
 # `target/`, a missing source, a non-macOS host, or a source on another or a
 # non-APFS volume all fall back to an ordinary cold build.
 set -u
 
-dest="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/target"
-main_worktree=$(git worktree list --porcelain 2>/dev/null | awk 'NR == 1 { sub(/^worktree /, ""); print }')
-src="${OMNIGRAPH_WARM_TARGET:-${main_worktree:+$main_worktree/target}}"
+root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+dest="$root/target"
+
+# Checksum of every Cargo config above a checkout, nearest first.
+ancestor_configs() {
+  d=$(cd "$1/.." && pwd -P) || return
+  while :; do
+    cat "$d/.cargo/config.toml" "$d/.cargo/config" 2>/dev/null
+    [ "$d" = / ] && break
+    d=$(dirname "$d")
+  done | cksum
+}
+
+src="${OMNIGRAPH_WARM_TARGET:-}"
+if [ -z "$src" ]; then
+  want=$(ancestor_configs "$root")
+  newest=0
+  while IFS= read -r wt; do
+    [ "$wt" = "$root" ] && continue
+    [ -d "$wt/target/debug" ] || continue
+    [ "$(ancestor_configs "$wt")" = "$want" ] || continue
+    built=$(stat -f %m "$wt/target/debug")
+    [ "$built" -gt "$newest" ] && { newest=$built; src="$wt/target"; }
+  done <<WORKTREES
+$(git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')
+WORKTREES
+fi
 
 [ "$(uname -s)" = Darwin ] || exit 0
 [ -n "$src" ] && [ -d "$src/debug" ] || exit 0
