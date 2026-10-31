@@ -1,21 +1,21 @@
 #!/bin/sh
-# Conductor workspace setup (conductor.json `scripts.setup`); also usable from
-# any fresh worktree. Seeds this worktree's `target/` as an APFS copy-on-write
-# clone of a warm checkout's `target/`, so the first build recompiles only the
+# Seeds a fresh worktree's `target/` as an APFS copy-on-write clone of a warm
+# checkout's `target/`, so the first build recompiles only the
 # workspace crates instead of all ~770 dependencies. The clone shares disk
 # blocks with its source until either side rewrites a file.
 #
-# Source, first match wins: $OMNIGRAPH_WARM_TARGET, then
-# $CONDUCTOR_ROOT_PATH/target (the repository root checkout). Keep that source
-# warm with `cargo dev-build-tests` on `main`.
+# Run it from the new worktree. Source: $OMNIGRAPH_WARM_TARGET, else the
+# `target/` of the repository's main worktree (the first `git worktree list`
+# entry). Keep that source warm with `cargo dev-build-tests` on `main`.
 #
 # Every failure is silent and leaves no partial `target/`: an existing
 # `target/`, a missing source, a non-macOS host, or a source on another or a
 # non-APFS volume all fall back to an ordinary cold build.
 set -u
 
-dest="${CONDUCTOR_WORKSPACE_PATH:-$(pwd)}/target"
-src="${OMNIGRAPH_WARM_TARGET:-${CONDUCTOR_ROOT_PATH:+$CONDUCTOR_ROOT_PATH/target}}"
+dest="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/target"
+main_worktree=$(git worktree list --porcelain 2>/dev/null | awk 'NR == 1 { sub(/^worktree /, ""); print }')
+src="${OMNIGRAPH_WARM_TARGET:-${main_worktree:+$main_worktree/target}}"
 
 [ "$(uname -s)" = Darwin ] || exit 0
 [ -n "$src" ] && [ -d "$src/debug" ] || exit 0
@@ -34,7 +34,7 @@ dev=$(df "$src_real" | awk 'NR == 2 { print $1 }')
 # workspace crate whose source differs from the warm checkout's.
 tmp="$dest.cloning.$$"
 if cp -c -R -p "$src_real" "$tmp" 2>/dev/null && mv "$tmp" "$dest" 2>/dev/null; then
-  echo "conductor-setup: cloned target/ from $src_real"
+  echo "seed-target: cloned target/ from $src_real"
 else
   rm -rf "$tmp"
 fi

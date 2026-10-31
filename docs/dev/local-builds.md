@@ -3,7 +3,7 @@
 **Audience:** anyone building or testing OmniGraph locally, often in many
 worktrees at once
 **Authority:** how the workspace's build configuration is meant to be used;
-`.cargo/config.toml`, `conductor.json` and the scripts they name are the source
+`.cargo/config.toml` and the scripts it and this page name are the source
 of truth
 
 The workspace links the Lance, DataFusion, Arrow and object-store stack into
@@ -43,18 +43,18 @@ sccache's main branch as of 0.19), and Cargo runs every rustc, registry crates
 included, from the workspace root, so a compile in one worktree never hits an
 entry another worktree wrote. `SCCACHE_BASEDIRS` normalizes C and C++ only.
 
-`scripts/conductor-setup.sh`, which `conductor.json` runs when Conductor
-creates a workspace, instead seeds the new worktree's `target/` as an APFS
-copy-on-write clone (`cp -c -R -p`) of a warm checkout's `target/`: by default
-`$CONDUCTOR_ROOT_PATH/target`, the repository root checkout, or
-`$OMNIGRAPH_WARM_TARGET` when set. The clone shares disk blocks with its source
-until either side rewrites a file. The script does nothing when `target/`
-already exists, when no source exists, off macOS, or when the source is on
-another or a non-APFS volume, where `cp -c` would fall back to a full copy.
-Run it by hand in any fresh worktree:
+`scripts/seed-target.sh`, run once in a new worktree, instead seeds its
+`target/` as an APFS copy-on-write clone (`cp -c -R -p`) of a warm checkout's
+`target/`: by default the repository's main worktree (the first
+`git worktree list` entry), or `$OMNIGRAPH_WARM_TARGET` when set. The clone
+shares disk blocks with its source until either side rewrites a file. The
+script does nothing when `target/` already exists, when no source exists, off
+macOS, or when the source is on another or a non-APFS volume, where `cp -c`
+would fall back to a full copy:
 
 ```bash
-OMNIGRAPH_WARM_TARGET=~/conductor/repos/omnigraph/target sh scripts/conductor-setup.sh
+sh scripts/seed-target.sh
+OMNIGRAPH_WARM_TARGET=/path/to/warm/target sh scripts/seed-target.sh
 ```
 
 The clone keeps the source's mtimes. Cargo decides freshness by comparing an
@@ -62,7 +62,7 @@ artifact's recorded time with its sources' mtimes; the new worktree's sources
 were just checked out, so every workspace crate rebuilds once and every
 registry dependency stays fresh. Cargo rewrites the build-script output paths
 recorded under the old `target/` itself. Keep the source warm by running
-`cargo dev-build-tests` on `main` in the root checkout; a source built with
+`cargo dev-build-tests` on `main` in the main worktree; a source built with
 other features or another toolchain seeds less.
 
 ## Shared sccache backend (optional)
