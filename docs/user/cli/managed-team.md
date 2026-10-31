@@ -177,6 +177,11 @@ If an older CLI saved an invitation without a role, repeat its original
 arguments and key to retrieve the saved result or uncertainty. The CLI preserves
 that request unchanged; a new invitation always requires `--role`.
 
+If an older CLI saved a role change with one role, repeat it with that one
+`--role` and the same key. The CLI resends the saved single-role request
+unchanged and shows the service's answer. A service that accepts only role sets
+refuses that request.
+
 A partial offboard result stays partial on replay. Inspect the current provider
 state and retained receipt before preparing a new request for remaining cleanup.
 An uncertain offboard blocks other offboards in that organization until the

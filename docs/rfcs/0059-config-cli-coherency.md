@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-06
-updated: 2026-10-29
+updated: 2026-10-31
 discussion: https://github.com/ModernRelay/omnigraph/pull/675
 supersedes: []
 superseded_by: []
@@ -61,7 +61,9 @@ reject duplicate flags and sort the set before retaining the exact request.
 Changing only flag order therefore reuses the same request and idempotency key.
 The service receives canonical `roles`, and its receipt must bind the exact
 `requested_roles` and verified resulting roles. No implicit default or additive
-role assignment is inferred.
+role assignment is inferred. A role change retained before this extension keeps
+record version 1 and its single `role` operation and body; the same one-role
+selection and key resend it unchanged, and its receipt binds one `requested_role`.
 
 Every new invitation explicitly selects one service role with `--role`.
 Its receipt exposes the provider-observed role; a successful new send must match

@@ -4521,6 +4521,148 @@ fn managed_organization_preserves_archived_roleless_invitations_without_new_send
 }
 
 #[test]
+fn managed_organization_replays_single_role_member_records_unchanged() {
+    // Before role sets, a retained member update was record version 1 with one
+    // `role` in its operation and body. Its same-key retry resends those bytes,
+    // and a later write keeps the record in that spelling.
+    for (outcome, exit) in [("updated", 0), ("uncertain", 3), ("refused", 2)] {
+        let temp = tempdir().unwrap();
+        let mut single = team_role_result(if outcome == "refused" {
+            "updated"
+        } else {
+            outcome
+        });
+        let data = single["data"].as_object_mut().unwrap();
+        data.remove("requested_roles");
+        data.insert("requested_role".into(), "writer".into());
+        let replay = if outcome == "refused" {
+            IntentReply::json(
+                422,
+                serde_json::json!({"type":"invalid_role_update","detail":"select a role set"}),
+            )
+        } else {
+            IntentReply::json(200, single.clone())
+        };
+        let sent = serde_json::json!({"data":{"organization_id":"account-one","action":"send","invitation":team_invitation("pending")},"meta":{}});
+        let api = lifecycle_fixture(vec![
+            IntentReply::json(200, organization_members()),
+            IntentReply::json(200, team_role_result("updated")),
+            replay.clone(),
+            IntentReply::json(200, sent.clone()),
+            replay,
+        ]);
+        let arguments = [
+            "members",
+            "set",
+            "user_one",
+            "--role",
+            "writer",
+            "--idempotency-key",
+            "saved-key",
+            "--json",
+        ];
+        output_success(organization_cli(temp.path(), &api.origin).args(arguments));
+        let path = organization_record(temp.path());
+        let mut records: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        for pointer in ["/0/operation", "/0/request/body"] {
+            let value = records
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap();
+            assert_eq!(value.remove("roles"), Some(serde_json::json!(["writer"])));
+            value.insert("role".into(), "writer".into());
+        }
+        let original = serde_json::to_vec(&records).unwrap();
+        fs::write(&path, &original).unwrap();
+        let replayed = || {
+            let output = organization_cli(temp.path(), &api.origin)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(exit), "{output:?}");
+            let body = parse_stdout_json(&output);
+            if outcome == "refused" {
+                assert_eq!(body["type"], "invalid_role_update");
+                assert_eq!(body["idempotency_key"], "saved-key");
+            } else {
+                assert_eq!(body, single);
+            }
+        };
+        replayed();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        for roles in [&["admin"][..], &["writer", "admin"][..]] {
+            let mut changed = organization_cli(temp.path(), &api.origin);
+            changed.args([
+                "members",
+                "set",
+                "user_one",
+                "--idempotency-key",
+                "saved-key",
+            ]);
+            for role in roles {
+                changed.args(["--role", role]);
+            }
+            let changed = output_failure(changed.arg("--json"));
+            assert_eq!(
+                parse_stdout_json(&changed)["type"],
+                "organization_request_conflict"
+            );
+        }
+        // Other writes in this profile proceed, and their rewrite of the file
+        // keeps the single-role record as it was retained.
+        output_success(organization_cli(temp.path(), &api.origin).args([
+            "invitations",
+            "send",
+            "avery@example.com",
+            "--role",
+            "member",
+            "--idempotency-key",
+            "invite-key",
+            "--json",
+        ]));
+        let rewritten: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(rewritten.as_array().unwrap().len(), 2);
+        assert_eq!(rewritten[0], records[0]);
+        replayed();
+        let requests = api.workflow_requests();
+        assert_eq!(requests.len(), 5);
+        for replay in [&requests[2], &requests[4]] {
+            assert_control_request(
+                replay,
+                "POST",
+                "/v1/organization/members/user_one:set-role",
+                records[0]["request"]["body"].clone(),
+                Some("saved-key"),
+            );
+        }
+        assert!(requests[2].body.get("roles").is_none());
+        // Unknown fields and mixed spellings still refuse every write in the profile.
+        for (pointer, field, value) in [
+            ("/0/operation", "note", serde_json::json!("unknown")),
+            ("/0/operation", "roles", serde_json::json!(["writer"])),
+            ("/0/request/body", "roles", serde_json::json!(["writer"])),
+        ] {
+            let mut damaged = rewritten.clone();
+            let object = damaged.pointer_mut(pointer).unwrap();
+            object.as_object_mut().unwrap().insert(field.into(), value);
+            let bytes = serde_json::to_vec(&damaged).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            let refused =
+                output_failure(organization_cli(temp.path(), &api.origin).args(arguments));
+            assert_eq!(
+                parse_stdout_json(&refused)["type"],
+                "organization_record_failed"
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+        assert_eq!(api.workflow_requests().len(), 5);
+        assert_no_core_effects(temp.path());
+        api.assert_complete();
+    }
+}
+
+#[test]
 fn managed_organization_resolves_invitation_email_across_pages_once() {
     for action in ["resend", "revoke"] {
         let temp = tempdir().unwrap();

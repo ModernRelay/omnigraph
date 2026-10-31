@@ -684,7 +684,8 @@ fn role_human(data: &Value, exact: &custody::ExactRequest) -> Result<(String, i3
         user_id: String,
         membership_id: String,
         previous_roles: Vec<String>,
-        requested_roles: Vec<String>,
+        requested_roles: Option<Vec<String>>,
+        requested_role: Option<String>,
         role_update: String,
         roles: Vec<String>,
         service_permissions: Vec<String>,
@@ -692,16 +693,26 @@ fn role_human(data: &Value, exact: &custody::ExactRequest) -> Result<(String, i3
         graph_policy_changed: bool,
     }
     let receipt: Receipt = parse(data)?;
+    // A request retained before role sets sent one `role`; the service that
+    // accepted it answers with one `requested_role`.
+    let requested = match (
+        &exact.body["role"],
+        receipt.requested_roles,
+        receipt.requested_role,
+    ) {
+        (Value::Null, Some(roles), None) if exact.body["roles"] == json!(roles) => roles,
+        (Value::String(role), None, Some(requested)) if *role == requested => vec![requested],
+        _ => return Err(Failure::protocol()),
+    };
     validate_roles(&receipt.previous_roles)?;
-    validate_roles(&receipt.requested_roles)?;
+    validate_roles(&requested)?;
     validate_roles(&receipt.roles)?;
     validate_service_permissions(&receipt.service_permissions)?;
     let updated = receipt.role_update == "updated";
     if exact.body["user_id"].as_str() != Some(receipt.user_id.as_str())
         || exact.body["expected_membership_id"].as_str() != Some(receipt.membership_id.as_str())
-        || exact.body["roles"] != json!(receipt.requested_roles)
         || !matches!(receipt.role_update.as_str(), "updated" | "uncertain")
-        || updated && receipt.roles != receipt.requested_roles
+        || updated && receipt.roles != requested
         || !updated && receipt.roles != receipt.previous_roles
         || receipt.graph_policy_changed
         || receipt.provider_observed_at.len() > 64

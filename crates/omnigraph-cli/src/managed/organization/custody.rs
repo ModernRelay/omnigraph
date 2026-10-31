@@ -17,17 +17,34 @@ pub(super) struct ExactRequest {
 }
 
 impl ExactRequest {
-    fn valid(&self, operation: &Operation, organization: &str) -> bool {
+    fn valid(&self, operation: &Retained, organization: &str) -> bool {
         let user = self.body["user_id"].as_str();
         let membership = self.body["expected_membership_id"].as_str();
         let selector_matches = |selector: &str, id: &str| email(selector) || selector == id;
-        match operation {
-            Operation::Set { selector, roles } => user.is_some_and(|user| {
-                identity(user) && selector_matches(selector, user)
+        let set_role = |selector: &str, field: &str, roles: Value| {
+            user.is_some_and(|user| {
+                identity(user)
+                    && selector_matches(selector, user)
                     && membership.is_some_and(valid_membership)
                     && self.path == format!("/v1/organization/members/{user}:set-role")
-                    && self.body == json!({"version":1,"organization_id":organization,"user_id":user,"expected_membership_id":membership,"roles":roles})
-            }),
+                    && self.body
+                        == json!({
+                            "version": 1,
+                            "organization_id": organization,
+                            "user_id": user,
+                            "expected_membership_id": membership,
+                            field: roles,
+                        })
+            })
+        };
+        let operation = match operation {
+            Retained::Current(operation) => operation,
+            Retained::SingleRole(SingleRole::Set { selector, role }) => {
+                return set_role(selector, "role", json!(role));
+            }
+        };
+        match operation {
+            Operation::Set { selector, roles } => set_role(selector, "roles", json!(roles)),
             Operation::Offboard { selector, expected_membership } => user.is_some_and(|user| {
                 identity(user) && selector_matches(selector, user)
                     && match expected_membership.as_deref() {
@@ -51,6 +68,35 @@ impl ExactRequest {
     }
 }
 
+/// A record's operation in the shape it was retained with. Rewriting the file
+/// writes every earlier record back in its own spelling, never a translation.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum Retained {
+    Current(Operation),
+    SingleRole(SingleRole),
+}
+
+/// `members set` as builds before role sets retained it, still record version 1:
+/// one role, sent as `role`. The same command with that one `--role` selects it.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+enum SingleRole {
+    Set { selector: String, role: String },
+}
+
+impl Retained {
+    fn operation(&self) -> Operation {
+        match self {
+            Self::Current(operation) => operation.clone(),
+            Self::SingleRole(SingleRole::Set { selector, role }) => Operation::Set {
+                selector: selector.clone(),
+                roles: vec![role.clone()],
+            },
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Record {
@@ -60,7 +106,7 @@ struct Record {
     principal_id: String,
     owner_profile: String,
     idempotency_key: String,
-    operation: Operation,
+    operation: Retained,
     request: ExactRequest,
 }
 
@@ -126,7 +172,7 @@ impl Journal {
                     || record.idempotency_key.len() > 256
                     || !record.idempotency_key.bytes().all(|b| b.is_ascii_graphic())
                     || !keys.insert(&record.idempotency_key)
-                    || record.operation.validate().is_err()
+                    || record.operation.operation().validate().is_err()
                     || !record
                         .request
                         .valid(&record.operation, &record.organization_id)
@@ -156,7 +202,7 @@ impl Journal {
             .iter()
             .find(|record| record.idempotency_key == key)
         {
-            if record.operation != *operation
+            if record.operation.operation() != *operation
                 || record.api != self.api
                 || record.organization_id != self.organization
                 || record.principal_id != self.principal
@@ -181,6 +227,7 @@ impl Journal {
         operation: Operation,
         request: ExactRequest,
     ) -> Result<ExactRequest> {
+        let operation = Retained::Current(operation);
         if !request.valid(&operation, &self.organization) {
             return Err(failure());
         }
