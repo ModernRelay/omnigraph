@@ -80,6 +80,7 @@ authority model.
 | Review architectural rules | [Invariants](docs/dev/invariants.md) |
 | Align with Lance | [Lance guide](docs/dev/lance.md) |
 | Find test ownership | [Testing guide](docs/dev/testing.md) |
+| Keep builds warm across features and worktrees | [Local builds](docs/dev/local-builds.md) |
 | Understand atomic writes and crashes | [Write path](docs/dev/writes.md) and [recovery](docs/dev/recovery.md) |
 | Understand query execution | [Execution](docs/dev/execution.md) |
 | Understand clusters and serving | [Control plane](docs/dev/control-plane.md) |
