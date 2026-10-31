@@ -1,0 +1,71 @@
+#!/bin/sh
+# Seeds a fresh worktree's `target/` as an APFS copy-on-write clone of a warm
+# checkout's `target/`, so the first build recompiles only the
+# workspace crates instead of all ~770 dependencies. The clone shares disk
+# blocks with its source until either side rewrites a file.
+#
+# Claude Code runs it at session start (`.claude/settings.json`); run it by
+# hand from any other new worktree. Source: $OMNIGRAPH_WARM_TARGET, else the
+# most recently built `target/` among this repository's other worktrees whose
+# ancestor Cargo configs match this one's. Cargo joins array values such as
+# `build.rustflags` from every `.cargo/config.toml` above a checkout, so a
+# worktree nested inside another checkout (`.claude/worktrees/*`) builds with
+# the flags twice and gets different artifact hashes from that checkout; a
+# sibling nested worktree matches. Keep one warm with `cargo dev-build-tests`.
+#
+# Every failure is silent and leaves no partial `target/`: an existing
+# `target/`, a missing source, a non-macOS host, or a source on another or a
+# non-APFS volume all fall back to an ordinary cold build.
+set -u
+
+root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+dest="$root/target"
+
+# Checksum of every Cargo config above a checkout, nearest first.
+ancestor_configs() {
+  d=$(cd "$1/.." && pwd -P) || return
+  while :; do
+    cat "$d/.cargo/config.toml" "$d/.cargo/config" 2>/dev/null
+    [ "$d" = / ] && break
+    d=$(dirname "$d")
+  done | cksum
+}
+
+src="${OMNIGRAPH_WARM_TARGET:-}"
+if [ -z "$src" ]; then
+  want=$(ancestor_configs "$root")
+  newest=0
+  while IFS= read -r wt; do
+    [ "$wt" = "$root" ] && continue
+    [ -d "$wt/target/debug" ] || continue
+    [ "$(ancestor_configs "$wt")" = "$want" ] || continue
+    built=$(stat -f %m "$wt/target/debug")
+    [ "$built" -gt "$newest" ] && { newest=$built; src="$wt/target"; }
+  done <<WORKTREES
+$(git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')
+WORKTREES
+fi
+
+[ "$(uname -s)" = Darwin ] || exit 0
+[ -n "$src" ] && [ -d "$src/debug" ] || exit 0
+[ -e "$dest" ] && exit 0
+src_real=$(cd "$src" && pwd -P) || exit 0
+[ "$src_real" = "$(cd "$(dirname "$dest")" && pwd -P)/target" ] && exit 0
+
+# `cp -c` clones each file with clonefile(2) but falls back to a full byte
+# copy across volumes, so clone only within one APFS volume.
+[ "$(stat -f %d "$src_real")" = "$(stat -f %d "$(dirname "$dest")")" ] || exit 0
+dev=$(df "$src_real" | awk 'NR == 2 { print $1 }')
+/sbin/mount | grep -q "^$dev on .*(apfs," || exit 0
+# `-p` keeps the source's mtimes, which Cargo's freshness check depends on:
+# an artifact stamped with the clone time would look newer than this
+# worktree's checked-out sources, and Cargo would skip rebuilding a
+# workspace crate whose source differs from the warm checkout's.
+tmp="$dest.cloning.$$"
+# A build that created `target/` meanwhile wins; `mv` would nest the clone.
+if cp -c -R -p "$src_real" "$tmp" 2>/dev/null && [ ! -e "$dest" ] && mv "$tmp" "$dest" 2>/dev/null; then
+  echo "seed-target: cloned target/ from $src_real"
+else
+  rm -rf "$tmp"
+fi
+exit 0

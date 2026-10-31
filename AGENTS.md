@@ -80,6 +80,7 @@ authority model.
 | Review architectural rules | [Invariants](docs/dev/invariants.md) |
 | Align with Lance | [Lance guide](docs/dev/lance.md) |
 | Find test ownership | [Testing guide](docs/dev/testing.md) |
+| Keep builds warm across features and worktrees | [Local builds](docs/dev/local-builds.md) |
 | Understand atomic writes and crashes | [Write path](docs/dev/writes.md) and [recovery](docs/dev/recovery.md) |
 | Understand query execution | [Execution](docs/dev/execution.md) |
 | Understand clusters and serving | [Control plane](docs/dev/control-plane.md) |
@@ -127,6 +128,11 @@ changes the invariant.
 
 `protoc` is a build dependency. The engine directory is `crates/omnigraph`, but
 its Cargo package is `omnigraph-engine`.
+
+In a new worktree, run `sh scripts/seed-target.sh` once before the first build
+to clone a warm `target/` (a Claude Code session-start hook already does), and
+prefer the `cargo dev-test` / `dev-nextest` / `dev-clippy` aliases, which share
+one feature set; see [local builds](docs/dev/local-builds.md).
 
 ```bash
 cargo build --workspace --locked
