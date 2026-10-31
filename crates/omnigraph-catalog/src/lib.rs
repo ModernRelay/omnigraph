@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use crate::branch_control::list_live_manifest_branch_contents;
 use crate::commit_graph::{CommitGraph, HistoryCache};
-use crate::error::{OmniError, Result, missing_graph_type_at_snapshot};
+use crate::error::{CompletionEvidence, OmniError, Result, missing_graph_type_at_snapshot};
 use crate::handle_cache::TableHandleCache;
 use crate::seams::{decide_seam, fail};
 use datafusion::logical_expr::Expr;
@@ -128,6 +128,10 @@ pub const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = migrations::INTERNAL_MANIFEST_
 pub const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 =
     migrations::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION;
 pub use migrations::is_served_stamp;
+
+/// Native attempts one branch create makes, each under a fresh native name.
+/// A retry follows only an attempt whose ref provably cannot land.
+const NATIVE_BRANCH_CREATE_ATTEMPTS: u32 = 2;
 
 /// One row per table identity: its registration and its current pin or drop.
 pub const OBJECT_TYPE_TABLE: &str = "table";
@@ -2604,16 +2608,42 @@ impl ManifestCoordinator {
         crate::branch_control::ensure_manifest_branch_create_namespace(&ds, name)
             .await
             .map_err(OmniError::before_effect)?;
-        let native =
-            crate::branch_names::native_branch_name(name, &crate::branch_names::mint_incarnation());
-        match crate::branch_control::create_branch_recoverably(&mut ds, &native, version, binding)
-            .await?
-        {
-            crate::branch_control::BranchCreateOutcome::Created => Ok(()),
-            crate::branch_control::BranchCreateOutcome::RefAlreadyExists => Err(
-                OmniError::manifest_conflict(format!("branch '{}' already exists", name)),
-            ),
+        // Each attempt mints a fresh native name, so a retry never meets what
+        // an earlier attempt left under its own. Only a failure that proved
+        // no copy of its ref can land (`Unpublished`) is retried: a ref that
+        // may still land keeps the create in doubt, since a retry beside it
+        // could leave the branch two live incarnations.
+        for attempt in 1..=NATIVE_BRANCH_CREATE_ATTEMPTS {
+            let native = crate::branch_names::native_branch_name(
+                name,
+                &crate::branch_names::mint_incarnation(),
+            );
+            match crate::branch_control::create_branch_recoverably(
+                &mut ds, &native, version, binding,
+            )
+            .await
+            {
+                Ok(crate::branch_control::BranchCreateOutcome::Created) => return Ok(()),
+                Ok(crate::branch_control::BranchCreateOutcome::RefAlreadyExists) => {
+                    return Err(OmniError::manifest_conflict(format!(
+                        "branch '{}' already exists",
+                        name
+                    )));
+                }
+                Err(error)
+                    if attempt < NATIVE_BRANCH_CREATE_ATTEMPTS
+                        && error.completion_evidence() == Some(CompletionEvidence::Unpublished) =>
+                {
+                    tracing::warn!(
+                        attempt,
+                        "native branch create failed before its ref could land; retrying under a \
+                         fresh native name"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
         }
+        unreachable!("the last native branch-create attempt returns")
     }
 
     /// Main's latest `__manifest`, read through this coordinator's control
