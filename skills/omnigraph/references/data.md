@@ -261,7 +261,8 @@ omnigraph commit list --target $REPO --branch main --json        # history
 > managed target and `--graph ID` (or its default graph). For direct local
 > access, stop the server, select the cluster root with `--target ROOT --graph
 > ID`, and before restarting the server release the lock the direct write
-> keeps: read `lock_id` from `cluster status --target ROOT --json`, then
+> keeps: once that write has finished and its I/O has settled, read its
+> `lock_id` from `cluster status --target ROOT --json`, then
 > `cluster force-unlock <LOCK_ID> --target ROOT`. Data commands refuse an
 > inline cloud URI; an `s3://` root reaches only cluster and maintenance
 > commands.

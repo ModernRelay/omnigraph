@@ -40,10 +40,15 @@ Registered direct targets pin a local `file://` URI. Inline direct targets
 accept local paths and `file://` URIs and, with the server stopped, an inline
 `s3://` cluster root for `cluster plan`, `apply`, `status`, `force-unlock` and
 `upgrade-ledger` and for direct maintenance with `--graph` (region from
-`AWS_REGION`; see [S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)).
-Each such command keeps the cluster lock afterwards: read `lock_id` from
-`cluster status --json` and `force-unlock` it before the next writer or the
-server starts. Every other command and any `az://` address refuses an inline
+`AWS_REGION` or `AWS_DEFAULT_REGION`; see
+[S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)).
+Every direct writer on the root (`cluster apply`, maintenance) takes the
+cluster's admission lock and keeps it after it finishes; `cluster plan` and
+`cluster status` only observe the lock, and `cluster status --json` reports the
+current holder's `lock_id`. Before the next writer or the server starts,
+establish that the holder has stopped and its I/O has settled, then release
+that exact ID with `cluster force-unlock`. Never release a lock you only
+observed. Every other command and any `az://` address refuses an inline
 cloud target: select a registered server or managed target, whose host holds
 the cloud storage settings and credentials.
 

@@ -197,7 +197,7 @@ backend. `--config DIR` is source input only.
 - Direct cluster root: `--target ./cluster --graph knowledge`; registered root targets can set `default_graph`.
 - Server: `--target production --graph knowledge`; the registered target owns endpoint and one auth provider.
 - Managed: `--profile work` for account operations; a managed target references that profile and pins cluster ID/incarnation. Graph operations need its endpoint and `--graph` or `default_graph`.
-- Direct targets support local files, plus an inline `s3://` cluster root for `cluster plan/apply/status/force-unlock/upgrade-ledger` and `optimize`/`index build`/`index rebuild`/`cleanup`/`repair --graph` once the server's lock is released. Each direct writer keeps its own admission lock; `cluster force-unlock` it before starting the server. Other cloud-direct, catalogue and Unix socket targets are unsupported. Remote inline URLs must be registered.
+- Direct targets support local files, plus an inline `s3://` cluster root for `cluster plan/apply/status/force-unlock/upgrade-ledger` and `optimize`/`index build`/`index rebuild`/`cleanup`/`repair --graph` while the server is stopped. Each direct writer on the root takes the admission lock and keeps it; once that writer has stopped and its I/O has settled, release its exact `lock_id` (from `cluster status --json`) with `cluster force-unlock` before the next writer or the server starts. Other cloud-direct, catalogue and Unix socket targets are unsupported. Remote inline URLs must be registered.
 
 Bare target names resolve from the operator file; use `./` for relative inline
 paths. `init --schema schema.pg ./graph.omni` is the sole positional backend
@@ -259,7 +259,7 @@ two agents given the same input should write the same graph and read the same
 meaning back. Decide conservatively what to model; once modeled, constrain
 precisely, because changing a commitment later is a rebuild (adding
 `@key`/`@unique`/`@range`/`@check`, changing cardinality, removing a
-constraint, and `T?` ↔ `T` are refused; only `@index` additions, nullable
+constraint from a property that stays, and `T?` ↔ `T` are refused; only `@index` additions, nullable
 additions, enum widening, renames and drops apply in place).
 
 In short: Gruber's five criteria (clarity · coherence · extendibility · minimal
@@ -296,7 +296,7 @@ Direct CLI targets are local, with one exception: a stopped S3 cluster accepts
 an inline `s3://` cluster root for `cluster plan/apply/status/force-unlock/upgrade-ledger`
 and the maintenance commands with `--graph` (see
 [S3 cluster roots](../../docs/user/operations/s3-cluster-roots.md)); the CLI
-then reads `AWS_REGION` and endpoint variables from its environment. Otherwise,
+then reads `AWS_REGION` (or `AWS_DEFAULT_REGION`) and endpoint variables from its environment. Otherwise,
 for cloud-backed graphs, use a registered server or managed target; the server
 owns storage credentials. Keep development credentials in a git-ignored
 `.env.omni` and source it before starting the process that needs them:

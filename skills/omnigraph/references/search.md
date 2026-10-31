@@ -162,7 +162,7 @@ line, `POST /query`, stored-query calls):
 `order` is `ascending` for a `nearest` distance and `descending` for a `bm25`
 or fused score. `exhaustive: false` means the `ann_nprobes` cap left
 partitions unsearched, so a nearer row may exist (raise `ann_nprobes`); `bm25`
-is always exhaustive, and `rrf` is when its `nearest` arm is. `score_columns`
+is always exhaustive, and `rrf` is when every `nearest` arm is. `score_columns`
 lists the returned columns that hold the ranking's own score. A read whose
 order is no search has no `ranking`.
 
@@ -204,8 +204,9 @@ query related_chunks($artifact_slug: String, $q: Vector(1536)) {
 ```
 
 Scoping fixes the answer, not always the cost: a `nearest` or `rrf` scan
-prefilters to the traversal's eligible entities only when they are few
-(`OMNIGRAPH_RRF_GATE_RATIO`, default 10% of the ranked type); otherwise, and
+prefilters to the traversal's eligible entities only when they are few:
+within `OMNIGRAPH_RRF_GATE_RATIO` of the ranked type (default 10%) and at most
+`OMNIGRAPH_RRF_GATE_MAX_IDS` (default 100000). Otherwise, and
 always for a standalone `bm25`, the ranked type is scanned and the traversal
 keeps the rows it reaches.
 

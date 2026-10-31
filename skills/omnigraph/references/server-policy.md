@@ -22,8 +22,9 @@ removals without a restart; a direct `cluster apply` needs the server stopped.
 There is no single-graph server mode. On local and S3 roots a clean shutdown
 releases the server's cluster lock, and on S3 a restarted server takes over a
 crashed predecessor's lock through its lease. A local server that exited
-uncertainly, any Azure server, and every direct CLI writer (`cluster apply`,
-`load`, maintenance) keep the lock: once that owner's writes have settled,
+uncertainly, any Azure server, and every direct CLI writer on the cluster
+root (`cluster apply`, `load`, maintenance; a standalone graph takes no
+cluster lock) keep the lock: once that owner's writes have settled,
 clear it with `cluster force-unlock <LOCK_ID>` before the next start (see
 [cluster mode](cluster.md)).
 

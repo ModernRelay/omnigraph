@@ -55,7 +55,8 @@ Ontologies Used for Knowledge Sharing* (Int. J. Human-Computer Studies
    the use case requires. In Omnigraph: no required properties, closed enums or
    `@card(1..1)` "in case". Changing a commitment later is a rebuild, not an
    in-place `schema apply`: adding `@key`/`@unique`/`@range`/`@check`, changing
-   cardinality in either direction, removing a constraint, and `T?` ↔ `T` are
+   cardinality in either direction, removing a constraint from a property
+   that stays, and `T?` ↔ `T` are
    refused; only `@index` additions, nullable additions, enum widening, renames
    and drops apply in place.
 
