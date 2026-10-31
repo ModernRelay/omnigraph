@@ -338,7 +338,11 @@ pub async fn init_and_load(dir: &tempfile::TempDir) -> Session {
 
 /// The standard rows under a compatible schema, for schema-size instruments.
 pub async fn init_and_load_with_schema(dir: &tempfile::TempDir, schema: &str) -> Session {
-    let uri = dir.path().to_str().unwrap();
+    init_and_load_at(dir.path().to_str().unwrap(), schema).await
+}
+
+/// [`init_and_load_with_schema`] at a graph uri on any backend.
+pub async fn init_and_load_at(uri: &str, schema: &str) -> Session {
     let db = session(Omnigraph::init(uri, schema).await.unwrap());
     db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
     // Mutation/load publish only exact data effects; physical indexes are

@@ -1,11 +1,13 @@
 # Troubleshooting
 
 CLI failures include a human-readable message. Add `--json` where supported to
-receive structured fields suitable for automation. Application-generated HTTP
-errors use a JSON body with `error`, an optional broad `code`, and optional
-details for conflicts, limits, Blob ranges, external sources, or recovery.
-Router, method, media-type, malformed-body, and extractor rejections may be
-plain responses, including 404, 405, 415, or 422.
+receive structured fields suitable for automation. Every HTTP error the server
+answers, an unknown route, a method the route does not serve and a malformed
+body, query string or path parameter included, uses a JSON body with `error`,
+`code`, `disposition` and optional details for conflicts, limits, Blob ranges,
+external sources, or recovery. A malformed request is `400`, a body without a
+JSON content type `415`. MCP tool calls report the same body beside the HTTP
+status ([MCP](mcp.md#results-and-errors)).
 
 Do not parse human-readable error text when a structured field is present.
 
@@ -19,21 +21,28 @@ means the data request was not sent. HTTP discovery refusals retain their status
 
 ## HTTP errors
 
+Each `code` is sent under the statuses `ErrorCode` in `openapi.json` names
+beside its meaning: one, except `branch_start_refusal`, which is `409`, or `410`
+for `not_retained`.
+
 | Status | Meaning | Usual action |
 |---:|---|---|
 | 400 | Invalid request, query, schema, configuration, or external-Blob policy, including an update that must carry a stored external Blob reference the policy does not admit | Correct the request; retrying unchanged will fail again. For a stored reference, assign that property in the same update (a new value or null), or admit its base in the policy |
-| 401 | Missing or invalid bearer token | Supply a token configured by the server. The CLI sends a token only to the server it is keyed to; see [server credentials](../cli/index.md#use-a-server) |
-| 403 | The resolved actor is not authorized | Change policy or use an authorized identity |
+| 401 | Missing or invalid bearer token. `WWW-Authenticate` says which: `error="invalid_token"` when the server refused the token sent, and `resource_metadata` when the server accepts OAuth sign-in | Supply a token configured by the server. The CLI sends a token only to the server it is keyed to; see [server credentials](../cli/index.md#use-a-server) |
+| 403 | The resolved actor is not authorized (`forbidden`), or a valid OIDC token's subject is not in the server's admission file (`not_admitted`) | For `forbidden`, change policy or use an authorized identity. For `not_admitted`, signing in again cannot help: the server's operator must admit the identity |
 | 404 | Graph, query, branch, entity, or route is unavailable | Check the name and applied cluster revision; stored-query denials may also appear as 404 |
-| 409 | Concurrent change, duplicate ID, merge conflict, existing resource, or incompatible full-text index | Inspect structured details; not every conflict is retryable |
-| 410 | Required change-feed history was reclaimed | Capture and durably install a new baseline, then resume from its terminal cursor |
-| 412 | Blob entity-tag or graph-commit precondition failed | Refresh the Blob ETag (a Blob write's `blob_precondition_failure` names the current one), or re-read the branch and retry the mutation with its current graph commit |
-| 413 | Request or operation exceeded a bounded resource limit | Split or reduce the operation using the reported limit. Blob limits are listed in [Blob limits](../blobs.md#limits) |
-| 416 | Blob byte range is outside the value | Use the returned length to choose a valid range |
+| 405 | The path is served, but not with this method (`method_not_allowed`) | Use a method the `Allow` header lists |
+| 408 | The request body did not arrive before its deadline (`request_timeout`) | Send the request again; nothing was admitted |
+| 409 | Concurrent change, duplicate ID, merge conflict, existing resource, incompatible full-text index, or a commit no branch can start at (`branch_start_refusal`) | Inspect structured details; not every conflict is retryable |
+| 410 | Required change-feed history was reclaimed, or the commit a branch start names (`branch_start_refusal`, `not_retained`) | Capture and durably install a new baseline, then resume from its terminal cursor; start the branch at a retained commit |
+| 412 | Blob entity-tag or graph-commit precondition failed (`precondition_failed`), or `Omnigraph-If-Actor` named another actor than the credential (`actor_mismatch`) | For `precondition_failed`, refresh the Blob ETag (a Blob write's `blob_precondition_failure` names the current one), or re-read the branch and retry the mutation with its current graph commit. For `actor_mismatch` nothing ran: use the named actor's credential or correct the header; retrying unchanged fails again |
+| 413 | Request or operation exceeded a bounded resource limit (`payload_too_large`) | Split or reduce the operation using the reported limit. Blob limits are listed in [Blob limits](../blobs.md#limits) |
+| 415 | The body's content type is not one the route accepts (`unsupported_media_type`) | Send JSON with `Content-Type: application/json`, or the type the route names |
+| 416 | Blob byte range is outside the value (`range_not_satisfiable`) | Use the returned length to choose a valid range |
 | 424 | An allowed external Blob source could not be read | Restore source availability or correct its URI/credentials |
-| 429 | Server or per-actor admission limit reached | Use the whole-command outcome below before retrying; preserve `Retry-After` |
+| 429 | Server or per-actor admission limit reached | Use the whole-command disposition below before retrying; preserve `Retry-After` |
 | 500 | Server or stored-data integrity failure | Check server logs; do not assume partial success. A Blob delivery, change-route or streamed-response failure logs its error class (`error_variant`, and `storage_kind` for a storage failure), never its storage path; see below |
-| 503 | Admission is closed, or a published schema change requires completion | Inspect the structured error; generic 503 is not permission to repeat a write |
+| 503 | Admission is closed, the server's OIDC identity snapshot has expired, or the graph is not served (`service_unavailable`, `graph_unavailable`, both with `Retry-After`), or a published schema change requires completion (`recovery_required`) | Inspect the structured error; generic 503 is not permission to repeat a write |
 
 A `GET` or `HEAD /blob` 500 logs `error_kind="blob_pre_header_internal"` with a
 `stage`. `target` is a failure resolving a snapshot target for a policy-gated
@@ -66,11 +75,41 @@ the same way. See [Diagnostics](../queries/diagnostics.md).
 
 ## Failed data-write commands
 
-CLI data-write failures preserve structured details and add `command_outcome`:
-`execution` is `not_started` or `unknown`, `effects` is `none` or `unknown`, and
-`action` is `retry`, `refresh`, `recover` or `reconcile`. JSON mode writes these
-fields to stdout; human mode prints the action on stderr. HTTP failures also
-retain `http_status` and, when present, the original `retry_after` string.
+Every server error body, and every CLI data-write and read failure, carries a
+`disposition`: `effects` is `none`, `partial` or `unknown`, and `action` is
+`fix`, `refresh`, `retry`, `recover` or `reconcile`. The server decides it for
+the request it answered by the first row that matches:
+
+| Error | `effects` | `action` |
+|---|---|---|
+| Any error before the request submitted a write | `none` | the refusal's own |
+| A write whose completion the server could not settle; `code` becomes `outcome_unknown` unless the action is `recover` | `unknown` | `reconcile`, or `recover` |
+| A refusal before the write started (`401`, `403`, `412`, `429`, `api_contract_mismatch`, `actor_mismatch`), a typed refusal of its one publication (a merge, key, read-set or dataset-version conflict, a resource limit, an external Blob source, a query diagnostic), or a failure the engine proved published nothing, such as a storage failure before publication; `code` is kept | `none`, or `partial` when an earlier step of the write published, such as a load that forked its missing branch | the refusal's own |
+| Any other error after a write, which may follow its publication; `code` is kept | `unknown` | `reconcile`, or `recover` |
+
+A refusal's own action follows its code: `recover` for a recovery intent or a
+full-text index to build, `retry` for `too_many_requests`,
+`service_unavailable`, `graph_unavailable` and `request_timeout`, `fix` for
+`unauthorized`, `bad_request`, `api_contract_mismatch`, `actor_mismatch`,
+`not_found`, `method_not_allowed`, `unattached_cannot_publish`,
+`branch_start_refusal`, `payload_too_large`, `unsupported_media_type` and
+`range_not_satisfiable`, and
+`refresh` for the rest: `forbidden`, `precondition_failed`, `conflict`,
+`external_blob_source`, `change_feed_gap` and `internal`. A write the server
+could not settle answers `500`.
+
+The CLI reports the server's disposition when that request was the command's
+only effectful one, and otherwise its own account of the whole command, so a
+lost response is `unknown` with `reconcile`. A read command changes nothing, so
+its failure always has `effects: none`. JSON mode writes the failure to stdout,
+or to stderr when part of the result, such as a streamed page, already reached
+stdout. Stdout then keeps the bytes already written, which can end inside an
+unfinished object, as for `diff`, `branch diff`, `commit changes` and
+`changes poll` with `--json` when they follow every page, and the failure
+document is on stderr. Human mode prints the `disposition` line on
+stderr. A target refusal on these commands exits 1 with `action: fix`. HTTP
+failures also retain `http_status` and, when present, the original
+`retry_after` string.
 
 This includes `commit publish` and `commit drop`, as well as their `mutate`
 statement forms. If a response or result output is lost, inspect the commit's
@@ -78,37 +117,59 @@ current state before another attempt; an output failure does not undo the write.
 The same applies to `load`, `blob put`, `blob clear` and `schema apply`: a closed
 output pipe or failed result flush can follow a successful write. The CLI exits with a failure
 and does not repeat the operation. If stdout cannot carry a JSON failure, stderr
-reports the undelivered diagnostic and its outcome.
+reports the undelivered diagnostic and its disposition, and the exit still
+follows it.
+
+For the data commands the CLI classifies (queries, reads, `load`, `mutate`,
+branch, commit, schema and Blob commands, and aliases), the
+exit follows from the disposition:
 
 | CLI exit | What to do |
 |---:|---|
 | 0 | The operation succeeded or was a no-op. A merge can separately report a source-deletion failure without losing its successful result. |
-| 4 | The server verified the requested write precondition failed with no earlier command effects. Re-read the branch and choose a new precondition deliberately. |
-| 75 | The server's typed admission refusal proves this whole command did not start. Honor `Retry-After` and bound any caller retry. |
-| 1 | Inspect the action and details. A conflict, resource limit, unavailable server, incomplete response or lost connection does not by itself permit repeating the write. |
+| 1 | `effects: none`: the command changed nothing. Inspect the action and details, correct the cause and run it again. |
+| 2 | `effects: unknown` or `partial`: the command may have had effects, or an earlier step of it did. Read the target, and reconcile or recover as `action` says, before another attempt; a conflict, resource limit, incomplete response or lost connection does not by itself permit repeating the write. |
+| 4 | A condition you set did not hold, with no earlier command effects: a verified write precondition or an `--as` assertion. Re-read the branch and choose a new precondition deliberately. |
+| 75 | `effects: none` with `retry`: the server refused before starting, as when the actor is busy. Honor `Retry-After` and bound any caller retry. |
+| 64 | The argument parser refused the command line before anything ran (`EX_USAGE`); an addressing refusal inside a command, such as two scope flags, exits 1. |
+
+Maintenance commands (`init`, `upgrade`, `optimize`, `index build`, `index rebuild`,
+`repair`, `cleanup`, `schema upgrade-system-columns`), `cluster`, `policy`,
+`target`, `credentials`, `mcp`, `studio` and the managed commands keep their own exits for now:
+their exit 1 does not by itself say that nothing changed, so read their report;
+`mcp` answers each relayed request with its own disposition.
 
 A served write refused with `401` `unauthorized`, `403` `forbidden` or `400`
-`api_contract_mismatch` exits 1 with `execution: not_started`, `effects: none`
-and `action: refresh`. The server answers these before it admits the write:
+`api_contract_mismatch` exits 1 with `effects: none`, and `action: refresh` for
+the policy denial and `fix` for the others. The server answers these before it admits the write:
 bearer authentication, then the API contract header, then policy. Fix the
 credential, the policy grant or the client before running the command again.
-When the CLI sent no credential, the refusal also carries `missing_credential`:
-`server` names a declared server with no stored token, or `unbound` names an
-address under no declared server, and `hint` says how to bind one. The server's
-`error` text is unchanged.
+If a server target with `auth: {provider: anonymous}` receives a 401, the CLI
+adds `missing_credential` with `target`, `auth: "anonymous"` and a setup `hint`.
+A missing credential for a token or exec provider refuses locally before any
+HTTP request. The server's `error` text is unchanged.
 The status counts only with its matching `code` in a response that carries the
 server's API contract header: a bare `403` from a proxy stays `unknown` with
 `reconcile`, and a refusal that also reports recovery work stays `recover`.
 
-`refresh` means inspect current inputs and correct the command; it does not grant
-automatic replay. `recover` means finish the reported recovery obligation.
+`fix` means correct the credential, input, path or client; sent unchanged, the
+command fails the same way. `refresh` means read the current state and decide
+again; it does not grant automatic replay. `partial` effects mean an earlier
+step stands although the failing one wrote nothing; read the target before
+deciding. `recover` means finish the reported recovery obligation.
 `reconcile` means establish the original operation's outcome before another
 attempt. Only `retry` with exit 75 grants the bounded retry described above; the
 CLI performs no automatic retry.
 
-The outcome covers the entire command. A later refused subrequest cannot undo
-an earlier branch creation, load or publication. Embedded load conflicts and
-conditional mismatches remain exit 1: writable open can complete earlier work.
+The disposition covers the entire command. A later refused subrequest cannot
+undo an earlier branch creation, load or publication. An embedded write's own
+refusal says what the engine did, projected as a server would project it: a
+policy refusal precedes every publication, a `load --from` fork included, so it
+has `effects: none` on both planes. The engine marks an error that follows a
+fork which did publish: a typed refusal then has `effects: partial` on both
+planes, and an error the engine cannot prove wrote nothing has `unknown`. A
+`load --from` onto a branch that already exists forks nothing. Any later
+failure, such as rendering a committed receipt, stays `unknown`.
 Disconnecting an admitted HTTP write does not cancel it: the server keeps
 running the original operation, and a lost response can leave the caller's
 outcome unknown. There is no durable request-result lookup in this release.
@@ -118,7 +179,7 @@ outcome unknown. There is no durable request-result lookup in this release.
 A `409` is not one universal retry signal:
 
 - A read-set or version conflict means another writer changed an input. Inspect
-  the whole-command outcome and re-read before deciding on a new operation.
+  the whole-command disposition and re-read before deciding on a new operation.
 - A key conflict means strict insertion found an existing ID. Change the ID or
   use merge/upsert semantics; repeating the strict insert is not useful.
 - A merge conflict requires an explicit resolution on one branch before
@@ -128,13 +189,22 @@ A `409` is not one universal retry signal:
   `code: "conflict"`. This condition persists until an operator rebuilds the
   affected branch's indexes; do not automatically retry the same query. Follow
   the [full-text upgrade procedure](upgrade.md#full-text-index-upgrade).
+- A full-text index with no part at the query's snapshot includes
+  `full_text_index_required: { "index": "Type.property" }` with
+  `code: "conflict"`. It persists until the branch's index is built
+  (`omnigraph index build --target <target> --branch <branch>`); do not retry
+  the same query. See
+  [Search indexes](../search/index.md#indexes).
 - “Already initialized” means the target already contains a graph. Choose a new
   root or deliberately use the command's destructive option when appropriate.
 
 Writes are atomic at the graph-commit boundary. A normal validation, conflict,
-or limit error does not mean that a subset became visible. A recovery-required
-error is different: a schema change is already published and only its schema
-files remain to be installed, so reopen read-write rather than retrying it.
+or limit error does not mean that a subset became visible. When
+`recovery_required` identifies an already published schema change, its table
+pins and accepted schema contract are durable together; only the process
+view may still need refresh. Reopen the graph read-write or restart its
+server rather than replaying the change. Legacy recovery sidecars require
+the original release, as described under [maintenance failures](#maintenance-failures).
 
 ## Storage-format mismatch
 
@@ -152,12 +222,15 @@ between graph roots.
 - Apply refuses existing unmanaged roots and missing managed graphs that remain
   declared. Restore authoritative data to keep a missing graph, or remove its
   declaration to delete it; see [deployment boundaries](../clusters/index.md#deployment-boundaries).
-- A retained lock requires prior-owner and accepted-I/O quiescence, exclusion
-  of other admissions/unlocks, and its exact ID; follow
+- A server restarted after a crash takes over its predecessor's leased S3 lock
+  once the predecessor's heartbeats have been silent for a lease and a half
+  (45 seconds by default). A lock with no lease (on a local or Azure root, or
+  an older binary's) requires prior-owner and accepted-I/O quiescence, exclusion of other
+  admissions/unlocks, and its exact ID; follow
   [ownership transfer](../deployment.md#writer-topology).
 - Directory boot reads `cluster.yaml` to resolve storage, but served graph,
   query, and policy resources come from applied state. Submit configuration
-  changes with `cluster apply --server` for live activation.
+  changes with `cluster apply --target` for live activation.
 - By default one graph that cannot open is quarantined while healthy graphs
   serve. Use `--require-all-graphs` when partial startup is unacceptable.
 - `external_blob_base_overlaps_storage_root`: an `external_blobs` base lies
@@ -179,7 +252,7 @@ See [Operating a cluster](../clusters/index.md).
 
 ## Maintenance failures
 
-If `optimize`, `repair`, `cleanup`, `rebuild-full-text-indexes` or `upgrade` cannot
+If `optimize`, `index build`, `index rebuild`, `repair`, `cleanup` or `upgrade` cannot
 write or flush its output, the CLI returns a failure without repeating the
 operation. An output failure does not undo completed work. Inspect the graph's
 state before another attempt; for an interrupted upgrade, follow the
@@ -223,10 +296,10 @@ See [Maintenance](maintenance.md) and [Deployment](../deployment.md).
 
 ```bash
 omnigraph version
-omnigraph snapshot --store ./graph.omni --json
-omnigraph commit list --store ./graph.omni --json
-omnigraph cluster status --config ./company-brain --json
-omnigraph repair ./graph.omni --json
+omnigraph snapshot --target ./graph.omni --json
+omnigraph commit list --target ./graph.omni --json
+omnigraph cluster status --target ./company-brain --json
+omnigraph repair --target ./graph.omni --json
 ```
 
 For server requests, retain the HTTP status, response body, request path,

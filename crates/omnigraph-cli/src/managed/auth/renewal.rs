@@ -1,9 +1,16 @@
 //! Provider credentials and their exact identity remain in the OS keychain.
 use super::*;
+use crate::managed::{MAX_BODY, ResponseLimits};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest as _, Sha256};
 
 const MAX_CACHE: usize = 64 * 1024;
+const HUMAN_SESSION_LIFETIME: time::Duration = time::Duration::days(30);
+const REFRESH_BUDGET: Duration = Duration::from_secs(20);
+const REFRESH_ATTEMPT: Duration = Duration::from_secs(6);
+const VERIFY_BUDGET: Duration = Duration::from_secs(15);
+const VERIFY_ATTEMPT: Duration = Duration::from_secs(4);
+const RETRY_BACKOFF: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(1)];
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -37,6 +44,10 @@ pub(super) struct Session {
 }
 
 impl Session {
+    pub(super) fn access_token(&self) -> &str {
+        &self.access_token
+    }
+
     pub(super) async fn revoke(&self) -> bool {
         revoke(&self.origin, self.access_token.clone()).await
     }
@@ -113,6 +124,7 @@ fn key(saved: &Session) -> Result<String> {
         &saved.identity.account_id,
         &saved.identity.principal_id,
         &saved.identity.subject,
+        &saved.identity.session_id,
     );
     let bytes = serde_json::to_vec(&tuple).map_err(|_| invalid())?;
     Ok(format!("credential:{:x}", Sha256::digest(bytes)))
@@ -144,7 +156,7 @@ fn parse(raw: &str, origin: &str) -> Result<Session> {
             .any(|c| c.is_control() || c.is_whitespace())
         || expiry > OffsetDateTime::from_unix_timestamp(decoded.exp).map_err(|_| invalid())?
         || expiry > refresh_expiry
-        || refresh_expiry > now + time::Duration::hours(8) + MAX_METADATA_CLOCK_SKEW
+        || refresh_expiry > now + HUMAN_SESSION_LIFETIME + MAX_METADATA_CLOCK_SKEW
     {
         return Err(invalid());
     }
@@ -183,6 +195,21 @@ fn index(store: &dyn Store, origin: &str) -> Result<Index> {
     Ok(index)
 }
 
+/// Check the bounded cache without selecting an organization or renewing a session.
+pub(super) fn validate_custody(store: &dyn Store, origin: &str) -> Result<Vec<Session>> {
+    let index = index(store, origin)?;
+    let mut sessions = Vec::new();
+    for (organization, reference) in index.sessions {
+        let raw = store.get(&reference)?.ok_or_else(invalid)?;
+        let saved = parse(&raw, origin)?;
+        if key(&saved)? != reference || saved.identity.account_id != organization {
+            return Err(invalid());
+        }
+        sessions.push(saved);
+    }
+    Ok(sessions)
+}
+
 pub(super) fn load_selected(
     store: &dyn Store,
     origin: &str,
@@ -197,7 +224,7 @@ pub(super) fn load_selected(
         None if index.sessions.len() > 1 => {
             return Err(Failure::refused(
                 "organization_required",
-                "multiple organizations are signed in; select --organization or a bound folder",
+                "multiple organizations are signed in; select a target with an organization_id",
             ));
         }
         None => index
@@ -225,6 +252,18 @@ pub(super) fn load(store: &dyn Store, origin: &str) -> Result<Option<Session>> {
 pub(super) fn save(store: &dyn Store, saved: &Session) -> Result<()> {
     let value = serde_json::to_string(saved).map_err(|_| invalid())?;
     parse(&value, &saved.origin)?;
+    let claim = session_claim(&saved.config, &saved.identity.session_id)?;
+    let owner = crate::operator_routing::journal_owner().unwrap_or_else(|| "test-unbound".into());
+    if store
+        .session_owner(&claim)?
+        .is_some_and(|previous| previous != owner)
+    {
+        return Err(Failure::refused(
+            "session_identity_mismatch",
+            "provider session belongs to another owner/profile",
+        ));
+    }
+    store.claim_session(&claim, &owner)?;
     let selected = key(saved)?;
     let mut index = index(store, &saved.origin)?;
     let previous = index
@@ -278,7 +317,46 @@ pub(super) fn check_device_session(
             ));
         }
     }
+    if store
+        .session_owner(&session_claim(config, &initial.sid)?)?
+        .is_some()
+    {
+        return Err(Failure::refused(
+            "session_identity_mismatch",
+            "device sign-in reused a previously claimed provider session; start a fresh sign-in",
+        ));
+    }
     Ok(initial)
+}
+
+fn session_claim(config: &provider::Config, sid: &str) -> Result<String> {
+    let bytes =
+        serde_json::to_vec(&(&config.issuer, &config.client_id, sid)).map_err(|_| invalid())?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+pub(super) fn check_replacement(
+    store: &dyn Store,
+    saved: &Session,
+    confirmed: Option<&str>,
+) -> Result<()> {
+    if confirmed.is_some_and(|principal| principal != saved.identity.principal_id) {
+        return Err(Failure::refused(
+            "principal_replacement_mismatch",
+            "verified new principal does not match --replace-principal",
+        ));
+    }
+    if let Some(previous) = load_selected(store, &saved.origin, Some(&saved.identity.account_id))? {
+        if previous.identity.principal_id != saved.identity.principal_id
+            && confirmed != Some(saved.identity.principal_id.as_str())
+        {
+            return Err(Failure::refused(
+                "principal_replacement_required",
+                "profile belongs to another principal; confirm the new verified principal with login --replace-principal PRINCIPAL_ID",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(super) async fn select_device_organization(
@@ -324,8 +402,7 @@ pub(super) async fn verify(
     if expected_user.is_some_and(|id| id != decoded.sub) {
         return Err(invalid());
     }
-    let body = Api::new(origin.into(), Some(token.into()))?
-        .request(Method::GET, "/v1/auth/session", None, None)
+    let body = verify_session_response(&Api::new(origin.into(), Some(token.into()))?)
         .await
         .map_err(|error| scrub(error, token))?;
     let data = &body["data"];
@@ -333,9 +410,11 @@ pub(super) async fn verify(
     let principal = bounded_string(data, "principal_id", 1024)?;
     let expires = bounded_string(data, "expires_at", 128)?;
     let expiry = timestamp(expires)?;
+    let permissions: Vec<String> =
+        serde_json::from_value(data["service_permissions"].clone()).map_err(|_| invalid())?;
+    super::super::validate_service_permissions(&permissions).map_err(|_| invalid())?;
     if Some(account) != decoded.org_id.as_deref()
         || data["kind"] != "human"
-        || !data["scopes"].is_object()
         || expiry <= OffsetDateTime::now_utc()
         || expiry > OffsetDateTime::from_unix_timestamp(decoded.exp).map_err(|_| invalid())?
     {
@@ -348,7 +427,7 @@ pub(super) async fn verify(
         session_id: decoded.sid,
     };
     // Provider/API extras never reach normal CLI output.
-    let mut output = json!({"data":{"principal_id":principal,"account_id":account,"kind":"human","subject":identity.subject,"scopes":data["scopes"],"expires_at":expires},"meta":{"assurance":"verified_human"}});
+    let mut output = json!({"data":{"principal_id":principal,"account_id":account,"kind":"human","subject":identity.subject,"service_permissions":permissions,"expires_at":expires},"meta":{"assurance":"verified_human"}});
     scrub_value(&mut output, token);
     Ok((identity, expires.into(), output))
 }
@@ -383,7 +462,7 @@ pub(super) async fn accept(
             }
             previous.refresh_expires_at.clone()
         }
-        None => (OffsetDateTime::now_utc() + time::Duration::hours(8))
+        None => (OffsetDateTime::now_utc() + HUMAN_SESSION_LIFETIME)
             .format(&Rfc3339)
             .map_err(|_| invalid())?,
     };
@@ -410,8 +489,154 @@ pub(super) async fn accept(
 pub(super) fn unknown() -> Failure {
     Failure::refused(
         "refresh_outcome_unknown",
-        "renewal may have completed; run login --api explicitly to recover",
+        "renewal may have completed; run login --target NAME explicitly to recover",
     )
+}
+
+fn retry_delay(
+    retry_after: &[reqwest::header::HeaderValue],
+    mut delay: Duration,
+) -> Option<Duration> {
+    match retry_after {
+        [] => {}
+        [value] => {
+            let Ok(value) = value.to_str() else {
+                return None;
+            };
+            let provider_delay = if let Ok(seconds) = value.trim().parse::<u64>() {
+                Duration::from_secs(seconds)
+            } else if let Ok(date) =
+                OffsetDateTime::parse(value.trim(), &time::format_description::well_known::Rfc2822)
+            {
+                (date - OffsetDateTime::now_utc())
+                    .max(time::Duration::ZERO)
+                    .unsigned_abs()
+            } else {
+                return None;
+            };
+            delay = delay.max(provider_delay);
+        }
+        _ => return None,
+    }
+    Some(delay)
+}
+
+async fn retry_pause(
+    attempt: usize,
+    retry_after: &[reqwest::header::HeaderValue],
+    deadline: Instant,
+    next_attempt: Duration,
+) -> bool {
+    let Some(delay) = RETRY_BACKOFF
+        .get(attempt)
+        .and_then(|delay| retry_delay(retry_after, *delay))
+    else {
+        return false;
+    };
+    if Instant::now()
+        .checked_add(delay)
+        .and_then(|next| next.checked_add(next_attempt))
+        .is_none_or(|next| next > deadline)
+    {
+        return false;
+    }
+    tokio::time::sleep(delay).await;
+    true
+}
+
+// AuthKit's replay grace applies only to this exact token/organization pair in
+// this invocation. Keep the whole loop comfortably inside its 30-second window.
+async fn refresh_tokens(
+    provider: &provider::Provider,
+    saved: &Session,
+) -> Result<workos::AuthenticateResponse> {
+    let deadline = Instant::now() + REFRESH_BUDGET;
+    for attempt in 0..3 {
+        if Instant::now() + REFRESH_ATTEMPT > deadline {
+            return Err(unknown());
+        }
+        let outcome = tokio::time::timeout(
+            REFRESH_ATTEMPT,
+            provider.refresh(&saved.refresh_token, &saved.identity.account_id),
+        )
+        .await;
+        let headers = match outcome {
+            Ok(Ok(tokens)) => return Ok(tokens),
+            Ok(Err(error)) if provider::transient(&error) => error
+                .api()
+                .map(|error| {
+                    error
+                        .headers
+                        .get_all(reqwest::header::RETRY_AFTER)
+                        .iter()
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Ok(Err(error)) => return Err(provider::failure(&error)),
+            Err(_) => Vec::new(),
+        };
+        if !retry_pause(attempt, &headers, deadline, REFRESH_ATTEMPT).await {
+            return Err(unknown());
+        }
+    }
+    Err(unknown())
+}
+
+// A successful rotation must never be repeated to recover a failed read. Reuse
+// the returned bearer for bounded verification; only accept() installs the pair.
+async fn verify_session_response(api: &Api) -> Result<Value> {
+    let deadline = Instant::now() + VERIFY_BUDGET;
+    for attempt in 0..3 {
+        if Instant::now() + VERIFY_ATTEMPT > deadline {
+            return Err(unknown());
+        }
+        let outcome = tokio::time::timeout(
+            VERIFY_ATTEMPT,
+            api.raw_bounded(
+                Method::GET,
+                "/v1/auth/session",
+                None,
+                None,
+                ResponseLimits {
+                    timeout: VERIFY_ATTEMPT,
+                    max_body: MAX_BODY,
+                    preserve_contents: false,
+                    auth_verification_status: true,
+                },
+            ),
+        )
+        .await;
+        let (failure, headers, transient) = match outcome {
+            Ok(Ok(response)) if response.status.is_success() => return Ok(response.body),
+            Ok(Ok(response)) => {
+                let transient = matches!(response.status.as_u16(), 408 | 429 | 500..=599);
+                (
+                    Failure {
+                        body: response.body,
+                        exit: if response.status.is_client_error() {
+                            2
+                        } else {
+                            1
+                        },
+                        response_status: Some(response.status),
+                    },
+                    response.retry_after,
+                    transient,
+                )
+            }
+            Ok(Err(error)) => {
+                let transient =
+                    error.response_status.is_none() && error.body["type"] == "transport_failed";
+                (error, Vec::new(), transient)
+            }
+            Err(_) => (unknown(), Vec::new(), true),
+        };
+        if !transient || !retry_pause(attempt, &headers, deadline, VERIFY_ATTEMPT).await {
+            return Err(failure);
+        }
+    }
+    Err(unknown())
 }
 
 async fn refresh(
@@ -422,10 +647,7 @@ async fn refresh(
     saved.state = RefreshState::Pending;
     save(store, saved)?;
     let outcome = tokio::time::timeout(Duration::from_secs(35), async {
-        let tokens = provider
-            .refresh(&saved.refresh_token, &saved.identity.account_id)
-            .await
-            .map_err(|error| provider::failure(&error))?;
+        let tokens = refresh_tokens(provider, saved).await?;
         accept(&saved.origin, saved.config.clone(), tokens, Some(saved)).await
     })
     .await;
@@ -451,7 +673,9 @@ pub(super) async fn credential(
 ) -> Result<String> {
     let saved = selected_session(store, origin, identity)?;
     let provider = provider::Provider::new(&saved.config)?;
-    credential_selected(store, origin, identity, &provider).await
+    Ok(credential_loaded(store, saved, &provider)
+        .await?
+        .access_token)
 }
 
 fn selected_session(store: &dyn Store, origin: &str, identity: &Identity) -> Result<Session> {
@@ -473,37 +697,51 @@ pub(super) async fn credential_with(
     provider: &provider::Provider,
 ) -> Result<String> {
     let saved = load_selected(store, origin, None)?.ok_or_else(login_required)?;
-    credential_selected(store, origin, &saved.identity, provider).await
+    Ok(credential_loaded(store, saved, provider)
+        .await?
+        .access_token)
 }
 
+#[cfg(test)]
 pub(super) async fn credential_selected(
     store: &dyn Store,
     origin: &str,
     identity: &Identity,
     provider: &provider::Provider,
 ) -> Result<String> {
-    let mut saved = selected_session(store, origin, identity)?;
+    let saved = selected_session(store, origin, identity)?;
+    Ok(credential_loaded(store, saved, provider)
+        .await?
+        .access_token)
+}
+
+pub(super) async fn credential_loaded(
+    store: &dyn Store,
+    mut saved: Session,
+    provider: &provider::Provider,
+) -> Result<Session> {
     let now = OffsetDateTime::now_utc();
     if saved.state == RefreshState::LoginRequired || timestamp(&saved.refresh_expires_at)? <= now {
         return Err(login_required());
     }
     if timestamp(&saved.expires_at)? > now + time::Duration::seconds(30) {
-        return Ok(saved.access_token);
+        return Ok(saved);
     }
     if saved.state == RefreshState::Pending {
         return if timestamp(&saved.expires_at)? > now {
-            Ok(saved.access_token)
+            Ok(saved)
         } else {
             Err(unknown())
         };
     }
     match refresh(store, &mut saved, provider).await {
-        Ok(()) => Ok(saved.access_token),
-        Err(_)
-            if saved.state != RefreshState::LoginRequired
+        Ok(()) => Ok(saved),
+        Err(error)
+            if error.body["type"] == "refresh_outcome_unknown"
+                && saved.state != RefreshState::LoginRequired
                 && timestamp(&saved.expires_at)? > OffsetDateTime::now_utc() =>
         {
-            Ok(saved.access_token)
+            Ok(saved)
         }
         Err(error) => Err(error),
     }
@@ -528,14 +766,6 @@ pub(super) async fn logout(
         .as_ref()
         .map(|s| s.identity.account_id.as_str())
         .or(organization);
-    let confirmed = if let Some(saved) = &saved {
-        match credential(store, origin, &saved.identity).await {
-            Ok(token) => revoke(origin, token).await,
-            Err(_) => false,
-        }
-    } else {
-        false
-    };
     if let Some(org) = org {
         let mut index = index(store, origin)?;
         if let Some(selected) = index.sessions.remove(org) {
@@ -550,6 +780,11 @@ pub(super) async fn logout(
             store.remove(&selected)?;
         }
     }
+    let confirmed = if let Some(saved) = &saved {
+        revoke(origin, saved.access_token.clone()).await
+    } else {
+        false
+    };
     Ok(
         json!({"data":{"logged_out":true,"organization_id":org,"local_credentials_removed":true,"provider_revocation_confirmed":confirmed},"meta":{}}),
     )

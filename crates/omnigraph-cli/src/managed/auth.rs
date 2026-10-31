@@ -6,27 +6,180 @@ use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::time::Instant;
 
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "openbsd"
+))]
+use crate::secure_store_error::{Operation, StoreFailure};
+
 mod coordination;
 mod provider;
 mod renewal;
+
+pub(crate) use coordination::LockGuard;
 
 const MAX_SECRET: usize = 16 * 1024;
 // Metadata from another clock may be slightly ahead. Actual expiry never has grace.
 const MAX_METADATA_CLOCK_SKEW: time::Duration = time::Duration::seconds(30);
 
 pub(super) trait Store {
+    fn cache_without_control(&self) -> Result<bool> {
+        Ok(false)
+    }
+    fn persistent(&self) -> bool {
+        true
+    }
     fn get(&self, origin: &str) -> Result<Option<String>>;
     fn put(&self, origin: &str, value: &str) -> Result<()>;
     fn remove(&self, origin: &str) -> Result<()>;
+    fn session_owner(&self, session: &str) -> Result<Option<String>> {
+        self.get(&format!("session-owner:{session}"))
+    }
+    fn claim_session(&self, session: &str, owner: &str) -> Result<()> {
+        self.put(&format!("session-owner:{session}"), owner)
+    }
 }
 
 pub(super) struct OsStore {
     service: &'static str,
 }
 
+impl OsStore {
+    fn account(&self, key: &str) -> String {
+        if self.service == SESSION_CLAIMS.service {
+            key.to_owned()
+        } else if self.service == DATA_STORE.service {
+            crate::operator_routing::data_namespace(key)
+        } else {
+            crate::operator_routing::namespace(key)
+        }
+    }
+}
+
 const AUTHKIT_STORE: OsStore = OsStore {
     service: "omnigraph.workos-authkit.session.v2",
 };
+const SESSION_CLAIMS: OsStore = OsStore {
+    service: "omnigraph.workos-authkit.session-owners.v1",
+};
+struct RawOsStore<'a>(&'a OsStore);
+
+impl Store for OsStore {
+    fn session_owner(&self, session: &str) -> Result<Option<String>> {
+        SESSION_CLAIMS.get(session)
+    }
+    fn claim_session(&self, session: &str, owner: &str) -> Result<()> {
+        SESSION_CLAIMS.put(session, owner)
+    }
+    fn get(&self, key: &str) -> Result<Option<String>> {
+        RawOsStore(self).get(&self.account(key))
+    }
+    fn put(&self, key: &str, value: &str) -> Result<()> {
+        let raw = RawOsStore(self);
+        if self.service == DATA_STORE.service {
+            let _lock = coordination::cache_index_lock()?;
+            put_data(&raw, &self.account(key), value)
+        } else {
+            raw.put(&self.account(key), value)
+        }
+    }
+    fn remove(&self, key: &str) -> Result<()> {
+        RawOsStore(self).remove(&self.account(key))
+    }
+}
+
+fn put_data(raw: &dyn Store, account: &str, value: &str) -> Result<()> {
+    let auth = crate::operator_routing::AUTH
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .ok_or_else(keychain_failed)?;
+    auth.ensure_current().map_err(|_| {
+        Failure::refused(
+            "credential_generation_changed",
+            "selected credential was replaced or removed; retry with a fresh invocation",
+        )
+    })?;
+    DataIndex::selected()?.put(raw, account, value)
+}
+
+struct DataIndex {
+    profile: String,
+}
+
+impl DataIndex {
+    fn selected() -> Result<Self> {
+        Ok(Self {
+            profile: crate::operator_routing::data_profile_namespace()
+                .ok_or_else(keychain_failed)?,
+        })
+    }
+
+    fn account(&self) -> String {
+        format!("{}:data-cache-index", self.profile)
+    }
+
+    fn owns(&self, account: &str) -> bool {
+        let Some(binding) = account.strip_prefix(&format!("{}:binding:", self.profile)) else {
+            return false;
+        };
+        let Some((binding, rest)) = binding.split_once(":generation:") else {
+            return false;
+        };
+        let Some((generation, key)) = rest.split_once(":credential:") else {
+            return false;
+        };
+        binding.len() == 64
+            && binding
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            && generation
+                .parse::<u64>()
+                .is_ok_and(|value| value.to_string() == generation)
+            && !key.is_empty()
+            && account.len() <= 4096
+            && !key.chars().any(char::is_control)
+    }
+
+    fn load(&self, raw: &dyn Store) -> Result<std::collections::BTreeSet<String>> {
+        let keys: std::collections::BTreeSet<String> = raw
+            .get(&self.account())?
+            .map(|value| serde_json::from_str(&value).map_err(|_| keychain_failed()))
+            .transpose()?
+            .unwrap_or_default();
+        if keys.len() > 4096 || keys.iter().any(|key| !self.owns(key)) {
+            return Err(keychain_failed());
+        }
+        Ok(keys)
+    }
+
+    fn put(&self, raw: &dyn Store, account: &str, value: &str) -> Result<()> {
+        if !self.owns(account) {
+            return Err(keychain_failed());
+        }
+        let mut keys = self.load(raw)?;
+        keys.insert(account.to_owned());
+        if keys.len() > 4096 {
+            return Err(keychain_failed());
+        }
+        raw.put(
+            &self.account(),
+            &serde_json::to_string(&keys).map_err(|_| keychain_failed())?,
+        )?;
+        raw.put(account, value)
+    }
+
+    fn clear(&self, raw: &dyn Store) -> Result<()> {
+        for key in self.load(raw)? {
+            raw.remove(&key)?;
+        }
+        raw.remove(&self.account())
+    }
+}
 pub(super) const DATA_STORE: OsStore = OsStore {
     service: "omnigraph.data-plane.credential.v1",
 };
@@ -47,27 +200,97 @@ fn keychain_failed() -> Failure {
     target_os = "freebsd",
     target_os = "openbsd"
 ))]
-impl Store for OsStore {
+fn keyring_failed(operation: Operation, error: keyring::Error) -> Failure {
+    let diagnostic = StoreFailure::from_keyring(operation, &error);
+    let mut failure = Failure::refused("keychain_unavailable", &diagnostic.to_string());
+    failure.body["secure_store"] = json!(diagnostic);
+    failure
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "windows",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "openbsd"
+    )
+))]
+#[test]
+fn keyring_failure_preserves_refusal_type_and_redacts_backend_payload() {
+    let failure = keyring_failed(
+        Operation::Read,
+        keyring::Error::BadEncoding(b"synthetic-secret".to_vec()),
+    );
+    assert_eq!(failure.body["type"], "keychain_unavailable");
+    assert_eq!(failure.body["secure_store"]["operation"], "read");
+    assert_eq!(failure.body["secure_store"]["category"], "invalid_encoding");
+    assert!(!failure.body.to_string().contains("synthetic-secret"));
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn keyring_failure_exposes_native_status_without_live_keychain_access() {
+    let error = keyring::Error::PlatformFailure(Box::new(
+        security_framework::base::Error::from_code(-25293),
+    ));
+    let failure = keyring_failed(Operation::Write, error);
+    assert_eq!(failure.body["type"], "keychain_unavailable");
+    assert_eq!(failure.body["secure_store"]["os_status"], -25293);
+    assert_eq!(failure.body["secure_store"]["symbol"], "errSecAuthFailed");
+    assert_eq!(failure.body["secure_store"]["operation"], "write");
+}
+
+#[cfg(target_os = "macos")]
+use crate::macos_secure_store::Entry as RawStoreEntry;
+#[cfg(any(
+    target_os = "ios",
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "openbsd"
+))]
+use keyring::Entry as RawStoreEntry;
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "openbsd"
+))]
+impl Store for RawOsStore<'_> {
     fn get(&self, origin: &str) -> Result<Option<String>> {
-        let entry = keyring::Entry::new(self.service, origin).map_err(|_| keychain_failed())?;
+        let entry = RawStoreEntry::new(self.0.service, origin)
+            .map_err(|error| keyring_failed(Operation::Open, error))?;
         match entry.get_password() {
             Ok(value) => Ok(Some(value)),
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(_) => Err(keychain_failed()),
+            Err(error) => Err(keyring_failed(Operation::Read, error)),
         }
     }
     fn put(&self, origin: &str, value: &str) -> Result<()> {
-        keyring::Entry::new(self.service, origin)
-            .and_then(|entry| entry.set_password(value))
-            .map_err(|_| keychain_failed())
+        RawStoreEntry::new(self.0.service, origin)
+            .map_err(|error| keyring_failed(Operation::Open, error))?
+            .set_password(value)
+            .map_err(|error| keyring_failed(Operation::Write, error))
     }
     fn remove(&self, origin: &str) -> Result<()> {
-        let entry = keyring::Entry::new(self.service, origin).map_err(|_| keychain_failed())?;
+        let entry = RawStoreEntry::new(self.0.service, origin)
+            .map_err(|error| keyring_failed(Operation::Open, error))?;
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(_) => Err(keychain_failed()),
+            Err(error) => Err(keyring_failed(Operation::Delete, error)),
         }
     }
+}
+
+pub(super) fn clear_data() -> Result<()> {
+    let _lock = coordination::cache_index_lock()?;
+    DataIndex::selected()?.clear(&RawOsStore(&DATA_STORE))
 }
 
 // keyring otherwise defaults to an in-memory mock on unsupported targets.
@@ -80,7 +303,7 @@ impl Store for OsStore {
     target_os = "freebsd",
     target_os = "openbsd"
 )))]
-impl Store for OsStore {
+impl Store for RawOsStore<'_> {
     fn get(&self, _: &str) -> Result<Option<String>> {
         Err(keychain_failed())
     }
@@ -106,18 +329,8 @@ fn validate_token(token: &str) -> Result<()> {
 fn login_required() -> Failure {
     Failure::refused(
         "login_required",
-        "sign in with login --api before continuing",
+        "sign in with login --profile NAME before continuing",
     )
-}
-
-fn env(name: &str) -> Result<Option<String>> {
-    std::env::var(name).map(Some).or_else(|error| match error {
-        std::env::VarError::NotPresent => Ok(None),
-        _ => Err(Failure::refused(
-            "credential_invalid",
-            "credential environment variables must be valid UTF-8",
-        )),
-    })
 }
 
 fn automation(origin: &str, token: Option<String>, api: Option<String>) -> Result<Option<String>> {
@@ -127,7 +340,7 @@ fn automation(origin: &str, token: Option<String>, api: Option<String>) -> Resul
             if canonical_origin(&api)? != origin {
                 return Err(Failure::refused(
                     "credential_origin_mismatch",
-                    "OMNIGRAPH_CONTROL_API does not match the selected API",
+                    "the declared credential owner does not match the selected API route",
                 ));
             }
             validate_token(&token)?;
@@ -135,14 +348,154 @@ fn automation(origin: &str, token: Option<String>, api: Option<String>) -> Resul
         }
         _ => Err(Failure::refused(
             "credential_origin_required",
-            "OMNIGRAPH_CONTROL_TOKEN and OMNIGRAPH_CONTROL_API must be supplied together",
+            "a control credential requires its explicit owner route",
         )),
     }
 }
 
 enum Source {
     Human(renewal::Identity),
-    Automation(String),
+    Automation {
+        credential: Box<tokio::sync::Mutex<crate::credential_sources::AcquiredCredential>>,
+        identity: VerifiedIdentity,
+    },
+}
+
+/// Complete verified metadata; continuity checks follow the selected provider.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VerifiedIdentity {
+    account_id: String,
+    principal_id: String,
+    kind: Option<String>,
+    subject: Option<String>,
+    provider_client_id: Option<String>,
+    assurance: Option<String>,
+}
+
+impl VerifiedIdentity {
+    // Existing external providers pin organization and principal; OAuth also
+    // pins its verified client identity. Keep the original metadata intact.
+    fn matches_profile(
+        &self,
+        other: &Self,
+        profile: Option<&crate::operator_schema::AuthProfile>,
+    ) -> bool {
+        self.account_id == other.account_id
+            && self.principal_id == other.principal_id
+            && (!matches!(
+                profile,
+                Some(crate::operator_schema::AuthProfile::OauthClientCredentials { .. })
+            ) || self == other)
+    }
+}
+
+async fn verify_external(
+    origin: &str,
+    organization: Option<&str>,
+    credential: crate::credential_sources::AcquiredCredential,
+) -> Result<(
+    VerifiedIdentity,
+    crate::credential_sources::AcquiredCredential,
+)> {
+    let token = acquired_bearer(&credential, origin)?.to_owned();
+    let body = Api::with_credential(origin.into(), credential.clone())?
+        .request(Method::GET, "/v1/auth/session", None, None)
+        .await
+        .map_err(|failure| scrub(failure, &token))?;
+    let data = &body["data"];
+    let account = bounded_string(data, "account_id", 128)?;
+    check_account(organization, account)?;
+    let optional = |value: &Value, field, max| -> Result<Option<String>> {
+        if value.get(field).is_none_or(Value::is_null) {
+            Ok(None)
+        } else {
+            bounded_string(value, field, max).map(|s| Some(s.into()))
+        }
+    };
+    let identity = VerifiedIdentity {
+        account_id: account.into(),
+        principal_id: bounded_string(data, "principal_id", 1024)?.into(),
+        kind: optional(data, "kind", 64)?,
+        subject: optional(data, "subject", 4096)?,
+        provider_client_id: optional(data, "provider_client_id", 512)?,
+        assurance: optional(&body["meta"], "assurance", 64)?,
+    };
+    let auth = crate::operator_routing::AUTH
+        .try_with(Clone::clone)
+        .ok()
+        .flatten();
+    if let Some(auth) = &auth {
+        if let crate::operator_schema::AuthProfile::OauthClientCredentials { client_id, .. } =
+            &auth.profile
+        {
+            if identity.kind.as_deref() != Some("automation")
+                || identity.assurance.as_deref() != Some("verified_workload")
+                || identity.provider_client_id.as_ref() != Some(client_id)
+                || identity.subject.is_none()
+                || data.get("expires_at").and_then(Value::as_str).is_none()
+            {
+                return Err(Failure::refused(
+                    "workload_identity_mismatch",
+                    "the verified session does not match the selected workload client",
+                ));
+            }
+        }
+    }
+    let credential = if data
+        .get("expires_at")
+        .is_some_and(|expiry| !expiry.is_null())
+    {
+        let expiry = OffsetDateTime::parse(bounded_string(data, "expires_at", 64)?, &Rfc3339)
+            .map_err(|_| Failure::protocol())?;
+        let bounded = credential.bound_expiry(expiry);
+        acquired_bearer(&bounded, origin)?;
+        bounded
+    } else {
+        credential
+    };
+    if let Some(auth) = auth {
+        let pinned = auth
+            .verified_managed_identity
+            .get_or_init(|| async { identity.clone() })
+            .await;
+        if !pinned.matches_profile(&identity, Some(&auth.profile)) {
+            return Err(Failure::refused(
+                "session_identity_mismatch",
+                "the verified identity changed during this invocation",
+            ));
+        }
+        auth.retain_verified_expiry(&credential)
+            .map_err(|_| Failure::protocol())?;
+    }
+    Ok((identity, credential))
+}
+
+pub(super) fn acquired_bearer<'a>(
+    credential: &'a crate::credential_sources::AcquiredCredential,
+    origin: &str,
+) -> Result<&'a str> {
+    let request = credential.request();
+    if request.purpose() != crate::credential_sources::Purpose::Control
+        || canonical_origin(request.endpoint())? != canonical_origin(origin)?
+    {
+        return Err(Failure::refused(
+            "credential_origin_mismatch",
+            "the captured credential belongs to another control destination",
+        ));
+    }
+    credential
+        .bearer_for(request, OffsetDateTime::now_utc())
+        .map(|secret| secret.expose())
+        .map_err(|error| match error {
+            crate::credential_sources::CredentialError::Expired => Failure::refused(
+                "credential_expired",
+                "the captured control credential has expired; no request was sent",
+            ),
+            _ => Failure::refused(
+                "credential_invalid",
+                "the captured control credential is invalid",
+            ),
+        })
 }
 
 pub(super) struct Selection {
@@ -166,23 +519,35 @@ async fn select_with(
     store: &dyn Store,
     origin: &str,
     organization: Option<&str>,
-    token: Option<String>,
+    credential: Option<crate::credential_sources::AcquiredCredential>,
     api: Option<String>,
+    mechanism: super::ControlAuth,
 ) -> Result<Option<Selection>> {
     if let Some(org) = organization {
         super::organization_id(org)?;
     }
-    if let Some(token) = automation(origin, token, api)? {
-        let body = Api::new(origin.into(), Some(token.clone()))?
-            .request(Method::GET, "/v1/auth/session", None, None)
+    if mechanism == super::ControlAuth::AutomationEnv {
+        let token = credential
+            .as_ref()
+            .map(|credential| acquired_bearer(credential, origin).map(str::to_owned))
+            .transpose()?;
+        let token = automation(origin, token, api)?.ok_or_else(|| {
+            Failure::refused(
+                "automation_credential_required",
+                "automation targets require OMNIGRAPH_CONTROL_TOKEN and OMNIGRAPH_CONTROL_API",
+            )
+        })?;
+        let credential = credential.ok_or_else(Failure::protocol)?;
+        let (identity, credential) = verify_external(origin, organization, credential)
             .await
             .map_err(|failure| scrub(failure, &token))?;
-        let account = bounded_string(&body["data"], "account_id", 128)?;
-        check_account(organization, account)?;
         return Ok(Some(Selection {
-            account_id: account.into(),
-            principal_id: bounded_string(&body["data"], "principal_id", 1024)?.into(),
-            source: Source::Automation(token),
+            account_id: identity.account_id.clone(),
+            principal_id: identity.principal_id.clone(),
+            source: Source::Automation {
+                credential: Box::new(tokio::sync::Mutex::new(credential)),
+                identity,
+            },
         }));
     }
     Ok(
@@ -194,68 +559,234 @@ async fn select_with(
     )
 }
 
-pub(super) async fn select(origin: &str, organization: Option<&str>) -> Result<Selection> {
-    let _lock = coordination::lock(origin).await?;
+async fn configured_token(
+    origin: &str,
+) -> Result<Option<crate::credential_sources::AcquiredCredential>> {
+    let auth = crate::operator_routing::AUTH
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .ok_or_else(|| {
+            Failure::refused("credential_binding_required", "select a configured profile")
+        })?;
+    if canonical_origin(auth.owner.route())? != canonical_origin(origin)? {
+        return Err(Failure::refused(
+            "credential_origin_mismatch",
+            "selected owner belongs to another service route",
+        ));
+    }
+    auth.acquire_credential().await.map_err(|error| {
+        if error.downcast_ref::<crate::credential_sources::CredentialError>()
+            == Some(&crate::credential_sources::CredentialError::Expired)
+        {
+            return Failure::refused(
+                "credential_expired",
+                "the captured control credential has expired; no request was sent",
+            );
+        }
+        Failure::refused(
+            "credential_unavailable",
+            "selected credential source failed; no fallback was attempted",
+        )
+    })
+}
+
+pub(super) async fn select(
+    origin: &str,
+    organization: Option<&str>,
+    mechanism: super::ControlAuth,
+) -> Result<Selection> {
+    let _lock = if mechanism == super::ControlAuth::HumanDevice {
+        Some(coordination::lock(origin).await?)
+    } else {
+        None
+    };
+    if mechanism == super::ControlAuth::HumanDevice {
+        return select_human_with(&AUTHKIT_STORE, origin, organization).await;
+    }
     let selected = select_with(
         &AUTHKIT_STORE,
         origin,
         organization,
-        env("OMNIGRAPH_CONTROL_TOKEN")?,
-        env("OMNIGRAPH_CONTROL_API")?,
+        if mechanism == super::ControlAuth::AutomationEnv {
+            configured_token(origin).await?
+        } else {
+            None
+        },
+        if mechanism == super::ControlAuth::AutomationEnv {
+            Some(origin.to_owned())
+        } else {
+            None
+        },
+        mechanism,
     )
     .await?
     .ok_or_else(login_required)?;
-    if let Source::Human(identity) = &selected.source {
-        let token = renewal::credential(&AUTHKIT_STORE, origin, identity).await?;
-        let saved = renewal::load_selected(&AUTHKIT_STORE, origin, Some(&identity.account_id))?
-            .ok_or_else(login_required)?;
-        let (verified, _, _) = renewal::verify(origin, &saved.config, &token, None).await?;
-        if verified != *identity {
-            return Err(Failure::refused(
-                "session_identity_mismatch",
-                "the verified sign-in identity changed",
-            ));
-        }
-    }
     Ok(selected)
+}
+
+async fn select_human_with(
+    store: &dyn Store,
+    origin: &str,
+    organization: Option<&str>,
+) -> Result<Selection> {
+    let saved = renewal::load_selected(store, origin, organization)?.ok_or_else(login_required)?;
+    let provider = provider::Provider::new(&saved.config)?;
+    let saved = renewal::credential_loaded(store, saved, &provider).await?;
+    let (verified, _, _) =
+        renewal::verify(origin, &saved.config, saved.access_token(), None).await?;
+    if verified != saved.identity {
+        return Err(Failure::refused(
+            "session_identity_mismatch",
+            "the verified sign-in identity changed",
+        ));
+    }
+    Ok(Selection {
+        account_id: saved.identity.account_id.clone(),
+        principal_id: saved.identity.principal_id.clone(),
+        source: Source::Human(saved.identity),
+    })
 }
 
 impl Selection {
     pub(super) async fn credential(&self, origin: &str) -> Result<String> {
         match &self.source {
-            Source::Automation(token) => Ok(token.clone()),
+            Source::Automation {
+                credential,
+                identity,
+            } => {
+                let authentication = crate::operator_routing::AUTH
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten();
+                if let Some(auth) = &authentication {
+                    auth.ensure_current().map_err(|_| {
+                        Failure::refused(
+                            "credential_generation_changed",
+                            "the selected credential owner changed; start a fresh invocation",
+                        )
+                    })?;
+                }
+                let mut credential = credential.lock().await;
+                if matches!(
+                    credential.bearer_for(credential.request(), OffsetDateTime::now_utc()),
+                    Err(crate::credential_sources::CredentialError::Expired)
+                ) {
+                    let fresh = configured_token(origin)
+                        .await?
+                        .ok_or_else(Failure::protocol)?;
+                    let (verified, fresh) =
+                        verify_external(origin, Some(&self.account_id), fresh).await?;
+                    if !identity.matches_profile(
+                        &verified,
+                        authentication.as_ref().map(|auth| &auth.profile),
+                    ) {
+                        return Err(Failure::refused(
+                            "session_identity_mismatch",
+                            "the renewed credential names another identity",
+                        ));
+                    }
+                    *credential = fresh;
+                }
+                acquired_bearer(&credential, origin).map(str::to_owned)
+            }
             Source::Human(identity) => {
                 let _lock = coordination::lock(origin).await?;
                 renewal::credential(&AUTHKIT_STORE, origin, identity).await
             }
         }
     }
+
+    pub(super) async fn renew_before_issuance(&self, origin: &str) -> Result<bool> {
+        let Source::Automation {
+            credential,
+            identity,
+        } = &self.source
+        else {
+            return Ok(false);
+        };
+        let Some(auth) = crate::operator_routing::AUTH
+            .try_with(Clone::clone)
+            .ok()
+            .flatten()
+        else {
+            return Ok(false);
+        };
+        if !auth.renewable() {
+            return Ok(false);
+        }
+        let mut current = credential.lock().await;
+        let fresh = auth.renew_control_credential(&current).await.map_err(|_| {
+            Failure::refused(
+                "credential_unavailable",
+                "the selected provider could not renew; no fallback was attempted",
+            )
+        })?;
+        let (verified, fresh) = verify_external(origin, Some(&self.account_id), fresh).await?;
+        if !identity.matches_profile(&verified, Some(&auth.profile)) {
+            return Err(Failure::refused(
+                "session_identity_mismatch",
+                "the renewed credential names another identity",
+            ));
+        }
+        *current = fresh;
+        Ok(true)
+    }
 }
 
-pub(super) async fn cache_lock(key: &str) -> Result<std::fs::File> {
+pub(super) async fn cache_lock(key: &str) -> Result<LockGuard> {
     coordination::lock(key).await
+}
+
+pub(super) fn local_status(_origin: &str, _organization: Option<&str>) -> Value {
+    json!({"availability":"unknown","identity":"unknown","reason":"noninteractive secure-store inspection is unavailable"})
 }
 
 async fn selected_principal_with(
     store: &dyn Store,
     origin: &str,
     organization: Option<&str>,
-    token: Option<String>,
+    credential: Option<crate::credential_sources::AcquiredCredential>,
     api: Option<String>,
+    mechanism: super::ControlAuth,
 ) -> Result<Option<String>> {
-    Ok(select_with(store, origin, organization, token, api)
-        .await?
-        .map(|s| s.principal_id))
+    // A valid data credential keeps its independent lifetime after control
+    // credentials are removed. Absence cannot fall back to human custody.
+    if mechanism == super::ControlAuth::AutomationEnv && credential.is_none() && api.is_none() {
+        return Ok(None);
+    }
+    Ok(
+        select_with(store, origin, organization, credential, api, mechanism)
+            .await?
+            .map(|s| s.principal_id),
+    )
 }
 
-pub(super) async fn selected_principal(origin: &str, organization: &str) -> Result<Option<String>> {
-    let _lock = coordination::lock(origin).await?;
+pub(super) async fn selected_principal(
+    origin: &str,
+    organization: &str,
+    mechanism: super::ControlAuth,
+) -> Result<Option<String>> {
+    let _lock = if mechanism == super::ControlAuth::HumanDevice {
+        Some(coordination::lock(origin).await?)
+    } else {
+        None
+    };
     selected_principal_with(
         &AUTHKIT_STORE,
         origin,
         Some(organization),
-        env("OMNIGRAPH_CONTROL_TOKEN")?,
-        env("OMNIGRAPH_CONTROL_API")?,
+        if mechanism == super::ControlAuth::AutomationEnv {
+            configured_token(origin).await?
+        } else {
+            None
+        },
+        if mechanism == super::ControlAuth::AutomationEnv {
+            Some(origin.to_owned())
+        } else {
+            None
+        },
+        mechanism,
     )
     .await
 }
@@ -327,6 +858,7 @@ fn seconds(value: f64, minimum: u64, maximum: u64) -> Result<u64> {
     Ok(value as u64)
 }
 
+#[cfg(test)]
 async fn login_with(
     store: &dyn Store,
     origin: &str,
@@ -335,15 +867,40 @@ async fn login_with(
     organization: Option<&str>,
     stderr: &mut dyn Write,
 ) -> Result<Value> {
-    let _ = store.get(origin)?;
-    if let Some(saved) = renewal::load_selected(store, origin, organization)?
+    let cached = renewal::validate_custody(store, origin)?;
+    login_validated(
+        store,
+        origin,
+        config,
+        provider,
+        organization,
+        stderr,
+        cached,
+    )
+    .await
+}
+
+async fn login_validated(
+    store: &dyn Store,
+    origin: &str,
+    config: provider::Config,
+    provider: &provider::Provider,
+    organization: Option<&str>,
+    stderr: &mut dyn Write,
+    cached: Vec<renewal::Session>,
+) -> Result<Value> {
+    if replacement_principal().is_none()
+        && organization.is_some()
+        && let Some(saved) = cached
+            .into_iter()
+            .find(|saved| Some(saved.identity.account_id.as_str()) == organization)
         && saved.config == config
         && saved.state == renewal::RefreshState::Ready
         && renewal::timestamp(&saved.refresh_expires_at)? > OffsetDateTime::now_utc()
     {
-        match renewal::credential_selected(store, origin, &saved.identity, provider).await {
-            Ok(token) => {
-                let verified = renewal::verify(origin, &config, &token, None).await;
+        match renewal::credential_loaded(store, saved.clone(), provider).await {
+            Ok(current) => {
+                let verified = renewal::verify(origin, &config, current.access_token(), None).await;
                 match verified {
                     Ok((identity, expiry, mut body)) => {
                         if identity != saved.identity {
@@ -411,7 +968,7 @@ async fn login_with(
         if next >= deadline {
             return Err(Failure::refused(
                 "device_expired",
-                "device sign-in expired; run login --api again",
+                "device sign-in expired; run login --target NAME again",
             ));
         }
         tokio::time::sleep_until(next).await;
@@ -420,7 +977,7 @@ async fn login_with(
             .map_err(|_| {
                 Failure::refused(
                     "device_expired",
-                    "device sign-in expired; run login --api again",
+                    "device sign-in expired; run login --target NAME again",
                 )
             })?;
         match reply {
@@ -444,6 +1001,11 @@ async fn accept_device(
     tokens: workos::AuthenticateResponse,
     organization: Option<&str>,
 ) -> Result<Value> {
+    let _claims_lock = if crate::operator_routing::journal_owner().is_some() {
+        Some(coordination::global_session_lock().await?)
+    } else {
+        None
+    };
     // Keychain reads can require interactive OS consent. Complete the cached
     // session collision check under the origin lock before timing network work.
     let initial = renewal::check_device_session(store, origin, &config, &tokens)?;
@@ -459,6 +1021,28 @@ async fn accept_device(
         saved.revoke().await;
         return Err(error);
     }
+    if let Err(error) =
+        renewal::check_replacement(store, &saved, replacement_principal().as_deref())
+    {
+        saved.revoke().await;
+        return Err(error);
+    }
+    if replacement_principal().is_some() {
+        if let Some(auth) = crate::operator_routing::AUTH
+            .try_with(Clone::clone)
+            .ok()
+            .flatten()
+        {
+            let cleanup = auth
+                .invalidate()
+                .map_err(|_| keychain_failed())
+                .and_then(|()| clear_data());
+            if let Err(error) = cleanup {
+                saved.revoke().await;
+                return Err(error);
+            }
+        }
+    }
     if let Err(error) = renewal::save(store, &saved) {
         // We cannot retain the new renewable session. Revoke it when possible
         // without obscuring the custody failure or touching another session.
@@ -468,29 +1052,60 @@ async fn accept_device(
     Ok(body)
 }
 
+tokio::task_local! { static REPLACE_PRINCIPAL: Option<String>; }
+
+fn replacement_principal() -> Option<String> {
+    REPLACE_PRINCIPAL.try_with(Clone::clone).ok().flatten()
+}
+
+pub(super) async fn login_replacing(
+    origin: String,
+    organization: Option<&str>,
+    principal: Option<&str>,
+    stderr: &mut dyn Write,
+) -> Result<Value> {
+    REPLACE_PRINCIPAL
+        .scope(
+            principal.map(str::to_owned),
+            login(origin, organization, stderr),
+        )
+        .await
+}
+
 pub(super) async fn login(
     origin: String,
     organization: Option<&str>,
     stderr: &mut dyn Write,
 ) -> Result<Value> {
     let _lock = coordination::lock(&origin).await?;
-    let _ = AUTHKIT_STORE.get(&origin)?;
+    let cached = renewal::validate_custody(&AUTHKIT_STORE, &origin)?;
     let config = provider::Config::discover(&origin).await?;
     let provider = provider::Provider::new(&config)?;
-    login_with(
+    login_validated(
         &AUTHKIT_STORE,
         &origin,
         config,
         &provider,
         organization,
         stderr,
+        cached,
     )
     .await
 }
 
 pub(super) async fn logout(origin: String, organization: Option<&str>) -> Result<Value> {
     let _lock = coordination::lock(&origin).await?;
-    renewal::logout(&AUTHKIT_STORE, &origin, organization).await
+    logout_after_data_cleanup(&AUTHKIT_STORE, &origin, organization, clear_data).await
+}
+
+async fn logout_after_data_cleanup(
+    sessions: &dyn Store,
+    origin: &str,
+    organization: Option<&str>,
+    cleanup: impl FnOnce() -> Result<()>,
+) -> Result<Value> {
+    cleanup()?;
+    renewal::logout(sessions, origin, organization).await
 }
 
 #[cfg(test)]

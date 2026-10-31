@@ -2,9 +2,10 @@
 use super::prepare::{ChangeFilter, Pagination};
 use super::{BranchCommand, HistoryScope, run_diff};
 use crate::client::{self, GraphClient};
-use crate::helpers::{confirm_destructive, resolve_branch, write_target};
-use crate::output::{write_json, write_merge_base_human};
+use crate::helpers::{confirm_destructive, resolve_branch};
+use crate::output::{write_branch_list_human, write_json, write_merge_base_human};
 use color_eyre::eyre::Result;
+use omnigraph::db::{ReadTarget, SnapshotId};
 use std::io::Write;
 
 pub(crate) async fn run_branch(
@@ -16,73 +17,55 @@ pub(crate) async fn run_branch(
 ) -> Result<()> {
     match command {
         BranchCommand::Create {
-            uri,
             from,
+            from_commit,
             name,
             json,
         } => {
-            let client = GraphClient::resolve_with_policy(
+            let client = GraphClient::from_target(
                 scope.operator,
-                scope.capability,
-                scope.server,
+                scope.target,
                 scope.graph,
-                uri,
                 scope.actor,
-                scope.profile,
-                scope.store,
                 stderr,
             )
             .await?;
-            let from = resolve_branch(from, None, "main");
-            write_target(
-                scope.quiet,
-                "branch create",
-                client.uri(),
-                client.is_remote(),
-                stderr,
-            )?;
-            let payload = client.branch_create_from(&from, &name, stderr).await?;
+            let start = match from_commit {
+                Some(commit) => ReadTarget::snapshot(SnapshotId::new(commit)),
+                None => ReadTarget::branch(resolve_branch(from, None, "main")),
+            };
+            let payload = client.branch_create(start, &name, stderr).await?;
             if json {
                 write_json(&payload, stdout)?;
             } else {
                 writeln!(
                     stdout,
-                    "created branch {} from {}",
-                    payload.name, payload.from
+                    "created branch {} from {} at {}",
+                    payload.name, payload.from, payload.from_commit_id
                 )?;
             }
         }
-        BranchCommand::List { uri, json } => {
-            let client = GraphClient::resolve(
-                scope.operator,
-                scope.capability,
-                scope.server,
-                scope.graph,
-                uri,
-                scope.profile,
-                scope.store,
-                stderr,
-            )
-            .await?;
-            let payload = client.branch_list().await?;
+        BranchCommand::List { detailed, json } => {
+            let client =
+                GraphClient::from_target(scope.operator, scope.target, scope.graph, None, stderr)
+                    .await?;
+            let payload = if detailed {
+                client.branch_list_detailed().await?
+            } else {
+                client.branch_list().await?
+            };
             if json {
                 write_json(&payload, stdout)?;
             } else {
-                for branch in payload.branches {
-                    writeln!(stdout, "{}", branch)?;
-                }
+                write_branch_list_human(&payload, stdout)?;
             }
         }
-        BranchCommand::Delete { uri, name, json } => {
-            let client = GraphClient::resolve_with_policy(
+        BranchCommand::Delete { name, json } => {
+            let client = GraphClient::from_target(
                 scope.operator,
-                scope.capability,
-                scope.server,
+                scope.target,
                 scope.graph,
-                uri,
                 scope.actor,
-                scope.profile,
-                scope.store,
                 stderr,
             )
             .await?;
@@ -94,13 +77,6 @@ pub(crate) async fn run_branch(
                 input,
                 stderr,
             )?;
-            write_target(
-                scope.quiet,
-                "branch delete",
-                client.uri(),
-                client.is_remote(),
-                stderr,
-            )?;
             let payload = client.branch_delete(&name, stderr).await?;
             if json {
                 write_json(&payload, stdout)?;
@@ -109,7 +85,6 @@ pub(crate) async fn run_branch(
             }
         }
         BranchCommand::Merge {
-            uri,
             source,
             into,
             delete_branch,
@@ -119,28 +94,15 @@ pub(crate) async fn run_branch(
             json,
         } => {
             let settings = client::parse_set_flags(&settings)?;
-            let client = GraphClient::resolve_with_policy(
+            let client = GraphClient::from_target(
                 scope.operator,
-                scope.capability,
-                scope.server,
+                scope.target,
                 scope.graph,
-                uri,
                 scope.actor,
-                scope.profile,
-                scope.store,
                 stderr,
             )
             .await?;
             let into = resolve_branch(into, None, "main");
-            if !dry_run {
-                write_target(
-                    scope.quiet,
-                    "branch merge",
-                    client.uri(),
-                    client.is_remote(),
-                    stderr,
-                )?;
-            }
             let payload = client
                 .branch_merge(
                     &source,
@@ -195,7 +157,6 @@ pub(crate) async fn run_branch(
             }
         }
         BranchCommand::Diff {
-            uri,
             source,
             into,
             limit,
@@ -205,17 +166,9 @@ pub(crate) async fn run_branch(
             ops,
             json,
         } => {
-            let client = GraphClient::resolve(
-                scope.operator,
-                scope.capability,
-                scope.server,
-                scope.graph,
-                uri,
-                scope.profile,
-                scope.store,
-                stderr,
-            )
-            .await?;
+            let client =
+                GraphClient::from_target(scope.operator, scope.target, scope.graph, None, stderr)
+                    .await?;
             let into = resolve_branch(into, None, "main");
             let sides = client::DiffSidesArg::Branch {
                 source: &source,
@@ -231,23 +184,10 @@ pub(crate) async fn run_branch(
             )
             .await?;
         }
-        BranchCommand::MergeBase {
-            uri,
-            source,
-            into,
-            json,
-        } => {
-            let client = GraphClient::resolve(
-                scope.operator,
-                scope.capability,
-                scope.server,
-                scope.graph,
-                uri,
-                scope.profile,
-                scope.store,
-                stderr,
-            )
-            .await?;
+        BranchCommand::MergeBase { source, into, json } => {
+            let client =
+                GraphClient::from_target(scope.operator, scope.target, scope.graph, None, stderr)
+                    .await?;
             let into = resolve_branch(into, None, "main");
             let output = client.merge_base(&source, &into).await?;
             if json {

@@ -4,7 +4,6 @@ use crate::helpers::resolve_branch;
 use crate::output::{
     DiffHumanStream, DiffJsonStream, write_diff_human, write_json, write_snapshot_human,
 };
-use crate::planes::Capability;
 use color_eyre::eyre::Result;
 use std::io::{self, Write};
 
@@ -24,14 +23,10 @@ use prepare::{ChangeFilter, Pagination};
 #[derive(Clone, Copy)]
 pub(crate) struct HistoryScope<'a> {
     pub(crate) operator: &'a crate::operator::InvocationConfig,
-    pub capability: Capability,
-    pub server: Option<&'a str>,
+    pub target: &'a crate::targets::ResolvedTarget,
     pub graph: Option<&'a str>,
     pub actor: Option<&'a str>,
-    pub profile: Option<&'a str>,
-    pub store: Option<&'a str>,
     pub yes: bool,
-    pub quiet: bool,
 }
 
 pub(crate) async fn run_snapshot(
@@ -40,18 +35,9 @@ pub(crate) async fn run_snapshot(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
-    let SnapshotArgs { uri, branch, json } = args;
-    let client = GraphClient::resolve(
-        scope.operator,
-        scope.capability,
-        scope.server,
-        scope.graph,
-        uri,
-        scope.profile,
-        scope.store,
-        stderr,
-    )
-    .await?;
+    let SnapshotArgs { branch, json } = args;
+    let client =
+        GraphClient::from_target(scope.operator, scope.target, scope.graph, None, stderr).await?;
     let branch = resolve_branch(branch, None, "main");
     let payload = client.snapshot(&branch).await?;
     if json {
@@ -75,7 +61,6 @@ pub(crate) async fn run_diff_command(
     stderr: &mut dyn Write,
 ) -> Result<()> {
     let DiffArgs {
-        uri,
         from,
         to,
         limit,
@@ -85,17 +70,8 @@ pub(crate) async fn run_diff_command(
         ops,
         json,
     } = args;
-    let client = GraphClient::resolve(
-        scope.operator,
-        scope.capability,
-        scope.server,
-        scope.graph,
-        uri,
-        scope.profile,
-        scope.store,
-        stderr,
-    )
-    .await?;
+    let client =
+        GraphClient::from_target(scope.operator, scope.target, scope.graph, None, stderr).await?;
     let sides = client::DiffSidesArg::Between {
         from: &from,
         to: &to,

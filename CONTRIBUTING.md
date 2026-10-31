@@ -78,12 +78,12 @@ Substitute the owning package and existing test target; the coverage map in
 non-trivial change, run the canonical feature-superset gate:
 
 ```bash
-cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked \
+cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 ```
 
-The GQT corpus and the DST suite are excluded by name: each has its own
-command and process environment, listed in
+The embedded and served GQT suites and the DST suite are excluded by name;
+their commands and process environments are listed in
 [`docs/dev/testing.md`](docs/dev/testing.md).
 
 If you touch S3-backed flows, the CI model uses a local RustFS instance for
@@ -131,6 +131,9 @@ CI runs both.
     (`refactor(blob,schema)!: …`).
   - `!` marks a breaking change; the change also carries a
     `changelog.d/<slug>.breaking.md` note.
+  - a `feat`, `fix` or `perf` change adds a `changelog.d` note
+    ([release notes](docs/dev/documentation.md#release-notes)); a maintainer
+    adds the `skip-changelog` label when users can see nothing of it.
   - the description starts lowercase (a backtick or a digit is fine), has no
     trailing period, and the whole title stays within 100 characters.
   - an RFC PR is `rfc: <the RFC's subject>`, not `docs(rfc):`; RFC numbers

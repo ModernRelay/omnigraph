@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check (or rewrite) the engine catalogue inventories in
 docs/user/queries/catalogue.md against the rows a built omnigraph CLI answers
-under the `og_catalog` scope.
+through the local `catalogue` command.
 
 The binary is named explicitly so the check never queries an installed CLI
 of another version; no store is initialized and no credentials are read.
@@ -42,7 +42,7 @@ INVENTORIES = {
 
 def rows_of(binary: pathlib.Path, query: str) -> list[dict]:
     result = subprocess.run(
-        [str(binary), "query", "--store", "og_catalog", "-e", query, "--json"],
+        [str(binary), "catalogue", "-e", query, "--json"],
         capture_output=True,
         text=True,
         check=False,

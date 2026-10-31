@@ -38,29 +38,40 @@ policies:
 ```
 
 Paths are relative to `cluster.yaml`. Its configuration version is independent
-of the deployment ledger version. The [configuration reference](config.md)
+of the deployment ledger version. A declared `storage:` is an equality assertion:
+it must match the selected root, and never redirects the command. For direct
+operations, relative storage paths resolve against the source directory;
+server submission requires an absolute assertion or no `storage:`. Omitting
+`--config` on source-bearing direct/server plan or apply uses the current
+directory (`.`). `cluster validate` reads source only and needs no target. The [configuration reference](config.md)
 covers storage roots, embedding providers, external Blob policy and limits.
 
 For server-owned deployment, the applied policy must grant the operator
 `config_manage` at cluster scope. Schema changes and graph deletions additionally
 require `read` and `schema_apply` on the affected graphs. Direct deletion also
 enforces an installed graph policy and requires an authorized `--as` actor.
-Deployment status reveals management
-metadata under `config_manage`; it does not require data access on unrelated
-graphs. New graphs need suitable declared policies too.
-The server derives the actor from its bearer token; `--as` is for direct access.
+Deployment status requires `config_manage`, not unrelated data access. New graphs
+need suitable declared policies too.
+The server derives the actor from its bearer token; there `--as` only asserts it.
 
 ## Bootstrap a cluster
 
 ```bash
+mkdir -p ./company-data
 omnigraph cluster validate --config ./company-brain
-omnigraph cluster plan --config ./company-brain
-omnigraph cluster apply --config ./company-brain --as act-alice --json
+omnigraph cluster plan --target ./company-data --config ./company-brain
+omnigraph cluster apply --target ./company-data --config ./company-brain --as act-alice --json
 ```
 
-Fresh apply creates the deployment ledger and declared graphs. It captures all
-source bytes before execution, prints the original `Deployment-ID`, and records
-exact outcomes. It does not load rows; use `load` or `mutate` for data changes.
+`--config` names the source directory containing `cluster.yaml`; `--target`
+selects the destination independently. Here `./company-data` is an inline direct
+root target. A configured target name or `defaults.target` works too. No folder
+file or `storage:` declaration selects a target. Every backend command reports
+its resolved target on stderr before execution.
+
+Fresh apply creates the ledger and declared graphs in the selected root, captures
+source bytes before execution and prints the original `Deployment-ID` with exact
+outcomes. Use `load` or `mutate` for rows.
 
 Direct apply retains its admission lock after completion. Establish that the
 owner and its accepted I/O have settled, then follow
@@ -68,7 +79,7 @@ owner and its accepted I/O have settled, then follow
 lock ID before starting the server:
 
 ```bash
-omnigraph --cluster file:///srv/company-brain cluster force-unlock '<LOCK_ID>'
+omnigraph --target file:///srv/company-brain cluster force-unlock '<LOCK_ID>'
 OMNIGRAPH_SERVER_BEARER_TOKENS_JSON='{"act-alice":"secret"}' \
   omnigraph-server --cluster file:///srv/company-brain --bind 0.0.0.0:8080
 ```
@@ -90,19 +101,14 @@ OMNIGRAPH_SERVER_BEARER_TOKENS_JSON='{"act-alice":"secret"}' \
   --bootstrap-handoff /run/omnigraph/bootstrap-receipt.json
 ```
 
-The receipt must be a regular file containing strict JSON, at most 16 KiB.
-It must match the selected root and its completed empty bootstrap. The server
-claims ownership once before listening; replay, mismatched state and uncertain
-claims refuse. Any failure after the claim retains ownership, including invalid
-trust or server settings. Investigate that exact attempt; do not retry by
-removing the lock or omitting the flag.
+The receipt must be a regular strict-JSON file of at most 16 KiB matching the
+root and completed empty bootstrap. The server claims ownership once before
+listening. Replay, mismatched state and uncertain claims refuse. Failure after
+claiming retains ownership; investigate that attempt before any ownership change.
 
-The receipt supplies no user permissions. Configure static tokens or identity
-trust normally; the applied policy controls who can create the first graph
-through `cluster apply --server`. Protect the receipt and boot configuration as
-administrator inputs. This path supports only first boot of a fresh S3 cluster;
-it is not a restart, recovery or writer-fencing mechanism. Local and Azure roots
-are unsupported, and other writers must remain excluded.
+The receipt grants no user permission; configure authentication normally. Protect
+both receipt and boot configuration. Only fresh S3 first boot is supported, with
+all other writers excluded; it is not a restart, recovery or fencing mechanism.
 
 ## Deploy without restarting
 
@@ -110,25 +116,16 @@ Edit and validate the bundle, then submit it to the running owner:
 
 ```bash
 omnigraph cluster validate --config ./company-brain
-OMNIGRAPH_TOKEN_PRODUCTION='secret' omnigraph cluster apply \
-  --server production --config ./company-brain --json
+omnigraph cluster apply \
+  --target production --config ./company-brain --json
 ```
 
-`production` names a server declared in the operator config, and the CLI sends
-its token only to that server's URL:
+`production` names a server target with its own `auth` provider.
+Configure it and install a token or declare an external source using the
+[operator reference](../cli/targets.md). No implicit token environment override
+or static-token login remains.
 
-```yaml
-# ~/.omnigraph/config.yaml
-servers:
-  production:
-    url: https://graph.example.com
-```
-
-`omnigraph login production` stores the token instead of the variable. A
-literal `--server https://…` URL that matches no declared server gets no token;
-see [server credentials](../cli/index.md#use-a-server).
-
-With `--server`, omitted `storage` binds the bundle to the selected server’s
+With a server target, omitted `storage` binds the bundle to the selected server’s
 canonical root. An explicit absolute `storage` must match that root; relative
 storage paths refuse. The CLI reads only local source files and needs no local
 mount or storage credentials for the server’s root.
@@ -136,8 +133,8 @@ mount or storage credentials for the server’s root.
 Preview the same local configuration through the server before applying:
 
 ```bash
-omnigraph cluster plan --server production --config . --json
-omnigraph cluster apply --server production --config . --timeout 1800 --json
+omnigraph cluster plan --target production --config . --json
+omnigraph cluster apply --target production --config . --timeout 1800 --json
 ```
 
 The served plan lists resource changes and schema migrations, including the exact
@@ -166,7 +163,7 @@ hint also preserves the server's original refusal, including an outstanding
 deployment ID. Resume observation with:
 
 ```bash
-omnigraph cluster status --server production --deployment-id ID --wait --timeout 1800 --json
+omnigraph cluster status --target production --deployment-id ID --wait --timeout 1800 --json
 ```
 
 The exact response contains `deployment`, `active` and `in_progress`. Default
@@ -203,7 +200,7 @@ achieved receipts are preserved. The graph storage format is unchanged.
 
 ## Direct deployments and conversion
 
-Without `--server`, apply executes under its own exclusive admission and requires
+With a direct root target, apply executes under its own exclusive admission and requires
 the serving owner to have stopped and handed off the lock. Start the server after
 settlement to activate the applied revision. Direct apply never takes over a live
 server or writes around its lock.
@@ -212,7 +209,7 @@ Use explicit stopped-ledger conversion for a v1 ledger or a v2 ledger whose
 completed receipts still contain obsolete runtime activation fields:
 
 ```bash
-omnigraph --cluster file:///srv/company-brain \
+omnigraph --target file:///srv/company-brain \
   cluster upgrade-ledger --writers-stopped --json
 ```
 
@@ -237,8 +234,8 @@ schema effects. It is not remote authentication.
 A lost connection does not mean failure. Observe the original ID:
 
 ```bash
-OMNIGRAPH_TOKEN_PRODUCTION='secret' omnigraph cluster status \
-  --server production --deployment-id '<DEPLOYMENT_ID>' --json
+omnigraph cluster status \
+  --target production --deployment-id '<DEPLOYMENT_ID>' --json
 ```
 
 An output failure also returns nonzero without proving that deployment failed.
@@ -248,6 +245,14 @@ be written, then returns the output error with the original ID, root and lock
 information. Observe that identity before taking further action; failed output
 does not cause automatic resubmission.
 
+Status never reads source files. `cluster apply --deployment-id ID` without
+`--config` is also source-free: on a direct root it observes the recorded ID,
+and `--writers-stopped` permits reconciliation only with an explicit `--target`.
+For a new source-bearing submission with a caller-chosen ID, provide both
+`--config DIR` and `--deployment-id ID`. The writer attestation cannot accompany
+source input. On a server target, use `cluster status --deployment-id ID` for
+observation; an ID-bearing apply requires explicit `--config`.
+
 Status is read-only. `active` is false for an older result after a newer revision
 activates. Only the current runtime can prove activation; a durable completion
 receipt alone cannot. Repeating apply with the same ID and identical captured input
@@ -256,7 +261,7 @@ returns its recorded outcome; it never executes again. Different input refuses.
 If the server stopped with an outstanding deployment, inspect the storage root:
 
 ```bash
-omnigraph --cluster file:///srv/company-brain \
+omnigraph --target file:///srv/company-brain \
   cluster status --deployment-id '<DEPLOYMENT_ID>' --json
 ```
 
@@ -264,10 +269,14 @@ Establish prior-owner and accepted-I/O quiescence, exclude concurrent admissions
 and unlocks, then reconcile that exact ID:
 
 ```bash
-omnigraph --cluster file:///srv/company-brain cluster force-unlock '<LOCK_ID>'
-omnigraph --cluster file:///srv/company-brain \
+omnigraph --target file:///srv/company-brain cluster force-unlock '<LOCK_ID>'
+omnigraph --target file:///srv/company-brain \
   cluster apply --deployment-id '<DEPLOYMENT_ID>' --writers-stopped --json
 ```
+
+An S3 root works the same way inline, for example
+`--target s3://bucket/company-brain`; see
+[S3 cluster roots](../operations/s3-cluster-roots.md).
 
 Reconciliation uses captured input and exact publication evidence; it never
 replays an uncertain schema or graph-creation invocation. Unstarted schema or

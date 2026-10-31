@@ -5,6 +5,182 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use workos::transport::{HttpRequest, HttpResponse, HttpTransport, TransportError};
 
+fn automation_credential(
+    origin: &str,
+    token: &str,
+) -> crate::credential_sources::AcquiredCredential {
+    use crate::credential_sources::{CredentialRequest, OwnerBinding, OwnerKind, Purpose};
+    let owner = OwnerBinding::new(
+        OwnerKind::Profile,
+        "test-owner".into(),
+        "test-auth".into(),
+        origin.into(),
+        Some("org_test".into()),
+    )
+    .unwrap();
+    let request =
+        CredentialRequest::new(owner, Purpose::Control, origin.into(), None, None).unwrap();
+    crate::credential_sources::acquire_environment_with(&request, "TEST_TOKEN", |_| {
+        Some(token.into())
+    })
+    .unwrap()
+}
+
+#[test]
+fn status_reports_unknown_without_requesting_keychain_custody() {
+    assert_eq!(
+        local_status("https://api.example/prefix", Some("org_test"))["availability"],
+        "unknown"
+    );
+}
+
+#[tokio::test]
+async fn selected_control_token_matches_the_canonical_prefixed_route() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("token"), "declared-token\n").unwrap();
+    std::fs::write(directory.path().join("config.yaml"), "version: 1\nprofiles:\n  work:\n    api: https://api.example/prefix/\n    organization_id: org_test\n    auth: {provider: token, source: {file: ./token}}\n").unwrap();
+    let input = crate::operator::InvocationConfig::at(Some(directory.path().to_owned()), None);
+    let cli =
+        crate::invocation::parse_from(["omnigraph", "credentials", "status", "--profile", "work"])
+            .unwrap()
+            .cli;
+    let target = crate::scope::resolve(&cli, &input, directory.path(), false, &mut Vec::new())
+        .unwrap()
+        .unwrap();
+    let auth = crate::operator_routing::authentication(&cli, &input, Some(&target)).unwrap();
+    crate::operator_routing::AUTH
+        .scope(auth, async {
+            assert_eq!(
+                configured_token("https://api.example/prefix")
+                    .await
+                    .unwrap()
+                    .as_ref()
+                    .map(
+                        |credential| acquired_bearer(credential, "https://api.example/prefix")
+                            .unwrap()
+                    ),
+                Some("declared-token")
+            );
+            assert_eq!(
+                configured_token("https://api.example/prefix/")
+                    .await
+                    .unwrap()
+                    .as_ref()
+                    .map(
+                        |credential| acquired_bearer(credential, "https://api.example/prefix/")
+                            .unwrap()
+                    ),
+                Some("declared-token")
+            );
+            assert!(
+                configured_token("https://api.example/sibling")
+                    .await
+                    .is_err()
+            );
+        })
+        .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn automation_credential_expiry_is_rechecked_before_each_control_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let api = IntentApiFixture::new(vec![
+        metadata(120, "principal_one"),
+        IntentReply::json(200, json!({"data": {}, "meta": {}})),
+        IntentReply::json(
+            200,
+            json!({"data": {"unexpected": "mutation dispatched"}, "meta": {}}),
+        ),
+    ]);
+    let helper = directory.path().join("helper.sh");
+    let response = directory.path().join("response.json");
+    let calls = directory.path().join("calls");
+    std::fs::write(
+        &helper,
+        "IFS= read -r request\nprintf 'called\\n' >> \"$2\"\ncat \"$1\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("config.yaml"),
+        json!({
+            "version": 1, "profiles": {"work": {
+                "api": api.origin, "organization_id": "org_test",
+                "auth": {"provider": "exec", "command": ["/bin/sh", helper, response, calls]}
+            }}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let input = crate::operator::InvocationConfig::at(Some(directory.path().to_owned()), None);
+    let cli = crate::invocation::parse_from(["omnigraph", "cluster", "list", "--profile", "work"])
+        .unwrap()
+        .cli;
+    let target = crate::scope::resolve(&cli, &input, directory.path(), false, &mut Vec::new())
+        .unwrap()
+        .unwrap();
+    let authentication =
+        crate::operator_routing::authentication(&cli, &input, Some(&target)).unwrap();
+    crate::operator_routing::test_transport_scope(&[&api.origin], async {
+        crate::operator_routing::AUTH
+            .scope(authentication, async {
+                let expires = OffsetDateTime::now_utc() + time::Duration::seconds(2);
+                std::fs::write(
+                    &response,
+                    json!({"version": 1,
+                        "credential": {"type": "bearer", "token": "expiring-control-test-only"},
+                        "expires_at": expires.format(&Rfc3339).unwrap()
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                let client = Api::authenticated(
+                    api.origin.clone(),
+                    Some("org_test"),
+                    super::super::ControlAuth::AutomationEnv,
+                )
+                .await
+                .unwrap();
+                client
+                    .request(Method::GET, "/v1/clusters", None, None)
+                    .await
+                    .unwrap();
+                assert_eq!(api.requests().len(), 2);
+                while OffsetDateTime::now_utc() < expires {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let result = client
+                    .request(
+                        Method::POST,
+                        "/v1/clusters",
+                        Some(&json!({"name": "must-not-create"})),
+                        None,
+                    )
+                    .await;
+                assert_eq!(
+                    api.requests().len(),
+                    2,
+                    "expired control credentials must not dispatch another request"
+                );
+                let error = result.unwrap_err();
+                assert_eq!(error.body["type"], "credential_expired");
+                assert!(
+                    !error
+                        .body
+                        .to_string()
+                        .contains("expiring-control-test-only")
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&calls).unwrap(),
+                    "called\ncalled\n",
+                    "an expired helper is read once again, but cannot dispatch with expired authority"
+                );
+            })
+            .await;
+    })
+    .await;
+}
+
 #[derive(Default)]
 pub(in crate::managed) struct MemoryStore(pub RefCell<HashMap<String, String>>);
 impl Store for MemoryStore {
@@ -18,6 +194,142 @@ impl Store for MemoryStore {
     fn remove(&self, key: &str) -> Result<()> {
         self.0.borrow_mut().remove(key);
         Ok(())
+    }
+}
+
+struct InterruptedCleanup<'a> {
+    raw: &'a MemoryStore,
+    remaining: Cell<usize>,
+}
+
+impl Store for InterruptedCleanup<'_> {
+    fn get(&self, key: &str) -> Result<Option<String>> {
+        self.raw.get(key)
+    }
+    fn put(&self, key: &str, value: &str) -> Result<()> {
+        self.raw.put(key, value)
+    }
+    fn remove(&self, key: &str) -> Result<()> {
+        if self.remaining.get() == 0 {
+            return Err(keychain_failed());
+        }
+        self.remaining.set(self.remaining.get() - 1);
+        self.raw.remove(key)
+    }
+}
+
+#[tokio::test]
+async fn derived_index_survives_generations_route_changes_and_interrupted_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let input = crate::operator::InvocationConfig::at(Some(root.path().to_owned()), None);
+    let binding = |profile, route| {
+        crate::operator_routing::registration_auth(&input, profile, route).unwrap()
+    };
+    let first = binding("human", "https://first.example");
+    let other = binding("other", "https://first.example");
+    let raw = MemoryStore::default();
+    let (index_account, old_key) = crate::operator_routing::AUTH
+        .scope(Some(first.clone()), async {
+            let key = crate::operator_routing::data_namespace("cluster-one");
+            put_data(&raw, &key, "first-generation").unwrap();
+            (DataIndex::selected().unwrap().account(), key)
+        })
+        .await;
+    let (other_index, other_key) = crate::operator_routing::AUTH
+        .scope(Some(other), async {
+            let key = crate::operator_routing::data_namespace("cluster-one");
+            put_data(&raw, &key, "other-profile").unwrap();
+            (DataIndex::selected().unwrap().account(), key)
+        })
+        .await;
+    first.invalidate().unwrap();
+    crate::operator_routing::AUTH
+        .scope(Some(first), async {
+            assert_eq!(
+                put_data(&raw, &old_key, "stale-writer").unwrap_err().body["type"],
+                "credential_generation_changed"
+            );
+            assert_eq!(
+                raw.get(&old_key).unwrap().as_deref(),
+                Some("first-generation")
+            );
+        })
+        .await;
+    let second = binding("human", "https://second.example");
+    let new_key = crate::operator_routing::AUTH
+        .scope(Some(second.clone()), async {
+            let index = DataIndex::selected().unwrap();
+            assert_eq!(index.account(), index_account);
+            let key = crate::operator_routing::data_namespace("cluster-two");
+            assert_ne!(key, old_key);
+            put_data(&raw, &key, "second-generation").unwrap();
+            assert_eq!(index.load(&raw).unwrap().len(), 2);
+            assert!(
+                index
+                    .clear(&InterruptedCleanup {
+                        raw: &raw,
+                        remaining: Cell::new(1)
+                    })
+                    .is_err()
+            );
+            assert!(raw.get(&index_account).unwrap().is_some());
+            key
+        })
+        .await;
+    second.invalidate().unwrap();
+    let fresh = binding("human", "https://third.example");
+    crate::operator_routing::AUTH
+        .scope(Some(fresh), async {
+            let index = DataIndex::selected().unwrap();
+            assert_eq!(index.account(), index_account);
+            index.clear(&raw).unwrap();
+            assert!(raw.get(&old_key).unwrap().is_none());
+            assert!(raw.get(&new_key).unwrap().is_none());
+            assert!(raw.get(&index_account).unwrap().is_none());
+            assert_eq!(
+                raw.get(&other_key).unwrap().as_deref(),
+                Some("other-profile")
+            );
+            assert!(raw.get(&other_index).unwrap().is_some());
+            assert_eq!(raw.0.borrow().len(), 2);
+        })
+        .await;
+}
+
+#[test]
+fn derived_index_rejects_foreign_or_malformed_keys_before_any_deletion() {
+    let index = DataIndex {
+        profile: "owner:one:profile:selected".into(),
+    };
+    let owned = format!(
+        "{}:binding:{}:generation:1:credential:cluster",
+        index.profile,
+        "a".repeat(64)
+    );
+    let foreign = format!(
+        "owner:one:profile:other:binding:{}:generation:1:credential:cluster",
+        "a".repeat(64)
+    );
+    for invalid in [
+        foreign,
+        index.account(),
+        format!(
+            "{}:binding:invalid:generation:1:credential:cluster",
+            index.profile
+        ),
+    ] {
+        let raw = MemoryStore::default();
+        raw.put(&owned, "selected").unwrap();
+        raw.put(&invalid, "foreign").unwrap();
+        raw.put(
+            &index.account(),
+            &serde_json::to_string(&[&owned, &invalid]).unwrap(),
+        )
+        .unwrap();
+        let before = raw.0.borrow().clone();
+        assert!(index.clear(&raw).is_err());
+        assert!(index.put(&raw, &owned, "replacement").is_err());
+        assert_eq!(*raw.0.borrow(), before);
     }
 }
 
@@ -73,14 +385,14 @@ pub(super) fn tokens(seconds: i64, user: &str) -> Value {
         "organization_id":"org_test","access_token":jwt(seconds,user),"refresh_token":"rotated-refresh"})
 }
 
-pub(super) fn metadata(seconds: i64, principal: &str) -> IntentReply {
+pub(in crate::managed) fn metadata(seconds: i64, principal: &str) -> IntentReply {
     metadata_for(seconds, principal, "org_test")
 }
 
 fn metadata_for(seconds: i64, principal: &str, organization: &str) -> IntentReply {
     IntentReply::json(
         200,
-        json!({"data":{"principal_id":principal,"account_id":organization,"kind":"human","scopes":{},
+        json!({"data":{"principal_id":principal,"account_id":organization,"kind":"human","service_permissions":["source_read","status"],
         "expires_at":OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp()+seconds).unwrap().format(&Rfc3339).unwrap()},"meta":{}}),
     )
 }
@@ -89,6 +401,7 @@ fn metadata_for(seconds: i64, principal: &str, organization: &str) -> IntentRepl
 pub(super) struct MockTransport {
     pub requests: Mutex<Vec<HttpRequest>>,
     pub responses: Mutex<VecDeque<(u16, Value)>>,
+    pub raw_error_body: Option<Vec<u8>>,
     pending: bool,
 }
 
@@ -120,7 +433,14 @@ impl HttpTransport for MockTransport {
         Ok(HttpResponse {
             status: reqwest::StatusCode::from_u16(status).unwrap(),
             headers: reqwest::header::HeaderMap::new(),
-            body: value.to_string().into(),
+            body: if status >= 400 {
+                self.raw_error_body
+                    .clone()
+                    .unwrap_or_else(|| value.to_string().into_bytes())
+                    .into()
+            } else {
+                value.to_string().into()
+            },
         })
     }
 }
@@ -159,21 +479,25 @@ fn explicit_automation_requires_its_exact_origin_and_never_uses_human_cache() {
 #[tokio::test]
 async fn explicit_automation_resolves_its_own_principal_before_data_cache_reuse() {
     let api = IntentApiFixture::new(vec![metadata(120, "automation_principal")]);
-    let store = MemoryStore::default();
-    // Even unreadable local human custody cannot override an explicit identity.
-    store.put(&api.origin, "unrelated-human-record").unwrap();
-    let principal = selected_principal_with(
-        &store,
-        &api.origin,
-        Some("org_test"),
-        Some("automation-access".into()),
-        Some(api.origin.clone()),
-    )
-    .await
-    .unwrap();
-    assert_eq!(principal.as_deref(), Some("automation_principal"));
-    assert_eq!(api.requests()[0].path, "/v1/auth/session");
-    api.assert_complete();
+    crate::operator_routing::test_transport_scope(&[&api.origin], async {
+        let store = MemoryStore::default();
+        // Even unreadable local human custody cannot override an explicit identity.
+        store.put(&api.origin, "unrelated-human-record").unwrap();
+        let principal = selected_principal_with(
+            &store,
+            &api.origin,
+            Some("org_test"),
+            Some(automation_credential(&api.origin, "automation-access")),
+            Some(api.origin.clone()),
+            super::super::ControlAuth::AutomationEnv,
+        )
+        .await
+        .unwrap();
+        assert_eq!(principal.as_deref(), Some("automation_principal"));
+        assert_eq!(api.requests()[0].path, "/v1/auth/session");
+        api.assert_complete();
+    })
+    .await;
 }
 
 #[test]
@@ -220,23 +544,26 @@ async fn explicit_api_credentials_are_scrubbed_from_success_and_error_responses(
         IntentReply::json(200, json!({"data":{"reflected":token},"meta":{}})),
         IntentReply::json(403, json!({"type":"permission_denied","detail":token})),
     ]);
-    let api = Api::new(fixture.origin.clone(), Some(token.into())).unwrap();
-    let response = api
-        .request(Method::GET, "/v1/auth/session", None, None)
-        .await
-        .unwrap();
-    assert!(!response.to_string().contains(token));
-    let error = api
-        .request(Method::GET, "/v1/auth/session", None, None)
-        .await
-        .unwrap_err();
-    assert_eq!(error.exit, 2);
-    assert_eq!(error.body["type"], "permission_denied");
-    assert!(!error.body.to_string().contains(token));
-    for request in fixture.requests() {
-        assert_eq!(request.headers["authorization"], format!("Bearer {token}"));
-    }
-    fixture.assert_complete();
+    crate::operator_routing::test_transport_scope(&[&fixture.origin], async {
+        let api = Api::new(fixture.origin.clone(), Some(token.into())).unwrap();
+        let response = api
+            .request(Method::GET, "/v1/auth/session", None, None)
+            .await
+            .unwrap();
+        assert!(!response.to_string().contains(token));
+        let error = api
+            .request(Method::GET, "/v1/auth/session", None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.exit, 2);
+        assert_eq!(error.body["type"], "permission_denied");
+        assert!(!error.body.to_string().contains(token));
+        for request in fixture.requests() {
+            assert_eq!(request.headers["authorization"], format!("Bearer {token}"));
+        }
+        fixture.assert_complete();
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -266,35 +593,118 @@ async fn official_sdk_uses_public_client_device_and_refresh_without_secret_or_re
             .to_string()
             .contains("secret-provider-reflection")
     );
-    let requests = transport.requests.lock().unwrap();
-    assert_eq!(requests.len(), 3);
-    for request in requests.iter() {
-        assert!(!request.headers.contains_key(reqwest::header::AUTHORIZATION));
-        let body: Value = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
-        assert_eq!(body["client_id"], "client_test");
-        assert!(body.get("client_secret").is_none());
+    {
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in requests.iter() {
+            assert!(!request.headers.contains_key(reqwest::header::AUTHORIZATION));
+            let body: Value = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+            assert_eq!(body["client_id"], "client_test");
+            assert!(body.get("client_secret").is_none());
+        }
+        assert_eq!(requests[0].url, config().device_authorization_endpoint);
+        assert_eq!(requests[1].url, config().token_endpoint);
     }
-    assert_eq!(requests[0].url, config().device_authorization_endpoint);
-    assert_eq!(requests[1].url, config().token_endpoint);
+    for (status, code, transient) in [
+        (408, "unavailable", true),
+        (429, "unavailable", true),
+        (500, "unavailable", true),
+        (503, "unavailable", true),
+        (400, "invalid_grant", false),
+        (401, "refused", false),
+        (403, "access_denied", false),
+        (302, "redirect", false),
+        (503, "invalid_grant", false),
+    ] {
+        let mut transport = MockTransport::with(vec![(status, json!({"error":code}))]);
+        if code == "unavailable" && matches!(status, 500 | 503) {
+            Arc::get_mut(&mut transport).unwrap().raw_error_body = Some(if status == 500 {
+                Vec::new()
+            } else {
+                b"<html>Bad Gateway</html>".to_vec()
+            });
+        }
+        let error = transport
+            .provider()
+            .refresh("secret-refresh", "org_test")
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(provider::transient(&error), transient);
+        assert_eq!(transport.requests.lock().unwrap().len(), 1);
+    }
+    for (error, transient) in [
+        (
+            TransportError::connect(std::io::Error::other("fixture")),
+            true,
+        ),
+        (
+            TransportError::timeout(std::io::Error::other("fixture")),
+            true,
+        ),
+        (
+            TransportError::other(std::io::Error::other("response refused")),
+            false,
+        ),
+    ] {
+        assert_eq!(
+            provider::transient(&workos::Error::Network(error)),
+            transient
+        );
+    }
 }
 
 #[tokio::test]
 async fn api_verifies_new_provider_identity_before_the_cache_accepts_it() {
-    let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
-    let response = serde_json::from_value(tokens(120, "user_one")).unwrap();
-    let (saved, output) = renewal::accept(&api.origin, config(), response, None)
-        .await
-        .unwrap();
-    let store = MemoryStore::default();
-    renewal::save(&store, &saved).unwrap();
-    assert!(renewal::load(&store, &api.origin).unwrap().is_some());
-    assert!(!output.to_string().contains("rotated-refresh"));
-    assert!(!output.to_string().contains(".signature"));
-    let requests = api.requests();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].path, "/v1/auth/session");
-    assert!(requests[0].headers["authorization"].starts_with("Bearer ey"));
-    api.assert_complete();
+    for permissions in [
+        Some(json!(["source_read", "status"])),
+        Some(json!([])),
+        Some(json!(["status", "status"])),
+        Some(json!(["status", "source_read"])),
+        Some(json!(["bad\n"])),
+        Some(Value::Null),
+        None,
+    ] {
+        let valid = matches!(&permissions, Some(Value::Array(values)) if values.is_empty() || values == &vec![json!("source_read"), json!("status")]);
+        let mut reply = metadata(120, "principal_one");
+        let mut body: Value = serde_json::from_slice(&reply.body).unwrap();
+        if let Some(permissions) = permissions {
+            body["data"]["service_permissions"] = permissions;
+        } else {
+            body["data"]
+                .as_object_mut()
+                .unwrap()
+                .remove("service_permissions");
+            body["data"]["scopes"] = json!({});
+        }
+        reply.body = body.to_string().into_bytes();
+        let api = IntentApiFixture::new(vec![reply]);
+        crate::operator_routing::test_transport_scope(&[&api.origin], async {
+            let response = serde_json::from_value(tokens(120, "user_one")).unwrap();
+            let result = renewal::accept(&api.origin, config(), response, None).await;
+            if valid {
+                let (saved, output) = result.unwrap();
+                let store = MemoryStore::default();
+                renewal::save(&store, &saved).unwrap();
+                assert!(renewal::load(&store, &api.origin).unwrap().is_some());
+                assert_eq!(
+                    output["data"]["service_permissions"],
+                    body["data"]["service_permissions"]
+                );
+                assert!(output["data"].get("scopes").is_none());
+                assert!(!output.to_string().contains("rotated-refresh"));
+                assert!(!output.to_string().contains(".signature"));
+            } else {
+                assert!(result.is_err());
+            }
+            let requests = api.requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].path, "/v1/auth/session");
+            assert!(requests[0].headers["authorization"].starts_with("Bearer ey"));
+            api.assert_complete();
+        })
+        .await;
+    }
 }
 
 #[tokio::test]
@@ -303,33 +713,41 @@ async fn cached_login_does_not_restart_provider_authorization() {
         metadata(120, "principal_one"),
         metadata(120, "principal_one"),
     ]);
-    let tokens = serde_json::from_value(tokens(120, "user_one")).unwrap();
-    let (saved, _) = renewal::accept(&api.origin, config(), tokens, None)
+    crate::operator_routing::test_transport_scope(&[&api.origin], async {
+        let tokens = serde_json::from_value(tokens(120, "user_one")).unwrap();
+        let (saved, _) = renewal::accept(&api.origin, config(), tokens, None)
+            .await
+            .unwrap();
+        let deadline = saved.refresh_expires_at.clone();
+        let remaining = renewal::timestamp(&deadline).unwrap() - OffsetDateTime::now_utc();
+        assert!(remaining > time::Duration::days(30) - time::Duration::seconds(5));
+        assert!(remaining <= time::Duration::days(30));
+        let store = MemoryStore::default();
+        renewal::save(&store, &saved).unwrap();
+        let provider = MockTransport::with(vec![]);
+        let output = login_with(
+            &store,
+            &api.origin,
+            config(),
+            &provider.provider(),
+            Some("org_test"),
+            &mut Vec::new(),
+        )
         .await
         .unwrap();
-    let store = MemoryStore::default();
-    renewal::save(&store, &saved).unwrap();
-    let provider = MockTransport::with(vec![]);
-    let output = login_with(
-        &store,
-        &api.origin,
-        config(),
-        &provider.provider(),
-        None,
-        &mut Vec::new(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(output["data"]["principal_id"], "principal_one");
-    assert!(output["data"]["refresh_expires_at"].is_string());
-    assert!(provider.requests.lock().unwrap().is_empty());
-    api.assert_complete();
+        assert_eq!(output["data"]["principal_id"], "principal_one");
+        assert_eq!(output["data"]["refresh_expires_at"], deadline);
+        assert!(provider.requests.lock().unwrap().is_empty());
+        api.assert_complete();
+    })
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "nightly: real 5 s device-flow poll intervals, 20 s in all"]
 async fn device_login_polls_the_provider_and_never_the_old_broker() {
     let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
+    crate::operator_routing::test_transport_scope(&[&api.origin], async {
     let transport = MockTransport::with(vec![
         (
             200,
@@ -354,6 +772,7 @@ async fn device_login_polls_the_provider_and_never_the_old_broker() {
     assert_eq!(transport.requests.lock().unwrap().len(), 4);
     assert_eq!(api.requests()[0].path, "/v1/auth/session");
     api.assert_complete();
+}).await;
 }
 
 #[tokio::test]
@@ -362,13 +781,16 @@ async fn rejected_resource_identity_never_becomes_a_cached_session() {
         401,
         json!({"type":"unauthenticated"}),
     )]);
-    let tokens = serde_json::from_value(tokens(120, "user_one")).unwrap();
-    assert!(
-        renewal::accept(&api.origin, config(), tokens, None)
-            .await
-            .is_err()
-    );
-    api.assert_complete();
+    crate::operator_routing::test_transport_scope(&[&api.origin], async {
+        let tokens = serde_json::from_value(tokens(120, "user_one")).unwrap();
+        assert!(
+            renewal::accept(&api.origin, config(), tokens, None)
+                .await
+                .is_err()
+        );
+        api.assert_complete();
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -380,6 +802,7 @@ async fn device_deadline_prevents_a_poll_or_resource_request_after_expiry() {
         Some(OutputFault::Flush),
     ] {
         let api = IntentApiFixture::new(vec![]);
+        crate::operator_routing::test_transport_scope(&[&api.origin], async {
         let transport = MockTransport::with(vec![(
             200,
             json!({"device_code":"device-secret","user_code":"ABCD","verification_uri":"https://auth.example/device","expires_in":if fault.is_some() {30} else {1},"interval":5}),
@@ -420,6 +843,7 @@ async fn device_deadline_prevents_a_poll_or_resource_request_after_expiry() {
         assert_eq!(transport.requests.lock().unwrap().len(), 1);
         assert!(store.0.borrow().is_empty());
         assert!(api.requests().is_empty());
+    }).await;
     }
 }
 
@@ -442,6 +866,7 @@ async fn failed_login_custody_attempts_to_revoke_the_new_provider_session() {
         metadata(120, "principal_one"),
         IntentReply::json(200, json!({"data":{"logged_out":true},"meta":{}})),
     ]);
+    crate::operator_routing::test_transport_scope(&[&api.origin], async {
     let transport = MockTransport::with(vec![
         (
             200,
@@ -463,60 +888,81 @@ async fn failed_login_custody_attempts_to_revoke_the_new_provider_session() {
     assert_eq!(api.requests()[1].path, "/v1/auth/logout");
     assert!(api.requests()[1].headers["authorization"].starts_with("Bearer ey"));
     api.assert_complete();
+}).await;
 }
 
 #[tokio::test]
-async fn signing_into_another_organization_starts_its_own_device_flow() {
-    let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
-    let (saved, _) = renewal::accept(
-        &api.origin,
-        config(),
-        serde_json::from_value(tokens(120, "user_one")).unwrap(),
-        None,
-    )
-    .await
-    .unwrap();
-    let store = MemoryStore::default();
-    renewal::save(&store, &saved).unwrap();
-    let before = store.0.borrow().clone();
-    let transport = MockTransport::with(vec![(
-        200,
-        json!({"device_code":"device-secret","user_code":"ABCD","verification_uri":"https://auth.example/device","expires_in":1,"interval":5}),
-    )]);
-    let error = login_with(
-        &store,
-        &api.origin,
-        config(),
-        &transport.provider(),
-        Some("org_other"),
-        &mut Vec::new(),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.body["type"], "device_expired");
-    assert_eq!(*store.0.borrow(), before);
-    let requests = transport.requests.lock().unwrap();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].url, config().device_authorization_endpoint);
-    let body: Value = serde_json::from_slice(requests[0].body.as_ref().unwrap()).unwrap();
-    assert_eq!(body, json!({"client_id":"client_test"}));
-    api.assert_complete();
+async fn organization_discovery_starts_fresh_with_zero_one_or_multiple_cached_organizations() {
+    for count in [0, 1, 2] {
+        let organizations = ["org_test", "org_other"];
+        let api = IntentApiFixture::new(
+            organizations
+                .iter()
+                .take(count)
+                .map(|org| metadata_for(120, "principal_one", org))
+                .collect(),
+        );
+        crate::operator_routing::test_transport_scope(&[&api.origin], async {
+        let store = MemoryStore::default();
+        for org in organizations.iter().take(count) {
+            let mut supplied = tokens(120, "user_one");
+            supplied["organization_id"] = json!(org);
+            rewrite_claim(&mut supplied, "org_id", json!(org));
+            let (saved, _) = renewal::accept(
+                &api.origin,
+                config(),
+                serde_json::from_value(supplied).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+            renewal::save(&store, &saved).unwrap();
+        }
+        let before = store.0.borrow().clone();
+        let transport = MockTransport::with(vec![(
+            200,
+            json!({"device_code":"device-secret","user_code":"ABCD","verification_uri":"https://auth.example/device","expires_in":1,"interval":5}),
+        )]);
+        let error = login_with(
+            &store,
+            &api.origin,
+            config(),
+            &transport.provider(),
+            None,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.body["type"], "device_expired");
+        assert_eq!(*store.0.borrow(), before);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url, config().device_authorization_endpoint);
+        let body: Value = serde_json::from_slice(requests[0].body.as_ref().unwrap()).unwrap();
+        assert_eq!(body, json!({"client_id":"client_test"}));
+        api.assert_complete();
+    }).await;
+    }
 }
 
 #[tokio::test]
 async fn explicit_organization_must_match_the_verified_automation_account() {
     let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
-    let result = select_with(
-        &MemoryStore::default(),
-        &api.origin,
-        Some("org_other"),
-        Some("automation".into()),
-        Some(api.origin.clone()),
-    )
+    crate::operator_routing::test_transport_scope(&[&api.origin], async {
+        let result = select_with(
+            &MemoryStore::default(),
+            &api.origin,
+            Some("org_other"),
+            Some(automation_credential(&api.origin, "automation")),
+            Some(api.origin.clone()),
+            super::super::ControlAuth::AutomationEnv,
+        )
+        .await;
+        assert_eq!(result.err().unwrap().body["type"], "organization_mismatch");
+        assert_eq!(api.requests().len(), 1);
+        api.assert_complete();
+    })
     .await;
-    assert_eq!(result.err().unwrap().body["type"], "organization_mismatch");
-    assert_eq!(api.requests().len(), 1);
-    api.assert_complete();
 }
 
 #[test]
@@ -541,6 +987,7 @@ fn discovery_v2_has_no_tenant_selector_and_rejects_v1() {
 #[ignore = "nightly: one real 5 s device-flow poll interval"]
 async fn device_login_refuses_another_organization_before_saving_credentials() {
     let api = IntentApiFixture::new(vec![]);
+    crate::operator_routing::test_transport_scope(&[&api.origin], async {
     let transport = MockTransport::with(vec![
         (
             200,
@@ -568,6 +1015,7 @@ async fn device_login_refuses_another_organization_before_saving_credentials() {
         assert!(body.get("organization_id").is_none());
     }
     api.assert_complete();
+}).await;
 }
 
 fn rewrite_claim(tokens: &mut Value, field: &str, value: Value) {
@@ -611,6 +1059,65 @@ async fn cache_original_session(store: &MemoryStore, origin: &str) {
 }
 
 #[tokio::test]
+async fn fresh_login_replaces_a_different_human_only_after_exact_confirmation() {
+    for confirmed in [false, true] {
+        let mut replies = vec![
+            metadata(120, "principal_one"),
+            metadata(120, "principal_other"),
+        ];
+        if !confirmed {
+            replies.push(IntentReply::json(
+                200,
+                json!({"data":{"logged_out":true},"meta":{}}),
+            ));
+        }
+        let api = IntentApiFixture::new(replies);
+        crate::operator_routing::test_transport_scope(&[&api.origin], async {
+            let store = MemoryStore::default();
+            cache_original_session(&store, &api.origin).await;
+            let before = store.0.borrow().clone();
+            let transport = MockTransport::with(vec![]);
+            let mut supplied = device_tokens(Some("org_test"), "fresh_session", "fresh-refresh");
+            supplied["user"]["id"] = json!("user_other");
+            rewrite_claim(&mut supplied, "sub", json!("user_other"));
+            let result = REPLACE_PRINCIPAL
+                .scope(
+                    confirmed.then(|| "principal_other".into()),
+                    accept_device(
+                        &store,
+                        &api.origin,
+                        config(),
+                        &transport.provider(),
+                        serde_json::from_value(supplied).unwrap(),
+                        Some("org_test"),
+                    ),
+                )
+                .await;
+            if confirmed {
+                result.unwrap();
+                assert_eq!(
+                    renewal::load_selected(&store, &api.origin, Some("org_test"))
+                        .unwrap()
+                        .unwrap()
+                        .identity
+                        .principal_id,
+                    "principal_other"
+                );
+            } else {
+                assert_eq!(
+                    result.unwrap_err().body["type"],
+                    "principal_replacement_required"
+                );
+                assert_eq!(*store.0.borrow(), before);
+            }
+            assert!(transport.requests.lock().unwrap().is_empty());
+            api.assert_complete();
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn fresh_device_selection_uses_only_new_credentials_and_preserves_cached_organization() {
     check_fresh_device_selection(false).await;
 }
@@ -627,6 +1134,7 @@ async fn check_fresh_device_selection(wait_for_consent: bool) {
             metadata(120, "principal_one"),
             metadata_for(120, "principal_one", "org_other"),
         ]);
+        crate::operator_routing::test_transport_scope(&[&api.origin], async {
         let store = MemoryStore::default();
         cache_original_session(&store, &api.origin).await;
         let before = store.0.borrow().clone();
@@ -689,6 +1197,7 @@ async fn check_fresh_device_selection(wait_for_consent: bool) {
         assert!(!result.to_string().contains("selected-refresh"));
         assert!(!result.to_string().contains("fresh-refresh"));
         api.assert_complete();
+    }).await;
     }
 }
 
@@ -696,32 +1205,36 @@ async fn check_fresh_device_selection(wait_for_consent: bool) {
 #[ignore = "nightly: one real 35 s organization-selection network deadline"]
 async fn fresh_device_selection_network_timeout_preserves_cached_custody_without_replay() {
     let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
-    let store = MemoryStore::default();
-    cache_original_session(&store, &api.origin).await;
-    let before = store.0.borrow().clone();
-    let transport = Arc::new(MockTransport {
-        pending: true,
-        ..MockTransport::default()
-    });
-    let error = tokio::time::timeout(
-        Duration::from_secs(40),
-        accept_device(
-            &store,
-            &api.origin,
-            config(),
-            &transport.provider(),
-            serde_json::from_value(device_tokens(None, "fresh_session", "fresh-refresh")).unwrap(),
-            Some("org_other"),
-        ),
-    )
-    .await
-    .expect("network selection remains bounded")
-    .unwrap_err();
-    assert_eq!(error.body["type"], "refresh_outcome_unknown");
-    assert_eq!(*store.0.borrow(), before);
-    assert_eq!(transport.requests.lock().unwrap().len(), 1);
-    assert_eq!(api.requests().len(), 1, "no acceptance or revocation");
-    api.assert_complete();
+    crate::operator_routing::test_transport_scope(&[&api.origin], async {
+        let store = MemoryStore::default();
+        cache_original_session(&store, &api.origin).await;
+        let before = store.0.borrow().clone();
+        let transport = Arc::new(MockTransport {
+            pending: true,
+            ..MockTransport::default()
+        });
+        let error = tokio::time::timeout(
+            Duration::from_secs(40),
+            accept_device(
+                &store,
+                &api.origin,
+                config(),
+                &transport.provider(),
+                serde_json::from_value(device_tokens(None, "fresh_session", "fresh-refresh"))
+                    .unwrap(),
+                Some("org_other"),
+            ),
+        )
+        .await
+        .expect("network selection remains bounded")
+        .unwrap_err();
+        assert_eq!(error.body["type"], "refresh_outcome_unknown");
+        assert_eq!(*store.0.borrow(), before);
+        assert_eq!(transport.requests.lock().unwrap().len(), 1);
+        assert_eq!(api.requests().len(), 1, "no acceptance or revocation");
+        api.assert_complete();
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -744,70 +1257,74 @@ async fn fresh_device_selection_refuses_substitutions_without_changing_cached_cu
             responses.push(IntentReply::json(401, json!({"type":"unauthenticated"})));
         }
         let api = IntentApiFixture::new(responses);
-        let store = MemoryStore::default();
-        cache_original_session(&store, &api.origin).await;
-        let before = store.0.borrow().clone();
-        let mut selected = device_tokens(Some("org_other"), "fresh_session", "selected-refresh");
-        let mut status = 200;
-        match change {
-            "organization" => {
-                selected["organization_id"] = json!("org_wrong");
-                rewrite_claim(&mut selected, "org_id", json!("org_wrong"));
+        crate::operator_routing::test_transport_scope(&[&api.origin], async {
+            let store = MemoryStore::default();
+            cache_original_session(&store, &api.origin).await;
+            let before = store.0.borrow().clone();
+            let mut selected =
+                device_tokens(Some("org_other"), "fresh_session", "selected-refresh");
+            let mut status = 200;
+            match change {
+                "organization" => {
+                    selected["organization_id"] = json!("org_wrong");
+                    rewrite_claim(&mut selected, "org_id", json!("org_wrong"));
+                }
+                "user" => selected["user"]["id"] = json!("user_other"),
+                "subject" => rewrite_claim(&mut selected, "sub", json!("user_other")),
+                "session" => rewrite_claim(&mut selected, "sid", json!("cached_session")),
+                "issuer" => rewrite_claim(&mut selected, "iss", json!("https://other.example")),
+                "client" => rewrite_claim(&mut selected, "client_id", json!("client_other")),
+                "expiry" => rewrite_claim(&mut selected, "exp", json!(0)),
+                "response_organization" => selected["organization_id"] = json!("org_wrong"),
+                "provider_denial" => {
+                    status = 400;
+                    selected = json!({"error":"invalid_grant","message":"fresh-refresh"});
+                }
+                "uncertain_exchange" => {
+                    status = 503;
+                    selected = json!({"error":"unavailable","message":"fresh-refresh"});
+                }
+                "target_denial" => {}
+                _ => unreachable!(),
             }
-            "user" => selected["user"]["id"] = json!("user_other"),
-            "subject" => rewrite_claim(&mut selected, "sub", json!("user_other")),
-            "session" => rewrite_claim(&mut selected, "sid", json!("cached_session")),
-            "issuer" => rewrite_claim(&mut selected, "iss", json!("https://other.example")),
-            "client" => rewrite_claim(&mut selected, "client_id", json!("client_other")),
-            "expiry" => rewrite_claim(&mut selected, "exp", json!(0)),
-            "response_organization" => selected["organization_id"] = json!("org_wrong"),
-            "provider_denial" => {
-                status = 400;
-                selected = json!({"error":"invalid_grant","message":"fresh-refresh"});
-            }
-            "uncertain_exchange" => {
-                status = 503;
-                selected = json!({"error":"unavailable","message":"fresh-refresh"});
-            }
-            "target_denial" => {}
-            _ => unreachable!(),
-        }
-        let transport = MockTransport::with(vec![(status, selected)]);
-        let error = accept_device(
-            &store,
-            &api.origin,
-            config(),
-            &transport.provider(),
-            serde_json::from_value(device_tokens(
-                Some("org_test"),
-                "fresh_session",
-                "fresh-refresh",
-            ))
-            .unwrap(),
-            Some("org_other"),
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            !error.body.to_string().contains("fresh-refresh"),
-            "{change}"
-        );
-        assert!(
-            !error.body.to_string().contains("selected-refresh"),
-            "{change}"
-        );
-        assert_eq!(*store.0.borrow(), before, "{change}");
-        assert_eq!(
-            transport.requests.lock().unwrap().len(),
-            1,
-            "no replay or fallback: {change}"
-        );
-        assert_eq!(
-            api.requests().len(),
-            if change == "target_denial" { 2 } else { 1 },
-            "no substituted bearer is accepted or revoked: {change}"
-        );
-        api.assert_complete();
+            let transport = MockTransport::with(vec![(status, selected)]);
+            let error = accept_device(
+                &store,
+                &api.origin,
+                config(),
+                &transport.provider(),
+                serde_json::from_value(device_tokens(
+                    Some("org_test"),
+                    "fresh_session",
+                    "fresh-refresh",
+                ))
+                .unwrap(),
+                Some("org_other"),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                !error.body.to_string().contains("fresh-refresh"),
+                "{change}"
+            );
+            assert!(
+                !error.body.to_string().contains("selected-refresh"),
+                "{change}"
+            );
+            assert_eq!(*store.0.borrow(), before, "{change}");
+            assert_eq!(
+                transport.requests.lock().unwrap().len(),
+                1,
+                "no replay or fallback: {change}"
+            );
+            assert_eq!(
+                api.requests().len(),
+                if change == "target_denial" { 2 } else { 1 },
+                "no substituted bearer is accepted or revoked: {change}"
+            );
+            api.assert_complete();
+        })
+        .await;
     }
 }
 
@@ -815,47 +1332,50 @@ async fn fresh_device_selection_refuses_substitutions_without_changing_cached_cu
 async fn fresh_device_cannot_select_or_revoke_an_existing_cached_session() {
     for malformed in [false, true] {
         let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
-        let store = MemoryStore::default();
-        cache_original_session(&store, &api.origin).await;
-        if malformed {
-            let key = store
-                .0
-                .borrow()
-                .keys()
-                .find(|key| key.starts_with("credential:"))
-                .unwrap()
-                .clone();
-            store.0.borrow_mut().insert(key, "invalid".into());
-        }
-        let before = store.0.borrow().clone();
-        let transport = MockTransport::with(vec![]);
-        let error = accept_device(
-            &store,
-            &api.origin,
-            config(),
-            &transport.provider(),
-            serde_json::from_value(device_tokens(
-                Some("org_test"),
-                "cached_session",
-                "fresh-refresh",
-            ))
-            .unwrap(),
-            Some("org_other"),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            error.body["type"],
+        crate::operator_routing::test_transport_scope(&[&api.origin], async {
+            let store = MemoryStore::default();
+            cache_original_session(&store, &api.origin).await;
             if malformed {
-                "credential_invalid"
-            } else {
-                "session_identity_mismatch"
+                let key = store
+                    .0
+                    .borrow()
+                    .keys()
+                    .find(|key| key.starts_with("credential:"))
+                    .unwrap()
+                    .clone();
+                store.0.borrow_mut().insert(key, "invalid".into());
             }
-        );
-        assert_eq!(*store.0.borrow(), before);
-        assert!(transport.requests.lock().unwrap().is_empty());
-        assert_eq!(api.requests().len(), 1);
-        api.assert_complete();
+            let before = store.0.borrow().clone();
+            let transport = MockTransport::with(vec![]);
+            let error = accept_device(
+                &store,
+                &api.origin,
+                config(),
+                &transport.provider(),
+                serde_json::from_value(device_tokens(
+                    Some("org_test"),
+                    "cached_session",
+                    "fresh-refresh",
+                ))
+                .unwrap(),
+                Some("org_other"),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.body["type"],
+                if malformed {
+                    "credential_invalid"
+                } else {
+                    "session_identity_mismatch"
+                }
+            );
+            assert_eq!(*store.0.borrow(), before);
+            assert!(transport.requests.lock().unwrap().is_empty());
+            assert_eq!(api.requests().len(), 1);
+            api.assert_complete();
+        })
+        .await;
     }
 }
 
@@ -878,30 +1398,265 @@ async fn selected_device_custody_failure_revokes_only_the_new_verified_session()
         metadata_for(120, "principal_one", "org_other"),
         IntentReply::json(200, json!({"data":{"logged_out":true},"meta":{}})),
     ]);
+    crate::operator_routing::test_transport_scope(&[&api.origin], async {
+        let store = MemoryStore::default();
+        cache_original_session(&store, &api.origin).await;
+        let before = store.0.borrow().clone();
+        let selected = device_tokens(Some("org_other"), "fresh_session", "selected-refresh");
+        let transport = MockTransport::with(vec![(200, selected.clone())]);
+        let error = accept_device(
+            &RefusingStore(&store),
+            &api.origin,
+            config(),
+            &transport.provider(),
+            serde_json::from_value(device_tokens(None, "fresh_session", "fresh-refresh")).unwrap(),
+            Some("org_other"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.body["type"], "keychain_unavailable");
+        assert_eq!(*store.0.borrow(), before);
+        assert_eq!(transport.requests.lock().unwrap().len(), 1);
+        let requests = api.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].path, "/v1/auth/logout");
+        assert_eq!(
+            requests[2].headers["authorization"],
+            format!("Bearer {}", selected["access_token"].as_str().unwrap())
+        );
+        api.assert_complete();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn target_mechanism_never_falls_back_to_another_credential_class() {
     let store = MemoryStore::default();
-    cache_original_session(&store, &api.origin).await;
-    let before = store.0.borrow().clone();
-    let selected = device_tokens(Some("org_other"), "fresh_session", "selected-refresh");
-    let transport = MockTransport::with(vec![(200, selected.clone())]);
-    let error = accept_device(
-        &RefusingStore(&store),
-        &api.origin,
-        config(),
-        &transport.provider(),
-        serde_json::from_value(device_tokens(None, "fresh_session", "fresh-refresh")).unwrap(),
-        Some("org_other"),
+    let origin = "https://control.example";
+    // A human target ignores foreign automation input.
+    let human = select_with(
+        &store,
+        origin,
+        Some("org_one"),
+        Some(automation_credential(
+            "https://foreign.example",
+            "foreign-secret",
+        )),
+        Some("https://foreign.example".into()),
+        super::super::ControlAuth::HumanDevice,
     )
     .await
-    .unwrap_err();
-    assert_eq!(error.body["type"], "keychain_unavailable");
-    assert_eq!(*store.0.borrow(), before);
-    assert_eq!(transport.requests.lock().unwrap().len(), 1);
-    let requests = api.requests();
-    assert_eq!(requests.len(), 3);
-    assert_eq!(requests[2].path, "/v1/auth/logout");
+    .unwrap();
+    assert!(human.is_none());
+    store.put(origin, "unreadable-human-session").unwrap();
+    let error = select_with(
+        &store,
+        origin,
+        Some("org_one"),
+        None,
+        None,
+        super::super::ControlAuth::AutomationEnv,
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(error.body["type"], "automation_credential_required");
     assert_eq!(
-        requests[2].headers["authorization"],
-        format!("Bearer {}", selected["access_token"].as_str().unwrap())
+        selected_principal_with(
+            &store,
+            origin,
+            Some("org_one"),
+            None,
+            None,
+            super::super::ControlAuth::AutomationEnv
+        )
+        .await
+        .unwrap(),
+        None
     );
-    api.assert_complete();
+}
+
+#[tokio::test]
+async fn workload_session_requires_verified_class_client_and_immutable_identity() {
+    let expires = (OffsetDateTime::now_utc() + time::Duration::minutes(5))
+        .replace_nanosecond(0)
+        .unwrap();
+    let original = json!({"data":{"account_id":"org_test","principal_id":"principal_one","kind":"automation","subject":"oauth:issuer:client_one","provider_client_id":"client_one","expires_at":expires.format(&Rfc3339).unwrap(),"service_permissions":["source_read"]},"meta":{"assurance":"verified_workload"}});
+    for (profile, strict) in [
+        (
+            json!({"provider":"oauth_client_credentials","token_endpoint":"https://auth.example/oauth2/token","client_id":"client_one","client_secret":{"env":"UNUSED_TEST_SECRET"}}),
+            true,
+        ),
+        (
+            json!({"provider":"exec","command":["/unused/helper"]}),
+            false,
+        ),
+        (
+            json!({"provider":"token","source":{"env":"UNUSED_TEST_TOKEN"}}),
+            false,
+        ),
+    ] {
+        for (pointer, changed, expected) in [
+            (
+                "/data/account_id",
+                json!("org_other"),
+                "organization_mismatch",
+            ),
+            (
+                "/data/principal_id",
+                json!("principal_other"),
+                "session_identity_mismatch",
+            ),
+            (
+                "/data/subject",
+                json!("oauth:other:client_one"),
+                "session_identity_mismatch",
+            ),
+            (
+                "/data/provider_client_id",
+                json!("client_other"),
+                "workload_identity_mismatch",
+            ),
+            ("/data/kind", json!("human"), "workload_identity_mismatch"),
+            (
+                "/meta/assurance",
+                json!("verified_human"),
+                "workload_identity_mismatch",
+            ),
+            (
+                "/data/expires_at",
+                Value::Null,
+                "workload_identity_mismatch",
+            ),
+            ("/data/service_permissions", json!(["source_write"]), ""),
+        ] {
+            let api = IntentApiFixture::with_session(vec![], original.clone());
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("config.yaml"), json!({"version":1,"profiles":{"work":{"api":api.origin,"organization_id":"org_test","auth":profile}}}).to_string()).unwrap();
+            let input =
+                crate::operator::InvocationConfig::at(Some(directory.path().to_owned()), None);
+            let cli = crate::invocation::parse_from([
+                "omnigraph",
+                "cluster",
+                "list",
+                "--profile",
+                "work",
+            ])
+            .unwrap()
+            .cli;
+            let target =
+                crate::scope::resolve(&cli, &input, directory.path(), false, &mut Vec::new())
+                    .unwrap()
+                    .unwrap();
+            let auth =
+                crate::operator_routing::authentication(&cli, &input, Some(&target)).unwrap();
+            crate::operator_routing::test_transport_scope(&[&api.origin], async {
+                crate::operator_routing::AUTH
+                    .scope(auth, async {
+                        let (_, credential) = verify_external(
+                            &api.origin,
+                            Some("org_test"),
+                            automation_credential(&api.origin, "test-token"),
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(credential.expires_at(), Some(expires));
+                        let mut altered = original.clone();
+                        *altered.pointer_mut(pointer).unwrap() = changed;
+                        api.set_session(altered.clone());
+                        let result = verify_external(
+                            &api.origin,
+                            Some("org_test"),
+                            automation_credential(&api.origin, "rotated-test-token"),
+                        )
+                        .await;
+                        if !expected.is_empty()
+                            && (strict
+                                || matches!(pointer, "/data/account_id" | "/data/principal_id"))
+                        {
+                            let failure = result.unwrap_err();
+                            assert_eq!(
+                                failure.body["type"], expected,
+                                "{pointer}: {}",
+                                failure.body
+                            );
+                        } else {
+                            let (identity, _) = result.unwrap();
+                            assert_eq!(
+                                identity.subject.as_deref(),
+                                altered["data"]["subject"].as_str()
+                            );
+                            assert_eq!(
+                                identity.assurance.as_deref(),
+                                altered["meta"]["assurance"].as_str()
+                            );
+                        }
+                        assert_eq!(
+                            api.requests().len(),
+                            2,
+                            "only session verification is allowed"
+                        );
+                    })
+                    .await;
+            })
+            .await;
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn concurrent_preissuance_refusals_share_one_new_control_acquisition() {
+    let home = tempfile::tempdir().unwrap();
+    let helper = home.path().join("helper.sh");
+    let response = home.path().join("response.json");
+    let calls = home.path().join("calls");
+    std::fs::write(
+        &helper,
+        "IFS= read -r request\nprintf 'called\\n' >> \"$2\"\ncat \"$1\"\n",
+    )
+    .unwrap();
+    let write = |token| {
+        std::fs::write(
+            &response,
+            json!({"version":1,"credential":{"type":"bearer","token":token}}).to_string(),
+        )
+        .unwrap()
+    };
+    write("initial-token");
+    std::fs::write(home.path().join("config.yaml"), json!({"version":1,"profiles":{"work":{"api":"https://api.example","organization_id":"org_test","auth":{"provider":"exec","command":["/bin/sh", helper, response, calls]}}}}).to_string()).unwrap();
+    let input = crate::operator::InvocationConfig::at(Some(home.path().to_owned()), None);
+    let cli = crate::invocation::parse_from(["omnigraph", "cluster", "list", "--profile", "work"])
+        .unwrap()
+        .cli;
+    let target = crate::scope::resolve(&cli, &input, home.path(), false, &mut Vec::new())
+        .unwrap()
+        .unwrap();
+    let auth = crate::operator_routing::authentication(&cli, &input, Some(&target))
+        .unwrap()
+        .unwrap();
+    let refused = auth.acquire_credential().await.unwrap().unwrap();
+    write("renewed-token");
+    let (first, second) = tokio::join!(
+        auth.renew_control_credential(&refused),
+        auth.renew_control_credential(&refused)
+    );
+    for credential in [first.unwrap(), second.unwrap()] {
+        assert_eq!(
+            acquired_bearer(&credential, "https://api.example").unwrap(),
+            "renewed-token"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap(),
+        "called\ncalled\n",
+        "one initial and one renewal acquisition"
+    );
+    auth.invalidate().unwrap();
+    assert!(auth.renew_control_credential(&refused).await.is_err());
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap(),
+        "called\ncalled\n",
+        "stale owners must not acquire again"
+    );
 }

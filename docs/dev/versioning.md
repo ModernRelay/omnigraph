@@ -9,8 +9,8 @@ version axes. Never derive one axis from another.
 | Axis | Policy | Guard |
 |---|---|---|
 | Release | Published workspace artifacts move in lockstep. | Workspace manifests, lockfile, generated metadata, release automation. |
-| CLI ↔ server wire | One v0.13 contract; coordinated client/server upgrades. Exact request admission and CLI discovery/response validation. | Shared contract header, DTOs, HTTP refusal tests and OpenAPI drift tests. |
-| Graph storage | Closed stamp range `[MIN_SUPPORTED, CURRENT]`, independent of system column vintage; a standalone graph at stamp 8, 9 or 13 is converted by the offline `omnigraph upgrade`, a graph at any other stamp is rebuilt by export and load; no open-time migration. | Main-manifest stamp guard on both bounds. |
+| CLI ↔ server wire | One v0.14 contract; coordinated client/server upgrades. Exact request admission and CLI discovery/response validation. | Shared contract header, DTOs, HTTP refusal tests and OpenAPI drift tests. |
+| Graph storage | Closed stamp range `[MIN_SUPPORTED, CURRENT]`, independent of system column vintage; explicit offline conversion, stamp-only upgrade and rebuild routes follow the [support matrix](#storage-upgrade-support-matrix), never open-time migration. | Main-manifest stamp guard on both bounds. |
 | Lance dependency and file format | One deliberately pinned Lance family and explicit stable file version. | Lockfile, write parameters, and Lance surface guards. |
 
 ## Current storage contract
@@ -340,11 +340,16 @@ still carries a sidecar until the build that wrote it has resolved it. See
 ## Lance contract
 
 The workspace resolves the unmodified crates.io Lance package family to
-**11.0.0** and explicitly writes stable data storage version **V2_2**.
+**13.0.0** and explicitly writes stable data storage version **V2_2**.
 Engine adapters and compatibility boundaries are documented in
 [lance.md](lance.md). A dependency bump alone
 does not change the OmniGraph manifest format. Adopting a new Lance file format
-or a behavior that changes persisted graph meaning does.
+or a behavior that changes persisted graph meaning does. The Lance 13 bump keeps
+graph format 16 and does not require `omnigraph upgrade` for a format-16 graph.
+Experimental V2_3, spilled row lineage and stable-row-ID fragment-reuse indexes
+remain outside the graph contract. Retaining V2_2 alone is not a general rollback
+guarantee: qualify old readers against actual new writes using the predecessor
+journey in [testing](testing.md#lance-compatibility).
 
 Current compatibility fences and the required upstream reading set are in
 [lance.md](lance.md).
@@ -362,8 +367,8 @@ Data, vectors and blobs are preserved; commit history and branches are not. See
 ## Storage upgrade support matrix
 
 The `storage_upgrade_compatibility` CI job (Storage Upgrade Compatibility)
-builds the genuine stamp-13 CLI from main commit `c0a4519f`, installs the
-released 0.10.0 and 0.11.0 CLIs, and requires the
+builds the genuine stamp-13 CLI from main commit `c0a4519f` and the Lance 11
+CLI from `0a62bb7b`, installs the released 0.10.0 and 0.11.0 CLIs, and requires the
 `storage_upgrade` cases of `crossversion_upgrade.rs`, the engine
 `db::upgrade::tests`, Lance version qualification and protocol guards on
 every change. Missing test cases, empty runs, a missing predecessor binary
@@ -389,7 +394,7 @@ points are refused
 
 ## Wire compatibility
 
-The v0.13 HTTP boundary requires `Omnigraph-Http-Api: 0.13` exactly once on
+The HTTP boundary requires `Omnigraph-Http-Api: 0.14` exactly once on
 protected graph and registry requests. Authentication precedes contract admission;
 missing, duplicate or unsupported values return typed 400 `api_contract_mismatch`
 before graph resolution or body execution. Ordinary responses carry the same
@@ -409,6 +414,14 @@ independent of package and graph-storage versions; it establishes neither suppor
 for another server increment nor permission to replay a write. No old-client
 fallback or negotiation framework is supported. New wire changes update shared
 DTOs, the contract decision, OpenAPI and transport qualification together.
+
+The released 0.14 contract replaces earlier prerelease shapes that used the
+same header value. Upgrade prerelease CLI, server and integrations together
+and regenerate SDKs; the header cannot distinguish those older shapes.
+The [HTTP API guide](http-api.md#compatibility-and-coverage) owns the field and
+SDK-name changes. The CLI access-report protocol is 2. MCP keeps its own
+protocol negotiation and tool schemas; its endpoint does not use the HTTP header.
+The [migration note](../../changelog.d/http-contract-014.breaking.md) owns the steps.
 
 Server URLs identify the service root, preserving any proxy prefix. Migrate
 graph-qualified URLs to that root plus `--graph`, `default_graph` or alias `graph`;

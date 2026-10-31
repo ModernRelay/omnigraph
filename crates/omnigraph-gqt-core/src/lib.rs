@@ -16,9 +16,9 @@ use omnigraph::instrumentation::{QueryIoProbes, capture_query_io_probes, with_qu
 use omnigraph::loader::LoadMode;
 use omnigraph::{MutationReceipt, Session};
 use omnigraph_compiler::query::ast::{
-    BranchDiffSides, BranchRead, BranchStmt, BranchWrite, Clause, CommitWrite, EmptyFile, Expr,
-    FileBody, Literal, LoadStmt, MutationWriteMode, Param, QueryDecl, SettingStmt, UnattachedBase,
-    show_statement_name,
+    BranchCreateFrom, BranchDiffSides, BranchRead, BranchStmt, BranchWrite, Clause, CommitWrite,
+    EmptyFile, Expr, FileBody, Literal, LoadStmt, MutationWriteMode, Param, QueryDecl, SettingStmt,
+    UnattachedBase, show_statement_name,
 };
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::query::typecheck::{
@@ -76,6 +76,12 @@ pub struct Case {
     /// The harness-only traversal setting; any header requests index preparation.
     /// `auto` retains cost selection, while `indexed` and `csr` check the forced path.
     traversal: Option<&'static str>,
+    /// The `# csv_slice_bytes:` pin: the bytes one `load csv` parse partition
+    /// owns and the slice it reads at once, so a small source cuts partitions.
+    csv_slice_bytes: Option<usize>,
+    /// The `# overwrite_chunk_rows:` pin: the rows one `load csv` overwrite
+    /// chunk holds before its writer takes it.
+    overwrite_chunk_rows: Option<usize>,
     pub items: Vec<Item>,
     pub needs_indices: bool,
     /// `--- csv <name>` sections: the CSV text a `load csv "<name>"` step
@@ -289,7 +295,7 @@ pub struct ControlStep {
 pub enum ControlWrite {
     Create {
         name: String,
-        from: Option<String>,
+        from: Option<BranchCreateFrom>,
         expect: WriteExpect,
     },
     Delete {
@@ -571,6 +577,8 @@ struct BodySpan {
 struct Header {
     issue: IssueRef,
     traversal: Option<&'static str>,
+    csv_slice_bytes: Option<usize>,
+    overwrite_chunk_rows: Option<usize>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -579,8 +587,15 @@ enum IssueRef {
     Num(u64),
 }
 
-/// The four header keys, in the spelling the canonical form requires.
-const HEADER_KEYS: [&str; 4] = ["issue", "red_on", "notes", "traversal"];
+/// The six header keys, in the spelling the canonical form requires.
+const HEADER_KEYS: [&str; 6] = [
+    "issue",
+    "red_on",
+    "notes",
+    "traversal",
+    "csv_slice_bytes",
+    "overwrite_chunk_rows",
+];
 
 /// Canonical spelling for one header key and its trimmed value.
 fn canonical_header_line(key: &str, value: &str) -> String {
@@ -618,6 +633,8 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
     let mut issue: Option<IssueRef> = None;
     let mut red_on = false;
     let mut traversal: Option<&'static str> = None;
+    let mut csv_slice_bytes: Option<usize> = None;
+    let mut overwrite_chunk_rows: Option<usize> = None;
     for (idx, line) in lines.iter().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -633,6 +650,8 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
             "issue" => issue.is_some(),
             "red_on" => red_on,
             "traversal" => traversal.is_some(),
+            "csv_slice_bytes" => csv_slice_bytes.is_some(),
+            "overwrite_chunk_rows" => overwrite_chunk_rows.is_some(),
             _ => false,
         };
         if duplicate {
@@ -670,6 +689,32 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
                     }
                 });
             }
+            "csv_slice_bytes" => {
+                let bytes = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|bytes| *bytes > 0 && value == bytes.to_string())
+                    .ok_or_else(|| {
+                        format!(
+                            "line {}: `# csv_slice_bytes:` takes a positive byte count without sign or leading zeros, got `{value}`",
+                            idx + 1
+                        )
+                    })?;
+                csv_slice_bytes = Some(bytes);
+            }
+            "overwrite_chunk_rows" => {
+                let rows = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|rows| *rows > 0 && value == rows.to_string())
+                    .ok_or_else(|| {
+                        format!(
+                            "line {}: `# overwrite_chunk_rows:` takes a positive row count without sign or leading zeros, got `{value}`",
+                            idx + 1
+                        )
+                    })?;
+                overwrite_chunk_rows = Some(rows);
+            }
             other => unreachable!("split_header_line admits only HEADER_KEYS, got `{other}`"),
         }
     }
@@ -679,7 +724,12 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
     if matches!(issue, IssueRef::Num(_)) && !red_on {
         return Err("`# red_on:` is required when `# issue:` names a number".into());
     }
-    Ok(Header { issue, traversal })
+    Ok(Header {
+        issue,
+        traversal,
+        csv_slice_bytes,
+        overwrite_chunk_rows,
+    })
 }
 
 fn check_file_name(stem: &str, issue: &IssueRef) -> Result<(), String> {
@@ -2238,11 +2288,29 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                                     source: source.clone(),
                                 }
                             }
-                            BranchStmt::Write(write) => Pending::Control {
-                                ordinal,
-                                prefix: file.settings,
-                                write: ControlSource::Branch(write),
-                            },
+                            BranchStmt::Write(write) => {
+                                if let BranchWrite::Create {
+                                    from: Some(BranchCreateFrom::Commit(commit)),
+                                    ..
+                                } = &write
+                                    && let Some(name) = bound_operand(commit)
+                                {
+                                    if !bound_names.contains(name) {
+                                        return Err(format!(
+                                            "`${{{name}}}` is not bound; `--- bind commit ${name}` must precede this step"
+                                        ));
+                                    }
+                                    if source.matches("${").count() == 1 {
+                                        substitutable_lines
+                                            .extend(section.body.iter().map(|(i, _)| *i));
+                                    }
+                                }
+                                Pending::Control {
+                                    ordinal,
+                                    prefix: file.settings,
+                                    write: ControlSource::Branch(write),
+                                }
+                            }
                         });
                         continue;
                     }
@@ -2806,6 +2874,8 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         source_lines,
         fixture,
         traversal: header.traversal,
+        csv_slice_bytes: header.csv_slice_bytes,
+        overwrite_chunk_rows: header.overwrite_chunk_rows,
         items,
         needs_indices,
         csv_sections,
@@ -3347,11 +3417,11 @@ fn check_planned_results(bound: &BoundPlan, result: &QueryResult) -> Result<(), 
     Ok(())
 }
 
-/// The executed plan, its explain document and the same run's report rows.
+/// The executed plan, its explain document and the same run's validated report.
 struct Inspection {
     plan: BoundPlan,
     explain: Value,
-    rows: Result<Vec<report::Row>, String>,
+    report: Result<report::Report, String>,
 }
 
 async fn run_query_step(
@@ -3402,10 +3472,18 @@ async fn run_query_step(
         let outcome = outcome.map_err(&fail)?;
         match outcome {
             Ok(run) => {
+                let explain = run.explain.to_value();
+                let report = report::read_report(&run.report).and_then(|report| {
+                    let profile = run
+                        .profile()
+                        .map_err(|error| format!("profile failed: {error}"))?;
+                    report.validate_ann(&explain, &profile)?;
+                    Ok(report)
+                });
                 let inspection = Inspection {
                     plan: run.plan,
-                    explain: run.explain.to_value(),
-                    rows: report::report_rows(&run.report),
+                    explain,
+                    report,
                 };
                 (Ok(run.result), counts, Some(inspection))
             }
@@ -3427,7 +3505,7 @@ async fn run_query_step(
         return Err(fail(violation));
     }
     if let Some(run) = &inspection {
-        run.rows.as_ref().map_err(|error| fail(error.clone()))?;
+        run.report.as_ref().map_err(|error| fail(error.clone()))?;
     }
     match &step.expect {
         QueryExpect::Rows {
@@ -3440,10 +3518,15 @@ async fn run_query_step(
             if let Some(run) = &inspection {
                 check_bound_plan_round_trip(&run.plan).map_err(&fail)?;
             }
-            if let (Some(plan), Some(Inspection { explain, rows, .. })) = (&step.plan, &inspection)
+            if let (
+                Some(plan),
+                Some(Inspection {
+                    explain, report, ..
+                }),
+            ) = (&step.plan, &inspection)
             {
                 validate_plan_columns(&plan.lines, &session.catalog()).map_err(&fail)?;
-                let report = rows.as_ref().ok().map(Vec::as_slice);
+                let report = report.as_ref().ok();
                 if let Some(mismatch) = plan_mismatch(&plan.lines, explain, report) {
                     return Err(fail(format!(
                         "{mismatch}\nexplain document:\n{}",
@@ -3893,11 +3976,17 @@ async fn run_control_step(
             from,
             expect,
         } => {
-            let parent = from.as_deref().unwrap_or(MAIN_BRANCH);
+            let start = match from {
+                Some(BranchCreateFrom::Commit(commit)) => ReadTarget::snapshot(SnapshotId::new(
+                    resolve_operand(commit, bindings).map_err(&fail)?,
+                )),
+                Some(BranchCreateFrom::Branch(parent)) => ReadTarget::branch(parent.as_str()),
+                None => ReadTarget::branch(MAIN_BRANCH),
+            };
             let outcome = operation(
                 host,
                 step.ordinal,
-                db.branch_create_from_as(ReadTarget::branch(parent), branch, None),
+                db.branch_create_from_as(start, branch, None),
             )
             .await
             .map_err(&fail)?;
@@ -3977,7 +4066,7 @@ async fn run_control_step(
             let executed = outcome.as_ref().ok().map(|receipt| {
                 (
                     receipt.plan.as_ref().map(|explain| explain.to_value()),
-                    receipt.executed,
+                    receipt.executed.clone(),
                 )
             });
             check_write_expect(host, name, expect, outcome).map_err(&fail)?;
@@ -4250,7 +4339,15 @@ pub fn execute_steps<'a, H: ExecutionHost>(
     storage: Option<Arc<dyn StorageAdapter>>,
     host: &'a H,
 ) -> futures::future::BoxFuture<'a, Result<Session, String>> {
-    execute_steps_inner(case, path, bless, session, uri, storage, host).boxed()
+    let steps = execute_steps_inner(case, path, bless, session, uri, storage, host);
+    let steps = match case.csv_slice_bytes {
+        Some(bytes) => omnigraph::instrumentation::with_csv_slice_bytes(bytes, steps).boxed(),
+        None => steps.boxed(),
+    };
+    match case.overwrite_chunk_rows {
+        Some(rows) => omnigraph::instrumentation::with_overwrite_chunk_rows(rows, steps).boxed(),
+        None => steps,
+    }
 }
 
 async fn execute_steps_inner<H: ExecutionHost>(

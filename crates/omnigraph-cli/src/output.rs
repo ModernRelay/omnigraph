@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::app::Completion;
-use omnigraph_api_types::CommitListOutput;
+use omnigraph_api_types::{BranchListOutput, CommitListOutput};
 
 pub(crate) fn graph_type_subject(type_key: &str) -> String {
     if let Some(type_name) = type_key.strip_prefix("node:") {
@@ -102,7 +102,7 @@ pub(crate) fn write_full_text_rebuild(
         }
         writeln!(
             stdout,
-            "rebuild-full-text-indexes {} — branch {}, {} indexes rebuilt",
+            "index rebuild {} — branch {}, {} indexes rebuilt",
             uri,
             result.branch,
             result.rebuilt_indexes.len(),
@@ -113,6 +113,72 @@ pub(crate) fn write_full_text_rebuild(
                 "  {}, property '{}'",
                 graph_type_subject(&index.type_key),
                 index.property,
+            )?;
+        }
+        if let Some(commit_id) = &result.graph_commit_id {
+            writeln!(stdout, "graph commit: {commit_id}")?;
+        } else {
+            writeln!(stdout, "no-op; no graph commit published")?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn write_index_build(
+    uri: &str,
+    result: &omnigraph::db::IndexBuildResult,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<()> {
+    if json {
+        write_json(
+            &serde_json::json!({
+                "uri": uri,
+                "branch": result.branch,
+                "graph_commit_id": result.graph_commit_id,
+                "indexes": result.indexes.iter().map(|index| {
+                    serde_json::json!({
+                        "type_key": index.type_key,
+                        "property": index.property,
+                        "kind": index.kind.as_str(),
+                        "action": index.action.as_str(),
+                    })
+                }).collect::<Vec<_>>(),
+                "pending_indexes": result.pending.iter().map(|pending| {
+                    serde_json::json!({
+                        "type_key": pending.type_key,
+                        "property": pending.property,
+                        "reason": pending.reason,
+                    })
+                }).collect::<Vec<_>>(),
+            }),
+            stdout,
+        )?;
+    } else {
+        writeln!(
+            stdout,
+            "index build {} — branch {}, {} indexes built or refreshed",
+            uri,
+            result.branch,
+            result.indexes.len(),
+        )?;
+        for index in &result.indexes {
+            writeln!(
+                stdout,
+                "  {}, property '{}': {} {}",
+                graph_type_subject(&index.type_key),
+                index.property,
+                index.kind.as_str(),
+                index.action.as_str(),
+            )?;
+        }
+        for pending in &result.pending {
+            writeln!(
+                stdout,
+                "  ↳ index pending on {}, property '{}': {}",
+                graph_type_subject(&pending.type_key),
+                pending.property,
+                pending.reason,
             )?;
         }
         if let Some(commit_id) = &result.graph_commit_id {
@@ -232,94 +298,6 @@ pub(crate) fn write_cleanup(
         }
     }
     Ok(())
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct LoadOutput {
-    pub(crate) uri: String,
-    pub(crate) branch: String,
-    pub(crate) mode: &'static str,
-    /// Present only when `--from` was given; echoes the requested base.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) base_branch: Option<String>,
-    pub(crate) branch_created: bool,
-    pub(crate) nodes: Vec<GraphBatchDeclarationOutput>,
-    pub(crate) edges: Vec<GraphBatchDeclarationOutput>,
-    pub(crate) total_entities: usize,
-    pub(crate) embedding_generation: Option<omnigraph_api_types::LoadEmbeddingGeneration>,
-    pub(crate) commit: Option<CommitOutput>,
-}
-
-pub(crate) fn load_output_from_graph_batch(
-    uri: &str,
-    mode: &'static str,
-    output: &GraphBatchLoadOutput,
-) -> LoadOutput {
-    LoadOutput {
-        uri: uri.to_string(),
-        branch: output.branch.clone(),
-        mode,
-        base_branch: output.base_branch.clone(),
-        branch_created: output.branch_created,
-        nodes: output.nodes.clone(),
-        edges: output.edges.clone(),
-        total_entities: output.total_entities,
-        embedding_generation: output.embedding_generation,
-        commit: output.commit.clone(),
-    }
-}
-
-/// The local arm's twin of `load_output_from_graph_batch`: build the same
-/// `LoadOutput` from the engine `LoadResult` directly (the remote arm has the
-/// logical graph-batch DTO; the local arm has the full result). Both load
-/// mappings live here, next to the struct — RFC-009
-/// Phase 2's "one place" for the `-> LoadOutput` mapping that used to fork
-/// between this file and main.rs's inline construction.
-pub(crate) fn load_output_from_receipt(
-    uri: &str,
-    branch: &str,
-    mode: &'static str,
-    receipt: &omnigraph::loader::LoadReceipt,
-    catalog: &omnigraph_compiler::catalog::Catalog,
-) -> LoadOutput {
-    let result = &receipt.result;
-    let mut nodes = result
-        .nodes_loaded
-        .iter()
-        .map(|(name, entities_loaded)| GraphBatchDeclarationOutput {
-            name: name.clone(),
-            entities_loaded: *entities_loaded,
-        })
-        .collect::<Vec<_>>();
-    nodes.sort_by(|left, right| left.name.cmp(&right.name));
-    let mut edges = result
-        .edges_loaded
-        .iter()
-        .map(|(name, entities_loaded)| GraphBatchDeclarationOutput {
-            name: name.clone(),
-            entities_loaded: *entities_loaded,
-        })
-        .collect::<Vec<_>>();
-    edges.sort_by(|left, right| left.name.cmp(&right.name));
-    let total_entities = nodes
-        .iter()
-        .chain(&edges)
-        .map(|entry| entry.entities_loaded)
-        .sum();
-    LoadOutput {
-        uri: uri.to_string(),
-        branch: branch.to_string(),
-        mode,
-        base_branch: result.base_branch.clone(),
-        branch_created: result.branch_created,
-        nodes,
-        edges,
-        total_entities,
-        embedding_generation: omnigraph_api_types::LoadEmbeddingGeneration::for_load(
-            catalog, result,
-        ),
-        commit: Some(omnigraph_api_types::commit_output(&receipt.commit)),
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -514,35 +492,6 @@ pub(crate) fn write_cluster_plan_human(output: &PlanOutput, stdout: &mut dyn Wri
     write_cluster_diagnostics(&output.diagnostics, stdout)
 }
 
-pub(crate) fn write_cluster_status_human(
-    output: &StatusOutput,
-    stdout: &mut dyn Write,
-) -> Result<()> {
-    if output.ok {
-        let state = &output.state_observations;
-        if state.state_found {
-            writeln!(
-                stdout,
-                "cluster state: revision {}, {} resource(s)",
-                state.state_revision, state.resource_count
-            )?;
-            if let Some(digest) = state.applied_config_digest.as_deref() {
-                writeln!(stdout, "  applied config: {digest}")?;
-            }
-            if state.locked {
-                writeln!(stdout, "  lock: held{}", cluster_lock_summary(state))?;
-            } else {
-                writeln!(stdout, "  lock: not held")?;
-            }
-        } else {
-            writeln!(stdout, "cluster state missing")?;
-        }
-    } else {
-        writeln!(stdout, "cluster status failed")?;
-    }
-    write_cluster_diagnostics(&output.diagnostics, stdout)
-}
-
 pub(crate) fn write_cluster_state_sync_human(
     output: &StateSyncOutput,
     stdout: &mut dyn Write,
@@ -585,33 +534,6 @@ pub(crate) fn write_cluster_state_sync_human(
         }
     } else {
         writeln!(stdout, "cluster {operation} failed")?;
-    }
-    write_cluster_diagnostics(&output.diagnostics, stdout)
-}
-
-pub(crate) fn write_cluster_force_unlock_human(
-    output: &ForceUnlockOutput,
-    stdout: &mut dyn Write,
-) -> Result<()> {
-    if output.ok {
-        if output.lock_removed {
-            writeln!(
-                stdout,
-                "cluster force-unlock: removed lock{}",
-                cluster_lock_summary(&output.state_observations)
-            )?;
-        } else {
-            writeln!(stdout, "cluster force-unlock: no lock removed")?;
-        }
-    } else {
-        writeln!(stdout, "cluster force-unlock failed")?;
-        if output.state_observations.locked {
-            writeln!(
-                stdout,
-                "  lock: held{}",
-                cluster_lock_summary(&output.state_observations)
-            )?;
-        }
     }
     write_cluster_diagnostics(&output.diagnostics, stdout)
 }
@@ -715,23 +637,6 @@ pub(crate) fn finish_cluster_plan(
     Ok(Completion::success())
 }
 
-pub(crate) fn finish_cluster_status(
-    output: &StatusOutput,
-    json: bool,
-    stdout: &mut dyn Write,
-) -> Result<Completion> {
-    if json {
-        write_json(output, stdout)?;
-    } else {
-        write_cluster_status_human(output, stdout)?;
-    }
-    if !output.ok {
-        stdout.flush()?;
-        return Ok(Completion::exit(1));
-    }
-    Ok(Completion::success())
-}
-
 pub(crate) fn finish_cluster_state_sync(
     output: &StateSyncOutput,
     json: bool,
@@ -749,30 +654,18 @@ pub(crate) fn finish_cluster_state_sync(
     Ok(Completion::success())
 }
 
-pub(crate) fn finish_cluster_force_unlock(
-    output: &ForceUnlockOutput,
-    json: bool,
-    stdout: &mut dyn Write,
-) -> Result<Completion> {
-    if json {
-        write_json(output, stdout)?;
-    } else {
-        write_cluster_force_unlock_human(output, stdout)?;
-    }
-    if !output.ok {
-        stdout.flush()?;
-        return Ok(Completion::exit(1));
-    }
-    Ok(Completion::success())
-}
-
-pub(crate) fn write_load_human(payload: &LoadOutput, writer: &mut dyn Write) -> Result<()> {
+/// The load route's body carries no address, so the caller names the graph.
+pub(crate) fn write_load_human(
+    uri: &str,
+    payload: &GraphBatchLoadOutput,
+    writer: &mut dyn Write,
+) -> Result<()> {
     writeln!(
         writer,
         "loaded {} on branch {} with {}: {} entities across {} node types and {} edge types",
-        payload.uri,
+        uri,
         payload.branch,
-        payload.mode,
+        payload.mode.as_str(),
         payload.total_entities,
         payload.nodes.len(),
         payload.edges.len()
@@ -1030,8 +923,8 @@ pub(crate) fn write_blob_write_human(
     writer: &mut dyn Write,
 ) -> Result<()> {
     let entity = match output.selector.entity {
-        omnigraph_api_types::BlobEntityKind::Node => "node",
-        omnigraph_api_types::BlobEntityKind::Edge => "edge",
+        omnigraph_api_types::EntityKind::Node => "node",
+        omnigraph_api_types::EntityKind::Edge => "edge",
     };
     writeln!(writer, "entity: {entity}")?;
     writeln!(writer, "type: {}", output.selector.r#type)?;
@@ -1039,7 +932,7 @@ pub(crate) fn write_blob_write_human(
     writeln!(writer, "property: {}", output.selector.property)?;
     writeln!(writer, "branch: {}", output.branch)?;
     match output.kind {
-        omnigraph_api_types::BlobWriteStateOutput::Managed => {
+        omnigraph_api_types::BlobWriteState::Managed => {
             writeln!(writer, "kind: managed")?;
             if let Some(size) = output.size {
                 writeln!(writer, "size: {size}")?;
@@ -1048,7 +941,7 @@ pub(crate) fn write_blob_write_human(
                 writeln!(writer, "etag: {etag}")?;
             }
         }
-        omnigraph_api_types::BlobWriteStateOutput::Null => writeln!(writer, "kind: null")?,
+        omnigraph_api_types::BlobWriteState::Null => writeln!(writer, "kind: null")?,
     }
     if let Some(actor) = output.actor_id.as_deref() {
         writeln!(writer, "actor: {actor}")?;
@@ -1062,8 +955,8 @@ pub(crate) fn write_blob_write_human(
 
 pub(crate) fn write_blob_stat_human(output: &BlobStatOutput, writer: &mut dyn Write) -> Result<()> {
     let entity = match output.selector.entity {
-        omnigraph_api_types::BlobEntityKind::Node => "node",
-        omnigraph_api_types::BlobEntityKind::Edge => "edge",
+        omnigraph_api_types::EntityKind::Node => "node",
+        omnigraph_api_types::EntityKind::Edge => "edge",
     };
     writeln!(writer, "entity: {entity}")?;
     writeln!(writer, "type: {}", output.selector.r#type)?;
@@ -1104,8 +997,15 @@ pub(crate) fn write_blob_stat_human(output: &BlobStatOutput, writer: &mut dyn Wr
 /// prints; a mutation's prints the affected counts.
 pub(crate) fn write_change_human(output: &ChangeOutput, writer: &mut dyn Write) -> Result<()> {
     match &output.outcome {
-        Some(BranchOutcomeOutput::Created { from, name }) => {
-            writeln!(writer, "created branch {name} from {from}")?;
+        Some(BranchOutcomeOutput::Created {
+            from,
+            name,
+            from_commit_id,
+        }) => {
+            writeln!(
+                writer,
+                "created branch {name} from {from} at {from_commit_id}"
+            )?;
         }
         Some(BranchOutcomeOutput::Deleted { name }) => writeln!(writer, "deleted branch {name}")?,
         Some(BranchOutcomeOutput::Merged {
@@ -1135,6 +1035,32 @@ pub(crate) fn write_change_human(output: &ChangeOutput, writer: &mut dyn Write) 
     }
     if let Some(actor_id) = &output.actor_id {
         writeln!(writer, "actor_id: {}", actor_id)?;
+    }
+    Ok(())
+}
+
+/// One line per branch: its name, then with details its head, where it
+/// started, and its creation and last-move times, under the keys the JSON
+/// output uses. A branch without details (one the caller may not read) writes
+/// its name alone.
+pub(crate) fn write_branch_list_human(
+    list: &BranchListOutput,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let details = list.details.as_deref().unwrap_or_default();
+    for branch in &list.branches {
+        let Some(detail) = details.iter().find(|detail| &detail.name == branch) else {
+            writeln!(writer, "{branch}")?;
+            continue;
+        };
+        let mut line = format!("{branch} head={}", detail.head.graph_commit_id);
+        if let (Some(from), Some(from_commit_id)) = (&detail.from, &detail.from_commit_id) {
+            line.push_str(&format!(" from={from} from_commit_id={from_commit_id}"));
+        }
+        if let Some(created_at) = detail.created_at {
+            line.push_str(&format!(" created_at={created_at}"));
+        }
+        writeln!(writer, "{line} updated_at={}", detail.updated_at)?;
     }
     Ok(())
 }
@@ -1172,11 +1098,11 @@ pub(crate) fn write_commit_list_human(
 /// `published: false` alone does not say whether an id can publish.
 fn commit_kind_suffix(commit: &CommitOutput) -> String {
     match commit.kind {
-        CommitKindOutput::Unattached => format!(
+        CommitKind::Unattached => format!(
             " kind=unattached root={}",
             commit.root_commit_id.as_deref().unwrap_or("?")
         ),
-        CommitKindOutput::Published | CommitKindOutput::Unpublished => String::new(),
+        CommitKind::Published | CommitKind::Unpublished => String::new(),
     }
 }
 
@@ -1199,9 +1125,9 @@ pub(crate) fn write_commit_human(commit: &CommitOutput, writer: &mut dyn Write) 
         writer,
         "kind: {}",
         match commit.kind {
-            CommitKindOutput::Published => "published",
-            CommitKindOutput::Unpublished => "unpublished",
-            CommitKindOutput::Unattached => "unattached",
+            CommitKind::Published => "published",
+            CommitKind::Unpublished => "unpublished",
+            CommitKind::Unattached => "unattached",
         }
     )?;
     if let Some(root_commit_id) = &commit.root_commit_id {
@@ -1895,13 +1821,13 @@ mod tests {
 
     fn change(id: &str) -> omnigraph_api_types::EntityChangeOutput {
         omnigraph_api_types::EntityChangeOutput {
-            kind: omnigraph_api_types::EntityKindOutput::Node,
+            kind: omnigraph_api_types::EntityKind::Node,
             r#type: omnigraph_api_types::ChangeTypeOutput {
                 id: "type-public".to_string(),
                 name: "Person".to_string(),
             },
             id: id.to_string(),
-            op: omnigraph_api_types::ChangeOpOutput::Insert,
+            op: omnigraph_api_types::ChangeOp::Insert,
             before: None,
             after: Some(omnigraph_api_types::ChangeImageOutput {
                 properties: serde_json::json!({"name": id}),
@@ -2221,7 +2147,7 @@ mod tests {
             }],
         };
         assert_maintenance_report(
-            "rebuild-full-text-indexes graph — branch dev, 1 indexes rebuilt\n  node type 'Doc', property 'body'\ngraph commit: commit-1\n",
+            "index rebuild graph — branch dev, 1 indexes rebuilt\n  node type 'Doc', property 'body'\ngraph commit: commit-1\n",
             serde_json::json!({"uri":"graph","branch":"dev","graph_commit_id":"commit-1","warnings":[warning],"rebuilt_indexes":[{"type_key":"node:Doc","property":"body"}]}),
             |json, writer| {
                 let mut stderr = Vec::new();
@@ -2254,7 +2180,7 @@ mod tests {
             rebuilt_indexes: vec![],
         };
         assert_maintenance_report(
-            "rebuild-full-text-indexes graph — branch main, 0 indexes rebuilt\nno-op; no graph commit published\n",
+            "index rebuild graph — branch main, 0 indexes rebuilt\nno-op; no graph commit published\n",
             serde_json::json!({"uri":"graph","branch":"main","graph_commit_id":null,"warnings":[],"rebuilt_indexes":[]}),
             |json, writer| {
                 let mut stderr = Vec::new();
@@ -2263,6 +2189,53 @@ mod tests {
                 assert!(stderr.is_empty());
                 output
             },
+        );
+    }
+
+    #[test]
+    fn index_build_reports_kinds_actions_pending_and_noop_issue_840() {
+        use omnigraph::db::{
+            BuiltIndex, BuiltIndexAction, BuiltIndexKind, IndexBuildResult, PendingIndex,
+        };
+        let pending = PendingIndex {
+            type_key: "node:Doc".into(),
+            property: "body".into(),
+            reason: "full-text index 'body_idx' has incomplete or unknown coverage".into(),
+        };
+        let result = IndexBuildResult {
+            branch: "dev".into(),
+            graph_commit_id: Some("commit-1".into()),
+            indexes: vec![
+                BuiltIndex {
+                    type_key: "node:Doc".into(),
+                    property: "__id".into(),
+                    kind: BuiltIndexKind::Btree,
+                    action: BuiltIndexAction::Refreshed,
+                },
+                BuiltIndex {
+                    type_key: "node:Tag".into(),
+                    property: "name".into(),
+                    kind: BuiltIndexKind::FullText,
+                    action: BuiltIndexAction::Built,
+                },
+            ],
+            pending: vec![pending.clone()],
+        };
+        assert_maintenance_report(
+            "index build graph — branch dev, 2 indexes built or refreshed\n  node type 'Doc', property '__id': btree refreshed\n  node type 'Tag', property 'name': full_text built\n  ↳ index pending on node type 'Doc', property 'body': full-text index 'body_idx' has incomplete or unknown coverage\ngraph commit: commit-1\n",
+            serde_json::json!({"uri":"graph","branch":"dev","graph_commit_id":"commit-1","indexes":[{"type_key":"node:Doc","property":"__id","kind":"btree","action":"refreshed"},{"type_key":"node:Tag","property":"name","kind":"full_text","action":"built"}],"pending_indexes":[{"type_key":"node:Doc","property":"body","reason":pending.reason}]}),
+            |json, writer| super::write_index_build("graph", &result, json, writer),
+        );
+        let noop = IndexBuildResult {
+            branch: "main".into(),
+            graph_commit_id: None,
+            indexes: vec![],
+            pending: vec![],
+        };
+        assert_maintenance_report(
+            "index build graph — branch main, 0 indexes built or refreshed\nno-op; no graph commit published\n",
+            serde_json::json!({"uri":"graph","branch":"main","graph_commit_id":null,"indexes":[],"pending_indexes":[]}),
+            |json, writer| super::write_index_build("graph", &noop, json, writer),
         );
     }
 
@@ -2447,12 +2420,11 @@ mod tests {
 
     #[test]
     fn load_human_preserves_branch_and_embedding_diagnostics() {
-        let mut output = super::LoadOutput {
-            uri: "graph".to_string(),
+        let mut output = omnigraph_api_types::GraphBatchLoadOutput {
             branch: "work".to_string(),
-            mode: "append",
             base_branch: Some("main".to_string()),
             branch_created: true,
+            mode: omnigraph::loader::LoadMode::Append,
             nodes: vec![omnigraph_api_types::GraphBatchDeclarationOutput {
                 name: "Doc".to_string(),
                 entities_loaded: 2,
@@ -2460,26 +2432,27 @@ mod tests {
             edges: Vec::new(),
             total_entities: 2,
             embedding_generation: Some(omnigraph_api_types::LoadEmbeddingGeneration::Unsupported),
+            actor_id: None,
             commit: None,
         };
         assert_human_format(
             "loaded graph on branch work with append: 2 entities across 1 node types and 0 edge types\n\
              branch work created from main\n\
              Loads do not generate embeddings. Supplied vectors are preserved; omitted vectors follow schema nullability. Supply vectors in the input or prepare them with omnigraph embed.\n",
-            |writer| super::write_load_human(&output, writer),
+            |writer| super::write_load_human("graph", &output, writer),
         );
         output.branch_created = false;
         output.embedding_generation = None;
         assert_human_format(
             "loaded graph on branch work with append: 2 entities across 1 node types and 0 edge types\n",
-            |writer| super::write_load_human(&output, writer),
+            |writer| super::write_load_human("graph", &output, writer),
         );
     }
 
     #[test]
     fn blob_stat_human_preserves_managed_external_and_read_target_fields() {
         let mut query = omnigraph_api_types::BlobReadQuery {
-            entity: omnigraph_api_types::BlobEntityKind::Node,
+            entity: omnigraph_api_types::EntityKind::Node,
             r#type: "Doc".to_string(),
             id: "one".to_string(),
             property: "body".to_string(),
@@ -2494,7 +2467,7 @@ mod tests {
             |writer| super::write_blob_stat_human(&output, writer),
         );
 
-        query.entity = omnigraph_api_types::BlobEntityKind::Edge;
+        query.entity = omnigraph_api_types::EntityKind::Edge;
         query.branch = None;
         query.snapshot = Some("requested".to_string());
         let output =
@@ -2510,13 +2483,13 @@ mod tests {
     fn blob_write_human_preserves_receipt_and_already_null_text() {
         let mut output = omnigraph_api_types::BlobWriteOutput {
             selector: omnigraph_api_types::BlobSelectorOutput {
-                entity: omnigraph_api_types::BlobEntityKind::Node,
+                entity: omnigraph_api_types::EntityKind::Node,
                 r#type: "Doc".to_string(),
                 id: "one".to_string(),
                 property: "body".to_string(),
             },
             branch: "work".to_string(),
-            kind: omnigraph_api_types::BlobWriteStateOutput::Managed,
+            kind: omnigraph_api_types::BlobWriteState::Managed,
             size: Some(0),
             etag: Some("\"etag\"".to_string()),
             actor_id: Some("actor".to_string()),
@@ -2529,7 +2502,7 @@ mod tests {
                 actor_id: Some("actor".to_string()),
                 created_at: 42,
                 published: true,
-                kind: omnigraph_api_types::CommitKindOutput::Published,
+                kind: omnigraph_api_types::CommitKind::Published,
                 root_commit_id: None,
             }),
         };
@@ -2539,8 +2512,8 @@ mod tests {
             |writer| super::write_blob_write_human(&output, writer),
         );
 
-        output.selector.entity = omnigraph_api_types::BlobEntityKind::Edge;
-        output.kind = omnigraph_api_types::BlobWriteStateOutput::Null;
+        output.selector.entity = omnigraph_api_types::EntityKind::Edge;
+        output.kind = omnigraph_api_types::BlobWriteState::Null;
         output.size = None;
         output.etag = None;
         output.actor_id = None;

@@ -29,10 +29,10 @@ Writing `.gq` query files in Omnigraph.
 omnigraph lint --schema schema.pg --query queries/signals.gq
 ```
 
-Or (lint against a live repo):
+Or lint against a local graph’s accepted schema:
 
 ```bash
-omnigraph lint --query queries/signals.gq s3://bucket/repo
+omnigraph lint --query queries/signals.gq --target ./graph.omni
 ```
 
 Lint returns:
@@ -450,7 +450,8 @@ branch delete "review/abandoned"
 branch list
 ```
 
-`from` and `into` default to `main`. Quote a name that is not a bare
+`from` and `into` default to `main`; `branch create "fix" from commit "<commit-id>"`
+starts the branch at a published commit. Quote a name that is not a bare
 identifier (a lowercase letter or `_`, then letters, digits, or `_`), such as
 one containing `/`, `-`, or `.`. Run the control writes with
 `omnigraph mutate -e '…'` (HTTP `POST /mutate`) and `branch list` with

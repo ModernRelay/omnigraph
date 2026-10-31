@@ -439,26 +439,39 @@ age: I32?
 
 #[test]
 fn test_parse_range_float_bounds() {
-    let input = r#"
-node Measurement {
-name: String @key
-temperature: F64?
-@range(temperature, 0.0..100.0)
-}
-"#;
-    let schema = parse_schema(input).unwrap();
-    match &schema.declarations[0] {
-        SchemaDecl::Node(n) => {
-            assert!(n.constraints.iter().any(|c| matches!(
-                c,
-                Constraint::Range { property, min, max }
-                if property == "temperature"
-                    && matches!(min, Some(ConstraintBound::Float(f)) if *f == 0.0)
-                    && matches!(max, Some(ConstraintBound::Float(f)) if *f == 100.0)
-            )));
-        }
-        _ => panic!("expected Node"),
+    use ConstraintBound::Float;
+
+    for (bounds, min, max) in [
+        ("0.0..100.0", Some(Float(0.0)), Some(Float(100.0))),
+        ("..100.0", None, Some(Float(100.0))),
+        ("0.0..", Some(Float(0.0)), None),
+        (
+            "..9223372036854775808.0",
+            None,
+            Some(Float(9_223_372_036_854_775_808.0)),
+        ),
+    ] {
+        let input =
+            format!("node Measurement {{ temperature: F64? @range(temperature, {bounds}) }}");
+        let schema = parse_schema(&input).unwrap();
+        let SchemaDecl::Node(node) = &schema.declarations[0] else {
+            panic!("expected Node");
+        };
+        assert_eq!(
+            node.constraints,
+            vec![Constraint::Range {
+                property: "temperature".into(),
+                min,
+                max,
+            }],
+            "{bounds}",
+        );
     }
+
+    // Persisted Float bounds remain Float even above the integer bound limit.
+    let persisted = r#"{"Float":9223372036854775808.0}"#;
+    let bound: ConstraintBound = serde_json::from_str(persisted).unwrap();
+    assert_eq!(bound, Float(9_223_372_036_854_775_808.0));
 }
 
 #[test]
@@ -487,25 +500,74 @@ temperature: F64?
 
 #[test]
 fn test_parse_range_negative_integer_bounds() {
-    let input = r#"
-node Account {
-name: String @key
-balance: I64?
-@range(balance, -1000..1000)
+    use ConstraintBound::Integer;
+
+    for (bounds, min, max) in [
+        ("-1000..1000", Some(Integer(-1000)), Some(Integer(1000))),
+        ("..10", None, Some(Integer(10))),
+        ("10..", Some(Integer(10)), None),
+        ("..-10", None, Some(Integer(-10))),
+        (
+            "-9223372036854775808..9223372036854775807",
+            Some(Integer(i64::MIN)),
+            Some(Integer(i64::MAX)),
+        ),
+        ("..-9223372036854775808", None, Some(Integer(i64::MIN))),
+        ("9223372036854775807..", Some(Integer(i64::MAX)), None),
+    ] {
+        let input = format!("node Account {{ balance: I64? @range(balance, {bounds}) }}");
+        let schema = parse_schema(&input).unwrap();
+        let SchemaDecl::Node(node) = &schema.declarations[0] else {
+            panic!("expected Node");
+        };
+        assert_eq!(
+            node.constraints,
+            vec![Constraint::Range {
+                property: "balance".into(),
+                min,
+                max,
+            }],
+            "{bounds}",
+        );
+    }
 }
-"#;
-    let schema = parse_schema(input).unwrap();
-    match &schema.declarations[0] {
-        SchemaDecl::Node(n) => {
-            assert!(n.constraints.iter().any(|c| matches!(
-                c,
-                Constraint::Range { property, min, max }
-                if property == "balance"
-                    && matches!(min, Some(ConstraintBound::Integer(n)) if *n == -1000)
-                    && matches!(max, Some(ConstraintBound::Integer(n)) if *n == 1000)
-            )));
+
+#[test]
+fn test_parse_range_rejects_integer_bounds_outside_i64() {
+    for value in [
+        "9223372036854775808",
+        "18446744073709551615",
+        "-9223372036854775809",
+        "9999999999999999999999999999999999999999",
+    ] {
+        for bounds in [
+            format!("{value}.."),
+            format!("..{value}"),
+            format!("0..{value}"),
+        ] {
+            let input = format!("node Account {{ balance: U64? @range(balance, {bounds}) }}");
+            let err = parse_schema(&input).expect_err(&bounds).to_string();
+            assert!(err.contains("integer range bound"), "{bounds}: {err}");
+            assert!(err.contains("outside I64"), "{bounds}: {err}");
+            assert!(err.contains(value), "{bounds}: {err}");
+            let persisted = parse_persisted_schema_contract(&input).unwrap();
+            let SchemaDecl::Node(node) = &persisted.declarations[0] else {
+                unreachable!();
+            };
+            assert!(
+                node.constraints.iter().any(|constraint| matches!(
+                    constraint,
+                    Constraint::Range {
+                        min: Some(ConstraintBound::Float(_)),
+                        ..
+                    } | Constraint::Range {
+                        max: Some(ConstraintBound::Float(_)),
+                        ..
+                    }
+                )),
+                "persisted overflow must remain Float: {bounds}"
+            );
         }
-        _ => panic!("expected Node"),
     }
 }
 

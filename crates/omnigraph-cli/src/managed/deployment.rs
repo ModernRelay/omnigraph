@@ -1,6 +1,8 @@
 //! Native managed previews and delivery: submit once, observe the original IDs.
 use super::*;
 
+mod preview;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct Identity {
     deployment_id: String,
@@ -181,14 +183,44 @@ async fn submit(
     stderr: &mut dyn Write,
 ) -> Result<(Value, String)> {
     let key = idempotency_key(run.idempotency_key.as_deref(), stderr)?;
-    let request = api.request(Method::POST, path, Some(body), Some(&key));
+    // A submission is answered only after the service's own work, such as a
+    // plan's preview capture, which can outlast the bound of an ordinary
+    // control call. The local deadline bounds the request instead.
+    let request = api.request_with_timeout(
+        Method::POST,
+        path,
+        Some(body),
+        Some(&key),
+        deadline.saturating_duration_since(Instant::now()),
+    );
+    let deadline_reached = || {
+        Failure::new(
+            "wait_timeout",
+            "local submission deadline reached; acceptance is unknown; retain the original idempotency key",
+            5,
+        )
+    };
     let result = if run.no_wait {
         request.await
     } else {
-        tokio::time::timeout_at(deadline, request).await.unwrap_or_else(|_| Err(Failure::new("wait_timeout", "local submission deadline reached; acceptance is unknown; retain the original idempotency key", 5)))
+        match tokio::time::timeout_at(deadline, request).await {
+            // The request's own bound ends no earlier than the deadline and
+            // can fire in the same timer tick: that is the deadline too.
+            Ok(Err(error))
+                if error.body["type"] == "transport_failed" && Instant::now() >= deadline =>
+            {
+                Err(deadline_reached())
+            }
+            Ok(result) => result,
+            Err(_) => Err(deadline_reached()),
+        }
     };
     result.map(|body| (body, key.clone())).map_err(|error| {
-        if error.exit == 2 {
+        if error.exit == 2
+            && !error
+                .response_status
+                .is_some_and(|status| status.is_success())
+        {
             error
         } else {
             retain_submission(error, &key, body)
@@ -251,7 +283,7 @@ async fn wait(
         if next >= deadline {
             tokio::time::sleep_until(deadline).await;
             identity.diagnostic(stderr, format_args!(
-                "wait deadline reached; inspect `cluster status --managed {}`; no work was cancelled or resubmitted\n",
+                "wait deadline reached; inspect `cluster status {} --target NAME`; no work was cancelled or resubmitted\n",
                 identity.deployment_id
             ))?;
             return Ok((body, 5));
@@ -270,6 +302,7 @@ async fn wait(
             Ok(Ok(response)) => {
                 return Err(identity.retain(Failure {
                     body: response.body,
+                    response_status: Some(response.status),
                     exit: if response.status.is_client_error() {
                         2
                     } else {
@@ -336,7 +369,7 @@ pub(super) async fn dispatch(
                 ));
             }
             let request = json!({"revision":revision});
-            let (body, key) = submit(
+            let submission = submit(
                 api,
                 &format!("{base}/plans"),
                 &request,
@@ -345,15 +378,13 @@ pub(super) async fn dispatch(
                 stderr,
             )
             .await?;
-            let exit = preview_exit(&body, context, &revision)
-                .map_err(|error| retain_submission(error, &key, &request))?;
-            Ok((body, exit))
+            preview::finish(api, context, submission, &revision, run, deadline, stderr).await
         }
         ClusterCommand::Apply { plan, run, .. } => {
             let plan = plan.as_deref().ok_or_else(|| {
                 Failure::refused(
                     "plan_required",
-                    "cluster apply --managed requires --plan <preview-id>",
+                    "managed cluster apply requires --plan <preview-id>",
                 )
             })?;
             identifier(plan)?;
@@ -418,8 +449,7 @@ pub(super) async fn dispatch(
             }
         }
         ClusterCommand::History { limit, since, .. } => {
-            let mut url = Url::parse(&format!("{}{base}/history", context.api))
-                .map_err(|_| Failure::protocol())?;
+            let mut url = api.url(&format!("{base}/history"))?;
             url.query_pairs_mut()
                 .append_pair("limit", &limit.to_string());
             if let Some(since) = since {
@@ -430,7 +460,12 @@ pub(super) async fn dispatch(
                 url.query_pairs_mut().append_pair("since", since);
             }
             let body = api
-                .request(Method::GET, &url[url::Position::BeforePath..], None, None)
+                .request(
+                    Method::GET,
+                    &format!("{base}/history?{}", url.query().unwrap_or_default()),
+                    None,
+                    None,
+                )
                 .await?;
             cluster_matches(&body, &context.cluster)?;
             for delivery in body["data"]["deployments"]

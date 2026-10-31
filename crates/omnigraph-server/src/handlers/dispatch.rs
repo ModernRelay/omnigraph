@@ -7,8 +7,8 @@ use super::*;
 use crate::api::branch_statement_refusals as refusals;
 use omnigraph::loader::CsvLoadRequest;
 use omnigraph_compiler::query::ast::{
-    BranchDiffSides, BranchRead, BranchStmt, BranchWrite, CommitWrite, EXPLAIN_STATEMENT_NAME,
-    LoadStmt, SettingStmt, show_statement_name,
+    BranchCreateFrom, BranchDiffSides, BranchRead, BranchStmt, BranchWrite, CommitWrite,
+    EXPLAIN_STATEMENT_NAME, LoadStmt, SettingStmt, show_statement_name,
 };
 use omnigraph_compiler::settings::{SettingId, SettingRow};
 
@@ -173,6 +173,7 @@ pub(super) async fn run_load_statement(
             .load_csv_as_with_receipt(&branch, &request, actor_id.as_deref())
             .await
             .map_err(ApiError::from_omni)?;
+        let executed = receipt.executed_plan().map(api::load_executed_output);
         Ok(ChangeOutput {
             branch: receipt.result.branch,
             query_name,
@@ -181,6 +182,7 @@ pub(super) async fn run_load_statement(
             actor_id,
             commit: Some(api::commit_output(&receipt.commit)),
             outcome: None,
+            executed,
         })
     })
     .await
@@ -229,6 +231,7 @@ pub(super) async fn branch_read_body(
     match read {
         BranchRead::Diff { sides, page } => {
             let scope = omnigraph::changes::ChangeFeedScope::default();
+            let lineage = session.settings().change_lineage();
             let diff = match sides {
                 BranchDiffSides::Branch { source, into } => {
                     branch_diff_page(
@@ -239,12 +242,22 @@ pub(super) async fn branch_read_body(
                         scope,
                         page.after_page,
                         page.limit,
+                        lineage,
                     )
                     .await?
                 }
                 BranchDiffSides::Between { from, to } => {
-                    two_point_diff_page(handle, actor, from, to, scope, page.after_page, page.limit)
-                        .await?
+                    two_point_diff_page(
+                        handle,
+                        actor,
+                        from,
+                        to,
+                        scope,
+                        page.after_page,
+                        page.limit,
+                        lineage,
+                    )
+                    .await?
                 }
             };
             api::branch_diff_read_output(&diff).map_err(render_error)
@@ -321,12 +334,22 @@ pub(super) async fn run_branch_statement(
     let actor_id = actor.map(|actor| actor.actor_id.as_ref().to_string());
     let (branch, commit, outcome) = match write {
         BranchWrite::Create { name, from } => {
-            let from = from.unwrap_or_else(|| "main".to_string());
-            branch_create_body(state, handle, actor, ingress, &from, &name).await?;
+            let start = match from {
+                Some(BranchCreateFrom::Commit(commit)) => {
+                    ReadTarget::snapshot(SnapshotId::new(commit))
+                }
+                Some(BranchCreateFrom::Branch(branch)) => ReadTarget::branch(branch),
+                None => ReadTarget::branch("main"),
+            };
+            let created = branch_create_body(state, handle, actor, ingress, start, &name).await?;
             (
                 name.clone(),
                 None,
-                api::BranchOutcomeOutput::Created { from, name },
+                api::BranchOutcomeOutput::Created {
+                    from: created.from,
+                    name,
+                    from_commit_id: created.from_commit_id,
+                },
             )
         }
         BranchWrite::Delete { name } => {
@@ -368,6 +391,7 @@ pub(super) async fn run_branch_statement(
         actor_id,
         commit,
         outcome: Some(outcome),
+        executed: None,
     })
 }
 
@@ -397,6 +421,7 @@ pub(super) async fn run_commit_statement(
         actor_id,
         commit,
         outcome: Some(outcome),
+        executed: None,
     })
 }
 

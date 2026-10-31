@@ -21,6 +21,7 @@ use datafusion::physical_expr::aggregate::AggregateExprBuilder;
 use datafusion::physical_expr::expressions::{CastExpr, Column};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+use datafusion::physical_plan::execution_plan::EmissionType;
 use omnigraph_compiler::ir::SubqueryPredicate;
 use omnigraph_compiler::query::ast::LoadStmtMode;
 use omnigraph_compiler::traversal::EDGE_TYPE_COLUMN;
@@ -474,10 +475,37 @@ impl<'l, 'a> Walk<'l, 'a> {
             .into()
     }
 
-    /// The one operator of node `id`.
+    /// The one operator of node `id`; `AggregateExec` (not built through a
+    /// shape; `Final` while its input order mode is linear) and `ValidateExec`
+    /// (its shape chosen by the plan's checks) have their emission checked.
     fn built(&mut self, id: NodeId, operator: impl ExecutionPlan) -> Lowers<Plan> {
         let plan: Plan = Arc::new(operator);
         let node = self.lowering.node(id)?;
+        if matches!(node, PhysicalNode::Aggregate { .. })
+            && plan.properties().emission_type != EmissionType::Final
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "node {id} `Aggregate` is a pipeline breaker in the plan but `{}` emits {:?}",
+                plan.name(),
+                plan.properties().emission_type,
+            ))
+            .into());
+        }
+        if matches!(node, PhysicalNode::Validate { .. }) {
+            let declared = match node.shape() {
+                omnigraph_planner::PipelineShape::Breaker => EmissionType::Final,
+                omnigraph_planner::PipelineShape::Streaming => EmissionType::Incremental,
+            };
+            if plan.properties().emission_type != declared {
+                return Err(OmniError::manifest_internal(format!(
+                    "node {id} `Validate` is {:?} in the plan's cut but `{}` emits {:?}",
+                    node.shape(),
+                    plan.name(),
+                    plan.properties().emission_type,
+                ))
+                .into());
+            }
+        }
         if matches!(
             node,
             PhysicalNode::Projection { .. }
@@ -1240,9 +1268,16 @@ impl Lower for Walk<'_, '_> {
             id,
             CsvSourceExec::new(
                 load.request.clone(),
-                Arc::clone(&load.capture),
+                Arc::clone(&load.bytes),
                 Arc::clone(self.lowering.catalog),
                 schema,
+                if load.single_partition {
+                    1
+                } else {
+                    usize::try_from(fields.max_partitions).unwrap_or(1)
+                },
+                load.slice_bytes,
+                Arc::clone(&load.source_refused),
             ),
         )
     }
@@ -1270,12 +1305,14 @@ impl Lower for Walk<'_, '_> {
             db: Arc::clone(&write.db),
             table,
             checks: fields.checks.to_vec(),
+            removal: fields.removal,
             mode: load.request.mode,
             write_budget: write.write_budget,
             snapshot: self.lowering.snapshot("load validation")?.clone(),
             catalog: Arc::clone(self.lowering.catalog),
         };
-        self.built(id, ValidateExec::new(input, judge))
+        let streams = omnigraph_planner::validate_streams(fields.checks, fields.removal);
+        self.built(id, ValidateExec::new(input, judge, streams))
     }
 
     fn fragment_write(

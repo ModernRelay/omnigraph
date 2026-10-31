@@ -15,6 +15,7 @@ members = [
     "crates/omnigraph-azure-admission",
     "crates/omnigraph-bench",
     "crates/omnigraph-policy",
+    "crates/omnigraph-mcp",
     "crates/omnigraph-server",
     "crates/omnigraph-dst",
     "crates/omnigraph-gqt",
@@ -47,26 +48,26 @@ datafusion-common = "54"
 datafusion-expr = "54"
 datafusion-functions-aggregate = "54"
 
-# Lance 11.0.0 (crates.io), kept in lockstep. Explicit V2_2 writes and the
-# late-payload KNN ordering fence remain required; see docs/dev/lance.md.
-lance = { version = "=11.0.0", default-features = false, features = ["aws", "azure"] }
-lance-core = "=11.0.0"
+# Lance 13.0.0 (crates.io), kept in lockstep. Graph writes explicitly use V2_2;
+# current compatibility requirements and native guards live in docs/dev/lance.md.
+lance = { version = "=13.0.0", default-features = false, features = ["aws", "azure"] }
+lance-core = "=13.0.0"
 # lance-io: the engine's `dst` object-store seam (provider trait) and
 # omnigraph-dst's fault injection; rand: the harness PRNG seeds.
-lance-io = { version = "=11.0.0", default-features = false }
+lance-io = { version = "=13.0.0", default-features = false }
 rand = "0.9"
 # RowAddrTreeMap moved from lance-core::utils::mask to the new lance-select crate in 9.x.
-lance-select = "=11.0.0"
-lance-datafusion = "=11.0.0"
-lance-file = "=11.0.0"
-lance-index = "=11.0.0"
-lance-linalg = "=11.0.0"
-lance-namespace = "=11.0.0"
-lance-namespace-impls = "=11.0.0"
-lance-table = "=11.0.0"
+lance-select = "=13.0.0"
+lance-datafusion = "=13.0.0"
+lance-file = "=13.0.0"
+lance-index = "=13.0.0"
+lance-linalg = "=13.0.0"
+lance-namespace = "=13.0.0"
+lance-namespace-impls = "=13.0.0"
+lance-table = "=13.0.0"
 # Persistent FTS certificates identify this analyzer generation. A change needs
 # the RFC 0043 compatibility audit, not just a transitive lockfile refresh.
-lance-tokenizer = "=11.0.0"
+lance-tokenizer = "=13.0.0"
 frostem = { version = "=1.20260821.3", default-features = false }
 stop-words = { version = "=0.10.0", default-features = false }
 unicode-normalization = "=0.1.25"
@@ -79,7 +80,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 pest = "2"
 pest_derive = "2"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }
 clap = { version = "4.6", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
@@ -98,7 +99,7 @@ bytes = "1"
 ariadne = "0.4"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-object_store = { version = "0.13.2", default-features = false, features = ["aws", "azure", "fs"] }
+object_store = { version = "0.14.1", default-features = false, features = ["aws", "azure", "fs"] }
 time = { version = "0.3.47", features = ["formatting"] }
 axum = { version = "0.8", features = ["json", "macros"] }
 utoipa = { version = "5", features = ["axum_extras"] }

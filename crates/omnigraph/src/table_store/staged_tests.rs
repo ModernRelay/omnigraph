@@ -1,24 +1,15 @@
 #![cfg(test)]
 
-//! Primitive-level tests for `TableStore`'s staged-write API. These
-//! exercise `stage_append`, `stage_merge_insert`, `scan_with_staged`,
-//! and `count_rows_with_staged` directly against a Lance dataset — no
-//! Omnigraph engine involved. The engine-level use of these primitives
-//! is exercised by `tests/writes.rs`.
+//! Primitive-level tests for `TableStore`'s staged-write API. These exercise
+//! `stage_append`, `stage_keyed_write`, `scan_with_staged`, and
+//! `count_rows_with_staged` directly against a Lance dataset. Public engine
+//! writes are covered by `tests/writes.rs`.
 //!
-//! Test surface here:
-//! 1. `stage_append` + `scan_with_staged` shows committed + staged data
-//!    without duplicates.
-//! 2. `stage_merge_insert` of a row that supersedes a committed fragment
-//!    surfaces only the rewritten row, not both, via the
-//!    `removed_fragment_ids` dedup contract.
-//! 3. **Documented contract**: chained `stage_merge_insert` calls on
-//!    the same dataset whose source rows share keys produce duplicate
-//!    rows in `scan_with_staged`. The engine's accumulator dedupes by
-//!    id at finalize time so this primitive-level pitfall doesn't
-//!    surface in production paths; this test pins the primitive's
-//!    behavior so a future change either (a) preserves it or
-//!    (b) consciously fixes it (and updates this test).
+//! Staged scans compose committed and staged fragments without exposing both
+//! a superseded fragment and its rewrite. Independently staged keyed writes
+//! still see only their committed parent, so overlapping keys across stages
+//! appear twice. The engine's pending-table accumulator combines upserts by key
+//! before staging once per table; the primitive tests retain this limitation.
 
 use crate::error::{OmniError, StorageFailureKind};
 use crate::instrumentation::{MergeWriteProbes, with_merge_write_probes};
@@ -32,9 +23,9 @@ use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{ident, lit};
 use futures::TryStreamExt;
 use lance::Dataset;
+use lance::dataset::DeleteBuilder;
 use lance::dataset::transaction::{Operation, UpdateMode};
 use lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilterBuilder;
-use lance::dataset::{DeleteBuilder, WhenMatched, WhenNotMatched};
 use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 use lance_table::format::Fragment;
 use omnigraph_compiler::SYSTEM_COLUMNS_LEGACY;
@@ -405,13 +396,13 @@ async fn stage_append_is_visible_via_scan_with_staged() {
 }
 
 #[tokio::test]
-async fn stage_merge_insert_dedupes_superseded_committed_fragment() {
+async fn stage_keyed_upsert_dedupes_superseded_committed_fragment() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
     let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
     // Seed: alice age 30 in one committed fragment.
-    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+    let ds = TableStore::write_dataset(&uri, person_pk_batch(&[("alice", Some(30))]))
         .await
         .unwrap();
 
@@ -419,12 +410,13 @@ async fn stage_merge_insert_dedupes_superseded_committed_fragment() {
     // Operation::Update whose removed_fragment_ids excludes the committed
     // fragment that contained the old alice.
     let staged = store
-        .stage_merge_insert(
+        .stage_keyed_write(
             ds.clone(),
-            person_batch(&[("alice", Some(31))]),
-            vec!["id".to_string()],
-            WhenMatched::UpdateAll,
-            WhenNotMatched::InsertAll,
+            "Person",
+            person_pk_batch(&[("alice", Some(31))]),
+            KeyedWriteSemantics::Upsert,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -523,12 +515,20 @@ async fn keyed_upsert_forces_filter_route_and_preserves_conflict_metadata() {
 
 #[tokio::test]
 async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
+    use lance::index::DatasetIndexExt;
+    use lance_core::utils::address::RowAddress;
+
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
     let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
-    let ds = TableStore::write_dataset(&uri, person_pk_batch(&[("alice", Some(30))]))
-        .await
-        .unwrap();
+    // Carol keeps the original indexed fragment live after Alice is rewritten.
+    // With Alice alone the old fragment disappears and Lance can use a flat scan.
+    let ds = TableStore::write_dataset(
+        &uri,
+        person_pk_batch(&[("alice", Some(30)), ("carol", Some(28))]),
+    )
+    .await
+    .unwrap();
     let staged_index = store
         .stage_create_indices(
             &ds,
@@ -544,6 +544,14 @@ async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
         .await
         .unwrap();
     let base_version = ds.version().version;
+    let original_indices = ds.load_indices().await.unwrap();
+    assert_eq!(original_indices.len(), 1);
+    let original_id_index = &original_indices[0];
+    assert_eq!(
+        original_id_index.fields,
+        [ds.schema().field("id").unwrap().id]
+    );
+    let original_coverage = original_id_index.fragment_bitmap.as_ref().unwrap();
 
     let probes = MergeWriteProbes::default();
     let staged = with_merge_write_probes(
@@ -580,7 +588,7 @@ async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
 
     let error = store
         .stage_keyed_write(
-            ds,
+            ds.clone(),
             "Person",
             person_pk_batch(&[("bob", Some(25))]),
             KeyedWriteSemantics::KnownPresentUpdate,
@@ -595,6 +603,69 @@ async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
         base_version,
         "staging a missing known-present id must not advance HEAD"
     );
+
+    // Keep the original BTREE after committing a row rewrite. Its stable-row-ID
+    // posting still names Alice while Alice now lives in an uncovered fragment.
+    // The indexed candidate and uncovered tail must not both reach the merge:
+    // Lance #6877 used to mistake those for ambiguous duplicate source rows.
+    // Native duplicate matching stays strict; no index rebuild may hide it.
+    assert!(ds.manifest.uses_stable_row_ids());
+    let rewritten = store.commit_staged(Arc::new(ds), staged).await.unwrap();
+    assert!(store.has_btree_index(&rewritten, "id").await.unwrap());
+    let retained_indices = rewritten.load_indices().await.unwrap();
+    assert_eq!(retained_indices.len(), 1);
+    assert_eq!(retained_indices[0].uuid, original_id_index.uuid);
+    assert_eq!(
+        retained_indices[0].fragment_bitmap.as_ref(),
+        Some(original_coverage)
+    );
+    let mut current_alice = rewritten.scan();
+    current_alice
+        .with_row_address()
+        .use_scalar_index(false)
+        .filter_expr(ident("id").eq(lit("alice")));
+    let current_alice = current_alice.try_into_batch().await.unwrap();
+    assert_eq!(current_alice.num_rows(), 1);
+    let address = current_alice
+        .column_by_name("_rowaddr")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    assert!(
+        !original_coverage.contains(RowAddress::from(address).fragment_id()),
+        "the rewritten row must remain outside the retained BTREE's fragment coverage"
+    );
+    let repeated = store
+        .stage_keyed_write(
+            rewritten.clone(),
+            "Person",
+            person_pk_batch(&[("alice", Some(42))]),
+            KeyedWriteSemantics::KnownPresentUpdate,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
+        )
+        .await
+        .expect("a repeated update must accept one source row with a stale id BTREE");
+    assert!(
+        matches!(
+            &repeated.transaction.operation,
+            Operation::Update {
+                inserted_rows_filter: None,
+                ..
+            }
+        ),
+        "the repeated update must exercise Lance's indexed v1 route"
+    );
+    let repeated = store
+        .commit_staged(Arc::new(rewritten), repeated)
+        .await
+        .unwrap();
+    let batches = store.scan_batches(&repeated).await.unwrap();
+    assert_eq!(collect_ids(&batches), vec!["alice", "carol"]);
+    assert_eq!(collect_age_for_id(&batches, "alice"), Some(42));
+    assert_eq!(collect_age_for_id(&batches, "carol"), Some(28));
 
     let uncovered_uri = format!("{}/uncovered-people.lance", dir.path().to_str().unwrap());
     let uncovered =
@@ -1195,6 +1266,10 @@ async fn proven_insert_rejects_prepared_blob_descriptors_before_staging() {
 
 #[tokio::test]
 async fn proven_and_general_strict_same_key_conflict_in_both_commit_orders() {
+    let settings = omnigraph_compiler::settings::SessionSettings::default()
+        .with("write_max_bytes", "4093")
+        .unwrap();
+    let budget = WriteBudget::from_settings(&settings);
     for proven_commits_first in [true, false] {
         let dir = tempfile::tempdir().unwrap();
         let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
@@ -1213,7 +1288,7 @@ async fn proven_and_general_strict_same_key_conflict_in_both_commit_orders() {
                 )
                 .unwrap(),
                 SYSTEM_COLUMNS_LEGACY,
-                WriteBudget::default(),
+                budget,
             )
             .await
             .unwrap();
@@ -1224,7 +1299,7 @@ async fn proven_and_general_strict_same_key_conflict_in_both_commit_orders() {
                 person_pk_batch(&[("bob", Some(26))]),
                 KeyedWriteSemantics::StrictInsert,
                 SYSTEM_COLUMNS_LEGACY,
-                WriteBudget::default(),
+                budget,
             )
             .await
             .unwrap();
@@ -1377,7 +1452,7 @@ fn proven_insert_delta_scan_never_enables_strict_batch_size() {
         .split_once("pub async fn scan_proven_insert_delta_bounded(")
         .unwrap()
         .1
-        .split_once("/// Stage a merge_insert (upsert)")
+        .split_once("pub async fn commit_staged(")
         .unwrap()
         .0;
     assert!(
@@ -1675,9 +1750,8 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
 /// row-ID index (prefilter, vector search). With the slice threaded
 /// through, the second call offsets by the first call's row count.
 ///
-/// This is what enables the engine's multi-statement `insert Knows ...;
-/// insert Knows ...` (multiple appends to the same edge table) under
-/// the D₂′ rule.
+/// This pins the test-only append primitive's provisional identity. Production
+/// mutations combine pending inserts before staging a keyed table write.
 #[tokio::test]
 async fn chained_stage_appends_have_distinct_row_ids() {
     let dir = tempfile::tempdir().unwrap();
@@ -1795,25 +1869,26 @@ async fn stage_append_then_commit_persists_data() {
     assert_eq!(collect_ids(&batches), vec!["alice", "bob"]);
 }
 
-/// `stage_merge_insert` + `commit_staged` round-trip: after commit, the
+/// `stage_keyed_write` + `commit_staged` round-trip: after commit, the
 /// merged view (existing alice updated + new bob inserted) is visible.
 #[tokio::test]
-async fn stage_merge_insert_then_commit_persists_merged_view() {
+async fn stage_keyed_upsert_then_commit_persists_merged_view() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
     let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
-    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+    let ds = TableStore::write_dataset(&uri, person_pk_batch(&[("alice", Some(30))]))
         .await
         .unwrap();
 
     let staged = store
-        .stage_merge_insert(
+        .stage_keyed_write(
             ds.clone(),
-            person_batch(&[("alice", Some(31)), ("bob", Some(25))]),
-            vec!["id".to_string()],
-            WhenMatched::UpdateAll,
-            WhenNotMatched::InsertAll,
+            "Person",
+            person_pk_batch(&[("alice", Some(31)), ("bob", Some(25))]),
+            KeyedWriteSemantics::Upsert,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -1823,6 +1898,8 @@ async fn stage_merge_insert_then_commit_persists_merged_view() {
     let reopened = Dataset::open(&uri).await.unwrap();
     let batches = store.scan_batches(&reopened).await.unwrap();
     assert_eq!(collect_ids(&batches), vec!["alice", "bob"]);
+    assert_eq!(collect_age_for_id(&batches, "alice"), Some(31));
+    assert_eq!(collect_age_for_id(&batches, "bob"), Some(25));
 
     // Confirm alice was updated to age=31, not duplicated.
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1830,18 +1907,18 @@ async fn stage_merge_insert_then_commit_persists_merged_view() {
 }
 
 #[tokio::test]
-async fn stage_merge_insert_commit_rebases_over_disjoint_committed_delete() {
+async fn known_present_update_commit_rebases_over_disjoint_committed_delete() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
     let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
-    let ds = TableStore::write_dataset(&uri, numbered_person_batch(0..100))
-        .await
-        .unwrap();
+    let seed = numbered_person_batch(0..100);
+    let seed = RecordBatch::try_new(person_pk_schema(), seed.columns().to_vec()).unwrap();
+    let ds = TableStore::write_dataset(&uri, seed).await.unwrap();
     let update_ids: Vec<String> = (0..10).map(|i| format!("p{i}")).collect();
     let update_ages: Vec<Option<i32>> = (0..10).map(|i| Some(1000 + i)).collect();
     let update_batch = RecordBatch::try_new(
-        person_schema(),
+        person_pk_schema(),
         vec![
             Arc::new(StringArray::from(update_ids)),
             Arc::new(Int32Array::from(update_ages)),
@@ -1850,12 +1927,13 @@ async fn stage_merge_insert_commit_rebases_over_disjoint_committed_delete() {
     .unwrap();
 
     let staged = store
-        .stage_merge_insert(
+        .stage_keyed_write(
             ds.clone(),
+            "Person",
             update_batch,
-            vec!["id".to_string()],
-            WhenMatched::UpdateAll,
-            WhenNotMatched::DoNothing,
+            KeyedWriteSemantics::KnownPresentUpdate,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -2113,39 +2191,32 @@ async fn scan_with_staged_with_filter_returns_matching_staged_rows() {
     );
 }
 
-/// **Documented contract** (see `stage_merge_insert` doc): chained
-/// `stage_merge_insert` calls on the same table whose source rows share
-/// keys cannot dedupe across stages. Each call's `MergeInsertBuilder` runs
-/// against the committed view; neither sees the other's staged fragments.
-/// The combined `scan_with_staged` therefore returns the shared key
-/// twice.
-///
-/// The engine's mutation path enforces D₂′ (per touched table: all
-/// stage_append OR exactly one stage_merge_insert) at parse time so this
-/// scenario is unreachable through public APIs. This test pins the
-/// primitive behavior — if a future change makes the primitive itself
-/// dedupe across stages (e.g. via a Lance API extension or in-memory
-/// pre-merge), update this assertion.
+/// Independently staged keyed upserts cannot dedupe across stages: both
+/// `MergeInsertBuilder`s read the same committed parent. The engine avoids
+/// this by combining pending upserts by id before one keyed stage per table.
+/// Retain the primitive limitation here so callers do not assume that
+/// `scan_with_staged` implements inter-stage key supersession.
 #[tokio::test]
-async fn chained_stage_merge_insert_with_shared_key_documents_duplicate_behavior() {
+async fn chained_keyed_upserts_with_shared_key_document_duplicate_behavior() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
     let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
     // Seed empty (an unrelated row keeps the schema unambiguous).
-    let ds = TableStore::write_dataset(&uri, person_batch(&[("seed", Some(0))]))
+    let ds = TableStore::write_dataset(&uri, person_pk_batch(&[("seed", Some(0))]))
         .await
         .unwrap();
 
     // Op-1: stage merge_insert of alice. Against committed view: alice
     // doesn't exist, so this lands as a fresh insert into Operation::Update.new_fragments.
     let staged_1 = store
-        .stage_merge_insert(
+        .stage_keyed_write(
             ds.clone(),
-            person_batch(&[("alice", Some(30))]),
-            vec!["id".to_string()],
-            WhenMatched::UpdateAll,
-            WhenNotMatched::InsertAll,
+            "Person",
+            person_pk_batch(&[("alice", Some(30))]),
+            KeyedWriteSemantics::Upsert,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -2155,19 +2226,20 @@ async fn chained_stage_merge_insert_with_shared_key_documents_duplicate_behavior
     // Lance produces another fresh insert. Op-2 has no knowledge of
     // op-1's staged fragments.
     let staged_2 = store
-        .stage_merge_insert(
+        .stage_keyed_write(
             ds.clone(),
-            person_batch(&[("alice", Some(31))]),
-            vec!["id".to_string()],
-            WhenMatched::UpdateAll,
-            WhenNotMatched::InsertAll,
+            "Person",
+            person_pk_batch(&[("alice", Some(31))]),
+            KeyedWriteSemantics::Upsert,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
 
     // scan_with_staged sees committed (seed) + op-1.new (alice age=30) +
-    // op-2.new (alice age=31). Alice appears twice — the documented
-    // contract violation that D₂′ prevents at the engine layer.
+    // op-2.new (alice age=31). Alice appears twice; the engine's pending-table
+    // accumulator resolves this overlap before staging.
     let batches = store
         .scan_with_staged(&ds, &[staged_1, staged_2], None, None)
         .await
@@ -2176,14 +2248,8 @@ async fn chained_stage_merge_insert_with_shared_key_documents_duplicate_behavior
     let alice_count = ids.iter().filter(|id| *id == "alice").count();
     assert_eq!(
         alice_count, 2,
-        "chained stage_merge_insert with shared key produces duplicates — \
-         this is the contract documented on stage_merge_insert. If you're \
-         here because this assertion failed: either (a) the primitive was \
-         improved to dedupe across stages (good — update to assert == 1) \
-         or (b) something subtler broke (investigate before changing the \
-         assertion). The engine's MutationStaging accumulator dedupes by \
-         id at finalize time so this primitive-level pitfall doesn't \
-         surface in production paths — see exec/staging.rs."
+        "independently staged keyed upserts do not resolve overlapping keys; \
+         MutationStaging must combine pending upserts before staging"
     );
 }
 
@@ -2402,59 +2468,130 @@ async fn stage_overwrite_empty_batch_replaces_all_rows() {
 /// allocation, and a zero-row batch between them contributes nothing.
 #[tokio::test]
 async fn stage_overwrite_batches_keeps_every_batch_in_one_overwrite() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    use arrow_select::concat::concat_batches;
+    use lance_file::reader::FileReader;
+    use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
-    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
-        .await
-        .unwrap();
-    let committed_fragment_ids: std::collections::HashSet<u64> =
-        ds.manifest.fragments.iter().map(|f| f.id).collect();
-    let pre_version = ds.version().version;
-
-    let staged = store
-        .stage_overwrite_batches(
-            &ds,
-            vec![
-                person_batch(&[("zoe", Some(99)), ("yan", Some(1))]),
-                person_batch(&[]),
-                person_batch(&[("xia", None)]),
-            ],
-        )
-        .await
-        .unwrap();
-    assert!(matches!(
-        staged.transaction.operation,
-        Operation::Overwrite { .. }
-    ));
-    assert_eq!(
-        staged
-            .new_fragments()
-            .iter()
-            .map(|fragment| fragment.physical_rows.unwrap_or(0))
-            .sum::<usize>(),
-        3,
-        "the staged fragments hold every row of every batch"
+    // One hot column among many small ones makes the native per-column
+    // allowance observable while the entire input still fits write_max_bytes.
+    let mut fields = person_schema().fields().to_vec();
+    fields.push(Arc::new(Field::new("payload", DataType::Utf8, false)));
+    fields.extend(
+        (0..29).map(|i| Arc::new(Field::new(format!("small_{i}"), DataType::Int32, false))),
     );
-    let removed: std::collections::HashSet<u64> =
-        staged.removed_fragment_ids().iter().copied().collect();
-    assert_eq!(removed, committed_fragment_ids);
-    assert_eq!(ds.version().version, pre_version);
-
-    let batches = store
-        .scan_with_staged(&ds, std::slice::from_ref(&staged), None, None)
-        .await
+    let schema = Arc::new(Schema::new(fields));
+    let batch = |rows: &[(&str, Option<i32>)]| {
+        let mut columns = person_batch(rows).columns().to_vec();
+        columns.push(Arc::new(StringArray::from_iter_values(
+            rows.iter().map(|(id, _)| id.repeat(4096)),
+        )));
+        columns.extend((0..29).map(|i| Arc::new(Int32Array::from(vec![i; rows.len()])) as _));
+        RecordBatch::try_new(schema.clone(), columns).unwrap()
+    };
+    let inputs = vec![
+        batch(&[("zoe", Some(99)), ("yan", Some(1))]),
+        batch(&[]),
+        batch(&[("xia", None)]),
+    ];
+    let expected = concat_batches(&schema, &inputs).unwrap();
+    let small_settings = omnigraph_compiler::settings::SessionSettings::default()
+        .with("write_max_bytes", "131072")
         .unwrap();
-    assert_eq!(collect_ids(&batches), vec!["xia", "yan", "zoe"]);
+    for (budget, expected_hot_pages) in [
+        (WriteBudget::from_settings(&small_settings), 2),
+        (WriteBudget::default(), 1),
+    ] {
+        assert!(
+            inputs
+                .iter()
+                .map(|batch| batch.get_array_memory_size() as u64)
+                .sum::<u64>()
+                < budget.bytes()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+        let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
-    let new_ds = store
-        .commit_staged(Arc::new(ds.clone()), staged)
-        .await
-        .unwrap();
-    assert_eq!(new_ds.version().version, pre_version + 1);
-    let after = store.scan_batches(&new_ds).await.unwrap();
-    assert_eq!(collect_ids(&after), vec!["xia", "yan", "zoe"]);
+        let ds = TableStore::write_dataset(&uri, batch(&[("alice", Some(30))]))
+            .await
+            .unwrap();
+        let committed_fragment_ids: std::collections::HashSet<u64> =
+            ds.manifest.fragments.iter().map(|f| f.id).collect();
+        let pre_version = ds.version().version;
+
+        let staged = store
+            .stage_overwrite_batches(&ds, inputs.clone(), budget, 1)
+            .await
+            .unwrap();
+        assert!(matches!(
+            staged.transaction.operation,
+            Operation::Overwrite { .. }
+        ));
+        assert_eq!(
+            staged
+                .new_fragments()
+                .iter()
+                .map(|fragment| fragment.physical_rows.unwrap_or(0))
+                .sum::<usize>(),
+            3,
+            "the staged fragments hold every row of every batch"
+        );
+        let removed: std::collections::HashSet<u64> =
+            staged.removed_fragment_ids().iter().copied().collect();
+        assert_eq!(removed, committed_fragment_ids);
+        assert_eq!(ds.version().version, pre_version);
+        assert_eq!(
+            Dataset::open(&uri).await.unwrap().version().version,
+            pre_version
+        );
+
+        // Read the actual emitted V2_2 footer, not a copy of the options we
+        // passed. The smaller allowance flushes the hot column between input
+        // batches; cold columns retain one page. This measures page layout,
+        // not peak RSS or an encoded-page byte limit.
+        assert_eq!(staged.new_fragments().len(), 1);
+        let files = &staged.new_fragments()[0].files;
+        assert_eq!(files.len(), 1);
+        let scheduler = ScanScheduler::new(
+            ds.object_store(None).await.unwrap(),
+            SchedulerConfig::new(1024 * 1024),
+        );
+        let file = scheduler
+            .open_file(
+                &ds.data_dir().join(files[0].path.as_str()),
+                &files[0].file_size_bytes,
+            )
+            .await
+            .unwrap();
+        let metadata = FileReader::read_all_metadata(&file).await.unwrap();
+        assert_eq!(metadata.num_rows, 3);
+        assert_eq!(metadata.column_metadatas[2].pages.len(), expected_hot_pages);
+        assert_eq!(metadata.column_metadatas[3].pages.len(), 1);
+        assert_eq!(
+            metadata.column_metadatas[2]
+                .pages
+                .iter()
+                .map(|page| page.length)
+                .sum::<u64>(),
+            3
+        );
+
+        let batches = store
+            .scan_with_staged(&ds, std::slice::from_ref(&staged), None, None)
+            .await
+            .unwrap();
+        assert_eq!(collect_ids(&batches), vec!["xia", "yan", "zoe"]);
+        assert_eq!(concat_batches(&schema, &batches).unwrap(), expected);
+
+        let new_ds = store
+            .commit_staged(Arc::new(ds.clone()), staged)
+            .await
+            .unwrap();
+        assert_eq!(new_ds.version().version, pre_version + 1);
+        let after = store.scan_batches(&new_ds).await.unwrap();
+        assert_eq!(collect_ids(&after), vec!["xia", "yan", "zoe"]);
+        assert_eq!(concat_batches(&schema, &after).unwrap(), expected);
+    }
 }
 
 /// With no batch at all the overwrite carries no fragment and keeps the
@@ -2474,7 +2611,7 @@ async fn stage_overwrite_batches_with_no_batch_empties_the_table_keeping_its_sch
     let pre_version = ds.version().version;
 
     let staged = store
-        .stage_overwrite_batches(&ds, Vec::new())
+        .stage_overwrite_batches(&ds, Vec::new(), WriteBudget::default(), 4)
         .await
         .unwrap();
     assert!(staged.new_fragments().is_empty());
@@ -2495,6 +2632,275 @@ async fn stage_overwrite_batches_with_no_batch_empties_the_table_keeping_its_sch
         arrow_schema::Schema::from(ds.schema()),
         "an overwrite without a batch keeps the committed schema"
     );
+}
+
+/// Ids in scan order, unsorted: the order the fragments were published in.
+fn ids_in_order(batches: &[RecordBatch]) -> Vec<String> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            (0..ids.len())
+                .map(|i| ids.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Several writers stage one overwrite: chunks of exactly the file target (4
+/// rows here, the 3-row batches sliced where they straddle it), one Lance call
+/// and file per chunk, staged and committed in chunk order, read back in input order.
+#[tokio::test]
+async fn stage_overwrite_batches_fans_out_writers_in_chunk_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    let pre_version = ds.version().version;
+    let expected: Vec<String> = (0..14).map(|i| format!("p{i:02}")).collect();
+    let mut inputs: Vec<RecordBatch> = expected
+        .chunks(3)
+        .map(|ids| {
+            person_batch(
+                &ids.iter()
+                    .map(|id| (id.as_str(), Some(1)))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    inputs.insert(3, person_batch(&[]));
+    assert_eq!(
+        super::overwrite_chunks(inputs.clone(), 4)
+            .iter()
+            .map(|chunk| chunk.iter().map(RecordBatch::num_rows).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        vec![vec![3, 1], vec![2, 2], vec![1, 3], vec![2]],
+        "each chunk holds exactly 4 rows, the straddling batch sliced"
+    );
+
+    let staged = store
+        .stage_overwrite_chunks(&ds, inputs, WriteBudget::default(), 3, 4)
+        .await
+        .unwrap();
+    assert!(matches!(
+        staged.transaction.operation,
+        Operation::Overwrite { .. }
+    ));
+    let staged_rows: Vec<usize> = staged
+        .new_fragments()
+        .iter()
+        .map(|fragment| fragment.physical_rows.unwrap_or(0))
+        .collect();
+    assert_eq!(
+        staged_rows,
+        vec![4, 4, 4, 2],
+        "one file per chunk, in chunk order"
+    );
+    assert!(
+        staged
+            .new_fragments()
+            .iter()
+            .all(|fragment| fragment.files.len() == 1)
+    );
+    assert_eq!(
+        staged
+            .new_fragments()
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
+    let before_commit = store
+        .scan_with_staged(&ds, std::slice::from_ref(&staged), None, None)
+        .await
+        .unwrap();
+    assert_eq!(ids_in_order(&before_commit), expected);
+    assert_eq!(ds.version().version, pre_version);
+
+    let new_ds = store
+        .commit_staged(Arc::new(ds.clone()), staged)
+        .await
+        .unwrap();
+    assert_eq!(new_ds.version().version, pre_version + 1);
+    let committed: Vec<(u64, usize)> = new_ds
+        .manifest
+        .fragments
+        .iter()
+        .map(|fragment| (fragment.id, fragment.physical_rows.unwrap_or(0)))
+        .collect();
+    assert_eq!(
+        committed.iter().map(|(_, rows)| *rows).collect::<Vec<_>>(),
+        vec![4, 4, 4, 2]
+    );
+    assert!(committed.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    assert_eq!(
+        new_ds.manifest.uses_stable_row_ids(),
+        ds.manifest.uses_stable_row_ids()
+    );
+    let after = store.scan_batches(&new_ds).await.unwrap();
+    assert_eq!(ids_in_order(&after), expected);
+}
+
+/// Chunks handed over out of source order, two writers in flight, are joined
+/// in `(partition, index)` order: one file per chunk, read back in source
+/// order before and after the commit.
+#[tokio::test]
+async fn stage_overwrite_stream_joins_chunks_in_partition_then_index_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    let pre_version = ds.version().version;
+    let chunk = |order: (u32, u64), ids: &[&str]| -> Result<super::OverwriteChunk, OmniError> {
+        let rows: Vec<(&str, Option<i32>)> = ids.iter().map(|id| (*id, Some(1))).collect();
+        Ok(super::OverwriteChunk {
+            order,
+            batches: vec![person_batch(&rows)],
+            lease: None,
+        })
+    };
+    let arrival = vec![
+        chunk((1, 0), &["d"]),
+        chunk((0, 1), &["c"]),
+        chunk((1, 1), &["e", "f"]),
+        chunk((0, 0), &["a", "b"]),
+    ];
+    let expected = ["a", "b", "c", "d", "e", "f"];
+
+    let staged = store
+        .stage_overwrite_stream(
+            &ds,
+            futures::stream::iter(arrival),
+            None,
+            WriteBudget::default(),
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        staged
+            .new_fragments()
+            .iter()
+            .map(|fragment| fragment.physical_rows.unwrap_or(0))
+            .collect::<Vec<_>>(),
+        vec![2, 1, 1, 2],
+        "one file per chunk, in (partition, index) order"
+    );
+    let before_commit = store
+        .scan_with_staged(&ds, std::slice::from_ref(&staged), None, None)
+        .await
+        .unwrap();
+    assert_eq!(ids_in_order(&before_commit), expected);
+    assert_eq!(ds.version().version, pre_version);
+
+    let new_ds = store
+        .commit_staged(Arc::new(ds.clone()), staged)
+        .await
+        .unwrap();
+    assert_eq!(new_ds.version().version, pre_version + 1);
+    let after = store.scan_batches(&new_ds).await.unwrap();
+    assert_eq!(ids_in_order(&after), expected);
+}
+
+/// Batches of two schemas are refused before any writer starts, as one Lance
+/// call refuses them (no data file written, HEAD stays), where Lance's own
+/// overwrite would publish a mixed table; a zero-row batch of another schema is dropped.
+#[tokio::test]
+async fn stage_overwrite_batches_refuses_mixed_schemas_before_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    let pre_version = ds.version().version;
+    let other_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, true),
+        Field::new("extra", DataType::Int32, true),
+    ]));
+    let other = RecordBatch::try_new(
+        Arc::clone(&other_schema),
+        vec![
+            Arc::new(StringArray::from(vec!["zed"])),
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Int32Array::from(vec![2])),
+        ],
+    )
+    .unwrap();
+    let other_empty = RecordBatch::new_empty(other_schema);
+    let inputs = vec![
+        person_batch(&[("a", Some(1)), ("b", Some(2))]),
+        person_batch(&[("c", Some(3)), ("d", Some(4))]),
+        other,
+    ];
+
+    let data_files = || {
+        std::fs::read_dir(format!("{uri}/data"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "lance"))
+            .count()
+    };
+    let before = data_files();
+
+    let error = store
+        .stage_overwrite_chunks(&ds, inputs, WriteBudget::default(), 2, 2)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("one schema"), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("field `extra` Int32 in one batch only"),
+        "{error}"
+    );
+    assert_eq!(data_files(), before, "no chunk was written");
+    assert_eq!(ds.version().version, pre_version);
+    assert_eq!(
+        Dataset::open(&uri).await.unwrap().version().version,
+        pre_version
+    );
+
+    let staged = store
+        .stage_overwrite_chunks(
+            &ds,
+            vec![
+                other_empty,
+                person_batch(&[("a", Some(1)), ("b", Some(2))]),
+                person_batch(&[("c", Some(3)), ("d", Some(4))]),
+            ],
+            WriteBudget::default(),
+            2,
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        staged
+            .new_fragments()
+            .iter()
+            .map(|fragment| fragment.physical_rows.unwrap_or(0))
+            .collect::<Vec<_>>(),
+        vec![2, 2],
+        "the zero-row batch of another schema is dropped"
+    );
+    let new_ds = store
+        .commit_staged(Arc::new(ds.clone()), staged)
+        .await
+        .unwrap();
+    assert_eq!(new_ds.schema().fields.len(), 2);
+    let after = store.scan_batches(&new_ds).await.unwrap();
+    assert_eq!(ids_in_order(&after), ["a", "b", "c", "d"]);
 }
 
 /// A mixed BTREE + FTS + full-table vector batch writes immutable index files

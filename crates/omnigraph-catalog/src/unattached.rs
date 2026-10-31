@@ -258,11 +258,18 @@ impl UnattachedCommit {
     }
 
     /// The snapshot's view, labelled with its physical coordinate.
-    pub fn snapshot(&self, root_uri: &str) -> Result<crate::Snapshot> {
+    /// Its reads go through the store registry of `session`, the reading
+    /// handle's control session.
+    pub fn snapshot(
+        &self,
+        root_uri: &str,
+        session: &Arc<lance::session::Session>,
+    ) -> Result<crate::Snapshot> {
         let mut snapshot = self.record.snapshot_as(
             root_uri,
             self.detached_version,
             self.property.native_branch.as_deref(),
+            session,
         )?;
         snapshot.graph_branch = self.property.graph_branch.clone();
         Ok(snapshot)
@@ -352,9 +359,13 @@ pub async fn release_unattached_tag(dataset: &Dataset, name: &str) -> Result<()>
 
 /// Delete a reserved candidate tag and confirm its absence by a read: a
 /// tag still listed, or a read that fails, leaves the release in doubt.
-pub async fn release_unattached_tag_confirmed(dataset: &Dataset, name: &str) -> Result<()> {
+pub async fn release_unattached_tag_confirmed(
+    dataset: &Dataset,
+    name: &str,
+    graph_commit_id: &str,
+) -> Result<()> {
     release_unattached_tag(dataset, name).await?;
-    confirm_tag_released(dataset, name).await
+    confirm_tag_released(dataset, name, graph_commit_id).await
 }
 
 /// Reads snapshots against one captured tag inventory, sharing ancestry and
@@ -884,10 +895,20 @@ impl ManifestCoordinator {
         let main =
             open_manifest_dataset_native_with_session(root_uri, None, control_session).await?;
         for descendant in descendants {
-            release_unattached_tag_confirmed(&main, &descendant.tag_name()).await?;
+            release_unattached_tag_confirmed(
+                &main,
+                &descendant.tag_name(),
+                &descendant.property.graph_commit_id,
+            )
+            .await?;
             fail(&UNATTACHED_DROP_POST_DESCENDANT_PRE_PARENT)?;
         }
-        release_unattached_tag_confirmed(&main, &candidate.tag_name()).await
+        release_unattached_tag_confirmed(
+            &main,
+            &candidate.tag_name(),
+            &candidate.property.graph_commit_id,
+        )
+        .await
     }
 }
 
@@ -913,18 +934,21 @@ fn descend<'a>(
     Ok(())
 }
 
-/// The deletion of the candidate tag `name`, confirmed by a read: a tag
-/// still listed, or a read that fails, leaves the release in doubt.
-async fn confirm_tag_released(main: &Dataset, name: &str) -> Result<()> {
+/// The deletion of the candidate tag `name`, which addresses graph commit
+/// `graph_commit_id`, confirmed by a read: a tag still listed, or a read that
+/// fails, leaves the release in doubt.
+async fn confirm_tag_released(main: &Dataset, name: &str, graph_commit_id: &str) -> Result<()> {
     match main.tags().get(name).await {
-        Ok(_) => Err(OmniError::manifest_publish_in_doubt(format!(
-            "the candidate tag '{name}' is still listed after its deletion"
-        ))),
+        Ok(_) => Err(OmniError::manifest_publish_in_doubt(
+            graph_commit_id,
+            format!("the candidate tag '{name}' is still listed after its deletion"),
+        )),
         Err(lance::Error::RefNotFound { .. }) => Ok(()),
         Err(error) if error.is_not_found() => Ok(()),
-        Err(error) => Err(OmniError::manifest_publish_in_doubt(format!(
-            "the deletion of the candidate tag '{name}' could not be confirmed: {error}"
-        ))),
+        Err(error) => Err(OmniError::manifest_publish_in_doubt(
+            graph_commit_id,
+            format!("the deletion of the candidate tag '{name}' could not be confirmed: {error}"),
+        )),
     }
 }
 

@@ -1,0 +1,1 @@
+- A `load csv` overwrite writes its Lance fragments while the rows drain instead of after validation, and a refused load leaves no fragment behind. LDBC SF30 loads 1.2× faster.

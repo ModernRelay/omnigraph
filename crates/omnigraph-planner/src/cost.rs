@@ -532,18 +532,77 @@ impl ValidateAccess {
     }
 }
 
-/// Accepted row counts and complete usable BTREE coverage for a validation's
-/// filter columns. Partial or unknown coverage earns no index discount.
+/// Whether a load validation finds the ids an overwrite removes, committed
+/// ids absent from the delta: one projected scan of the committed id column,
+/// or none, when no planned check consumes them. An empty committed table
+/// removes nothing, so its retained-edge checks are not planned and the scan
+/// is not either; append and merge remove nothing by definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidateRemoval {
+    #[default]
+    Scan,
+    None,
+}
+
+impl ValidateRemoval {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scan => "scan",
+            Self::None => "none",
+        }
+    }
+}
+
+/// Where an edge load's endpoint checks probe the committed node ids: on the
+/// parse partitions as the delta arrives (`Swept`), when both endpoint checks
+/// read their committed set whole (`Scan`) and both node types carry one
+/// integer `@key`, so the sets load beside the parse and each partition keeps
+/// its earliest miss; or after the drain on one thread (`Judged`), the route a
+/// `Probe` needs, since it reads `id IN (delta values)`, and the route a text
+/// key set keeps, since the delta values bound it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointProbe {
+    Swept,
+    Judged,
+}
+
+impl EndpointProbe {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Swept => "swept",
+            Self::Judged => "judged",
+        }
+    }
+}
+
+/// Usable BTREE coverage of a validation's filter columns. Fragment counts
+/// cannot estimate row work for partially covered tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidateIndexCoverage {
+    Absent,
+    Full,
+    Partial,
+}
+
+/// Accepted row counts and usable BTREE coverage for a validation's filter columns.
 #[derive(Debug, Clone, Copy)]
 pub struct ValidateCostInputs {
     pub input_rows: Option<u64>,
     pub consulted_rows: Option<u64>,
-    pub indexed: bool,
+    pub index_coverage: ValidateIndexCoverage,
 }
 
 impl ValidateCostInputs {
-    /// Estimated row work: probe, scan and filtered-scan calls. Indexed
-    /// lookup uses the same per-row factor as dependent-scan selection.
+    /// Estimated row work: probe, scan and filtered-scan calls. A probe first
+    /// builds its key list, one entry per input row, then an indexed lookup
+    /// pays the dependent-scan per-row factor and an unindexed one reads the
+    /// table once per call. Partial coverage is costed as a full index: the
+    /// filtered read serves the covered fragments through the index and scans
+    /// the rest, at most one table read more than the estimate, so the probe
+    /// is kept only while its key list is small against the table.
     pub fn costs(self, check: &ValidateCheck) -> Option<(u64, u64, u64)> {
         let (input, table) = (self.input_rows?, self.consulted_rows?);
         let calls = if matches!(check, ValidateCheck::Unique { .. }) {
@@ -551,18 +610,21 @@ impl ValidateCostInputs {
         } else {
             u64::from(input > 0)
         };
-        let probe = if self.indexed {
+        let lookup = if self.index_coverage != ValidateIndexCoverage::Absent {
             input.saturating_mul(HASH_JOIN_RATIO)
         } else {
             table.saturating_mul(calls).saturating_add(input)
         };
+        let probe = lookup.saturating_add(input);
         let scan = table.saturating_add(input);
         Some((probe, scan, calls))
     }
 }
 
 /// Pick the cheaper supported access. Ties and unknown statistics retain
-/// Probe; cardinality and retained-edge checks only implement Probe.
+/// Probe; cardinality and retained-edge checks only implement Probe, apart
+/// from an overwrite's cardinality scan under a minimum, which the optimizer
+/// chooses before costing.
 pub fn choose_validate_access(check: &ValidateCheck, inputs: ValidateCostInputs) -> ValidateAccess {
     if matches!(
         check,
@@ -596,16 +658,46 @@ mod tests {
         let inputs = ValidateCostInputs {
             input_rows: Some(8193),
             consulted_rows: Some(1_000_000),
-            indexed: false,
+            index_coverage: ValidateIndexCoverage::Absent,
         };
-        assert_eq!(inputs.costs(&endpoint), Some((1_008_193, 1_008_193, 1)));
-        assert_eq!(inputs.costs(&unique), Some((2_008_193, 1_008_193, 2)));
+        assert_eq!(inputs.costs(&endpoint), Some((1_016_386, 1_008_193, 1)));
+        assert_eq!(inputs.costs(&unique), Some((2_016_386, 1_008_193, 2)));
         assert_eq!(
             choose_validate_access(&endpoint, inputs),
+            ValidateAccess::Scan
+        );
+        let indexed = ValidateCostInputs {
+            index_coverage: ValidateIndexCoverage::Full,
+            consulted_rows: Some(1024),
+            input_rows: Some(2),
+        };
+        assert_eq!(indexed.costs(&endpoint), Some((18, 1026, 1)));
+        assert_eq!(
+            choose_validate_access(&endpoint, indexed),
             ValidateAccess::Probe
         );
         assert_eq!(
             choose_validate_access(&unique, inputs),
+            ValidateAccess::Scan
+        );
+        let partial = ValidateCostInputs {
+            index_coverage: ValidateIndexCoverage::Partial,
+            ..inputs
+        };
+        assert_eq!(partial.costs(&endpoint), Some((73_737, 1_008_193, 1)));
+        assert_eq!(partial.costs(&unique), Some((73_737, 1_008_193, 2)));
+        assert_eq!(
+            choose_validate_access(&endpoint, partial),
+            ValidateAccess::Probe
+        );
+        let partial_large = ValidateCostInputs {
+            input_rows: Some(200),
+            consulted_rows: Some(65),
+            index_coverage: ValidateIndexCoverage::Partial,
+        };
+        assert_eq!(partial_large.costs(&endpoint), Some((1_800, 265, 1)));
+        assert_eq!(
+            choose_validate_access(&endpoint, partial_large),
             ValidateAccess::Scan
         );
         let unknown = ValidateCostInputs {

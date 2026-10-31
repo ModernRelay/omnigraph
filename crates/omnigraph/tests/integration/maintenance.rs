@@ -17,8 +17,9 @@ use lance_core::datatypes::BlobHandling;
 use omnigraph::IndexCoverage;
 use omnigraph::db::{
     CleanupPolicyOptions, MergeOutcome, Omnigraph, ReadTarget, RepairAction, RepairClassification,
-    RepairOptions,
+    RepairOptions, SnapshotId,
 };
+use omnigraph::error::{BranchStartRefusal, OmniError};
 use omnigraph::loader::LoadMode;
 use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 
@@ -483,7 +484,11 @@ node Doc {
         .pending_indexes;
     assert_eq!(deferred.len(), 1);
     assert_eq!(deferred[0].property, "slug");
-    assert!(deferred[0].reason.contains("rebuild-full-text-indexes"));
+    assert!(
+        deferred[0]
+            .reason
+            .contains("omnigraph index rebuild --kind full-text")
+    );
     let commits_before = db.list_commits(None).await.unwrap().len();
     for _ in 0..2 {
         let repeated = db.optimize().await.unwrap();
@@ -1927,6 +1932,158 @@ async fn full_text_rebuild_replaces_all_columns_and_segments_in_one_publication(
     );
 }
 
+/// An index build on a branch builds the declared indexes a type whose first
+/// rows landed there lacks, rebuilds a BTREE whose coverage lags the branch's
+/// new rows, and publishes both in one commit on that branch, attributed to
+/// its actor. Full-text coverage is pending with the rebuild that refreshes
+/// it; main keeps its registrations and history; a second run publishes
+/// nothing.
+#[tokio::test]
+async fn index_build_on_a_branch_builds_missing_and_lagging_indexes_issue_840() {
+    use omnigraph::db::{BuiltIndex, BuiltIndexAction, BuiltIndexKind};
+
+    let dir = tempfile::tempdir().unwrap();
+    let schema =
+        format!("{TEST_SCHEMA}\nnode Tag {{\n    slug: String @key\n    rank: I64 @index\n}}\n");
+    let db = helpers::init_and_load_with_schema(&dir, &schema).await;
+    db.branch_create("feature").await.unwrap();
+    db.load(
+        "feature",
+        concat!(
+            r#"{"type":"Tag","data":{"slug":"graphs","rank":1}}"#,
+            "\n",
+            r#"{"type":"Tag","data":{"slug":"search","rank":2}}"#,
+            "\n",
+            r#"{"type":"Person","data":{"name":"Eve","age":41}}"#,
+        ),
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let main_before = snapshot_main(&db).await.unwrap();
+    let main_commits_before = db.list_commits(None).await.unwrap();
+    let feature_before = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
+    let tag = feature_before.open_dataset("node:Tag").await.unwrap();
+    assert!(!tag.has_btree_index("__id").await.unwrap());
+    assert!(!tag.has_btree_index("rank").await.unwrap());
+    assert!(matches!(
+        feature_before
+            .open_dataset("node:Person")
+            .await
+            .unwrap()
+            .index_coverage("__id")
+            .await
+            .unwrap(),
+        IndexCoverage::Degraded { .. }
+    ));
+
+    let result = db
+        .ensure_indices_on_as("feature", Some("act-indexer"))
+        .await
+        .unwrap();
+    let built = |type_key: &str, property: &str, kind, action| BuiltIndex {
+        type_key: type_key.to_string(),
+        property: property.to_string(),
+        kind,
+        action,
+    };
+    assert_eq!(result.branch, "feature");
+    assert_eq!(
+        result.indexes,
+        vec![
+            built(
+                "node:Person",
+                "__id",
+                BuiltIndexKind::Btree,
+                BuiltIndexAction::Refreshed
+            ),
+            built(
+                "node:Tag",
+                "__id",
+                BuiltIndexKind::Btree,
+                BuiltIndexAction::Built
+            ),
+            built(
+                "node:Tag",
+                "rank",
+                BuiltIndexKind::Btree,
+                BuiltIndexAction::Built
+            ),
+            built(
+                "node:Tag",
+                "slug",
+                BuiltIndexKind::FullText,
+                BuiltIndexAction::Built
+            ),
+        ]
+    );
+    assert_eq!(result.pending.len(), 1, "{:?}", result.pending);
+    assert_eq!(result.pending[0].type_key, "node:Person");
+    assert_eq!(result.pending[0].property, "name");
+    assert!(
+        result.pending[0]
+            .reason
+            .contains(&omnigraph::error::FULL_TEXT_REBUILD_COMMAND.replace("<branch>", "feature")),
+        "{}",
+        result.pending[0].reason
+    );
+
+    let feature_after = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
+    let tag = feature_after.open_dataset("node:Tag").await.unwrap();
+    for column in ["__id", "rank"] {
+        assert!(
+            matches!(
+                tag.index_coverage(column).await.unwrap(),
+                IndexCoverage::Indexed
+            ),
+            "{column}"
+        );
+    }
+    assert!(matches!(
+        feature_after
+            .open_dataset("node:Person")
+            .await
+            .unwrap()
+            .index_coverage("__id")
+            .await
+            .unwrap(),
+        IndexCoverage::Indexed
+    ));
+    let feature_commits = db.list_commits(Some("feature")).await.unwrap();
+    assert_eq!(
+        result.graph_commit_id.as_deref(),
+        Some(feature_commits[0].graph_commit_id.as_str())
+    );
+    assert_eq!(feature_commits[0].actor_id.as_deref(), Some("act-indexer"));
+
+    let main_after = snapshot_main(&db).await.unwrap();
+    for table_key in [
+        "node:Person",
+        "node:Company",
+        "node:Tag",
+        "edge:Knows",
+        "edge:WorksAt",
+    ] {
+        assert_same_dataset_entry(
+            main_before.dataset(table_key).unwrap(),
+            main_after.dataset(table_key).unwrap(),
+        );
+    }
+    assert_eq!(db.list_commits(None).await.unwrap(), main_commits_before);
+
+    let again = db
+        .ensure_indices_on_as("feature", Some("act-indexer"))
+        .await
+        .unwrap();
+    assert_eq!(again.graph_commit_id, None);
+    assert!(again.indexes.is_empty(), "{:?}", again.indexes);
+    assert_eq!(again.pending, result.pending);
+    assert_eq!(
+        db.list_commits(Some("feature")).await.unwrap(),
+        feature_commits
+    );
+}
+
 /// A branch rebuild stages a detached pin on the inherited location; main's
 /// registrations and rows stay as they were.
 #[tokio::test]
@@ -2337,6 +2494,74 @@ async fn cleanup_preserves_main_version_pinned_by_live_lazy_branch() {
         count_rows_branch(&db, "feature", "node:Person").await,
         feature_people_before,
         "time-only cleanup must honor the same live lazy-branch floor"
+    );
+}
+
+/// A branch started at a past commit keeps that commit retained: its first
+/// `__manifest` version is its base, which cleanup always retains with every
+/// table version it pins. A commit whose table versions cleanup reclaimed
+/// starts no branch: the refusal names the reclaimed table, and nothing is
+/// created.
+#[tokio::test]
+async fn cleanup_retains_the_commit_a_branch_starts_at() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let loaded = db.list_commits(Some("main")).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 40)]),
+    )
+    .await
+    .unwrap();
+    let eve = db.list_commits(Some("main")).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    add_person_fragments(&db).await;
+    let at = |id: &str| ReadTarget::snapshot(SnapshotId::new(id));
+
+    db.branch_create_from(at(&loaded), "at-load").await.unwrap();
+    let people_at_load = count_rows_branch(&db, "at-load", "node:Person").await;
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        count_rows_branch(&db, "at-load", "node:Person").await,
+        people_at_load,
+        "the branch's base keeps the commit's table versions"
+    );
+    db.branch_create_from(at(&loaded), "again")
+        .await
+        .expect("a commit a live branch starts at stays retained");
+
+    let refused = db
+        .branch_create_from(at(&eve), "at-eve")
+        .await
+        .expect_err("cleanup reclaimed the Person version Eve's commit pins")
+        .into_completion_evidence()
+        .0;
+    assert!(
+        matches!(
+            &refused,
+            OmniError::BranchStartRefused {
+                graph_commit_id,
+                reason: BranchStartRefusal::NotRetained { table_key, .. },
+            } if graph_commit_id == &eve && table_key == "node:Person"
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        !db.branch_list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|branch| branch == "at-eve")
     );
 }
 

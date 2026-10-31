@@ -11,7 +11,7 @@ use omnigraph_api_types::{
     BranchMergeOutcome, BranchOutcomeOutput, ChangeOutput, ChangeRequest, HTTP_API_CONTRACT,
     HTTP_API_CONTRACT_HEADER, IngestRequest, QueryRequest, ReadOutput, SchemaOutput,
 };
-use omnigraph_compiler::query::ast::show_statement_name;
+use omnigraph_compiler::query::ast::{BranchCreateFrom, show_statement_name};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -66,6 +66,12 @@ pub fn admit_served(case: &Case) -> Result<(), String> {
     }
     if case.traversal.is_some() {
         refused.push("the `# traversal:` pin".to_string());
+    }
+    if case.csv_slice_bytes.is_some() {
+        refused.push("the `# csv_slice_bytes:` pin".to_string());
+    }
+    if case.overwrite_chunk_rows.is_some() {
+        refused.push("the `# overwrite_chunk_rows:` pin".to_string());
     }
     if case.needs_indices {
         refused.push("queries that need indices (search, fuzzy, nearest, rrf)".to_string());
@@ -714,12 +720,21 @@ fn control_statement(write: &ControlWrite, bindings: &Bindings) -> Result<String
     Ok(match write {
         ControlWrite::Create {
             name,
-            from: Some(parent),
+            from: Some(BranchCreateFrom::Branch(parent)),
             ..
         } => format!(
             "branch create {} from {}",
             branch_name(name),
             branch_name(parent)
+        ),
+        ControlWrite::Create {
+            name,
+            from: Some(BranchCreateFrom::Commit(commit)),
+            ..
+        } => format!(
+            "branch create {} from commit {}",
+            branch_name(name),
+            string_literal(&resolve_operand(commit, bindings)?)
         ),
         ControlWrite::Create { name, .. } => format!("branch create {}", branch_name(name)),
         ControlWrite::Delete { name, .. } => format!("branch delete {}", branch_name(name)),

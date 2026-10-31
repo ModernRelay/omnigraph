@@ -49,6 +49,133 @@ fn cluster_e2e_azure_live_apply_without_restart() {
     live_apply_changes_schema_queries_and_adds_graph_without_restart(Some(&root));
 }
 
+/// With no server, an inline S3 root takes the stopped-writer doors a local
+/// root has: deploy, observe and replay by ID, unlock by exact ID, and run
+/// direct maintenance on one of its graphs (#1163, #1082).
+#[test]
+fn cluster_e2e_s3_direct_root_deploys_unlocks_and_maintains_issue_1163() {
+    let Ok(bucket) = std::env::var("OMNIGRAPH_S3_TEST_BUCKET") else {
+        eprintln!("skipping s3 direct root: OMNIGRAPH_S3_TEST_BUCKET is not set");
+        return;
+    };
+    let prefix = std::env::var("OMNIGRAPH_S3_TEST_PREFIX")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "omnigraph-itests".into());
+    let root = format!(
+        "s3://{bucket}/{prefix}/direct-root/{}",
+        uuid::Uuid::new_v4()
+    );
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let rooted = |args: &[&str]| {
+        let mut command = cli();
+        command.args(["--target", &root]).args(args);
+        command
+    };
+    let status = || {
+        parse_stdout_json(&output_success(&mut rooted(&[
+            "cluster", "status", "--json",
+        ])))
+    };
+    let unlock = |lock_id: &str| {
+        let unlocked = parse_stdout_json(&output_success(&mut rooted(&[
+            "cluster",
+            "force-unlock",
+            lock_id,
+            "--json",
+        ])));
+        assert_eq!(unlocked["unlocked"], true, "{unlocked}");
+    };
+
+    let output = output_success(
+        rooted(&[
+            "--as",
+            "act-cluster-test",
+            "cluster",
+            "apply",
+            "--json",
+            "--config",
+        ])
+        .arg(temp.path()),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("direct root") && stderr.contains("provider=S3"),
+        "{stderr}"
+    );
+    let deployed = parse_stdout_json(&output);
+    assert_eq!(deployed["status"], "complete", "{deployed}");
+    assert_eq!(deployed["result"]["converged"], true, "{deployed}");
+    let id = deployed["result"]["id"].as_str().unwrap();
+
+    let observed = parse_stdout_json(&output_success(&mut rooted(&[
+        "cluster",
+        "status",
+        "--deployment-id",
+        id,
+        "--json",
+    ])));
+    assert_eq!(observed["lookup"], deployed);
+    let lock_id = observed["lock_id"].as_str().unwrap().to_owned();
+    let replayed = parse_stdout_json(&output_success(&mut rooted(&[
+        "cluster",
+        "apply",
+        "--deployment-id",
+        id,
+        "--writers-stopped",
+        "--json",
+    ])));
+    assert_eq!(replayed, deployed, "a terminal ID is lookup only");
+    unlock(&lock_id);
+
+    let plan = parse_stdout_json(&output_success(
+        rooted(&["cluster", "plan", "--json", "--config"]).arg(temp.path()),
+    ));
+    assert!(plan["changes"].as_array().unwrap().is_empty(), "{plan}");
+
+    // A non-local cleanup still needs --yes, and refuses before admission.
+    let unconfirmed = output_failure(&mut rooted(&[
+        "cleanup",
+        "--graph",
+        "knowledge",
+        "--keep",
+        "1",
+        "--confirm",
+        "--json",
+    ]));
+    assert!(
+        String::from_utf8_lossy(&unconfirmed.stdout).contains("refusing destructive `cleanup`")
+            || String::from_utf8_lossy(&unconfirmed.stderr)
+                .contains("refusing destructive `cleanup`"),
+        "{unconfirmed:?}"
+    );
+    assert!(status()["lock_id"].is_null());
+
+    for maintenance in [
+        vec!["optimize", "--graph", "knowledge", "--json"],
+        vec![
+            "cleanup",
+            "--graph",
+            "knowledge",
+            "--keep",
+            "1",
+            "--confirm",
+            "--yes",
+            "--json",
+        ],
+    ] {
+        output_success(&mut rooted(&maintenance));
+        let retained = status();
+        unlock(
+            retained["lock_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{maintenance:?} retains its lock: {retained}")),
+        );
+    }
+    assert!(status()["lock_id"].is_null());
+}
+
 fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root: Option<&str>) {
     use std::sync::{
         Arc,
@@ -75,49 +202,13 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
     let root = storage_root
         .map(str::to_owned)
         .unwrap_or_else(|| format!("file://{}", temp.path().display()));
-    let initial = parse_stdout_json(&output_success(
-        cli()
-            .args(["cluster", "apply", "--config"])
-            .arg(temp.path())
-            .arg("--json"),
-    ));
-    assert_eq!(initial["status"], "complete", "{initial}");
-    assert_eq!(initial["result"]["converged"], true, "{initial}");
-    let unlock = || {
-        let status = parse_stdout_json(&output_success(cli().args([
-            "--cluster",
-            &root,
-            "cluster",
-            "status",
-            "--json",
-        ])));
-        let lock = status["lock_id"]
-            .as_str()
-            .expect("direct owner retains exact lock");
-        output_success(cli().args([
-            "--cluster",
-            &root,
-            "cluster",
-            "force-unlock",
-            lock,
-            "--json",
-        ]));
-    };
-    unlock();
+    bootstrap_cluster_fixture(temp.path(), &root);
+    let unlock = || unlock_storage_fixture(&root);
     fs::write(
         temp.path().join("seed.jsonl"),
         "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":31}}\n",
     )
     .unwrap();
-    output_success(
-        cli()
-            .args(["--as", "act-live", "load", "--data"])
-            .arg(temp.path().join("seed.jsonl"))
-            .args(["--mode", "merge"])
-            .arg(format!("{root}/graphs/knowledge.omni")),
-    );
-    unlock();
-
     let bindings = storage_root.is_none().then(LiveBindingsFixture::new);
     let mut server_env = vec![(
         "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
@@ -127,6 +218,20 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
         server_env.extend(bindings.envs());
     }
     let server = spawn_server_with_cluster_env(temp.path(), &server_env);
+    output_success(
+        cli()
+            .envs(server.credential("live-deployment-token"))
+            .args(["load", "--data"])
+            .arg(temp.path().join("seed.jsonl"))
+            .args([
+                "--mode",
+                "merge",
+                "--target",
+                KEYED_SERVER_NAME,
+                "--graph",
+                "knowledge",
+            ]),
+    );
     let original_pid = server.id();
     let original_url = server.base_url.clone();
     let stop = Arc::new(AtomicBool::new(false));
@@ -181,7 +286,13 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
     fs::write(temp.path().join("cluster.yaml"), format!("{config}  tools:\n    schema: ./tools.pg\n    queries:\n      tools:\n        file: ./tools.gq\n{policies}")).unwrap();
     let output = cli()
         .envs(server.credential("live-deployment-token"))
-        .args(["cluster", "apply", "--server", &server.base_url, "--config"])
+        .args([
+            "cluster",
+            "apply",
+            "--target",
+            KEYED_SERVER_NAME,
+            "--config",
+        ])
         .arg(temp.path())
         .arg("--json")
         .timeout(Duration::from_secs(30))
@@ -251,8 +362,8 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
             .args([
                 "cluster",
                 "status",
-                "--server",
-                &server.base_url,
+                "--target",
+                KEYED_SERVER_NAME,
                 "--deployment-id",
                 id,
                 "--json",
@@ -268,8 +379,8 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
             .args([
                 "cluster",
                 "apply",
-                "--server",
-                &server.base_url,
+                "--target",
+                KEYED_SERVER_NAME,
                 "--deployment-id",
                 id,
                 "--config",
@@ -286,8 +397,8 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
             .args([
                 "cluster",
                 "apply",
-                "--server",
-                &server.base_url,
+                "--target",
+                KEYED_SERVER_NAME,
                 "--deployment-id",
                 id,
                 "--config",
@@ -324,8 +435,8 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
         live_policy_cli(&server, "live-deployment-token").args([
             "cluster",
             "status",
-            "--server",
-            &server.base_url,
+            "--target",
+            KEYED_SERVER_NAME,
             "--deployment-id",
             boot_deployment,
             "--wait",
@@ -382,8 +493,8 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
                 .args([
                     "cluster",
                     "apply",
-                    "--server",
-                    &recovering.base_url,
+                    "--target",
+                    KEYED_SERVER_NAME,
                     "--config",
                 ])
                 .arg(temp.path())
@@ -411,8 +522,8 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
                     .args([
                         "cluster",
                         "apply",
-                        "--server",
-                        &recovering.base_url,
+                        "--target",
+                        KEYED_SERVER_NAME,
                         "--config",
                     ])
                     .arg(temp.path())
@@ -446,11 +557,11 @@ fn cluster_e2e_offline_deployment_has_root_only_receipts_and_explicit_unlock() {
             let mut command = cli();
             command.current_dir(temp.path());
             if root_first {
-                command.args(["--cluster", &root]);
+                command.args(["--target", &root]);
             }
             command.arg("cluster").args(args);
             if !root_first {
-                command.args(["--cluster", &root]);
+                command.args(["--target", &root]);
             }
             command
         };
@@ -483,7 +594,15 @@ fn cluster_e2e_offline_deployment_has_root_only_receipts_and_explicit_unlock() {
         fs::write(temp.path().join("people.gq"), "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.bio } }\n").unwrap();
         let output = output_success(
             cli()
-                .args(["--as", "operator:deploy", "cluster", "apply", "--config"])
+                .args([
+                    "--target",
+                    &root,
+                    "--as",
+                    "operator:deploy",
+                    "cluster",
+                    "apply",
+                    "--config",
+                ])
                 .arg(temp.path())
                 .arg("--json"),
         );
@@ -520,7 +639,7 @@ fn cluster_e2e_offline_deployment_has_root_only_receipts_and_explicit_unlock() {
             "missing.json",
             "--json",
         ]));
-        assert_eq!(refused.status.code(), Some(2));
+        assert_eq!(refused.status.code(), Some(64));
         assert!(String::from_utf8_lossy(&refused.stderr).contains("unexpected argument"));
         for args in [
             vec!["cluster", "upgrade-ledger", "--writers-stopped"],
@@ -534,8 +653,8 @@ fn cluster_e2e_offline_deployment_has_root_only_receipts_and_explicit_unlock() {
             ],
         ] {
             let missing_root = output_failure(cli().current_dir(temp.path()).args(args));
-            assert_eq!(missing_root.status.code(), Some(2));
-            assert!(String::from_utf8_lossy(&missing_root.stderr).contains("requires --cluster"));
+            assert!(!missing_root.status.success());
+            assert!(String::from_utf8_lossy(&missing_root.stderr).contains("target"));
         }
         for unsupported_flag in [
             vec!["--no-wait"],
@@ -545,14 +664,17 @@ fn cluster_e2e_offline_deployment_has_root_only_receipts_and_explicit_unlock() {
             let output = output_failure(
                 rooted(&["apply", "--deployment-id", id, "--json"]).args(&unsupported_flag),
             );
-            assert_eq!(output.status.code(), Some(2));
+            assert!(!output.status.success());
             let expected = if unsupported_flag[0] == "--idempotency-key" {
-                "--plan and --idempotency-key require --managed"
+                "managed"
             } else {
-                "deployment wait options require --server"
+                "target"
             };
+            assert_eq!(output.status.code(), Some(2));
+            let refusal = parse_stdout_json(&output);
+            assert_eq!(refusal["code"], "target_incompatible");
             assert!(
-                String::from_utf8_lossy(&output.stderr).contains(expected),
+                refusal["error"].as_str().unwrap().contains(expected),
                 "{output:?}"
             );
         }
@@ -606,10 +728,8 @@ fn cluster_e2e_offline_deployment_has_root_only_receipts_and_explicit_unlock() {
         assert!(status["lock_id"].is_null());
         assert_eq!(status["next_sequence"], 3);
         let conflict = output_failure(&mut rooted(&["status", "--config", "."]));
-        assert_eq!(conflict.status.code(), Some(2));
-        assert!(
-            String::from_utf8_lossy(&conflict.stderr).contains("--cluster and explicit --config")
-        );
+        assert_eq!(conflict.status.code(), Some(64));
+        assert!(String::from_utf8_lossy(&conflict.stderr).contains("unexpected argument"));
     }
 }
 
@@ -630,7 +750,7 @@ fn cluster_e2e_apply_schema_query_and_noop_each_have_exact_receipts() {
     assert_ne!(first["result"]["id"], evolved["result"]["id"]);
     let schema = output_success(
         cli()
-            .args(["schema", "show"])
+            .args(["schema", "show", "--target"])
             .arg(temp.path().join("graphs/knowledge.omni")),
     );
     assert!(stdout_string(&schema).contains("bio"));
@@ -650,6 +770,8 @@ fn cluster_e2e_force_unlock_unblocks_apply() {
     let before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
     let refused = parse_stdout_json(&output_failure(
         cli()
+            .arg("--target")
+            .arg(temp.path())
             .args(["cluster", "apply", "--config"])
             .arg(temp.path())
             .arg("--json"),
@@ -676,6 +798,8 @@ fn cluster_e2e_lost_ledger_does_not_adopt_existing_graphs() {
     fs::remove_file(temp.path().join("__cluster/state.json")).unwrap();
     let refused = output_failure(
         cli()
+            .arg("--target")
+            .arg(temp.path())
             .args(["cluster", "apply", "--config"])
             .arg(temp.path())
             .arg("--json"),
@@ -709,6 +833,8 @@ fn cluster_e2e_destroyed_graph_is_not_silently_recreated() {
     .unwrap();
     let refused = output_failure(
         cli()
+            .arg("--target")
+            .arg(temp.path())
             .args(["cluster", "apply", "--config"])
             .arg(temp.path())
             .arg("--json"),
@@ -760,14 +886,14 @@ fn cluster_e2e_declared_graph_removal_deletes_owned_storage() {
                 "seed",
                 "-e",
                 "query seed() { insert Service { name: \"Deleted\" } }",
-                "--store",
+                "--target",
             ])
             .arg(&graph),
     );
     unlock_cluster_fixture(temp.path());
     output_success(
         cli()
-            .args(["branch", "create", "retained-history", "--uri"])
+            .args(["branch", "create", "retained-history", "--target"])
             .arg(&graph),
     );
     unlock_cluster_fixture(temp.path());
@@ -783,6 +909,8 @@ fn cluster_e2e_declared_graph_removal_deletes_owned_storage() {
     fs::write(&config, &source).unwrap();
     let plan = parse_stdout_json(&output_success(
         cli()
+            .arg("--target")
+            .arg(temp.path())
             .args(["cluster", "plan", "--config"])
             .arg(temp.path())
             .arg("--json"),
@@ -836,7 +964,7 @@ fn cluster_e2e_removed_v1_commands_are_not_executable() {
                 .args(["cluster", command, "--config"])
                 .arg(temp.path()),
         );
-        assert_eq!(refused.status.code(), Some(2));
+        assert_eq!(refused.status.code(), Some(64));
         assert!(String::from_utf8_lossy(&refused.stderr).contains("unrecognized subcommand"));
         assert!(!temp.path().join("__cluster").exists());
     }
@@ -859,13 +987,23 @@ fn cluster_e2e_payload_drift_requires_authoritative_restore() {
         .join(format!("{digest}.gq"));
     let expected = fs::read(&blob).unwrap();
     fs::remove_file(&blob).unwrap();
-    let status = cluster_json(temp.path(), "status");
+    let ledger_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+    let status = cluster_json(temp.path(), "observe");
+    assert_eq!(
+        fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+        ledger_before,
+        "observing payload drift must not alter authoritative state"
+    );
     assert!(
         status["diagnostics"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|diagnostic| diagnostic["code"] == "catalog_payload_missing"),
+            .any(|diagnostic| diagnostic["code"] == "catalog_payload_missing"
+                && diagnostic["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("restore the authoritative payload")),
         "{status}"
     );
     apply_cluster_fixture(temp.path());
@@ -876,7 +1014,7 @@ fn cluster_e2e_payload_drift_requires_authoritative_restore() {
     // Restore the authoritative immutable payload from backup; apply has no
     // repair override that could substitute a different policy or query.
     fs::write(&blob, &expected).unwrap();
-    let clean = cluster_json(temp.path(), "status");
+    let clean = cluster_json(temp.path(), "observe");
     assert!(
         clean["diagnostics"]
             .as_array()
@@ -894,7 +1032,13 @@ fn live_apply(config_dir: &std::path::Path, server: &TestServer, token: &str) ->
     let mut command = cli();
     command
         .envs(server.credential(token))
-        .args(["cluster", "apply", "--server", &server.base_url, "--config"])
+        .args([
+            "cluster",
+            "apply",
+            "--target",
+            KEYED_SERVER_NAME,
+            "--config",
+        ])
         .arg(config_dir)
         .arg("--json")
         .timeout(std::time::Duration::from_secs(30));
@@ -929,8 +1073,8 @@ fn assert_live_tool_data(server: &TestServer) {
         live_policy_cli(server, "live-deployment-token").args([
             "query",
             "tools",
-            "--server",
-            &server.base_url,
+            "--target",
+            KEYED_SERVER_NAME,
             "--graph",
             "tools",
             "--json",
@@ -945,8 +1089,8 @@ fn assert_live_person_query(server: &TestServer) {
         live_policy_cli(server, "live-deployment-token").args([
             "query",
             "find_person",
-            "--server",
-            &server.base_url,
+            "--target",
+            KEYED_SERVER_NAME,
             "--graph",
             "knowledge",
             "--params",
@@ -976,8 +1120,8 @@ fn live_graph_removal_deletes_owned_storage(
     output_success(live_policy_cli(server, "live-deployment-token").args([
         "mutate",
         "seed",
-        "--server",
-        &server.base_url,
+        "--target",
+        KEYED_SERVER_NAME,
         "--graph",
         "tools",
         "-e",
@@ -1000,8 +1144,8 @@ fn live_graph_removal_deletes_owned_storage(
     output_success(live_policy_cli(server, "live-deployment-token").args([
         "mutate",
         "seed",
-        "--server",
-        &server.base_url,
+        "--target",
+        KEYED_SERVER_NAME,
         "--graph",
         "retired",
         "-e",
@@ -1017,7 +1161,13 @@ fn live_graph_removal_deletes_owned_storage(
     let deleted_before = live_snapshot(server, "retired");
     live_policy_expect_forbidden(
         live_policy_cli(server, "reader-token")
-            .args(["cluster", "apply", "--server", &server.base_url, "--config"])
+            .args([
+                "cluster",
+                "apply",
+                "--target",
+                KEYED_SERVER_NAME,
+                "--config",
+            ])
             .arg(config_dir)
             .arg("--json"),
     );
@@ -1031,7 +1181,7 @@ fn live_graph_removal_deletes_owned_storage(
     // either the ledger or the graph's readable data/history.
     let plan = parse_stdout_json(&output_success(
         live_policy_cli(server, "live-deployment-token")
-            .args(["cluster", "plan", "--server", &server.base_url, "--config"])
+            .args(["cluster", "plan", "--target", KEYED_SERVER_NAME, "--config"])
             .arg(config_dir)
             .arg("--json"),
     ));
@@ -1062,7 +1212,13 @@ fn live_graph_removal_deletes_owned_storage(
 
     let accepted = parse_stdout_json(&output_success(
         live_policy_cli(server, "live-deployment-token")
-            .args(["cluster", "apply", "--server", &server.base_url, "--config"])
+            .args([
+                "cluster",
+                "apply",
+                "--target",
+                KEYED_SERVER_NAME,
+                "--config",
+            ])
             .arg(config_dir)
             .args(["--no-wait", "--timeout", "30", "--json"]),
     ));
@@ -1074,8 +1230,8 @@ fn live_graph_removal_deletes_owned_storage(
         live_policy_cli(server, "live-deployment-token").args([
             "cluster",
             "status",
-            "--server",
-            &server.base_url,
+            "--target",
+            KEYED_SERVER_NAME,
             "--deployment-id",
             deployment_id,
             "--wait",
@@ -1110,8 +1266,8 @@ fn live_graph_removal_deletes_owned_storage(
             .args([
                 "cluster",
                 "apply",
-                "--server",
-                &server.base_url,
+                "--target",
+                KEYED_SERVER_NAME,
                 "--deployment-id",
                 id,
                 "--config",
@@ -1135,8 +1291,8 @@ fn live_graph_removal_deletes_owned_storage(
         live_policy_cli(server, "live-deployment-token").args([
             "query",
             "tools",
-            "--server",
-            &server.base_url,
+            "--target",
+            KEYED_SERVER_NAME,
             "--graph",
             "retired",
             "--json",
@@ -1149,8 +1305,8 @@ fn live_graph_removal_deletes_owned_storage(
             .args([
                 "cluster",
                 "apply",
-                "--server",
-                &server.base_url,
+                "--target",
+                KEYED_SERVER_NAME,
                 "--deployment-id",
                 id,
                 "--config",
@@ -1196,7 +1352,13 @@ fn live_policy_grants_revocations_and_management_handoff(
     .unwrap();
     live_policy_expect_forbidden(
         live_policy_cli(server, "reader-token")
-            .args(["cluster", "apply", "--server", &server.base_url, "--config"])
+            .args([
+                "cluster",
+                "apply",
+                "--target",
+                KEYED_SERVER_NAME,
+                "--config",
+            ])
             .arg(config_dir)
             .arg("--json"),
     );
@@ -1247,14 +1409,20 @@ fn live_policy_grants_revocations_and_management_handoff(
     live_policy_expect_forbidden(live_policy_cli(server, "live-deployment-token").args([
         "cluster",
         "status",
-        "--server",
-        &server.base_url,
+        "--target",
+        KEYED_SERVER_NAME,
         "--json",
     ]));
     fs::write(&management_path, &original_management).unwrap();
     live_policy_expect_forbidden(
         live_policy_cli(server, "live-deployment-token")
-            .args(["cluster", "apply", "--server", &server.base_url, "--config"])
+            .args([
+                "cluster",
+                "apply",
+                "--target",
+                KEYED_SERVER_NAME,
+                "--config",
+            ])
             .arg(config_dir)
             .arg("--json"),
     );
@@ -1264,8 +1432,8 @@ fn live_policy_grants_revocations_and_management_handoff(
     live_policy_expect_forbidden(live_policy_cli(server, "next-token").args([
         "cluster",
         "status",
-        "--server",
-        &server.base_url,
+        "--target",
+        KEYED_SERVER_NAME,
         "--json",
     ]));
     assert_eq!(server.id(), original_pid);
@@ -1289,8 +1457,8 @@ fn live_policy_handoff_before_restart(
         live_policy_cli(server, "live-deployment-token").args([
             "cluster",
             "status",
-            "--server",
-            &server.base_url,
+            "--target",
+            KEYED_SERVER_NAME,
             "--deployment-id",
             result["deployment"]["result"]["id"].as_str().unwrap(),
             "--wait",
@@ -1306,13 +1474,19 @@ fn live_policy_handoff_before_restart(
     live_policy_expect_forbidden(live_policy_cli(server, "live-deployment-token").args([
         "cluster",
         "status",
-        "--server",
-        &server.base_url,
+        "--target",
+        KEYED_SERVER_NAME,
         "--json",
     ]));
     live_policy_expect_forbidden(
         live_policy_cli(server, "live-deployment-token")
-            .args(["cluster", "apply", "--server", &server.base_url, "--config"])
+            .args([
+                "cluster",
+                "apply",
+                "--target",
+                KEYED_SERVER_NAME,
+                "--config",
+            ])
             .arg(config_dir)
             .arg("--json"),
     );
@@ -1328,14 +1502,20 @@ fn live_policy_state_survives_restart(config_dir: &std::path::Path, server: &Tes
     live_policy_expect_forbidden(live_policy_cli(server, "live-deployment-token").args([
         "cluster",
         "status",
-        "--server",
-        &server.base_url,
+        "--target",
+        KEYED_SERVER_NAME,
         "--json",
     ]));
     let current = live_policy_status(server, "next-token");
     live_policy_expect_forbidden(
         live_policy_cli(server, "live-deployment-token")
-            .args(["cluster", "apply", "--server", &server.base_url, "--config"])
+            .args([
+                "cluster",
+                "apply",
+                "--target",
+                KEYED_SERVER_NAME,
+                "--config",
+            ])
             .arg(config_dir)
             .arg("--json"),
     );
@@ -1350,8 +1530,8 @@ fn live_policy_state_survives_restart(config_dir: &std::path::Path, server: &Tes
     live_policy_expect_forbidden(live_policy_cli(server, "next-token").args([
         "cluster",
         "status",
-        "--server",
-        &server.base_url,
+        "--target",
+        KEYED_SERVER_NAME,
         "--json",
     ]));
 }
@@ -1369,8 +1549,8 @@ fn live_policy_mutation(server: &TestServer, name: &str) -> assert_cmd::Command 
     command.args([
         "mutate",
         "policy_probe",
-        "--server",
-        &server.base_url,
+        "--target",
+        KEYED_SERVER_NAME,
         "--graph",
         "knowledge",
         "-e",
@@ -1399,8 +1579,8 @@ fn live_policy_status(server: &TestServer, token: &str) -> serde_json::Value {
     parse_stdout_json(&output_success(live_policy_cli(server, token).args([
         "cluster",
         "status",
-        "--server",
-        &server.base_url,
+        "--target",
+        KEYED_SERVER_NAME,
         "--json",
     ])))
 }
@@ -1409,8 +1589,8 @@ fn live_policy_assert_granted_row(server: &TestServer) {
     let rows = parse_stdout_json(&output_success(live_policy_cli(server, "reader-token").args([
         "query",
         "policy_read",
-        "--server",
-        &server.base_url,
+        "--target",
+        KEYED_SERVER_NAME,
         "--graph",
         "knowledge",
         "-e",
@@ -1489,9 +1669,9 @@ impl LiveBindingsFixture {
             ),
             ("AWS_REGION", "us-east-1"),
             ("AWS_DEFAULT_REGION", "us-east-1"),
-            ("AWS_ENDPOINT", self.blobs.origin.as_str()),
-            ("AWS_ENDPOINT_URL", self.blobs.origin.as_str()),
-            ("AWS_ENDPOINT_URL_S3", self.blobs.origin.as_str()),
+            ("AWS_ENDPOINT", self.blobs.http_origin.as_str()),
+            ("AWS_ENDPOINT_URL", self.blobs.http_origin.as_str()),
+            ("AWS_ENDPOINT_URL_S3", self.blobs.http_origin.as_str()),
             ("AWS_ALLOW_HTTP", "true"),
             ("AWS_VIRTUAL_HOSTED_STYLE_REQUEST", "false"),
             ("AWS_S3_FORCE_PATH_STYLE", "true"),
@@ -1505,7 +1685,7 @@ impl LiveBindingsFixture {
         let token = "live-deployment-token";
         let first_profile = yaml_serde::from_str::<yaml_serde::Value>(&format!(
             "kind: openai-compatible\nbase_url: {}/v1\nmodel: space-a\napi_key: ${{OMNIGRAPH_LIFECYCLE_EMBED_KEY}}\n",
-            self.first.origin
+            self.first.http_origin
         )).unwrap();
         fs::write(config_dir.join("bindings.pg"), "node SearchDoc { name: String @key text: String embedding: Vector(3) @embed(\"text\") }\nnode Asset { name: String @key content: Blob? }\n").unwrap();
         bindings_edit_config(config_dir, |config| {
@@ -1525,8 +1705,8 @@ impl LiveBindingsFixture {
                 .envs(server.credential(token))
                 .args([
                     "load",
-                    "--server",
-                    &server.base_url,
+                    "--target",
+                    KEYED_SERVER_NAME,
                     "--graph",
                     "bindings",
                     "--mode",
@@ -1558,7 +1738,7 @@ impl LiveBindingsFixture {
         // A new endpoint and graph binding also remove the former definition.
         let replacement = yaml_serde::from_str::<yaml_serde::Value>(&format!(
             "kind: openai-compatible\nbase_url: {}/v2\nmodel: space-c\napi_key: ${{OMNIGRAPH_LIFECYCLE_EMBED_KEY}}\n",
-            self.replacement.origin
+            self.replacement.http_origin
         )).unwrap();
         bindings_edit_config(config_dir, |config| {
             config["providers"]["embedding"]
@@ -1591,7 +1771,13 @@ impl LiveBindingsFixture {
         let refused = output_failure(
             cli()
                 .envs(server.credential(token))
-                .args(["cluster", "apply", "--server", &server.base_url, "--config"])
+                .args([
+                    "cluster",
+                    "apply",
+                    "--target",
+                    KEYED_SERVER_NAME,
+                    "--config",
+                ])
                 .arg(config_dir)
                 .arg("--json")
                 .timeout(std::time::Duration::from_secs(30)),
@@ -1753,6 +1939,7 @@ fn bindings_external_load(server: &TestServer, uri: &str, allowed: bool) {
 
 fn bindings_external_redirect(server: &TestServer, uri: &str) {
     let client = reqwest::blocking::Client::builder()
+        .add_root_certificate(tls_gateway::certificate())
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(10))
         .build()

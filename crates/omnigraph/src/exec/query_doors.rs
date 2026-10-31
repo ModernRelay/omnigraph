@@ -200,6 +200,7 @@ impl Session {
             source_bytes,
             self.settings().query_memory_bytes(),
             WriteBudget::from_settings(self.settings()).bytes(),
+            self.settings().stage_write_concurrency(),
         )
         .await?;
         let explain = decision.explain().ok_or_else(|| {
@@ -374,6 +375,7 @@ impl Session {
                 catalog.system_columns,
             ),
             (IndexSource::Direct, true) => engine::GraphIndexHandle::direct(
+                Arc::clone(&**self),
                 snapshot.clone(),
                 engine::referenced_edge_types(&ir.pipeline, catalog),
                 catalog.system_columns,

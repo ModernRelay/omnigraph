@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-cli"
-version = "0.14.0"
+version = "0.14.1"
 edition = "2024"
 description = "CLI for the Omnigraph graph database."
 license = "MIT"
@@ -14,13 +14,13 @@ path = "src/main.rs"
 
 [dependencies]
 bytes = { workspace = true }
-omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.14.0" }
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.14.0" }
-omnigraph-api-types = { path = "../omnigraph-api-types", version = "0.14.0" }
-omnigraph-cluster = { path = "../omnigraph-cluster", version = "0.14.0" }
-omnigraph-policy = { path = "../omnigraph-policy", version = "0.14.0" }
-omnigraph-server = { path = "../omnigraph-server", version = "0.14.0" }
-omnigraph-skill = { path = "../../skills", version = "0.14.0" }
+omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.14.1" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.14.1" }
+omnigraph-api-types = { path = "../omnigraph-api-types", version = "0.14.1" }
+omnigraph-cluster = { path = "../omnigraph-cluster", version = "0.14.1" }
+omnigraph-policy = { path = "../omnigraph-policy", version = "0.14.1" }
+omnigraph-server = { path = "../omnigraph-server", version = "0.14.1" }
+omnigraph-skill = { path = "../../skills", version = "0.14.1" }
 clap = { workspace = true }
 base64 = { workspace = true }
 color-eyre = { workspace = true }
@@ -28,8 +28,9 @@ serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = { workspace = true }
 yaml_serde = { workspace = true }
-tokio = { workspace = true, features = ["fs", "io-std", "io-util"] }
-reqwest = { workspace = true, features = ["blocking", "stream"] }
+libyaml-rs = "0.3"
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "process"] }
+reqwest = { workspace = true, features = ["blocking", "stream", "rustls-tls-native-roots"] }
 futures = { workspace = true }
 tempfile = { workspace = true }
 url = { workspace = true }
@@ -41,6 +42,11 @@ time = { workspace = true, features = ["parsing"] }
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 keyring = { version = "3.6.3", features = ["apple-native"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+security-framework = "3"
+security-framework-sys = { version = "2.17", default-features = false }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3.6.3", features = ["windows-native"] }
 
@@ -48,6 +54,8 @@ keyring = { version = "3.6.3", features = ["windows-native"] }
 keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust", "vendored"] }
 
 [dev-dependencies]
+rcgen = "0.13.2"
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 assert_cmd = "2"
 predicates = "3"
 serde_json = { workspace = true }

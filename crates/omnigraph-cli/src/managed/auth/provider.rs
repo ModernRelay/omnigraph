@@ -64,6 +64,17 @@ impl Config {
 
 struct BoundedTransport(reqwest::Client);
 
+#[derive(Debug)]
+struct NetworkFailure;
+
+impl std::fmt::Display for NetworkFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("provider network I/O failed")
+    }
+}
+
+impl std::error::Error for NetworkFailure {}
+
 #[async_trait::async_trait]
 impl HttpTransport for BoundedTransport {
     async fn execute(
@@ -91,9 +102,10 @@ impl HttpTransport for BoundedTransport {
             if let Some(body) = request.body {
                 outgoing = outgoing.body(body);
             }
-            let mut response = outgoing.send().await.map_err(|_| {
-                TransportError::other(std::io::Error::other("provider transport failed"))
-            })?;
+            let mut response = outgoing
+                .send()
+                .await
+                .map_err(|_| TransportError::other(NetworkFailure))?;
             if response.status().is_redirection()
                 || response
                     .content_length()
@@ -106,9 +118,11 @@ impl HttpTransport for BoundedTransport {
             let status = response.status();
             let headers = response.headers().clone();
             let mut bytes = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(|_| {
-                TransportError::other(std::io::Error::other("provider response failed"))
-            })? {
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| TransportError::other(NetworkFailure))?
+            {
                 if chunk.len() > MAX_PROVIDER_BODY.saturating_sub(bytes.len()) {
                     return Err(TransportError::other(std::io::Error::other(
                         "provider response too large",
@@ -130,12 +144,28 @@ impl HttpTransport for BoundedTransport {
     }
 }
 
+pub(super) fn transient(error: &workos::Error) -> bool {
+    if failure(error).body["type"] == "login_required" {
+        return false;
+    }
+    match error {
+        workos::Error::Api(error) => matches!(error.status, 408 | 429 | 500..=599),
+        workos::Error::Network(error) => {
+            error.is_retryable() || error.source.is::<NetworkFailure>()
+        }
+        _ => false,
+    }
+}
+
 pub(super) struct Provider(pub workos::Client);
 
 impl Provider {
     pub fn new(config: &Config) -> Result<Self> {
         config.validate()?;
         let http = reqwest::Client::builder()
+            .no_proxy()
+            .tls_built_in_webpki_certs(false)
+            .tls_built_in_native_certs(true)
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(10))
@@ -213,7 +243,7 @@ pub(super) fn failure(error: &workos::Error) -> Failure {
         Some("access_denied") => Failure::refused("device_denied", "device sign-in was denied"),
         Some("expired_token") => Failure::refused(
             "device_expired",
-            "device sign-in expired; run login --api again",
+            "device sign-in expired; run login --target NAME again",
         ),
         _ => Failure::new(
             "identity_provider_unavailable",

@@ -155,9 +155,68 @@ pub(super) type ScanReports = std::collections::BTreeMap<NodeId, ScanReport>;
 #[derive(Debug, Default, Clone)]
 pub(super) struct ScanReport {
     pub(super) nearest_scan: Option<NearestScanReport>,
+    /// The scan's last attempt in this pass ranked exactly: no row it
+    /// admitted and did not return is nearer than a returned one. It was
+    /// proven empty, scored every admitted row flat (by the ladder's choice,
+    /// or for want of a vector index covering the column), searched every
+    /// partition of the IVF_FLAT index, or returned every admitted row, with
+    /// none left unreached. `false` when partitions went unsearched.
+    pub(super) exact: bool,
     /// Every Lance attempt of that nearest scan in this pass, in order: the
     /// probe cap it ran under and whether it scored flat.
     pub(super) probes: Vec<ProbeAttempt>,
+    /// Optional native diagnostics, separate from the ladder's decision inputs.
+    pub(super) ann_metrics: Vec<AnnAttemptMetrics>,
+}
+
+/// Bounded native diagnostics for one completed nearest probe attempt.
+/// Missing native keys stay absent, including on flat scans. These values are
+/// observations only: neither the ladder nor plan replay reads them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(super) struct AnnAttemptMetrics {
+    /// Zero-based position in this pass's `ProbeAttempt` list.
+    pub(super) attempt: usize,
+    pub(super) counts: std::collections::BTreeMap<&'static str, usize>,
+    /// Cumulative wall times, including waits, in nanoseconds. Nested stages
+    /// and concurrent partitions overlap; their sum is not query latency.
+    pub(super) cumulative_times_ns: std::collections::BTreeMap<&'static str, usize>,
+}
+
+impl AnnAttemptMetrics {
+    pub(super) fn from_summary(
+        attempt: usize,
+        summary: &lance_datafusion::exec::ExecutionSummaryCounts,
+    ) -> Option<Self> {
+        use lance_datafusion::utils::{PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC};
+        use lance_index::metrics::IndexTiming;
+
+        let counts = [
+            PARTITIONS_SEARCHED_METRIC,
+            PARTITIONS_RANKED_METRIC,
+            "prefilter_loads",
+            "prefilter_input_rows",
+            "prefilter_input_batches",
+            "prefilter_row_ids",
+        ]
+        .into_iter()
+        .filter_map(|name| summary.all_counts.get(name).map(|value| (name, *value)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+        let cumulative_times_ns = IndexTiming::ALL
+            .into_iter()
+            .map(IndexTiming::name)
+            .chain([
+                "prefilter_load_time",
+                "prefilter_input_time",
+                "prefilter_build_time",
+            ])
+            .filter_map(|name| summary.all_times.get(name).map(|value| (name, *value)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        (!counts.is_empty() || !cumulative_times_ns.is_empty()).then_some(Self {
+            attempt,
+            counts,
+            cumulative_times_ns,
+        })
+    }
 }
 
 /// One attempt of a nearest scan's probe ladder.
@@ -912,6 +971,47 @@ mod ann_probe_budget_tests {
 
     const IVF_SHORT: Option<(Option<u64>, Option<u64>)> = Some((Some(1), Some(1_000)));
     const POLICY: omnigraph_planner::NearestPolicy = omnigraph_planner::NearestPolicy::DEFAULT;
+
+    #[test]
+    fn native_ann_diagnostics_keep_only_known_present_metrics() {
+        use super::AnnAttemptMetrics;
+        use lance_datafusion::exec::ExecutionSummaryCounts;
+
+        let mut summary = ExecutionSummaryCounts::default();
+        assert_eq!(AnnAttemptMetrics::from_summary(0, &summary), None);
+        summary
+            .all_counts
+            .insert("future_native_counter".into(), 42);
+        summary
+            .all_times
+            .insert("SortExec_elapsed_compute".into(), 100);
+        assert_eq!(AnnAttemptMetrics::from_summary(0, &summary), None);
+        summary.all_counts.insert("prefilter_loads".into(), 0);
+        summary
+            .all_counts
+            .insert("prefilter_row_ids".into(), usize::MAX);
+        summary.all_times.insert("index_search_time".into(), 0);
+        summary.all_times.insert("prefilter_build_time".into(), 37);
+
+        let metrics = AnnAttemptMetrics::from_summary(2, &summary).unwrap();
+        assert_eq!(metrics.attempt, 2);
+        assert_eq!(
+            metrics.counts,
+            [("prefilter_loads", 0), ("prefilter_row_ids", usize::MAX)].into()
+        );
+        assert_eq!(
+            metrics.cumulative_times_ns,
+            [("index_search_time", 0), ("prefilter_build_time", 37)].into()
+        );
+        assert!(
+            !metrics.counts.contains_key("prefilter_input_rows"),
+            "missing is not zero"
+        );
+        assert_eq!(
+            serde_json::to_value(&metrics).unwrap()["counts"]["prefilter_row_ids"].as_u64(),
+            Some(usize::MAX as u64)
+        );
+    }
 
     /// The ladder takes its factor and its fallbacks from the plan's
     /// declared policy, not from a constant of its own.

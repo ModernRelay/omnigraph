@@ -50,6 +50,7 @@ use lance_table::format::Fragment;
 use super::enumerate::{Emit, next_emit};
 use super::model::{ChangeFeedScope, ChangeOpKind};
 use super::row_compare::{OrderedRows, ScanTargets, rows_equal_across_vintages};
+use super::row_identity::{row_id_filter, row_identity_plan, verify_emit_agreement};
 use crate::db::DatasetEntry;
 use crate::error::Result;
 use crate::staging::is_detached_version;
@@ -155,6 +156,15 @@ pub(crate) enum CandidatePlan {
         parent_fragments: Vec<Fragment>,
         ids: Vec<String>,
     },
+    /// Rows paired by `_rowid` across the two pinned versions: each side scans
+    /// the fragments whose files differ, narrowed to the row ids whose stamp
+    /// differs or that are live on that side only (`None`: every live row).
+    RowIdentity {
+        from_fragments: Vec<Fragment>,
+        from_row_ids: Option<Vec<u64>>,
+        to_fragments: Vec<Fragment>,
+        to_row_ids: Option<Vec<u64>>,
+    },
 }
 
 /// How an interval is proven before its one transaction is read.
@@ -203,6 +213,7 @@ pub(crate) async fn interval_candidate_plan(
     to_entry: &DatasetEntry,
     from_dataset: &Dataset,
     to_dataset: &Dataset,
+    pair_rows_by_identity: bool,
 ) -> Result<Option<CandidatePlan>> {
     if from_entry.native_dataset_branch != to_entry.native_dataset_branch
         || from_entry.identity != to_entry.identity
@@ -215,7 +226,10 @@ pub(crate) async fn interval_candidate_plan(
     let to_opened = to_dataset.version().version;
     let Some(proof) = interval_proof(from_entry, to_entry, from_opened, to_opened, to_dataset)
     else {
-        return Ok(None);
+        if !pair_rows_by_identity {
+            return Ok(None);
+        }
+        return row_identity_plan(from_dataset, to_dataset).await;
     };
 
     crate::instrumentation::record_candidate_transaction_read();
@@ -460,15 +474,11 @@ fn find_fragment(fragments: &[Fragment], id: u64) -> (Option<&Fragment>, u64) {
 /// at the fragment level. `uses_stable_row_ids()` alone is a dataset-level
 /// flag and cannot prove a specific fragment's sequence survives loading.
 ///
-/// The Inline bytes are decoded directly rather than through
-/// `load_sequence()`: pinned Lance 11's External arm of that method is
-/// `todo!()` (it panics, it does not `Err`), so the variant must be
-/// structurally unreachable here. And a clean decode alone does not prove the
-/// sequence covers the fragment — Lance's single-run fast path stamps its one
-/// version across every requested row without consulting the encoded length —
-/// so the sequence must be exactly `physical_rows` long. Absent, external,
-/// undecodable, short, or unmeasurable all mean "not provably complete" and
-/// route the interval to the exact ordered merge.
+/// Only inline bytes can prove this without another dataset read. Spilled
+/// column lineage needs dataset I/O and takes the exact ordered-merge path.
+/// A clean decode alone does not prove the sequence covers the fragment, so
+/// its length must equal `physical_rows`. Absent, spilled, undecodable, short,
+/// or unmeasurable metadata means "not provably complete".
 fn fragment_version_metadata_is_loadable(fragment: &Fragment) -> bool {
     let Some(lance_table::rowids::version::RowDatasetVersionMeta::Inline(data)) =
         fragment.last_updated_at_version_meta.as_ref()
@@ -704,9 +714,26 @@ pub(crate) enum EmitSource {
     FullMerge(Box<FullMergeRows>),
     Pruned(Box<CandidateUpserts>),
     Deleted(Box<CandidateDeletes>),
+    /// `change_lineage = verify`: the row-identity emitter answers, and the
+    /// exact merge of the same interval is pulled beside it; the page is
+    /// refused at the first change on which the two disagree.
+    Verified {
+        primary: Box<EmitSource>,
+        oracle: Box<EmitSource>,
+        type_key: String,
+    },
 }
 
 impl EmitSource {
+    /// `primary` checked against `oracle`, two emitters over one interval.
+    pub(crate) fn verified(primary: EmitSource, oracle: EmitSource, type_key: &str) -> Self {
+        Self::Verified {
+            primary: Box::new(primary),
+            oracle: Box::new(oracle),
+            type_key: type_key.to_string(),
+        }
+    }
+
     /// Open the emitter for one interval. `candidate_plan` is the pruning
     /// decision [`interval_candidate_plan`] computed in `plan_intervals` before
     /// (and therefore covered by) the final head witness. This constructor
@@ -761,6 +788,43 @@ impl EmitSource {
                 )
                 .await?,
             ))),
+            Some(CandidatePlan::RowIdentity {
+                from_fragments,
+                from_row_ids,
+                to_fragments,
+                to_row_ids,
+            }) => {
+                crate::instrumentation::record_candidate_scan_targets(
+                    scan_targets.rows(),
+                    scan_targets.bytes(),
+                );
+                let from = OrderedRows::open_scan(
+                    from_dataset,
+                    after_id,
+                    row_id_filter(from_row_ids),
+                    Some(from_fragments),
+                    scan_targets,
+                    from_columns.id,
+                )
+                .await?;
+                let to = OrderedRows::open_scan(
+                    to_dataset,
+                    after_id,
+                    row_id_filter(to_row_ids),
+                    Some(to_fragments),
+                    scan_targets,
+                    to_columns.id,
+                )
+                .await?;
+                Ok(Self::FullMerge(Box::new(FullMergeRows {
+                    from,
+                    to,
+                    scope: scope.clone(),
+                    from_columns,
+                    to_columns,
+                    is_edge: from_entry.type_key.starts_with("edge:"),
+                })))
+            }
             None => {
                 let from = OrderedRows::open(from_dataset, after_id, from_columns.id).await?;
                 let to = OrderedRows::open(to_dataset, after_id, to_columns.id).await?;
@@ -791,6 +855,23 @@ impl EmitSource {
             }
             Self::Pruned(candidates) => candidates.next().await,
             Self::Deleted(deletes) => deletes.next().await,
+            Self::Verified {
+                primary,
+                oracle,
+                type_key,
+            } => {
+                let expected = Box::pin(oracle.next()).await?;
+                let actual = Box::pin(primary.next()).await?;
+                verify_emit_agreement(
+                    type_key,
+                    primary.parent_dataset(),
+                    primary.child_dataset(),
+                    expected.as_ref(),
+                    actual.as_ref(),
+                )
+                .await?;
+                Ok(actual)
+            }
         }
     }
 
@@ -799,6 +880,7 @@ impl EmitSource {
             Self::FullMerge(full) => full.from.dataset(),
             Self::Pruned(candidates) => candidates.parent_dataset(),
             Self::Deleted(deletes) => deletes.parents.dataset(),
+            Self::Verified { primary, .. } => primary.parent_dataset(),
         }
     }
 
@@ -807,6 +889,7 @@ impl EmitSource {
             Self::FullMerge(full) => full.to.dataset(),
             Self::Pruned(candidates) => candidates.child_dataset(),
             Self::Deleted(deletes) => &deletes.child_dataset,
+            Self::Verified { primary, .. } => primary.child_dataset(),
         }
     }
 }
@@ -979,22 +1062,12 @@ mod tests {
     }
 
     #[test]
-    fn external_row_version_metadata_is_not_loadable() {
-        // Pinned Lance 11's `RowDatasetVersionMeta::External` arm of
-        // `load_sequence()` is `todo!()` — it panics rather than returning
-        // `Err`. The gate must classify the variant structurally instead of
-        // probing it, so an externally-stored sequence routes the interval to
-        // the exact ordered merge instead of aborting the poll.
+    fn spilled_row_version_metadata_is_not_loadable() {
+        // Column lineage needs dataset I/O. The metadata-only candidate gate
+        // must route it to the exact merge without trying to decode it inline.
         let mut fragment = Fragment::new(7);
-        fragment.last_updated_at_version_meta = Some(
-            lance_table::rowids::version::RowDatasetVersionMeta::External(
-                lance_table::format::ExternalFile {
-                    path: "external.versions".to_string(),
-                    offset: 0,
-                    size: 64,
-                },
-            ),
-        );
+        fragment.last_updated_at_version_meta =
+            Some(lance_table::rowids::version::RowDatasetVersionMeta::Column);
         assert!(!fragment_version_metadata_is_loadable(&fragment));
     }
 

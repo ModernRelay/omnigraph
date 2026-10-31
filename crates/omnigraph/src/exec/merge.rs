@@ -11,7 +11,8 @@ use crate::storage_layer::{
     KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, ProvenInsertChunk,
 };
 use crate::table_store::{
-    MATERIALIZED_BLOB_PAYLOAD_BYTES, certified_insert_absence_rows, is_full_text_declaration,
+    MATERIALIZED_BLOB_PAYLOAD_BYTES, certified_insert_absence_rows, deletion_file_identical,
+    fragment_data_identical, fragment_deletion_vector, is_index_only_commit,
 };
 use futures::StreamExt;
 use omnigraph_compiler::settings::MergeLineage;
@@ -994,9 +995,9 @@ fn opened_at_pin(dataset: &Dataset, entry: &crate::db::DatasetEntry) -> bool {
 }
 
 /// Walk the source's chain of commits by `read_version` links down to either
-/// base pin, certifying each as an exact-id fenced insert or a full-text
-/// declaration (which moves no row); the new fragments are the source's
-/// fragments the base lacks, and the rows are the chain's.
+/// base pin, certifying each as an exact-id fenced insert or an index-only
+/// commit (which moves no row); the new fragments are the source's fragments
+/// the base lacks, and the rows are the chain's.
 async fn proven_chain_fragments(
     source: &Dataset,
     base: &Dataset,
@@ -1010,7 +1011,7 @@ async fn proven_chain_fragments(
         let identity = crate::table_store::StagedTransactionIdentity::recorded_by(&dataset)?;
         crate::instrumentation::record_proven_insert_history_read();
         let transaction = dataset.read_transaction().await.ok()??;
-        let rows = if is_full_text_declaration(&transaction, identity.read_version) {
+        let rows = if is_index_only_commit(&transaction, identity.read_version) {
             0
         } else {
             certified_insert_absence_rows(
@@ -1891,125 +1892,6 @@ struct LineageMergePlan {
     source: Option<Dataset>,
     target: Option<Dataset>,
     candidate_chunks: DeleteIdChunks,
-}
-
-/// Resolve one data file to its physical identity: (owning root, relative
-/// path), with `base_id` resolved through the manifest's base paths. `None`
-/// when the referenced base path is missing — callers treat that fragment as
-/// changed (superset-safe).
-fn resolved_data_file_key<'a>(
-    dataset: &'a Dataset,
-    base_id: Option<u32>,
-    path: &'a str,
-) -> Option<(&'a str, &'a str)> {
-    let root = match base_id {
-        None => dataset.uri(),
-        Some(base_id) => dataset
-            .manifest
-            .base_paths
-            .get(&base_id)
-            .map(|base_path| base_path.path.as_str())?,
-    };
-    // The same local root appears both as `file:///abs/path` (dataset URIs)
-    // and bare `/abs/path` (stored base paths); strip the scheme so the two
-    // spellings of one root compare equal. Non-file schemes are untouched.
-    let root = root.strip_prefix("file://").unwrap_or(root);
-    Some((root.trim_end_matches('/'), path))
-}
-
-/// Whether two fragment incarnations hold byte-identical row data: same
-/// resolved data files (base-path indirection resolved on each side) and the
-/// same overlay list. Deletion state is compared separately — a deletion-file
-/// mismatch is self-correcting through the deletion-vector content diff.
-fn fragment_data_identical(
-    base_dataset: &Dataset,
-    base_meta: &lance_table::format::Fragment,
-    side_dataset: &Dataset,
-    side_meta: &lance_table::format::Fragment,
-) -> bool {
-    if base_meta.files.len() != side_meta.files.len()
-        || base_meta.overlays.len() != side_meta.overlays.len()
-    {
-        return false;
-    }
-    // Overlay data files carry `base_id` indirection exactly like fragment
-    // data files, and the same `base_id` number can resolve to different
-    // roots in the two manifests — so overlays must compare through resolved
-    // physical identity too, never raw struct equality. A false "identical"
-    // here is the one direction that breaks the candidate superset.
-    let overlays_identical = base_meta
-        .overlays
-        .iter()
-        .zip(side_meta.overlays.iter())
-        .all(|(base_overlay, side_overlay)| {
-            base_overlay.coverage == side_overlay.coverage
-                && base_overlay.committed_version == side_overlay.committed_version
-                && data_file_identical(
-                    base_dataset,
-                    &base_overlay.data_file,
-                    side_dataset,
-                    &side_overlay.data_file,
-                )
-        });
-    if !overlays_identical {
-        return false;
-    }
-    base_meta
-        .files
-        .iter()
-        .zip(side_meta.files.iter())
-        .all(|(base_file, side_file)| {
-            data_file_identical(base_dataset, base_file, side_dataset, side_file)
-        })
-}
-
-/// Whether two data-file references name the same physical file with the same
-/// column layout, `base_id` indirection resolved on each side.
-fn data_file_identical(
-    base_dataset: &Dataset,
-    base_file: &lance_table::format::DataFile,
-    side_dataset: &Dataset,
-    side_file: &lance_table::format::DataFile,
-) -> bool {
-    base_file.fields == side_file.fields
-        && base_file.column_indices == side_file.column_indices
-        && match (
-            resolved_data_file_key(base_dataset, base_file.base_id, &base_file.path),
-            resolved_data_file_key(side_dataset, side_file.base_id, &side_file.path),
-        ) {
-            (Some(base_key), Some(side_key)) => base_key == side_key,
-            _ => false,
-        }
-}
-
-/// Whether two deletion-file references name the same physical deletion file.
-/// `(read_version, id, file_type, base_id)` pins the uniquely-named file; a
-/// false negative only costs two deletion-vector reads whose content diff
-/// comes back empty (superset-safe).
-fn deletion_file_identical(
-    base_meta: &lance_table::format::Fragment,
-    side_meta: &lance_table::format::Fragment,
-) -> bool {
-    match (&base_meta.deletion_file, &side_meta.deletion_file) {
-        (None, None) => true,
-        (Some(base_file), Some(side_file)) => {
-            base_file.read_version == side_file.read_version
-                && base_file.id == side_file.id
-                && base_file.file_type == side_file.file_type
-                && base_file.base_id == side_file.base_id
-        }
-        _ => false,
-    }
-}
-
-async fn fragment_deletion_vector(
-    fragment: &lance::dataset::fragment::FileFragment,
-) -> Result<Arc<lance_core::utils::deletion::DeletionVector>> {
-    Ok(fragment
-        .get_deletion_vector()
-        .await
-        .map_err(OmniError::storage)?
-        .unwrap_or_default())
 }
 
 /// Check the owned-key estimate before copying a decoded key into the set.
@@ -4982,6 +4864,12 @@ impl Session {
         } else {
             MergeMode::Publish
         };
+        // Every failure the merge returns before its one publisher call is
+        // definite: the chains it committed are detached versions no manifest
+        // names. The publisher marks its own in-doubt outcomes, which this
+        // wrapper never overwrites, and no fallible step follows the publish
+        // inside `branch_merge_impl`; a step added there must mark its own
+        // evidence.
         let result = Box::pin(self.branch_merge_impl(
             source,
             target,
@@ -4991,7 +4879,8 @@ impl Session {
             WriteBudget::from_settings(self.settings()),
             mode,
         ))
-        .await;
+        .await
+        .map_err(OmniError::unpublished);
         if let Err(error) = fail(&BRANCH_MERGE_PRE_RETURN) {
             // This boundary is after the result is fixed. A simulated lost
             // receipt cannot turn an acknowledged publication into a normal
@@ -5175,8 +5064,12 @@ impl Omnigraph {
             let base_snapshot = if head_is_base {
                 target_txn.base.clone()
             } else {
-                let base =
-                    ManifestCoordinator::pinned_graph_commit(self.uri(), &base_commit).await?;
+                let base = ManifestCoordinator::pinned_graph_commit_with_session(
+                    self.uri(),
+                    &base_commit,
+                    &self.control_session(),
+                )
+                .await?;
                 if !dry_run {
                     input_guard.pin(&base.dataset).await?;
                 }

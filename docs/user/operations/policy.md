@@ -2,8 +2,9 @@
 
 OmniGraph uses Cedar policy bundles to authorize graph, server, and cluster
 configuration actions.
-Policies are declared in `cluster.yaml` and installed during cluster bootstrap
-or graph creation. Servers load them at startup or when activating a new graph.
+Policies are declared in `cluster.yaml` and installed by `cluster apply`.
+Servers load applied policies at startup and activate policy changes during
+live deployment, including changes to existing graphs.
 
 ## Actions
 
@@ -137,25 +138,83 @@ the target the base snapshot recorded, whatever branch the request names.
 snapshot need `read` on that recorded target; `commit show <id>` keeps its
 scope-free `read`; `commit drop` takes `commit_drop` on the recorded target as
 for an unpublished commit (see [Unattached graph branches](../../rfcs/2026-10-11-unattached-graph-branches.md)).
+`branch_create` from a branch checks that branch as the source and the new
+branch as the target. A start at a commit (`from_commit`) checks the branch
+that wrote the commit as the source; a denial answers `404`, as an id no
+commit has does, so the id discloses nothing (see
+[start a branch at a commit](../branching/index.md#start-a-branch-at-a-commit)).
 
 ## Validate and test
 
 Policy commands read the applied bundle from a cluster:
 
 ```bash
-omnigraph policy validate --cluster ./company-brain --graph knowledge
+omnigraph policy validate --target ./company-brain --graph knowledge
 omnigraph policy test --tests policy.tests.yaml \
-  --cluster ./company-brain --graph knowledge
+  --target ./company-brain --graph knowledge
 omnigraph policy explain \
-  --cluster ./company-brain --graph knowledge \
+  --target ./company-brain --graph knowledge \
   --actor act-alice --action read --branch main
 ```
 
 Edit the policy file or its `applies_to` bindings, then run
-`cluster apply --server URL --config DIR`. The server finishes admitted requests
-before activating matching HTTP and engine permissions. Later requests use the
+`cluster apply --target NAME --config DIR` using a registered server target.
+The server finishes admitted requests before activating matching HTTP and
+engine permissions. Later requests use the
 new rules. Cluster management policy changes take effect in the same deployment;
 a newly granted administrator cannot authorize that grant.
+
+## Learn your access
+
+`GET /graphs/{graph_id}/access` tells the caller what its own credential may do
+on a graph, so a client can show only the actions it is allowed instead of
+learning them from a refusal:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" -H "Omnigraph-Http-Api: 0.14" \
+  "https://graph.example/graphs/knowledge/access?branch=feature&target_branch=main"
+```
+
+With the example graph policy above, `act-alice` gets:
+
+```json
+{"actor_id":"act-alice","graph_id":"knowledge","graph_wide":["read","invoke_query"],
+ "branch":"feature","target_branch":"main","actions":["read"]}
+```
+
+- `client_id` appears when the credential is a verified OIDC access token: the
+  OAuth client it was issued to. The actor stays the person's
+  `principal:<id>`, so policy decides alike for every client a person uses.
+- `graph_wide` is the decision with no branch named: `invoke_query`, and an
+  action one rule allows on every branch, with no branch scope, `branch_scope:
+  any` or `target_branch_scope: any`. Rules that cover every branch only
+  together, one for protected branches and one for the rest, allow each named
+  branch but not the decision without one, so read `actions` for a branch.
+  `read` here also decides the reads that name no branch: listing branches, the
+  schema, `show` and `commit show`. A commit list authorizes `read` on its
+  branch, `main` when the query names none.
+- With `branch`, `actions` lists the actions allowed on it: `read`, `export`
+  and `change`, and `branch_delete`, `commit_publish`, `commit_drop` and
+  `schema_apply` with that branch as their target. Schema apply and the
+  system-column upgrade target `main` only, and a storage upgrade authorizes
+  each live branch, so `schema_apply` on another branch does not make schema
+  apply possible there.
+- With `target_branch` as well, `actions` also lists `branch_create` from
+  `branch` into the target and `branch_merge` of `branch` into it.
+
+The route evaluates the installed policy for the caller's resolved actor, each
+action shaped as the route that performs it shapes it, so it answers exactly as
+those routes decide. It needs no action of its own, reads no graph data, and
+judges branches by name without checking that they exist. It names actions,
+never the rules behind them, and reveals nothing about other actors. A static
+token on a graph without a policy gets `read` alone, and a signed data
+credential without one nothing, as those routes decide; a server without
+authentication allows every graph action and reports `actor_id: null`. The MCP
+`access` tool returns the same body, and `omnigraph access` prints it for a
+server or managed target ([what you may do at a target](../cli/targets.md#what-you-may-do-at-a-target)).
+
+It reports policy actions, not actor views, so a view can still refuse a
+`change` the policy allows.
 
 ## Actor identity
 
@@ -168,18 +227,20 @@ graph/action grants. Version-1 restricted credentials are not accepted.
 For direct CLI writes, actor resolution is:
 
 1. `--as <ACTOR>`;
-2. `operator.actor` in `~/.omnigraph/config.yaml`;
-3. no actor.
+2. no actor.
 
-When a policy is installed, a missing actor is denied. Served writes reject
-`--as` because only the server may resolve their actor.
+The version-1 operator document has no actor field.
+
+When a policy is installed, a missing actor is denied. Only the server
+resolves a served write's actor; there `--as` is an assertion the server checks
+against the token ([Assert the actor](server.md#assert-the-actor)).
 
 Successful graph commits record the actor for the whole atomic change. Inspect
 the audit trail with:
 
 ```bash
-omnigraph commit list --store ./graph.omni --json
-omnigraph commit show <COMMIT_ID> --store ./graph.omni --json
+omnigraph commit list --target ./graph.omni --json
+omnigraph commit show <COMMIT_ID> --target ./graph.omni --json
 ```
 
 ## Server startup modes

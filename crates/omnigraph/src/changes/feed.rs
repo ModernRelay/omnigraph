@@ -10,8 +10,10 @@
 
 use std::collections::{HashMap, HashSet};
 
+use omnigraph_compiler::settings::ChangeLineage;
+
 use super::enumerate::{
-    self, CommitEnumeration, ContinuationKey, PageBudget, enumerate_commit_changes,
+    self, ChangeDiscovery, CommitEnumeration, ContinuationKey, PageBudget, enumerate_commit_changes,
 };
 use super::model::{
     CHANGE_FEED_DEFAULT_COMMITS_PER_POLL, CHANGE_FEED_MAX_COMMITS_PER_POLL,
@@ -222,6 +224,7 @@ pub(crate) async fn poll(
     graph_identity: &str,
     cut: &ChangeFeedCut,
     request: &ChangeFeedRequest,
+    lineage: ChangeLineage,
 ) -> Result<ChangeFeedPage> {
     let max_changes = request
         .max_changes
@@ -339,6 +342,7 @@ pub(crate) async fn poll(
             &child_snapshot,
             graph_identity,
             commit_id,
+            ChangeDiscovery::linear(lineage),
             &request.scope,
             resume.as_ref(),
             &mut budget,
@@ -486,7 +490,8 @@ impl<'a> PollSnapshots<'a> {
                 .cut
                 .buffer
                 .record_of(buffered, &self.cut.head_record.tables);
-            let snapshot = Snapshot::wrap(record.snapshot(self.root_uri)?);
+            let snapshot =
+                Snapshot::wrap(record.snapshot(self.root_uri, &self.cut.control_session)?);
             (record.commit, snapshot)
         } else {
             let record = self.settled.remove(commit_id).ok_or_else(|| {
@@ -495,7 +500,8 @@ impl<'a> PollSnapshots<'a> {
                      `__history` does not hold its record"
                 ))
             })?;
-            let snapshot = Snapshot::wrap(record.snapshot(self.root_uri)?);
+            let snapshot =
+                Snapshot::wrap(record.snapshot(self.root_uri, &self.cut.control_session)?);
             (record.commit, snapshot)
         };
         if let Some(native) = &commit.native_branch

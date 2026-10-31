@@ -21,7 +21,7 @@
 //! module stays generic over the `lance::io`-re-exported trait, so it adds no
 //! production dependency.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -173,6 +173,13 @@ pub struct QueryIoProbes {
     /// over all-changing rows should inspect only the emitted row plus one
     /// continuation sentinel.
     pub candidate_rows_examined: Arc<AtomicU64>,
+    /// Change intervals with no adjacent-transaction proof that paired their
+    /// live rows by stable row id (`change_lineage` on or verify), and those
+    /// that ran the exact ordered merge of both versions. A cost test asserts
+    /// the route a window shape took, since the read counts alone cannot tell
+    /// a flat route from a small table.
+    pub change_intervals_row_identity: Arc<AtomicU64>,
+    pub change_intervals_exact_merge: Arc<AtomicU64>,
     /// Largest row/byte scanner target requested by a candidate emitter in the
     /// measured operation. Both are maxima (not sums) because parent and child
     /// streams use the same current-page target.
@@ -396,6 +403,46 @@ pub fn query_memory_limit() -> Option<u64> {
     QUERY_MEMORY_LIMIT.try_with(|bytes| *bytes).ok()
 }
 
+tokio::task_local! {
+    static CSV_SLICE_BYTES: usize;
+}
+
+/// Run `fut` with every `load csv` source it parses cut into slices of
+/// `bytes` instead of the planner's partition size. Test-only entry point;
+/// nothing in production sets it.
+pub async fn with_csv_slice_bytes<F>(bytes: usize, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    CSV_SLICE_BYTES.scope(bytes, fut).await
+}
+
+/// The slice size a test installed for this task, if any; `None` in
+/// production.
+pub fn csv_slice_bytes() -> Option<usize> {
+    CSV_SLICE_BYTES.try_with(|bytes| *bytes).ok()
+}
+
+tokio::task_local! {
+    static OVERWRITE_CHUNK_ROWS: usize;
+}
+
+/// Run `fut` with every `load csv` overwrite chunk holding `rows` rows before
+/// its Lance writer takes it, instead of Lance's file target (1 Mi rows).
+/// Test-only entry point; nothing in production sets it.
+pub async fn with_overwrite_chunk_rows<F>(rows: usize, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    OVERWRITE_CHUNK_ROWS.scope(rows, fut).await
+}
+
+/// The chunk row count a test installed for this task, if any; `None` in
+/// production.
+pub fn overwrite_chunk_rows() -> Option<usize> {
+    OVERWRITE_CHUNK_ROWS.try_with(|rows| *rows).ok()
+}
+
 /// Reservations and execution metrics observed by v2 acceptance tests.
 /// Holding a pool here keeps the observer alive without retaining reservations.
 #[derive(Clone, Debug, Default)]
@@ -498,12 +545,16 @@ where
     QUERY_MEMORY_PROBES.scope(probes, fut).await
 }
 
+/// One checkpoint pause. The first body to reach it claims it, marks it
+/// waiting and only then marks it entered, so a test that has seen
+/// `entered()` also sees `is_paused()` until it releases the pause.
 #[derive(Debug, Default)]
 struct QueryBlockingPause {
     released: Mutex<bool>,
     wake: std::sync::Condvar,
-    entered: AtomicU64,
-    waiting: AtomicU64,
+    claimed: AtomicBool,
+    entered: AtomicBool,
+    waiting: AtomicBool,
 }
 
 /// Releases the test checkpoint even when an assertion unwinds.
@@ -512,11 +563,11 @@ pub struct QueryBlockingPauseGuard(Arc<QueryBlockingPause>);
 
 impl QueryBlockingPauseGuard {
     pub fn entered(&self) -> bool {
-        self.0.entered.load(Ordering::SeqCst) > 0
+        self.0.entered.load(Ordering::SeqCst)
     }
 
     pub fn is_paused(&self) -> bool {
-        self.0.waiting.load(Ordering::SeqCst) > 0
+        self.0.waiting.load(Ordering::SeqCst)
     }
 
     pub fn release(&self) {
@@ -639,10 +690,11 @@ impl QueryBlockingWorkGuard {
         else {
             return;
         };
-        if pause.entered.fetch_add(1, Ordering::SeqCst) > 0 {
+        if pause.claimed.swap(true, Ordering::SeqCst) {
             return;
         }
-        pause.waiting.store(1, Ordering::SeqCst);
+        pause.waiting.store(true, Ordering::SeqCst);
+        pause.entered.store(true, Ordering::SeqCst);
         let released = pause
             .released
             .lock()
@@ -655,7 +707,7 @@ impl QueryBlockingWorkGuard {
                 })
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
-        pause.waiting.store(0, Ordering::SeqCst);
+        pause.waiting.store(false, Ordering::SeqCst);
     }
 
     pub fn started(&mut self) {
@@ -780,6 +832,68 @@ pub async fn external_payload_read_stall() {
     }
     if let Ok(hold) = EXTERNAL_PAYLOAD_READ_HOLD.try_with(Clone::clone) {
         hold.park().await;
+    }
+}
+
+/// The task-local seams an external object payload read answers to: the
+/// stall, the hold and the merge-write probes. A load plan's source
+/// partitions read on blocking workers under tasks DataFusion spawns, none of
+/// which inherits a task local, so the statement's task captures these when
+/// it builds its query resources and the worker reinstalls them with
+/// [`with_external_read_seams`]. Production captures three unset lookups.
+#[derive(Clone, Default)]
+pub struct ExternalReadSeams {
+    stalled: bool,
+    hold: Option<ExternalPayloadReadHold>,
+    probes: Option<MergeWriteProbes>,
+}
+
+impl std::fmt::Debug for ExternalReadSeams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalReadSeams")
+            .field("stalled", &self.stalled)
+            .field("hold", &self.hold.is_some())
+            .field("probes", &self.probes.is_some())
+            .finish()
+    }
+}
+
+/// Capture the external read seams of the current task.
+pub fn capture_external_read_seams() -> ExternalReadSeams {
+    ExternalReadSeams {
+        stalled: EXTERNAL_PAYLOAD_READ_STALL.try_with(|_| ()).is_ok(),
+        hold: EXTERNAL_PAYLOAD_READ_HOLD.try_with(Clone::clone).ok(),
+        probes: MERGE_WRITE_PROBES.try_with(Clone::clone).ok(),
+    }
+}
+
+/// Run `fut` under the seams `capture_external_read_seams` took on another
+/// task; an unset seam installs nothing.
+pub async fn with_external_read_seams<F>(seams: ExternalReadSeams, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    let ExternalReadSeams {
+        stalled,
+        hold,
+        probes,
+    } = seams;
+    let probed = async move {
+        match probes {
+            Some(probes) => MERGE_WRITE_PROBES.scope(probes, fut).await,
+            None => fut.await,
+        }
+    };
+    let held = async move {
+        match hold {
+            Some(hold) => EXTERNAL_PAYLOAD_READ_HOLD.scope(hold, probed).await,
+            None => probed.await,
+        }
+    };
+    if stalled {
+        EXTERNAL_PAYLOAD_READ_STALL.scope((), held).await
+    } else {
+        held.await
     }
 }
 
@@ -1175,6 +1289,22 @@ pub fn record_candidate_fragment_metadata_steps(steps: u64) {
 
 pub fn record_candidate_row_examined() {
     let _ = current(|p| p.candidate_rows_examined.fetch_add(1, Ordering::Relaxed));
+}
+
+/// One change interval with no adjacency proof discovered by row identity.
+pub fn record_change_interval_row_identity() {
+    let _ = current(|p| {
+        p.change_intervals_row_identity
+            .fetch_add(1, Ordering::Relaxed)
+    });
+}
+
+/// One change interval with no adjacency proof read by the exact merge.
+pub fn record_change_interval_exact_merge() {
+    let _ = current(|p| {
+        p.change_intervals_exact_merge
+            .fetch_add(1, Ordering::Relaxed)
+    });
 }
 
 pub fn record_candidate_scan_targets(rows: usize, bytes: u64) {
@@ -1609,7 +1739,7 @@ pub fn record_stage_append(rows: u64) {
     });
 }
 
-/// Record one `stage_merge_insert` of `rows` rows against the active probes.
+/// Record one merge-insert keyed stage of `rows` rows against the active probes.
 /// No-op in production (no probes installed).
 pub fn record_stage_merge_insert(rows: u64) {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
@@ -2058,8 +2188,8 @@ async fn dataset_builder(
     let session = session
         .cloned()
         .unwrap_or_else(crate::lance_access::control_session);
+    let mut store_params = crate::storage::lance_store_params_for_session(uri, &session)?;
     builder = builder.with_session(session);
-    let mut store_params = crate::storage::lance_store_params_for_uri(uri)?;
     if let Some(wrapper) = wrapper {
         store_params.object_store_wrapper = Some(wrapper.clone());
     }
@@ -2149,6 +2279,12 @@ impl CountingStorageAdapter {
 
 #[async_trait]
 impl StorageAdapter for CountingStorageAdapter {
+    fn binding(&self) -> Option<crate::storage::CapturedStorageBinding> {
+        self.inner.binding()
+    }
+    fn io_scope(&self) -> Option<crate::storage::StorageIoScope> {
+        self.inner.io_scope()
+    }
     async fn read_text(&self, uri: &str) -> Result<String> {
         self.counts.read_text.fetch_add(1, Ordering::Relaxed);
         self.inner.read_text(uri).await

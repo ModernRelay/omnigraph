@@ -103,9 +103,9 @@ This validates the schema **and** the queries against it. No running repo requir
 ### Plan before apply — always
 
 ```bash
-omnigraph schema plan --schema next.pg s3://bucket/repo --json
+omnigraph schema plan --schema next.pg --target ./graph.omni --json
 # inspect "supported": true|false and the step list
-omnigraph schema apply --schema next.pg s3://bucket/repo
+omnigraph schema apply --schema next.pg --target ./graph.omni
 ```
 
 If `supported: false`, fix the source before applying. Plan is free; run it as often as needed.
@@ -117,9 +117,8 @@ a code is present, match it rather than the free-form message text.
 the current schema; older commits still read the dropped data until
 `omnigraph cleanup` stops retaining them, and only then is it gone for good. No
 flag makes a drop destructive at apply: to reclaim the space, run `cleanup`
-with a retention that excludes the commits before the drop. A cluster-only
-server rejects
-`POST /graphs/{id}/schema/apply` with `409`; evolve a served graph through
+with a retention that excludes the commits before the drop. The HTTP server
+has no `POST /graphs/{id}/schema/apply` route; evolve a served graph through
 `cluster plan` and `cluster apply`.
 
 ### Apply is main-only
@@ -165,11 +164,15 @@ Changing the key field is effectively a replace — it invalidates every externa
 ### Constraints: only `@index` is added in place
 
 Adding a constraint other than `@index` (`@key`, `@unique`, `@range`, `@check`)
-to an existing type, removing any constraint, changing edge cardinality or
-endpoints, and adding an edge type with a non-zero `@card` minimum from an
-existing node type (OG-MF-107) are refused as unsupported. In-place migrations are additions of
-nullable properties and types, `@index` additions, enum widening, renames, and
-drops; tightening a constraint means a rebuild.
+to an existing type, removing a constraint from a property that stays,
+changing edge cardinality or endpoints, and adding an edge type with a non-zero
+`@card` minimum from an existing node type (OG-MF-107) are refused as
+unsupported. Dropping a
+property drops every constraint that names only dropped properties (its own
+`@index`, `@unique`, `@range` or `@check`); a drop that would remove a `@key`,
+or a constraint that also names a field that stays, is refused. In-place
+migrations are additions of nullable properties and types, `@index` additions,
+enum widening, renames, and drops; tightening a constraint means a rebuild.
 
 ### `schema apply` blocks writes while running
 
@@ -205,8 +208,13 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 - `@key(@src, @dst, prop)` — edge identity tuple including both endpoints and optional scalar members
 - `@unique(prop1, prop2)` — composite uniqueness, enforced as a true tuple key at intake and merge (works on edges too: `@unique(@src, @dst)`). Members must reduce to scalar keys. Blob is rejected at schema admission; list/vector declarations may parse but writes fail scalar-key validation.
 - `@index(prop1, prop2)` — composite index intent. Composite and edge intents are accepted but are not currently materialized as property indexes.
-- `@range(prop, min..max)` — node-only numeric bounds; either bound may be omitted
+- `@range(prop, min..max)` — node-only inclusive numeric bounds, compared exactly; a list property bounds each element; either bound may be omitted
 - `@check(prop, "regex")` — node-only String regular-expression constraint
+
+Integer bounds must fit `I64`; `..max` is upper-only and `min..` is lower-only.
+Decimal bounds use `F64`. Existing accepted schemas retain their bounds: before
+restating a historical schema, write an old upper-only bound as `min..` and an
+oversized integer bound as a decimal with its stored value.
 
 ## Interfaces
 
@@ -239,18 +247,18 @@ schema is declared (`graphs.<id>.schema:` in `cluster.yaml`) and converged:
 
 ```bash
 $EDITOR schema.pg
-omnigraph cluster plan  --config . --observe   # migration steps; takes no cluster lock
-omnigraph cluster apply --server <name|url> --config .
+# production is a registered server target
+omnigraph cluster plan --target production --config . --json
+omnigraph cluster apply --target production --config .
 # the running server publishes and activates the new shape; no restart
 ```
 
-Without `--server`, `cluster apply --config . --as <you>` writes the storage
-root itself: stop the server and transfer its cluster lock first (see
+With a direct-root target, `cluster apply --target ./cluster --config . --as <you>` writes storage directly: stop the server and transfer its cluster lock first (see
 [`cluster.md`](cluster.md)), then start the server to serve the new shape.
 
 Differences from direct `schema apply` (on a non-cluster store): out-of-band
 schema changes on the live graph are *drift* — the next `cluster apply`
-refuses with `applied_schema_drift`, and `--schema-correction` accepts a
-reviewed observed schema.
+refuses with `applied_schema_drift`. Apply does not adopt drift; restore
+authoritative state from verified evidence or a backup before proceeding.
 Everything else in this file (`@rename_from`, backfills,
 linting, enum discipline) applies unchanged to the `.pg` you edit.

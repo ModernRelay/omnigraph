@@ -6,8 +6,6 @@ use std::path::PathBuf;
 
 #[derive(Debug, Args)]
 pub(crate) struct LoadArgs {
-    /// Graph URI
-    pub(crate) uri: Option<String>,
     #[arg(long)]
     pub(crate) data: PathBuf,
     /// Target branch (defaults to main). Without --from it must exist.
@@ -32,8 +30,6 @@ pub(crate) struct LoadArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct ExportArgs {
-    /// Graph URI
-    pub(crate) uri: Option<String>,
     #[arg(long)]
     pub(crate) branch: Option<String>,
     #[arg(long = "type")]
@@ -46,7 +42,7 @@ pub(crate) enum BlobEntityArg {
     Edge,
 }
 
-impl From<BlobEntityArg> for omnigraph_api_types::BlobEntityKind {
+impl From<BlobEntityArg> for omnigraph_api_types::EntityKind {
     fn from(entity: BlobEntityArg) -> Self {
         match entity {
             BlobEntityArg::Node => Self::Node,

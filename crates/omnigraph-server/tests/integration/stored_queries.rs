@@ -279,7 +279,8 @@ async fn parked_stored_invocation_requires_a_serving_transition_barrier() {
                 .await
                 .unwrap();
             assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert!(!refused.headers().contains_key("retry-after"));
+            // An unavailable graph asks for a retry, and says when.
+            assert_eq!(refused.headers()["retry-after"], "60");
             drop(refused);
             let (status, ready) = json_response(&app, get_request("/readyz", "")).await;
             assert_eq!(status, StatusCode::OK);
@@ -442,9 +443,11 @@ async fn server_refuses_boot_on_type_broken_stored_query() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn invoke_stored_read_returns_rows() {
+    const RANKED_PEOPLE_GQ: &str = "query ranked_people($q: String) { match { $p: Person } return { $p.name, bm25($p.name, $q) as relevance } order { bm25($p.name, $q) } limit 2 }";
     let (_temp, app) = app_with_stored_queries(
         &[
             ("find_person", FIND_PERSON_GQ, false),
+            ("ranked_people", RANKED_PEOPLE_GQ, false),
             (
                 "load",
                 &FIND_PERSON_GQ.replace("find_person", "load"),
@@ -476,6 +479,29 @@ async fn invoke_stored_read_returns_rows() {
         "Alice is in the fixture; body: {body}"
     );
     assert!(body["rows"].is_array(), "read envelope shape; body: {body}");
+    assert!(
+        body.get("ranking").is_none(),
+        "an unranked read reports no ranking; body: {body}"
+    );
+
+    // A stored ranked read reports its ranking as an inline one does.
+    let (status, body) = json_response(
+        &app,
+        invoke_request(
+            "ranked_people",
+            "t-invoke",
+            json!({ "params": { "q": "Alice" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["ranking"],
+        json!({
+            "by": "bm25", "order": "descending", "exhaustive": true,
+            "score_columns": ["relevance"]
+        })
+    );
 
     // The stored query name is a parameter, never an upload-route selector.
     // A second chunk proves refusal happened at collection's 1 MiB bound,

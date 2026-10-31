@@ -86,9 +86,24 @@ also have a single-property shorthand.
 | `@key(p, ...)` | node or edge | The property tuple identifies the entity; its id is derived from it. Key properties must be non-null scalar values. An edge key must include both `@src` and `@dst`, and a key may be declared only when the type is created. |
 | `@unique(p, ...)` | node or edge | No two entities may share the property tuple. Edge constraints may include `@src` and `@dst`. |
 | `@index(p, ...)` | node or edge | Declares index intent. Indexes affect performance, not correctness. |
-| `@range(p, min..max)` | node | Restricts a numeric property; either bound may be omitted. |
+| `@range(p, min..max)` | node | Restricts a numeric property, or each element of a numeric list, to an inclusive range; either bound may be omitted. Values compare with the bounds exactly at any magnitude, and a decimal bound on an integer property admits the integers on its side: `@range(n, -2.5..2.5)` admits -2 through 2. |
 | `@check(p, "regex")` | node | Requires a String property to match the expression. |
 | `@card(min..max)` | edge | Bounds how many edges of the type start at each source node; omit `max` for an unbounded range, as in `@card(1..)`. The default is unbounded from zero. See [Edge cardinality](#edge-cardinality). |
+
+`@range(p, ..10)` supplies only a maximum, and `@range(p, 10..)` supplies
+only a minimum; both endpoints are inclusive. Integer bounds must fit `I64`
+(`-9223372036854775808` through `9223372036854775807`), even for a `U64`
+property. Decimal bounds use their `F64` value.
+
+Already accepted graph schemas keep their stored bounds. Older versions
+interpreted an upper-only bound as a minimum and converted oversized integer
+bounds to `F64`, possibly rounding their value. Opening or upgrading a graph
+does not rewrite those accepted meanings. Reapplying that source, or using an
+exported schema to create another graph, uses the corrected admission rules:
+to preserve the accepted constraint, spell the historical minimum as `min..`
+and a stored floating-point bound as a decimal with the recorded value.
+Complete outstanding deployments containing affected schema source before
+upgrading the binary; deployment source validation uses the admission rules.
 
 `Blob`, list, and vector properties cannot be keys. Blob properties also cannot
 be unique or indexed.
@@ -182,19 +197,24 @@ have no built-in behavior.
 Always preview a direct schema change before applying it:
 
 ```bash
-omnigraph schema plan --schema next.pg graph.omni
-omnigraph schema apply --schema next.pg graph.omni
+omnigraph schema plan --schema next.pg --target ./graph.omni
+omnigraph schema apply --schema next.pg --target ./graph.omni
 ```
 
 Supported changes include adding types, adding nullable properties, renaming
 nodes, edges, or properties with `@rename_from`, adding index declarations,
 widening an enum with new values, updating descriptions or instructions, and
-dropping node, edge, or property declarations.
+dropping node, edge, or property declarations. Dropping a property also drops
+every constraint that names only dropped properties: its own `@index`,
+`@unique`, `@range` or `@check`, and a composite constraint whose members are
+all dropped.
 
 None of these changes rewrites existing rows. Adding a nullable property,
 renaming a property, or dropping a property changes only the table's metadata:
 existing rows read the new property as null, no stored value or Blob is read,
-and existing indexes keep covering the rows they covered. The time and memory
+and the indexes of the remaining properties keep covering the rows they
+covered. A dropped property's index is removed by the same commit, and index
+maintenance does not build it again. The time and memory
 the apply takes therefore do not grow with the number of rows or the size of
 their values. They still grow with the table's metadata: its columns, its
 indexes and its fragments, of which a table written by many small commits has
@@ -207,8 +227,12 @@ same accepted source again leaves the graph unchanged.
 Changes such as adding a required property to existing entities, changing a property
 type (except enum widening), changing edge endpoints or cardinality, adding an
 edge type with a non-zero `@card` minimum from an existing node type, changing a
-node's implemented interfaces, and adding or removing most constraints are
-rejected. The plan reports the exact unsupported step before anything changes.
+node's implemented interfaces, adding a constraint other than `@index`,
+removing a constraint from a property that stays, and adding, removing or
+changing an existing type's `@key` are rejected. A drop is rejected when it
+would remove a constraint that also names a field that stays, such as
+`@unique(a, b)` when only `a` is dropped. The plan reports the exact
+unsupported step before anything changes.
 
 A drop removes the declaration from the current schema and reclaims no storage
 at apply. Older commits still read the dropped data until `omnigraph cleanup`

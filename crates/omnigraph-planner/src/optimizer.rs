@@ -6,20 +6,19 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use omnigraph_compiler::QueryDiagnostic;
 use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR, is_fresh_variable};
 use omnigraph_compiler::query::ast::{AggFunc, LoadStmtMode};
-use omnigraph_compiler::query::codes::{P001, P002, P004, P005};
+use omnigraph_compiler::query::codes::{P002, P004};
 use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::traversal::{EDGE_TYPE_COLUMN, EdgeSelection};
 use omnigraph_compiler::types::Direction;
 
 use crate::cost::{
-    AccessPath, AntiJoinStrategy, CoverageProvenance, ExpandCostInputs, ExpandMode, ExpandPolicy,
-    HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, HYDRATE_ROW_RATIO, IndexCoverage,
-    SOURCE_PARTITION_BYTES, ValidateAccess, ValidateCostInputs, chain_rows, choose_access_path,
-    choose_anti_join_strategy, choose_expand_mode, choose_validate_access, direction_probe_factor,
-    estimate_rows, executed_hops, hydrate_chunk_bytes, scan_row_estimate,
+    AccessPath, AntiJoinStrategy, CoverageProvenance, EndpointProbe, ExpandCostInputs, ExpandMode,
+    ExpandPolicy, HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, HYDRATE_ROW_RATIO, IndexCoverage,
+    ValidateAccess, ValidateCostInputs, ValidateIndexCoverage, ValidateRemoval, chain_rows,
+    choose_access_path, choose_anti_join_strategy, choose_expand_mode, choose_validate_access,
+    direction_probe_factor, estimate_rows, executed_hops, hydrate_chunk_bytes, scan_row_estimate,
 };
 use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
 use crate::key_set::{KeySetTree, key_set_tree};
@@ -68,6 +67,9 @@ pub struct Bounds {
     pub load_workers_max: u32,
     /// The bound every staged write input of a load is checked against.
     pub load_write_max_bytes: u64,
+    /// The source bytes one parse partition of a load owns,
+    /// `cost::SOURCE_PARTITION_BYTES` unless a test pins a smaller slice.
+    pub source_partition_bytes: u64,
 }
 
 pub const PASS_RESOLVE: &str = PassId::Resolve.name();
@@ -216,6 +218,7 @@ fn resolve_load(
                 version: version_of(table),
             }),
             access: None,
+            probe: None,
         })
         .collect();
     let validated = plan.add(
@@ -253,11 +256,130 @@ pub fn write_count_schema() -> SchemaRef {
 /// Stage 1, pass 1 for a GQ query: the flat `IROp` pipeline folded into a
 /// tree, then a leading search function, the `return`, the remaining
 /// `order` keys and the `limit` above it.
+/// The node properties the query's full-text calls read the index of, as
+/// `(type name, property)`, first appearance first: `search`, `fuzzy` and
+/// `match_text` in any filter (correlated blocks included), and `bm25` in the
+/// leading order key or either arm of an `rrf()` there. Planning checks each
+/// one's coverage (`require_full_text_indexes`) and acceptance requires the
+/// plan to record it. Block-local bindings stay within their lexical scope;
+/// nested blocks inherit their parent's bindings, never a sibling's locals.
+pub fn full_text_targets(ir: &QueryIR) -> Vec<(String, String)> {
+    fn bindings(ops: &[IROp], out: &mut HashMap<String, String>) {
+        for op in ops {
+            match op {
+                IROp::NodeScan {
+                    variable,
+                    type_name,
+                    filters: _,
+                } => {
+                    out.insert(variable.clone(), type_name.clone());
+                }
+                IROp::Expand {
+                    dst_var, dst_type, ..
+                } => {
+                    out.insert(dst_var.clone(), dst_type.clone());
+                }
+                IROp::AntiJoin { .. } | IROp::Filter(_) => {}
+            }
+        }
+    }
+    fn calls(expr: &IRExpr, types: &HashMap<String, String>, out: &mut Vec<(String, String)>) {
+        match expr {
+            IRExpr::Search { field, .. }
+            | IRExpr::Fuzzy { field, .. }
+            | IRExpr::MatchText { field, .. }
+            | IRExpr::Bm25 { field, .. } => {
+                if let IRExpr::PropAccess {
+                    variable, property, ..
+                } = field.as_ref()
+                {
+                    if let Some(type_name) = types.get(variable) {
+                        let target = (type_name.clone(), property.clone());
+                        if !out.contains(&target) {
+                            out.push(target);
+                        }
+                    }
+                }
+            }
+            IRExpr::Rrf {
+                primary, secondary, ..
+            } => {
+                calls(primary, types, out);
+                calls(secondary, types, out);
+            }
+            IRExpr::Binary { left, right, .. } => {
+                calls(left, types, out);
+                calls(right, types, out);
+            }
+            IRExpr::Not(inner, _)
+            | IRExpr::Cast { expr: inner, .. }
+            | IRExpr::IsNull { expr: inner, .. } => calls(inner, types, out),
+            IRExpr::PropAccess { .. }
+            | IRExpr::Nearest { .. }
+            | IRExpr::Variable(..)
+            | IRExpr::Param(..)
+            | IRExpr::Literal(..)
+            | IRExpr::Aggregate { .. }
+            | IRExpr::AliasRef(..) => {}
+        }
+    }
+    fn filter_calls(
+        ops: &[IROp],
+        types: &HashMap<String, String>,
+        out: &mut Vec<(String, String)>,
+    ) {
+        for op in ops {
+            match op {
+                IROp::NodeScan { filters, .. }
+                | IROp::Expand {
+                    dst_filters: filters,
+                    ..
+                } => filters.iter().for_each(|filter| calls(filter, types, out)),
+                IROp::Filter(filter) => calls(filter, types, out),
+                IROp::AntiJoin { inner, .. } => {
+                    let mut inner_types = types.clone();
+                    bindings(inner, &mut inner_types);
+                    filter_calls(inner, &inner_types, out);
+                }
+            }
+        }
+    }
+    let mut types = HashMap::new();
+    bindings(&ir.pipeline, &mut types);
+    let mut targets = Vec::new();
+    filter_calls(&ir.pipeline, &types, &mut targets);
+    if let Some(leading) = ir.order_by.first() {
+        calls(&leading.expr, &types, &mut targets);
+    }
+    targets
+}
+
+/// Every full-text call reads its property's full-text index, whose analyzer
+/// (case folding, stemming) a segment carries: a trained one with postings or
+/// the untrained declaration every write records. Coverage may be full or
+/// partial, since Lance scans uncovered rows with that analyzer; an absent
+/// index means no segment records the analyzer at the pinned snapshot, and
+/// Lance would fall back to a bare, case-sensitive tokenizer, so the call is
+/// refused rather than answered differently. The type checker (`T27`)
+/// already required the declaration.
+fn require_full_text_indexes(ir: &QueryIR, source: &dyn PlanSource) -> Result<(), PlanError> {
+    for (type_name, property) in full_text_targets(ir) {
+        let type_key = format!("node:{type_name}");
+        if source.full_text_coverage(&type_key, &property) == FullTextCoverage::Absent {
+            return Err(PlanError::FullTextIndexRequired {
+                index: format!("{type_name}.{property}"),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn resolve_query(
     plan: &mut LogicalPlan,
     ir: &QueryIR,
     source: &dyn PlanSource,
 ) -> Result<(), PlanError> {
+    require_full_text_indexes(ir, source)?;
     if ir.has_edge_selections() {
         let limit = source.traversal_work_limit().ok_or_else(|| {
             PlanError::refused(
@@ -2657,26 +2779,10 @@ impl Lowering<'_> {
             matches!(self.physical.node(id), Some(PhysicalNode::HashJoin { build, .. }) if *build == scan)
         });
         if destination {
-            let function = match access.kind {
-                RankKind::Nearest => "nearest",
-                RankKind::Bm25 => "bm25",
-            };
-            // Declaring the binding first makes it the component's scan root,
-            // which is ranked; the compiler picks the first-declared binding.
-            return Err(PlanError::Unsupported(Box::new(
-                QueryDiagnostic::plan(
-                    P001,
-                    format!(
-                        "`{function}()` orders `${binding}`, a traversal destination; engine v2 ranks only the binding a traversal starts from"
-                    ),
-                )
-                .with_expression(format!(
-                    "{function}(${binding}.{}, {})",
-                    access.property, access.query
-                ))
-                .with_fix(format!(
-                    "declare `${binding}` first in `match`, so the ranking starts the traversal"
-                )),
+            // Lowering roots the component holding the ranked binding at that
+            // binding, so a ranked scan a traversal reaches is its defect.
+            return Err(PlanError::Internal(format!(
+                "the ranked binding `${binding}` is a traversal destination; lowering roots a ranked binding's component at it"
             )));
         }
         self.unmark(scan);
@@ -3322,33 +3428,11 @@ impl Lowering<'_> {
                         &secondary_arm.binding,
                     )
                 {
-                    // One of two bindings a traversal connects always starts
-                    // it and the other is reached, and engine v2 ranks only the
-                    // binding a traversal starts from: no declaration order
-                    // serves both arms, so the refusal offers none.
-                    let call = |arm: &SearchArm| {
-                        let function = match arm.kind {
-                            RankKind::Nearest => "nearest",
-                            RankKind::Bm25 => "bm25",
-                        };
-                        format!(
-                            "{function}(${}.{}, {})",
-                            arm.binding, arm.property, arm.query
-                        )
-                    };
-                    return Err(PlanError::Unsupported(Box::new(
-                        QueryDiagnostic::plan(
-                            P005,
-                            format!(
-                                "`rrf()` ranks `${}` and `${}`, which one traversal connects; engine v2 ranks only the binding a traversal starts from, so one arm always ranks a traversal destination and no declaration order serves both",
-                                primary_arm.binding, secondary_arm.binding
-                            ),
-                        )
-                        .with_expression(format!(
-                            "rrf({}, {})",
-                            call(primary_arm),
-                            call(secondary_arm)
-                        )),
+                    // The type checker refuses these arms (`T59`): one
+                    // traversal cannot start at both ranked bindings.
+                    return Err(PlanError::Internal(format!(
+                        "`rrf()` ranks `${}` and `${}`, which one traversal connects; the type checker refuses those arms",
+                        primary_arm.binding, secondary_arm.binding
                     )));
                 }
                 let mut lowered_arms = Vec::with_capacity(2);
@@ -3557,7 +3641,8 @@ impl Lowering<'_> {
             }
             LogicalNode::CsvSource { spec } => {
                 let max_workers = self.bounds.load_workers_max.max(1);
-                let partitions_by_size = spec.source_bytes.div_ceil(SOURCE_PARTITION_BYTES).max(1);
+                let partition_bytes = self.bounds.source_partition_bytes.max(1);
+                let partitions_by_size = spec.source_bytes.div_ceil(partition_bytes).max(1);
                 let max_partitions =
                     u32::try_from(partitions_by_size.min(u64::from(max_workers))).unwrap_or(1);
                 Ok(self.physical.add(PhysicalNode::CsvSource {
@@ -3573,17 +3658,65 @@ impl Lowering<'_> {
             } => {
                 let estimated_rows = estimate_rows(self.logical, *input, self.source);
                 let lowered = self.lower(*input)?;
-                let checks = checks
+                let overwrite = self.load_overwrites();
+                let target_rows = table
+                    .strip_prefix("node:")
+                    .and_then(|name| self.source.node_type(name).ok())
+                    .and_then(|node| node.row_count);
+                let empty_target = overwrite && target_rows == Some(0);
+                let mut checks: Vec<ValidateSpec> = checks
                     .iter()
+                    .filter(|spec| {
+                        !(empty_target
+                            && matches!(
+                                spec.check,
+                                omnigraph_compiler::ir::ValidateCheck::RetainedEdges { .. }
+                            ))
+                    })
                     .map(|spec| ValidateSpec {
-                        access: Some(self.validate_access(spec, estimated_rows)),
+                        access: Some(self.validate_access(spec, estimated_rows, overwrite)),
                         ..spec.clone()
                     })
                     .collect();
+                let probe = self.endpoint_probe(table, &checks);
+                for spec in &mut checks {
+                    if matches!(
+                        spec.check,
+                        omnigraph_compiler::ir::ValidateCheck::EdgeRi { .. }
+                    ) {
+                        spec.probe = probe;
+                    }
+                }
+                let retained_edge_checks = checks
+                    .iter()
+                    .filter(|spec| {
+                        matches!(
+                            spec.check,
+                            omnigraph_compiler::ir::ValidateCheck::RetainedEdges { .. }
+                        )
+                    })
+                    .count();
+                let removal = if overwrite && retained_edge_checks > 0 {
+                    ValidateRemoval::Scan
+                } else {
+                    ValidateRemoval::None
+                };
+                self.decisions.push(StatisticSource {
+                    statistic: "validate_removal".to_string(),
+                    value: removal.as_str().to_string(),
+                    origin: serde_json::json!({
+                        "table": table,
+                        "overwrite": overwrite,
+                        "target_rows": target_rows,
+                        "retained_edge_checks": retained_edge_checks,
+                    })
+                    .to_string(),
+                });
                 Ok(self.physical.add(PhysicalNode::Validate {
                     input: lowered,
                     table: table.clone(),
                     checks,
+                    removal,
                     max_workers: self.bounds.load_workers_max.max(1),
                 }))
             }
@@ -3599,20 +3732,80 @@ impl Lowering<'_> {
         }
     }
 
+    /// Where the `edge_ri` checks probe: `Swept` when every one reads its
+    /// set whole over a one-integer `@key` node type, `Judged` otherwise,
+    /// `None` when the load plans no endpoint check.
+    fn endpoint_probe(&mut self, table: &str, checks: &[ValidateSpec]) -> Option<EndpointProbe> {
+        let endpoints: Vec<(&str, Option<ValidateAccess>)> = checks
+            .iter()
+            .filter_map(|spec| match &spec.check {
+                omnigraph_compiler::ir::ValidateCheck::EdgeRi { node_type, .. } => {
+                    Some((node_type.as_str(), spec.access))
+                }
+                _ => None,
+            })
+            .collect();
+        if endpoints.is_empty() {
+            return None;
+        }
+        let integer_key = |node_type: &str| {
+            self.source.node_type(node_type).ok().is_some_and(|node| {
+                let [key] = node.key.as_slice() else {
+                    return false;
+                };
+                node.schema.field_with_name(key).is_ok_and(|field| {
+                    matches!(
+                        field.data_type(),
+                        DataType::Int32 | DataType::Int64 | DataType::UInt32
+                    )
+                })
+            })
+        };
+        let swept = endpoints.iter().all(|(node_type, access)| {
+            *access == Some(ValidateAccess::Scan) && integer_key(node_type)
+        });
+        let probe = if swept {
+            EndpointProbe::Swept
+        } else {
+            EndpointProbe::Judged
+        };
+        self.decisions.push(StatisticSource {
+            statistic: "endpoint_probe".to_string(),
+            value: probe.as_str().to_string(),
+            origin: serde_json::json!({
+                "table": table,
+                "endpoints": endpoints
+                    .iter()
+                    .map(|(node_type, access)| serde_json::json!({
+                        "node_type": node_type,
+                        "access": access.map(ValidateAccess::as_str),
+                        "integer_key": integer_key(node_type),
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+            .to_string(),
+        });
+        Some(probe)
+    }
+
+    /// Whether the load plan's write replaces its table.
+    fn load_overwrites(&self) -> bool {
+        self.logical
+            .live()
+            .any(|(_, node)| matches!(node, LogicalNode::FragmentWrite { spec, .. } if spec.mode == LoadStmtMode::Overwrite))
+    }
+
     /// Pass 9 costs the committed lookup from the accepted node count and
     /// index metadata. Append and merge retain their executor's Probe path.
     fn validate_access(
         &mut self,
         spec: &ValidateSpec,
         estimated_rows: Option<u64>,
+        overwrite: bool,
     ) -> ValidateAccess {
         let Some(image) = &spec.consults else {
             return ValidateAccess::Delta;
         };
-        let overwrite = self
-            .logical
-            .live()
-            .any(|(_, node)| matches!(node, LogicalNode::FragmentWrite { spec, .. } if spec.mode == LoadStmtMode::Overwrite));
         let node = image
             .table
             .strip_prefix("node:")
@@ -3638,15 +3831,33 @@ impl Lowering<'_> {
                 candidates.peek().is_some()
                     && candidates.all(|fact| fact.fully_covers_btree(column))
             });
+        let index_coverage = if indexed {
+            ValidateIndexCoverage::Full
+        } else if facts.iter().any(|fact| {
+            columns.contains(&fact.column.as_str())
+                && matches!(fact.kind, crate::source::IndexKind::Btree { usable: true })
+                && fact.may_narrow()
+        }) {
+            ValidateIndexCoverage::Partial
+        } else {
+            ValidateIndexCoverage::Absent
+        };
         let inputs = ValidateCostInputs {
             input_rows: estimated_rows,
             consulted_rows: node.as_ref().and_then(|node| node.row_count),
-            indexed,
+            index_coverage,
         };
-        let access = if overwrite {
-            choose_validate_access(&spec.check, inputs)
-        } else {
-            ValidateAccess::Probe
+        let access = match &spec.check {
+            // An overwrite replaces the table, so each source of its prior
+            // image keeps only its delta edges: under a minimum the check
+            // scans those sources for one the delta leaves without an edge.
+            omnigraph_compiler::ir::ValidateCheck::Cardinality { min, .. }
+                if overwrite && *min > 0 =>
+            {
+                ValidateAccess::Scan
+            }
+            _ if overwrite => choose_validate_access(&spec.check, inputs),
+            _ => ValidateAccess::Probe,
         };
         let costs = inputs.costs(&spec.check);
         self.access_path = true;
@@ -3660,6 +3871,7 @@ impl Lowering<'_> {
                 "estimated_rows": estimated_rows,
                 "consulted_rows": inputs.consulted_rows,
                 "index_full_coverage": indexed,
+                "index_coverage": index_coverage,
                 "index_facts": facts,
                 "indexed_row_factor": HASH_JOIN_RATIO,
                 "probe_calls": costs.map(|(_, _, calls)| calls),

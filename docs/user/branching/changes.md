@@ -12,7 +12,7 @@ JSON or streamed body.
 ## Inspect one commit
 
 ```bash
-omnigraph commit changes <commit-id> --store graph.omni --json
+omnigraph commit changes <commit-id> --target ./graph.omni --json
 ```
 
 The equivalent HTTP route is
@@ -48,7 +48,7 @@ as an empty change.
 ## Compare two points
 
 ```bash
-omnigraph diff --from <commit-id> --to main --store graph.omni --json
+omnigraph diff --from <commit-id> --to main --target ./graph.omni --json
 ```
 
 Each side is a branch name, meaning its head when the diff starts, or a commit
@@ -82,15 +82,28 @@ across a
 schema change returns `409` with reason `schema_boundary`, and a side whose
 history was reclaimed returns `410` with `change_feed_gap`.
 
-Cost grows with the size of each changed type, not with the number of
-changes: apart from a single commit, every changed type is compared in full.
-Types unchanged between the two points are skipped.
+Types unchanged between the two points are skipped. A changed type is
+compared row by row. For a single commit the engine reads the fragments that
+commit wrote. Across several commits it pairs the two versions' live rows by
+Lance's stable row id and reads only the rows whose version stamp differs or
+that exist on one side alone, so the cost follows the changed rows and the
+fragments that hold them, not the table's size, and stays flat across a
+compaction. That pairing applies when the `from` side is on the `to` side's
+history: a branch review whose merge base is on the source's first-parent
+history, and a two-point diff whose `to` names a branch whose first-parent
+chain holds `from`. A diff of two diverged heads compares every row of each changed
+type, and so does a review of a branch that has merged its target since the
+fork. The `change_lineage`
+[session setting](../queries/settings.md) selects the comparison for every
+change read: `on` (the default) pairs rows by id, `off` compares every row,
+and `verify` runs both and fails the page where they disagree, which a debug
+build does by default.
 
 ## Review a branch
 
 ```bash
-omnigraph branch diff feature --into main --store graph.omni --json
-omnigraph branch merge-base feature --into main --store graph.omni --json
+omnigraph branch diff feature --into main --target ./graph.omni --json
+omnigraph branch merge-base feature --into main --target ./graph.omni --json
 ```
 
 `branch diff` reports what `feature` changed since its merge base with `main`
@@ -124,14 +137,14 @@ the merge would succeed, run it as a [dry run](merge.md#preview-a-merge).
 
 ```bash
 # Start at the current head. Existing history is not replayed.
-omnigraph changes poll --start now --store graph.omni --json
+omnigraph changes poll --start now --target ./graph.omni --json
 
 # Replay the branch's first-parent history.
-omnigraph changes poll --start beginning --store graph.omni --json
+omnigraph changes poll --start beginning --target ./graph.omni --json
 
 # Continue after a known commit, or resume from a saved cursor.
-omnigraph changes poll --start after:<commit-id> --store graph.omni --json
-omnigraph changes poll --cursor <cursor> --store graph.omni --json
+omnigraph changes poll --start after:<commit-id> --target ./graph.omni --json
+omnigraph changes poll --cursor <cursor> --target ./graph.omni --json
 ```
 
 `now` is the default when neither `--start` nor `--cursor` is supplied.
@@ -169,7 +182,7 @@ available, the rejected `cursor`. Retrying the same cursor cannot close the
 gap; install a new baseline:
 
 ```bash
-omnigraph changes baseline --out snapshot.jsonl --store graph.omni --json
+omnigraph changes baseline --out snapshot.jsonl --target ./graph.omni --json
 ```
 
 If a poll has already accumulated complete readable blocks before it reaches a

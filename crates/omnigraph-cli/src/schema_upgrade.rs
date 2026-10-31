@@ -1,39 +1,22 @@
 use super::*;
 use crate::app::Completion;
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
-    input: &crate::operator::InvocationConfig,
-    profile: &Option<String>,
-    store: &Option<String>,
-    uri: Option<String>,
+    target: &crate::targets::ResolvedTarget,
     check: bool,
     json: bool,
-    quiet: bool,
     stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
 ) -> Result<Completion> {
-    let target = scope::resolve_scope(
-        input.get(stderr)?,
-        input.profile(),
-        planes::Capability::Direct,
-        scope::ScopeFlags {
-            profile: profile.as_deref(),
-            store: store.as_deref(),
-            server: None,
-            cluster: None,
-            graph: None,
-            uri,
-        },
-    )?;
-    if target.cluster.is_some() {
-        bail!(
-            "schema upgrade-system-columns refuses cluster-managed graphs; a qualified cluster upgrade operation is required"
-        );
+    if !matches!(
+        target.binding,
+        crate::targets::TargetBinding::DirectGraph { .. }
+    ) {
+        bail!("schema upgrade-system-columns requires a standalone direct graph target");
     }
-    let uri = resolve_local_uri(target.uri, "schema upgrade-system-columns")?;
+    let uri = scope::direct_graph_uri(target, None).await?;
     let uri = omnigraph::storage::normalize_root_uri(&uri)?;
-    if let Some(root) = omnigraph_cluster::cluster_root_for_graph_uri(&uri)
+    let binding = scope::capture_storage_binding(target)?.for_uri(&uri)?;
+    if let Some(root) = omnigraph_cluster::cluster_root_for_graph_binding(&binding)
         .await
         .map_err(|diagnostic| {
             color_eyre::eyre::eyre!("{}: {}", diagnostic.path, diagnostic.message)
@@ -43,13 +26,19 @@ pub(crate) async fn run(
             "schema upgrade-system-columns refuses graph `{uri}` inside cluster `{root}`; a qualified cluster upgrade operation is required"
         );
     }
-    if !check {
-        write_target(quiet, "schema upgrade-system-columns", &uri, false, stderr)?;
-    }
+    let uri = binding.uri();
     let db = if check {
-        omnigraph::db::Omnigraph::open_read_only(&uri).await?
+        omnigraph::db::Omnigraph::open_read_only_with_storage(
+            uri,
+            omnigraph::storage::storage_for_binding(&binding)?,
+        )
+        .await?
     } else {
-        omnigraph::db::Omnigraph::open(&uri).await?
+        omnigraph::db::Omnigraph::open_with_storage(
+            uri,
+            omnigraph::storage::storage_for_binding(&binding)?,
+        )
+        .await?
     };
     let report = db
         .upgrade_system_columns(omnigraph::db::SystemColumnUpgradeOptions { check })
@@ -254,7 +243,8 @@ mod tests {
             "omnigraph",
             "schema",
             "upgrade-system-columns",
-            "graph.omni",
+            "--target",
+            "./graph.omni",
             "--check",
             "--json",
         ])
@@ -262,32 +252,58 @@ mod tests {
         assert!(matches!(
             &cli.command,
             Command::Schema {
-                command: SchemaCommand::UpgradeSystemColumns { uri: Some(uri), check: true, json: true }
-            } if uri == "graph.omni"
+                command: SchemaCommand::UpgradeSystemColumns {
+                    check: true,
+                    json: true
+                }
+            }
         ));
-        assert_eq!(
-            planes::command_capability(&cli.command),
-            planes::Capability::Direct
-        );
-        assert!(planes::guard_addressing(&cli).is_ok());
+        assert_eq!(cli.target.as_deref(), Some("./graph.omni"));
     }
 
     #[test]
-    fn system_column_upgrade_rejects_served_and_cluster_addressing() {
-        for flag in ["--server", "--cluster", "--graph"] {
-            let cli = Cli::try_parse_from([
-                "omnigraph",
-                flag,
-                "x",
-                "schema",
-                "upgrade-system-columns",
-                "graph.omni",
-            ])
-            .unwrap();
+    fn system_column_upgrade_rejects_retired_addressing() {
+        for flag in ["--server", "--cluster", "--store", "--connection"] {
             assert!(
-                planes::guard_addressing(&cli).is_err(),
+                Cli::try_parse_from(["omnigraph", flag, "x", "schema", "upgrade-system-columns",])
+                    .is_err(),
                 "{flag} must be refused"
             );
         }
+        for args in [
+            [
+                "omnigraph",
+                "--profile",
+                "work",
+                "schema",
+                "upgrade-system-columns",
+            ],
+            [
+                "omnigraph",
+                "schema",
+                "upgrade-system-columns",
+                "--profile",
+                "work",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(cli.profile.as_deref(), Some("work"));
+            assert_eq!(
+                crate::planes::guard_addressing(&cli)
+                    .unwrap_err()
+                    .to_string(),
+                "schema upgrade-system-columns does not accept --profile"
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "omnigraph",
+                "schema",
+                "upgrade-system-columns",
+                "./graph.omni",
+            ])
+            .is_err(),
+            "only init retains a positional address"
+        );
     }
 }

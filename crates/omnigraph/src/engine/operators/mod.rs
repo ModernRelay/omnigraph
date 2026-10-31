@@ -1,28 +1,26 @@
 //! The read engine's operators, one per read `PhysicalNode` kind, with
-//! shared query memory accounting. Each pipeline breaker drains the input it
-//! needs, admits retained batches and work storage to the query's pool, and
-//! emits results in batch-size slices. Every operator counts the polls of
-//! the streams it hands out (`polled`) and, where its node declares a switch,
-//! sets the `switch` gauge to the side it took; the execution report reads
-//! both off `metrics()`.
+//! shared query memory accounting. Every operator holds one shape from
+//! `shape` (`Breaker`, `Streaming`, `Source`) and builds its output stream
+//! only through it, so its declared emission is the one it executes and the
+//! planner's `PipelineShape` needs no second declaration here. A breaker
+//! drains the input it needs, admits retained batches and work storage to
+//! the query's pool, and emits results in batch-size slices. The shape
+//! counts the polls of the stream it hands out and, where the node declares
+//! a switch, the operator sets the `switch` gauge to the side it took; the
+//! execution report reads both off `metrics()`.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use self::memory::WorkMemory;
+use self::shape::{DRAINED, POLLS};
 use arrow_array::RecordBatch;
 use arrow_schema::{Field, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result as DfResult};
-use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::metrics::{
-    BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue, MetricsSet,
+    ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue, MetricsSet,
 };
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{PlanProperties, RecordBatchStream, SendableRecordBatchStream};
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{OmniError, Result};
@@ -41,13 +39,14 @@ mod fragment_sink;
 mod hash_join;
 mod hydrate;
 mod limit;
+mod load_budget;
 pub(in crate::engine) mod memory;
 mod metadata_count;
 mod pair_buffer;
-mod producer;
 mod projection;
 mod rank_fuse;
 mod scan;
+mod shape;
 mod single_hop;
 mod sort;
 mod subquery_aggregate;
@@ -77,15 +76,6 @@ pub(super) use scan::{RuntimeFilterSlot, ScanExec, ScanSource};
 pub(super) use sort::{SortExec, SortKey};
 pub(crate) use subquery_aggregate::RowCountPredicate;
 pub(super) use validate::{LoadJudge, ValidateExec};
-
-/// The `polls` counter: one per `poll_next` of any stream the operator handed
-/// out, so a zero says no consumer ever asked the operator for a batch.
-const POLLS: &str = "polls";
-
-/// The `drained` counter: one per stream the operator handed out whose
-/// consumer pulled it to its end, so a row count is complete only where this
-/// is set.
-const DRAINED: &str = "drained";
 
 /// The `switch` gauge: the slot of the [`Switch`] side an operator with a
 /// declared switch took, 0 until it took one.
@@ -172,78 +162,6 @@ pub(in crate::engine) fn was_drained(metrics: &MetricsSet) -> Option<bool> {
         }
     }
     counts_polls.then_some(drained)
-}
-
-/// `stream` with every poll counted on `metrics`, and its end when reached.
-pub(super) fn polled(
-    metrics: &ExecutionPlanMetricsSet,
-    stream: SendableRecordBatchStream,
-) -> SendableRecordBatchStream {
-    Box::pin(Polled {
-        stream,
-        polls: MetricBuilder::new(metrics).counter(POLLS, 0),
-        drained: MetricBuilder::new(metrics).counter(DRAINED, 0),
-    })
-}
-
-struct Polled {
-    stream: SendableRecordBatchStream,
-    polls: Count,
-    drained: Count,
-}
-
-impl Stream for Polled {
-    type Item = DfResult<RecordBatch>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.polls.add(1);
-        let polled = self.stream.as_mut().poll_next(cx);
-        if matches!(polled, Poll::Ready(None)) {
-            self.drained.add(1);
-        }
-        polled
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.stream.size_hint()
-    }
-}
-
-impl RecordBatchStream for Polled {
-    fn schema(&self) -> SchemaRef {
-        self.stream.schema()
-    }
-}
-
-/// A stream that ends at once: the operator ran and produced nothing, its
-/// input never executed.
-pub(super) fn empty_stream(schema: SchemaRef) -> SendableRecordBatchStream {
-    Box::pin(RecordBatchStreamAdapter::new(
-        schema,
-        futures::stream::empty(),
-    ))
-}
-
-/// The properties of a pipeline breaker: one partition, output only
-/// once the input is complete, bounded.
-pub(super) fn breaker_properties(schema: SchemaRef) -> Arc<PlanProperties> {
-    Arc::new(PlanProperties::new(
-        EquivalenceProperties::new(schema),
-        Partitioning::UnknownPartitioning(1),
-        EmissionType::Final,
-        Boundedness::Bounded,
-    ))
-}
-
-/// The properties of an operator that emits as its input arrives: one
-/// partition, incremental, bounded.
-pub(super) fn streaming_properties(schema: SchemaRef) -> Arc<PlanProperties> {
-    Arc::new(PlanProperties::new(
-        EquivalenceProperties::new(schema),
-        Partitioning::UnknownPartitioning(1),
-        EmissionType::Incremental,
-        Boundedness::Bounded,
-    ))
 }
 
 pub(super) fn external(error: OmniError) -> DataFusionError {
@@ -342,61 +260,4 @@ pub(super) fn joined_schema(left: &Schema, right: &Schema) -> Result<SchemaRef> 
         fields.push(field.as_ref().clone());
     }
     Ok(Arc::new(Schema::new(fields)))
-}
-
-/// The stream of a breaker: `body` builds the whole output under the
-/// reservation, which then lives with the stream while the output leaves in
-/// `batch_size` slices; dropping the stream drops the body, the held batches
-/// and the reservation together.
-pub(super) fn breaker_stream<F>(
-    name: &str,
-    schema: SchemaRef,
-    ctx: &Arc<datafusion::execution::TaskContext>,
-    metrics: &ExecutionPlanMetricsSet,
-    body: impl FnOnce(Arc<WorkMemory>) -> F,
-) -> SendableRecordBatchStream
-where
-    F: Future<Output = DfResult<RecordBatch>> + Send + 'static,
-{
-    let reservation = match WorkMemory::new(Arc::clone(ctx), name) {
-        Ok(mut memory) => {
-            memory.set_metrics(metrics.clone());
-            memory.metric("input_rows", 0);
-            Arc::new(memory)
-        }
-        Err(error) => {
-            return Box::pin(RecordBatchStreamAdapter::new(
-                schema,
-                futures::stream::once(async move { Err(error) }),
-            ));
-        }
-    };
-    let batch_size = ctx.session_config().batch_size();
-    let emitted = Arc::clone(&reservation);
-    let output_schema = Arc::clone(&schema);
-    let future = body(reservation);
-    let baseline = BaselineMetrics::new(metrics, 0);
-    let stream = futures::stream::once(async move {
-        let mut future = Box::pin(future);
-        let batch = futures::future::poll_fn(|cx| {
-            let _timer = baseline.elapsed_compute().timer();
-            future.as_mut().poll(cx)
-        })
-        .await?;
-        baseline.record_output(batch.num_rows());
-        baseline.done();
-        emitted.output(&batch)?;
-        let held = Arc::clone(&emitted);
-        Ok::<_, DataFusionError>(
-            futures::stream::iter((0..batch.num_rows()).step_by(batch_size.max(1)).map(
-                move |offset| Ok(batch.slice(offset, batch_size.min(batch.num_rows() - offset))),
-            ))
-            .map(move |batch| {
-                let _held = &held;
-                batch
-            }),
-        )
-    })
-    .try_flatten();
-    Box::pin(RecordBatchStreamAdapter::new(output_schema, stream))
 }

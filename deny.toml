@@ -23,10 +23,26 @@ unsound = "all"
 # advisory also removes its row here.
 unused-ignored-advisory = "deny"
 ignore = [
-  { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.39.4 via object_store 0.13.2 (DataFusion 54, Lance 11); patched only in 0.41, cleared when object_store bumps quick-xml" },
-  { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.39.4, same path and clearing event as RUSTSEC-2026-0194" },
-  { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; a proc-macro pulled by lance-bitpacking 11.0.0, cleared when Lance replaces it" },
+  { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; a proc-macro pulled by lance-bitpacking 13.0.0, cleared when Lance replaces it" },
   { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 Marvin timing side channel via reqsign (lance-io, opendal); RustSec lists no patched version" },
+  # zstd 0.13 and its zstd-safe 7 are pinned by arrow-ipc 58.3.0 (`zstd = "0.13.0"`)
+  # and lance-encoding 13.0.0 (`zstd = "0.13"`); the patched line is zstd 0.14.3 with
+  # zstd-safe 8.2.0, taken when arrow and Lance move. Those two crates reach only the
+  # bulk API and `stream::copy_decode` (a `read::Decoder` on a fresh context); no
+  # workspace crate names zstd. Each row names the API the advisory is about.
+  { id = "RUSTSEC-2026-0391", reason = "zstd 0.13.3 `with_context` stream constructors on a borrowed context; arrow-ipc and lance-encoding build every context themselves (bulk, `copy_decode`); cleared by zstd 0.14.3" },
+  { id = "RUSTSEC-2026-0395", reason = "zstd-safe 7.2.4 `CParameter::StableInBuffer`; never set by zstd 0.13.3 or its two dependents; cleared by zstd-safe 8.2.0" },
+  { id = "RUSTSEC-2026-0396", reason = "zstd-safe 7.2.4 `Seekable` seek table; the seekable API is not used; cleared by zstd-safe 8.2.0" },
+  { id = "RUSTSEC-2026-0397", reason = "zstd-safe 7.2.4 `OutBuffer::around_pos`; zstd 0.13.3 never calls it and no crate uses zstd-safe streaming directly (lance-encoding calls only `compress_bound`); cleared by zstd-safe 8.2.0" },
+  { id = "RUSTSEC-2026-0398", reason = "zstd-safe 7.2.4 `Seekable::decompress`; the seekable API is not used; cleared by zstd-safe 8.2.0" },
+  { id = "RUSTSEC-2026-0399", reason = "zstd-safe 7.2.4 `init_using_cdict` / `init_using_ddict`; no dictionary is used; cleared by zstd-safe 8.2.0" },
+  { id = "RUSTSEC-2026-0400", reason = "zstd-safe 7.2.4 one-shot dictionary call on a context with an open stream; no dictionary is used and the bulk contexts never carry a stream; cleared by zstd-safe 8.2.0" },
+  { id = "RUSTSEC-2026-0401", reason = "zstd-safe 7.2.4 `train_from_buffer`; no dictionary is trained; cleared by zstd-safe 8.2.0" },
+  { id = "RUSTSEC-2026-0402", reason = "zstd-safe 7.2.4 `CCtx::try_clone` on a multithreaded context; neither `try_clone` nor `zstdmt` is used; cleared by zstd-safe 8.2.0" },
+  { id = "RUSTSEC-2026-0403", reason = "zstd-safe 7.2.4 legacy frame through `stream::write::Decoder`; the tree decodes through `read::Decoder` and the bulk API, which the advisory lists as unaffected; cleared by zstd-safe 8.2.0" },
+  { id = "RUSTSEC-2026-0404", reason = "zstd-safe 7.2.4 `DCtx::try_clone`; not used; cleared by zstd-safe 8.2.0" },
+  { id = "RUSTSEC-2026-0405", reason = "zstd-safe 7.2.4 out-of-range `InBuffer::pos` in the seekable compress stream; the seekable API is not used; cleared by zstd-safe 8.2.0" },
+  { id = "RUSTSEC-2026-0406", reason = "zstd-safe 7.2.4 changing a multithreaded context with an unfinished frame; `zstdmt` is not used; cleared by zstd-safe 8.2.0" },
 ]
 
 [licenses]

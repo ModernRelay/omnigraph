@@ -1286,7 +1286,7 @@ async fn test_snapshot_at_reads_branch_pinned_historical_state() {
 
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let main_manifest_version = mc.version();
-    mc.create_branch("feature").await.unwrap();
+    mc.create_branch("feature", None).await.unwrap();
 
     let snap = mc.snapshot();
     let person_entry = snap.dataset("node:Person").unwrap().clone();
@@ -1373,7 +1373,7 @@ async fn test_branch_manifest_namespace_uses_entry_owner_branch_for_latest_table
     let catalog = build_test_catalog();
 
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
-    mc.create_branch("feature").await.unwrap();
+    mc.create_branch("feature", None).await.unwrap();
 
     let snap = mc.snapshot();
     let person_entry = snap.dataset("node:Person").unwrap().clone();
@@ -1993,7 +1993,7 @@ async fn test_batch_create_table_versions_allows_owner_branch_handoff_at_same_ve
     let catalog = build_test_catalog();
 
     let mut main_mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
-    main_mc.create_branch("feature").await.unwrap();
+    main_mc.create_branch("feature", None).await.unwrap();
 
     let snap = main_mc.snapshot();
     let person_entry = snap.dataset("node:Person").unwrap().clone();
@@ -2032,7 +2032,7 @@ async fn test_batch_create_table_versions_allows_owner_branch_handoff_at_same_ve
     let mut feature_mc = ManifestCoordinator::open_at_branch(uri, "feature")
         .await
         .unwrap();
-    feature_mc.create_branch("experiment").await.unwrap();
+    feature_mc.create_branch("experiment", None).await.unwrap();
     feature_ds
         .create_branch("experiment", feature_version, None)
         .await
@@ -2873,7 +2873,7 @@ async fn branch_inherits_main_internal_schema_stamp() {
     let uri = dir.path().to_str().unwrap();
     let catalog = build_test_catalog();
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
-    mc.create_branch("feature").await.unwrap();
+    mc.create_branch("feature", None).await.unwrap();
 
     let main_ds = open_manifest_dataset(uri, None).await.unwrap();
     let feature_ds = open_manifest_dataset(uri, Some("feature")).await.unwrap();
@@ -2977,7 +2977,7 @@ async fn assert_exact_named_head_race(establish_head: bool) {
     let uri = dir.path().to_str().unwrap();
     let catalog = build_test_catalog();
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
-    mc.create_branch("feature").await.unwrap();
+    mc.create_branch("feature", None).await.unwrap();
 
     let publisher = GraphNamespacePublisher::new(uri, Some("feature"));
     let empty = HashMap::new();
@@ -3247,7 +3247,7 @@ async fn exact_publish_rejects_named_branch_delete_recreate_aba() {
     let uri = dir.path().to_str().unwrap();
     let catalog = build_test_catalog();
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
-    mc.create_branch("feature").await.unwrap();
+    mc.create_branch("feature", None).await.unwrap();
 
     let old_branch = open_manifest_dataset(uri, Some("feature")).await.unwrap();
     let old_identifier = old_branch.branch_identifier().await.unwrap();
@@ -3283,7 +3283,7 @@ async fn exact_publish_rejects_named_branch_delete_recreate_aba() {
         old_branch.branch_identifier().await,
         Err(lance::Error::RefNotFound { .. })
     ));
-    mc.create_branch("feature").await.unwrap();
+    mc.create_branch("feature", None).await.unwrap();
     assert_ne!(
         probe_dataset_latest_incarnation(&old_branch, Some("feature"))
             .await
@@ -4311,7 +4311,7 @@ async fn fresh_fork_publishes_on_top_of_the_head_it_inherits() {
     mc.commit_changes_with_lineage(&[], &HashMap::new(), Some(&on_main))
         .await
         .unwrap();
-    mc.create_branch("feature").await.unwrap();
+    mc.create_branch("feature", None).await.unwrap();
 
     let fork = ManifestCoordinator::open_at_branch(uri, "feature")
         .await
@@ -4413,12 +4413,12 @@ async fn recreated_branch_has_no_exact_head_and_inherits_the_head_of_its_source(
         outcome.head
     };
 
-    mc.create_branch("b").await.unwrap();
+    mc.create_branch("b", None).await.unwrap();
     let on_b = publish("b").await;
     ManifestCoordinator::open_at_branch(uri, "b")
         .await
         .unwrap()
-        .create_branch("c")
+        .create_branch("c", None)
         .await
         .unwrap();
     let on_c = publish("c").await;
@@ -4430,7 +4430,7 @@ async fn recreated_branch_has_no_exact_head_and_inherits_the_head_of_its_source(
     ManifestCoordinator::open_at_branch(uri, "c")
         .await
         .unwrap()
-        .create_branch("b")
+        .create_branch("b", None)
         .await
         .unwrap();
 
@@ -4509,7 +4509,7 @@ async fn unattached_root_on_a_fresh_branch_records_the_inherited_head() {
     mc.commit_changes_with_lineage(&[], &HashMap::new(), Some(&on_main))
         .await
         .unwrap();
-    mc.create_branch("feature").await.unwrap();
+    mc.create_branch("feature", None).await.unwrap();
     let fork = ManifestCoordinator::open_at_branch(uri, "feature")
         .await
         .unwrap();
@@ -4785,6 +4785,7 @@ async fn unattached_child_checks_expected_versions_against_its_base() {
     crate::unattached::release_unattached_tag_confirmed(
         &main,
         &unattached_tag_name(&root.graph_commit_id, &root.graph_commit_id),
+        &root.graph_commit_id,
     )
     .await
     .unwrap();
@@ -4955,7 +4956,7 @@ async fn generation_is_the_greatest_parent_generation_plus_one() {
     let mut mc = ManifestCoordinator::init(uri, &build_test_catalog())
         .await
         .unwrap();
-    mc.create_branch("feature").await.unwrap();
+    mc.create_branch("feature", None).await.unwrap();
     let publish = |branch: Option<&'static str>, merged_parent: Option<BranchRecords>| async move {
         GraphNamespacePublisher::new(uri, branch)
             .publish(
@@ -5173,7 +5174,7 @@ async fn merge_publish_appends_the_records_of_an_idle_branch() {
     let mut main = ManifestCoordinator::init(uri, &build_test_catalog())
         .await
         .unwrap();
-    main.create_branch("feature").await.unwrap();
+    main.create_branch("feature", None).await.unwrap();
     let mut feature = ManifestCoordinator::open_at_branch(uri, "feature")
         .await
         .unwrap();
@@ -5294,7 +5295,7 @@ async fn branch_records_of_a_wide_unchanged_catalog_rebuild_no_table_rows() {
     let mut main = ManifestCoordinator::init(uri, &build_wide_catalog())
         .await
         .unwrap();
-    main.create_branch("feature").await.unwrap();
+    main.create_branch("feature", None).await.unwrap();
     let mut feature = ManifestCoordinator::open_at_branch(uri, "feature")
         .await
         .unwrap();
@@ -5374,11 +5375,11 @@ async fn branch_delete_appends_the_commits_the_branch_wrote() {
         .await
         .unwrap();
 
-    main.create_branch("unwritten").await.unwrap();
+    main.create_branch("unwritten", None).await.unwrap();
     main.delete_branch("unwritten").await.unwrap();
     assert_eq!(history_row_count(uri).await, 0);
 
-    main.create_branch("feature").await.unwrap();
+    main.create_branch("feature", None).await.unwrap();
     let mut feature = ManifestCoordinator::open_at_branch(uri, "feature")
         .await
         .unwrap();
@@ -5446,10 +5447,11 @@ async fn branch_delete_appends_the_commits_the_branch_wrote() {
         Some(head.commit.clone())
     );
 
-    let snapshot = head.snapshot(uri).unwrap();
+    let snapshot = head.snapshot(uri, &session).unwrap();
     let at_head = ManifestCoordinator::snapshot_from_state(
         uri,
         read_manifest_state(&feature_manifest).await.unwrap(),
+        Arc::clone(&session),
     );
     assert_eq!(snapshot.version, at_head.version);
     assert_eq!(snapshot.graph_heads, at_head.graph_heads);
@@ -5466,7 +5468,7 @@ async fn branch_delete_appends_the_commits_the_branch_wrote() {
         .await
         .unwrap_err();
     assert!(matches!(error, OmniError::BranchNotFound { .. }), "{error}");
-    main.create_branch("feature").await.unwrap();
+    main.create_branch("feature", None).await.unwrap();
     let error = ManifestCoordinator::ensure_incarnation_live(uri, &session, &head.commit)
         .await
         .unwrap_err();
@@ -6340,7 +6342,7 @@ async fn repeated_merge_base_search_makes_no_request() {
         publish_block_commit(&mut main, fat_block_intent(None)).await;
     }
     let fork_point = main.head().graph_commit_id.clone();
-    main.create_branch("feature").await.unwrap();
+    main.create_branch("feature", None).await.unwrap();
     let mut feature = ManifestCoordinator::open_at_branch(uri, "feature")
         .await
         .unwrap();
@@ -6880,7 +6882,7 @@ async fn fork_inherits_the_buffer_and_the_replaced_rows_of_the_version_it_forks(
         .await
         .unwrap();
     }
-    main.create_branch("feature").await.unwrap();
+    main.create_branch("feature", None).await.unwrap();
     let mut fork = ManifestCoordinator::open_at_branch(uri, "feature")
         .await
         .unwrap();
@@ -7000,7 +7002,7 @@ async fn block_placement_preserves_fork_and_parent_records_through_two_releases(
          slot 0, so the fork releases A[0..5] before main releases all of A"
     );
     let block = format!("blocks/{}/", inherited.block);
-    main.create_branch("feature").await.unwrap();
+    main.create_branch("feature", None).await.unwrap();
     let mut fork = ManifestCoordinator::open_at_branch(uri, "feature")
         .await
         .unwrap();
@@ -7240,7 +7242,7 @@ async fn merge_into_a_full_buffer_appends_both_lineages_in_one_append() {
     let mut main = ManifestCoordinator::init(uri, &build_test_catalog())
         .await
         .unwrap();
-    main.create_branch("feature").await.unwrap();
+    main.create_branch("feature", None).await.unwrap();
     let mut feature = ManifestCoordinator::open_at_branch(uri, "feature")
         .await
         .unwrap();
@@ -7332,7 +7334,7 @@ async fn repeated_merges_of_an_open_source_block_append_each_commit_once_and_sta
     let mut main = ManifestCoordinator::init(uri, &build_test_catalog())
         .await
         .unwrap();
-    main.create_branch("f").await.unwrap();
+    main.create_branch("f", None).await.unwrap();
     let mut source = ManifestCoordinator::open_at_branch(uri, "f").await.unwrap();
     let mut first = None;
     for _ in 0..MERGES {
@@ -7405,7 +7407,7 @@ async fn merges_separated_by_a_target_release_append_each_source_commit_once() {
     let mut main = ManifestCoordinator::init(uri, &build_test_catalog())
         .await
         .unwrap();
-    main.create_branch("f").await.unwrap();
+    main.create_branch("f", None).await.unwrap();
     let mut source = ManifestCoordinator::open_at_branch(uri, "f").await.unwrap();
     let mut merge_base = main.head().graph_commit_id.clone();
     let mut first = None;
@@ -7576,7 +7578,9 @@ async fn several_targets_merging_one_open_source_block_keep_its_head_readable_in
         .unwrap();
     let mut fork_bases = Vec::new();
     for target in 0..TARGETS {
-        main.create_branch(&format!("t{target}")).await.unwrap();
+        main.create_branch(&format!("t{target}"), None)
+            .await
+            .unwrap();
         fork_bases.push(main.head().graph_commit_id.clone());
         main.commit_changes_with_lineage(&[], &HashMap::new(), Some(&block_intent()))
             .await
@@ -7717,7 +7721,7 @@ async fn merge_and_delete_append_only_the_commits_no_other_lineage_keeps() {
         publish_on(&mut main, None, None).await;
     }
 
-    main.create_branch("task").await.unwrap();
+    main.create_branch("task", None).await.unwrap();
     let mut task = ManifestCoordinator::open_at_branch(uri, "task")
         .await
         .unwrap();
@@ -7736,7 +7740,7 @@ async fn merge_and_delete_append_only_the_commits_no_other_lineage_keeps() {
         "the deleted branch wrote one commit"
     );
 
-    main.create_branch("slow").await.unwrap();
+    main.create_branch("slow", None).await.unwrap();
     let mut slow = ManifestCoordinator::open_at_branch(uri, "slow")
         .await
         .unwrap();
@@ -7774,12 +7778,12 @@ async fn merge_and_delete_append_only_the_commits_no_other_lineage_keeps() {
         "main appended every commit the branch inherited from it"
     );
 
-    main.create_branch("outer").await.unwrap();
+    main.create_branch("outer", None).await.unwrap();
     let mut outer = ManifestCoordinator::open_at_branch(uri, "outer")
         .await
         .unwrap();
     let on_outer = publish_on(&mut outer, Some("outer"), None).await;
-    outer.create_branch("inner").await.unwrap();
+    outer.create_branch("inner", None).await.unwrap();
     let mut inner = ManifestCoordinator::open_at_branch(uri, "inner")
         .await
         .unwrap();
@@ -7813,8 +7817,8 @@ async fn merge_and_delete_append_only_the_commits_no_other_lineage_keeps() {
         "each delete acknowledges its already archived records"
     );
 
-    main.create_branch("left").await.unwrap();
-    main.create_branch("right").await.unwrap();
+    main.create_branch("left", None).await.unwrap();
+    main.create_branch("right", None).await.unwrap();
     let mut left = ManifestCoordinator::open_at_branch(uri, "left")
         .await
         .unwrap();
@@ -8805,7 +8809,9 @@ async fn publish_replaces_the_schema_contract_row_and_carries_it_forward() {
         .into_iter()
         .find(|record| record.commit.graph_manifest_version == genesis_version)
         .unwrap();
-    let historical = old_record.snapshot(uri).unwrap();
+    let historical = old_record
+        .snapshot(uri, &crate::lance_access::control_session())
+        .unwrap();
     assert_eq!(historical.schema_contract(), Some(&genesis_contract.head));
     assert_eq!(
         ManifestCoordinator::read_schema_contract_for_snapshot(uri, &historical)
@@ -9527,6 +9533,15 @@ async fn state_scan_projection_leaves_the_content_columns_unread() {
 pub(super) struct SmallScanProbeMarker;
 
 impl lance::io::WrappingObjectStore for SmallScanProbeMarker {
+    fn wrap_paginated(
+        &self,
+        _: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        // This wrapper does not observe or change listings.
+        Some(original)
+    }
+
     fn wrap(
         &self,
         _: &str,
@@ -9574,6 +9589,15 @@ impl HistoryGets {
 }
 
 impl lance::io::WrappingObjectStore for HistoryGets {
+    fn wrap_paginated(
+        &self,
+        _: &str,
+        _original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        // Keep listings on the wrapped path so faults and request accounting apply.
+        None
+    }
+
     fn wrap(
         &self,
         _: &str,
@@ -10384,6 +10408,15 @@ struct HistoryPutFault {
 }
 
 impl lance::io::WrappingObjectStore for HistoryPutFault {
+    fn wrap_paginated(
+        &self,
+        _: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        // This wrapper does not observe or change listings.
+        Some(original)
+    }
+
     fn wrap(
         &self,
         _: &str,
@@ -10954,7 +10987,9 @@ async fn schema_content_is_archived_by_digest_and_serves_commit_snapshots() {
     let read_genesis_contract = |record: HistoryRecord| {
         let uri = uri.clone();
         async move {
-            let snapshot = record.snapshot(&uri).unwrap();
+            let snapshot = record
+                .snapshot(&uri, &crate::lance_access::control_session())
+                .unwrap();
             let sent = HistoryGets::default();
             let probes = sent.probes();
             let opens = probes.internal_open_count.clone();
@@ -10994,7 +11029,10 @@ async fn schema_content_is_archived_by_digest_and_serves_commit_snapshots() {
         .expect("the release archived the genesis commit");
     assert_eq!(archived.commit, genesis);
     assert_eq!(read_genesis_contract(archived).await, genesis_contract);
-    let latest = mc.head_record().snapshot(&uri).unwrap();
+    let latest = mc
+        .head_record()
+        .snapshot(&uri, &mc.control_session())
+        .unwrap();
     assert_eq!(
         ManifestCoordinator::read_schema_contract_for_snapshot(&uri, &latest)
             .await
@@ -11017,7 +11055,10 @@ async fn missing_or_inconsistent_archived_schema_content_fails_closed() {
     let digest = mc.head().schema_content_hash.clone().unwrap();
     let path = schema_object_path(dir.path(), &digest);
     let intact = std::fs::read(&path).unwrap();
-    let snapshot = mc.head_record().snapshot(&uri).unwrap();
+    let snapshot = mc
+        .head_record()
+        .snapshot(&uri, &mc.control_session())
+        .unwrap();
     let read = || async {
         let direct = super::history::read_schema(&uri, &session, &digest, &contract.head).await;
         let through = ManifestCoordinator::read_schema_contract_for_snapshot(&uri, &snapshot).await;
@@ -11083,7 +11124,9 @@ async fn missing_or_inconsistent_archived_schema_content_fails_closed() {
     refused(
         ManifestCoordinator::read_schema_contract_for_snapshot(
             &uri,
-            &unnamed.snapshot(&uri).unwrap(),
+            &unnamed
+                .snapshot(&uri, &crate::lance_access::control_session())
+                .unwrap(),
         )
         .await,
         "recorded no schema content",
@@ -13973,7 +14016,7 @@ async fn assert_legacy_versions_of_an_upgraded_root(target: u32) {
         assert_eq!(super::migrations::read_stamp(&converted_feature), Some(14));
 
         let mut main = ManifestCoordinator::open(root).await.unwrap();
-        main.create_branch("after_upgrade").await.unwrap();
+        main.create_branch("after_upgrade", None).await.unwrap();
 
         for (logical, old_head, person_version) in [
             ("feature", f4.commit.graph_commit_id.as_str(), 6),
@@ -14753,4 +14796,705 @@ async fn proposal_reader_reads_are_independent_of_the_unattached_population() {
              {lookup} manifest-store objects, {lookup_without} with none"
         );
     }
+}
+
+/// What [`ManifestRequestFault`] does to the publication requests of
+/// `__manifest`. Every other request passes through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestFault {
+    /// The `_transactions/*.txn` put fails before Lance sends the manifest:
+    /// a file is planted where `__manifest/_transactions/` goes, because
+    /// Lance writes a local transaction file past the object store.
+    TransactionPut,
+    /// The first numbered manifest create is applied, then answered by a
+    /// lost acknowledgement.
+    LostAcknowledgement,
+    /// Every numbered manifest create fails unapplied with an ambiguous error.
+    EveryManifestPut,
+    /// The first numbered manifest create fails at once, and its request is
+    /// applied 50 ms later, after the client gave up on it.
+    LandsLate,
+    /// Every numbered manifest create fails with an ambiguous error; the
+    /// first one's request is held and applied when the test lands it, after
+    /// every re-issue gave up.
+    LandsAfterGiveUp,
+    /// A tag create succeeds after an internal retry, while an earlier copy
+    /// remains pending. Its authority probe fails, and the test lands the
+    /// earlier copy after the publisher has deleted the acknowledged tag.
+    CandidateTagReplay,
+}
+
+/// A conditional create held back to land after its client gave up.
+type DeferredCreate = (
+    Arc<dyn object_store::ObjectStore>,
+    object_store::path::Path,
+    object_store::PutPayload,
+    object_store::PutOptions,
+);
+
+#[derive(Debug, Clone)]
+struct ManifestRequestFault {
+    fault: ManifestFault,
+    fired: Arc<std::sync::atomic::AtomicBool>,
+    manifest_puts: Arc<std::sync::atomic::AtomicUsize>,
+    deferred: Arc<std::sync::Mutex<Option<DeferredCreate>>>,
+    /// Set when the store answers manifest creates again.
+    healed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ManifestRequestFault {
+    fn new(fault: ManifestFault) -> Self {
+        Self {
+            fault,
+            fired: Arc::default(),
+            manifest_puts: Arc::default(),
+            deferred: Arc::default(),
+            healed: Arc::default(),
+        }
+    }
+
+    fn candidate_probe_unavailable(&self) -> bool {
+        self.fault == ManifestFault::CandidateTagReplay
+            && self.fired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Apply the held create now; returns whether one was held.
+    async fn land(&self) -> bool {
+        self.try_land()
+            .await
+            .map(|answer| answer.unwrap())
+            .is_some()
+    }
+
+    /// Send the held create now, and return the store's answer to it.
+    async fn try_land(&self) -> Option<object_store::Result<()>> {
+        let deferred = self.deferred.lock().unwrap().take();
+        let (store, location, payload, options) = deferred?;
+        Some(store.put_opts(&location, payload, options).await.map(drop))
+    }
+
+    /// The store answers manifest creates again.
+    fn heal(&self) {
+        self.healed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl lance::io::WrappingObjectStore for ManifestRequestFault {
+    fn wrap(
+        &self,
+        _: &str,
+        original: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(ManifestRequestFaultStore {
+            original,
+            fault: self.clone(),
+        })
+    }
+    fn wrap_paginated(
+        &self,
+        _: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        if self.fault == ManifestFault::CandidateTagReplay {
+            // The post-tag authority probe must observe the same read fault
+            // whether Lance uses a complete listing or a pushed-down page.
+            None
+        } else {
+            Some(original)
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ManifestRequestFaultStore {
+    original: Arc<dyn object_store::ObjectStore>,
+    fault: ManifestRequestFault,
+}
+
+impl std::fmt::Display for ManifestRequestFaultStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "manifest request fault over {}", self.original)
+    }
+}
+
+fn ambiguous_store_error(text: &str) -> object_store::Error {
+    // A remote store's generic failure: the request may have applied.
+    object_store::Error::Generic {
+        store: "S3",
+        source: Box::new(std::io::Error::other(text.to_string())),
+    }
+}
+
+#[async_trait]
+impl object_store::ObjectStore for ManifestRequestFaultStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        use std::sync::atomic::Ordering;
+
+        let parts: Vec<_> = location.parts().collect();
+        let [.., directory, name] = parts.as_slice() else {
+            return self.original.put_opts(location, payload, options).await;
+        };
+        let transaction = directory.as_ref() == "_transactions";
+        let candidate_tag = directory.as_ref() == "tags"
+            && (name.as_ref().starts_with("unpublished_")
+                || name.as_ref().starts_with("unattached_"))
+            && matches!(options.mode, object_store::PutMode::Create);
+        let numbered_manifest = directory.as_ref() == "_versions"
+            && name.as_ref().ends_with(".manifest")
+            && !name.as_ref().starts_with('d')
+            && matches!(options.mode, object_store::PutMode::Create);
+        if numbered_manifest {
+            self.fault.manifest_puts.fetch_add(1, Ordering::SeqCst);
+        }
+        let first = |hit: bool| hit && !self.fault.fired.swap(true, Ordering::SeqCst);
+        match self.fault.fault {
+            ManifestFault::CandidateTagReplay if first(candidate_tag) => {
+                // Model a remote client's internal retry: one copy is
+                // acknowledged, but the earlier identical request can still
+                // reach the store after rollback removes this copy's key.
+                let result = self
+                    .original
+                    .put_opts(location, payload.clone(), options.clone())
+                    .await?;
+                *self.fault.deferred.lock().unwrap() = Some((
+                    Arc::clone(&self.original),
+                    location.clone(),
+                    payload,
+                    options,
+                ));
+                Ok(result)
+            }
+            ManifestFault::TransactionPut if first(transaction) => Err(ambiguous_store_error(
+                "<Code>SlowDown</Code><Message>Please reduce your request rate.</Message>",
+            )),
+            ManifestFault::LostAcknowledgement if first(numbered_manifest) => {
+                self.original.put_opts(location, payload, options).await?;
+                Err(ambiguous_store_error("connection reset after the request"))
+            }
+            ManifestFault::EveryManifestPut if numbered_manifest => {
+                Err(ambiguous_store_error("503 Service Unavailable"))
+            }
+            ManifestFault::LandsAfterGiveUp
+                if numbered_manifest && !self.fault.healed.load(Ordering::SeqCst) =>
+            {
+                if first(true) {
+                    *self.fault.deferred.lock().unwrap() = Some((
+                        Arc::clone(&self.original),
+                        location.clone(),
+                        payload,
+                        options,
+                    ));
+                }
+                Err(ambiguous_store_error("request timed out"))
+            }
+            ManifestFault::LandsLate if first(numbered_manifest) => {
+                let original = Arc::clone(&self.original);
+                let location = location.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    // The abandoned request reaches the store; a re-issue
+                    // that won the key makes it fail its precondition.
+                    let _ = original.put_opts(&location, payload, options).await;
+                });
+                Err(ambiguous_store_error("request timed out"))
+            }
+            _ => self.original.put_opts(location, payload, options).await,
+        }
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.original.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if self.fault.candidate_probe_unavailable() {
+            return Err(ambiguous_store_error("post-tag authority read unavailable"));
+        }
+        self.original.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.original.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        if self.fault.candidate_probe_unavailable() {
+            return futures::stream::once(async {
+                Err(ambiguous_store_error(
+                    "post-tag authority listing unavailable",
+                ))
+            })
+            .boxed();
+        }
+        self.original.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        if self.fault.candidate_probe_unavailable() {
+            return Err(ambiguous_store_error(
+                "post-tag authority listing unavailable",
+            ));
+        }
+        self.original.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.original.copy_opts(from, to, options).await
+    }
+}
+
+/// Publish one lineage commit through `fault` on `__manifest`; returns the
+/// result and the `__manifest` version before and after.
+async fn publish_through(
+    fault: ManifestFault,
+) -> (Result<PublishOutcome>, u64, u64, ManifestRequestFault) {
+    let dir = tempfile::tempdir().unwrap();
+    let published = publish_through_in(dir.path(), fault).await;
+    drop(dir);
+    published
+}
+
+/// [`publish_through`] on a graph root the caller owns.
+async fn publish_through_in(
+    root: &std::path::Path,
+    fault: ManifestFault,
+) -> (Result<PublishOutcome>, u64, u64, ManifestRequestFault) {
+    let uri = root.to_str().unwrap().to_string();
+    ManifestCoordinator::init(&uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let before = open_manifest_dataset(&uri, None)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    let transactions = root.join("__manifest/_transactions");
+    let parked = root.join("__manifest/_transactions.parked");
+    if fault == ManifestFault::TransactionPut {
+        std::fs::rename(&transactions, &parked).unwrap();
+        std::fs::write(&transactions, b"not a directory").unwrap();
+    }
+    let fault = ManifestRequestFault::new(fault);
+    let probes = crate::instrumentation::QueryIoProbes {
+        manifest_wrapper: Some(Arc::new(fault.clone())),
+        ..Default::default()
+    };
+    let publisher = GraphNamespacePublisher::new(&uri, None);
+    let result = crate::instrumentation::with_query_io_probes(
+        probes,
+        publisher.publish(&[], &HashMap::new(), Some(&lineage_intent(None, None))),
+    )
+    .await;
+    if fault.fault == ManifestFault::TransactionPut {
+        std::fs::remove_file(&transactions).unwrap();
+        std::fs::rename(&parked, &transactions).unwrap();
+    }
+    // The late landing, if any, has had its chance before the version is read.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let after = open_manifest_dataset(&uri, None)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    (result, before, after, fault)
+}
+
+/// A publication whose transaction file put fails never sent its manifest:
+/// the failure is definite, `Unpublished`, and not a publication in doubt.
+/// This is the store answer a quiet bucket gave a single served mutate on
+/// 2026-10-19; the server contained itself on the in-doubt answer it got.
+#[tokio::test]
+async fn transaction_file_failure_before_the_manifest_is_unpublished_issue_1067() {
+    let (result, before, after, fault) = publish_through(ManifestFault::TransactionPut).await;
+    let error = result.expect_err("the transaction file put fails");
+    assert!(
+        !error.is_manifest_publish_in_doubt(),
+        "no manifest request was sent: {error}"
+    );
+    assert_eq!(
+        error.completion_evidence(),
+        Some(crate::error::CompletionEvidence::Unpublished),
+        "{error:?}"
+    );
+    assert!(error.storage_failure().is_some(), "{error:?}");
+    assert_eq!(after, before, "nothing published");
+    assert_eq!(
+        fault
+            .manifest_puts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the manifest was never sent"
+    );
+}
+
+/// A manifest create the store applied and whose answer was lost is
+/// re-issued unchanged; the re-issue finds the version held, Lance reads it
+/// back as this commit, and the publication succeeds once.
+#[tokio::test]
+async fn lost_manifest_acknowledgement_resolves_by_re_issue_issue_1067() {
+    let (result, before, after, fault) = publish_through(ManifestFault::LostAcknowledgement).await;
+    result.expect("the re-issued request reads back as this commit");
+    assert_eq!(after, before + 1, "exactly one version published");
+    assert_eq!(
+        fault
+            .manifest_puts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the original request and one re-issue"
+    );
+}
+
+/// A manifest request abandoned after an ambiguous answer, which reaches the
+/// store later, is settled by the re-issue: whichever copy lands first is
+/// this commit, and the other fails its precondition.
+#[tokio::test]
+async fn abandoned_manifest_create_that_lands_late_publishes_once_issue_1067() {
+    let (result, before, after, _) = publish_through(ManifestFault::LandsLate).await;
+    result.expect("the re-issue or the late original is this commit");
+    assert_eq!(after, before + 1, "exactly one version published");
+}
+
+/// A store that answers no manifest create definitively leaves the version
+/// open to a late landing: after every re-issue the publication is in doubt,
+/// never `Unpublished`.
+#[tokio::test]
+async fn manifest_create_without_a_definite_answer_stays_in_doubt_issue_1067() {
+    let (result, before, after, fault) = publish_through(ManifestFault::EveryManifestPut).await;
+    let error = result.expect_err("no manifest create succeeds");
+    assert!(error.is_manifest_publish_in_doubt(), "{error:?}");
+    assert_eq!(
+        error.completion_evidence(),
+        Some(crate::error::CompletionEvidence::Uncertain),
+        "{error:?}"
+    );
+    assert_eq!(after, before, "nothing published");
+    assert_eq!(
+        fault
+            .manifest_puts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1 + crate::manifest_request::MANIFEST_REQUEST_REISSUES as usize,
+        "the original request and every re-issue"
+    );
+}
+
+/// A manifest create no re-issue settled may still land, and its manifest
+/// names the attempt's transaction file. The in-doubt error names the graph
+/// commit that may land, which is the one that does. Lance reads the version back after
+/// the last re-issue; the missing version must not count as proof of
+/// absence there, or Lance deletes that file and the late manifest names a
+/// file that is gone. Here no storage scope backs the protocol, as on an
+/// embedded or CLI open.
+#[tokio::test]
+async fn unresolved_manifest_create_keeps_its_transaction_file_issue_1067() {
+    let dir = tempfile::tempdir().unwrap();
+    let (result, before, after, fault) =
+        publish_through_in(dir.path(), ManifestFault::LandsAfterGiveUp).await;
+    let error = result.expect_err("no manifest create is answered");
+    assert!(error.is_manifest_publish_in_doubt(), "{error:?}");
+    assert_eq!(after, before, "nothing visible yet");
+
+    assert!(fault.land().await, "the first create was held");
+    let uri = dir.path().to_str().unwrap();
+    let landed = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(
+        landed.version().version,
+        before + 1,
+        "the late create landed"
+    );
+    // The error named, as its own field, the graph commit that landed.
+    assert_eq!(
+        error.publication_id(),
+        Some(
+            read_manifest_rows(&landed)
+                .await
+                .unwrap()
+                .head
+                .graph_commit_id
+                .as_str()
+        ),
+        "{error:?}"
+    );
+    let transaction = landed
+        .manifest()
+        .transaction_file
+        .clone()
+        .expect("the landed manifest names its transaction file");
+    assert!(
+        dir.path()
+            .join("__manifest/_transactions")
+            .join(&transaction)
+            .exists(),
+        "the transaction file {transaction} named by the late manifest is kept"
+    );
+}
+
+/// An unknown publication needs no record to stay safe: its manifest version
+/// is created only if absent, so it lands before the branch's next
+/// publication or never. If the next publication takes the version first,
+/// the late request fails its precondition and only that publication is
+/// visible; if the late request lands first, the next publication builds on
+/// it.
+#[tokio::test]
+async fn unknown_publication_lands_before_the_next_publication_or_never_issue_1067() {
+    for late_first in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
+        ManifestCoordinator::init(&uri, &build_test_catalog())
+            .await
+            .unwrap();
+        let before = open_manifest_dataset(&uri, None)
+            .await
+            .unwrap()
+            .version()
+            .version;
+        let fault = ManifestRequestFault::new(ManifestFault::LandsAfterGiveUp);
+        let probes = || crate::instrumentation::QueryIoProbes {
+            manifest_wrapper: Some(Arc::new(fault.clone())),
+            ..Default::default()
+        };
+        let publisher = GraphNamespacePublisher::new(&uri, None);
+        let unknown = lineage_intent(None, None);
+        let error = crate::instrumentation::with_query_io_probes(
+            probes(),
+            publisher.publish(&[], &HashMap::new(), Some(&unknown)),
+        )
+        .await
+        .expect_err("no manifest create is answered");
+        assert!(error.is_manifest_publish_in_doubt(), "{error:?}");
+        if late_first {
+            fault
+                .try_land()
+                .await
+                .expect("the first create was held")
+                .expect("the late create lands on a free version");
+        }
+        fault.heal();
+        let next = lineage_intent(None, None);
+        crate::instrumentation::with_query_io_probes(
+            probes(),
+            publisher.publish(&[], &HashMap::new(), Some(&next)),
+        )
+        .await
+        .expect("the branch publishes again");
+        if !late_first {
+            let late = fault.try_land().await.expect("the first create was held");
+            assert!(
+                matches!(late, Err(object_store::Error::AlreadyExists { .. })),
+                "a late create cannot replace the next publication: {late:?}"
+            );
+        }
+        let latest = open_manifest_dataset(&uri, None).await.unwrap();
+        assert_eq!(
+            read_manifest_rows(&latest)
+                .await
+                .unwrap()
+                .head
+                .graph_commit_id,
+            next.graph_commit_id,
+            "late_first={late_first}: the next publication is the head"
+        );
+        if late_first {
+            assert_eq!(latest.version().version, before + 2);
+            let landed = latest.checkout_version(before + 1).await.unwrap();
+            assert_eq!(
+                read_manifest_rows(&landed)
+                    .await
+                    .unwrap()
+                    .head
+                    .graph_commit_id,
+                unknown.graph_commit_id,
+                "the late create is the version the next publication built on"
+            );
+        } else {
+            assert_eq!(
+                latest.version().version,
+                before + 1,
+                "the late create never landed"
+            );
+        }
+    }
+}
+
+/// Use Lance's stock object-store implementation of local files for the
+/// publisher session, so native filesystem shortcuts cannot bypass the read
+/// fault. The fixture and its verification still open the same files normally.
+#[derive(Debug)]
+struct FileObjectStoreProvider(Arc<dyn lance_io::object_store::ObjectStoreProvider>);
+
+#[async_trait]
+impl lance_io::object_store::ObjectStoreProvider for FileObjectStoreProvider {
+    async fn new_store(
+        &self,
+        url: url::Url,
+        params: &lance::io::ObjectStoreParams,
+    ) -> lance::Result<lance_io::object_store::ObjectStore> {
+        let url =
+            url::Url::parse(&url.as_str().replacen("file:", "file-object-store:", 1)).unwrap();
+        self.0.new_store(url, params).await
+    }
+
+    fn extract_path(&self, url: &url::Url) -> lance::Result<object_store::path::Path> {
+        self.0.extract_path(url)
+    }
+}
+
+/// A successful tag deletion does not fence an earlier conditional create
+/// that the remote client retried. The candidate can become addressable again
+/// after the failed authority probe, so that failure must stay uncertain.
+/// Rust rather than GQT: this asserts a deferred native tag request and the
+/// completion evidence of an operation that returned no candidate id.
+#[tokio::test]
+async fn candidate_tag_reappearing_after_rollback_stays_uncertain_issue_1067() {
+    let mut evidence = Vec::new();
+    for unattached in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut mc = ManifestCoordinator::init(uri, &build_test_catalog())
+            .await
+            .unwrap();
+        let before = main_rows(uri).await;
+        let before_version = mc.version();
+        let person = mc.snapshot().dataset("node:Person").unwrap().clone();
+        let update = append_person_and_make_update(uri, &person, "Alice").await;
+        let authority = GraphHeadExpectation::new(
+            None,
+            lance::dataset::refs::BranchIdentifier::main(),
+            mc.exact_graph_head(),
+        );
+        let registry = lance::io::ObjectStoreRegistry::default();
+        let provider = registry.get_provider("file-object-store").unwrap();
+        registry.insert("file", Arc::new(FileObjectStoreProvider(provider)));
+        let session = Arc::new(lance::session::Session::new(0, 0, Arc::new(registry)));
+        let publisher = GraphNamespacePublisher::new_with_session(uri, None, session);
+        let fault = ManifestRequestFault::new(ManifestFault::CandidateTagReplay);
+        let probes = crate::instrumentation::QueryIoProbes {
+            manifest_wrapper: Some(Arc::new(fault.clone())),
+            ..Default::default()
+        };
+        let result = crate::instrumentation::with_query_io_probes(probes, async {
+            let changes = [ManifestChange::Update(update.clone())];
+            let expected = expect_person(&person, 1);
+            if unattached {
+                publisher
+                    .write_unattached_candidate(
+                        &changes,
+                        &expected,
+                        &unattached_intent(None),
+                        &authority,
+                        &UnattachedWriteBase::Head,
+                    )
+                    .await
+                    .map(|_| ())
+            } else {
+                let intent = LineageIntent {
+                    graph_commit_id: ulid::Ulid::new().to_string(),
+                    ..lineage_intent(None, None)
+                };
+                publisher
+                    .write_candidate(&changes, &expected, &intent, &authority, None)
+                    .await
+                    .map(|_| ())
+            }
+        })
+        .await;
+        let error = result.expect_err("the authority probe fails after tag creation");
+        assert!(
+            error.to_string().contains("post-tag authority"),
+            "{error:?}"
+        );
+        evidence.push((
+            unattached,
+            error.completion_evidence(),
+            error.is_manifest_publish_in_doubt(),
+        ));
+        let main = open_manifest_dataset(uri, None).await.unwrap();
+        assert_eq!(main.version().version, before_version);
+        assert_eq!(
+            main_rows(uri).await.records(),
+            before.records(),
+            "the live graph did not move"
+        );
+        assert!(
+            main.tags().list().await.unwrap().is_empty(),
+            "rollback removed the acknowledged tag"
+        );
+
+        assert!(
+            fault.land().await,
+            "the earlier conditional tag create was held"
+        );
+        let session = mc.control_session();
+        if unattached {
+            let snapshots = ManifestCoordinator::list_unattached(uri, &session, None)
+                .await
+                .unwrap();
+            assert_eq!(snapshots.len(), 1);
+            let snapshot = &snapshots[0];
+            snapshot.require_readable().unwrap();
+            snapshot.require_extendable().unwrap();
+            assert_eq!(
+                pinned_version(&snapshot.record.tables, &person),
+                update.published_dataset_version
+            );
+        } else {
+            let proposals = ManifestCoordinator::list_unpublished(uri, &session, None)
+                .await
+                .unwrap();
+            assert_eq!(proposals.len(), 1);
+            let proposal = &proposals[0];
+            proposal.require_publishable().unwrap();
+            mc.publish_unpublished(proposal).await.unwrap();
+            assert_eq!(
+                mc.exact_graph_head().as_deref(),
+                Some(proposal.property.graph_commit_id.as_str()),
+                "the resurrected proposal can still publish"
+            );
+        }
+    }
+    assert_eq!(
+        evidence,
+        [
+            (
+                false,
+                Some(crate::error::CompletionEvidence::Uncertain),
+                true
+            ),
+            (
+                true,
+                Some(crate::error::CompletionEvidence::Uncertain),
+                true
+            ),
+        ],
+        "deleting the acknowledged tag does not prove the candidate stayed unreachable"
+    );
 }

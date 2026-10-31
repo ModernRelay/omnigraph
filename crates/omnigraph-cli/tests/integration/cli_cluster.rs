@@ -8,10 +8,34 @@ use tempfile::tempdir;
 use crate::support::managed_http::{IntentApiFixture, IntentReply, IntentRequest};
 use crate::support::*;
 
+fn managed_fixture_command(
+    root: &std::path::Path,
+    origin: &str,
+    target: &str,
+) -> assert_cmd::Command {
+    if !managed_home(root).join("config.yaml").exists() {
+        write_managed_target(root, origin);
+    }
+    managed_command(root, origin, target)
+}
+
+fn lifecycle_record(root: &std::path::Path, origin: &str, name: &str) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let identity = serde_json::to_vec(&(origin, "account-one")).unwrap();
+    managed_home(root)
+        .join("lifecycle")
+        .join(format!("{:x}", Sha256::digest(identity)))
+        .join(name)
+}
+
 const MANAGED_REVISION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 fn managed_preview(state: &str) -> Value {
-    serde_json::json!({"data":{"preview_id":"saved-plan","state":state,"revision":MANAGED_REVISION,"input_digest":"exact-input","generation":{"state_revision":3}},"meta":{"cluster_id":"managed-test","incarnation":"inc-one","provenance":"service_db"}})
+    let mut body = serde_json::json!({"data":{"preview_id":"saved-plan","state":state,"revision":MANAGED_REVISION,"first_attempt_deadline":"2026-10-30T00:44:57Z","failure_code":null,"input_digest":"exact-input","generation":{"state_revision":3}},"meta":{"cluster_id":"managed-test","incarnation":"inc-one","provenance":"service_db"}});
+    if state == "ready" {
+        body["data"]["native_plan"] = serde_json::json!({"ok":true,"changes":[]});
+    }
+    body
 }
 
 fn managed_delivery(delivery: &str) -> Value {
@@ -69,109 +93,162 @@ fn lifecycle_fixture(replies: Vec<IntentReply>) -> IntentApiFixture {
     IntentApiFixture::with_session(replies, lifecycle_session("principal-one", "account-one"))
 }
 
+/// `--as` on a served cluster command asserts the actor; the server refuses
+/// another one before any effect, so the command exits 4 having sent nothing
+/// that could change the cluster, with and without `--json`.
 #[test]
-fn core_remote_status_uses_one_operator_config_for_server_and_token() {
-    let status = serde_json::json!({
-        "status": {
-            "canonical_root": "file:///server-only-storage",
-            "ledger_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            "state_revision": 1,
-            "result_revision": 0,
-            "next_sequence": 1,
-            "lock_id": "server-owner",
-            "outstanding_id": null,
-            "lookup": null
-        },
-        "active": false,
-        "in_progress": false
+fn as_on_a_served_cluster_command_exits_4_on_another_actor() {
+    let refusal = serde_json::json!({
+        "error": "the credential resolves to actor 'act-real', not the expected 'act-nope'",
+        "code": "actor_mismatch"
     });
-    for named in [true, false] {
-        let home = tempdir().unwrap();
+    let root = tempdir().unwrap();
+    write_cluster_config_fixture(root.path());
+    for command in ["plan", "apply"] {
+        for json in [true, false] {
+            let api = IntentApiFixture::graph(vec![IntentReply::json(412, refusal.clone())]);
+            let mut cmd = cli();
+            cmd.args(["cluster", command, "--target"])
+                .fixture_target(&api.origin)
+                .args(["--as", "act-nope", "--config"])
+                .arg(root.path());
+            if json {
+                cmd.arg("--json");
+            }
+            let output = cmd.output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(4),
+                "{command} json={json}: {output:?}"
+            );
+            if json {
+                assert_eq!(parse_stdout_json(&output)["code"], "actor_mismatch");
+            } else {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("act-nope"),
+                    "{command}: {output:?}"
+                );
+            }
+            let requests = api.workflow_requests();
+            assert_eq!(requests.len(), 1, "{command}: {requests:?}");
+            assert_eq!(requests[0].method, "GET", "{command}: {requests:?}");
+            assert_eq!(
+                requests[0].headers["omnigraph-if-actor"], "act-nope",
+                "{command}: {requests:?}"
+            );
+            api.assert_complete();
+        }
+    }
+}
+
+#[test]
+fn core_remote_status_uses_only_the_selected_target_credential() {
+    let ca = tls_gateway::ca_path().display();
+    let status = serde_json::json!({"status":{"canonical_root":"file:///server-only-storage","ledger_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","state_revision":1,"result_revision":0,"next_sequence":1,"lock_id":"server-owner","outstanding_id":null,"lookup":null},"active":false,"in_progress":false});
+    for mode in ["named", "named_anonymous"] {
         let api = IntentApiFixture::graph(vec![IntentReply::json(200, status.clone())]);
-        fs::write(
-            home.path().join("config.yaml"),
-            format!(
-                "servers:\n  status-server:\n    url: '{}'\ncaptured_only: true\n",
-                api.origin
-            ),
-        )
-        .unwrap();
-        let server = if named { "status-server" } else { &api.origin };
+        let operator = KeyedServer::new(&api.origin);
+        let mut command = cli();
+        command.envs(operator.env("keyed-status-token"));
+        if mode == "named_anonymous" {
+            command.env("OMNIGRAPH_HOME", tls_gateway::anonymous_home(&api.origin));
+        }
         let output = output_success(
-            cli()
-                .current_dir(home.path())
-                .env("OMNIGRAPH_HOME", home.path())
-                .env("OMNIGRAPH_TOKEN_STATUS_SERVER", "keyed-status-token")
-                .env("OMNIGRAPH_BEARER_TOKEN", "fallback-status-token")
-                .args(["cluster", "status", "--server", server, "--json"]),
+            command
+                .env("OMNIGRAPH_BEARER_TOKEN", "must-not-leak")
+                .args(["cluster", "status", "--target", KEYED_SERVER_NAME, "--json"]),
         );
         assert_eq!(parse_stdout_json(&output), status);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(
-            stderr.matches("unknown key `captured_only`").count(),
-            1,
-            "one setup must read and warn about its config once: named={named}: {stderr}"
-        );
         let requests = api.workflow_requests();
         assert_eq!(requests.len(), 1, "{requests:?}");
         assert_eq!(requests[0].method, "GET");
         assert_eq!(requests[0].path, "/cluster/deployments");
         assert_eq!(
-            requests[0].headers["authorization"],
-            "Bearer keyed-status-token"
+            requests[0].headers.get("authorization").map(String::as_str),
+            (mode != "named_anonymous").then_some("Bearer keyed-status-token")
         );
-        for request in api
-            .requests()
-            .iter()
-            .filter(|request| request.method == "HEAD")
-        {
-            assert!(!request.headers.contains_key("authorization"));
+        assert_no_core_effects(operator.home());
+        api.assert_complete();
+    }
+    // Inline served selectors no longer inherit registered credentials and
+    // cannot dispatch anonymously either. Keep these refusals separate from
+    // the named-target credential assertions above.
+    for registered in [false, true] {
+        let api = IntentApiFixture::graph(vec![]);
+        let operator = KeyedServer::new(&api.origin);
+        let mut command = cli();
+        if registered {
+            command.envs(operator.env("must-not-leak"));
         }
-        assert_no_core_effects(home.path());
+        let refused =
+            output_failure(command.args(["cluster", "status", "--target", &api.origin, "--json"]));
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("inline access supports local storage only"),
+            "{refused:?}"
+        );
+        assert!(api.requests().is_empty());
+        assert_no_core_effects(operator.home());
+        api.assert_complete();
+    }
+    // A complete request path may cross a more-specific credential boundary
+    // even though the selected server root belongs to the keyed owner.
+    for suffix in ["cluster", "cluster/deployments"] {
+        let api = IntentApiFixture::graph(vec![]);
+        let operator = KeyedServer::new(&api.origin);
+        let config_path = operator.home().join("config.yaml");
+        let config = fs::read_to_string(&config_path).unwrap();
+        fs::write(
+            &config_path,
+            format!(
+                "{config}  nested:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/{}'\n    auth:\n      provider: anonymous\n",
+                api.origin, suffix
+            ),
+        )
+        .unwrap();
+        let output = output_failure(cli().envs(operator.env("must-not-cross-boundary")).args([
+            "cluster",
+            "status",
+            "--target",
+            KEYED_SERVER_NAME,
+            "--json",
+        ]));
+        assert_eq!(
+            parse_stdout_json(&output)["code"],
+            "credential_scope_mismatch"
+        );
+        assert!(
+            api.requests().is_empty(),
+            "no discovery or credential may be sent"
+        );
         api.assert_complete();
     }
 }
 
 #[test]
-fn core_remote_server_validation_preserves_config_error_precedence() {
+fn core_remote_retired_selectors_refuse_before_operator_or_backend_access() {
     let home = tempdir().unwrap();
-    fs::write(home.path().join("config.yaml"), "servers: [\n").unwrap();
+    fs::write(home.path().join("config.yaml"), "targets: [\n").unwrap();
     let api = IntentApiFixture::graph(vec![]);
-    for server in [
-        "ftp://host/root",
-        "file:///must-not-open",
-        "s3://bucket/must-not-open",
-        "unix://host/tmp/og.sock",
-    ] {
-        let output = output_failure(
-            cli()
-                .current_dir(home.path())
-                .env("OMNIGRAPH_HOME", home.path())
-                .args(["cluster", "status", "--server", server, "--json"]),
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    for selector in ["--server", "--store", "--cluster", "--profile"] {
+        let output = output_failure(cli().env("OMNIGRAPH_HOME", home.path()).args([
+            "cluster",
+            "status",
+            selector,
+            &api.origin,
+            "--json",
+        ]));
+        let (exit, diagnostic) = if selector == "--profile" {
+            (1, "cluster does not accept --profile")
+        } else {
+            (64, "unexpected argument")
+        };
+        assert_eq!(output.status.code(), Some(exit), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
         assert!(
-            stderr.contains("invalid server address"),
-            "{server}: {stderr}"
+            String::from_utf8_lossy(&output.stderr).contains(diagnostic),
+            "{output:?}"
         );
-        assert!(
-            !stderr.contains("could not parse operator config"),
-            "literal validation must precede config loading: {server}: {stderr}"
-        );
-    }
-    for server in ["status-server", api.origin.as_str()] {
-        let output = output_failure(
-            cli()
-                .current_dir(home.path())
-                .env("OMNIGRAPH_HOME", home.path())
-                .args(["cluster", "status", "--server", server, "--json"]),
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("could not parse operator config"),
-            "{server}: {stderr}"
-        );
-        assert!(!stderr.contains("unknown server"), "{server}: {stderr}");
     }
     assert!(api.requests().is_empty());
     assert_no_core_effects(home.path());
@@ -224,8 +301,8 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
                 .args([
                     "cluster",
                     "apply",
-                    "--server",
-                    &api.origin,
+                    "--target",
+                    KEYED_SERVER_NAME,
                     "--deployment-id",
                     id,
                     "--config",
@@ -314,15 +391,9 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
         let api = IntentApiFixture::graph(replies);
         let mut command = cli();
         command
-            .args([
-                "cluster",
-                "apply",
-                "--server",
-                &api.origin,
-                "--deployment-id",
-                id,
-                "--config",
-            ])
+            .args(["cluster", "apply", "--target"])
+            .fixture_target(&api.origin)
+            .args(["--deployment-id", id, "--config"])
             .arg(temp.path())
             .arg("--json");
         if mode == "accepted" {
@@ -387,15 +458,9 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
         ]);
         let mut command = cli();
         command
-            .args([
-                "cluster",
-                "apply",
-                "--server",
-                &api.origin,
-                "--deployment-id",
-                id,
-                "--config",
-            ])
+            .args(["cluster", "apply", "--target"])
+            .fixture_target(&api.origin)
+            .args(["--deployment-id", id, "--config"])
             .arg(temp.path())
             .args(["--json", "--timeout", "10"]);
         if no_wait {
@@ -434,18 +499,12 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
         IntentReply::json(200, accepted.clone()),
         IntentReply::json(200, complete.clone()),
     ]);
-    let observed = output_success(cli().args([
-        "cluster",
-        "status",
-        "--server",
-        &api.origin,
-        "--deployment-id",
-        id,
-        "--wait",
-        "--timeout",
-        "10",
-        "--json",
-    ]));
+    let observed = output_success(
+        cli()
+            .args(["cluster", "status", "--target"])
+            .fixture_target(&api.origin)
+            .args(["--deployment-id", id, "--wait", "--timeout", "10", "--json"]),
+    );
     assert_eq!(parse_stdout_json(&observed), complete);
     assert!(
         api.workflow_requests()
@@ -478,17 +537,15 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
         ]);
         let api = IntentApiFixture::graph(replies);
         let mut command = cli();
-        command.timeout(std::time::Duration::from_secs(15)).args([
-            "cluster",
-            if apply { "apply" } else { "status" },
-            "--server",
-            &api.origin,
-            "--deployment-id",
-            id,
-            "--timeout",
-            "10",
-            "--json",
-        ]);
+        command
+            .timeout(std::time::Duration::from_secs(15))
+            .args([
+                "cluster",
+                if apply { "apply" } else { "status" },
+                "--target",
+            ])
+            .fixture_target(&api.origin)
+            .args(["--deployment-id", id, "--timeout", "10", "--json"]);
         if apply {
             command.arg("--config").arg(temp.path());
         } else {
@@ -518,18 +575,12 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
     invalid_json.body = b"{".to_vec();
     for reply in [invalid_json, IntentReply::json(200, serde_json::json!({}))] {
         let api = IntentApiFixture::graph(vec![reply]);
-        let output = output_failure(cli().args([
-            "cluster",
-            "status",
-            "--server",
-            &api.origin,
-            "--deployment-id",
-            id,
-            "--wait",
-            "--timeout",
-            "10",
-            "--json",
-        ]));
+        let output = output_failure(
+            cli()
+                .args(["cluster", "status", "--target"])
+                .fixture_target(&api.origin)
+                .args(["--deployment-id", id, "--wait", "--timeout", "10", "--json"]),
+        );
         assert_ne!(output.status.code(), Some(5), "{output:?}");
         let requests = api.workflow_requests();
         assert_eq!(requests.len(), 1, "invalid receipt must not be retried");
@@ -565,16 +616,12 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
             }
         };
         let api = IntentApiFixture::graph(vec![IntentReply::json(200, response.clone())]);
-        let output = output_failure(cli().args([
-            "cluster",
-            "status",
-            "--server",
-            &api.origin,
-            "--deployment-id",
-            id,
-            "--wait",
-            "--json",
-        ]));
+        let output = output_failure(
+            cli()
+                .args(["cluster", "status", "--target"])
+                .fixture_target(&api.origin)
+                .args(["--deployment-id", id, "--wait", "--json"]),
+        );
         assert_eq!(parse_stdout_json(&output), response);
         api.assert_complete();
     }
@@ -587,7 +634,13 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
     output_failure(
         cli()
             .envs(operator.env("capture-token"))
-            .args(["cluster", "apply", "--server", &api.origin, "--config"])
+            .args([
+                "cluster",
+                "apply",
+                "--target",
+                KEYED_SERVER_NAME,
+                "--config",
+            ])
             .arg(temp.path())
             .arg("--json"),
     );
@@ -624,21 +677,12 @@ fn managed_lifecycle_uncertain_create_reuses_durable_key_and_preserves_context()
             IntentReply::json(202, accepted.clone()),
         ]);
         let invoke = |name: &str, key: Option<&str>| {
-            let mut command = cli();
+            let mut command = managed_fixture_command(temp.path(), &api.origin, "managed-account");
             command
                 .current_dir(temp.path())
                 .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
                 .env("OMNIGRAPH_CONTROL_API", &api.origin)
-                .args([
-                    "cluster",
-                    "create",
-                    "--managed",
-                    name,
-                    "--api",
-                    &api.origin,
-                    "--no-wait",
-                    "--json",
-                ]);
+                .args(["cluster", "create", name, "--no-wait", "--json"]);
             if let Some(key) = key {
                 command.args(["--idempotency-key", key]);
             }
@@ -649,7 +693,7 @@ fn managed_lifecycle_uncertain_create_reuses_durable_key_and_preserves_context()
             uncertain.status.code(),
             Some(if status < 500 { 2 } else { 1 })
         );
-        let pending_path = temp.path().join(".omnigraph/pending-lifecycle.json");
+        let pending_path = lifecycle_record(temp.path(), &api.origin, "pending-lifecycle.json");
         let pending: serde_json::Value =
             serde_json::from_slice(&fs::read(&pending_path).unwrap()).unwrap();
         assert_eq!(pending["request_digest"].as_str().unwrap().len(), 64);
@@ -694,14 +738,19 @@ fn managed_lifecycle_uncertain_create_reuses_durable_key_and_preserves_context()
         );
         assert!(!pending_path.exists());
         let saved: serde_json::Value = serde_json::from_slice(
-            &fs::read(temp.path().join(".omnigraph/last-lifecycle.json")).unwrap(),
+            &fs::read(lifecycle_record(
+                temp.path(),
+                &api.origin,
+                "accepted-lifecycle.json",
+            ))
+            .unwrap(),
         )
         .unwrap();
-        assert_eq!(saved["operation_id"], "operation-one");
-        let context = fs::read(temp.path().join(".omnigraph/context")).unwrap();
-        assert_eq!(invoke("another-cluster", None).status.code(), Some(2));
+        assert_eq!(saved[0]["identity"]["operation_id"], "operation-one");
+        let context = fs::read(managed_home(temp.path()).join("config.yaml")).unwrap();
+        assert_eq!(invoke("new-cluster", None).status.code(), Some(2));
         assert_eq!(
-            fs::read(temp.path().join(".omnigraph/context")).unwrap(),
+            fs::read(managed_home(temp.path()).join("config.yaml")).unwrap(),
             context
         );
         assert_eq!(api.workflow_requests().len(), 3);
@@ -721,25 +770,16 @@ fn managed_lifecycle_pending_is_principal_bound_across_session_renewal() {
         ),
     ]);
     let invoke = |token: &str| {
-        cli()
+        managed_fixture_command(temp.path(), &api.origin, "managed-account")
             .current_dir(temp.path())
             .env("OMNIGRAPH_CONTROL_TOKEN", token)
             .env("OMNIGRAPH_CONTROL_API", &api.origin)
-            .args([
-                "cluster",
-                "create",
-                "--managed",
-                "new-name",
-                "--api",
-                &api.origin,
-                "--no-wait",
-                "--json",
-            ])
+            .args(["cluster", "create", "new-name", "--no-wait", "--json"])
             .output()
             .unwrap()
     };
     assert_eq!(invoke("og_fixture_control").status.code(), Some(1));
-    let path = temp.path().join(".omnigraph/pending-lifecycle.json");
+    let path = lifecycle_record(temp.path(), &api.origin, "pending-lifecycle.json");
     let pending = fs::read(&path).unwrap();
     let record: serde_json::Value = serde_json::from_slice(&pending).unwrap();
     assert_eq!(record["principal_id"], "principal-one");
@@ -753,7 +793,11 @@ fn managed_lifecycle_pending_is_principal_bound_across_session_renewal() {
         assert_eq!(output.status.code(), Some(2));
         assert_eq!(
             parse_stdout_json(&output)["type"],
-            "pending_lifecycle_conflict"
+            if account == "account-one" {
+                "pending_lifecycle_conflict"
+            } else {
+                "organization_mismatch"
+            }
         );
         assert_eq!(fs::read(&path).unwrap(), pending);
         assert_eq!(api.workflow_requests().len(), 1);
@@ -804,30 +848,16 @@ fn managed_lifecycle_definitive_first_refusal_releases_pending_intent() {
         ),
     ]);
     let invoke = |name: &str| {
-        cli()
+        managed_fixture_command(temp.path(), &api.origin, "managed-account")
             .current_dir(temp.path())
             .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
             .env("OMNIGRAPH_CONTROL_API", &api.origin)
-            .args([
-                "cluster",
-                "create",
-                "--managed",
-                name,
-                "--api",
-                &api.origin,
-                "--no-wait",
-                "--json",
-            ])
+            .args(["cluster", "create", name, "--no-wait", "--json"])
             .output()
             .unwrap()
     };
     assert_eq!(invoke("taken-name").status.code(), Some(2));
-    assert!(
-        !temp
-            .path()
-            .join(".omnigraph/pending-lifecycle.json")
-            .exists()
-    );
+    assert!(!lifecycle_record(temp.path(), &api.origin, "pending-lifecycle.json").exists());
     assert!(!temp.path().join(".omnigraph/context").exists());
     assert!(invoke("new-name").status.success());
     let requests = api.workflow_requests();
@@ -870,16 +900,15 @@ fn managed_lifecycle_delete_and_undo_send_exact_authority_targets() {
             202,
             lifecycle_envelope(kind, "proposed", "requested"),
         )]);
-        write_managed_context(temp.path(), &api.origin);
-        let before = fs::read(temp.path().join(".omnigraph/context")).unwrap();
+        write_managed_target(temp.path(), &api.origin);
+        let before = fs::read(managed_home(temp.path()).join("config.yaml")).unwrap();
         let output = output_success(
-            cli()
+            managed_fixture_command(temp.path(), &api.origin, "managed-test")
                 .current_dir(temp.path())
                 .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
                 .env("OMNIGRAPH_CONTROL_API", &api.origin)
                 .arg("cluster")
                 .args(args)
-                .arg("--managed")
                 .args(["--no-wait", "--idempotency-key", "exact-intent", "--json"]),
         );
         assert_eq!(parse_stdout_json(&output)["data"]["kind"], kind);
@@ -891,7 +920,7 @@ fn managed_lifecycle_delete_and_undo_send_exact_authority_targets() {
             Some("exact-intent"),
         );
         assert_eq!(
-            fs::read(temp.path().join(".omnigraph/context")).unwrap(),
+            fs::read(managed_home(temp.path()).join("config.yaml")).unwrap(),
             before
         );
         api.assert_complete();
@@ -908,16 +937,15 @@ fn managed_lifecycle_wait_reports_tombstone_and_checks_every_poll_identity() {
         IntentReply::json(202, lifecycle_envelope("delete", "proposed", "requested")),
         IntentReply::json(200, tombstone.clone()),
     ]);
-    write_managed_context(temp.path(), &api.origin);
+    write_managed_target(temp.path(), &api.origin);
     let output = output_success(
-        cli()
+        managed_fixture_command(temp.path(), &api.origin, "managed-test")
             .current_dir(temp.path())
             .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
             .env("OMNIGRAPH_CONTROL_API", &api.origin)
             .args([
                 "cluster",
                 "delete",
-                "--managed",
                 "--incarnation",
                 "inc-one",
                 "--timeout",
@@ -945,17 +973,14 @@ fn managed_lifecycle_wait_reports_tombstone_and_checks_every_poll_identity() {
         ),
         IntentReply::json(200, mismatched),
     ]);
-    let output = cli()
+    let output = managed_fixture_command(temp.path(), &api.origin, "managed-test")
         .current_dir(temp.path())
         .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
         .env("OMNIGRAPH_CONTROL_API", &api.origin)
         .args([
             "cluster",
             "operation",
-            "--managed",
             "operation-one",
-            "--api",
-            &api.origin,
             "--wait",
             "--timeout",
             "10",
@@ -964,7 +989,7 @@ fn managed_lifecycle_wait_reports_tombstone_and_checks_every_poll_identity() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
-    assert_eq!(parse_stdout_json(&output)["type"], "context_mismatch");
+    assert_eq!(parse_stdout_json(&output)["type"], "target_mismatch");
     assert!(!temp.path().join(".omnigraph/context").exists());
     api.assert_complete();
 }
@@ -976,72 +1001,45 @@ fn managed_lifecycle_bad_acceptance_and_deadline_keep_recovery_identity() {
     let mut bad = lifecycle_envelope("create", "proposed", "provisioning");
     bad["meta"]["cluster_id"] = serde_json::json!("foreign");
     let api = lifecycle_fixture(vec![IntentReply::json(202, bad)]);
-    let output = cli()
+    let output = managed_fixture_command(temp.path(), &api.origin, "managed-account")
         .current_dir(temp.path())
         .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
         .env("OMNIGRAPH_CONTROL_API", &api.origin)
-        .args([
-            "cluster",
-            "create",
-            "--managed",
-            "new",
-            "--api",
-            &api.origin,
-            "--no-wait",
-            "--json",
-        ])
+        .args(["cluster", "create", "new", "--no-wait", "--json"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
-    assert!(
-        temp.path()
-            .join(".omnigraph/pending-lifecycle.json")
-            .exists()
-    );
+    assert!(lifecycle_record(temp.path(), &api.origin, "pending-lifecycle.json").exists());
     assert!(!temp.path().join(".omnigraph/context").exists());
     api.assert_complete();
 
     let temp = tempdir().unwrap();
     let accepted = lifecycle_envelope("create", "proposed", "provisioning");
     let api = lifecycle_fixture(vec![IntentReply::json(202, accepted.clone())]);
-    let output = cli()
+    let output = managed_fixture_command(temp.path(), &api.origin, "managed-account")
         .current_dir(temp.path())
         .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
         .env("OMNIGRAPH_CONTROL_API", &api.origin)
-        .args([
-            "cluster",
-            "create",
-            "--managed",
-            "new",
-            "--api",
-            &api.origin,
-            "--timeout",
-            "1",
-            "--json",
-        ])
+        .args(["cluster", "create", "new", "--timeout", "1", "--json"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(5));
     assert_eq!(parse_stdout_json(&output), accepted);
-    assert!(temp.path().join(".omnigraph/last-lifecycle.json").exists());
+    assert!(lifecycle_record(temp.path(), &api.origin, "accepted-lifecycle.json").exists());
     assert_eq!(api.workflow_requests().len(), 1);
     api.assert_complete();
     assert_no_core_effects(temp.path());
 }
 
 #[test]
-fn managed_cluster_list_uses_selected_organization_and_refuses_context_conflicts() {
+fn managed_cluster_list_uses_selected_account_without_folder_routing() {
     let temp = tempdir().unwrap();
-    let response = serde_json::json!({"data":{"clusters":[{"cluster_id":"managed-test","incarnation":"inc-one","name":"Example","state":"ready"}]},"meta":{"provenance":"service_db"}});
+    let response =
+        serde_json::json!({"data":{"organization_id":"account-one","clusters":[]},"meta":{}});
     let api = lifecycle_fixture(vec![IntentReply::json(200, response.clone())]);
-    let output = output_success(managed_cli(temp.path(), &api.origin).args([
-        "list",
-        "--api",
-        &api.origin,
-        "--organization",
-        "account-one",
-        "--json",
-    ]));
+    write_managed_target(temp.path(), &api.origin);
+    let output =
+        output_success(managed_account_cli(temp.path(), &api.origin).args(["list", "--json"]));
     assert_eq!(parse_stdout_json(&output), response);
     assert_control_request(
         &api.workflow_requests()[0],
@@ -1050,53 +1048,35 @@ fn managed_cluster_list_uses_selected_organization_and_refuses_context_conflicts
         Value::Null,
         None,
     );
-    api.assert_complete();
     assert!(!temp.path().join(".omnigraph").exists());
-
-    let api = lifecycle_fixture(vec![]);
-    write_managed_context(temp.path(), &api.origin);
-    let output = managed_cli(temp.path(), &api.origin)
-        .args([
-            "list",
-            "--api",
-            &api.origin,
-            "--organization",
-            "another-account",
-            "--json",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(parse_stdout_json(&output)["type"], "context_mismatch");
-    assert!(api.requests().is_empty());
     api.assert_complete();
 }
 
 fn member_directory() -> Value {
     serde_json::json!({
-        "data": {"cluster_id":"managed-test","members":[
-            {"user_id":"user_one","principal_id":"principal-one","name":"Avery Chen","email":"avery@example.com","admitted":true,"control_grants":["source_read","status"]},
-            {"user_id":"user_two","principal_id":"principal-two","name":null,"email":null,"admitted":false,"control_grants":["status"]}
+        "data": {"cluster_id":"managed-test","organization_id":"account-one","provider_observed_at":"2026-10-26T10:00:00Z","provider_expires_at":"2026-10-26T10:00:30Z","members":[
+            {"user_id":"user_one","membership_id":"om_one","principal_id":"principal-one","name":"Avery Chen","email":"avery@example.com","eligible":true,"service_permissions":["source_read","status"]},
+            {"user_id":"user_two","membership_id":"om_two","principal_id":null,"name":null,"email":null,"eligible":true,"service_permissions":[]}
         ]},
         "meta":{"cluster_id":"managed-test","incarnation":"inc-one","provenance":"service_db"}
     })
 }
 
 #[test]
-fn managed_cluster_members_lists_exact_enrollment_as_json_and_readable_text() {
+fn managed_cluster_members_lists_provider_eligibility_as_json_and_readable_text() {
     for json in [true, false] {
         let temp = tempdir().unwrap();
         let response = member_directory();
         let api = lifecycle_fixture(vec![IntentReply::json(200, response.clone())]);
-        write_managed_context(temp.path(), &api.origin);
-        let before = fs::read(temp.path().join(".omnigraph/context")).unwrap();
-        // Exercise --managed after both nested command levels too.
-        let mut command = cli();
+        write_managed_target(temp.path(), &api.origin);
+        let before = fs::read(managed_home(temp.path()).join("config.yaml")).unwrap();
+        // Exercise the same explicit target through both nested command levels.
+        let mut command = managed_fixture_command(temp.path(), &api.origin, "managed-test");
         command
             .current_dir(temp.path())
             .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
             .env("OMNIGRAPH_CONTROL_API", &api.origin)
-            .args(["cluster", "members", "list", "--managed"]);
+            .args(["cluster", "members", "list"]);
         if json {
             command.arg("--json");
         }
@@ -1109,12 +1089,12 @@ fn managed_cluster_members_lists_exact_enrollment_as_json_and_readable_text() {
                 "NAME",
                 "EMAIL",
                 "PRINCIPAL",
-                "ADMITTED",
-                "CONTROL GRANTS",
+                "ELIGIBLE",
+                "ORG SERVICE PERMISSIONS",
                 "Avery Chen",
                 "avery@example.com",
                 "principal-one",
-                "principal-two",
+                "not yet signed in",
                 "source_read, status",
                 "Graph permissions are evaluated by Cedar separately.",
             ] {
@@ -1130,7 +1110,7 @@ fn managed_cluster_members_lists_exact_enrollment_as_json_and_readable_text() {
             None,
         );
         assert_eq!(
-            fs::read(temp.path().join(".omnigraph/context")).unwrap(),
+            fs::read(managed_home(temp.path()).join("config.yaml")).unwrap(),
             before
         );
         assert_no_core_effects(temp.path());
@@ -1140,9 +1120,9 @@ fn managed_cluster_members_lists_exact_enrollment_as_json_and_readable_text() {
     let mut empty = member_directory();
     empty["data"]["members"] = serde_json::json!([]);
     let api = lifecycle_fixture(vec![IntentReply::json(200, empty)]);
-    write_managed_context(temp.path(), &api.origin);
+    write_managed_target(temp.path(), &api.origin);
     let output = output_success(managed_cli(temp.path(), &api.origin).args(["members", "list"]));
-    assert!(String::from_utf8_lossy(&output.stdout).contains("No explicitly enrolled members."));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No active organization members."));
     api.assert_complete();
 }
 
@@ -1162,9 +1142,33 @@ fn managed_cluster_members_refuses_wrong_identity_malformed_results_and_denials(
             "context_mismatch",
             2,
         ),
-        ("/meta/incarnation", Value::Null, "api_response_invalid", 1),
         (
-            "/data/members/0/admitted",
+            "/data/organization_id",
+            serde_json::json!("foreign"),
+            "context_mismatch",
+            2,
+        ),
+        (
+            "/data/provider_expires_at",
+            serde_json::json!("2026-10-26T10:01:00Z"),
+            "api_response_invalid",
+            1,
+        ),
+        (
+            "/data/members/1/membership_id",
+            serde_json::json!("om_one"),
+            "api_response_invalid",
+            1,
+        ),
+        ("/meta/incarnation", Value::Null, "target_mismatch", 2),
+        (
+            "/meta/incarnation",
+            serde_json::json!("foreign-incarnation"),
+            "target_mismatch",
+            2,
+        ),
+        (
+            "/data/members/0/eligible",
             serde_json::json!("yes"),
             "api_response_invalid",
             1,
@@ -1176,14 +1180,14 @@ fn managed_cluster_members_refuses_wrong_identity_malformed_results_and_denials(
             1,
         ),
         (
-            "/data/members/0/control_grants",
+            "/data/members/0/service_permissions",
             serde_json::json!(["status", "status"]),
             "api_response_invalid",
             1,
         ),
         (
-            "/data/members/1/control_grants",
-            serde_json::json!([]),
+            "/data/members/1/eligible",
+            serde_json::json!(false),
             "api_response_invalid",
             1,
         ),
@@ -1197,6 +1201,14 @@ fn managed_cluster_members_refuses_wrong_identity_malformed_results_and_denials(
         let mut response = member_directory();
         *response.pointer_mut(pointer).unwrap() = value;
         cases.push((200, response, kind, exit));
+    }
+    for field in ["principal_id", "service_permissions", "membership_id"] {
+        let mut response = member_directory();
+        response["data"]["members"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        cases.push((200, response, "api_response_invalid", 1));
     }
     for (status, kind) in [
         (401, "unauthorized"),
@@ -1213,7 +1225,7 @@ fn managed_cluster_members_refuses_wrong_identity_malformed_results_and_denials(
     for (status, response, kind, exit) in cases {
         let temp = tempdir().unwrap();
         let api = lifecycle_fixture(vec![IntentReply::json(status, response)]);
-        write_managed_context(temp.path(), &api.origin);
+        write_managed_target(temp.path(), &api.origin);
         let output = managed_cli(temp.path(), &api.origin)
             .args(["members", "list", "--json"])
             .output()
@@ -1232,31 +1244,30 @@ fn managed_cluster_members_refuses_wrong_identity_malformed_results_and_denials(
 }
 
 #[test]
-fn managed_cluster_members_requires_bound_context_and_refuses_competing_targets() {
+fn managed_cluster_members_requires_cluster_target_and_rejects_duplicate_selectors() {
     let temp = tempdir().unwrap();
     let api = lifecycle_fixture(vec![]);
-    let output = managed_cli(temp.path(), &api.origin)
-        .args(["members", "list", "--json"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(
-        parse_stdout_json(&output)["type"],
-        "managed_context_required"
+    write_managed_target(temp.path(), &api.origin);
+    let output = output_failure(
+        managed_account_cli(temp.path(), &api.origin).args(["members", "list", "--json"]),
     );
-    write_managed_context(temp.path(), &api.origin);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cluster does not accept --profile"),
+        "{output:?}"
+    );
     for args in [
         vec!["--direct"],
+        vec!["--target", "https://other.example"],
         vec!["--server", "https://other.example"],
-        vec!["--cluster", "s3://other/root"],
     ] {
-        let output = managed_cli(temp.path(), &api.origin)
-            .args(["members", "list", "--json"])
-            .args(args)
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(2));
-        assert_eq!(parse_stdout_json(&output)["type"], "managed_scope_conflict");
+        let output = output_failure(
+            managed_cli(temp.path(), &api.origin)
+                .args(["members", "list", "--json"])
+                .args(args),
+        );
+        assert_eq!(output.status.code(), Some(64));
     }
     assert!(api.requests().is_empty());
     assert_no_core_effects(temp.path());
@@ -1279,7 +1290,7 @@ fn managed_cluster_pull_downloads_exact_source_and_context_without_printing_cont
             "policies/access.yaml":"# og_fixture_control must survive byte-exact download\npolicies: []\n",
         });
         let api = lifecycle_fixture(vec![IntentReply::json(200, source_export(files.clone()))]);
-        write_managed_context(temp.path(), &api.origin);
+        write_managed_target(temp.path(), &api.origin);
         let mut command = managed_cli(temp.path(), &api.origin);
         command.args(["pull", "--out", "checkout", "--json"]);
         if explicit_revision {
@@ -1302,10 +1313,7 @@ fn managed_cluster_pull_downloads_exact_source_and_context_without_printing_cont
                 0o600
             );
         }
-        assert_eq!(
-            fs::read(temp.path().join(".omnigraph/context")).unwrap(),
-            fs::read(temp.path().join("checkout/.omnigraph/context")).unwrap()
-        );
+        assert!(!temp.path().join("checkout/.omnigraph").exists());
         assert_eq!(
             fs::metadata(temp.path().join("checkout"))
                 .unwrap()
@@ -1373,7 +1381,7 @@ fn managed_cluster_pull_refuses_foreign_invalid_and_unsafe_exports_without_parti
     for response in cases {
         let temp = tempdir().unwrap();
         let api = lifecycle_fixture(vec![IntentReply::json(200, response)]);
-        write_managed_context(temp.path(), &api.origin);
+        write_managed_target(temp.path(), &api.origin);
         let output = managed_cli(temp.path(), &api.origin)
             .args([
                 "pull",
@@ -1398,7 +1406,7 @@ fn managed_cluster_pull_preserves_existing_destinations_before_http() {
     use std::os::unix::fs::symlink;
     let temp = tempdir().unwrap();
     let api = lifecycle_fixture(vec![]);
-    write_managed_context(temp.path(), &api.origin);
+    write_managed_target(temp.path(), &api.origin);
     fs::create_dir(temp.path().join("empty")).unwrap();
     fs::write(temp.path().join("edited"), "keep my work").unwrap();
     symlink("missing", temp.path().join("link")).unwrap();
@@ -1429,7 +1437,7 @@ fn managed_lifecycle_push_sends_only_complete_referenced_files() {
     let temp = tempdir().unwrap();
     let response = serde_json::json!({"data":{"cluster_id":"managed-test","revision":"a".repeat(40)},"meta":{"cluster_id":"managed-test","incarnation":"inc-one"}});
     let api = lifecycle_fixture(vec![IntentReply::json(200, response.clone())]);
-    write_managed_context(temp.path(), &api.origin);
+    write_managed_target(temp.path(), &api.origin);
     fs::create_dir(temp.path().join("queries")).unwrap();
     let files = [
         (
@@ -1449,14 +1457,13 @@ fn managed_lifecycle_push_sends_only_complete_referenced_files() {
     fs::write(temp.path().join("private.key"), "NEVER_UPLOAD_ME").unwrap();
     fs::write(temp.path().join("queries/ignored.txt"), "NEVER_UPLOAD_ME").unwrap();
     let output = output_success(
-        cli()
+        managed_fixture_command(temp.path(), &api.origin, "managed-test")
             .current_dir(temp.path())
             .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
             .env("OMNIGRAPH_CONTROL_API", &api.origin)
             .args([
                 "cluster",
                 "push",
-                "--managed",
                 "--expected-revision",
                 &"b".repeat(40),
                 "--message",
@@ -1481,7 +1488,7 @@ fn managed_lifecycle_push_sends_only_complete_referenced_files() {
 fn managed_lifecycle_push_refuses_unsafe_paths_and_oversized_files_before_http() {
     let temp = tempdir().unwrap();
     let api = lifecycle_fixture(vec![]);
-    write_managed_context(temp.path(), &api.origin);
+    write_managed_target(temp.path(), &api.origin);
     fs::write(
         temp.path().join("large.pg"),
         vec![b'x'; 2 * 1024 * 1024 + 1],
@@ -1501,14 +1508,13 @@ fn managed_lifecycle_push_refuses_unsafe_paths_and_oversized_files_before_http()
             format!("version: 1\ngraphs:\n  sample:\n    schema: {path}\n"),
         )
         .unwrap();
-        let output = cli()
+        let output = managed_fixture_command(temp.path(), &api.origin, "managed-test")
             .current_dir(temp.path())
             .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
             .env("OMNIGRAPH_CONTROL_API", &api.origin)
             .args([
                 "cluster",
                 "push",
-                "--managed",
                 "--expected-revision",
                 &"b".repeat(40),
                 "--message",
@@ -1528,29 +1534,26 @@ fn managed_lifecycle_push_refuses_unsafe_paths_and_oversized_files_before_http()
 fn managed_lifecycle_local_lock_and_direct_flags_refuse_without_submission() {
     let temp = tempdir().unwrap();
     let api = lifecycle_fixture(vec![]);
-    fs::create_dir(temp.path().join(".omnigraph")).unwrap();
+    write_managed_target(temp.path(), &api.origin);
+    fs::create_dir_all(
+        lifecycle_record(temp.path(), &api.origin, "lifecycle.lock")
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
     let lock = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(temp.path().join(".omnigraph/lifecycle.lock"))
+        .open(lifecycle_record(temp.path(), &api.origin, "lifecycle.lock"))
         .unwrap();
     lock.try_lock().unwrap();
-    let output = cli()
+    let output = managed_fixture_command(temp.path(), &api.origin, "managed-account")
         .current_dir(temp.path())
         .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
         .env("OMNIGRAPH_CONTROL_API", &api.origin)
-        .args([
-            "cluster",
-            "create",
-            "--managed",
-            "locked",
-            "--api",
-            &api.origin,
-            "--no-wait",
-            "--json",
-        ])
+        .args(["cluster", "create", "locked", "--no-wait", "--json"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
@@ -1558,59 +1561,30 @@ fn managed_lifecycle_local_lock_and_direct_flags_refuse_without_submission() {
         parse_stdout_json(&output)["type"],
         "lifecycle_submission_busy"
     );
-    assert!(
-        !temp
-            .path()
-            .join(".omnigraph/pending-lifecycle.json")
-            .exists()
-    );
+    assert!(!lifecycle_record(temp.path(), &api.origin, "pending-lifecycle.json").exists());
     drop(lock);
     for args in [
-        vec![
-            "cluster",
-            "create",
-            "--managed",
-            "direct",
-            "--api",
-            &api.origin,
-            "--direct",
-        ],
-        vec![
-            "cluster",
-            "delete",
-            "--managed",
-            "--incarnation",
-            "inc-one",
-            "--direct",
-        ],
+        vec!["cluster", "create", "direct", "--direct"],
+        vec!["cluster", "delete", "--incarnation", "inc-one", "--direct"],
         vec![
             "cluster",
             "undo-delete",
-            "--managed",
             "--incarnation",
             "inc-one",
             "--deletion-id",
             "op",
             "--direct",
         ],
-        vec![
-            "cluster",
-            "operation",
-            "--managed",
-            "op",
-            "--api",
-            &api.origin,
-            "--direct",
-        ],
+        vec!["cluster", "operation", "op", "--direct"],
     ] {
-        let output = cli()
+        let output = managed_fixture_command(temp.path(), &api.origin, "managed-test")
             .current_dir(temp.path())
             .args(args)
             .arg("--json")
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(2));
-        assert_eq!(parse_stdout_json(&output)["type"], "managed_scope_conflict");
+        assert_eq!(output.status.code(), Some(64));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
     }
     assert!(api.workflow_requests().is_empty());
     assert_no_core_effects(temp.path());
@@ -1622,7 +1596,7 @@ fn managed_lifecycle_capture_and_retry_records_refuse_symlinks_without_reading_t
     let temp = tempdir().unwrap();
     let outside = tempdir().unwrap();
     let api = lifecycle_fixture(vec![]);
-    write_managed_context(temp.path(), &api.origin);
+    write_managed_target(temp.path(), &api.origin);
     fs::write(outside.path().join("private.pg"), "DO_NOT_SEND").unwrap();
     std::os::unix::fs::symlink(outside.path(), temp.path().join("linked")).unwrap();
     fs::write(
@@ -1630,14 +1604,13 @@ fn managed_lifecycle_capture_and_retry_records_refuse_symlinks_without_reading_t
         "version: 1\ngraphs:\n  sample:\n    schema: linked/private.pg\n",
     )
     .unwrap();
-    let output = cli()
+    let output = managed_fixture_command(temp.path(), &api.origin, "managed-test")
         .current_dir(temp.path())
         .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
         .env("OMNIGRAPH_CONTROL_API", &api.origin)
         .args([
             "cluster",
             "push",
-            "--managed",
             "--expected-revision",
             &"b".repeat(40),
             "--message",
@@ -1648,19 +1621,24 @@ fn managed_lifecycle_capture_and_retry_records_refuse_symlinks_without_reading_t
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(parse_stdout_json(&output)["type"], "config_capture_failed");
-    std::os::unix::fs::symlink(
-        outside.path().join("private.pg"),
-        temp.path().join(".omnigraph/pending-lifecycle.json"),
+    fs::create_dir_all(
+        lifecycle_record(temp.path(), &api.origin, "pending-lifecycle.json")
+            .parent()
+            .unwrap(),
     )
     .unwrap();
-    let output = cli()
+    std::os::unix::fs::symlink(
+        outside.path().join("private.pg"),
+        lifecycle_record(temp.path(), &api.origin, "pending-lifecycle.json"),
+    )
+    .unwrap();
+    let output = managed_fixture_command(temp.path(), &api.origin, "managed-test")
         .current_dir(temp.path())
         .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
         .env("OMNIGRAPH_CONTROL_API", &api.origin)
         .args([
             "cluster",
             "delete",
-            "--managed",
             "--incarnation",
             "inc-one",
             "--no-wait",
@@ -1681,42 +1659,62 @@ fn managed_lifecycle_capture_and_retry_records_refuse_symlinks_without_reading_t
 fn managed_data_process_refuses_missing_graph_and_actor_override_before_keychain() {
     let temp = tempdir().unwrap();
     let api = IntentApiFixture::new(vec![]);
-    write_managed_context(temp.path(), &api.origin);
-    for args in [
-        vec!["query", "q", "--json"],
-        vec![
-            "mutate",
-            "m",
-            "--graph",
-            "knowledge",
-            "--as",
-            "forged",
-            "--json",
-        ],
-        vec![
-            "cluster",
-            "token",
-            "--managed",
-            "--clear",
-            "--graph",
-            "knowledge",
-            "--json",
-        ],
+    write_managed_target(temp.path(), &api.origin);
+    for (args, code, message) in [
+        (
+            vec!["query", "q", "--json"],
+            "target_incompatible",
+            "graph_required",
+        ),
+        (
+            vec![
+                "mutate",
+                "m",
+                "--graph",
+                "knowledge",
+                "--as",
+                "forged",
+                "--json",
+            ],
+            "target_incompatible",
+            "--as is not available for a managed target",
+        ),
+        (
+            vec![
+                "cluster",
+                "token",
+                "--clear",
+                "--graph",
+                "knowledge",
+                "--json",
+            ],
+            "argument_conflict",
+            "cluster does not accept --graph",
+        ),
     ] {
-        let output = cli()
+        let output = managed_fixture_command(temp.path(), &api.origin, "managed-test")
             .current_dir(temp.path())
             .env_remove("OMNIGRAPH_PROFILE")
             .args(&args)
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        if code == "argument_conflict" {
+            assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
+            assert!(output.stdout.is_empty());
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(message),
+                "{output:?}"
+            );
+            assert_no_core_effects(temp.path());
+            continue;
+        }
+        let exit = if args[0] == "cluster" { 2 } else { 1 };
+        assert_eq!(output.status.code(), Some(exit), "{args:?}: {output:?}");
         let problem = parse_stdout_json(&output);
+        assert_eq!(problem["code"], code, "{args:?}: {problem}");
         assert!(
-            matches!(
-                problem["type"].as_str(),
-                Some("graph_required" | "managed_scope_conflict" | "token_clear_conflict")
-            ),
-            "{problem}"
+            problem["error"].as_str().unwrap().contains(message),
+            "{args:?}: {problem}"
         );
         assert_no_core_effects(temp.path());
     }
@@ -1725,10 +1723,11 @@ fn managed_data_process_refuses_missing_graph_and_actor_override_before_keychain
 }
 
 #[test]
-fn managed_data_direct_override_uses_only_explicit_legacy_transport() {
+fn managed_data_named_server_ignores_folder_context() {
     let temp = tempdir().unwrap();
     let api = IntentApiFixture::new(vec![]);
-    write_managed_context(temp.path(), &api.origin);
+    write_managed_target(temp.path(), &api.origin);
+    fs::create_dir_all(temp.path().join(".omnigraph")).unwrap();
     fs::write(temp.path().join(".omnigraph/context"), "malformed").unwrap();
     let data = IntentApiFixture::graph(vec![IntentReply::json(
         200,
@@ -1744,9 +1743,9 @@ fn managed_data_direct_override_uses_only_explicit_legacy_transport() {
             .envs(operator.env("explicit-legacy-token"))
             .env("OMNIGRAPH_CONTROL_TOKEN", "never-data")
             .env("OMNIGRAPH_CONTROL_API", &api.origin)
-            .args(["query", "q", "--graph", "knowledge", "--server"])
-            .arg(&data.origin)
-            .args(["--json", "--direct"]),
+            .args(["query", "q", "--graph", "knowledge", "--target"])
+            .arg(KEYED_SERVER_NAME)
+            .arg("--json"),
     );
     assert_eq!(
         parse_stdout_json(&output)["rows"],
@@ -1765,12 +1764,19 @@ fn managed_data_direct_override_uses_only_explicit_legacy_transport() {
 
 #[test]
 fn managed_data_issue_633_explicit_targets_ignore_folder_context() {
+    let ca = tls_gateway::ca_path().display();
     for malformed in [false, true] {
-        for selector in ["--server", "--profile"] {
+        for selector in ["--target"] {
             for verb in ["query", "mutate", "load"] {
                 let temp = tempdir().unwrap();
                 let api = IntentApiFixture::new(vec![]);
-                write_managed_context(temp.path(), &api.origin);
+                write_managed_target(temp.path(), &api.origin);
+                fs::create_dir_all(temp.path().join(".omnigraph")).unwrap();
+                fs::write(
+                    temp.path().join(".omnigraph/context"),
+                    "version: 2\ncluster: ignored\n",
+                )
+                .unwrap();
                 if malformed {
                     fs::write(temp.path().join(".omnigraph/context"), "malformed").unwrap();
                 }
@@ -1798,7 +1804,7 @@ fn managed_data_issue_633_explicit_targets_ignore_folder_context() {
                 fs::write(
                     home.join("config.yaml"),
                     format!(
-                        "servers:\n  staging:\n    url: {}\nprofiles:\n  staging:\n    server: staging\n    default_graph: knowledge\n",
+                        "version: 1\ntargets:\n  staging:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: {}\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_STAGING\n    default_graph: knowledge\n",
                         data.origin
                     ),
                 )
@@ -1820,7 +1826,7 @@ fn managed_data_issue_633_explicit_targets_ignore_folder_context() {
                 } else {
                     command.arg("q");
                 }
-                if selector == "--server" {
+                if selector == "--target" {
                     command.args(["--graph", "knowledge"]);
                 }
                 let output = output_success(&mut command);
@@ -1855,314 +1861,11 @@ fn managed_data_issue_633_explicit_targets_ignore_folder_context() {
 }
 
 #[test]
-fn managed_data_issue_633_ambient_targets_refuse_without_selecting_either() {
-    for (config, profile) in [
-        ("{}", Some("unknown-profile")),
-        ("defaults:\n  server: staging\n", None),
-        ("defaults:\n  store: file:///must-not-open\n", None),
-    ] {
-        let temp = tempdir().unwrap();
-        let api = IntentApiFixture::new(vec![]);
-        write_managed_context(temp.path(), &api.origin);
-        let home = temp.path().join("operator");
-        fs::create_dir(&home).unwrap();
-        fs::write(home.join("config.yaml"), config).unwrap();
-        for verb in ["query", "mutate", "load"] {
-            let mut command = cli();
-            command
-                .current_dir(temp.path())
-                .env("OMNIGRAPH_HOME", &home)
-                .env_remove("OMNIGRAPH_PROFILE")
-                .env("OMNIGRAPH_BEARER_TOKEN", "must-not-be-used")
-                .args([verb, "--json"])
-                .timeout(std::time::Duration::from_secs(15));
-            if verb == "load" {
-                command.args(["--data", "missing.jsonl", "--mode", "append"]);
-            } else {
-                command.arg("q");
-            }
-            if let Some(profile) = profile {
-                command.env("OMNIGRAPH_PROFILE", profile);
-            }
-            // No graph means the old dispatcher fails without touching a real
-            // keychain too; the regression is which target decision occurs first.
-            let output = command.output().unwrap();
-            assert_eq!(output.status.code(), Some(2));
-            assert_eq!(
-                parse_stdout_json(&output)["type"],
-                "managed_target_ambiguous"
-            );
-            assert!(api.requests().is_empty());
-            assert_no_core_effects(temp.path());
-        }
-    }
-}
-
-#[test]
-fn managed_data_issue_633_direct_load_and_commit_preserve_ambient_targets() {
-    for malformed in [false, true] {
-        for use_profile in [false, true] {
-            for operation in ["load", "commit-list", "commit-show"] {
-                let temp = tempdir().unwrap();
-                let api = IntentApiFixture::new(vec![]);
-                write_managed_context(temp.path(), &api.origin);
-                if malformed {
-                    fs::write(temp.path().join(".omnigraph/context"), "malformed").unwrap();
-                }
-                let commit = serde_json::json!({
-                    "graph_commit_id":"commit-a", "graph_branch":null,
-                    "graph_manifest_version":3, "parent_commit_id":"prior",
-                    "merged_parent_commit_id":null, "actor_id":"legacy-actor",
-                    "created_at":123456,
-                });
-                let mut shown = commit.clone();
-                shown["published"] = serde_json::json!(true);
-                shown["kind"] = serde_json::json!("published");
-                shown["root_commit_id"] = serde_json::json!(null);
-                let reply = match operation {
-                    "load" => serde_json::json!({
-                        "branch":"main", "base_branch":null, "branch_created":false,
-                        "mode":"append", "nodes":[{"name":"Person", "entities_loaded":1}],
-                        "edges":[], "total_entities":1, "actor_id":"legacy-actor", "commit":null,
-                        "embedding_generation":null
-                    }),
-                    "commit-list" => serde_json::json!({"commits":[commit.clone()]}),
-                    _ => commit.clone(),
-                };
-                let data = IntentApiFixture::graph(vec![IntentReply::json(200, reply)]);
-                let home = temp.path().join("operator");
-                fs::create_dir(&home).unwrap();
-                fs::write(
-                    home.join("config.yaml"),
-                    format!(
-                        "servers:\n  staging:\n    url: {}\nprofiles:\n  staging:\n    server: staging\n    default_graph: knowledge\ndefaults:\n  server: staging\n  default_graph: knowledge\n",
-                        data.origin
-                    ),
-                )
-                .unwrap();
-                let mut command = cli();
-                command
-                    .current_dir(temp.path())
-                    .env("OMNIGRAPH_HOME", &home)
-                    .env_remove("OMNIGRAPH_PROFILE")
-                    .env("OMNIGRAPH_TOKEN_STAGING", "ordinary-ambient-token")
-                    .env("OMNIGRAPH_BEARER_TOKEN", "unused-legacy-fallback")
-                    .timeout(std::time::Duration::from_secs(15));
-                if use_profile {
-                    command.env("OMNIGRAPH_PROFILE", "staging");
-                }
-                match operation {
-                    "load" => {
-                        fs::write(temp.path().join("batch.jsonl"), "{}\n").unwrap();
-                        command.args(["load", "--data", "batch.jsonl", "--mode", "append"]);
-                    }
-                    "commit-list" => {
-                        command.args(["commit", "list"]);
-                    }
-                    _ => {
-                        command.args(["commit", "show", "commit-a"]);
-                    }
-                }
-                command.args(["--direct", "--json"]);
-                let output = output_success(&mut command);
-                let payload = parse_stdout_json(&output);
-                match operation {
-                    "load" => assert_eq!(payload["total_entities"], 1),
-                    "commit-list" => assert_eq!(payload["commits"][0], shown),
-                    _ => assert_eq!(payload, shown),
-                }
-                let requests = data.workflow_requests();
-                assert_eq!(requests.len(), 1);
-                assert_eq!(
-                    requests[0].path,
-                    match operation {
-                        "load" => "/graphs/knowledge/load/ndjson?branch=main&mode=append",
-                        "commit-list" => "/graphs/knowledge/commits",
-                        _ => "/graphs/knowledge/commits/commit-a",
-                    }
-                );
-                assert_eq!(
-                    requests[0].headers["authorization"],
-                    "Bearer ordinary-ambient-token"
-                );
-                assert!(api.requests().is_empty());
-                data.assert_complete();
-                assert_no_core_effects(temp.path());
-            }
-        }
-    }
-}
-
-#[test]
-fn managed_data_issue_633_folder_context_does_not_gate_local_graph_work() {
+fn managed_status_and_history_verify_selected_target_identity() {
     let temp = tempdir().unwrap();
-    let api = IntentApiFixture::new(vec![]);
-    write_managed_context(temp.path(), &api.origin);
-    fs::write(temp.path().join(".omnigraph/context"), "malformed").unwrap();
-    let graph = graph_path(temp.path());
-    let home = temp.path().join("operator");
-    fs::create_dir(&home).unwrap();
-    fs::write(
-        home.join("config.yaml"),
-        format!("defaults:\n  store: {}\n", graph.display()),
-    )
-    .unwrap();
-    let schema = fixture("test.pg");
-    let queries = fixture("test.gq");
-    let command = || {
-        let mut command = cli();
-        command
-            .current_dir(temp.path())
-            .env("OMNIGRAPH_HOME", &home)
-            .env_remove("OMNIGRAPH_PROFILE")
-            .timeout(std::time::Duration::from_secs(30));
-        command
-    };
-    output_success(
-        command()
-            .arg("init")
-            .arg("--schema")
-            .arg(&schema)
-            .arg(&graph),
-    );
-    assert!(graph.exists());
-    output_success(
-        command()
-            .args(["load", "--mode", "append", "--data"])
-            .arg(fixture("test.jsonl"))
-            .arg("--store")
-            .arg(&graph)
-            .arg("--json"),
-    );
-    output_success(
-        command()
-            .args(["lint", "--schema"])
-            .arg(&schema)
-            .arg("--query")
-            .arg(&queries)
-            .arg("--json"),
-    );
-    let query = output_success(
-        command()
-            .args(["query", "get_person", "--query"])
-            .arg(&queries)
-            .arg("--store")
-            .arg(&graph)
-            .args(["--params", r#"{"name":"Alice"}"#, "--json"]),
-    );
-    assert_eq!(parse_stdout_json(&query)["rows"][0]["p.name"], "Alice");
-    output_success(
-        command()
-            .args(["schema", "plan", "--schema"])
-            .arg(&schema)
-            .arg("--store")
-            .arg(&graph)
-            .arg("--json"),
-    );
-    output_success(
-        command()
-            .args(["commit", "list", "--store"])
-            .arg(&graph)
-            .arg("--json"),
-    );
-    assert!(api.requests().is_empty());
-    assert_no_core_effects(temp.path());
-}
-
-#[test]
-fn managed_data_issue_633_operator_preferences_do_not_select_a_target() {
-    let temp = tempdir().unwrap();
-    let api = IntentApiFixture::new(vec![]);
-    write_managed_context(temp.path(), &api.origin);
-    let home = temp.path().join("operator");
-    fs::create_dir(&home).unwrap();
-    fs::write(
-        home.join("config.yaml"),
-        "operator:\n  actor: preferred-actor\ndefaults:\n  output: json\n  default_graph: knowledge\nprofiles:\n  unused:\n    server: staging\n",
-    )
-    .unwrap();
-    for profile in [None, Some("")] {
-        let mut command = cli();
-        command
-            .current_dir(temp.path())
-            .env("OMNIGRAPH_HOME", &home)
-            .env_remove("OMNIGRAPH_PROFILE")
-            .args(["query", "q", "--json"]);
-        if let Some(profile) = profile {
-            command.env("OMNIGRAPH_PROFILE", profile);
-        }
-        let output = command.output().unwrap();
-        assert_eq!(parse_stdout_json(&output)["type"], "graph_required");
-        assert!(api.requests().is_empty());
-    }
-    fs::write(home.join("config.yaml"), "defaults: [invalid]").unwrap();
-    let output = cli()
-        .current_dir(temp.path())
-        .env("OMNIGRAPH_HOME", &home)
-        .env_remove("OMNIGRAPH_PROFILE")
-        .args(["query", "q", "--json"])
-        .output()
-        .unwrap();
-    assert_eq!(
-        parse_stdout_json(&output)["type"],
-        "operator_config_invalid"
-    );
-    assert!(api.requests().is_empty());
-    assert_no_core_effects(temp.path());
-}
-
-#[test]
-fn managed_data_issue_633_direct_preserves_ambient_legacy_resolution() {
-    for use_profile in [false, true] {
-        let temp = tempdir().unwrap();
-        let api = IntentApiFixture::new(vec![]);
-        write_managed_context(temp.path(), &api.origin);
-        let data = IntentApiFixture::graph(vec![IntentReply::json(
-            200,
-            serde_json::json!({
-                "query_name":"q", "target":{"branch":"main"}, "row_count":1,
-                "columns":["value"], "rows":[{"value":42}], "graph_commit_id":"head-a"
-            }),
-        )]);
-        let home = temp.path().join("operator");
-        fs::create_dir(&home).unwrap();
-        fs::write(
-            home.join("config.yaml"),
-            format!(
-                "servers:\n  staging:\n    url: {}\nprofiles:\n  staging:\n    server: staging\ndefaults:\n  server: staging\n",
-                data.origin
-            ),
-        )
-        .unwrap();
-        let mut command = cli();
-        command
-            .current_dir(temp.path())
-            .env("OMNIGRAPH_HOME", &home)
-            .env_remove("OMNIGRAPH_PROFILE")
-            .env("OMNIGRAPH_TOKEN_STAGING", "legacy-ambient-token")
-            .args(["query", "q", "--graph", "knowledge", "--json", "--direct"]);
-        if use_profile {
-            command.env("OMNIGRAPH_PROFILE", "staging");
-        }
-        let output = output_success(&mut command);
-        assert_eq!(parse_stdout_json(&output)["rows"][0]["value"], 42);
-        assert_eq!(
-            data.workflow_requests()[0].headers["authorization"],
-            "Bearer legacy-ambient-token"
-        );
-        assert!(api.requests().is_empty());
-        data.assert_complete();
-        assert_no_core_effects(temp.path());
-    }
-}
-
-#[test]
-fn managed_use_verifies_access_before_writing_context() {
-    let temp = tempdir().unwrap();
-    let body = serde_json::json!({"data":{"cluster_id":"managed-test","name":"prod"},"meta":{"cluster_id":"managed-test","assurance":"verified_workload"}});
-    let status = serde_json::json!({"data":{"source":{"revision":MANAGED_REVISION},"requested":null,"observed":{"state":"observation_blocked"}},"meta":{"cluster_id":"managed-test","provenance":"service_db"}});
+    let status = serde_json::json!({"data":{"source":{"revision":MANAGED_REVISION},"requested":null,"observed":{"state":"observation_blocked"}},"meta":{"cluster_id":"managed-test","incarnation":"inc-one","provenance":"service_db"}});
     let delivery = managed_complete(false, false, "archived");
-    let history = serde_json::json!({"data":{"deployments":[delivery["data"].clone()]},"meta":{"cluster_id":"managed-test","provenance":"service_db"}});
+    let history = serde_json::json!({"data":{"deployments":[delivery["data"].clone()]},"meta":{"cluster_id":"managed-test","incarnation":"inc-one","provenance":"service_db"}});
     let mut reads = Vec::new();
     for (args, path, response) in [
         (vec!["status"], "/v1/clusters/managed-test/status", status),
@@ -2198,40 +1901,28 @@ fn managed_use_verifies_access_before_writing_context() {
             reads.push((args, path, foreign, true));
         }
     }
-    let replies = std::iter::once(IntentReply::json(200, body.clone()))
-        .chain(
-            reads
-                .iter()
-                .map(|(_, _, body, _)| IntentReply::json(200, body.clone())),
-        )
+    let replies = reads
+        .iter()
+        .map(|(_, _, body, _)| IntentReply::json(200, body.clone()))
         .collect();
     let api = lifecycle_fixture(replies);
-    let output = output_success(
-        cli()
-            .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
-            .env("OMNIGRAPH_CONTROL_API", &api.origin)
-            .args(["use", "managed-test", "--api"])
-            .arg(&api.origin)
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--json"),
-    );
-    assert_eq!(parse_stdout_json(&output), body);
-    let context: yaml_serde::Value =
-        yaml_serde::from_slice(&fs::read(temp.path().join(".omnigraph/context")).unwrap()).unwrap();
-    assert_eq!(context["version"], 2);
-    assert_eq!(context["organization_id"], "account-one");
-    assert_eq!(context["cluster"], "managed-test");
-    assert_eq!(context["api"].as_str(), Some(api.origin.as_str()));
-    assert_control_request(
-        &api.workflow_requests()[0],
-        "GET",
-        "/v1/clusters/managed-test",
-        Value::Null,
-        None,
-    );
+    write_managed_target(temp.path(), &api.origin);
+    let config_path = managed_home(temp.path()).join("config.yaml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        format!(
+            "{}\ndefaults:\n  profile: other\n",
+            config.replace(
+                "profiles:\n",
+                "profiles:\n  other:\n    api: https://other.example.test\n    organization_id: account-two\n    auth: {provider: token, source: {env: CLI_TEST_OTHER_TOKEN}}\n",
+            )
+        ),
+    )
+    .unwrap();
     for (index, (args, path, response, refused)) in reads.into_iter().enumerate() {
         let output = managed_cli(temp.path(), &api.origin)
+            .env_remove("CLI_TEST_OTHER_TOKEN")
             .args(args)
             .arg("--json")
             .output()
@@ -2246,9 +1937,9 @@ fn managed_use_verifies_access_before_writing_context() {
         } else {
             assert_eq!(parse_stdout_json(&output), response);
         }
-        assert_eq!(api.workflow_requests().len(), index + 2);
+        assert_eq!(api.workflow_requests().len(), index + 1);
         assert_control_request(
-            &api.workflow_requests()[index + 1],
+            &api.workflow_requests()[index],
             "GET",
             path,
             Value::Null,
@@ -2272,7 +1963,7 @@ fn managed_plan_and_apply_submit_exact_native_intent_without_waiting() {
             vec!["plan", "--rev", MANAGED_REVISION],
             "/v1/clusters/managed-test/plans",
             serde_json::json!({"revision":MANAGED_REVISION}),
-            managed_preview("ready"),
+            managed_preview("capturing"),
         ),
         (
             vec!["apply", "--plan", "saved-plan"],
@@ -2284,14 +1975,18 @@ fn managed_plan_and_apply_submit_exact_native_intent_without_waiting() {
         let temp = tempdir().unwrap();
         write_cluster_config_fixture(temp.path());
         let api = lifecycle_fixture(vec![IntentReply::json(202, body.clone())]);
-        write_managed_context(temp.path(), &api.origin);
+        write_managed_target(temp.path(), &api.origin);
         let output = output_success(managed_cli(temp.path(), &api.origin).args(arguments).args([
             "--no-wait",
             "--idempotency-key",
             "exact-key",
             "--json",
         ]));
-        assert_eq!(parse_stdout_json(&output), body);
+        let mut expected_output = body;
+        if path.ends_with("/plans") {
+            expected_output["idempotency_key"] = "exact-key".into();
+        }
+        assert_eq!(parse_stdout_json(&output), expected_output);
         assert!(String::from_utf8_lossy(&output.stderr).contains("exact-key"));
         assert!(!String::from_utf8_lossy(&output.stderr).contains("og_fixture_control"));
         assert_control_request(
@@ -2307,28 +2002,117 @@ fn managed_plan_and_apply_submit_exact_native_intent_without_waiting() {
 }
 
 #[test]
+#[ignore = "nightly: holds plan and apply replies past the real 10 s control request bound"]
+fn managed_plan_and_apply_submissions_wait_until_their_local_deadline() {
+    // A submission is answered only after the service's own work, so
+    // `--timeout` bounds it, not the bound of an ordinary control call.
+    let slow = std::time::Duration::from_millis(10_500);
+    for (arguments, path, expected, body, delay, code) in [
+        (
+            vec!["plan", "--rev", MANAGED_REVISION, "--timeout", "30"],
+            "/v1/clusters/managed-test/plans",
+            serde_json::json!({"revision":MANAGED_REVISION}),
+            managed_preview("ready"),
+            slow,
+            0,
+        ),
+        (
+            vec![
+                "apply",
+                "--plan",
+                "saved-plan",
+                "--no-wait",
+                "--timeout",
+                "30",
+            ],
+            "/v1/clusters/managed-test/deployments",
+            serde_json::json!({"preview_id":"saved-plan"}),
+            managed_delivery("queued"),
+            slow,
+            0,
+        ),
+        (
+            vec!["plan", "--rev", MANAGED_REVISION, "--timeout", "1"],
+            "/v1/clusters/managed-test/plans",
+            serde_json::json!({"revision":MANAGED_REVISION}),
+            managed_preview("ready"),
+            std::time::Duration::from_millis(2_500),
+            5,
+        ),
+    ] {
+        let temp = tempdir().unwrap();
+        let api = IntentApiFixture::with_session_and_first_reply_delay(
+            vec![IntentReply::json(202, body.clone())],
+            lifecycle_session("principal-one", "account-one"),
+            delay,
+        );
+        write_managed_target(temp.path(), &api.origin);
+        let started = std::time::Instant::now();
+        let output = managed_cli(temp.path(), &api.origin)
+            .args(&arguments)
+            .args(["--idempotency-key", "slow-key", "--json"])
+            // The held reply alone outlasts most of the helper's 15 s bound.
+            .timeout(std::time::Duration::from_secs(40))
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{arguments:?}: {output:?}"
+        );
+        let result = parse_stdout_json(&output);
+        if code == 0 {
+            assert_eq!(result, body);
+            assert!(started.elapsed() >= slow);
+        } else {
+            assert_eq!(result["type"], "wait_timeout");
+            assert_eq!(result["submission"]["idempotency_key"], "slow-key");
+            assert_eq!(result["submission"]["acceptance"], "unknown");
+        }
+        assert_control_request(
+            &api.workflow_requests()[0],
+            "POST",
+            path,
+            expected,
+            Some("slow-key"),
+        );
+        api.assert_complete();
+        assert_no_core_effects(temp.path());
+    }
+}
+
+#[test]
 fn managed_plan_omitted_revision_captures_public_source_head_once() {
     for state in ["ready", "capturing", "failed", "expired"] {
         let temp = tempdir().unwrap();
-        let source = serde_json::json!({"data":{"revision":MANAGED_REVISION},"meta":{"cluster_id":"managed-test"}});
+        let source = serde_json::json!({"data":{"revision":MANAGED_REVISION},"meta":{"cluster_id":"managed-test","incarnation":"inc-one"}});
         let expected = managed_preview(state);
         let api = lifecycle_fixture(vec![
             IntentReply::json(200, source),
             IntentReply::json(200, expected.clone()),
         ]);
-        write_managed_context(temp.path(), &api.origin);
+        write_managed_target(temp.path(), &api.origin);
         let output = managed_cli(temp.path(), &api.origin)
-            .args(["plan", "--idempotency-key", "snapshot", "--json"])
+            .args([
+                "plan",
+                "--no-wait",
+                "--idempotency-key",
+                "snapshot",
+                "--json",
+            ])
             .output()
             .unwrap();
         assert_eq!(
             output.status.code(),
             Some(match state {
-                "ready" => 0,
-                "capturing" => 5,
+                "ready" | "capturing" => 0,
                 _ => 1,
             })
         );
+        let mut expected = expected;
+        if state == "capturing" {
+            expected["idempotency_key"] = "snapshot".into();
+        }
         assert_eq!(parse_stdout_json(&output), expected);
         assert_control_request(
             &api.workflow_requests()[0],
@@ -2350,68 +2134,216 @@ fn managed_plan_omitted_revision_captures_public_source_head_once() {
 }
 
 #[test]
-#[ignore = "nightly: real 2 s delivery polling and a 1 s wait deadline"]
-fn managed_apply_polls_original_delivery_without_resubmission_or_cancellation() {
-    for timeout in [false, true] {
+fn managed_plan_replay_reads_only_the_original_authorized_preview() {
+    for case in [
+        "ready",
+        "denied",
+        "other-id",
+        "other-revision",
+        "other-deadline",
+        "missing-plan",
+    ] {
         let temp = tempdir().unwrap();
-        let queued = managed_delivery("queued");
-        let complete = managed_complete(true, true, "archived");
-        let replies = if timeout {
-            vec![IntentReply::json(202, queued.clone())]
-        } else {
-            vec![
-                IntentReply::json(202, queued.clone()),
-                IntentReply::json(200, complete.clone()),
-            ]
+        let mut accepted = managed_preview("ready");
+        accepted["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("native_plan");
+        let mut observed = managed_preview("ready");
+        let (status, exit) = match case {
+            "denied" => {
+                observed = serde_json::json!({"type":"native_authorization_denied","detail":"Current policy denies this preview"});
+                (403, 2)
+            }
+            "other-id" => {
+                observed["data"]["preview_id"] = "another-preview".into();
+                (200, 2)
+            }
+            "other-revision" => {
+                observed["data"]["revision"] = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+                (200, 2)
+            }
+            "other-deadline" => {
+                observed["data"]["first_attempt_deadline"] = "2026-10-30T00:45:57Z".into();
+                (200, 2)
+            }
+            "missing-plan" => {
+                observed["data"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("native_plan");
+                (200, 1)
+            }
+            _ => (200, 0),
         };
-        let api = lifecycle_fixture(replies);
-        write_managed_context(temp.path(), &api.origin);
+        let api = lifecycle_fixture(vec![
+            IntentReply::json(200, accepted),
+            IntentReply::json(status, observed.clone()),
+        ]);
+        write_managed_target(temp.path(), &api.origin);
         let output = managed_cli(temp.path(), &api.origin)
             .args([
-                "apply",
-                "--plan",
-                "saved-plan",
-                "--timeout",
-                if timeout { "1" } else { "10" },
+                "plan",
+                "--rev",
+                MANAGED_REVISION,
                 "--idempotency-key",
-                "poll-key",
+                "original-plan-key",
                 "--json",
             ])
             .output()
             .unwrap();
-        assert_eq!(
-            output.status.code(),
-            Some(if timeout { 5 } else { 0 }),
-            "{output:?}"
-        );
-        assert_eq!(
-            parse_stdout_json(&output),
-            if timeout { queued } else { complete }
-        );
-        if timeout {
-            assert!(
-                String::from_utf8_lossy(&output.stderr)
-                    .contains("cluster status --managed delivery-one")
+        assert_eq!(output.status.code(), Some(exit), "{case}: {output:?}");
+        let body = parse_stdout_json(&output);
+        if exit == 0 {
+            assert_eq!(body, observed);
+        } else {
+            assert_eq!(body["accepted_preview"]["preview_id"], "saved-plan");
+            assert_eq!(body["accepted_preview"]["revision"], MANAGED_REVISION);
+            assert_eq!(body["idempotency_key"], "original-plan-key");
+            assert_eq!(
+                body["type"],
+                match case {
+                    "denied" => "native_authorization_denied",
+                    "missing-plan" => "api_response_invalid",
+                    _ => "context_mismatch",
+                }
             );
         }
         assert_control_request(
             &api.workflow_requests()[0],
             "POST",
-            "/v1/clusters/managed-test/deployments",
-            serde_json::json!({"preview_id":"saved-plan"}),
-            Some("poll-key"),
+            "/v1/clusters/managed-test/plans",
+            serde_json::json!({"revision":MANAGED_REVISION}),
+            Some("original-plan-key"),
         );
-        if !timeout {
-            assert_control_request(
-                &api.workflow_requests()[1],
-                "GET",
-                "/v1/clusters/managed-test/deployments/delivery-one",
-                Value::Null,
-                None,
-            );
-        }
+        assert_control_request(
+            &api.workflow_requests()[1],
+            "GET",
+            "/v1/clusters/managed-test/plans/saved-plan",
+            Value::Null,
+            None,
+        );
         api.assert_complete();
         assert_no_core_effects(temp.path());
+    }
+}
+
+#[test]
+#[ignore = "nightly: real 2 s delivery polling and a 1 s wait deadline"]
+fn managed_plan_and_apply_poll_original_identity_without_resubmission_or_cancellation() {
+    for (verb, selector, selected, queued, complete, path, lookup, request) in [
+        (
+            "plan",
+            "--rev",
+            MANAGED_REVISION,
+            managed_preview("capturing"),
+            managed_preview("ready"),
+            "/v1/clusters/managed-test/plans",
+            "/v1/clusters/managed-test/plans/saved-plan",
+            serde_json::json!({"revision":MANAGED_REVISION}),
+        ),
+        (
+            "apply",
+            "--plan",
+            "saved-plan",
+            managed_delivery("queued"),
+            managed_complete(true, true, "archived"),
+            "/v1/clusters/managed-test/deployments",
+            "/v1/clusters/managed-test/deployments/delivery-one",
+            serde_json::json!({"preview_id":"saved-plan"}),
+        ),
+    ] {
+        for outcome in ["ready", "timeout", "failed", "expired", "unavailable"] {
+            if verb == "apply" && !matches!(outcome, "ready" | "timeout") {
+                continue;
+            }
+            let timeout = outcome == "timeout";
+            let terminal_failure = matches!(outcome, "failed" | "expired");
+            let mut complete = complete.clone();
+            if terminal_failure {
+                complete = managed_preview(outcome);
+                complete["data"]["failure_code"] = format!("preview_{outcome}").into();
+            }
+            let temp = tempdir().unwrap();
+            let mut replies = if timeout {
+                vec![IntentReply::json(202, queued.clone())]
+            } else {
+                vec![
+                    IntentReply::json(202, queued.clone()),
+                    IntentReply::json(200, complete.clone()),
+                ]
+            };
+            if outcome == "unavailable" {
+                replies.insert(
+                    1,
+                    IntentReply::json(
+                        503,
+                        serde_json::json!({"type":"unavailable","detail":"retry this read"}),
+                    ),
+                );
+            }
+            let api = lifecycle_fixture(replies);
+            write_managed_target(temp.path(), &api.origin);
+            let output = managed_cli(temp.path(), &api.origin)
+                .args([
+                    verb,
+                    selector,
+                    selected,
+                    "--timeout",
+                    if timeout { "1" } else { "10" },
+                    "--idempotency-key",
+                    "poll-key",
+                    "--json",
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(if timeout {
+                    5
+                } else if terminal_failure {
+                    1
+                } else {
+                    0
+                }),
+                "{output:?}"
+            );
+            let mut expected = if timeout {
+                queued.clone()
+            } else {
+                complete.clone()
+            };
+            if timeout && verb == "plan" {
+                expected["idempotency_key"] = "poll-key".into();
+            }
+            assert_eq!(parse_stdout_json(&output), expected);
+            if timeout {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains(if verb == "plan" {
+                        "--idempotency-key KEY --target NAME"
+                    } else {
+                        "cluster status delivery-one --target NAME"
+                    })
+                );
+            }
+            if terminal_failure {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains(&format!("preview_{outcome}"))
+                );
+            }
+            assert_control_request(
+                &api.workflow_requests()[0],
+                "POST",
+                path,
+                request.clone(),
+                Some("poll-key"),
+            );
+            for observation in api.workflow_requests().iter().skip(1) {
+                assert_control_request(observation, "GET", lookup, Value::Null, None);
+            }
+            api.assert_complete();
+            assert_no_core_effects(temp.path());
+        }
     }
 }
 
@@ -2454,7 +2386,7 @@ fn managed_native_outcomes_preserve_activation_archive_and_uncertainty() {
     {
         let temp = tempdir().unwrap();
         let api = lifecycle_fixture(vec![IntentReply::json(200, body.clone())]);
-        write_managed_context(temp.path(), &api.origin);
+        write_managed_target(temp.path(), &api.origin);
         let output = managed_cli(temp.path(), &api.origin)
             .args([
                 "status",
@@ -2502,7 +2434,7 @@ fn managed_current_policy_and_stale_preview_refusals_never_submit_again() {
         let temp = tempdir().unwrap();
         let problem = serde_json::json!({"type":kind,"status":status,"detail":"current native authority refused"});
         let api = lifecycle_fixture(vec![IntentReply::json(status, problem.clone())]);
-        write_managed_context(temp.path(), &api.origin);
+        write_managed_target(temp.path(), &api.origin);
         let output = managed_cli(temp.path(), &api.origin)
             .args(args)
             .arg("--json")
@@ -2532,7 +2464,7 @@ fn managed_poll_identity_mismatch_retains_original_delivery_and_native_ids() {
             IntentReply::json(202, queued),
             IntentReply::json(200, changed),
         ]);
-        write_managed_context(temp.path(), &api.origin);
+        write_managed_target(temp.path(), &api.origin);
         let output = managed_cli(temp.path(), &api.origin)
             .args(["apply", "--plan", "saved-plan", "--json"])
             .output()
@@ -2568,7 +2500,7 @@ fn managed_lost_submission_retains_key_without_effect_retry() {
         headers: vec![],
         body: b"{".to_vec(),
     }]);
-    write_managed_context(temp.path(), &api.origin);
+    write_managed_target(temp.path(), &api.origin);
     let output = managed_cli(temp.path(), &api.origin)
         .args([
             "apply",
@@ -2590,304 +2522,25 @@ fn managed_lost_submission_retains_key_without_effect_retry() {
 }
 
 #[test]
-fn managed_invalid_context_refuses_without_network_or_core_effects() {
-    let api = lifecycle_fixture(vec![]);
-    for context in [
-        "{\n".to_string(),
-        format!("version: 2\ncluster: managed-test\napi: {}\n", api.origin),
-        format!(
-            "version: 1\ncluster: managed-test\napi: {}\nunknown: true\n",
-            api.origin
-        ),
-        "x".repeat(16 * 1024 + 1),
-    ] {
-        let temp = tempdir().unwrap();
-        write_cluster_config_fixture(temp.path());
-        write_managed_context(temp.path(), &api.origin);
-        fs::write(temp.path().join(".omnigraph/context"), context).unwrap();
-        let output = managed_cli(temp.path(), &api.origin)
-            .args(["apply", "--plan", "saved-plan", "--json"])
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(2));
-        assert_eq!(parse_stdout_json(&output)["type"], "context_invalid");
-        assert_no_core_effects(temp.path());
-    }
-    assert!(api.requests().is_empty());
-}
-
-#[test]
-#[cfg(unix)]
-fn managed_context_links_and_fifo_refuse_without_blocking_or_core_effects() {
-    let api = lifecycle_fixture(vec![]);
-    for variant in ["file-link", "dangling-link", "directory-link", "fifo"] {
-        let temp = tempdir().unwrap();
-        write_cluster_config_fixture(temp.path());
-        write_managed_context(temp.path(), &api.origin);
-        let context = temp.path().join(".omnigraph/context");
-        match variant {
-            "file-link" => {
-                let target = temp.path().join("actual-context");
-                fs::rename(&context, &target).unwrap();
-                std::os::unix::fs::symlink(target, &context).unwrap();
-            }
-            "dangling-link" => {
-                fs::remove_file(&context).unwrap();
-                std::os::unix::fs::symlink(temp.path().join("missing"), &context).unwrap();
-            }
-            "directory-link" => {
-                let actual = temp.path().join("actual-directory");
-                fs::rename(temp.path().join(".omnigraph"), &actual).unwrap();
-                std::os::unix::fs::symlink(actual, temp.path().join(".omnigraph")).unwrap();
-            }
-            "fifo" => {
-                fs::remove_file(&context).unwrap();
-                assert!(
-                    std::process::Command::new("mkfifo")
-                        .arg(&context)
-                        .status()
-                        .unwrap()
-                        .success()
-                );
-            }
-            _ => unreachable!(),
-        }
-        let output = managed_cli(temp.path(), &api.origin)
-            .args(["apply", "--plan", "saved-plan", "--json"])
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(2), "{variant}");
-        assert_eq!(
-            parse_stdout_json(&output)["type"],
-            "context_invalid",
-            "{variant}"
-        );
-        assert_no_core_effects(temp.path());
-    }
-    assert!(api.requests().is_empty());
-}
-
-#[test]
-fn managed_mode_is_explicit_and_direct_commands_ignore_folder_context() {
+fn managed_folder_context_is_inert_and_missing_target_never_falls_back() {
     let temp = tempdir().unwrap();
     let api = lifecycle_fixture(vec![]);
-    write_managed_context(temp.path(), &api.origin);
-    for context in ["valid", "malformed"] {
-        let root = temp.path().join(context);
-        fs::create_dir(&root).unwrap();
-        write_cluster_config_fixture(&root);
-        write_managed_context(&root, &api.origin);
-        let context_path = root.join(".omnigraph/context");
-        if context == "malformed" {
-            fs::write(&context_path, "{\n").unwrap();
-        }
-        let original_context = fs::read(&context_path).unwrap();
-        for verb in ["validate", "plan", "status"] {
-            let output = output_success(cli().current_dir(&root).args(["cluster", verb, "--json"]));
-            assert_eq!(parse_stdout_json(&output)["ok"], true, "{context}: {verb}");
-        }
-        let observed = cli()
-            .current_dir(&root)
-            .args(["cluster", "observe", "--json"])
-            .output()
-            .unwrap();
-        assert!(!observed.status.success());
-        let observed = parse_stdout_json(&observed);
-        assert_eq!(observed["ok"], false);
-        assert!(
-            observed["diagnostics"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|diagnostic| diagnostic["code"] == "state_missing")
-        );
-        assert_no_core_effects(&root);
-        let output = output_success(
-            cli()
-                .current_dir(&root)
-                .env("OMNIGRAPH_CONTROL_API", &api.origin)
-                .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
-                .args(["cluster", "apply", "--json"]),
-        );
-        let receipt = parse_stdout_json(&output);
-        assert_eq!(receipt["status"], "complete", "{context}: {receipt}");
-        assert_eq!(receipt["result"]["converged"], true);
-        assert_eq!(
-            receipt["result"]["graphs"]["knowledge"]["outcome"],
-            "created"
-        );
-        assert!(root.join("graphs/knowledge.omni/__manifest").exists());
-        let ledger: Value =
-            serde_json::from_slice(&fs::read(root.join("__cluster/state.json")).unwrap()).unwrap();
-        assert_eq!(ledger["deployment_results"][0], receipt["result"]);
-        assert_eq!(fs::read(&context_path).unwrap(), original_context);
-        assert!(
-            api.requests().is_empty(),
-            "Core apply consulted the managed service"
-        );
+    write_cluster_config_fixture(temp.path());
+    fs::create_dir(temp.path().join(".omnigraph")).unwrap();
+    fs::write(temp.path().join(".omnigraph/context"), "malformed").unwrap();
+    for verb in ["plan", "apply", "status"] {
+        let output = output_failure(cli().current_dir(temp.path()).args(["cluster", verb]));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("target"));
     }
-    // Neither a selected folder nor an invalid context may change the meaning
-    // of a command. Reject the spelling/flag conflict before reading context,
-    // opening storage, or submitting anything to either HTTP API.
-    let rejected_root = temp.path().join("rejected");
-    fs::create_dir(&rejected_root).unwrap();
-    write_cluster_config_fixture(&rejected_root);
-    write_managed_context(&rejected_root, &api.origin);
-    let rejected_context = rejected_root.join(".omnigraph/context");
-    fs::write(&rejected_context, "{\n").unwrap();
-    let mut rejected_arguments = vec![
-        vec!["managed", "status"], // Removed spelling has no compatibility alias.
-        vec!["cluster", "create", "new", "--api", &api.origin],
-        vec![
-            "cluster",
-            "push",
-            "--expected-revision",
-            "old",
-            "--message",
-            "new",
-        ],
-        vec!["cluster", "delete", "--incarnation", "inc-one"],
-        vec![
-            "cluster",
-            "undo-delete",
-            "--incarnation",
-            "inc-one",
-            "--deletion-id",
-            "op",
-        ],
-        vec!["cluster", "token"],
-        vec!["cluster", "members", "list"],
-        vec!["cluster", "operation", "op"],
-        vec!["cluster", "history"],
-        vec!["cluster", "cancel", "run"],
-        vec!["cluster", "plan", "--rev", "revision"],
-        vec!["cluster", "plan", "--no-wait"],
-        vec!["cluster", "plan", "--timeout", "10"],
-        vec!["cluster", "plan", "--idempotency-key", "key"],
-        vec!["cluster", "apply", "--plan", "plan"],
-        vec!["cluster", "apply", "--idempotency-key", "key"],
-        vec!["cluster", "status", "run"],
-        vec!["cluster", "apply", "--managed"], // A managed apply requires a plan.
-        vec![
-            "cluster",
-            "apply",
-            "--managed",
-            "--plan",
-            "plan",
-            "--deployment-id",
-            "id",
-        ],
-        vec![
-            "cluster",
-            "apply",
-            "--managed",
-            "--plan",
-            "plan",
-            "--writers-stopped",
-        ],
-        vec!["cluster", "status", "--managed", "--deployment-id", "id"],
-        vec!["cluster", "status", "--managed", "run", "--timeout", "10"],
-        vec!["cluster", "validate", "--managed"],
-        vec!["cluster", "observe", "--managed"],
-        vec!["cluster", "force-unlock", "lock", "--managed"],
-        vec![
-            "cluster",
-            "upgrade-ledger",
-            "--writers-stopped",
-            "--managed",
-        ],
-    ];
-    for selector in [
-        vec!["--server", api.origin.as_str()],
-        vec!["--cluster", "file:///must-not-open"],
-        vec!["--store", "file:///must-not-open"],
-        vec!["--profile", "must-not-load"],
-        vec!["--graph", "knowledge"],
-        vec!["--as", "forged"],
-        vec!["--direct"],
-    ] {
-        let mut arguments = vec!["cluster", "apply", "--managed", "--plan", "plan"];
-        arguments.extend(selector);
-        rejected_arguments.push(arguments);
-    }
-    // Global flags retain their provenance on either side of the command.
-    let config_conflicts = [
-        vec![
-            "--cluster",
-            "file:///must-not-open",
-            "cluster",
-            "status",
-            "--config",
-            ".",
-        ],
-        vec![
-            "cluster",
-            "status",
-            "--cluster",
-            "file:///must-not-open",
-            "--config",
-            ".",
-        ],
-    ];
-    let rejected_arguments = rejected_arguments
-        .into_iter()
-        .map(|arguments| (arguments, None))
-        .chain(config_conflicts.into_iter().map(|arguments| {
-            (
-                arguments,
-                Some("--cluster and explicit --config cannot be used together"),
-            )
-        }));
-    for (arguments, expected_clap_error) in rejected_arguments {
-        let output = cli()
-            .current_dir(&rejected_root)
-            .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
-            .env("OMNIGRAPH_CONTROL_API", &api.origin)
-            .args(&arguments)
-            .arg("--json")
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
-        if let Some(expected) = expected_clap_error {
-            assert!(output.stdout.is_empty(), "{arguments:?}: {output:?}");
-            assert!(
-                String::from_utf8_lossy(&output.stderr).contains(expected),
-                "{arguments:?}: {output:?}"
-            );
-        }
-        let diagnostics = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            !diagnostics.contains("context_invalid")
-                && !diagnostics.contains("managed_context_required"),
-            "argument refusal must precede context access: {arguments:?}: {diagnostics}"
-        );
-        assert!(api.requests().is_empty(), "{arguments:?}");
-        assert_no_core_effects(&rejected_root);
-        assert_eq!(fs::read(&rejected_context).unwrap(), b"{\n");
-        assert!(!rejected_root.join(".omnigraph/lifecycle.lock").exists());
-        assert!(
-            !rejected_root
-                .join(".omnigraph/pending-lifecycle.json")
-                .exists()
-        );
-    }
-    let child = temp.path().join("nested");
-    fs::create_dir(&child).unwrap();
-    let missing = managed_cli(&child, &api.origin)
-        .args(["status", "--json"])
-        .output()
-        .unwrap();
-    assert_eq!(missing.status.code(), Some(2));
+    let preview = cluster_json(temp.path(), "plan");
+    assert_eq!(preview["ok"], true);
+    let applied = apply_cluster_fixture(temp.path());
+    assert_eq!(applied["status"], "complete");
     assert_eq!(
-        parse_stdout_json(&missing)["type"],
-        "managed_context_required"
+        fs::read(temp.path().join(".omnigraph/context")).unwrap(),
+        b"malformed"
     );
     assert!(api.requests().is_empty());
-    assert_no_core_effects(&child);
 }
 
 #[test]
@@ -2896,7 +2549,7 @@ fn managed_cancel_uses_exact_cluster_scope_and_refuses_foreign_response() {
     let mut foreign = managed_delivery("cancelled");
     foreign["meta"]["cluster_id"] = serde_json::json!("another-cluster");
     let api = lifecycle_fixture(vec![IntentReply::json(200, foreign)]);
-    write_managed_context(temp.path(), &api.origin);
+    write_managed_target(temp.path(), &api.origin);
     let output = managed_cli(temp.path(), &api.origin)
         .args(["cancel", "delivery-one", "--json"])
         .output()
@@ -2924,7 +2577,7 @@ fn managed_cancel_is_idempotent_and_cannot_cancel_attempted_native_work() {
         IntentReply::json(200, cancelled.clone()),
         IntentReply::json(409, problem.clone()),
     ]);
-    write_managed_context(temp.path(), &api.origin);
+    write_managed_target(temp.path(), &api.origin);
     for (expected, code) in [(cancelled.clone(), 0), (cancelled, 0), (problem, 2)] {
         let output = managed_cli(temp.path(), &api.origin)
             .args(["cancel", "delivery-one", "--json"])
@@ -2978,7 +2631,7 @@ fn managed_redirect_and_oversized_reply_fail_without_following_or_core_effects()
             headers,
             body: vec![],
         }]);
-        write_managed_context(temp.path(), &api.origin);
+        write_managed_target(temp.path(), &api.origin);
         let output = managed_cli(temp.path(), &api.origin)
             .args(["apply", "--plan", "saved-plan", "--json"])
             .output()
@@ -2992,17 +2645,22 @@ fn managed_redirect_and_oversized_reply_fail_without_following_or_core_effects()
 }
 
 #[test]
-fn managed_origin_mismatch_and_api_down_never_open_core() {
+fn managed_auth_selector_and_api_down_never_open_core() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
     let api = lifecycle_fixture(vec![]);
-    write_managed_context(temp.path(), &api.origin);
+    write_managed_target(temp.path(), &api.origin);
     let mismatch = managed_cli(temp.path(), &api.origin)
-        .env("OMNIGRAPH_CONTROL_API", "https://other.example")
+        .args(["--auth", "unknown-profile"])
         .args(["apply", "--plan", "saved-plan", "--json"])
         .output()
         .unwrap();
-    assert_eq!(mismatch.status.code(), Some(2));
+    assert_eq!(mismatch.status.code(), Some(64), "{mismatch:?}");
+    assert!(mismatch.stdout.is_empty(), "{mismatch:?}");
+    assert!(
+        String::from_utf8_lossy(&mismatch.stderr).contains("unexpected argument '--auth'"),
+        "{mismatch:?}"
+    );
     assert!(api.requests().is_empty());
     assert_no_core_effects(temp.path());
     let origin = api.origin.clone();
@@ -3186,103 +2844,41 @@ fn cluster_plan_json_reads_inferred_local_state() {
 fn cluster_status_json_reports_missing_state() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
-
-    let json = parse_stdout_json(&output_success(
+    let output = output_failure(
         cli()
-            .arg("cluster")
-            .arg("status")
-            .arg("--config")
+            .args(["cluster", "status", "--target"])
             .arg(temp.path())
             .arg("--json"),
-    ));
-    assert_eq!(json["ok"], true);
-    assert_eq!(json["state_observations"]["state_found"], false);
-    assert!(
-        json["diagnostics"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|diagnostic| diagnostic["code"] == "state_missing"),
-        "missing state should be a warning diagnostic: {json}"
     );
+    assert_eq!(
+        parse_stdout_json(&output)["diagnostics"][0]["code"],
+        "state_missing"
+    );
+    assert!(!temp.path().join("__cluster/state.json").exists());
 }
 
 #[test]
-fn cluster_status_json_reports_lock_metadata() {
-    let temp = tempdir().unwrap();
-    write_cluster_config_fixture(temp.path());
+fn cluster_status_json_reports_applied_revision_and_exact_lock() {
+    let temp = applied_knowledge_cluster();
     write_cluster_lock(temp.path(), "held-lock", "refresh");
-
-    let json = parse_stdout_json(&output_success(
+    let state: Value =
+        serde_json::from_slice(&fs::read(temp.path().join("__cluster/state.json")).unwrap())
+            .unwrap();
+    fs::remove_file(temp.path().join("cluster.yaml")).unwrap();
+    let output = output_success(
         cli()
-            .arg("cluster")
-            .arg("status")
-            .arg("--config")
+            .args(["cluster", "status", "--target"])
             .arg(temp.path())
             .arg("--json"),
-    ));
-    assert_eq!(json["ok"], true);
-    assert_eq!(json["state_observations"]["locked"], true);
-    assert_eq!(json["state_observations"]["lock_id"], "held-lock");
-    assert_eq!(json["state_observations"]["lock_operation"], "refresh");
-    assert_eq!(json["state_observations"]["lock_pid"], 123);
+    );
+    let json = parse_stdout_json(&output);
+    assert_eq!(json["lock_id"], "held-lock");
+    assert_eq!(json["state_revision"], state["state_revision"]);
     assert_eq!(
-        json["state_observations"]["lock_created_at"],
-        "1970-01-01T00:00:00Z"
+        json["result_revision"],
+        state["applied_revision"]["result_revision"]
     );
-    assert!(json["state_observations"]["lock_age_seconds"].is_number());
-}
-
-#[test]
-fn cluster_status_json_reports_extended_state() {
-    let temp = tempdir().unwrap();
-    write_cluster_config_fixture(temp.path());
-    let state_dir = temp.path().join("__cluster");
-    fs::create_dir_all(&state_dir).unwrap();
-    fs::write(
-        state_dir.join("state.json"),
-        r#"
-{
-  "version": 1,
-  "state_revision": 5,
-  "applied_revision": {
-    "config_digest": "applied",
-    "resources": {
-      "graph.knowledge": { "digest": "graph-digest" }
-    }
-  },
-  "resource_statuses": {
-    "graph.knowledge": { "status": "applied", "conditions": ["healthy"] }
-  },
-  "approval_records": {},
-  "recovery_records": {},
-  "observations": {}
-}
-"#,
-    )
-    .unwrap();
-
-    let json = parse_stdout_json(&output_success(
-        cli()
-            .arg("cluster")
-            .arg("status")
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--json"),
-    ));
-    assert_eq!(json["ok"], true);
-    assert_eq!(json["state_observations"]["state_revision"], 5);
-    assert!(
-        json["state_observations"]["state_cas"]
-            .as_str()
-            .unwrap()
-            .starts_with("sha256:")
-    );
-    assert_eq!(json["resource_digests"]["graph.knowledge"], "graph-digest");
-    assert_eq!(
-        json["resource_statuses"]["graph.knowledge"]["status"],
-        "applied"
-    );
+    assert_eq!(json["next_sequence"], state["next_sequence"]);
 }
 
 #[test]
@@ -3320,6 +2916,8 @@ fn cluster_plan_observes_an_existing_lock() {
         cli()
             .arg("cluster")
             .arg("plan")
+            .arg("--target")
+            .arg(temp.path())
             .arg("--config")
             .arg(temp.path())
             .arg("--json"),
@@ -3351,14 +2949,12 @@ fn cluster_force_unlock_json_removes_lock() {
             .arg("cluster")
             .arg("force-unlock")
             .arg("held-lock")
-            .arg("--config")
+            .arg("--target")
             .arg(temp.path())
             .arg("--json"),
     ));
-    assert_eq!(json["ok"], true);
-    assert_eq!(json["lock_removed"], true);
-    assert_eq!(json["state_observations"]["lock_id"], "held-lock");
-    assert_eq!(json["state_observations"]["lock_operation"], "plan");
+    assert_eq!(json["unlocked"], true);
+    assert_eq!(json["lock_id"], "held-lock");
     assert!(!temp.path().join("__cluster/lock.json").exists());
 }
 
@@ -3375,12 +2971,11 @@ fn cluster_force_unlock_wrong_id_exits_nonzero() {
             .arg("cluster")
             .arg("force-unlock")
             .arg("other-lock")
-            .arg("--config")
+            .arg("--target")
             .arg(temp.path())
             .arg("--json"),
     ));
     assert_eq!(json["ok"], false);
-    assert_eq!(json["lock_removed"], false);
     assert!(
         json["diagnostics"]
             .as_array()
@@ -3401,6 +2996,8 @@ fn cluster_plan_succeeds_before_and_after_force_unlock() {
         cli()
             .arg("cluster")
             .arg("plan")
+            .arg("--target")
+            .arg(temp.path())
             .arg("--config")
             .arg(temp.path())
             .arg("--json"),
@@ -3413,16 +3010,18 @@ fn cluster_plan_succeeds_before_and_after_force_unlock() {
             .arg("cluster")
             .arg("force-unlock")
             .arg("held-lock")
-            .arg("--config")
+            .arg("--target")
             .arg(temp.path())
             .arg("--json"),
     ));
-    assert_eq!(unlocked["lock_removed"], true);
+    assert_eq!(unlocked["unlocked"], true);
 
     let planned = parse_stdout_json(&output_success(
         cli()
             .arg("cluster")
             .arg("plan")
+            .arg("--target")
+            .arg(temp.path())
             .arg("--config")
             .arg(temp.path())
             .arg("--json"),
@@ -3484,6 +3083,8 @@ fn cluster_apply_bootstraps_v2_and_retains_exact_owner() {
     write_cluster_config_fixture(temp.path());
     let output = output_success(
         cli()
+            .arg("--target")
+            .arg(temp.path())
             .args(["cluster", "apply", "--config"])
             .arg(temp.path())
             .arg("--json"),
@@ -3511,6 +3112,8 @@ fn cluster_apply_locked_exits_nonzero() {
     write_cluster_lock(temp.path(), "held-lock", "plan");
     let output = output_failure(
         cli()
+            .arg("--target")
+            .arg(temp.path())
             .args(["cluster", "apply", "--config"])
             .arg(temp.path())
             .arg("--json"),
@@ -3527,23 +3130,22 @@ fn cluster_apply_locked_exits_nonzero() {
 }
 
 #[test]
-fn cluster_apply_uses_operator_actor_from_omnigraph_home() {
+fn cluster_apply_uses_explicit_actor_with_version1_operator_home() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
     let operator_home = tempdir().unwrap();
-    fs::write(
-        operator_home.path().join("config.yaml"),
-        "operator:
-  actor: act-operator
-",
-    )
-    .unwrap();
-    for (extra, expected) in [(vec![], "act-operator"), (vec!["--as", "andrew"], "andrew")] {
+    fs::write(operator_home.path().join("config.yaml"), "version: 1\n").unwrap();
+    for (extra, expected) in [
+        (vec!["--as", "act-operator"], "act-operator"),
+        (vec!["--as", "andrew"], "andrew"),
+    ] {
         let output = output_success(
             cli()
                 .current_dir(temp.path())
                 .env("OMNIGRAPH_HOME", operator_home.path())
                 .args(extra)
+                .arg("--target")
+                .arg(temp.path())
                 .args(["cluster", "apply", "--config"])
                 .arg(temp.path())
                 .arg("--json"),
@@ -3560,35 +3162,31 @@ fn cluster_apply_uses_operator_actor_from_omnigraph_home() {
 #[test]
 fn cluster_commands_ignore_legacy_omnigraph_yaml() {
     // RFC-011: the CLI never reads omnigraph.yaml for cluster commands — a
-    // present (even malformed) legacy file is inert. The actor falls back to
-    // `operator.actor`, then to none (no loud failure on absence).
+    // present (even malformed) legacy file is inert. No actor is inferred.
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
     fs::write(temp.path().join("omnigraph.yaml"), "{{{{ not yaml").unwrap();
 
-    for command in ["validate", "plan", "status"] {
-        let output = cli()
+    for command in ["validate", "plan"] {
+        let mut invocation = cli();
+        invocation
             .current_dir(temp.path())
-            .arg("cluster")
-            .arg(command)
-            .arg("--config")
+            .args(["cluster", command, "--config"])
             .arg(temp.path())
-            .arg("--json")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success() || command == "plan", // plan warns state-missing before bootstrap; still must not config-error
-            "cluster {command} affected by malformed omnigraph.yaml: {output:?}"
-        );
-        assert!(
-            !String::from_utf8_lossy(&output.stderr).contains("omnigraph.yaml"),
-            "cluster {command} touched omnigraph.yaml"
-        );
+            .arg("--json");
+        if command == "plan" {
+            invocation.arg("--target").arg(temp.path());
+        }
+        let output = invocation.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("omnigraph.yaml"));
     }
     // Bootstrap apply (no --as, no operator config): the legacy file is never
     // loaded and the no-actor apply succeeds (actor defaults to none).
     let output = cli()
         .current_dir(temp.path())
+        .arg("--target")
+        .arg(temp.path())
         .args(["cluster", "apply", "--config"])
         .arg(temp.path())
         .output()
@@ -3665,7 +3263,7 @@ fn optimize_resolves_a_cluster_graph_by_id() {
     let out = output_success(
         cli()
             .arg("optimize")
-            .arg("--cluster")
+            .arg("--target")
             .arg(temp.path())
             .arg("--graph")
             .arg("knowledge")
@@ -3696,7 +3294,7 @@ async fn v2_root_admission_blocks_cli_write_and_native_control_doors() {
         vec!["cleanup", "--keep", "1", "--confirm", "--json"],
         vec!["branch", "create", "must-not-exist"],
     ] {
-        let output = output_failure(cli().args(&args).arg("--store").arg(&graph).arg("--yes"));
+        let output = output_failure(cli().args(&args).arg("--target").arg(&graph).arg("--yes"));
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("state_lock_held"),
             "{args:?}: {output:?}"
@@ -3721,7 +3319,7 @@ async fn v2_root_admission_blocks_cli_write_and_native_control_doors() {
     db.apply_schema(&source).await.unwrap();
     assert_eq!(db.schema_source(), source);
     assert_ne!(db.schema_contract_digest(), original_contract);
-    let refused = output_failure(cli().args(["schema", "show"]).arg(&graph));
+    let refused = output_failure(cli().args(["schema", "show", "--target"]).arg(&graph));
     assert!(
         String::from_utf8_lossy(&refused.stderr).contains("applied_schema_drift"),
         "{refused:?}"
@@ -3772,12 +3370,12 @@ async fn successful_v2_cli_reads_preserve_admission_and_applied_state() {
             ],
         ];
         for args in &mut reads {
-            args.extend(["--store", graph.to_str().unwrap()]);
+            args.extend(["--target", graph.to_str().unwrap()]);
         }
         reads.push(vec![
             "queries",
             "validate",
-            "--cluster",
+            "--target",
             temp.path().to_str().unwrap(),
         ]);
         for args in reads {
@@ -3843,7 +3441,7 @@ async fn successful_v2_cli_reads_preserve_admission_and_applied_state() {
     // Reads leave the writer door usable; writers still retain their own lock.
     output_success(
         cli()
-            .args(["branch", "create", "after-reads", "--store"])
+            .args(["branch", "create", "after-reads", "--target"])
             .arg(&graph),
     );
     assert!(lock_path.exists());
@@ -3866,10 +3464,10 @@ async fn v2_graph_alias_cannot_bypass_server_admission() {
     std::os::unix::fs::symlink(temp.path().join("graphs/knowledge.omni"), &alias).unwrap();
     let before_state = fs::read(temp.path().join("__cluster/state.json")).unwrap();
     let before_lock = fs::read(temp.path().join("__cluster/lock.json")).unwrap();
-    output_success(cli().args(["schema", "show"]).arg(&alias));
+    output_success(cli().args(["schema", "show", "--target"]).arg(&alias));
     let output = output_failure(
         cli()
-            .args(["branch", "create", "blocked", "--store"])
+            .args(["branch", "create", "blocked", "--target"])
             .arg(&alias),
     );
     assert!(
@@ -3880,13 +3478,13 @@ async fn v2_graph_alias_cannot_bypass_server_admission() {
     fs::create_dir(&unknown).unwrap();
     let escaped = temp.path().join("graphs/escaped.omni");
     let outside = alias_dir.path().join("outside.omni");
-    fs::create_dir(&outside).unwrap();
+    init_graph(&outside);
     std::os::unix::fs::symlink(&outside, &escaped).unwrap();
     for (graph, code) in [
         (&unknown, "graph_not_applied"),
         (&escaped, "cluster_graph_root_mismatch"),
     ] {
-        let output = output_failure(cli().args(["schema", "show"]).arg(graph));
+        let output = output_failure(cli().args(["schema", "show", "--target"]).arg(graph));
         assert!(
             String::from_utf8_lossy(&output.stderr).contains(code),
             "{output:?}"
@@ -3909,7 +3507,7 @@ fn optimize_unknown_cluster_graph_id_errors() {
     let out = output_failure(
         cli()
             .arg("optimize")
-            .arg("--cluster")
+            .arg("--target")
             .arg(temp.path())
             .arg("--graph")
             .arg("does-not-exist")
@@ -3923,21 +3521,23 @@ fn optimize_unknown_cluster_graph_id_errors() {
 }
 
 #[test]
-fn optimize_auto_uses_the_sole_cluster_graph() {
-    // RFC-011 D7: a cluster with exactly one applied graph needs no --graph —
-    // the resolver enumerates the catalog and uses the only candidate.
+fn optimize_uses_only_an_explicit_or_configured_graph() {
     let temp = applied_knowledge_cluster();
-    let out = output_success(
+    let refused = output_failure(
         cli()
-            .arg("optimize")
-            .arg("--cluster")
+            .args(["optimize", "--target"])
             .arg(temp.path())
             .arg("--json"),
     );
-    assert!(
-        parse_stdout_json(&out)["datasets"].as_array().is_some(),
-        "optimize should auto-resolve the sole cluster graph"
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("graph"));
+    let home = tempdir().unwrap();
+    fs::write(home.path().join("config.yaml"), format!("version: 1\ntargets:\n  root:\n    kind: direct\n    scope: root\n    uri: file://{}\n    default_graph: knowledge\n", temp.path().display())).unwrap();
+    let out = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .args(["optimize", "--target", "root", "--json"]),
     );
+    assert!(parse_stdout_json(&out)["datasets"].is_array());
 }
 
 /// Stand up an applied cluster with two graphs (`knowledge`, `archive`).
@@ -3976,24 +3576,30 @@ policies:
 }
 
 #[test]
-fn optimize_on_multi_graph_cluster_without_graph_lists_candidates() {
-    // RFC-011 D7: >1 graph and no --graph → error naming every candidate,
-    // never an auto-pick.
+fn optimize_on_multi_graph_cluster_requires_a_graph_without_discovery() {
     let temp = applied_two_graph_cluster();
+    let operator_home = tempdir().unwrap();
+    fs::write(
+        operator_home.path().join("config.yaml"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "targets": {"root": {"kind": "direct", "scope": "root", "uri": url::Url::from_directory_path(temp.path()).unwrap().as_str()}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     let out = output_failure(
         cli()
-            .arg("optimize")
-            .arg("--cluster")
-            .arg(temp.path())
-            .arg("--json"),
+            .env("OMNIGRAPH_HOME", operator_home.path())
+            .args(["optimize", "--target", "root", "--json"]),
     );
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2));
+    let refusal = parse_stdout_json(&out);
+    assert_eq!(refusal["code"], "target_incompatible");
+    let message = refusal["error"].as_str().unwrap();
     assert!(
-        stderr.contains("2 graphs")
-            && stderr.contains("archive")
-            && stderr.contains("knowledge")
-            && stderr.contains("--graph <id>"),
-        "expected a candidate-listing error; got: {stderr}"
+        message.contains("--graph") && message.contains("default_graph"),
+        "{refusal}"
     );
 }
 
@@ -4034,7 +3640,11 @@ fn schema_apply_refuses_a_cluster_managed_graph_and_signposts_cluster_apply() {
     .unwrap();
     let graph = temp.path().join("graphs").join("knowledge.omni");
     let before = parse_stdout_json(&output_success(
-        cli().arg("snapshot").arg(&graph).arg("--json"),
+        cli()
+            .arg("snapshot")
+            .arg("--target")
+            .arg(&graph)
+            .arg("--json"),
     ));
     for schema in ["people_v2.pg", "missing.pg"] {
         let out = output_failure(
@@ -4043,7 +3653,7 @@ fn schema_apply_refuses_a_cluster_managed_graph_and_signposts_cluster_apply() {
                 .arg("apply")
                 .arg("--schema")
                 .arg(temp.path().join(schema))
-                .arg("--store")
+                .arg("--target")
                 .arg(&graph),
         );
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -4052,14 +3662,18 @@ fn schema_apply_refuses_a_cluster_managed_graph_and_signposts_cluster_apply() {
             "cluster ownership must be checked before reading {schema}; got: {stderr}"
         );
         assert!(out.stdout.is_empty());
-        let show = output_success(cli().args(["schema", "show"]).arg(&graph));
+        let show = output_success(cli().args(["schema", "show", "--target"]).arg(&graph));
         assert!(
             !stdout_string(&show).contains("bio"),
             "the refused apply must not have changed the live schema; got: {}",
             stdout_string(&show)
         );
         let after = parse_stdout_json(&output_success(
-            cli().arg("snapshot").arg(&graph).arg("--json"),
+            cli()
+                .arg("snapshot")
+                .arg("--target")
+                .arg(&graph)
+                .arg("--json"),
         ));
         assert_eq!(after, before, "refusal must not publish a graph change");
     }
@@ -4085,7 +3699,7 @@ fn optimize_by_cluster_works_when_catalog_payloads_are_degraded() {
     // Robustness (Greptile, #221): maintenance resolves the graph URI from the
     // state ledger alone, so an unrelated corrupt/missing catalog payload (or a
     // pending recovery sweep) does NOT block it — unlike the full serving-snapshot
-    // read. This is what keeps `repair --cluster` usable on a degraded cluster.
+    // read. This is what keeps `repair --target ROOT --graph GRAPH` usable on a degraded cluster.
     let temp = applied_knowledge_cluster();
     // Remove the verified catalog payloads (queries/policies) — a serving read
     // would refuse with a catalog-payload diagnostic; the ledger-only resolve
@@ -4097,7 +3711,7 @@ fn optimize_by_cluster_works_when_catalog_payloads_are_degraded() {
     let out = output_success(
         cli()
             .arg("optimize")
-            .arg("--cluster")
+            .arg("--target")
             .arg(temp.path())
             .arg("--graph")
             .arg("knowledge")
@@ -4114,13 +3728,15 @@ fn managed_invalid_acknowledgements_keep_request_identity_in_json_and_human_outp
     for (command, mut body, field) in [
         ("apply", managed_delivery("queued"), "/data/preview_id"),
         ("apply", managed_delivery("queued"), "/meta/cluster_id"),
+        ("apply", managed_delivery("queued"), "/meta/incarnation"),
         ("plan", managed_preview("ready"), "/data/revision"),
+        ("plan", managed_preview("ready"), "/meta/incarnation"),
     ] {
         *body.pointer_mut(field).unwrap() = serde_json::json!("foreign");
         for json in [false, true] {
             let temp = tempdir().unwrap();
             let api = lifecycle_fixture(vec![IntentReply::json(200, body.clone())]);
-            write_managed_context(temp.path(), &api.origin);
+            write_managed_target(temp.path(), &api.origin);
             let mut cli = managed_cli(temp.path(), &api.origin);
             cli.args(if command == "apply" {
                 vec!["apply", "--plan", "saved-plan"]
@@ -4154,7 +3770,7 @@ fn managed_cancellation_never_claims_an_attempted_delivery_was_cancelled() {
     let mut body = managed_delivery("cancelled");
     body["data"]["attempted_at"] = serde_json::json!("2026-10-08T00:00:00Z");
     let api = lifecycle_fixture(vec![IntentReply::json(200, body)]);
-    write_managed_context(temp.path(), &api.origin);
+    write_managed_target(temp.path(), &api.origin);
     let output = managed_cli(temp.path(), &api.origin)
         .args(["cancel", "delivery-one", "--json"])
         .output()
@@ -4169,98 +3785,19 @@ fn managed_cancellation_never_claims_an_attempted_delivery_was_cancelled() {
 }
 
 #[test]
-fn managed_explicit_use_rebinds_regular_context_only_after_access_verification() {
-    for previous in [
-        "version: 1\ncluster: old\napi: https://old.example\n",
-        "version: 2\ncluster: old\napi: https://old.example\norganization_id: account-other\n",
-        "not: [valid yaml",
-    ] {
-        let dir = tempdir().unwrap();
-        fs::create_dir(dir.path().join(".omnigraph")).unwrap();
-        let path = dir.path().join(".omnigraph/context");
-        fs::write(&path, previous).unwrap();
-        let body = serde_json::json!({"data":{"cluster_id":"managed-test"},"meta":{"cluster_id":"managed-test"}});
-        let api = lifecycle_fixture(vec![
-            IntentReply::json(403, serde_json::json!({"type":"scope_missing"})),
-            IntentReply::json(200, body.clone()),
-        ]);
-        let invoke = || {
-            cli()
-                .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
-                .env("OMNIGRAPH_CONTROL_API", &api.origin)
-                .args([
-                    "use",
-                    "managed-test",
-                    "--api",
-                    &api.origin,
-                    "--organization",
-                    "account-one",
-                    "--json",
-                    "--config",
-                ])
-                .arg(dir.path())
-                .output()
-                .unwrap()
-        };
-        assert_eq!(invoke().status.code(), Some(2));
-        assert_eq!(fs::read_to_string(&path).unwrap(), previous);
-        assert!(invoke().status.success());
-        let bound: yaml_serde::Value = yaml_serde::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(bound["version"], 2);
-        assert_eq!(bound["cluster"], "managed-test");
-        assert_eq!(bound["api"].as_str(), Some(api.origin.as_str()));
-        assert_eq!(bound["organization_id"], "account-one");
-        api.assert_complete();
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::symlink;
-        let dir = tempdir().unwrap();
-        fs::create_dir(dir.path().join(".omnigraph")).unwrap();
-        let victim = dir.path().join("untouched");
-        fs::write(&victim, "preserve").unwrap();
-        symlink(&victim, dir.path().join(".omnigraph/context")).unwrap();
-        let api = lifecycle_fixture(vec![]);
-        let output = cli()
-            .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
-            .env("OMNIGRAPH_CONTROL_API", &api.origin)
-            .args([
-                "use",
-                "managed-test",
-                "--api",
-                &api.origin,
-                "--organization",
-                "account-one",
-                "--json",
-                "--config",
-            ])
-            .arg(dir.path())
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(2));
-        assert_eq!(parse_stdout_json(&output)["type"], "context_invalid");
-        assert_eq!(fs::read_to_string(victim).unwrap(), "preserve");
-        assert!(api.requests().is_empty());
-    }
-}
-
-#[test]
-fn managed_bound_operation_rejects_cross_organization_before_authentication() {
+fn managed_operation_rejects_retired_organization_override_before_authentication() {
     let dir = tempdir().unwrap();
     let api = lifecycle_fixture(vec![]);
-    write_managed_context(dir.path(), &api.origin);
-    let output = managed_cli(dir.path(), &api.origin)
-        .args([
-            "operation",
-            "operation-one",
-            "--organization",
-            "account-other",
-            "--json",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(parse_stdout_json(&output)["type"], "context_mismatch");
+    write_managed_target(dir.path(), &api.origin);
+    let output = output_failure(managed_cli(dir.path(), &api.origin).args([
+        "operation",
+        "operation-one",
+        "--organization",
+        "foreign",
+        "--json",
+    ]));
+    assert_eq!(output.status.code(), Some(64));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
     assert!(api.requests().is_empty());
 }
 
@@ -4278,8 +3815,8 @@ fn managed_native_deployment_commands_refuse_a_foreign_organization_before_work(
             vec![],
             lifecycle_session("principal-one", "account-other"),
         );
-        write_managed_context(temp.path(), &api.origin);
-        let before = fs::read(temp.path().join(".omnigraph/context")).unwrap();
+        write_managed_target(temp.path(), &api.origin);
+        let before = fs::read(managed_home(temp.path()).join("config.yaml")).unwrap();
         let output = managed_cli(temp.path(), &api.origin)
             .args(arguments)
             .arg("--json")
@@ -4292,7 +3829,7 @@ fn managed_native_deployment_commands_refuse_a_foreign_organization_before_work(
         assert_control_request(&requests[0], "GET", "/v1/auth/session", Value::Null, None);
         assert!(api.workflow_requests().is_empty());
         assert_eq!(
-            fs::read(temp.path().join(".omnigraph/context")).unwrap(),
+            fs::read(managed_home(temp.path()).join("config.yaml")).unwrap(),
             before
         );
         api.assert_complete();
@@ -4301,51 +3838,29 @@ fn managed_native_deployment_commands_refuse_a_foreign_organization_before_work(
 }
 
 fn organization_cli(root: &std::path::Path, origin: &str) -> assert_cmd::Command {
-    let mut command = cli();
+    let mut command = managed_fixture_command(root, origin, "managed-account");
+    command.arg("organization");
     command
-        .current_dir(root)
-        .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
-        .env("OMNIGRAPH_CONTROL_API", origin)
-        .args([
-            "organization",
-            "--managed",
-            "--api",
-            origin,
-            "--organization",
-            "account-one",
-        ]);
-    command
-}
-
-fn team_scopes() -> Value {
-    serde_json::json!({"admin":false,"clusters":[],"verbs":[],"control_grants":[],"data_grants":[],"cluster_admissions":[]})
 }
 
 fn organization_members() -> Value {
-    serde_json::json!({"data":{"organization_id":"account-one","members":[
-        {"user_id":"user_one","membership_id":"om_one","membership_status":"active","principal_id":"principal-one","grant_version":3,"scopes":team_scopes(),"name":"Avery Chen","email":"avery@example.com"},
-        {"user_id":"user_two","membership_id":"om_two","membership_status":"pending","principal_id":null,"grant_version":0,"scopes":team_scopes(),"name":null,"email":null}
+    serde_json::json!({"data":{"organization_id":"account-one","provider_observed_at":"2026-10-26T10:00:00Z","provider_expires_at":"2026-10-26T10:00:30Z","members":[
+        {"user_id":"user_one","membership_id":"om_one","membership_status":"active","principal_id":"principal-one","roles":["member"],"service_permissions":["source_read","status"],"name":"Avery Chen","email":"avery@example.com"},
+        {"user_id":"user_two","membership_id":"om_two","membership_status":"pending","principal_id":null,"roles":["member"],"service_permissions":[],"name":null,"email":null}
     ]},"meta":{"provenance":"service_db"}})
 }
 
 fn team_invitation(state: &str) -> Value {
-    serde_json::json!({"id":"inv_one","email":"avery@example.com","state":state,"organization_id":"account-one","accepted_user_id":null,"created_at":"2026-10-15T00:00:00Z","expires_at":"2026-10-22T00:00:00Z"})
+    serde_json::json!({"id":"inv_one","email":"avery@example.com","state":state,"role":"member","organization_id":"account-one","accepted_user_id":null,"created_at":"2026-10-15T00:00:00Z","expires_at":"2026-10-22T00:00:00Z"})
 }
 
-fn team_patch(action: &str, version: i64) -> Value {
-    let mut patch = serde_json::json!({"version":1,"organization_id":"account-one","user_id":"user_one","action":action,"expected_grant_version":version,"add":{"control_grants":[],"cluster_admissions":[]},"remove":{"control_grants":[],"cluster_admissions":[]}});
-    if action != "remove" {
-        patch["add"] = serde_json::json!({"control_grants":[{"cluster":"managed-test","verb":"status"},{"cluster":null,"verb":"members_manage"}],"cluster_admissions":["managed-test"]});
-    }
-    patch
-}
-
-fn team_patch_receipt(action: &str, version: i64) -> Value {
-    let mut scopes = team_scopes();
-    let patch = team_patch(action, version);
-    scopes["control_grants"] = patch["add"]["control_grants"].clone();
-    scopes["cluster_admissions"] = patch["add"]["cluster_admissions"].clone();
-    serde_json::json!({"data":{"organization_id":"account-one","action":action,"previous_grant_version":version,"member":{"user_id":"user_one","principal_id":"principal-one","grant_version":version+1,"scopes":scopes},"provider_membership_verified":action!="remove","provider_changed":false,"graph_policy_changed":false,"maximum_existing_native_credential_lifetime_seconds":86400},"meta":{"provenance":"service_db"}})
+fn team_offboard(
+    membership: Option<&str>,
+    provider: &str,
+    session_state: &str,
+    revoked: u64,
+) -> Value {
+    serde_json::json!({"data":{"organization_id":"account-one","user_id":"user_one","principal_id":"principal-one","membership_id":membership,"provider_observed_at":"2026-10-26T10:00:00Z","provider_membership":provider,"sessions":{"revoked":revoked,"total":2,"state":session_state},"graph_policy_changed":false,"maximum_existing_native_credential_lifetime_seconds":86400},"meta":{}})
 }
 
 #[test]
@@ -4369,8 +3884,10 @@ fn managed_organization_lists_directory_and_invitation_pages_without_enrolling()
                 "avery@example.com",
                 "user_two",
                 "pending",
-                "not enrolled",
-                "grant version: 3",
+                "not yet signed in",
+                "Organization service permissions: source_read, status",
+                "service roles: member",
+                "principal:principal-one",
                 "Cedar",
             ] {
                 assert!(text.contains(expected), "{text}");
@@ -4389,9 +3906,9 @@ fn managed_organization_lists_directory_and_invitation_pages_without_enrolling()
     let temp = tempdir().unwrap();
     let response = serde_json::json!({"data":{"organization_id":"account-one","invitations":[team_invitation("pending")],"after":"cursor-next"},"meta":{}});
     let api = lifecycle_fixture(vec![IntentReply::json(200, response.clone())]);
-    write_managed_context(temp.path(), &api.origin);
+    write_managed_target(temp.path(), &api.origin);
     let output = output_success(
-        cli()
+        managed_fixture_command(temp.path(), &api.origin, "managed-account")
             .current_dir(temp.path())
             .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
             .env("OMNIGRAPH_CONTROL_API", &api.origin)
@@ -4399,7 +3916,6 @@ fn managed_organization_lists_directory_and_invitation_pages_without_enrolling()
                 "org",
                 "invitations",
                 "list",
-                "--managed",
                 "--after",
                 "cursor/a+b",
                 "--json",
@@ -4422,7 +3938,8 @@ fn managed_organization_writes_send_exact_identity_and_required_key_once() {
         let temp = tempdir().unwrap();
         let response = serde_json::json!({"data":{"organization_id":"account-one","action":action,"invitation":team_invitation(if action=="revoke" {"revoked"} else {"pending"})},"meta":{}});
         let api = lifecycle_fixture(vec![IntentReply::json(200, response.clone())]);
-        let output = output_success(organization_cli(temp.path(), &api.origin).args([
+        let mut command = organization_cli(temp.path(), &api.origin);
+        command.args([
             "invitations",
             action,
             if action == "send" {
@@ -4433,12 +3950,16 @@ fn managed_organization_writes_send_exact_identity_and_required_key_once() {
             "--idempotency-key",
             "invite-key",
             "--json",
-        ]));
+        ]);
+        if action == "send" {
+            command.args(["--role", "member"]);
+        }
+        let output = output_success(&mut command);
         assert_eq!(parse_stdout_json(&output), response);
         let (path, input) = if action == "send" {
             (
                 "/v1/organization/invitations".to_owned(),
-                serde_json::json!({"organization_id":"account-one","email":"avery@example.com"}),
+                serde_json::json!({"organization_id":"account-one","email":"avery@example.com","role":"member"}),
             )
         } else {
             (
@@ -4455,85 +3976,98 @@ fn managed_organization_writes_send_exact_identity_and_required_key_once() {
         );
         api.assert_complete();
     }
-    for (action, version, unchanged) in [
-        ("add", 0, false),
-        ("update", 3, false),
-        ("remove", 3, false),
-        ("update", 3, true),
-        ("remove", 3, true),
-    ] {
-        let temp = tempdir().unwrap();
-        let input = team_patch(action, version);
-        fs::write(
-            temp.path().join("member.yaml"),
-            yaml_serde::to_string(&input).unwrap(),
-        )
-        .unwrap();
-        let mut response = team_patch_receipt(action, version);
-        if unchanged {
-            response["data"]["member"]["grant_version"] = serde_json::json!(version);
-        }
-        let api = lifecycle_fixture(vec![IntentReply::json(200, response.clone())]);
-        let output = output_success(organization_cli(temp.path(), &api.origin).args([
-            "members",
-            "apply",
-            "member.yaml",
-            "--idempotency-key",
-            "member-key",
-            "--json",
-        ]));
-        assert_eq!(parse_stdout_json(&output), response);
-        assert_control_request(
-            &api.workflow_requests()[0],
-            "POST",
-            "/v1/organization/members",
-            input,
-            Some("member-key"),
-        );
-        api.assert_complete();
-    }
 }
 
 #[test]
 fn managed_organization_offboard_preserves_partial_outcome_and_graph_boundary() {
-    for (provider, session_state, revoked, exit) in [
-        ("removed", "complete", 2, 0),
-        ("uncertain", "partial", 1, 3),
+    for (membership, provider, session_state, revoked, exit) in [
+        (Some("om_one"), "removed", "complete", 2, 0),
+        (Some("om_one"), "removed", "partial", 1, 3),
+        (Some("om_one"), "uncertain", "not_attempted", 0, 3),
+        (None, "already_absent", "complete", 2, 0),
     ] {
-        let temp = tempdir().unwrap();
-        let response = serde_json::json!({"data":{"organization_id":"account-one","user_id":"user_one","principal_id":"principal-one","grant_version":4,"local_access_removed":true,"provider_membership":provider,"sessions":{"revoked":revoked,"total":2,"state":session_state},"graph_policy_changed":false,"maximum_existing_native_credential_lifetime_seconds":86400},"meta":{}});
-        let api = lifecycle_fixture(vec![IntentReply::json(200, response.clone())]);
-        let output = organization_cli(temp.path(), &api.origin)
-            .args([
+        for json in [true, false] {
+            let temp = tempdir().unwrap();
+            let response = team_offboard(membership, provider, session_state, revoked);
+            let api = lifecycle_fixture(vec![IntentReply::json(200, response.clone())]);
+            let mut command = organization_cli(temp.path(), &api.origin);
+            command.args([
                 "members",
                 "offboard",
                 "user_one",
-                "--expected-version",
-                "3",
+                "--expected-membership",
+                membership.unwrap_or("absent"),
                 "--idempotency-key",
                 "offboard-key",
-                "--json",
-            ])
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(exit));
-        assert_eq!(parse_stdout_json(&output), response);
-        assert_control_request(
-            &api.workflow_requests()[0],
-            "POST",
-            "/v1/organization/members/user_one:offboard",
-            serde_json::json!({"version":1,"organization_id":"account-one","user_id":"user_one","expected_grant_version":3}),
-            Some("offboard-key"),
-        );
-        api.assert_complete();
+            ]);
+            if json {
+                command.arg("--json");
+            }
+            let output = command.output().unwrap();
+            assert_eq!(output.status.code(), Some(exit), "{output:?}");
+            if json {
+                assert_eq!(parse_stdout_json(&output), response);
+            } else {
+                let text = String::from_utf8_lossy(&output.stdout);
+                assert!(text.contains("Graph policy is unchanged"), "{text}");
+                assert!(text.contains(provider), "{text}");
+                assert!(!text.contains("grant version"), "{text}");
+            }
+            assert_control_request(
+                &api.workflow_requests()[0],
+                "POST",
+                "/v1/organization/members/user_one:offboard",
+                serde_json::json!({"version":2,"organization_id":"account-one","user_id":"user_one","expected_membership_id":membership}),
+                Some("offboard-key"),
+            );
+            api.assert_complete();
+        }
     }
 }
 
 #[test]
-fn managed_organization_refuses_invalid_targets_and_yaml_before_external_access() {
+fn managed_organization_refuses_invalid_targets_and_retired_grants_before_external_access() {
     let temp = tempdir().unwrap();
     let api = lifecycle_fixture(vec![]);
     for arguments in [
+        vec![
+            "members",
+            "set",
+            "avery@example.com",
+            "--role",
+            "INVALID ROLE",
+            "--idempotency-key",
+            "key",
+        ],
+        vec![
+            "members",
+            "set",
+            "avery@example.com",
+            "--role",
+            "writer",
+            "--role",
+            "writer",
+            "--idempotency-key",
+            "duplicate-key",
+        ],
+        vec![
+            "invitations",
+            "send",
+            "avery@example.com",
+            "--role",
+            "INVALID ROLE",
+            "--idempotency-key",
+            "invalid-role-key",
+        ],
+        vec![
+            "members",
+            "offboard",
+            "avery@example.com",
+            "--expected-membership",
+            "absent",
+            "--idempotency-key",
+            "key",
+        ],
         vec![
             "invitations",
             "send",
@@ -4553,8 +4087,8 @@ fn managed_organization_refuses_invalid_targets_and_yaml_before_external_access(
             "members",
             "offboard",
             "../user",
-            "--expected-version",
-            "0",
+            "--expected-membership",
+            "absent",
             "--idempotency-key",
             "key",
         ],
@@ -4564,6 +4098,8 @@ fn managed_organization_refuses_invalid_targets_and_yaml_before_external_access(
             "avery@example.com",
             "--idempotency-key",
             "space key",
+            "--role",
+            "member",
         ],
     ] {
         let output = organization_cli(temp.path(), &api.origin)
@@ -4573,35 +4109,14 @@ fn managed_organization_refuses_invalid_targets_and_yaml_before_external_access(
             .unwrap();
         assert_eq!(output.status.code(), Some(2), "{output:?}");
     }
-    for (pointer, value) in [
-        ("/organization_id", serde_json::json!("foreign")),
-        ("/version", serde_json::json!(2)),
-        ("/expected_grant_version", serde_json::json!(1)),
-        (
-            "/add/control_grants",
-            serde_json::json!([{"cluster":"*","verb":"status"}]),
-        ),
-        (
-            "/add/control_grants",
-            serde_json::json!([{"cluster":null,"verb":"plan"}]),
-        ),
-        (
-            "/add/cluster_admissions",
-            serde_json::json!(["cluster", "cluster"]),
-        ),
-    ] {
-        let mut patch = team_patch("add", 0);
-        *patch.pointer_mut(pointer).unwrap() = value;
-        fs::write(
-            temp.path().join("member.yaml"),
-            yaml_serde::to_string(&patch).unwrap(),
-        )
-        .unwrap();
+    for membership in ["bad/id", "org_wrong", "", "om_bad\n"] {
         let output = organization_cli(temp.path(), &api.origin)
             .args([
                 "members",
-                "apply",
-                "member.yaml",
+                "offboard",
+                "user_one",
+                "--expected-membership",
+                membership,
                 "--idempotency-key",
                 "key",
                 "--json",
@@ -4610,68 +4125,46 @@ fn managed_organization_refuses_invalid_targets_and_yaml_before_external_access(
             .unwrap();
         assert_eq!(output.status.code(), Some(2), "{output:?}");
     }
-    fs::write(
-        temp.path().join("member.yaml"),
-        format!(
-            "{}\nadmin: true\n",
-            yaml_serde::to_string(&team_patch("add", 0)).unwrap()
-        ),
-    )
-    .unwrap();
-    let output = organization_cli(temp.path(), &api.origin)
-        .args([
+    for arguments in [
+        vec![
             "members",
             "apply",
             "member.yaml",
             "--idempotency-key",
             "key",
-            "--json",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(parse_stdout_json(&output)["type"], "member_patch_invalid");
-    fs::write(
-        temp.path().join("oversized.yaml"),
-        vec![b'a'; 256 * 1024 + 1],
-    )
-    .unwrap();
-    let output = organization_cli(temp.path(), &api.origin)
-        .args([
+        ],
+        vec![
             "members",
-            "apply",
-            "oversized.yaml",
+            "offboard",
+            "user_one",
+            "--expected-version",
+            "3",
             "--idempotency-key",
             "key",
-            "--json",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(parse_stdout_json(&output)["type"], "member_patch_invalid");
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink("member.yaml", temp.path().join("linked.yaml")).unwrap();
-        let output = organization_cli(temp.path(), &api.origin)
-            .args([
-                "members",
-                "apply",
-                "linked.yaml",
-                "--idempotency-key",
-                "key",
-                "--json",
-            ])
-            .output()
-            .unwrap();
-        assert_eq!(parse_stdout_json(&output)["type"], "member_patch_invalid");
+        ],
+    ] {
+        let output = output_failure(organization_cli(temp.path(), &api.origin).args(arguments));
+        assert!(output.stdout.is_empty(), "{output:?}");
     }
-    write_managed_context(temp.path(), &api.origin);
-    for argument in ["--direct", "--server"] {
+    write_managed_target(temp.path(), &api.origin);
+    for argument in ["--direct", "--target"] {
         let mut command = organization_cli(temp.path(), &api.origin);
         command.args(["members", "list", "--json", argument]);
-        if argument == "--server" {
+        if argument == "--target" {
             command.arg("https://other.example");
         }
         let output = command.output().unwrap();
-        assert_eq!(parse_stdout_json(&output)["type"], "managed_scope_conflict");
+        let (exit, diagnostic) = if argument == "--direct" {
+            (64, "unexpected argument '--direct'")
+        } else {
+            (1, "this operation selects --profile, not --target")
+        };
+        assert_eq!(output.status.code(), Some(exit), "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(diagnostic),
+            "{output:?}"
+        );
     }
     let output = organization_cli(temp.path(), &api.origin)
         .args(["members", "list", "--organization", "foreign", "--json"])
@@ -4686,25 +4179,29 @@ fn managed_organization_refuses_invalid_targets_and_yaml_before_external_access(
 #[test]
 fn managed_organization_refuses_foreign_malformed_and_uncertain_results_without_replay() {
     for (pointer, value) in [
-        ("/data/member/user_id", serde_json::json!("user_foreign")),
-        ("/data/previous_grant_version", serde_json::json!(10)),
-        ("/data/member/scopes/control_grants", serde_json::json!([])),
+        ("/data/user_id", serde_json::json!("user_foreign")),
+        ("/data/membership_id", serde_json::json!("om_replaced")),
+        ("/data/membership_id", Value::Null),
+        ("/data/provider_observed_at", serde_json::json!("invalid")),
+        (
+            "/data/provider_membership",
+            serde_json::json!("already_absent"),
+        ),
+        ("/data/provider_membership", serde_json::json!("uncertain")),
+        ("/data/sessions/revoked", serde_json::json!(3)),
         ("/data/graph_policy_changed", serde_json::json!(true)),
     ] {
         let temp = tempdir().unwrap();
-        fs::write(
-            temp.path().join("member.yaml"),
-            yaml_serde::to_string(&team_patch("add", 0)).unwrap(),
-        )
-        .unwrap();
-        let mut response = team_patch_receipt("add", 0);
+        let mut response = team_offboard(Some("om_one"), "removed", "complete", 2);
         *response.pointer_mut(pointer).unwrap() = value;
         let api = lifecycle_fixture(vec![IntentReply::json(200, response)]);
         let output = organization_cli(temp.path(), &api.origin)
             .args([
                 "members",
-                "apply",
-                "member.yaml",
+                "offboard",
+                "user_one",
+                "--expected-membership",
+                "om_one",
                 "--idempotency-key",
                 "member-key",
                 "--json",
@@ -4721,13 +4218,26 @@ fn managed_organization_refuses_foreign_malformed_and_uncertain_results_without_
         ("/data/members/0/name", serde_json::json!("bad\u{1b}[2J")),
         (
             "/data/members/1/principal_id",
-            serde_json::json!("principal-two"),
+            serde_json::json!("principal-one"),
         ),
         (
             "/data/members/0/membership_status",
             serde_json::json!("unknown"),
         ),
         ("/data/members/1/user_id", serde_json::json!("user_one")),
+        ("/data/members/1/membership_id", serde_json::json!("om_one")),
+        (
+            "/data/members/1/service_permissions",
+            serde_json::json!(["status"]),
+        ),
+        (
+            "/data/members/0/service_permissions",
+            serde_json::json!(["status", "status"]),
+        ),
+        (
+            "/data/provider_expires_at",
+            serde_json::json!("2026-10-26T10:01:00Z"),
+        ),
     ] {
         let temp = tempdir().unwrap();
         let mut response = organization_members();
@@ -4742,7 +4252,21 @@ fn managed_organization_refuses_foreign_malformed_and_uncertain_results_without_
         assert_eq!(api.workflow_requests().len(), 1);
         api.assert_complete();
     }
+    let role_receipt = |role: Option<&str>| {
+        let mut invitation = team_invitation("pending");
+        if let Some(role) = role {
+            invitation["role"] = serde_json::json!(role);
+        } else {
+            invitation.as_object_mut().unwrap().remove("role");
+        }
+        IntentReply::json(
+            200,
+            serde_json::json!({"data":{"organization_id":"account-one","action":"send","invitation":invitation},"meta":{}}),
+        )
+    };
     for reply in [
+        role_receipt(None),
+        role_receipt(Some("writer")),
         IntentReply::json(
             403,
             serde_json::json!({"type":"scope_missing","detail":"not permitted"}),
@@ -4770,6 +4294,8 @@ fn managed_organization_refuses_foreign_malformed_and_uncertain_results_without_
                 "avery@example.com",
                 "--idempotency-key",
                 "same-key",
+                "--role",
+                "member",
                 "--json",
             ])
             .output()
@@ -4778,49 +4304,832 @@ fn managed_organization_refuses_foreign_malformed_and_uncertain_results_without_
         assert_eq!(parse_stdout_json(&output)["idempotency_key"], "same-key");
         assert!(!String::from_utf8_lossy(&output.stdout).contains("must-never-print"));
         assert_eq!(api.workflow_requests().len(), 1);
+        assert!(organization_record(temp.path()).exists());
         api.assert_complete();
     }
 }
 
 #[test]
-fn managed_organization_requires_explicit_mode_and_write_keys() {
+fn managed_organization_requires_an_account_target_and_write_keys() {
     let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![]);
+    write_managed_target(temp.path(), &api.origin);
+    let missing = output_failure(cli().args(["organization", "members", "list"]));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("profile_required"));
     for arguments in [
-        vec!["organization", "members", "list"],
+        vec!["members", "set", "member@example.com", "--role", "writer"],
+        vec!["invitations", "send", "member@example.com"],
+        vec!["invitations", "resend", "inv_one"],
+        vec!["invitations", "revoke", "inv_one"],
         vec![
-            "organization",
-            "--managed",
-            "invitations",
-            "send",
-            "avery@example.com",
-        ],
-        vec![
-            "organization",
-            "--managed",
-            "members",
-            "apply",
-            "member.yaml",
-        ],
-        vec![
-            "organization",
-            "--managed",
             "members",
             "offboard",
             "user_one",
-            "--expected-version",
-            "0",
+            "--expected-membership",
+            "om_one",
         ],
     ] {
-        let output = cli()
-            .current_dir(temp.path())
+        let output = output_failure(organization_cli(temp.path(), &api.origin).args(arguments));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--idempotency-key"));
+    }
+    assert!(api.requests().is_empty());
+}
+
+fn team_role_result(outcome: &str) -> Value {
+    serde_json::json!({"data":{"organization_id":"account-one","user_id":"user_one","membership_id":"om_one","previous_roles":["member"],"requested_roles":["writer"],"role_update":outcome,"roles":[if outcome == "updated" {"writer"} else {"member"}],"service_permissions":["source_read","status"],"provider_observed_at":"2026-10-27T10:00:00Z","graph_policy_changed":false},"meta":{}})
+}
+
+fn organization_record(root: &std::path::Path) -> std::path::PathBuf {
+    let entries = fs::read_dir(managed_home(root).join("organization"))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    entries[0].path().join("requests.json")
+}
+
+#[test]
+fn managed_organization_resolves_members_once_and_retains_exact_role_and_offboard_requests() {
+    for (action, roles) in [
+        ("set", &["writer"][..]),
+        ("set", &["writer", "source-reader"][..]),
+        ("offboard", &[][..]),
+    ] {
+        for selector in ["AVERY@example.com", "user_one"] {
+            let temp = tempdir().unwrap();
+            let receipt = if action == "set" {
+                let mut roles = roles.to_vec();
+                roles.sort();
+                let mut receipt = team_role_result("updated");
+                receipt["data"]["requested_roles"] = serde_json::json!(roles);
+                receipt["data"]["roles"] = serde_json::json!(roles);
+                receipt
+            } else {
+                team_offboard(Some("om_one"), "removed", "complete", 2)
+            };
+            let api = lifecycle_fixture(vec![
+                IntentReply::json(200, organization_members()),
+                IntentReply::json(200, receipt.clone()),
+                IntentReply::json(200, receipt.clone()),
+            ]);
+            let arguments = vec![
+                "members",
+                action,
+                selector,
+                "--idempotency-key",
+                "member-key",
+                "--json",
+            ];
+            for retry in 0..2 {
+                let mut arguments = arguments.clone();
+                let mut selected = roles.to_vec();
+                if retry == 1 {
+                    selected.reverse();
+                }
+                for role in selected {
+                    arguments.extend(["--role", role]);
+                }
+                let output =
+                    output_success(organization_cli(temp.path(), &api.origin).args(&arguments));
+                assert_eq!(parse_stdout_json(&output), receipt);
+            }
+            let requests = api.workflow_requests();
+            assert_eq!(requests.len(), 3);
+            assert_eq!(requests[0].method, "GET");
+            assert_eq!(requests[1].method, "POST");
+            assert_eq!(requests[1].path, requests[2].path);
+            assert_eq!(requests[1].body, requests[2].body);
+            assert_eq!(requests[1].body["user_id"], "user_one");
+            assert_eq!(requests[1].body["expected_membership_id"], "om_one");
+            if action == "set" {
+                assert_eq!(
+                    requests[1].body["roles"],
+                    receipt["data"]["requested_roles"]
+                );
+                assert!(requests[1].body.get("role").is_none());
+            }
+            let records: Value =
+                serde_json::from_slice(&fs::read(organization_record(temp.path())).unwrap())
+                    .unwrap();
+            assert_eq!(records.as_array().unwrap().len(), 1);
+            assert_eq!(records[0]["request"]["body"], requests[1].body);
+            assert_eq!(records[0]["operation"]["selector"], selector);
+            let changed = output_failure(organization_cli(temp.path(), &api.origin).args([
+                "members",
+                "set",
+                selector,
+                "--role",
+                "admin",
+                "--idempotency-key",
+                "member-key",
+                "--json",
+            ]));
+            assert_eq!(
+                parse_stdout_json(&changed)["type"],
+                "organization_request_conflict"
+            );
+            assert_eq!(api.workflow_requests().len(), 3);
+            assert_no_core_effects(temp.path());
+            api.assert_complete();
+        }
+    }
+}
+
+#[test]
+fn managed_organization_preserves_archived_roleless_invitations_without_new_sends() {
+    for uncertain in [false, true] {
+        let temp = tempdir().unwrap();
+        let receipt = serde_json::json!({"data":{"organization_id":"account-one","action":"send","invitation":team_invitation("pending")},"meta":{}});
+        let mut archived = receipt.clone();
+        archived["data"]["invitation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("role");
+        let replay = if uncertain {
+            IntentReply::json(
+                409,
+                serde_json::json!({"type":"team_operation_uncertain","detail":"retain original request"}),
+            )
+        } else {
+            IntentReply::json(200, archived.clone())
+        };
+        let api = lifecycle_fixture(vec![IntentReply::json(200, receipt), replay]);
+        let arguments = [
+            "invitations",
+            "send",
+            "avery@example.com",
+            "--idempotency-key",
+            "saved-key",
+            "--json",
+        ];
+        output_success(
+            organization_cli(temp.path(), &api.origin)
+                .args(arguments)
+                .args(["--role", "member"]),
+        );
+        // Reproduce the exact pre-role custody format, without inventing a role
+        // for an invitation that may already have been sent by an older CLI.
+        let path = organization_record(temp.path());
+        let mut records: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        records[0]["operation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("role");
+        records[0]["request"]["body"]
+            .as_object_mut()
+            .unwrap()
+            .remove("role");
+        let original = serde_json::to_vec(&records).unwrap();
+        fs::write(&path, &original).unwrap();
+        let output = organization_cli(temp.path(), &api.origin)
             .args(arguments)
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(2));
-        let text = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            text.contains("--managed") || text.contains("--idempotency-key"),
-            "{text}"
+        if uncertain {
+            assert!(!output.status.success());
+            assert_eq!(
+                parse_stdout_json(&output)["type"],
+                "team_operation_uncertain"
+            );
+        } else {
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(parse_stdout_json(&output), archived);
+        }
+        assert_eq!(
+            api.workflow_requests()[1].body,
+            records[0]["request"]["body"]
         );
+        assert!(api.workflow_requests()[1].body.get("role").is_none());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let changed = output_failure(
+            organization_cli(temp.path(), &api.origin)
+                .args(arguments)
+                .args(["--role", "member"]),
+        );
+        assert_eq!(
+            parse_stdout_json(&changed)["type"],
+            "organization_request_conflict"
+        );
+        let mut fresh = arguments;
+        fresh[4] = "fresh-key";
+        let missing = output_failure(organization_cli(temp.path(), &api.origin).args(fresh));
+        assert_eq!(parse_stdout_json(&missing)["type"], "role_required");
+        assert_eq!(api.workflow_requests().len(), 2);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        api.assert_complete();
+    }
+}
+
+#[test]
+fn managed_organization_resolves_invitation_email_across_pages_once() {
+    for action in ["resend", "revoke"] {
+        let temp = tempdir().unwrap();
+        let receipt = serde_json::json!({"data":{"organization_id":"account-one","action":action,"invitation":team_invitation(if action == "revoke" { "revoked" } else { "pending" })},"meta":{}});
+        let api = lifecycle_fixture(vec![
+            IntentReply::json(
+                200,
+                serde_json::json!({"data":{"organization_id":"account-one","invitations":[],"after":"next"},"meta":{}}),
+            ),
+            IntentReply::json(
+                200,
+                serde_json::json!({"data":{"organization_id":"account-one","invitations":[team_invitation("pending")],"after":null},"meta":{}}),
+            ),
+            IntentReply::json(200, receipt.clone()),
+            IntentReply::json(200, receipt.clone()),
+        ]);
+        for _ in 0..2 {
+            let output = output_success(organization_cli(temp.path(), &api.origin).args([
+                "invitations",
+                action,
+                "AVERY@example.com",
+                "--idempotency-key",
+                "invite-key",
+                "--json",
+            ]));
+            assert_eq!(parse_stdout_json(&output), receipt);
+        }
+        let requests = api.workflow_requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[1].path, "/v1/organization/invitations?after=next");
+        assert_eq!(
+            requests[2].path,
+            format!("/v1/organization/invitations/inv_one:{action}")
+        );
+        assert_eq!(requests[2].path, requests[3].path);
+        api.assert_complete();
+    }
+}
+
+#[test]
+fn managed_organization_refuses_missing_ambiguous_inactive_and_mismatched_members() {
+    for case in ["missing", "ambiguous", "inactive", "assertion"] {
+        let temp = tempdir().unwrap();
+        let mut directory = organization_members();
+        match case {
+            "missing" => directory["data"]["members"] = serde_json::json!([]),
+            "ambiguous" => {
+                directory["data"]["members"][1]["email"] = serde_json::json!("AVERY@example.com")
+            }
+            "inactive" => {
+                directory["data"]["members"][0]["membership_status"] =
+                    serde_json::json!("inactive");
+                directory["data"]["members"][0]["service_permissions"] = serde_json::json!([]);
+            }
+            _ => (),
+        }
+        let api = lifecycle_fixture(vec![IntentReply::json(200, directory)]);
+        let mut command = organization_cli(temp.path(), &api.origin);
+        if case == "assertion" {
+            command.args([
+                "members",
+                "offboard",
+                "avery@example.com",
+                "--expected-membership",
+                "om_replaced",
+            ]);
+        } else {
+            command.args(["members", "set", "avery@example.com", "--role", "writer"]);
+        }
+        let output = output_failure(command.args(["--idempotency-key", "member-key", "--json"]));
+        assert_eq!(output.status.code(), Some(2), "{case}: {output:?}");
+        assert_eq!(api.workflow_requests().len(), 1);
+        assert!(!organization_record(temp.path()).exists());
+        api.assert_complete();
+    }
+}
+
+#[test]
+fn managed_organization_refuses_incomplete_or_ambiguous_invitation_scans() {
+    for case in [
+        "missing",
+        "ambiguous",
+        "cursor-loop",
+        "too-many-pages",
+        "oversized-page",
+        "duplicate-id",
+    ] {
+        let temp = tempdir().unwrap();
+        let page = |invitations: Vec<Value>, after: Option<&str>| {
+            IntentReply::json(
+                200,
+                serde_json::json!({"data":{"organization_id":"account-one","invitations":invitations,"after":after},"meta":{}}),
+            )
+        };
+        let pending = team_invitation("pending");
+        let mut other = pending.clone();
+        other["id"] = serde_json::json!("inv_other");
+        let replies = match case {
+            "missing" => vec![page(vec![team_invitation("accepted")], None)],
+            "ambiguous" => vec![
+                page(vec![pending.clone()], Some("next")),
+                page(vec![other], None),
+            ],
+            "cursor-loop" => vec![page(vec![], Some("next")), page(vec![], Some("next"))],
+            "too-many-pages" => (0..10)
+                .map(|n| page(vec![], Some(&format!("cursor{n}"))))
+                .collect(),
+            "oversized-page" => vec![page(vec![pending.clone(); 101], None)],
+            "duplicate-id" => vec![
+                page(vec![pending.clone()], Some("next")),
+                page(vec![pending], None),
+            ],
+            _ => unreachable!(),
+        };
+        let count = replies.len();
+        let api = lifecycle_fixture(replies);
+        let output = output_failure(organization_cli(temp.path(), &api.origin).args([
+            "invitations",
+            "revoke",
+            "avery@example.com",
+            "--idempotency-key",
+            "invite-key",
+            "--json",
+        ]));
+        assert!(
+            !parse_stdout_json(&output)["type"].is_null(),
+            "{case}: {output:?}"
+        );
+        assert_eq!(api.workflow_requests().len(), count);
+        assert!(
+            api.workflow_requests()
+                .iter()
+                .all(|request| request.method == "GET")
+        );
+        assert!(!organization_record(temp.path()).exists());
+        api.assert_complete();
+    }
+}
+
+#[test]
+fn managed_organization_preserves_uncertain_requests_and_validates_role_receipts() {
+    for outcome in ["updated", "uncertain"] {
+        let temp = tempdir().unwrap();
+        let receipt = team_role_result(outcome);
+        let api = lifecycle_fixture(vec![
+            IntentReply::json(200, organization_members()),
+            IntentReply::json(200, receipt.clone()),
+        ]);
+        let output = organization_cli(temp.path(), &api.origin)
+            .args([
+                "members",
+                "set",
+                "avery@example.com",
+                "--role",
+                "writer",
+                "--idempotency-key",
+                "role-key",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if outcome == "updated" { 0 } else { 3 })
+        );
+        assert_eq!(parse_stdout_json(&output), receipt);
+        assert!(organization_record(temp.path()).exists());
+        api.assert_complete();
+    }
+    for (pointer, value) in [
+        ("/data/user_id", serde_json::json!("user_other")),
+        ("/data/membership_id", serde_json::json!("om_other")),
+        ("/data/requested_roles", serde_json::json!(["admin"])),
+        ("/data/role_update", serde_json::json!("unsupported")),
+        ("/data/roles", serde_json::json!(["admin"])),
+        ("/data/previous_roles", serde_json::json!([])),
+        ("/data/graph_policy_changed", serde_json::json!(true)),
+        ("/data/provider_observed_at", serde_json::json!("invalid")),
+    ] {
+        let temp = tempdir().unwrap();
+        let mut receipt = team_role_result("updated");
+        *receipt.pointer_mut(pointer).unwrap() = value;
+        let api = lifecycle_fixture(vec![
+            IntentReply::json(200, organization_members()),
+            IntentReply::json(200, receipt),
+        ]);
+        let output = output_failure(organization_cli(temp.path(), &api.origin).args([
+            "members",
+            "set",
+            "avery@example.com",
+            "--role",
+            "writer",
+            "--idempotency-key",
+            "role-key",
+            "--json",
+        ]));
+        assert_eq!(parse_stdout_json(&output)["type"], "api_response_invalid");
+        assert_eq!(api.workflow_requests().len(), 2);
+        assert!(organization_record(temp.path()).exists());
+        api.assert_complete();
+    }
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(200, organization_members()),
+        IntentReply {
+            status: 200,
+            headers: vec![],
+            body: b"{\"data\":".to_vec(),
+        },
+        IntentReply::json(200, team_role_result("updated")),
+    ]);
+    let arguments = [
+        "members",
+        "set",
+        "avery@example.com",
+        "--role",
+        "writer",
+        "--idempotency-key",
+        "role-key",
+        "--json",
+    ];
+    output_failure(organization_cli(temp.path(), &api.origin).args(arguments));
+    output_success(organization_cli(temp.path(), &api.origin).args(arguments));
+    assert_eq!(api.workflow_requests().len(), 3);
+    assert_eq!(
+        api.workflow_requests()[1].body,
+        api.workflow_requests()[2].body
+    );
+    api.assert_complete();
+}
+
+#[test]
+fn managed_organization_custody_refuses_capacity_corruption_and_rebinding_without_effects() {
+    for case in [
+        "full",
+        "corrupt",
+        "oversized",
+        "principal",
+        "organization",
+        "api",
+        "request-path",
+    ] {
+        let temp = tempdir().unwrap();
+        let receipt = serde_json::json!({"data":{"organization_id":"account-one","action":"send","invitation":team_invitation("pending")},"meta":{}});
+        let mut replies = vec![IntentReply::json(200, receipt.clone())];
+        if case == "full" {
+            replies.push(IntentReply::json(200, receipt));
+        }
+        let api = lifecycle_fixture(replies);
+        let arguments = [
+            "invitations",
+            "send",
+            "avery@example.com",
+            "--idempotency-key",
+            "invite-key",
+            "--role",
+            "member",
+            "--json",
+        ];
+        output_success(organization_cli(temp.path(), &api.origin).args(arguments));
+        let path = organization_record(temp.path());
+        let original = fs::read(&path).unwrap();
+        let mut records: Value = serde_json::from_slice(&original).unwrap();
+        let config_path = managed_home(temp.path()).join("config.yaml");
+        let original_config = fs::read_to_string(&config_path).unwrap();
+        let alternate = lifecycle_fixture(vec![]);
+        let mut selected_origin = api.origin.as_str();
+        match case {
+            "full" => {
+                let first = records[0].clone();
+                for index in 1..128 {
+                    let mut record = first.clone();
+                    record["idempotency_key"] = serde_json::json!(format!("saved-key-{index}"));
+                    records.as_array_mut().unwrap().push(record);
+                }
+                fs::write(&path, serde_json::to_vec(&records).unwrap()).unwrap();
+                output_success(organization_cli(temp.path(), &api.origin).args(arguments));
+            }
+            "corrupt" => fs::write(&path, b"{").unwrap(),
+            "oversized" => fs::write(&path, vec![b' '; 1024 * 1024 + 1]).unwrap(),
+            "principal" => api.set_session(lifecycle_session("principal-other", "account-one")),
+            "organization" => {
+                fs::write(
+                    &config_path,
+                    original_config.replace("account-one", "account-two"),
+                )
+                .unwrap();
+                api.set_session(lifecycle_session("principal-one", "account-two"));
+            }
+            "api" => {
+                fs::write(
+                    &config_path,
+                    original_config.replace(&api.origin, &alternate.origin),
+                )
+                .unwrap();
+                selected_origin = &alternate.origin;
+            }
+            "request-path" => {
+                records[0]["request"]["path"] = serde_json::json!("/v1/clusters");
+                fs::write(&path, serde_json::to_vec(&records).unwrap()).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = fs::read(&path).unwrap();
+        let mut retry = arguments;
+        if case == "full" {
+            retry[4] = "new-key";
+        }
+        let output = output_failure(organization_cli(temp.path(), selected_origin).args(retry));
+        let kind = parse_stdout_json(&output)["type"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let expected = match case {
+            "full" => "organization_custody_full",
+            "principal" | "organization" | "api" => "organization_request_conflict",
+            _ => "organization_record_failed",
+        };
+        assert_eq!(kind, expected, "{case}: {output:?}");
+        assert_eq!(
+            api.workflow_requests().len(),
+            if case == "full" { 2 } else { 1 }
+        );
+        assert!(alternate.workflow_requests().is_empty());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        api.assert_complete();
+        alternate.assert_complete();
+    }
+}
+
+#[test]
+fn managed_organization_profile_rename_preserves_retry_and_other_profiles_have_separate_custody() {
+    let temp = tempdir().unwrap();
+    let receipt = serde_json::json!({"data":{"organization_id":"account-one","action":"send","invitation":team_invitation("pending")},"meta":{}});
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(200, receipt.clone()),
+        IntentReply::json(200, receipt.clone()),
+        IntentReply::json(200, receipt),
+    ]);
+    let arguments = [
+        "organization",
+        "invitations",
+        "send",
+        "avery@example.com",
+        "--idempotency-key",
+        "invite-key",
+        "--role",
+        "member",
+        "--json",
+    ];
+    output_success(
+        managed_fixture_command(temp.path(), &api.origin, "managed-account").args(arguments),
+    );
+    let record = organization_record(temp.path());
+    output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", managed_home(temp.path()))
+            .args(["config", "rename-profile", "managed-account", "renamed"]),
+    );
+    let run = |profile: &str| {
+        let mut command = cli();
+        command
+            .env("OMNIGRAPH_HOME", managed_home(temp.path()))
+            .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+            .env("OMNIGRAPH_CONTROL_API", &api.origin)
+            .args(["--profile", profile])
+            .args(arguments);
+        command
+    };
+    output_success(&mut run("renamed"));
+    assert!(record.exists());
+    api.set_session(lifecycle_session("principal-other", "account-one"));
+    let config_path = managed_home(temp.path()).join("config.yaml");
+    let mut config: serde_json::Value =
+        yaml_serde::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["profiles"]["other"] = config["profiles"]["renamed"].clone();
+    fs::write(&config_path, yaml_serde::to_string(&config).unwrap()).unwrap();
+    output_success(&mut run("other"));
+    assert_eq!(
+        fs::read_dir(managed_home(temp.path()).join("organization"))
+            .unwrap()
+            .count(),
+        2
+    );
+    assert_eq!(api.workflow_requests().len(), 3);
+    api.assert_complete();
+}
+
+#[test]
+#[cfg(unix)]
+fn managed_organization_refuses_symlink_custody_before_selector_reads() {
+    use std::os::unix::fs::symlink;
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![]);
+    write_managed_target(temp.path(), &api.origin);
+    let outside = tempdir().unwrap();
+    symlink(
+        outside.path(),
+        managed_home(temp.path()).join("organization"),
+    )
+    .unwrap();
+    let output = output_failure(organization_cli(temp.path(), &api.origin).args([
+        "members",
+        "set",
+        "avery@example.com",
+        "--role",
+        "writer",
+        "--idempotency-key",
+        "role-key",
+        "--json",
+    ]));
+    assert_eq!(
+        parse_stdout_json(&output)["type"],
+        "organization_record_failed"
+    );
+    assert!(api.workflow_requests().is_empty());
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    api.assert_complete();
+}
+
+#[test]
+#[cfg(unix)]
+fn managed_organization_keeps_exact_custody_when_stdout_is_closed_and_lock_is_busy() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+    let temp = tempdir().unwrap();
+    let receipt = serde_json::json!({"data":{"organization_id":"account-one","action":"send","invitation":team_invitation("pending")},"meta":{}});
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(200, receipt.clone()),
+        IntentReply::json(200, receipt),
+    ]);
+    let arguments = [
+        "invitations",
+        "send",
+        "avery@example.com",
+        "--idempotency-key",
+        "invite-key",
+        "--role",
+        "member",
+        "--json",
+    ];
+    let (reader, writer) = UnixStream::pair().unwrap();
+    drop(reader);
+    let writer: OwnedFd = writer.into();
+    write_managed_target(temp.path(), &api.origin);
+    let mut command = cli_process();
+    command
+        .env("OMNIGRAPH_HOME", managed_home(temp.path()))
+        .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+        .env("OMNIGRAPH_CONTROL_API", &api.origin)
+        .args(["--profile", "managed-account", "organization"])
+        .args(arguments)
+        .stdout(Stdio::from(writer));
+    let output = command.output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invite-key"));
+    let path = organization_record(temp.path());
+    let original = fs::read(&path).unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path.with_file_name("requests.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let output = output_failure(organization_cli(temp.path(), &api.origin).args(arguments));
+    assert_eq!(
+        parse_stdout_json(&output)["type"],
+        "organization_submission_busy"
+    );
+    assert_eq!(api.workflow_requests().len(), 1);
+    assert_eq!(fs::read(&path).unwrap(), original);
+    drop(lock);
+    output_success(organization_cli(temp.path(), &api.origin).args(arguments));
+    assert_eq!(api.workflow_requests().len(), 2);
+    assert_eq!(
+        api.workflow_requests()[0].body,
+        api.workflow_requests()[1].body
+    );
+    assert_eq!(fs::read(&path).unwrap(), original);
+    api.assert_complete();
+}
+
+#[test]
+fn managed_workload_explicit_token_and_clear_use_only_invocation_custody() {
+    let temp = tempdir().unwrap();
+    let endpoint = "https://graph.example.invalid";
+    let (api, tokens) = IntentApiFixture::workload_identity_issuer(endpoint, 1);
+    let provider = IntentApiFixture::new(vec![IntentReply::json(
+        200,
+        serde_json::json!({"access_token":"oauth-initial","token_type":"Bearer","expires_in":600}),
+    )]);
+    write_managed_data_target(temp.path(), &api.origin, endpoint);
+    let home = managed_home(temp.path());
+    let config = home.join("config.yaml");
+    let mut document: Value = yaml_serde::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    document["profiles"]["managed-account"]["auth"] = serde_json::json!({
+        "provider":"oauth_client_credentials",
+        "token_endpoint":format!("{}/oauth2/token", provider.origin),
+        "client_id":"client-one","client_secret":{"env":"OG_FIXTURE_CLIENT_SECRET"}});
+    fs::write(&config, yaml_serde::to_string(&document).unwrap()).unwrap();
+    let output = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", &home)
+            .env("SSL_CERT_FILE", crate::support::tls_gateway::ca_path())
+            .env("OG_FIXTURE_CLIENT_SECRET", "fixture-private-secret")
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/nonexistent/omnigraph-no-keyring",
+            )
+            .current_dir(temp.path())
+            .timeout(std::time::Duration::from_secs(15))
+            .args(["cluster", "token", "--target", "managed-test", "--json"]),
+    );
+    let result = parse_stdout_json(&output);
+    assert_eq!(result["data"]["actor"], "principal:principal-one");
+    assert!(result["data"].get("token").is_none());
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for secret in ["fixture-private-secret", "oauth-initial", &tokens[0]] {
+        assert!(!printed.contains(secret));
+    }
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(api.workflow_requests().len(), 1);
+    assert_eq!(
+        api.workflow_requests()[0].path,
+        "/v1/clusters/managed-test/tokens"
+    );
+    provider.assert_complete();
+    api.assert_complete();
+
+    // Clear is local even when the provider is unreachable and no secret exists.
+    document["profiles"]["managed-account"]["auth"]["token_endpoint"] =
+        serde_json::json!("https://provider.example.invalid/oauth2/token");
+    fs::write(&config, yaml_serde::to_string(&document).unwrap()).unwrap();
+    let cleared = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", &home)
+            .env_remove("OG_FIXTURE_CLIENT_SECRET")
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/nonexistent/omnigraph-no-keyring",
+            )
+            .timeout(std::time::Duration::from_secs(5))
+            .args([
+                "cluster",
+                "token",
+                "--clear",
+                "--target",
+                "managed-test",
+                "--json",
+            ]),
+    );
+    assert_eq!(
+        parse_stdout_json(&cleared)["data"]["local_credential_removed"],
+        false
+    );
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(api.workflow_requests().len(), 1);
+}
+
+#[test]
+fn managed_workload_token_exchange_refuses_redirects_and_errors_without_secret_output() {
+    for status in [302, 401] {
+        let temp = tempdir().unwrap();
+        let api = lifecycle_fixture(vec![]);
+        let provider = IntentApiFixture::new(vec![IntentReply {
+            status,
+            headers: vec![(
+                "Location".into(),
+                "https://other.example.invalid/redirected".into(),
+            )],
+            body: br#"{"error":"fixture-provider-private-response"}"#.to_vec(),
+        }]);
+        write_managed_target(temp.path(), &api.origin);
+        let home = managed_home(temp.path());
+        let config = home.join("config.yaml");
+        let mut document: Value =
+            yaml_serde::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        document["profiles"]["managed-account"]["auth"] = serde_json::json!({
+            "provider":"oauth_client_credentials", "token_endpoint":format!("{}/oauth2/token", provider.origin),
+            "client_id":"client-one", "client_secret":{"env":"OG_FIXTURE_CLIENT_SECRET"}});
+        fs::write(&config, yaml_serde::to_string(&document).unwrap()).unwrap();
+        let output = output_failure(
+            cli()
+                .env("OMNIGRAPH_HOME", &home)
+                .env("SSL_CERT_FILE", crate::support::tls_gateway::ca_path())
+                .env("OG_FIXTURE_CLIENT_SECRET", "fixture-private-secret")
+                .timeout(std::time::Duration::from_secs(10))
+                .args(["cluster", "token", "--target", "managed-test", "--json"]),
+        );
+        let printed = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for secret in [
+            "fixture-private-secret",
+            "fixture-provider-private-response",
+        ] {
+            assert!(!printed.contains(secret));
+        }
+        assert_eq!(provider.requests().len(), 1);
+        assert!(api.requests().is_empty());
+        provider.assert_complete();
+        api.assert_complete();
+        assert_no_core_effects(temp.path());
     }
 }

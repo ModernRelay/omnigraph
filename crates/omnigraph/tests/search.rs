@@ -641,9 +641,9 @@ async fn issue_567_bounded_nearest_and_rrf_retry_after_partitioned_ivf_underfill
 
     use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
     let probes = QueryIoProbes::default();
-    let result = with_query_io_probes(probes.clone(), async {
-        query_main(
-            &db,
+    let run = with_query_io_probes(probes.clone(), async {
+        db.query_inspected(
+            omnigraph::db::ReadTarget::branch("main"),
             queries,
             "filtered_nearest",
             &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
@@ -653,6 +653,26 @@ async fn issue_567_bounded_nearest_and_rrf_retry_after_partitioned_ivf_underfill
     .await
     .unwrap();
 
+    let report = serde_json::to_value(&run.report).unwrap();
+    let metrics = report["ann_metrics"].as_array().unwrap();
+    let profile = run.profile().unwrap().concat_batches().unwrap();
+    let nodes = profile["node"]
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let details = profile["detail"]
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let profiled: Vec<serde_json::Value> = (0..profile.num_rows())
+        .filter(|row| nodes.value(*row) == "ann_metrics")
+        .map(|row| serde_json::from_str(details.value(row)).unwrap())
+        .collect();
+    assert_eq!(
+        &profiled, metrics,
+        "profile carries the same native attempt diagnostics"
+    );
+    let result = run.result;
     assert_eq!(result.num_rows(), 10);
     let rescans = probes
         .ann_rescans
@@ -676,6 +696,36 @@ async fn issue_567_bounded_nearest_and_rrf_retry_after_partitioned_ivf_underfill
     );
     assert_rungs_climb(&rungs, 1, "filtered_nearest");
     assert_eq!(
+        metrics.len(),
+        rungs.len(),
+        "every native retry has its own diagnostics"
+    );
+    let decision = report["search"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|decision| decision["decision"] == "probes")
+        .unwrap();
+    assert_eq!(
+        metrics.len(),
+        decision["attempts"].as_array().unwrap().len()
+    );
+    for (attempt, (metrics, searched)) in metrics.iter().zip(&rungs).enumerate() {
+        assert_eq!(metrics["id"], decision["id"]);
+        assert_eq!(metrics["rung"], 0);
+        assert_eq!(metrics["attempt"], attempt);
+        assert_eq!(metrics["counts"]["partitions_searched"], *searched);
+        let times = metrics["cumulative_times_ns"].as_object().unwrap();
+        for stage in ["index_partition_load_time", "index_search_time"] {
+            assert!(
+                times[stage].as_u64().is_some(),
+                "native stage is recorded, without a wall-time assertion"
+            );
+        }
+        assert!(times.len() <= 12, "only curated native stages are reported");
+        assert!(metrics["counts"].as_object().unwrap().len() <= 6);
+    }
+    assert_eq!(
         probes
             .ann_scan_rows
             .load(std::sync::atomic::Ordering::Relaxed),
@@ -697,9 +747,9 @@ async fn issue_567_bounded_nearest_and_rrf_retry_after_partitioned_ivf_underfill
     );
 
     let rrf_keep_probes = QueryIoProbes::default();
-    let rrf_keep = with_query_io_probes(rrf_keep_probes.clone(), async {
-        query_main(
-            &db,
+    let rrf_keep_run = with_query_io_probes(rrf_keep_probes.clone(), async {
+        db.query_inspected(
+            omnigraph::db::ReadTarget::branch("main"),
             queries,
             "rrf_keep",
             &vector_param("$q", &[0.0, 0.0, 0.0, 0.0]),
@@ -708,6 +758,8 @@ async fn issue_567_bounded_nearest_and_rrf_retry_after_partitioned_ivf_underfill
     })
     .await
     .unwrap();
+    let rrf_report = serde_json::to_value(&rrf_keep_run.report).unwrap();
+    let rrf_keep = rrf_keep_run.result;
     assert_eq!(rrf_keep.num_rows(), 10);
     assert_eq!(
         result_slugs(&rrf_keep),
@@ -733,6 +785,26 @@ async fn issue_567_bounded_nearest_and_rrf_retry_after_partitioned_ivf_underfill
         "one rung per scan: {keep_rungs:?}"
     );
     assert_rungs_climb(&keep_rungs, 2, "rrf_keep");
+    let rrf_metrics = rrf_report["ann_metrics"].as_array().unwrap();
+    assert_eq!(rrf_metrics.len(), keep_rungs.len());
+    let arms: std::collections::BTreeSet<u64> = rrf_metrics
+        .iter()
+        .map(|metrics| metrics["id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(arms.len(), 2, "each RRF arm retains its own diagnostics");
+    for id in arms {
+        for (attempt, metrics) in rrf_metrics
+            .iter()
+            .filter(|metrics| metrics["id"] == id)
+            .enumerate()
+        {
+            assert_eq!(metrics["rung"], 0);
+            assert_eq!(
+                metrics["attempt"], attempt,
+                "each arm starts its own probe ladder"
+            );
+        }
+    }
 
     let rrf_probes = QueryIoProbes::default();
     let rrf = with_query_io_probes(rrf_probes.clone(), async {
@@ -837,6 +909,10 @@ async fn issue_567_unfiltered_nearest_climbs_the_ladder_to_the_whole_corpus() {
         Some(ranked),
         "the last rung read every ranked partition: rungs {rungs:?}"
     );
+    assert!(
+        result.ranking().unwrap().exhaustive,
+        "the last attempt searched every partition of the IVF_FLAT index"
+    );
     assert_eq!(
         probes
             .ann_overfetches
@@ -877,6 +953,10 @@ async fn issue_567_unfiltered_nearest_keeps_the_probe_cap() {
         result_slugs(&result),
         (0..10).map(|row| format!("n{row:05}")).collect::<Vec<_>>(),
         "the ten nearest docs, from the one partition nearest the query"
+    );
+    assert!(
+        !result.ranking().unwrap().exhaustive,
+        "three partitions went unsearched, so a nearer row may exist"
     );
     assert_eq!(
         probes
@@ -943,6 +1023,10 @@ async fn issue_567_ladder_stops_when_the_prefilter_admits_fewer_rows_than_k() {
             .map(|row| format!("n{row:05}"))
             .collect::<Vec<_>>(),
         "every edge-bearing doc, nothing else, in distance order"
+    );
+    assert!(
+        result.ranking().unwrap().exhaustive,
+        "the flat scan scored every admitted row"
     );
     assert_eq!(
         probes
@@ -1730,11 +1814,10 @@ async fn issue_567_forced_prefilter_skips_the_nearest_gate_threshold() {
     );
 }
 
-/// Lance 11 still drops KNN ordering metadata when its sorted candidate stream
-/// is late-hydrated with ordinary node payload. Above one 8,192-row output
-/// batch, a parallel final coalesce can then put a later partition first. This
-/// engine-level cell proves the temporary one-output-partition fence is wired
-/// through the real stable-row-ID graph scan and preserves the complete rank.
+/// Lance 13 preserves KNN ordering metadata through V2 payload hydration.
+/// Above one 8,192-row output batch, the engine must merge parallel partitions
+/// by that order. This exercises the real stable-row-ID graph scan and proves
+/// the complete rank survives without the legacy V1 single-partition fence.
 #[tokio::test(flavor = "multi_thread")]
 async fn nearest_large_k_preserves_global_order_through_payload_hydration() {
     const ROWS_PER_FRAGMENT: usize = 5_000;
@@ -2731,5 +2814,92 @@ async fn full_text_analyzer_holds_after_first_rows_and_overwrites_issue_904() {
         hits("feature", "notes").await,
         ["n1", "n2"],
         "a type's first rows on a branch"
+    );
+}
+
+/// A full-text call refuses a declared index that has no segment at the
+/// query's snapshot, rather than answering with Lance's bare, case-sensitive
+/// tokenizer: a table version written before writers declared the analyzer
+/// is this case, built here with a raw Lance append to the table's creation
+/// version, published without index work. Planning and explain refuse alike
+/// (`FullTextIndexRequired`, before any scan); building the declared index
+/// lifts the refusal, and the call then folds case.
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn a_full_text_index_with_no_segment_refuses_the_call_issue_747() {
+    use lance::index::DatasetIndexExt;
+    use omnigraph::db::ReadTarget;
+    use omnigraph::error::OmniError;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = session(Omnigraph::init(uri, ANALYZER_SCHEMA).await.unwrap());
+    let entry = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .dataset("node:Doc")
+        .unwrap()
+        .clone();
+    let mut raw = lance::Dataset::open(&format!("{uri}/{}", entry.dataset_path))
+        .await
+        .unwrap();
+    assert_eq!(raw.version().version, entry.published_dataset_version);
+    let body = raw.schema().field("body").unwrap().id;
+    assert!(
+        !raw.load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .any(|index| index.fields.contains(&body)),
+        "the creation version declares no segment on `body`"
+    );
+    let schema = std::sync::Arc::new(arrow_schema::Schema::from(raw.schema()));
+    let column = |values: [&str; 2]| {
+        std::sync::Arc::new(StringArray::from(values.to_vec())) as arrow_array::ArrayRef
+    };
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| match field.name().as_str() {
+            "__id" | "slug" => column(["d1", "d2"]),
+            "body" => column(["Deep Learning", "deep dive"]),
+            other => panic!("unexpected `Doc` field {other}"),
+        })
+        .collect::<Vec<_>>();
+    lance_append_inline(
+        &mut raw,
+        arrow_array::RecordBatch::try_new(schema, columns).unwrap(),
+    )
+    .await;
+    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Doc", None)
+        .await
+        .unwrap();
+
+    let deep = params(&[("q", "deep")]);
+    let refused = |error: OmniError| match error {
+        OmniError::FullTextIndexRequired { index } => assert_eq!(index, "Doc.body"),
+        other => panic!("an index with no segment answered or failed otherwise: {other}"),
+    };
+    refused(
+        query_branch(&db, "main", ANALYZER_QUERIES, "docs", &deep)
+            .await
+            .unwrap_err(),
+    );
+    refused(
+        db.explain_query(ReadTarget::branch("main"), ANALYZER_QUERIES, "docs", &deep)
+            .await
+            .unwrap_err(),
+    );
+
+    db.ensure_indices().await.unwrap();
+    assert_eq!(
+        first_column_sorted(
+            &query_branch(&db, "main", ANALYZER_QUERIES, "docs", &deep)
+                .await
+                .unwrap()
+        ),
+        ["d1", "d2"],
+        "the built index folds case"
     );
 }

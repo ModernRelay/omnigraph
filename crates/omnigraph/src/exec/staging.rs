@@ -39,7 +39,7 @@ use omnigraph_compiler::SystemColumns;
 use crate::db::{DatasetUpdate, MutationOpKind};
 use crate::error::{OmniError, Result};
 use crate::seams::{catalog, decide_seam, fail};
-use crate::table_store::ExternalBlobUriCollector;
+use crate::table_store::{ExternalBlobUriCollector, OverwriteChunk};
 
 /// Logical semantics for one accumulated table write.
 ///
@@ -140,6 +140,10 @@ pub(crate) struct MutationStaging {
     /// `RetryableCommitConflict` as a 500. See
     /// [`MutationOpKind::strict_pre_stage_version_check`].
     pub(crate) op_kinds: HashMap<String, MutationOpKind>,
+    /// The Lance writers one table's overwrite runs at once; `Default` leaves
+    /// 0 and the store treats 0 as one writer, [`Self::with_overwrite_writers`]
+    /// widens it.
+    overwrite_writers: usize,
 }
 
 decide_seam! {
@@ -156,8 +160,16 @@ impl MutationStaging {
         Self {
             write_budget,
             deleted_id_budget: DeletedIdBudget::new(write_budget),
+            overwrite_writers: 1,
             ..Self::default()
         }
+    }
+
+    /// Run each table's overwrite through up to `writers` Lance writers at
+    /// once; see `TableStore::stage_overwrite_batches`.
+    pub(crate) fn with_overwrite_writers(mut self, writers: usize) -> Self {
+        self.overwrite_writers = writers.max(1);
+        self
     }
 
     pub(crate) fn write_budget(&self) -> WriteBudget {
@@ -483,6 +495,7 @@ impl MutationStaging {
             deleted_ids,
             deleted_id_budget: _,
             op_kinds: _,
+            overwrite_writers,
         } = self;
 
         let mut stage_inputs: Vec<(String, PreparedPendingTable, StagedTablePath, u64)> =
@@ -613,7 +626,16 @@ impl MutationStaging {
                     if stage_idx > 0 {
                         fail(&LOAD_BETWEEN_TABLE_STAGES)?;
                     }
-                    stage_pending_table(db, table_key, table, path, expected, write_budget).await
+                    stage_pending_table(
+                        db,
+                        table_key,
+                        table,
+                        path,
+                        expected,
+                        write_budget,
+                        overwrite_writers,
+                    )
+                    .await
                 },
             ))
             .buffered(concurrency)
@@ -661,30 +683,134 @@ impl MutationStaging {
             }
         }
 
-        let expected_versions = expected_versions
-            .iter()
-            .map(|(table_key, table_version)| {
-                let path = paths.get(table_key).ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "MutationStaging::stage_all: missing path for table '{table_key}'"
-                    ))
-                })?;
-                Ok((
-                    path.identity,
-                    crate::db::manifest::TableVersionExpectation {
-                        table_key: table_key.clone(),
-                        table_version: *table_version,
-                        native_ref: path.pinned_native_ref.clone(),
-                    },
-                ))
-            })
-            .collect::<Result<crate::db::manifest::ExpectedTableVersions>>()?;
+        let expected_versions = expected_table_versions(&expected_versions, &paths)?;
 
         Ok(StagedMutation {
             staged: staged_entries,
             expected_versions,
         })
     }
+}
+
+impl MutationStaging {
+    /// Stage one table's overwrite from chunks as the load's sink cuts them,
+    /// the table registered by [`Self::ensure_path`] and nothing else
+    /// pending: every batch passes the keyed-write contract and its external
+    /// Blob references are authorized per chunk before that chunk's writer
+    /// starts, then `TableStorage::stage_overwrite_stream` writes it. The
+    /// result is the [`StagedMutation`] `stage_all` would build for the table.
+    pub(crate) async fn stage_overwrite_stream<S>(
+        self,
+        db: &crate::db::Omnigraph,
+        table_key: &str,
+        chunks: S,
+        schema: SchemaRef,
+    ) -> Result<StagedMutation>
+    where
+        S: futures::Stream<Item = Result<OverwriteChunk>> + Send,
+    {
+        let MutationStaging {
+            expected_versions,
+            paths,
+            pending,
+            write_budget,
+            overwrite_writers,
+            ..
+        } = self;
+        if !pending.is_empty() {
+            return Err(OmniError::manifest_internal(
+                "MutationStaging::stage_overwrite_stream: the staging also holds pending batches",
+            ));
+        }
+        let path = paths.get(table_key).cloned().ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "MutationStaging::stage_overwrite_stream: missing path for table '{table_key}'"
+            ))
+        })?;
+        let expected = *expected_versions.get(table_key).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "MutationStaging::stage_overwrite_stream: missing expected version for table '{table_key}'"
+            ))
+        })?;
+        let ds = db
+            .open_pinned_for_write(&path.full_path, &path.entry)
+            .await?;
+        let system_columns = db.catalog().system_columns;
+        let prepared = chunks.then(|chunk| async move {
+            let mut chunk = chunk?;
+            let mut uris = ExternalBlobUriCollector::default();
+            for batch in &chunk.batches {
+                db.storage()
+                    .validate_keyed_write_batch(table_key, batch, system_columns)?;
+                uris.include_batch(batch)?;
+            }
+            if !uris.as_slice().is_empty() {
+                let preflight = db
+                    .storage()
+                    .preflight_external_blob_uris(uris.as_slice())
+                    .await?;
+                for batch in chunk.batches.iter_mut() {
+                    *batch = db
+                        .storage()
+                        .prepare_overwrite_blob_references_with_preflight(
+                            table_key,
+                            batch.clone(),
+                            &preflight,
+                            system_columns,
+                        )?;
+                }
+            }
+            Ok(chunk)
+        });
+        let staged = db
+            .storage()
+            .stage_overwrite_stream(
+                &ds,
+                Box::pin(prepared),
+                Some(schema),
+                write_budget,
+                overwrite_writers,
+            )
+            .await?;
+        let staged_entries = vec![StagedTableEntry {
+            table_key: table_key.to_string(),
+            path,
+            expected_version: expected,
+            dataset: ds,
+            staged_write: Some(staged),
+        }];
+        let expected_versions = expected_table_versions(&expected_versions, &paths)?;
+        Ok(StagedMutation {
+            staged: staged_entries,
+            expected_versions,
+        })
+    }
+}
+
+/// The publisher's CAS fence from the staging's pins: every touched table's
+/// identity with the version and native ref it was read at.
+fn expected_table_versions(
+    expected_versions: &HashMap<String, u64>,
+    paths: &HashMap<String, StagedTablePath>,
+) -> Result<crate::db::manifest::ExpectedTableVersions> {
+    expected_versions
+        .iter()
+        .map(|(table_key, table_version)| {
+            let path = paths.get(table_key).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "MutationStaging::stage_all: missing path for table '{table_key}'"
+                ))
+            })?;
+            Ok((
+                path.identity,
+                crate::db::manifest::TableVersionExpectation {
+                    table_key: table_key.clone(),
+                    table_version: *table_version,
+                    native_ref: path.pinned_native_ref.clone(),
+                },
+            ))
+        })
+        .collect()
 }
 
 /// One table's input as its Lance writer consumes it: a keyed adapter takes
@@ -785,6 +911,7 @@ async fn stage_pending_table(
     path: StagedTablePath,
     expected: u64,
     write_budget: WriteBudget,
+    overwrite_writers: usize,
 ) -> Result<Option<StagedTableEntry>> {
     let ds = db
         .open_pinned_for_write(&path.full_path, &path.entry)
@@ -811,7 +938,9 @@ async fn stage_pending_table(
                 .await?
         }
         PreparedPendingTable::Overwrite { batches } => {
-            db.storage().stage_overwrite_batches(&ds, batches).await?
+            db.storage()
+                .stage_overwrite_batches(&ds, batches, write_budget, overwrite_writers)
+                .await?
         }
     };
     Ok(Some(StagedTableEntry {
@@ -1097,16 +1226,6 @@ impl StagedMutation {
     }
 }
 
-/// Walk `batches` in reverse, tracking seen `id` values; for each row
-/// whose id we have NOT seen yet, mark it as a keeper. After the walk,
-/// take the kept rows in forward (input) order and concat into one batch.
-///
-/// Result: a deduped batch where each `id` appears at most once, with
-/// the LAST occurrence's column values. Required by `stage_merge_insert`,
-/// which needs unique source keys (Lance's `MergeInsertBuilder` produces
-/// arbitrary results on duplicates).
-///
-/// `batches` must be non-empty and all share `schema` (caller enforces).
 /// Compare two schemas for the purposes of `MutationStaging::append_batch`'s
 /// accumulator-compatibility check. We treat schemas as compatible if
 /// they have the same field names and data types in the same order.
@@ -1125,6 +1244,11 @@ fn schemas_compatible(a: &SchemaRef, b: &SchemaRef) -> bool {
     true
 }
 
+/// Fold pending upserts to unique ids before `stage_keyed_write`, which
+/// rejects duplicate source ids. Walking backwards keeps the last occurrence's
+/// values; the result retains input order among the surviving rows.
+///
+/// `batches` must be non-empty and all share `schema` (caller enforces).
 fn dedupe_merge_batches_by_id(
     schema: &SchemaRef,
     batches: Vec<RecordBatch>,

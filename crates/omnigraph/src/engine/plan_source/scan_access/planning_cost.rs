@@ -1,7 +1,6 @@
 //! Cold planning, execution and storage-format seams are not observable in a GQT plan claim.
 use super::*;
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
-use bytes::Bytes;
 use futures::{TryStreamExt, stream::BoxStream};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::transaction::{DataOverlayGroup, Operation, Transaction};
@@ -12,12 +11,11 @@ use lance_file::{version::LanceFileVersion, writer::FileWriterOptions};
 use lance_index::{IndexType, scalar::ScalarIndexParams};
 use lance_io::object_store::{ObjectStore as LanceStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::utils::CachedFileSize;
+use lance_table::format::DataFile;
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
-use lance_table::format::{DataFile, ExternalFile, RowIdMeta};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    ObjectStoreExt as _, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    Result as StoreResult, path::Path,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as StoreResult, path::Path,
 };
 use omnigraph_compiler::ir::{IRExpr, ParamMap};
 use omnigraph_compiler::query::ast::{CompOp, Literal};
@@ -52,13 +50,6 @@ fn planning_budget(kind: &str) -> Costs {
                 Cost {
                     requests: 2,
                     bytes: 894,
-                },
-            ),
-            (
-                "row_ids",
-                Cost {
-                    requests: 1,
-                    bytes: 6,
                 },
             ),
             (
@@ -117,6 +108,15 @@ impl Tracker {
     }
 }
 impl WrappingObjectStore for Tracker {
+    fn wrap_paginated(
+        &self,
+        _: &str,
+        _original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        // Keep listings on the wrapped path so faults and request accounting apply.
+        None
+    }
+
     fn wrap(&self, _: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
         Arc::new(TrackingStore {
             target,
@@ -277,37 +277,9 @@ async fn overlay(mut ds: Dataset, uri: &str) -> Dataset {
     )
     .await
     .unwrap();
-    let mut fragments = ds.manifest().fragments.as_ref().clone();
-    for fragment in &mut fragments {
-        let Some(RowIdMeta::Inline(encoded)) = &fragment.row_id_meta else {
-            panic!("expected inline row IDs")
-        };
-        let bytes = encoded.to_vec();
-        let name = format!("external-rowids-fragment-{}.bin", fragment.id);
-        store
-            .inner
-            .put(
-                &base.clone().join(name.clone()),
-                PutPayload::from(Bytes::from(bytes.clone())),
-            )
-            .await
-            .unwrap();
-        fragment.row_id_meta = Some(RowIdMeta::External(ExternalFile {
-            path: name,
-            offset: 0,
-            size: bytes.len() as u64,
-        }));
-    }
-    let schema = ds.schema().clone();
-    ds = commit(
-        ds,
-        Operation::Merge {
-            fragments,
-            schema,
-            preserves_nullability: true,
-        },
-    )
-    .await;
+    // Keep the native inline row IDs. Lance 13 retired the external-range
+    // representation that this fixture used to construct by hand; no Lance
+    // writer emitted it. Overlay and deletion planning remain real I/O here.
     let fragment_id = ds.manifest().fragments[0].id;
     let field_id = ds.schema().field("age").unwrap().id;
     let filename = "age-overlay.lance";
@@ -456,6 +428,29 @@ async fn planning_cost_matches_one_cold_builder_for_modern_overlay_and_legacy() 
         .await;
         if kind == "overlay" {
             ds = overlay(ds, &uri).await;
+            if !cfg!(debug_assertions) {
+                // Native overlays remain experimental in release; the modern
+                // and legacy cases below still qualify ordinary cold planning.
+                assert!(!lance_table::feature_flags::can_read_dataset(
+                    lance_table::feature_flags::FLAG_UNSTABLE_DATA_OVERLAY_FILES
+                ));
+                assert_ne!(
+                    ds.manifest().reader_feature_flags
+                        & lance_table::feature_flags::FLAG_UNSTABLE_DATA_OVERLAY_FILES,
+                    0
+                );
+                let error = DatasetBuilder::from_uri(&uri)
+                    .with_version(ds.version().version)
+                    .with_session(Arc::new(lance::session::Session::default()))
+                    .load()
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(&error, lance::Error::NotSupported { .. }),
+                    "{error:?}"
+                );
+                continue;
+            }
         }
         for value in if kind == "overlay" {
             vec![10, 20, 999]
@@ -507,12 +502,7 @@ async fn planning_cost_matches_one_cold_builder_for_modern_overlay_and_legacy() 
                 assert!(!finalized.0.contains_key("index"));
             }
             if kind == "overlay" {
-                assert!(
-                    finalized
-                        .0
-                        .get("row_ids")
-                        .is_some_and(|cost| cost.bytes > 0)
-                );
+                assert!(!finalized.0.contains_key("row_ids"));
                 assert!(
                     finalized
                         .0

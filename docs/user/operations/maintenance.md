@@ -1,9 +1,10 @@
 # Maintenance
 
-OmniGraph provides four direct-storage maintenance commands:
+OmniGraph provides five direct-storage maintenance commands:
 
-- `optimize` compacts data and reconciles declared indexes.
-- `rebuild-full-text-indexes` replaces full-text indexes on one branch.
+- `optimize` compacts data and reconciles declared indexes on `main`.
+- `index build` brings one branch's declared indexes up to its rows.
+- `index rebuild --kind full-text` replaces full-text indexes on one branch.
 - `repair` diagnoses foreign storage drift without adopting it.
 - `cleanup` permanently removes unretained table versions and unused table
   forks left by branches created before storage format v11.
@@ -12,26 +13,30 @@ They do not run through the HTTP server. Address a standalone graph directly,
 or select a graph from a cluster root:
 
 ```bash
-omnigraph optimize ./graph.omni
-omnigraph optimize --cluster s3://company/omnigraph --graph knowledge
+omnigraph optimize --target ./graph.omni
+omnigraph optimize --target ./cluster-root --graph knowledge
 ```
 
-Follow the command-specific concurrency requirements below. Azure writers
-must also run through `omnigraph-azure-admission`; Azure support remains a
-qualification preview pending the adversarial live-Azure matrix.
+Follow the command-specific concurrency requirements below. Registered direct
+targets accept local files only; an inline [S3 cluster root](s3-cluster-roots.md)
+is the one cloud-direct exception. See
+[operator configuration](../cli/targets.md#transport-and-capability-boundaries).
 
 ## Optimize
 
 ```bash
-omnigraph optimize ./graph.omni
-omnigraph optimize ./graph.omni --json
+omnigraph optimize --target ./graph.omni
+omnigraph optimize --target ./graph.omni --json
 ```
 
 Optimize rewrites small fragments into fewer larger fragments, rewrites every
 fragment that still stores a dropped property's values, rebuilds each scalar or
 vector index whose coverage lags behind appended rows, and builds missing
-declared indexes that are ready to build. It does not delete old versions or
-collect unused table forks. Use `cleanup` for storage reclamation.
+declared indexes that are ready to build. It works on `main`. `index build`
+does only the index part, on any branch including `main`; compaction, the
+dropped-value rewrite and the traversal artifact stay with optimize. Optimize
+does not delete old versions or collect unused table forks. Use `cleanup` for
+storage reclamation.
 
 Dropping a property removes it from the schema without rewriting its table
 (see [schema changes](../schema/index.md#schema-changes)), so its values stay
@@ -88,21 +93,48 @@ never correctness.
 
 Existing full-text indexes are preserved rather than incrementally merged.
 Unindexed rows remain searchable, but a growing uncovered tail can cost more to
-scan. Use `rebuild-full-text-indexes` to refresh that coverage or migrate an old
-analyzer generation. Optimize reports uncovered full-text coverage under
+scan. Use `index rebuild --kind full-text` to refresh that coverage or migrate
+an old analyzer generation. Optimize reports uncovered full-text coverage under
 `pending_indexes` with this remedy. Deferred coverage alone creates no graph
 commit or maintenance work.
 
 A vector index whose property has no usable vectors remains pending rather than
 failing the run. Run optimize again after loading or generating vectors.
 
+## Build indexes
+
+```bash
+omnigraph index build --target ./graph.omni --branch review
+omnigraph index build --target ./cluster-root --graph knowledge \
+  --branch review --json
+```
+
+On any branch, `index build` builds every declared index a table lacks, such as
+those of a type whose first rows were loaded there, and rebuilds whole each
+BTREE or vector index that leaves rows uncovered. Every table publishes in one
+graph commit on that branch; other branches and snapshots keep their indexes,
+and a branch with nothing to do publishes nothing. The default branch is `main`.
+As with optimize, a write that lands on a table while its batch is staged fails
+the run with a read-set conflict; run the command again. A vector property with no vectors yet and full-text coverage stay pending: only
+`index rebuild --kind full-text` refreshes a full-text index's coverage, and
+queries match uncovered rows with the index's analyzer meanwhile.
+
+JSON reports `branch`, `graph_commit_id` (null for a no-op), `indexes` with each
+`type_key`, `property` (the indexed column, `__id` for the identity index),
+`kind` (`btree`, `full_text` or `vector`) and `action` (`built` or `refreshed`),
+and `pending_indexes` with each `type_key`, `property` and `reason`. `--as` and
+the trust boundary are as for the full-text rebuild below.
+
 ## Rebuild full-text indexes
 
 ```bash
-omnigraph rebuild-full-text-indexes ./graph.omni --branch main
-omnigraph rebuild-full-text-indexes --cluster s3://company/omnigraph \
+omnigraph index rebuild --kind full-text --target ./graph.omni --branch main
+omnigraph index rebuild --kind full-text --target ./cluster-root \
   --graph knowledge --branch review --json
 ```
+
+`--kind` is required. The deprecated spelling `rebuild-full-text-indexes` still
+works for one release.
 
 The command fully replaces text-search indexes from current entities using the
 engine's default English analyzer, including already indexed entities. It builds
@@ -118,9 +150,9 @@ no-op with an empty index list, null commit, and empty `warnings` array. The def
 branch is `main`.
 
 `--as` supplies actor attribution for this command. Direct CLI access, including
-`--cluster`, does not load the server's Cedar policy; storage permissions are its
+`--target`, does not load the server's Cedar policy; storage permissions are its
 trust boundary. An embedded host that installs a policy checker also enforces
-the Change permission before rebuilding.
+the Change permission on the selected branch before building or rebuilding.
 
 Other branches and historical snapshots are not rewritten. Rebuild every live
 branch that needs full-text search; restoring an older snapshot may require
@@ -136,7 +168,7 @@ Repair reports, per node or edge type, how the backing dataset's Lance linear
 history stands against the graph's registration. Preview:
 
 ```bash
-omnigraph repair ./graph.omni --json
+omnigraph repair --target ./graph.omni --json
 ```
 
 Every OmniGraph table write is a detached Lance commit that a graph commit
@@ -174,6 +206,19 @@ in addition to the versions selected by the policy.
 Historical table lifetimes participate even after a type is dropped or its
 name is re-added under a new identity. Blob sidecars follow their parent data
 file's reachability.
+
+`omnigraph cleanup` is the only cleanup to run against a graph root. Lance's
+own cleanup (`cleanup_old_versions`, and every vacuum or retention tool built
+on it) does not trace OmniGraph's detached table versions. On Lance 13 it can
+delete files used only by detached versions once those files are older than
+seven days, leaving the manifests present but affected snapshots unreadable.
+This can affect the current graph or a recent commit that inherits an old file;
+files shared with retained attached versions remain protected. The same risk
+applies to the graph's catalog dataset, whose unpublished proposals and
+unattached snapshots are detached versions. If an external cleanup has run,
+stop writes and check for missing files; restore the whole root from a verified
+backup if data was deleted.
+
 A table version no graph commit ever named is unpublished staging: a write
 in flight, or one that failed before its publication. Unless a native tag
 protects it, it is deleted when the branch incarnation and graph head its
@@ -189,13 +234,13 @@ CLI only echoes the requested retention policy and exits before opening the
 graph; it does not enumerate candidates:
 
 ```bash
-omnigraph cleanup --keep 10 --older-than 7d ./graph.omni
+omnigraph cleanup --keep 10 --older-than 7d --target ./graph.omni
 ```
 
 Run the reviewed policy with `--confirm`:
 
 ```bash
-omnigraph cleanup --keep 10 --older-than 7d --confirm ./graph.omni
+omnigraph cleanup --keep 10 --older-than 7d --confirm --target ./graph.omni
 ```
 
 At least one retention option is required:
@@ -208,7 +253,10 @@ At least one retention option is required:
 A graph commit survives when either option retains it. The current HEAD of
 every live branch is always retained, and a named branch also keeps its
 oldest commit, the copy of the parent's commit it was created from, while
-the branch lives. Cleanup also retains the selected merge bases between
+the branch lives; for a branch started at a past commit, that is the commit
+it names. A commit cleanup no longer retains starts no branch
+([start a branch at a commit](../branching/index.md#start-a-branch-at-a-commit)).
+Cleanup also retains the selected merge bases between
 current branch heads and accepted merge inputs. Native tags protect the exact
 snapshots they name. A tagged graph snapshot retains all its table versions; a
 tagged table snapshot retains that version, including a detached version or a
@@ -221,10 +269,6 @@ its name is gone: immediately with `--keep` alone, and with `--older-than`
 only after every object of the fork is older than the cutoff. Native tags,
 readable graph snapshots and required native ancestors also protect forks. Choose a policy that matches
 your rollback and audit needs.
-
-For `s3://` and `az://` targets, destructive execution also requires an
-interactive confirmation or `--yes`. Non-interactive and JSON runs refuse
-without `--yes`.
 
 Before cleanup:
 

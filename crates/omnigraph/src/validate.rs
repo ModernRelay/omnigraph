@@ -24,6 +24,7 @@
 //! live HEAD depending on the surface).
 
 mod kernels;
+mod key_set;
 pub(crate) mod load;
 
 use std::collections::{HashMap, HashSet};
@@ -45,6 +46,7 @@ use kernels::{
     edge_ri_delta, match_unique_holders, orphans_in_delta, orphans_retained, partition_endpoints,
     unique_coalesced_dups, unique_committed_collisions, unique_image, unique_probe_keys,
 };
+use key_set::{IntKeySet, IntKeySetLayout, canonical_i64, key_bytes};
 
 /// A single integrity violation, surface-neutral. Maps to the merge path's
 /// [`MergeConflict`] today via [`Violation::into_merge_conflict`]; a write-path
@@ -166,7 +168,7 @@ fn value_violation(table_key: &str, err: OmniError) -> Violation {
 // the source table or the unindexed staged temp (which carries no index).
 
 /// A declared integrity constraint, derived from the catalog. Mirrors the
-/// `node_prop_index_kind` chokepoint: adding a kind is one variant + one arm in
+/// `PropType::index_kind` chokepoint: adding a kind is one variant + one arm in
 /// [`evaluate`], run on every surface that adopts the evaluator.
 #[derive(Debug, Clone)]
 pub(crate) enum Constraint {
@@ -327,9 +329,9 @@ pub(crate) fn constraints_for(catalog: &Catalog) -> Vec<Constraint> {
         // `@key` is id-backed: cross-version duplication is impossible (the key
         // IS the identity), so it needs only intra-delta dedup — `is_key: true`
         // tells the evaluator to skip the committed lookup. Sound only because
-        // a key exists from type creation on: schema_plan refuses adding or
-        // removing constraints on an existing type, so committed rows always
-        // carry derived ids.
+        // a key exists from type creation on: schema_plan refuses every key
+        // change on an existing type, so committed rows always carry derived
+        // ids.
         if let Some(key) = &edge_type.key {
             out.push(Constraint::Unique {
                 table_key: table_key.clone(),
@@ -538,6 +540,48 @@ impl<'a> CommittedState<'a> {
         Ok(present)
     }
 
+    /// The committed `id`s of `table_key` that spell canonical integers, as one
+    /// probeable key set: `Probe` filters by `wanted`, `Scan` reads every id.
+    async fn existing_int_keys(
+        &self,
+        table_key: &str,
+        wanted: &[String],
+        system_columns: SystemColumns,
+        access: AccessPath,
+        admit: &mut load::ByteAdmission<'_>,
+    ) -> Result<(IntKeySet, Box<dyn Send>)> {
+        let ds = self.open(table_key).await?;
+        let bound = match &ds {
+            Some(ds) => {
+                let rows = ds.count_rows(None).await.map_err(OmniError::storage)?;
+                match access {
+                    AccessPath::Probe => rows.min(wanted.len()),
+                    AccessPath::Scan => rows,
+                }
+            }
+            None => 0,
+        };
+        let _input_memory = admit(key_bytes(bound).ok_or_else(|| integer_capacity_error(bound))?)?;
+        let mut keys = Vec::with_capacity(bound);
+        if let Some(ds) = ds.filter(|_| bound > 0) {
+            match access {
+                AccessPath::Probe => {
+                    let expr = col(system_columns.id)
+                        .in_list(wanted.iter().map(|k| lit(k.clone())).collect(), false);
+                    for batch in &scan_filtered(&ds, &[system_columns.id], expr).await? {
+                        push_int_ids(batch, system_columns.id, &mut keys, bound)?;
+                    }
+                }
+                AccessPath::Scan => scan_int_ids(&ds, system_columns.id, &mut keys, bound).await?,
+            }
+        }
+        let layout =
+            IntKeySetLayout::new(keys.len()).ok_or_else(|| integer_capacity_error(keys.len()))?;
+        let retained = admit(layout.retained_bytes)?;
+        let _scratch = admit(layout.scratch_bytes)?;
+        Ok((IntKeySet::build(&keys, layout), retained))
+    }
+
     /// Committed holders of the `columns` tuples in `table_key`, holder lists in
     /// scan order: `Probe` filters per [`UNIQUE_PROBE_CHUNK_KEYS`] chunk, `Scan`
     /// reads the id and group columns once; both match exact tuples in Rust.
@@ -615,34 +659,50 @@ impl<'a> CommittedState<'a> {
         let Some(ds) = self.open_cardinality(edge_table).await? else {
             return Ok(Vec::new());
         };
-        edges_matching(&ds, key_col, keys, system_columns).await
+        let expr = col(key_col).in_list(keys.iter().map(|k| lit(k.clone())).collect(), false);
+        let batches = scan_filtered(&ds, &[system_columns.id, system_columns.src], expr).await?;
+        let mut out = Vec::new();
+        for batch in &batches {
+            let ids = string_col(batch, system_columns.id)?;
+            let srcs = string_col(batch, system_columns.src)?;
+            for i in 0..batch.num_rows() {
+                out.push((ids.value(i).to_string(), srcs.value(i).to_string()));
+            }
+        }
+        Ok(out)
     }
 
-    /// Edges `(id, src)` of `edge_table` matching `keys` on `key_col` as they
-    /// stood before this write. An overwritten table's committed view is
-    /// empty, but the sources its removed or re-placed edges left still lose
-    /// them, so they are read from the pre-overwrite snapshot; every other
-    /// table reads the cardinality view.
-    async fn prior_edges(
+    /// The smallest source in `edge_table`'s image before this write that
+    /// `reject` names, read by one bounded scan of the src column: the
+    /// replaced image of an overwritten table, which its committed view hides.
+    async fn first_replaced_source(
         &self,
         edge_table: &str,
-        key_col: &str,
-        keys: &[String],
         system_columns: SystemColumns,
-    ) -> Result<Vec<(String, String)>> {
-        if !self.overwritten.contains(edge_table) {
-            return self
-                .committed_edges(edge_table, key_col, keys, system_columns)
-                .await;
-        }
+        reject: impl Fn(&str) -> bool,
+    ) -> Result<Option<String>> {
         let Some(committed) = self.committed else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
-        if keys.is_empty() || committed.dataset(edge_table).is_none() {
-            return Ok(Vec::new());
+        if committed.dataset(edge_table).is_none() {
+            return Ok(None);
         }
         let ds = committed.open_lance_dataset(edge_table).await?;
-        edges_matching(&ds, key_col, keys, system_columns).await
+        let mut stream = scan_bounded(&ds, &[system_columns.src]).await?;
+        let mut first: Option<String> = None;
+        while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+            let srcs = string_col(&batch, system_columns.src)?;
+            for row in 0..srcs.len() {
+                if srcs.is_null(row) {
+                    continue;
+                }
+                let src = srcs.value(row);
+                if reject(src) && first.as_deref().is_none_or(|smallest| src < smallest) {
+                    first = Some(src.to_string());
+                }
+            }
+        }
+        Ok(first)
     }
 
     /// The first committed edge a single-table node overwrite would strand.
@@ -776,29 +836,6 @@ async fn scan_filtered(ds: &Dataset, projection: &[&str], expr: Expr) -> Result<
     .map_err(OmniError::storage)
 }
 
-/// Edges `(id, src)` of `ds` whose `key_col` (id or src) is one of `keys`.
-async fn edges_matching(
-    ds: &Dataset,
-    key_col: &str,
-    keys: &[String],
-    system_columns: SystemColumns,
-) -> Result<Vec<(String, String)>> {
-    if keys.is_empty() {
-        return Ok(Vec::new());
-    }
-    let expr = col(key_col).in_list(keys.iter().map(|k| lit(k.clone())).collect(), false);
-    let batches = scan_filtered(ds, &[system_columns.id, system_columns.src], expr).await?;
-    let mut out = Vec::new();
-    for batch in &batches {
-        let ids = string_col(batch, system_columns.id)?;
-        let srcs = string_col(batch, system_columns.src)?;
-        for i in 0..batch.num_rows() {
-            out.push((ids.value(i).to_string(), srcs.value(i).to_string()));
-        }
-    }
-    Ok(out)
-}
-
 /// Stream `ds` projecting `projection` in bounded batches, unfiltered. The
 /// `Scan` access path and the overwrite id sweep read whole tables this way.
 async fn scan_bounded(
@@ -876,6 +913,45 @@ pub(crate) async fn overwrite_removed_ids(
         }
     }
     Ok(removed)
+}
+
+/// A key count whose vectors cannot be addressed: the allocation ceiling as
+/// the limit, the keys' own bytes as the demand.
+fn integer_capacity_error(keys: usize) -> OmniError {
+    OmniError::resource_limit(
+        "query_memory_bytes",
+        isize::MAX as u64,
+        (keys as u64).saturating_mul(size_of::<i64>() as u64),
+    )
+}
+
+/// Every committed id of `ds` that spells a canonical integer, at most `bound`.
+async fn scan_int_ids(ds: &Dataset, id: &str, keys: &mut Vec<i64>, bound: usize) -> Result<()> {
+    let mut stream = scan_bounded(ds, &[id]).await?;
+    while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+        push_int_ids(&batch, id, keys, bound)?;
+    }
+    Ok(())
+}
+
+/// Every non-null canonical-integer value of `batch`'s `name` column, appended
+/// to `keys`; a value that is not a canonical integer is no id of an
+/// integer-keyed table and is skipped.
+fn push_int_ids(batch: &RecordBatch, name: &str, keys: &mut Vec<i64>, bound: usize) -> Result<()> {
+    let column = string_col(batch, name)?;
+    for row in 0..column.len() {
+        if !column.is_null(row) {
+            if let Some(key) = canonical_i64(column.value(row)) {
+                if keys.len() == bound {
+                    return Err(OmniError::manifest_internal(
+                        "integer endpoint scan exceeded its admitted row bound",
+                    ));
+                }
+                keys.push(key);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn string_col<'b>(batch: &'b RecordBatch, name: &str) -> Result<&'b StringArray> {
@@ -1319,14 +1395,35 @@ where
         Some(change) => card_plan(change, system_columns)?,
         None => CardPlan::default(),
     };
+    let written = match written_sources {
+        Some(change) => delta_id_set(change, system_columns)?,
+        None => HashSet::new(),
+    };
+    let deleted_src_nodes: HashSet<String> = changeset
+        .get(&format!("node:{}", edge_type.from_type))
+        .map(|change| change.deleted_ids.iter().cloned().collect())
+        .unwrap_or_default();
+    if card.min > 0 && committed.overwritten.contains(edge_table) {
+        return evaluate_replaced_cardinality(
+            edge_table,
+            edge_type,
+            &plan,
+            &written,
+            &deleted_src_nodes,
+            committed,
+            system_columns,
+            sink,
+        )
+        .await;
+    }
 
-    // Prior srcs of the edges this delta touches. `removed_edges` are the
+    // Committed srcs of the edges this delta touches. `removed_edges` are the
     // deleted ids (direct deletes; a node-delete cascade already lands those ids
-    // in `deleted_ids`; an overwrite lands the ids its batch omits). `moved_from`
-    // are the changed ids' OLD srcs: an upsert that moves an edge's src vacates
-    // its old src, which must be recounted or a drop below @card min is missed.
+    // in `deleted_ids`). `moved_from` are the changed ids' OLD committed srcs: an
+    // upsert that moves an edge's src vacates its old src, which must be
+    // recounted or a drop below @card min is missed.
     let removed_edges = committed
-        .prior_edges(
+        .committed_edges(
             edge_table,
             system_columns.id,
             &plan.removed_ids,
@@ -1334,22 +1431,13 @@ where
         )
         .await?;
     let moved_from = committed
-        .prior_edges(
+        .committed_edges(
             edge_table,
             system_columns.id,
             &plan.changed_ids,
             system_columns,
         )
         .await?;
-    let written = match written_sources {
-        Some(change) => delta_id_set(change, system_columns)?,
-        None => HashSet::new(),
-    };
-
-    let deleted_src_nodes: HashSet<String> = changeset
-        .get(&format!("node:{}", edge_type.from_type))
-        .map(|change| change.deleted_ids.iter().cloned().collect())
-        .unwrap_or_default();
     let affected = card_affected(
         &plan,
         &removed_edges,
@@ -1378,6 +1466,40 @@ where
         &committed_for_affected,
         sink,
     )
+}
+
+/// `@card` under a non-zero minimum for an edge table the write replaces (an
+/// `overwrite` load). Every source of the replaced image or the delta then
+/// holds exactly its coalesced delta edges, so a source the overwrite empties
+/// is below the minimum although no delta row names it. The replaced image's
+/// sources stream past once in bounded batches and only the smallest source
+/// the delta leaves without an edge is kept, so memory stays with the delta.
+/// The first violation in source order is always among those reported, which
+/// is the one a load refuses on. A src that is itself a deleted node is
+/// skipped.
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_replaced_cardinality<F>(
+    edge_table: &str,
+    edge_type: &EdgeType,
+    plan: &CardPlan,
+    written: &HashSet<String>,
+    deleted_src_nodes: &HashSet<String>,
+    committed: &CommittedState<'_>,
+    system_columns: SystemColumns,
+    sink: &mut F,
+) -> Result<()>
+where
+    F: FnMut(Violation) -> Result<()>,
+{
+    let delta_sources: HashSet<&str> = plan.delta_by_id.values().map(String::as_str).collect();
+    let emptied = committed
+        .first_replaced_source(edge_table, system_columns, |src| {
+            !delta_sources.contains(src) && !deleted_src_nodes.contains(src)
+        })
+        .await?;
+    let mut affected = card_affected(plan, &[], &[], written, deleted_src_nodes);
+    affected.extend(emptied);
+    card_violations(edge_table, edge_type, plan, &affected, &[], sink)
 }
 
 #[cfg(test)]

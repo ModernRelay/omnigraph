@@ -83,6 +83,14 @@ pub const DEFINITIONS: &[SettingSpec] = &[
         doc: "how a merge finds the entities it classifies: the full-scan walk, the lineage path, or both compared",
     },
     SettingSpec {
+        name: "change_lineage",
+        kind: SettingKind::Enum(&["off", "on", "verify"]),
+        default: "on",
+        scope: SettingScope::Request,
+        env: "OMNIGRAPH_CHANGE_LINEAGE",
+        doc: "how a graph diff or commit page finds the entities it compares across a window with no adjacent transaction: the exact ordered merge of both versions, the entities paired by stable identity, or both compared",
+    },
+    SettingSpec {
         name: "ann_nprobes",
         kind: SettingKind::Integer { min: 0, max: None },
         default: "20",
@@ -99,7 +107,7 @@ pub const DEFINITIONS: &[SettingSpec] = &[
         default: "8",
         scope: SettingScope::Process,
         env: "OMNIGRAPH_LOAD_CONCURRENCY",
-        doc: "the width of the staged-write fan-out for `load` and `mutate`",
+        doc: "the width of the staged-write fan-out for `load` and `mutate`: tables staged at once, and in one `load csv` overwrite the Lance writers and the streams that parse the source (one per 8 MiB of it, at most this many)",
     },
     SettingSpec {
         name: "traversal_work_limit",
@@ -163,6 +171,7 @@ pub enum SettingId {
     Engine,
     RrfPlan,
     MergeLineage,
+    ChangeLineage,
     AnnNprobes,
     StageWriteConcurrency,
     TraversalWorkLimit,
@@ -179,6 +188,7 @@ impl SettingId {
         SettingId::Engine,
         SettingId::RrfPlan,
         SettingId::MergeLineage,
+        SettingId::ChangeLineage,
         SettingId::AnnNprobes,
         SettingId::StageWriteConcurrency,
         SettingId::TraversalWorkLimit,
@@ -358,6 +368,21 @@ enum_spelling!(Traversal { Auto => "auto", Indexed => "indexed", Csr => "csr" })
 enum_spelling!(RrfPlan { Auto => "auto", ForcePrefilter => "force_prefilter", ForcePostfilter => "force_postfilter" });
 enum_spelling!(MergeLineage { Off => "off", On => "on", Verify => "verify" });
 
+/// `change_lineage`: how a change read finds the rows it compares across a
+/// window with no adjacent transaction. `Off` is the exact ordered merge of
+/// both pinned versions; `On` pairs the live rows by stable row id and skips
+/// the pairs whose version stamps are equal; `Verify` runs both and refuses
+/// a page on which they disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeLineage {
+    Off,
+    On,
+    Verify,
+}
+
+enum_spelling!(ChangeLineage { Off => "off", On => "on", Verify => "verify" });
+
 /// Where a setting's current value came from, the `source` column of `show`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -394,6 +419,7 @@ pub struct SessionSettings {
     engine: Engine,
     rrf_plan: RrfPlan,
     merge_lineage: MergeLineage,
+    change_lineage: ChangeLineage,
     ann_nprobes: Option<usize>,
     stage_write_concurrency: usize,
     traversal_work_limit: u64,
@@ -405,14 +431,15 @@ pub struct SessionSettings {
 }
 
 impl Default for SessionSettings {
-    /// The definition's defaults; `merge_lineage` is `verify` in a debug
-    /// build, `on` otherwise.
+    /// The definition's defaults; `merge_lineage` and `change_lineage` are
+    /// `verify` in a debug build, `on` otherwise.
     fn default() -> Self {
         let mut settings = SessionSettings {
             traversal: Traversal::Auto,
             engine: Engine::V2,
             rrf_plan: RrfPlan::Auto,
             merge_lineage: MergeLineage::On,
+            change_lineage: ChangeLineage::On,
             ann_nprobes: None,
             stage_write_concurrency: 1,
             traversal_work_limit: 1,
@@ -429,6 +456,7 @@ impl Default for SessionSettings {
         }
         if cfg!(debug_assertions) {
             settings.merge_lineage = MergeLineage::Verify;
+            settings.change_lineage = ChangeLineage::Verify;
         }
         settings
     }
@@ -473,6 +501,9 @@ impl SessionSettings {
             SettingId::MergeLineage => {
                 self.merge_lineage = parse_enum(id, value, MergeLineage::from_spelling)?
             }
+            SettingId::ChangeLineage => {
+                self.change_lineage = parse_enum(id, value, ChangeLineage::from_spelling)?
+            }
             SettingId::AnnNprobes => {
                 let probes = parse_integer(id, value)?;
                 self.ann_nprobes = usize::try_from(probes).ok().filter(|probes| *probes > 0);
@@ -514,6 +545,7 @@ impl SessionSettings {
             SettingId::Engine => self.engine = from.engine,
             SettingId::RrfPlan => self.rrf_plan = from.rrf_plan,
             SettingId::MergeLineage => self.merge_lineage = from.merge_lineage,
+            SettingId::ChangeLineage => self.change_lineage = from.change_lineage,
             SettingId::AnnNprobes => self.ann_nprobes = from.ann_nprobes,
             SettingId::TraversalWorkLimit => self.traversal_work_limit = from.traversal_work_limit,
             SettingId::StageWriteConcurrency => {
@@ -541,6 +573,7 @@ impl SessionSettings {
             SettingId::Engine => self.engine.as_str().to_string(),
             SettingId::RrfPlan => self.rrf_plan.as_str().to_string(),
             SettingId::MergeLineage => self.merge_lineage.as_str().to_string(),
+            SettingId::ChangeLineage => self.change_lineage.as_str().to_string(),
             SettingId::AnnNprobes => self.ann_nprobes.unwrap_or(0).to_string(),
             SettingId::StageWriteConcurrency => self.stage_write_concurrency.to_string(),
             SettingId::TraversalWorkLimit => self.traversal_work_limit.to_string(),
@@ -586,6 +619,10 @@ impl SessionSettings {
 
     pub fn merge_lineage(&self) -> MergeLineage {
         self.merge_lineage
+    }
+
+    pub fn change_lineage(&self) -> ChangeLineage {
+        self.change_lineage
     }
 
     /// The probe cap; `None` is no cap (spelled `0`).
@@ -1045,7 +1082,9 @@ mod tests {
         assert_eq!(names.len(), DEFINITIONS.len(), "names are unique");
         let defaults = SessionSettings::default();
         for id in SettingId::ALL {
-            let expected = if id == SettingId::MergeLineage && cfg!(debug_assertions) {
+            let expected = if matches!(id, SettingId::MergeLineage | SettingId::ChangeLineage)
+                && cfg!(debug_assertions)
+            {
                 "verify"
             } else {
                 id.spec().default
@@ -1059,7 +1098,7 @@ mod tests {
         let err = SettingId::parse("merge_linage").unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unknown setting `merge_linage`; expected one of engine, rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, write_max_bytes, load_source_max_bytes, query_memory_bytes, history_release_bytes, explain_dump_dir"
+            "unknown setting `merge_linage`; expected one of engine, rrf_plan, merge_lineage, change_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, write_max_bytes, load_source_max_bytes, query_memory_bytes, history_release_bytes, explain_dump_dir"
         );
         let err = SessionSettings::default().with("engine", "v1").unwrap_err();
         assert_eq!(

@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-storage"
-version = "0.14.0"
+version = "0.14.1"
 edition = "2024"
 description = "Shared local and object-store control-object storage boundary for Omnigraph."
 license = "MIT"
@@ -16,6 +16,7 @@ object_store = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]

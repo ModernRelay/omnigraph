@@ -299,17 +299,29 @@ pub(crate) fn validate_current_source_matches(
         .map_err(|err| schema_lock_conflict(err.to_string()))?;
     let accepted_hash =
         schema_shape_hash_from_ir(ir).map_err(|err| schema_lock_conflict(err.to_string()))?;
-    if current_hash != accepted_hash {
-        return Err(schema_lock_conflict(
-            "schema-contract source no longer matches the accepted compiled schema",
-        ));
+    if current_hash == accepted_hash {
+        return Ok(());
     }
-    Ok(())
+    // Older admission treated every `..max` as `min..`. A stored contract
+    // retains that meaning only when the complete historical shape matches
+    // its already validated IR, never by mixing endpoint interpretations.
+    if let Some(historical) = current_source_shape.with_historical_range_endpoints() {
+        let historical_hash =
+            schema_shape_hash(&historical).map_err(|err| schema_lock_conflict(err.to_string()))?;
+        if historical_hash == accepted_hash {
+            return Ok(());
+        }
+    }
+    Err(schema_lock_conflict(
+        "schema-contract source no longer matches the accepted compiled schema",
+    ))
 }
 
 /// Compile a persisted `.pg` source with the compatibility parser, so a root
-/// admitted before v0.10 with body-level @unique(Blob) remains openable; init
-/// and the desired side of a schema apply use the strict parser.
+/// admitted with body-level @unique(Blob) or an integer range bound stored as
+/// Float remains openable; init and the desired side of a schema apply use
+/// the strict parser. Historical range endpoint roles are checked separately
+/// against the complete accepted IR by `validate_current_source_matches`.
 pub(crate) fn compile_schema_source(source: &str) -> Result<SchemaShape> {
     let schema = parse_persisted_schema_contract(source).map_err(|err| {
         schema_lock_conflict(format!(

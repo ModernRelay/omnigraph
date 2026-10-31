@@ -192,6 +192,7 @@ slug: String
 --- expect plan
 expand $d $t: selection named [Knows out]
 rank fuse row tiebreak [$t.@id]
+scan Doc as $d: ranked nearest diagnostics present
 
 --- query
 query fused_sparse_wildcard($q: Vector(4), $other: Vector(4)) {

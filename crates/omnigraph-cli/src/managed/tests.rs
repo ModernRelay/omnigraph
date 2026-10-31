@@ -1,6 +1,52 @@
 use super::*;
 use clap::Parser;
 
+#[test]
+fn registration_uses_only_attested_endpoint_and_refuses_incarnation_drift() {
+    let mut binding = Binding {
+        api: "https://api.example/prefix".into(),
+        organization_id: Some("org_test".into()),
+        cluster: None,
+        control_auth: ControlAuth::HumanDevice,
+    };
+    let mut row = json!({"cluster_id":"cluster_one","incarnation":"incarnation_one","endpoint":"https://unattested.example"});
+    let listing = |row: &Value| json!({"data":{"clusters":[row]}});
+    let target = target_from_listing(&binding, "work", "cluster_one", &listing(&row)).unwrap();
+    assert!(matches!(
+        target,
+        crate::operator_schema::Target::Managed { endpoint: None, .. }
+    ));
+    row["data_endpoint"] = json!("https://data.example/prefix");
+    let target = target_from_listing(&binding, "work", "cluster_one", &listing(&row)).unwrap();
+    assert!(
+        matches!(target, crate::operator_schema::Target::Managed { endpoint: Some(endpoint), .. } if endpoint == "https://data.example/prefix/")
+    );
+    binding.cluster = Some(ClusterBinding {
+        cluster_id: "cluster_one".into(),
+        cluster_incarnation: "incarnation_other".into(),
+        endpoint: Some("https://existing.example/".into()),
+        default_graph: None,
+    });
+    assert_eq!(
+        target_from_listing(&binding, "work", "cluster_one", &listing(&row))
+            .unwrap_err()
+            .body["type"],
+        "target_mismatch"
+    );
+    binding.cluster = None;
+    row["data_endpoint"] = json!("http://127.0.0.1:9000");
+    assert!(target_from_listing(&binding, "work", "cluster_one", &listing(&row)).is_err());
+    assert!(
+        target_from_listing(
+            &binding,
+            "work",
+            "cluster_one",
+            &json!({"data":{"clusters":[row,row]}})
+        )
+        .is_err()
+    );
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum OutputFault {
     PartialWrite,
@@ -155,37 +201,56 @@ fn managed_output_preserves_bytes_and_recovery_details_on_delivery_failure() {
         }
     }
 
-    // A lifecycle identity receives the same narrow fallback. Extra fields and
+    // Accepted identities receive the same narrow fallback. Extra fields and
     // reflected error text must never turn recovery into source/secret export.
-    let identity = json!({"cluster_id":"cluster-original","incarnation":"incarnation-original","operation_id":"operation-original","kind":"create"});
-    for fault in [OutputFault::PartialWrite, OutputFault::Flush] {
-        let mut body = json!({"type":"output_delivery_failed","detail":"private-error-content","accepted_operation":identity,"submission":{"idempotency_key":"original-key","request":{"source":"private-request-content"}},"access_token":"private-token-extra","data":{"files":{"secret.pg":"private-source-content"}}});
-        body["accepted_operation"]["token"] = json!("private-identity-extra");
-        let mut stdout = Vec::new();
-        assert_eq!(
-            Output::from_result(Err(Failure { body, exit: 1 }), false, 1)
+    for (field, identity) in [
+        (
+            "accepted_operation",
+            json!({"cluster_id":"cluster-original","incarnation":"incarnation-original","operation_id":"operation-original","kind":"create"}),
+        ),
+        (
+            "accepted_preview",
+            json!({"preview_id":"preview-original","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}),
+        ),
+    ] {
+        for fault in [OutputFault::PartialWrite, OutputFault::Flush] {
+            let mut body = json!({"type":"output_delivery_failed","detail":"private-error-content","submission":{"idempotency_key":"original-key","request":{"source":"private-request-content"}},"access_token":"private-token-extra","data":{"files":{"secret.pg":"private-source-content"}}});
+            body[field] = identity.clone();
+            body[field]["token"] = json!("private-identity-extra");
+            let mut stdout = Vec::new();
+            assert_eq!(
+                Output::from_result(
+                    Err(Failure {
+                        body,
+                        exit: 1,
+                        response_status: None
+                    }),
+                    false,
+                    1
+                )
                 .emit(&mut stdout, &mut FailedOutput::new(fault, 0))
                 .unwrap(),
-            1
-        );
-        let recovery: Value = serde_json::from_slice(&stdout).unwrap();
-        assert_eq!(recovery["accepted_operation"], identity);
-        assert_eq!(recovery["idempotency_key"], "original-key");
-        assert!(!String::from_utf8(stdout).unwrap().contains("private-"));
+                1
+            );
+            let recovery: Value = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(recovery[field], identity);
+            assert_eq!(recovery["idempotency_key"], "original-key");
+            assert!(!String::from_utf8(stdout).unwrap().contains("private-"));
 
-        let mut stdout = Vec::new();
-        let error = Output::from_result(
-            Err(Failure::refused(
-                "invalid_input",
-                "no operation was accepted",
-            )),
-            false,
-            2,
-        )
-        .emit(&mut stdout, &mut FailedOutput::new(fault, 0))
-        .unwrap_err();
-        assert!(stdout.is_empty());
-        assert!(format!("{error:#}").contains("invalid_input"));
+            let mut stdout = Vec::new();
+            let error = Output::from_result(
+                Err(Failure::refused(
+                    "invalid_input",
+                    "no operation was accepted",
+                )),
+                false,
+                2,
+            )
+            .emit(&mut stdout, &mut FailedOutput::new(fault, 0))
+            .unwrap_err();
+            assert!(stdout.is_empty());
+            assert!(format!("{error:#}").contains("invalid_input"));
+        }
     }
 }
 
@@ -200,10 +265,14 @@ async fn managed_deployment_delivery_failures_never_submit_or_poll_again() {
             } else {
                 vec![]
             });
+            crate::operator_routing::test_transport_scope(&[&server.origin], async {
             let api =
                 Api::new(server.origin.clone(), Some("automation-secret".to_owned())).unwrap();
             let context = Context {
-                version: 2,
+                incarnation: "incarnation-one".into(),
+                endpoint: None,
+                default_graph: None,
+                control_auth: ControlAuth::HumanDevice,
                 cluster: "cluster-one".to_owned(),
                 api: server.origin.clone(),
                 organization_id: "org_one".to_owned(),
@@ -212,7 +281,6 @@ async fn managed_deployment_delivery_failures_never_submit_or_poll_again() {
                 "omnigraph",
                 "cluster",
                 "apply",
-                "--managed",
                 "--plan",
                 "preview-original",
                 "--idempotency-key",
@@ -250,6 +318,7 @@ async fn managed_deployment_delivery_failures_never_submit_or_poll_again() {
                     Err(Failure {
                         body: error.body.clone(),
                         exit: error.exit,
+                        response_status: error.response_status,
                     }),
                     false,
                     1,
@@ -295,6 +364,7 @@ async fn managed_deployment_delivery_failures_never_submit_or_poll_again() {
             }
             assert_eq!(server.requests().len(), usize::from(fail_after_key));
             server.assert_complete();
+        }).await;
         }
     }
 }
@@ -305,6 +375,10 @@ fn origins_are_canonical_and_credentials_cannot_change_destination() {
         ("https://CONTROL.example:443/", "https://control.example"),
         ("http://127.0.0.1:3000", "http://127.0.0.1:3000"),
         ("http://[::1]:3000/", "http://[::1]:3000"),
+        (
+            "https://control.example/Prefix/",
+            "https://control.example/Prefix",
+        ),
     ] {
         assert_eq!(canonical_origin(input).unwrap(), expected);
     }
@@ -313,7 +387,6 @@ fn origins_are_canonical_and_credentials_cannot_change_destination() {
         "http://127.0.0.2",
         "http://localhost.evil",
         "https://user@control.example",
-        "https://control.example/path",
         "https://control.example?x",
         "https://control.example#x",
         "file:///tmp/root",
@@ -322,6 +395,28 @@ fn origins_are_canonical_and_credentials_cannot_change_destination() {
     }
     for bad in ["", "../other", "run?x", "run#x", "run:cancel", "run/other"] {
         assert!(identifier(bad).is_err());
+    }
+}
+
+#[test]
+fn control_routes_preserve_prefix_and_refuse_escape_before_credentials() {
+    let api = Api::new(
+        "https://control.example/Prefix".into(),
+        Some("secret".into()),
+    )
+    .unwrap();
+    assert_eq!(
+        api.url("/v1/clusters?limit=10").unwrap().as_str(),
+        "https://control.example/Prefix/v1/clusters?limit=10"
+    );
+    for path in [
+        "//evil.example/v1/clusters",
+        "/v1/../../sibling",
+        "/v1/%2e%2e/sibling",
+        "/v1/%252e%252e/sibling",
+        "https://evil.example/v1/clusters",
+    ] {
+        assert!(api.url(path).is_err());
     }
 }
 
@@ -346,353 +441,99 @@ fn lifecycle_outcomes_preserve_public_exit_contract() {
 }
 
 #[test]
-fn legacy_login_and_managed_login_are_exclusive() {
-    assert!(Cli::try_parse_from(["omnigraph", "login", "prod", "--token", "legacy"]).is_ok());
-    assert!(
-        Cli::try_parse_from(["omnigraph", "login", "--api", "https://control.example"]).is_ok()
-    );
+fn retired_managed_selectors_refuse_and_targets_do_not_add_selector_commands() {
     for args in [
-        vec!["login"],
-        vec!["login", "prod", "--api", "https://control.example"],
-        vec![
-            "login",
-            "--api",
-            "https://control.example",
-            "--token",
-            "legacy",
-        ],
-        vec!["logout", "prod", "--api", "https://control.example"],
+        vec!["login", "old-name"],
+        vec!["use", "cluster-one"],
+        vec!["cluster", "status", "--managed"],
+        vec!["cluster", "status", "--config", "."],
+        vec!["organization", "members", "list", "--managed"],
     ] {
         assert!(Cli::try_parse_from(std::iter::once("omnigraph").chain(args)).is_err());
     }
-    for value in ["0", "3601"] {
-        assert!(
-            Cli::try_parse_from([
-                "omnigraph",
-                "cluster",
-                "plan",
-                "--managed",
-                "--timeout",
-                value
-            ])
-            .is_err()
-        );
+    for verb in ["login", "logout"] {
+        assert!(Cli::try_parse_from(["omnigraph", verb, "--target", "account"]).is_ok());
+        assert!(Cli::try_parse_from(["omnigraph", verb, "--profile", "work"]).is_ok());
+    }
+    for args in [
+        vec![
+            "login",
+            "--create-profile",
+            "work",
+            "--api",
+            "https://control.example",
+        ],
+        vec![
+            "login",
+            "--create-profile",
+            "work",
+            "--organization",
+            "org_one",
+        ],
+    ] {
+        assert!(Cli::try_parse_from(std::iter::once("omnigraph").chain(args)).is_ok());
+    }
+}
+
+fn account() -> Binding {
+    Binding {
+        api: "https://control.example".into(),
+        organization_id: Some("org_one".into()),
+        cluster: None,
+        control_auth: ControlAuth::HumanDevice,
+    }
+}
+
+#[tokio::test]
+async fn incomplete_and_automation_targets_refuse_before_credential_access() {
+    let input = crate::operator::InvocationConfig::at(None, None);
+    let mut binding = account();
+    binding.organization_id = None;
+    for args in [
+        vec!["logout"],
+        vec!["cluster", "list"],
+        vec!["cluster", "token"],
+    ] {
+        let cli = Cli::try_parse_from(std::iter::once("omnigraph").chain(args)).unwrap();
+        let output = dispatch(&cli, &binding, &input, &mut Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(output.body["type"], "organization_required");
+    }
+    binding.organization_id = Some("org_one".into());
+    binding.control_auth = ControlAuth::AutomationEnv;
+    for verb in ["login", "logout"] {
+        let cli = Cli::try_parse_from(["omnigraph", verb]).unwrap();
+        let output = dispatch(&cli, &binding, &input, &mut Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(output.body["type"], "authentication_mode_conflict");
     }
 }
 
 #[test]
-fn contexts_are_exact_and_cannot_hide_unknown_authority() {
-    let dir = tempfile::tempdir().unwrap();
-    let context = Context {
-        version: 2,
-        organization_id: "org_test".into(),
-        cluster: "cluster-a".into(),
-        api: "https://control.example".into(),
-    };
-    save_context(dir.path(), &context).unwrap();
+fn cluster_binding_is_complete_and_response_incarnation_is_an_equality_constraint() {
+    let mut binding = account();
+    assert!(binding.context().is_err());
+    binding.cluster = Some(ClusterBinding {
+        cluster_id: "cluster-one".into(),
+        cluster_incarnation: "incarnation-one".into(),
+        endpoint: None,
+        default_graph: None,
+    });
+    let captured = binding.context().unwrap();
+    assert!(binding.account().is_err());
+    binding.cluster.as_mut().unwrap().cluster_id = "later-edit".into();
+    let body = json!({"meta":{"cluster_id":"cluster-one","incarnation":"incarnation-one"}});
+    captured.verify(&body).unwrap();
+    let mut other = body;
+    other["meta"]["incarnation"] = json!("recreated");
     assert_eq!(
-        read_context(dir.path()).unwrap().unwrap().cluster,
-        "cluster-a"
+        captured.verify(&other).unwrap_err().body["type"],
+        "target_mismatch"
     );
-    let child = dir.path().join("child");
-    std::fs::create_dir(&child).unwrap();
-    assert!(read_context(&child).unwrap().is_none());
-    std::fs::write(
-        dir.path().join(".omnigraph/context"),
-        "version: 1\ncluster: cluster-a\napi: https://control.example\nactor: trusted\n",
-    )
-    .unwrap();
-    assert!(read_context(dir.path()).is_err());
 }
 
 fn parse_cluster(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
     crate::invocation::parse_from(args).map(|parsed| parsed.cli)
-}
-
-#[tokio::test]
-async fn managed_flag_is_explicit_and_local_commands_ignore_context() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir(dir.path().join(".omnigraph")).unwrap();
-    std::fs::write(dir.path().join(".omnigraph/context"), "malformed").unwrap();
-    let config = dir.path().to_str().unwrap();
-    for args in [
-        vec![
-            "omnigraph",
-            "cluster",
-            "status",
-            "--managed",
-            "--config",
-            config,
-        ],
-        vec![
-            "omnigraph",
-            "cluster",
-            "--managed",
-            "status",
-            "--config",
-            config,
-        ],
-    ] {
-        let managed = parse_cluster(&args).unwrap();
-        let output = dispatch(&managed, &mut Vec::new()).await.unwrap();
-        assert_eq!(output.exit, 2);
-        assert_eq!(output.body["type"], "context_invalid");
-    }
-    for verb in ["validate", "plan", "apply", "status", "observe"] {
-        let local = parse_cluster(&["omnigraph", "cluster", verb, "--config", config]).unwrap();
-        assert!(dispatch(&local, &mut Vec::new()).await.is_none(), "{verb}");
-    }
-    // Conflicting selectors refuse before the deliberately malformed context is read.
-    for extra in [
-        vec!["--direct"],
-        vec!["--as", "actor"],
-        vec!["--server", "https://data.example"],
-        vec!["--graph", "knowledge"],
-        vec!["--profile", "prod"],
-        vec!["--store", "file:///unused-store"],
-        vec!["--cluster", "file:///unused-cluster"],
-    ] {
-        let args = [
-            "omnigraph",
-            "cluster",
-            "status",
-            "--managed",
-            "--config",
-            config,
-        ]
-        .into_iter()
-        .chain(extra.iter().copied())
-        .collect::<Vec<_>>();
-        let cli = parse_cluster(&args).unwrap();
-        let output = dispatch(&cli, &mut Vec::new()).await.unwrap();
-        assert_eq!(output.exit, 2, "{extra:?}");
-        assert_eq!(output.body["type"], "managed_scope_conflict", "{extra:?}");
-    }
-    for (extra, kind) in [
-        (vec!["--graph", "knowledge"], "token_profile_conflict"),
-        (
-            vec!["--graph", "knowledge", "--clear"],
-            "token_clear_conflict",
-        ),
-    ] {
-        let args = [
-            "omnigraph",
-            "cluster",
-            "token",
-            "--managed",
-            "--config",
-            config,
-        ]
-        .into_iter()
-        .chain(extra)
-        .collect::<Vec<_>>();
-        let cli = parse_cluster(&args).unwrap();
-        let output = dispatch(&cli, &mut Vec::new()).await.unwrap();
-        assert_eq!(output.exit, 2);
-        assert_eq!(output.body["type"], kind);
-    }
-    for args in [
-        vec!["cluster", "list", "--api", "https://control.example"],
-        vec!["cluster", "pull", "--out", "checkout"],
-        vec![
-            "cluster",
-            "create",
-            "demo",
-            "--api",
-            "https://control.example",
-        ],
-        vec!["cluster", "apply", "--plan", "saved-plan"],
-        vec!["cluster", "plan", "--rev", "revision"],
-        vec!["cluster", "status", "run-id"],
-        vec!["cluster", "status", "--operation", "operation-id"],
-        vec![
-            "cluster",
-            "push",
-            "--expected-revision",
-            "rev",
-            "--message",
-            "update",
-        ],
-        vec!["cluster", "delete", "--incarnation", "inc-one"],
-        vec![
-            "cluster",
-            "undo-delete",
-            "--incarnation",
-            "inc-one",
-            "--deletion-id",
-            "delete-one",
-        ],
-        vec!["cluster", "token"],
-        vec!["cluster", "operation", "op-id"],
-        vec!["cluster", "history"],
-        vec!["cluster", "cancel", "run-id"],
-        vec!["cluster", "apply", "--managed"],
-        vec![
-            "cluster",
-            "apply",
-            "--managed",
-            "--plan",
-            "saved-plan",
-            "--deployment-id",
-            "id",
-        ],
-        vec!["cluster", "status", "--managed", "--deployment-id", "id"],
-        vec!["cluster", "status", "--managed", "--operation", "id"],
-        vec!["cluster", "validate", "--managed"],
-        vec!["cluster", "observe", "--managed"],
-        vec!["cluster", "force-unlock", "lock-id", "--managed"],
-        vec![
-            "cluster",
-            "upgrade-ledger",
-            "--writers-stopped",
-            "--managed",
-        ],
-        vec!["managed", "plan"],
-        vec!["managed", "operation", "op-id"],
-    ] {
-        let args = std::iter::once("omnigraph").chain(args).collect::<Vec<_>>();
-        assert!(parse_cluster(&args).is_err(), "accepted {args:?}");
-    }
-    for args in [
-        vec![
-            "omnigraph",
-            "cluster",
-            "list",
-            "--managed",
-            "--api",
-            "https://control.example",
-        ],
-        vec![
-            "omnigraph",
-            "cluster",
-            "pull",
-            "--managed",
-            "--out",
-            "checkout",
-        ],
-        vec!["omnigraph", "cluster", "operation", "op-id", "--managed"],
-        vec![
-            "omnigraph",
-            "cluster",
-            "plan",
-            "--managed",
-            "--rev",
-            "revision",
-        ],
-        vec![
-            "omnigraph",
-            "cluster",
-            "apply",
-            "--managed",
-            "--plan",
-            "saved-plan",
-        ],
-        vec!["omnigraph", "cluster", "status", "--managed", "delivery-id"],
-        vec![
-            "omnigraph",
-            "cluster",
-            "status",
-            "--managed",
-            "delivery-id",
-            "--wait",
-            "--timeout",
-            "1",
-        ],
-    ] {
-        assert!(parse_cluster(&args).is_ok(), "refused {args:?}");
-    }
-}
-
-#[test]
-fn organization_selection_is_explicit_or_pinned_to_the_exact_folder() {
-    let context = Context {
-        version: 2,
-        cluster: "one".into(),
-        api: "https://api.example".into(),
-        organization_id: "org_one".into(),
-    };
-    assert_eq!(
-        selected_organization(Some(&context), &context.api, None).unwrap(),
-        Some("org_one")
-    );
-    assert_eq!(
-        selected_organization(Some(&context), &context.api, Some("org_one")).unwrap(),
-        Some("org_one")
-    );
-    assert!(selected_organization(Some(&context), &context.api, Some("org_two")).is_err());
-    assert!(selected_organization(Some(&context), "https://other.example", None).is_err());
-    assert!(selected_organization(None, &context.api, Some("../org")).is_err());
-    let dir = tempfile::tempdir().unwrap();
-    save_context(dir.path(), &context).unwrap();
-    let path = dir.path().join(".omnigraph/context");
-    for text in [
-        "version: 1\ncluster: one\napi: https://api.example\n",
-        "version: 2\ncluster: one\napi: https://api.example\n",
-    ] {
-        std::fs::write(&path, text).unwrap();
-        assert!(read_context(dir.path()).is_err());
-    }
-    for args in [
-        vec!["login", "--api", &context.api, "--organization", "org_one"],
-        vec!["logout", "--api", &context.api, "--organization", "org_one"],
-        vec![
-            "use",
-            "one",
-            "--api",
-            &context.api,
-            "--organization",
-            "org_one",
-        ],
-        vec![
-            "cluster",
-            "create",
-            "one",
-            "--managed",
-            "--api",
-            &context.api,
-            "--organization",
-            "org_one",
-        ],
-        vec![
-            "cluster",
-            "operation",
-            "one",
-            "--managed",
-            "--api",
-            &context.api,
-            "--organization",
-            "org_one",
-        ],
-    ] {
-        assert!(
-            parse_cluster(&std::iter::once("omnigraph").chain(args).collect::<Vec<_>>()).is_ok()
-        );
-    }
-    assert!(
-        Cli::try_parse_from(["omnigraph", "login", "named", "--organization", "org_one"]).is_err()
-    );
-}
-
-#[test]
-fn explicit_session_selection_ignores_old_or_foreign_folder_binding() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir(dir.path().join(".omnigraph")).unwrap();
-    for text in [
-        "version: 1\ncluster: old\napi: https://old.example\n",
-        "version: 2\ncluster: old\napi: https://old.example\norganization_id: org_other\n",
-        "invalid: [",
-    ] {
-        std::fs::write(dir.path().join(".omnigraph/context"), text).unwrap();
-        assert_eq!(
-            session_organization(dir.path(), "https://new.example", Some("org_new"))
-                .unwrap()
-                .as_deref(),
-            Some("org_new")
-        );
-        assert!(session_organization(dir.path(), "https://new.example", None).is_err());
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join(".omnigraph/context")).unwrap(),
-            text
-        );
-    }
 }

@@ -6,46 +6,64 @@
 //! route and the mutation evaluator cannot judge the same rows differently.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use arrow_array::{Array, RecordBatch};
+use arrow_array::{Array, RecordBatch, StringArray};
+use lance::Dataset;
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::{Catalog, EdgeType};
 use omnigraph_compiler::ir::{Endpoint, ValidateCheck};
-use omnigraph_planner::{ValidateAccess, ValidateSpec};
+use omnigraph_compiler::types::ScalarType;
+use omnigraph_planner::{EndpointProbe, ValidateAccess, ValidateRemoval, ValidateSpec};
 
 use super::kernels::{
-    CardPlan, UniqueImageBuilder, card_affected, card_observe, card_violations, edge_ri_batch,
-    orphans_in_delta, orphans_retained, unique_coalesced_dups, unique_committed_collisions,
-    unique_probe_keys,
+    CardPlan, FinalKeys, Position, SharedFirstHolders, UniqueImage, UniquePartial, card_affected,
+    card_violations, merge_unique_image, orphan_violation, orphans_retained, unique_coalesced_dups,
+    unique_committed_collisions, unique_probe_keys,
 };
+use super::key_set::{IntKeySet, IntKeySetLayout, canonical_i64, key_bytes};
 use super::{
-    AccessPath, CommittedState, TableChange, Violation, overwrite_removed_ids, string_col,
-    value_violation,
+    AccessPath, CommittedState, TableChange, Violation, integer_capacity_error,
+    overwrite_removed_ids, scan_int_ids, string_col, value_violation,
 };
 use crate::db::Snapshot;
 use crate::error::{OmniError, Result};
 use crate::loader::read_reuse::LoadReadReuse;
-use crate::loader::{LoadMode, validate_enum_constraints, validate_value_constraints};
+use crate::loader::{LoadMode, enum_constraint_failures, value_constraint_failures};
 
 pub(crate) enum LoadPhase {
     RemovedInput,
-    Extracted,
 }
+
+pub(super) type ByteAdmission<'a> = dyn FnMut(usize) -> Result<Box<dyn Send>> + Send + 'a;
 
 type PhaseAdmission<'a> = dyn FnMut(LoadPhase) -> Result<Box<dyn Send>> + Send + 'a;
 type ReadReuseAdmission<'a> = dyn FnMut() -> Option<LoadReadReuse> + Send + 'a;
 
 pub(crate) struct LoadAdmission<'a> {
     pub(crate) phase: Option<&'a mut PhaseAdmission<'a>>,
+    pub(crate) bytes: Option<&'a mut ByteAdmission<'a>>,
     pub(crate) reuse: Option<&'a mut ReadReuseAdmission<'a>>,
     pub(crate) removed: &'a mut (dyn FnMut(&str) -> Result<()> + Send),
     pub(crate) retained: &'a mut (dyn FnMut(&RecordBatch) -> Result<()> + Send),
+}
+
+impl LoadAdmission<'_> {
+    fn reserve_bytes(&mut self, bytes: usize) -> Result<Box<dyn Send>> {
+        match self.bytes.as_mut() {
+            Some(admit) => admit(bytes),
+            None => Ok(Box::new(())),
+        }
+    }
 }
 
 /// Judge `batches`, the whole delta of `table`, against `checks` in order.
 /// `Ok(())` admits the delta; the first violation in check order, then in
 /// the check's own order, is the error, with the evaluator's text.
 /// Admission charges removed ids and the first retained edge before copying them.
+/// The engine sweeps per partition and calls [`judge_load_swept`]; this
+/// sequential form is the tests' door.
+#[cfg(test)]
 pub(crate) async fn judge_load(
     table: &str,
     checks: &[ValidateSpec],
@@ -55,9 +73,54 @@ pub(crate) async fn judge_load(
     batches: &[RecordBatch],
     admission: &mut LoadAdmission<'_>,
 ) -> Result<()> {
+    let extracted = Extracted::sweep(
+        table,
+        checks,
+        catalog,
+        batches,
+        catalog.system_columns,
+        mode == LoadMode::Overwrite,
+    )?;
+    judge_load_swept(
+        table,
+        checks,
+        ValidateRemoval::Scan,
+        catalog,
+        base,
+        mode,
+        batches,
+        batches.iter().map(RecordBatch::num_rows).sum(),
+        extracted,
+        admission,
+    )
+    .await
+}
+
+/// [`judge_load`] with the sweep already done by the caller: the engine's
+/// `ValidateExec` sweeps each partition's batches as they arrive and merges
+/// the partials ([`Extracted::prepare`], [`Merging::finish`]). `removal` is
+/// the plan's word on the ids an overwrite removes: under `Scan` they are
+/// found before the checks run, under `None` the plan carries no check that
+/// reads them, which the committed table's row count must bear out.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn judge_load_swept(
+    table: &str,
+    checks: &[ValidateSpec],
+    removal: ValidateRemoval,
+    catalog: &Catalog,
+    base: &Snapshot,
+    mode: LoadMode,
+    batches: &[RecordBatch],
+    delta_rows: usize,
+    mut extracted: Extracted,
+    admission: &mut LoadAdmission<'_>,
+) -> Result<()> {
     let system_columns = catalog.system_columns;
     let overwrite = mode == LoadMode::Overwrite;
-    let removed = if overwrite {
+    if overwrite && removal == ValidateRemoval::None {
+        removal_omitted_soundly(table, checks, catalog, base).await?;
+    }
+    let removed = if overwrite && removal == ValidateRemoval::Scan {
         let _phase = admission
             .phase
             .as_mut()
@@ -74,24 +137,22 @@ pub(crate) async fn judge_load(
     } else {
         Vec::new()
     };
-    let _phase = admission
-        .phase
-        .as_mut()
-        .map(|admit| admit(LoadPhase::Extracted))
-        .transpose()?;
-    let mut extracted =
-        Extracted::sweep(table, checks, catalog, batches, system_columns, overwrite)?;
     let mut reuse = admission.reuse.as_mut().and_then(|admit| admit());
     let mut cached_base = reuse.as_ref().map(|reuse| {
         let mut snapshot = base.clone();
         snapshot.set_read_caches(reuse.snapshot_caches());
         snapshot
     });
+    let integer_endpoints = checks.iter().any(|spec| {
+        matches!(&spec.check, ValidateCheck::EdgeRi { node_type, .. } if int_keyed(catalog, node_type))
+    });
     let mut first = FirstViolation::default();
     let mut edge_ri_judged = false;
     let mut retained_judged: HashSet<&str> = HashSet::new();
     for (index, spec) in checks.iter().enumerate() {
-        if matches!(spec.check, ValidateCheck::RetainedEdges { .. }) {
+        if matches!(spec.check, ValidateCheck::RetainedEdges { .. })
+            || (integer_endpoints && matches!(spec.check, ValidateCheck::EdgeRi { .. }))
+        {
             drop(cached_base.take());
             drop(reuse.take());
         }
@@ -103,12 +164,11 @@ pub(crate) async fn judge_load(
         match &spec.check {
             ValidateCheck::Value { .. } => first.refuse(extracted.value.take())?,
             ValidateCheck::Unique { columns, .. } => {
-                let (builder, within_batch) = extracted
+                let (image, repeat) = extracted
                     .unique
                     .remove(&index)
                     .ok_or_else(|| missing_facts(spec))?;
-                first.refuse(within_batch)?;
-                let image = builder.finish();
+                first.refuse(repeat)?;
                 unique_coalesced_dups(table, columns, &image.entries, &mut first.sink())?;
                 first.refuse_pending()?;
                 if spec.consults.is_some() {
@@ -129,10 +189,14 @@ pub(crate) async fn judge_load(
                 }
             }
             ValidateCheck::EdgeRi { .. } => {
-                if edge_ri_judged {
+                if edge_ri_judged || delta_rows == 0 {
                     continue;
                 }
                 edge_ri_judged = true;
+                if spec.probe == Some(EndpointProbe::Swept) {
+                    first.refuse(extracted.orphan.take())?;
+                    continue;
+                }
                 let edge_type = edge_type_of(catalog, table)?;
                 let access_of = |wanted: Endpoint| -> Result<AccessPath> {
                     let spec = checks
@@ -143,40 +207,37 @@ pub(crate) async fn judge_load(
                         .unwrap_or(spec);
                     access_path(spec)
                 };
-                let srcs: Vec<String> = extracted
-                    .edges
-                    .iter()
-                    .map(|(_, src, _)| src.clone())
-                    .collect();
-                let dsts: Vec<String> = extracted
-                    .edges
-                    .iter()
-                    .map(|(_, _, dst)| dst.clone())
-                    .collect();
-                let from_exist = committed
-                    .existing_ids(
-                        &format!("node:{}", edge_type.from_type),
-                        &srcs,
-                        system_columns,
-                        access_of(Endpoint::From)?,
-                    )
-                    .await?;
-                let to_exist = committed
-                    .existing_ids(
-                        &format!("node:{}", edge_type.to_type),
-                        &dsts,
-                        system_columns,
-                        access_of(Endpoint::To)?,
-                    )
-                    .await?;
-                orphans_in_delta(
+                let from_keys = EndpointKeys::load(
+                    &committed,
+                    catalog,
+                    &edge_type.from_type,
+                    batches,
+                    system_columns.src,
+                    system_columns,
+                    access_of(Endpoint::From)?,
+                    admission,
+                )
+                .await?;
+                let to_keys = EndpointKeys::load(
+                    &committed,
+                    catalog,
+                    &edge_type.to_type,
+                    batches,
+                    system_columns.dst,
+                    system_columns,
+                    access_of(Endpoint::To)?,
+                    admission,
+                )
+                .await?;
+                first_orphan(
                     table,
                     &edge_type.from_type,
                     &edge_type.to_type,
-                    &extracted.edges,
-                    &from_exist,
-                    &to_exist,
+                    batches,
+                    &from_keys,
+                    &to_keys,
                     system_columns,
+                    admission,
                     &mut first.sink(),
                 )?;
                 first.refuse_pending()?;
@@ -192,18 +253,37 @@ pub(crate) async fn judge_load(
                     delta_by_id,
                     removed_ids: Vec::new(),
                 };
-                // An overwrite's committed view is empty, so the edges it
-                // removes or re-places leave their sources from the prior
-                // image; `removed` is empty unless this load overwrites.
-                let removed_edges = committed
-                    .prior_edges(table, system_columns.id, &removed, system_columns)
+                // An overwrite's committed view is empty, but a source of the
+                // replaced image the delta leaves without an edge is below the
+                // minimum; only the plan's scan of those sources finds it.
+                if overwrite && edge_type.cardinality.min > 0 {
+                    if spec.access != Some(ValidateAccess::Scan) {
+                        return Err(OmniError::manifest_internal(format!(
+                            "Validate: the plan reads the replaced sources of {table} under {:?}, \
+                             not a scan, so a source the overwrite empties would go uncounted",
+                            spec.access
+                        )));
+                    }
+                    super::evaluate_replaced_cardinality(
+                        table,
+                        edge_type,
+                        &plan,
+                        &HashSet::new(),
+                        &HashSet::new(),
+                        &committed,
+                        system_columns,
+                        &mut first.sink(),
+                    )
                     .await?;
+                    first.refuse_pending()?;
+                    continue;
+                }
                 let moved_from = committed
-                    .prior_edges(table, system_columns.id, &plan.changed_ids, system_columns)
+                    .committed_edges(table, system_columns.id, &plan.changed_ids, system_columns)
                     .await?;
                 let affected = card_affected(
                     &plan,
-                    &removed_edges,
+                    &[],
                     &moved_from,
                     &HashSet::new(),
                     &HashSet::new(),
@@ -285,24 +365,379 @@ pub(crate) async fn judge_load(
     Ok(())
 }
 
+/// The position of a row: the slice key `partition << 32 | index` the
+/// source tagged its batch with, and row `row` inside the slice, packed
+/// `partition << 48 | index << 24 | row` so positions sort in source order.
+pub(crate) fn position(slice: usize, row: u64) -> Position {
+    let partition = (slice >> 32) as Position;
+    let index = (slice & 0xff_ffff) as Position;
+    (partition << 48) | (index << 24) | (row & 0xff_ffff)
+}
+
+/// What the sweep extracts, read off the checks once: which facts a
+/// partition keeps, the shards its unique holders split into, and the
+/// endpoints it probes when the plan sweeps the edge's endpoint checks.
+pub(crate) struct SweepPlan {
+    table: String,
+    needs_value: bool,
+    needs_ids: bool,
+    needs_card: bool,
+    unique: Vec<(usize, Vec<String>)>,
+    /// Per uniqueness check, in `unique`'s order: the first holders every
+    /// partition inserts into as it sweeps.
+    unique_holders: Vec<Arc<SharedFirstHolders>>,
+    input_only: bool,
+    /// The swept endpoint checks, `From` before `To`, so a row whose src and
+    /// dst both miss reports its src as [`first_orphan`] does.
+    endpoints: Vec<SweptEndpoint>,
+}
+
+struct SweptEndpoint {
+    endpoint: Endpoint,
+    node_type: String,
+}
+
+impl SweepPlan {
+    /// `shards` is the partitions that sweep at once; each uniqueness check's
+    /// shared holders split into that many locked maps, so the partitions
+    /// rarely wait on one another.
+    pub(crate) fn new(
+        table: &str,
+        checks: &[ValidateSpec],
+        overwrite: bool,
+        shards: usize,
+    ) -> Self {
+        let unique: Vec<(usize, Vec<String>)> = checks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, spec)| match &spec.check {
+                ValidateCheck::Unique { columns, .. } => Some((index, columns.clone())),
+                _ => None,
+            })
+            .collect();
+        let mut endpoints: Vec<SweptEndpoint> = checks
+            .iter()
+            .filter(|spec| spec.probe == Some(EndpointProbe::Swept))
+            .filter_map(|spec| match &spec.check {
+                ValidateCheck::EdgeRi {
+                    endpoint,
+                    node_type,
+                } => Some(SweptEndpoint {
+                    endpoint: *endpoint,
+                    node_type: node_type.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        endpoints.sort_by_key(|swept| swept.endpoint != Endpoint::From);
+        Self {
+            table: table.to_string(),
+            needs_value: checks
+                .iter()
+                .any(|spec| matches!(spec.check, ValidateCheck::Value { .. })),
+            needs_ids: checks.iter().any(|spec| match spec.check {
+                ValidateCheck::Unique { .. } => spec.consults.is_some(),
+                ValidateCheck::SourceCardinality { .. } => true,
+                _ => false,
+            }),
+            needs_card: checks
+                .iter()
+                .any(|spec| matches!(spec.check, ValidateCheck::Cardinality { .. })),
+            unique_holders: unique
+                .iter()
+                .map(|_| Arc::new(SharedFirstHolders::new(shards)))
+                .collect(),
+            unique,
+            input_only: overwrite,
+            endpoints,
+        }
+    }
+
+    /// Whether the partitions probe the endpoint checks as they sweep.
+    pub(crate) fn sweeps_endpoints(&self) -> bool {
+        !self.endpoints.is_empty()
+    }
+
+    /// Whether a uniqueness check's holders are sized and shared.
+    pub(crate) fn has_unique_holders(&self) -> bool {
+        !self.unique_holders.is_empty()
+    }
+
+    /// Every uniqueness check's holders sized for `rows` once, the first time
+    /// a partition has the source's estimate; `admit` charges one check's
+    /// table bytes and returns the charge, or `None` to let that table grow;
+    /// `per_row_charged` is what the drain charges per row for the check,
+    /// which carries the table from some row on.
+    pub(crate) fn size_unique_holders(
+        &self,
+        rows: usize,
+        per_row_charged: usize,
+        admit: &mut dyn FnMut(usize) -> Option<Box<dyn Send>>,
+    ) {
+        for holders in &self.unique_holders {
+            holders.size(rows, per_row_charged, &mut *admit);
+        }
+    }
+
+    /// Every uniqueness check's holders taken out of their shards, one box per
+    /// shard, for the caller to free on workers; the judgment has read them.
+    pub(crate) fn release_unique_holders(&self) -> Vec<Box<dyn Send>> {
+        self.unique_holders
+            .iter()
+            .flat_map(|holders| holders.take_maps())
+            .collect()
+    }
+}
+
+/// The committed integer key sets the swept endpoint checks probe, one per
+/// node type, loaded beside the parse and shared by every partition.
+pub(crate) struct SweptSets {
+    sets: HashMap<String, IntKeySet>,
+}
+
+/// The bytes a partition's probe scratch grows by to parse `rows` more
+/// integer keys per batch than it has room for.
+pub(crate) fn parse_scratch_bytes(rows: usize) -> Result<usize> {
+    key_bytes(rows).ok_or_else(|| integer_capacity_error(rows))
+}
+
+/// The sets the plan's swept endpoint checks probe, admitted but not yet
+/// read: one committed table per distinct endpoint node type with its row
+/// count, the judged route's read (`CommittedState::existing_int_keys` under
+/// `Scan`) once per table instead of once per endpoint. Every byte of the
+/// read is admitted here, before the parse starts, and the scan and build
+/// scratch stay admitted in `transient` until the caller releases them after
+/// the parse, so the loader never moves the pool while a partition charges
+/// it: a refusal's `actual` replays the same under DST.
+pub(crate) struct AdmittedSets {
+    tables: Vec<(String, Option<Dataset>, usize)>,
+    retained: Vec<Box<dyn Send>>,
+    transient: Vec<Box<dyn Send>>,
+}
+
+/// Admit the swept endpoint key sets of `table`'s load: the input, retained
+/// and build scratch bytes of each distinct endpoint table's row count.
+pub(crate) async fn admit_swept_sets(
+    table: &str,
+    checks: &[ValidateSpec],
+    base: &Snapshot,
+    overwrite: bool,
+    admit: &mut ByteAdmission<'_>,
+) -> Result<AdmittedSets> {
+    let committed = CommittedState {
+        committed: Some(base),
+        overwritten: overwrite.then(|| table.to_string()).into_iter().collect(),
+        live: None,
+    };
+    let mut admitted = AdmittedSets {
+        tables: Vec::new(),
+        retained: Vec::new(),
+        transient: Vec::new(),
+    };
+    for spec in checks {
+        let ValidateCheck::EdgeRi { node_type, .. } = &spec.check else {
+            continue;
+        };
+        if spec.probe != Some(EndpointProbe::Swept)
+            || admitted
+                .tables
+                .iter()
+                .any(|(table, _, _)| table == node_type)
+        {
+            continue;
+        }
+        let ds = committed.open(&format!("node:{node_type}")).await?;
+        let rows = match &ds {
+            Some(ds) => ds.count_rows(None).await.map_err(OmniError::storage)?,
+            None => 0,
+        };
+        let layout = IntKeySetLayout::new(rows).ok_or_else(|| integer_capacity_error(rows))?;
+        admitted.transient.push(admit(
+            key_bytes(rows).ok_or_else(|| integer_capacity_error(rows))?,
+        )?);
+        admitted.retained.push(admit(layout.retained_bytes)?);
+        admitted.transient.push(admit(layout.scratch_bytes)?);
+        admitted.tables.push((node_type.clone(), ds, rows));
+    }
+    Ok(admitted)
+}
+
+impl AdmittedSets {
+    /// Read and build every admitted set; the retained guards hold the sets'
+    /// bytes, the transient ones the scan input and build scratch.
+    pub(crate) async fn load(
+        self,
+        system_columns: SystemColumns,
+    ) -> Result<(SweptSets, Vec<Box<dyn Send>>, Vec<Box<dyn Send>>)> {
+        let mut sets = HashMap::new();
+        for (node_type, ds, bound) in self.tables {
+            let mut keys = Vec::with_capacity(bound);
+            if let Some(ds) = ds.filter(|_| bound > 0) {
+                scan_int_ids(&ds, system_columns.id, &mut keys, bound).await?;
+            }
+            let layout = IntKeySetLayout::new(keys.len())
+                .ok_or_else(|| integer_capacity_error(keys.len()))?;
+            sets.insert(node_type, IntKeySet::build(&keys, layout));
+        }
+        Ok((SweptSets { sets }, self.retained, self.transient))
+    }
+}
+
+/// The facts one partition extracted from the batches it drained, every row
+/// placed by its [`Position`]; [`Extracted::prepare`] joins the partitions'.
+pub(crate) struct SweepPartial {
+    /// Per value constraint, by its declaration index: the earliest row that
+    /// violates it, so the merge names constraints in declaration order over
+    /// the whole source, whatever batch or slice each violation sits in.
+    value: Vec<Option<(Position, Violation)>>,
+    ids: HashSet<String>,
+    unique: Vec<UniquePartial>,
+    card: HashMap<String, (Position, String)>,
+    /// The earliest endpoint miss among the partition's rows, when the plan
+    /// sweeps the endpoint checks.
+    orphan: Option<(Position, Violation)>,
+    parsed: Vec<i64>,
+}
+
+impl SweepPartial {
+    pub(crate) fn new(plan: &SweepPlan) -> Self {
+        Self {
+            value: Vec::new(),
+            ids: HashSet::new(),
+            unique: plan
+                .unique_holders
+                .iter()
+                .map(|holders| UniquePartial::new(plan.input_only, Arc::clone(holders)))
+                .collect(),
+            card: HashMap::new(),
+            orphan: None,
+            parsed: Vec::new(),
+        }
+    }
+
+    /// Probe `batch`'s swept endpoints against `sets`, keeping the earliest
+    /// miss: row order, src before dst within a row, as [`first_orphan`]
+    /// reports it over the whole delta. `base` is the batch's first row.
+    pub(crate) fn probe_endpoints(
+        &mut self,
+        plan: &SweepPlan,
+        batch: &RecordBatch,
+        system_columns: SystemColumns,
+        base: Position,
+        sets: &SweptSets,
+    ) -> Result<()> {
+        let mut miss: Option<(Position, Violation)> = None;
+        for swept in &plan.endpoints {
+            let column = match swept.endpoint {
+                Endpoint::From => system_columns.src,
+                Endpoint::To => system_columns.dst,
+            };
+            let keys = sets.sets.get(&swept.node_type).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "swept endpoint check on {} has no loaded key set",
+                    swept.node_type
+                ))
+            })?;
+            let values = string_col(batch, column)?;
+            let Some(row) = first_int_miss(keys, values, &mut self.parsed) else {
+                continue;
+            };
+            let position = base.saturating_add(row as Position);
+            if miss.as_ref().is_none_or(|(at, _)| position < *at) {
+                let ids = string_col(batch, system_columns.id)?;
+                miss = Some((
+                    position,
+                    orphan_violation(
+                        &plan.table,
+                        ids.value(row),
+                        column,
+                        values.value(row),
+                        &swept.node_type,
+                    ),
+                ));
+            }
+        }
+        if let Some((position, violation)) = miss
+            && self.orphan.as_ref().is_none_or(|(at, _)| position < *at)
+        {
+            self.orphan = Some((position, violation));
+        }
+        Ok(())
+    }
+
+    /// Extract `batch`, whose first row sits at `base`; the partition's
+    /// batches arrive in source order, so within one partial later wins.
+    pub(crate) fn observe(
+        &mut self,
+        plan: &SweepPlan,
+        catalog: &Catalog,
+        batch: &RecordBatch,
+        system_columns: SystemColumns,
+        base: Position,
+    ) -> Result<()> {
+        let table = plan.table.as_str();
+        if plan.needs_value {
+            let type_name = table.split_once(':').map(|(_, name)| name).unwrap_or(table);
+            for (index, row, error) in value_check(table, type_name, catalog, batch) {
+                if index >= self.value.len() {
+                    self.value.resize(index + 1, None);
+                }
+                if self.value[index].is_none() {
+                    let position = base.saturating_add(row as Position);
+                    self.value[index] = Some((position, value_violation(table, error)));
+                }
+            }
+        }
+        if plan.needs_ids {
+            let ids = string_col(batch, system_columns.id)?;
+            for row in 0..ids.len() {
+                if !ids.is_null(row) {
+                    self.ids.insert(ids.value(row).to_string());
+                }
+            }
+        }
+        for ((_, columns), partial) in plan.unique.iter().zip(&mut self.unique) {
+            partial.observe(table, columns, batch, system_columns, base)?;
+        }
+        if plan.needs_card {
+            let ids = string_col(batch, system_columns.id)?;
+            let srcs = string_col(batch, system_columns.src)?;
+            for row in 0..batch.num_rows() {
+                self.card.insert(
+                    ids.value(row).to_string(),
+                    (
+                        base.saturating_add(row as Position),
+                        srcs.value(row).to_string(),
+                    ),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 /// What one sweep over the delta extracts for every check at once.
 #[derive(Default)]
-struct Extracted {
-    /// The first value violation in batch order.
+pub(crate) struct Extracted {
+    /// The first value violation: the first constraint in declaration order
+    /// with a violating row anywhere in the delta, at its earliest row.
     value: Option<Violation>,
     /// Every non-null id of the delta, when a consulted uniqueness or a
     /// source cardinality check reads it.
     ids: HashSet<String>,
-    /// Per uniqueness check (by list index): its image under construction and
-    /// the first key repeated anywhere in the input.
-    unique: HashMap<usize, (UniqueImageBuilder, Option<Violation>)>,
-    /// `(id, src, dst)` per row, when an endpoint check reads them.
-    edges: Vec<(String, String, String)>,
+    /// Per uniqueness check (by list index): its image and the first key
+    /// repeated anywhere in the input.
+    unique: HashMap<usize, (UniqueImage, Option<Violation>)>,
     /// Last-wins src per edge id, when a cardinality check reads it.
     card: HashMap<String, String>,
+    /// The first endpoint miss of the delta, when the plan swept the
+    /// endpoint checks on the partitions.
+    orphan: Option<Violation>,
 }
 
 impl Extracted {
+    /// Every batch swept in order as one partial, merged alone.
+    #[cfg(test)]
     fn sweep(
         table: &str,
         checks: &[ValidateSpec],
@@ -311,93 +746,107 @@ impl Extracted {
         system_columns: SystemColumns,
         overwrite: bool,
     ) -> Result<Self> {
-        let mut extracted = Self::default();
-        let needs_value = checks
-            .iter()
-            .any(|spec| matches!(spec.check, ValidateCheck::Value { .. }));
-        let needs_edges = checks
-            .iter()
-            .any(|spec| matches!(spec.check, ValidateCheck::EdgeRi { .. }));
-        let needs_ids = checks.iter().any(|spec| match spec.check {
-            ValidateCheck::Unique { .. } => spec.consults.is_some(),
-            ValidateCheck::SourceCardinality { .. } => true,
-            _ => false,
-        });
-        let needs_card = checks
-            .iter()
-            .any(|spec| matches!(spec.check, ValidateCheck::Cardinality { .. }));
-        let unique_checks: Vec<(usize, &[String])> = checks
-            .iter()
-            .enumerate()
-            .filter_map(|(index, spec)| match &spec.check {
-                ValidateCheck::Unique { columns, .. } => Some((index, columns.as_slice())),
-                _ => None,
-            })
-            .collect();
-        for &(index, _) in &unique_checks {
-            extracted.unique.insert(
-                index,
-                (
-                    if overwrite {
-                        UniqueImageBuilder::for_replacement()
-                    } else {
-                        UniqueImageBuilder::for_input()
-                    },
-                    None,
-                ),
-            );
-        }
-        let type_name = table.split_once(':').map(|(_, name)| name).unwrap_or(table);
+        let plan = SweepPlan::new(table, checks, overwrite, 1);
+        let mut partial = SweepPartial::new(&plan);
+        let mut base = 0;
         for batch in batches {
-            if needs_value && extracted.value.is_none() {
-                extracted.value = value_check(table, type_name, catalog, batch)
-                    .map(|err| value_violation(table, err));
+            partial.observe(&plan, catalog, batch, system_columns, base)?;
+            base += batch.num_rows() as Position;
+        }
+        Ok(Self::prepare(&plan, vec![partial]))
+    }
+
+    /// Join the partitions' partials: the first value violation (the earliest
+    /// row per constraint, then the first constraint in declaration order),
+    /// the union of ids, the last src per edge id, each check's final keys
+    /// merged into its image and its earliest repeat read from the shared
+    /// holders, which the partitions judged as they swept.
+    pub(crate) fn prepare(plan: &SweepPlan, partials: Vec<SweepPartial>) -> Self {
+        let mut value: Vec<Option<(Position, Violation)>> = Vec::new();
+        let mut ids = HashSet::new();
+        let mut card: HashMap<String, (Position, String)> = HashMap::new();
+        let mut finals: Vec<Vec<FinalKeys>> = plan.unique.iter().map(|_| Vec::new()).collect();
+        let mut orphan: Option<(Position, Violation)> = None;
+        for partial in partials {
+            if let Some((position, violation)) = partial.orphan
+                && orphan.as_ref().is_none_or(|(at, _)| position < *at)
+            {
+                orphan = Some((position, violation));
             }
-            if needs_ids {
-                let ids = string_col(batch, system_columns.id)?;
-                for row in 0..ids.len() {
-                    if !ids.is_null(row) {
-                        extracted.ids.insert(ids.value(row).to_string());
+            if partial.value.len() > value.len() {
+                value.resize(partial.value.len(), None);
+            }
+            for (index, found) in partial.value.into_iter().enumerate() {
+                if let Some((position, violation)) = found {
+                    if value[index].as_ref().is_none_or(|(at, _)| position < *at) {
+                        value[index] = Some((position, violation));
                     }
                 }
             }
-            for &(index, columns) in &unique_checks {
-                let (builder, within_batch) = extracted
-                    .unique
-                    .get_mut(&index)
-                    .expect("every uniqueness check has a builder");
-                builder.observe(table, columns, batch, system_columns, &mut |violation| {
-                    within_batch.get_or_insert(violation);
-                    Ok(())
-                })?;
+            ids.extend(partial.ids);
+            for (id, (position, src)) in partial.card {
+                match card.get(&id) {
+                    Some((held, _)) if *held > position => {}
+                    _ => {
+                        card.insert(id, (position, src));
+                    }
+                }
             }
-            if needs_edges {
-                edge_ri_batch(batch, system_columns, &mut extracted.edges)?;
-            }
-            if needs_card {
-                card_observe(batch, system_columns, &mut extracted.card)?;
+            for (index, unique_partial) in partial.unique.into_iter().enumerate() {
+                finals[index].push(unique_partial.into_final_keys());
             }
         }
-        Ok(extracted)
+        let unique = plan
+            .unique
+            .iter()
+            .zip(finals)
+            .zip(&plan.unique_holders)
+            .map(|(((check, _), finals), holders)| {
+                let repeat = holders.first_repeat().map(|(_, violation)| violation);
+                let image = merge_unique_image(finals, repeat.is_some());
+                (*check, (image, repeat))
+            })
+            .collect();
+        Self {
+            value: value
+                .into_iter()
+                .flatten()
+                .next()
+                .map(|(_, violation)| violation),
+            ids,
+            unique,
+            card: card.into_iter().map(|(id, (_, src))| (id, src)).collect(),
+            orphan: orphan.map(|(_, violation)| violation),
+        }
     }
 }
 
-/// The evaluator's row-local value judgment of one batch: `@range`/`@check`
-/// then enum membership on a node, enum membership on an edge.
+/// The evaluator's row-local value judgment of one batch: every violated
+/// constraint with its declaration index and first violating row, `@range`
+/// and `@check` then enum membership on a node, enum membership on an edge.
 fn value_check(
     table: &str,
     type_name: &str,
     catalog: &Catalog,
     batch: &RecordBatch,
-) -> Option<OmniError> {
+) -> Vec<(usize, usize, OmniError)> {
     if table.starts_with("node:") {
-        let node_type = catalog.node_types.get(type_name)?;
-        validate_value_constraints(batch, node_type)
-            .err()
-            .or_else(|| validate_enum_constraints(batch, &node_type.properties, type_name).err())
+        let Some(node_type) = catalog.node_types.get(type_name) else {
+            return Vec::new();
+        };
+        let declared = node_type.range_constraints.len() + node_type.check_constraints.len();
+        let mut failures = value_constraint_failures(batch, node_type);
+        failures.extend(
+            enum_constraint_failures(batch, &node_type.properties, type_name)
+                .into_iter()
+                .map(|(index, row, error)| (declared + index, row, error)),
+        );
+        failures
     } else {
-        let edge_type = catalog.edge_types.get(type_name)?;
-        validate_enum_constraints(batch, &edge_type.properties, type_name).err()
+        match catalog.edge_types.get(type_name) {
+            Some(edge_type) => enum_constraint_failures(batch, &edge_type.properties, type_name),
+            None => Vec::new(),
+        }
     }
 }
 
@@ -446,6 +895,219 @@ fn missing_facts(spec: &ValidateSpec) -> OmniError {
     ))
 }
 
+/// The committed ids of one endpoint table, as the probe reads them: an
+/// integer key set when the node type's `@key` is one `I32`/`I64`/`U32`
+/// property (its ids are canonical decimals), the id strings otherwise.
+enum EndpointKeys {
+    Int {
+        keys: IntKeySet,
+        _memory: Box<dyn Send>,
+    },
+    Text(HashSet<String>),
+}
+
+impl EndpointKeys {
+    async fn load(
+        committed: &CommittedState<'_>,
+        catalog: &Catalog,
+        node_type: &str,
+        batches: &[RecordBatch],
+        column: &str,
+        system_columns: SystemColumns,
+        access: AccessPath,
+        admission: &mut LoadAdmission<'_>,
+    ) -> Result<Self> {
+        let table_key = format!("node:{node_type}");
+        let _wanted_memory = match access {
+            AccessPath::Probe => admission.reserve_bytes(endpoint_value_bytes(batches, column)?)?,
+            AccessPath::Scan => Box::new(()),
+        };
+        if int_keyed(catalog, node_type) {
+            let wanted = match access {
+                AccessPath::Probe => endpoint_values(batches, column)?,
+                AccessPath::Scan => Vec::new(),
+            };
+            let (keys, memory) = committed
+                .existing_int_keys(&table_key, &wanted, system_columns, access, &mut |bytes| {
+                    admission.reserve_bytes(bytes)
+                })
+                .await?;
+            return Ok(Self::Int {
+                keys,
+                _memory: memory,
+            });
+        }
+        let values = endpoint_values(batches, column)?;
+        let ids = committed
+            .existing_ids(&table_key, &values, system_columns, access)
+            .await?;
+        Ok(Self::Text(ids))
+    }
+
+    /// The first row of `column` naming no committed id (a null or a
+    /// non-canonical spelling misses). Integer keys are parsed for the whole
+    /// column into `parsed` first, so the probes run as independent loads.
+    fn first_miss(&self, column: &StringArray, parsed: &mut Vec<i64>) -> Option<usize> {
+        match self {
+            Self::Int { keys, .. } => first_int_miss(keys, column, parsed),
+            Self::Text(ids) => (0..column.len())
+                .find(|&row| column.is_null(row) || !ids.contains(column.value(row))),
+        }
+    }
+}
+
+/// The first row of `column` naming no committed integer key: a null or a
+/// non-canonical spelling misses. The column is parsed into `parsed` first,
+/// so the probes run as independent loads.
+fn first_int_miss(keys: &IntKeySet, column: &StringArray, parsed: &mut Vec<i64>) -> Option<usize> {
+    parsed.clear();
+    let mut unparsed = None;
+    for row in 0..column.len() {
+        let key = (!column.is_null(row))
+            .then(|| canonical_i64(column.value(row)))
+            .flatten();
+        match key {
+            Some(key) => parsed.push(key),
+            None => {
+                unparsed = Some(row);
+                break;
+            }
+        }
+    }
+    parsed
+        .iter()
+        .position(|&key| !keys.contains(key))
+        .or(unparsed)
+}
+
+pub(crate) fn int_keyed(catalog: &Catalog, node_type: &str) -> bool {
+    catalog
+        .node_types
+        .get(node_type)
+        .and_then(|node| match node.key.as_deref() {
+            Some([key]) => node.properties.get(key),
+            _ => None,
+        })
+        .is_some_and(|prop| {
+            !prop.list
+                && matches!(
+                    prop.scalar,
+                    ScalarType::I32 | ScalarType::I64 | ScalarType::U32
+                )
+        })
+}
+
+/// What `endpoint_values` allocates: one `String` per cell plus its text.
+fn endpoint_value_bytes(batches: &[RecordBatch], column: &str) -> Result<usize> {
+    let mut bytes = 0usize;
+    for batch in batches {
+        let endpoints = string_col(batch, column)?;
+        let text = endpoints
+            .iter()
+            .flatten()
+            .fold(0usize, |sum, value| sum.saturating_add(value.len()));
+        bytes = bytes
+            .saturating_add(text)
+            .saturating_add(endpoints.len().saturating_mul(size_of::<String>()));
+    }
+    Ok(bytes)
+}
+
+fn endpoint_values(batches: &[RecordBatch], column: &str) -> Result<Vec<String>> {
+    let mut values = Vec::new();
+    for batch in batches {
+        let endpoints = string_col(batch, column)?;
+        values.extend((0..endpoints.len()).map(|row| endpoints.value(row).to_string()));
+    }
+    Ok(values)
+}
+
+/// The first delta edge, in row order and src before dst, whose endpoint is
+/// absent from its node table: the one violation the endpoint check reports.
+fn first_orphan<F>(
+    edge_table: &str,
+    from_type: &str,
+    to_type: &str,
+    batches: &[RecordBatch],
+    from_keys: &EndpointKeys,
+    to_keys: &EndpointKeys,
+    system_columns: SystemColumns,
+    admission: &mut LoadAdmission<'_>,
+    sink: &mut F,
+) -> Result<()>
+where
+    F: FnMut(Violation) -> Result<()>,
+{
+    let parsed_len = if matches!(from_keys, EndpointKeys::Int { .. })
+        || matches!(to_keys, EndpointKeys::Int { .. })
+    {
+        batches.iter().map(RecordBatch::num_rows).max().unwrap_or(0)
+    } else {
+        0
+    };
+    let _parsed_memory = admission
+        .reserve_bytes(key_bytes(parsed_len).ok_or_else(|| integer_capacity_error(parsed_len))?)?;
+    let mut parsed = Vec::with_capacity(parsed_len);
+    for batch in batches {
+        let ids = string_col(batch, system_columns.id)?;
+        let srcs = string_col(batch, system_columns.src)?;
+        let dsts = string_col(batch, system_columns.dst)?;
+        let src_miss = from_keys.first_miss(srcs, &mut parsed);
+        let dst_miss = to_keys.first_miss(dsts, &mut parsed);
+        let (row, column, values, node_type) = match (src_miss, dst_miss) {
+            (None, None) => continue,
+            (Some(src), Some(dst)) if dst < src => (dst, system_columns.dst, dsts, to_type),
+            (Some(src), _) => (src, system_columns.src, srcs, from_type),
+            (None, Some(dst)) => (dst, system_columns.dst, dsts, to_type),
+        };
+        return sink(orphan_violation(
+            edge_table,
+            ids.value(row),
+            column,
+            values.value(row),
+            node_type,
+        ));
+    }
+    Ok(())
+}
+
+/// A plan omits the removal scan only when nothing can read removed ids: no
+/// retained-edge check is planned, and a referenced node target holds no
+/// committed rows; a manifest count the dataset contradicts refuses the load.
+async fn removal_omitted_soundly(
+    table: &str,
+    checks: &[ValidateSpec],
+    catalog: &Catalog,
+    base: &Snapshot,
+) -> Result<()> {
+    if checks
+        .iter()
+        .any(|spec| matches!(spec.check, ValidateCheck::RetainedEdges { .. }))
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "Validate: the plan omits the removal scan of {table} and reads removed ids in a retained-edge check"
+        )));
+    }
+    let Some(name) = table.strip_prefix("node:") else {
+        return Ok(());
+    };
+    let referenced = catalog
+        .edge_types
+        .values()
+        .any(|edge| edge.from_type == name || edge.to_type == name);
+    if !referenced || base.dataset(table).is_none() {
+        return Ok(());
+    }
+    let ds = base.open_lance_dataset(table).await?;
+    let rows = ds.count_rows(None).await.map_err(OmniError::storage)?;
+    if rows == 0 {
+        return Ok(());
+    }
+    Err(OmniError::manifest_internal(format!(
+        "Validate: the plan omits the removal scan of {table} but the committed table holds {rows} rows"
+    )))
+}
+
 fn edge_type_of<'c>(catalog: &'c Catalog, edge_table: &str) -> Result<&'c EdgeType> {
     edge_table
         .strip_prefix("edge:")
@@ -469,6 +1131,25 @@ mod tests {
     use crate::db::Omnigraph;
 
     const GRAPH_SCHEMA: &str = "node Person {\n  name: String @key\n  email: String @unique\n}\nedge Knows: Person -> Person @card(0..2)\n";
+
+    /// The slice key the source tags its batches with (`csv_source.rs`).
+    fn slice_key(partition: usize, index: usize) -> usize {
+        (partition << 32) | index
+    }
+
+    #[test]
+    fn positions_order_partitions_before_slices_before_rows() {
+        let p0_last_slice = position(slice_key(0, 7), 1_000_000);
+        let p1_first_slice = position(slice_key(1, 0), 0);
+        assert!(position(slice_key(0, 0), 5) < position(slice_key(0, 1), 0));
+        assert!(p0_last_slice < p1_first_slice);
+        assert!(p1_first_slice < position(slice_key(1, 0), 1));
+        assert!(position(slice_key(1, 6), 9) < position(slice_key(2, 0), 0));
+        assert_eq!(
+            p1_first_slice.saturating_add(3),
+            position(slice_key(1, 0), 3)
+        );
+    }
 
     const COMMITTED: &str = r#"{"type": "Person", "data": {"name": "Alice", "email": "alice@x"}}
 {"type": "Person", "data": {"name": "Bob", "email": "bob@x"}}
@@ -520,6 +1201,7 @@ mod tests {
                     version: None,
                 }),
                 check: check.check,
+                probe: None,
             })
             .collect()
     }
@@ -595,6 +1277,7 @@ mod tests {
             batches,
             &mut LoadAdmission {
                 phase: None,
+                bytes: None,
                 reuse: None,
                 removed: &mut |_| Ok(()),
                 retained: &mut |_| Ok(()),
@@ -745,6 +1428,7 @@ mod tests {
             &[person_batch(sc, &[("Alice", "alice@x"), ("Bob", "bob@x")])],
             &mut LoadAdmission {
                 phase: None,
+                bytes: None,
                 reuse: None,
                 removed: &mut |id| {
                     admitted.push(id.to_string());
@@ -773,6 +1457,7 @@ mod tests {
             )],
             &mut LoadAdmission {
                 phase: None,
+                bytes: None,
                 reuse: None,
                 removed: &mut |_| Ok(()),
                 retained: &mut |_| Ok(()),
@@ -780,5 +1465,85 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// A plan that omits the removal scan is refused when a retained-edge
+    /// check still reads removed ids, and when the referenced node target
+    /// holds committed rows: the engine never trusts `none` on its own.
+    #[tokio::test]
+    async fn a_none_plan_refuses_a_listed_retained_edge_check_and_a_populated_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = committed_graph(&dir).await;
+        let catalog = db.catalog();
+        let sc = catalog.system_columns;
+        let snapshot = db.snapshot().await;
+        let checks = checks(
+            &catalog,
+            LoadTarget::Node("Person".into()),
+            LoadStmtMode::Overwrite,
+            ValidateAccess::Scan,
+        );
+        let batches = [person_batch(
+            sc,
+            &[("Alice", "alice@x"), ("Bob", "bob@x"), ("Carol", "carol@x")],
+        )];
+        let listed = judge_load_swept(
+            "node:Person",
+            &checks,
+            ValidateRemoval::None,
+            &catalog,
+            &snapshot,
+            LoadMode::Overwrite,
+            &batches,
+            3,
+            Extracted::sweep("node:Person", &checks, &catalog, &batches, sc, true).unwrap(),
+            &mut LoadAdmission {
+                phase: None,
+                bytes: None,
+                reuse: None,
+                removed: &mut |_| Ok(()),
+                retained: &mut |_| Ok(()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            listed.to_string().contains(
+                "omits the removal scan of node:Person and reads removed ids in a retained-edge check"
+            ),
+            "{listed}"
+        );
+
+        let pruned: Vec<ValidateSpec> = checks
+            .iter()
+            .filter(|spec| !matches!(spec.check, ValidateCheck::RetainedEdges { .. }))
+            .cloned()
+            .collect();
+        let populated = judge_load_swept(
+            "node:Person",
+            &pruned,
+            ValidateRemoval::None,
+            &catalog,
+            &snapshot,
+            LoadMode::Overwrite,
+            &batches,
+            3,
+            Extracted::sweep("node:Person", &pruned, &catalog, &batches, sc, true).unwrap(),
+            &mut LoadAdmission {
+                phase: None,
+                bytes: None,
+                reuse: None,
+                removed: &mut |_| Ok(()),
+                retained: &mut |_| Ok(()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            populated
+                .to_string()
+                .contains("omits the removal scan of node:Person but the committed table holds"),
+            "{populated}"
+        );
     }
 }

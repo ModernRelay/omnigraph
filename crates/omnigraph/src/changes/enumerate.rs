@@ -15,6 +15,7 @@
 
 use lance::Dataset;
 use omnigraph_compiler::SystemColumns;
+use omnigraph_compiler::settings::ChangeLineage;
 
 use super::candidate_scan::{CandidatePlan, EmitSource};
 use super::model::{
@@ -361,6 +362,7 @@ async fn plan_intervals(
     child: &Snapshot,
     schema_identity_domain: &str,
     graph_commit_id: &str,
+    pair_rows_by_identity: bool,
     scope: &ChangeFeedScope,
 ) -> Result<Vec<IntervalPlan>> {
     let intervals = changed_table_intervals(parent, child);
@@ -418,6 +420,7 @@ async fn plan_intervals(
                         to,
                         &from_dataset,
                         &to_dataset,
+                        pair_rows_by_identity,
                     )
                     .await?
                 } else {
@@ -463,10 +466,15 @@ async fn reprove_named_branch_heads(store: &TableStore, snapshot: &Snapshot) -> 
     let Some(branch) = snapshot.graph_branch() else {
         return Ok(());
     };
-    let fresh = crate::db::manifest::ManifestCoordinator::snapshot_at(
+    // Reprove authority with fresh metadata while retaining the captured
+    // provider registry; the data session may contain an earlier page's view.
+    let control_session =
+        crate::lance_access::statement_session(store.session().store_registry(), 0, 0);
+    let fresh = crate::db::manifest::ManifestCoordinator::snapshot_at_with_session(
         store.root_uri(),
         Some(branch),
         snapshot.graph_manifest_version(),
+        &control_session,
     )
     .await?;
     if fresh.graph_head(Some(branch)) != snapshot.graph_head(Some(branch)) {
@@ -477,6 +485,29 @@ async fn reprove_named_branch_heads(store: &TableStore, snapshot: &Snapshot) -> 
         )));
     }
     Ok(())
+}
+
+/// How an interval with no adjacent-transaction proof is discovered: the
+/// session's `change_lineage`, and whether `from` lies on `to`'s first-parent
+/// chain, without which stamp equality proves nothing across the two sides.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChangeDiscovery {
+    pub(crate) lineage: ChangeLineage,
+    pub(crate) from_is_ancestor: bool,
+}
+
+impl ChangeDiscovery {
+    /// A parent-to-child interval, the feed's and the commit page's shape.
+    pub(crate) fn linear(lineage: ChangeLineage) -> Self {
+        Self {
+            lineage,
+            from_is_ancestor: true,
+        }
+    }
+
+    fn pair_rows_by_identity(self) -> bool {
+        self.from_is_ancestor && self.lineage != ChangeLineage::Off
+    }
 }
 
 /// Enumerate one commit's entity changes into `out`, charging `budget` per
@@ -490,6 +521,7 @@ pub(crate) async fn enumerate_commit_changes(
     child: &Snapshot,
     schema_identity_domain: &str,
     graph_commit_id: &str,
+    discovery: ChangeDiscovery,
     scope: &ChangeFeedScope,
     resume: Option<&ContinuationKey>,
     budget: &mut PageBudget,
@@ -501,6 +533,7 @@ pub(crate) async fn enumerate_commit_changes(
         child,
         schema_identity_domain,
         graph_commit_id,
+        discovery.pair_rows_by_identity(),
         scope,
     )
     .await?;
@@ -552,6 +585,32 @@ pub(crate) async fn enumerate_commit_changes(
         // child handle. The pruning decision itself was made by
         // `plan_intervals` before, and covered by, the final head witness — no
         // live history read happens here.
+        let scan_targets = ScanTargets::for_page(budget.remaining_rows, budget.remaining_bytes);
+        let row_identity = matches!(plan.candidate_plan, Some(CandidatePlan::RowIdentity { .. }));
+        if row_identity {
+            crate::instrumentation::record_change_interval_row_identity();
+        } else if plan.candidate_plan.is_none() {
+            crate::instrumentation::record_change_interval_exact_merge();
+        }
+        let verify = row_identity && discovery.lineage == ChangeLineage::Verify;
+        let oracle = if verify {
+            Some(
+                EmitSource::plan(
+                    &plan.from_entry,
+                    plan.from_dataset.clone(),
+                    plan.to_dataset.clone(),
+                    None,
+                    after_id.as_deref(),
+                    scope,
+                    scan_targets,
+                    plan.from_columns,
+                    plan.to_columns,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         let mut source = EmitSource::plan(
             &plan.from_entry,
             plan.from_dataset,
@@ -559,11 +618,14 @@ pub(crate) async fn enumerate_commit_changes(
             plan.candidate_plan,
             after_id.as_deref(),
             scope,
-            ScanTargets::for_page(budget.remaining_rows, budget.remaining_bytes),
+            scan_targets,
             plan.from_columns,
             plan.to_columns,
         )
         .await?;
+        if let Some(oracle) = oracle {
+            source = EmitSource::verified(source, oracle, &plan.from_entry.type_key);
+        }
 
         while let Some(emit) = source.next().await? {
             // The source yields one look-ahead change so we can distinguish a
@@ -665,4 +727,71 @@ pub(crate) async fn enumerate_commit_changes(
         ));
     }
     Ok(CommitEnumeration::Complete)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{Omnigraph, ReadTarget};
+    use crate::loader::LoadMode;
+
+    /// The named-branch re-prove reads `__manifest` on a zero-cache session
+    /// over the store's registry and never through the store's data session.
+    /// Lance keys a cached manifest by dataset URI and version alone where a
+    /// store reports no ETag, so a data session warmed by an earlier page
+    /// must not be the one that answers whether the branch head is unchanged.
+    #[tokio::test]
+    async fn reproving_a_branch_head_reads_nothing_through_the_data_session() {
+        #[cfg(feature = "failpoints")]
+        let _scenario = crate::seams::FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = crate::Session::from_defaults(
+            std::sync::Arc::new(
+                Omnigraph::init(uri, "node Person {\n    name: String @key\n}\n")
+                    .await
+                    .unwrap(),
+            ),
+            omnigraph_compiler::settings::SessionSettings::default(),
+        );
+        db.load(
+            "main",
+            r#"{"type":"Person","data":{"name":"a"}}"#,
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap();
+        db.branch_create("feature").await.unwrap();
+        db.load(
+            "feature",
+            r#"{"type":"Person","data":{"name":"b"}}"#,
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
+        let snapshot = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
+        let store = TableStore::new(
+            db.root_uri(),
+            crate::lance_access::LanceAccessContext::new().data_session(),
+        );
+        // Warm the data session with the branch's own `__manifest` first.
+        crate::db::manifest::ManifestCoordinator::snapshot_at_with_session(
+            store.root_uri(),
+            Some("feature"),
+            snapshot.graph_manifest_version(),
+            &store.session(),
+        )
+        .await
+        .unwrap();
+        let warm = store.session().metadata_cache_stats().await;
+        assert!(warm.num_entries > 0, "the data session was not warmed");
+
+        reprove_named_branch_heads(&store, &snapshot).await.unwrap();
+        let after = store.session().metadata_cache_stats().await;
+        assert_eq!(
+            (after.hits, after.misses, after.num_entries),
+            (warm.hits, warm.misses, warm.num_entries),
+            "the branch-head re-prove consulted the data session's metadata cache"
+        );
+    }
 }

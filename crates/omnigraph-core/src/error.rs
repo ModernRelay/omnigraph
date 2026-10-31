@@ -8,10 +8,29 @@ const STORAGE_MESSAGE_PREFIX: &str = "storage: ";
 
 /// Evidence supplied by the operation that owns its effect boundary, independent
 /// of the error's cause. This does not authorize replay or prove native I/O drain.
+///
+/// `BeforeEffect` and `Unpublished` are definite: a caller deciding whether the
+/// write may have become graph-visible can treat either as "it did not".
+/// `PartlyPublished` says the graph did move, by an earlier step of the same
+/// operation, and keeps the failing step's own definite proof beside that
+/// fact. `Uncertain` is sticky through every composition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionEvidence {
     /// The owning operation has not attempted any durable effect.
     BeforeEffect,
+    /// The owning operation attempted no publication. Every durable effect it
+    /// may have left (a staged data file, a detached table version, its
+    /// transaction file) is one no `__manifest` version names, so the graph
+    /// did not move and the collector reclaims the effect once its recorded
+    /// authority is gone.
+    Unpublished,
+    /// An earlier step of the owning operation published, such as the branch
+    /// a load forks before its rows, and a later step failed; the operation as
+    /// a whole is neither unstarted nor unpublished. `step_unpublished` says
+    /// the failing step proved it published nothing itself (it carried
+    /// `BeforeEffect` or `Unpublished`); without that proof the failure's own
+    /// type says what the step did.
+    PartlyPublished { step_unpublished: bool },
     /// The owning operation cannot establish settled completion.
     Uncertain,
 }
@@ -62,10 +81,14 @@ pub struct ManifestError {
     pub kind: ManifestErrorKind,
     pub message: String,
     pub details: Option<ManifestConflictDetails>,
-    /// Publication may be durable despite an unavailable acknowledgement or
-    /// readback. Retention guards must remain until authority proves it cannot
-    /// still publish; the external error category remains `Internal`.
-    pub publication_in_doubt: bool,
+    /// The graph commit of a publication that may be durable despite an
+    /// unavailable acknowledgement or readback; `None` when no publication is
+    /// in doubt. Retention guards must remain until authority proves it cannot
+    /// still publish; the external error category remains `Internal`. The id
+    /// is an engine identifier, never a storage path, so a log may name it
+    /// where it names no message. A thin box keeps the field one word, so
+    /// every `Result<_, OmniError>` stays under the large-error bound.
+    pub publication_in_doubt: Option<Box<String>>,
 }
 
 impl ManifestError {
@@ -74,7 +97,7 @@ impl ManifestError {
             kind,
             message: message.into(),
             details: None,
-            publication_in_doubt: false,
+            publication_in_doubt: None,
         }
     }
 
@@ -164,6 +187,61 @@ fn format_key_conflict(type_key: &str) -> String {
     format!("{} already has this id", graph_type_subject(type_key))
 }
 
+/// Why a branch cannot start at a graph commit. Each reason is decided before
+/// any effect; none is approximated by a nearby commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchStartRefusal {
+    /// Cleanup reclaimed a table version the commit's snapshot pins.
+    NotRetained {
+        table_key: String,
+        published_dataset_version: u64,
+    },
+    /// The commit was written under another accepted schema than the graph's.
+    SchemaChanged,
+    /// The commit's `__manifest` version predates the storage upgrade; this
+    /// build reads it only through the legacy history.
+    EarlierStorageFormat,
+    /// The branch incarnation that wrote the commit was deleted: its name
+    /// names no branch now, or a later branch created under the same name.
+    BranchDeleted { branch: String },
+    /// The commit is an unpublished proposal, which belongs to no branch's
+    /// history until it is published.
+    UnpublishedCommit,
+    /// The commit is an unattached snapshot, which never becomes branch
+    /// history.
+    UnattachedSnapshot,
+}
+
+fn format_branch_start_refusal(graph_commit_id: &str, reason: &BranchStartRefusal) -> String {
+    let why = match reason {
+        BranchStartRefusal::NotRetained {
+            table_key,
+            published_dataset_version,
+        } => format!(
+            "it is no longer retained: cleanup reclaimed version {published_dataset_version} of \
+             {}; start the branch at a retained commit",
+            graph_type_subject(table_key)
+        ),
+        BranchStartRefusal::SchemaChanged => "it was written under an earlier schema; start the \
+             branch at a commit written under the current schema"
+            .to_string(),
+        BranchStartRefusal::EarlierStorageFormat => "it was written before the storage upgrade; \
+             start the branch at a commit written after it"
+            .to_string(),
+        BranchStartRefusal::BranchDeleted { branch } => format!(
+            "branch '{branch}', which wrote it, was deleted; start the branch at a commit of a \
+             live branch"
+        ),
+        BranchStartRefusal::UnpublishedCommit => "it is an unpublished commit; publish it with \
+             `commit publish` and start the branch at the published commit"
+            .to_string(),
+        BranchStartRefusal::UnattachedSnapshot => {
+            "it is an unattached snapshot, which never becomes branch history".to_string()
+        }
+    };
+    format!("cannot start a branch at commit '{graph_commit_id}': {why}")
+}
+
 fn merge_conflict_kind_label(kind: MergeConflictKind) -> &'static str {
     match kind {
         MergeConflictKind::DivergentInsert => "divergent_insert",
@@ -191,6 +269,17 @@ fn format_merge_conflicts(conflicts: &[MergeConflict]) -> String {
         .join("; ")
 }
 
+/// The command that builds a branch's missing declared indexes, as errors and
+/// reports name it. `<target>` and `<branch>` are placeholders; the CLI
+/// parses every remedy command with them filled in.
+pub const INDEX_BUILD_COMMAND: &str = "omnigraph index build --target <target> --branch <branch>";
+
+/// The command that rebuilds a branch's full-text indexes from its rows with
+/// the engine's analyzer, as errors and reports name it; placeholders as in
+/// [`INDEX_BUILD_COMMAND`].
+pub const FULL_TEXT_REBUILD_COMMAND: &str =
+    "omnigraph index rebuild --kind full-text --target <target> --branch <branch>";
+
 #[derive(Debug, Error)]
 pub enum OmniError {
     /// Operation-local completion evidence. Composing callers must discard
@@ -213,9 +302,20 @@ pub enum OmniError {
     /// be proven compatible. Ordinary reads remain available; do not return a
     /// partial indexed result or infer provenance from the dataset writer.
     #[error(
-        "full-text index '{index}' requires rebuild: {reason}; run omnigraph rebuild-full-text-indexes <URI> --branch <branch> on the live branch (historical snapshots are unchanged)"
+        "full-text index '{index}' requires rebuild: {reason}; run {remedy} on the live branch (historical snapshots are unchanged)",
+        remedy = FULL_TEXT_REBUILD_COMMAND
     )]
     FullTextIndexRebuildRequired { index: String, reason: String },
+    /// A full-text call reads a declared full-text index that has no segment
+    /// at the query's snapshot, so no segment carries the index's analyzer
+    /// and Lance would match with a bare, case-sensitive tokenizer. Refused
+    /// before any scan rather than answered differently; `index` is
+    /// `Type.property`.
+    #[error(
+        "full-text index '{index}' has no segment at this snapshot; build it with {remedy} (historical snapshots are unchanged)",
+        remedy = INDEX_BUILD_COMMAND
+    )]
+    FullTextIndexRequired { index: String },
     /// The exact staged-commit adapter proved that Lance contention was
     /// effect-free. This operation-local signal lets RFC-023 distinguish a
     /// safe key-fence re-evaluation from an arbitrary storage failure; generic
@@ -274,6 +374,13 @@ pub enum OmniError {
         "'{target}' names both a branch and a commit; rename the branch, or name its head by commit id"
     )]
     AmbiguousReadTarget { target: String },
+    /// `branch create` named a graph commit a branch cannot start at. Refused
+    /// before any effect; the commit itself is unchanged.
+    #[error("{}", format_branch_start_refusal(graph_commit_id, reason))]
+    BranchStartRefused {
+        graph_commit_id: String,
+        reason: BranchStartRefusal,
+    },
     /// A change page or feed can no longer be reconstructed contiguously:
     /// cleanup reclaimed a published dataset version one of its commits pins. Recovery is
     /// the exact baseline handshake, never a retried continuation.
@@ -540,15 +647,42 @@ impl From<omnigraph_storage::StorageError> for OmniError {
     }
 }
 
+/// Compose evidence attached after `existing`. Uncertainty is sticky; an
+/// earlier publication outlives a definite proof, which it keeps as the
+/// failing step's own; a later definite claim never replaces an earlier one's
+/// recorded publication.
+fn compose_evidence(existing: CompletionEvidence, added: CompletionEvidence) -> CompletionEvidence {
+    use CompletionEvidence::{BeforeEffect, PartlyPublished, Uncertain, Unpublished};
+    match (existing, added) {
+        (Uncertain, _) | (_, Uncertain) => Uncertain,
+        (
+            PartlyPublished {
+                step_unpublished: inner,
+            },
+            PartlyPublished {
+                step_unpublished: outer,
+            },
+        ) => PartlyPublished {
+            step_unpublished: inner || outer,
+        },
+        (PartlyPublished { step_unpublished }, BeforeEffect | Unpublished) => {
+            PartlyPublished { step_unpublished }
+        }
+        (BeforeEffect | Unpublished, PartlyPublished { .. }) => PartlyPublished {
+            step_unpublished: true,
+        },
+        (BeforeEffect | Unpublished, added @ (BeforeEffect | Unpublished)) => added,
+    }
+}
+
 impl OmniError {
     /// Attach evidence only where the whole owning operation's effect boundary
     /// is known. An inner refusal alone cannot certify a compound operation.
     pub fn with_completion_evidence(self, evidence: CompletionEvidence) -> Self {
         let (source, existing) = self.into_completion_evidence();
-        let evidence = if existing == Some(CompletionEvidence::Uncertain) {
-            CompletionEvidence::Uncertain
-        } else {
-            evidence
+        let evidence = match existing {
+            Some(existing) => compose_evidence(existing, evidence),
+            None => evidence,
         };
         Self::Completion {
             evidence,
@@ -560,16 +694,79 @@ impl OmniError {
         self.with_completion_evidence(CompletionEvidence::BeforeEffect)
     }
 
-    /// Remove only a sub-operation's no-effect proof when composing it after
-    /// earlier work. Never erase explicit uncertainty or recovery evidence.
+    /// Mark a failure between the first durable effect and the publisher
+    /// call: nothing is graph-visible. Only an opaque failure needs the
+    /// mark, one whose type alone leaves open whether the graph moved
+    /// (storage, I/O, DataFusion, an internal manifest or Blob integrity
+    /// error); a typed outcome (a conflict, a precondition, a validation or
+    /// policy refusal, not found, bad request) already states what happened
+    /// and stays as it is, so callers matching on it see the same shape.
+    /// An error that already carries evidence keeps it: `BeforeEffect` is
+    /// the stronger definite claim, and a composer that knows effects
+    /// happened since removes it with [`Self::without_pre_effect_evidence`]
+    /// first; explicit uncertainty is never touched. A failure under an
+    /// earlier publication keeps that publication and gains the step's own
+    /// proof, `step_unpublished`.
+    pub fn unpublished(self) -> Self {
+        if !self.outcome_opaque() {
+            return self;
+        }
+        match self.completion_evidence() {
+            None => self.with_completion_evidence(CompletionEvidence::Unpublished),
+            Some(CompletionEvidence::PartlyPublished {
+                step_unpublished: false,
+            }) => self.with_completion_evidence(CompletionEvidence::PartlyPublished {
+                step_unpublished: true,
+            }),
+            Some(_) => self,
+        }
+    }
+
+    /// Whether the type of this failure leaves open what happened to the
+    /// graph. These are the failures a transport can only call internal.
+    pub fn outcome_opaque(&self) -> bool {
+        matches!(
+            self.without_evidence(),
+            Self::Storage(_)
+                | Self::Io(_)
+                | Self::DataFusion(_)
+                | Self::BlobIntegrity { .. }
+                | Self::Manifest(ManifestError {
+                    kind: ManifestErrorKind::Internal,
+                    ..
+                })
+        )
+    }
+
+    /// Remove a sub-operation's definite proof (no effect, or no
+    /// publication) when composing it after earlier durable work that may
+    /// have published, a failing step's proof under a recorded earlier
+    /// publication included. Never erase explicit uncertainty, recovery
+    /// evidence or the recorded earlier publication itself.
     pub fn without_pre_effect_evidence(self) -> Self {
         let (source, evidence) = self.into_completion_evidence();
         match evidence {
             Some(CompletionEvidence::Uncertain) => {
                 source.with_completion_evidence(CompletionEvidence::Uncertain)
             }
+            Some(CompletionEvidence::PartlyPublished { .. }) => {
+                source.with_completion_evidence(CompletionEvidence::PartlyPublished {
+                    step_unpublished: false,
+                })
+            }
             _ => source,
         }
+    }
+
+    /// Compose a step's failure after an earlier step of the same operation
+    /// published: the operation is [`CompletionEvidence::PartlyPublished`]
+    /// unless its completion is already uncertain, and the step's own
+    /// no-effect or no-publication proof stays beside that fact as
+    /// `step_unpublished`.
+    pub fn after_earlier_publication(self) -> Self {
+        self.with_completion_evidence(CompletionEvidence::PartlyPublished {
+            step_unpublished: false,
+        })
     }
 
     pub fn completion_evidence(&self) -> Option<CompletionEvidence> {
@@ -580,11 +777,12 @@ impl OmniError {
             source,
         } = current
         {
-            if *next == CompletionEvidence::Uncertain {
-                evidence = Some(CompletionEvidence::Uncertain);
-            } else if evidence.is_none() {
-                evidence = Some(*next);
-            }
+            // An inner wrapper composes under the outer ones, as it would have
+            // had the outer evidence been attached after it.
+            evidence = Some(match evidence {
+                Some(outer) => compose_evidence(*next, outer),
+                None => *next,
+            });
             current = source;
         }
         if matches!(
@@ -593,7 +791,7 @@ impl OmniError {
                 | Self::InitializationCommitted { .. }
                 | Self::InitializationIndeterminate { .. }
                 | Self::Manifest(ManifestError {
-                    publication_in_doubt: true,
+                    publication_in_doubt: Some(_),
                     ..
                 })
         ) {
@@ -836,11 +1034,28 @@ impl OmniError {
         Self::Manifest(ManifestError::new(ManifestErrorKind::Internal, message))
     }
 
-    pub fn manifest_publish_in_doubt(message: impl Into<String>) -> Self {
+    /// A publication of graph commit `graph_commit_id` whose outcome is
+    /// unknown: it may be durable, now or later.
+    pub fn manifest_publish_in_doubt(
+        graph_commit_id: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self::Manifest(ManifestError {
-            publication_in_doubt: true,
+            publication_in_doubt: Some(Box::new(graph_commit_id.into())),
             ..ManifestError::new(ManifestErrorKind::Internal, message)
         })
+    }
+
+    /// The graph commit of a publication whose outcome is unknown, through
+    /// any completion evidence wrapped around it.
+    pub fn publication_id(&self) -> Option<&str> {
+        match self.without_evidence() {
+            Self::Manifest(ManifestError {
+                publication_in_doubt: Some(graph_commit_id),
+                ..
+            }) => Some(graph_commit_id.as_str()),
+            _ => None,
+        }
     }
 
     /// Whether a manifest publication lacks a definitive durable outcome.
@@ -849,7 +1064,7 @@ impl OmniError {
         matches!(
             self.without_evidence(),
             Self::Manifest(ManifestError {
-                publication_in_doubt: true,
+                publication_in_doubt: Some(_),
                 ..
             })
         )
@@ -887,6 +1102,16 @@ impl OmniError {
             ManifestError::new(ManifestErrorKind::Conflict, message)
                 .with_details(ManifestConflictDetails::UnattachedCannotPublish { graph_commit_id }),
         )
+    }
+
+    pub fn branch_start_refused(
+        graph_commit_id: impl Into<String>,
+        reason: BranchStartRefusal,
+    ) -> Self {
+        Self::BranchStartRefused {
+            graph_commit_id: graph_commit_id.into(),
+            reason,
+        }
     }
 
     pub fn manifest_row_level_cas_contention(message: impl Into<String>) -> Self {
@@ -1065,7 +1290,9 @@ fn classify_engine_storage_source<'a>(
             return Break(StorageFailureKind::Unknown);
         }
         return match error {
-            lance::Error::Timeout { .. } => Break(StorageFailureKind::Transient),
+            lance::Error::Timeout { .. } | lance::Error::Backpressure { .. } => {
+                Break(StorageFailureKind::Transient)
+            }
             lance::Error::DiskCapExceeded { .. }
             | lance::Error::InvalidInput { .. }
             | lance::Error::InvalidTableLocation { .. }
@@ -1233,7 +1460,7 @@ mod tests {
         );
 
         let explicit = [
-            OmniError::manifest_publish_in_doubt("publish acknowledgement lost"),
+            OmniError::manifest_publish_in_doubt("01JCOMMIT", "publish acknowledgement lost"),
             OmniError::recovery_required("commit", "contract pending"),
             OmniError::InitializationCommitted {
                 uri: "memory://graph".to_string(),
@@ -1270,6 +1497,261 @@ mod tests {
         assert!(changed.is_read_set_changed());
     }
 
+    /// A failure between the first durable effect and the publisher call is
+    /// definite: the outer composer's `Unpublished` wins over an inner
+    /// `BeforeEffect`, uncertainty wins over both, and composition after
+    /// earlier published work strips it like a no-effect proof.
+    #[test]
+    fn unpublished_evidence_is_definite_and_never_hides_uncertainty_issue_1067() {
+        let staged = OmniError::Storage(StorageFailure::new(
+            StorageFailureKind::Transient,
+            "storage: detached manifest put failed",
+        ))
+        .unpublished();
+        assert_eq!(
+            staged.completion_evidence(),
+            Some(CompletionEvidence::Unpublished)
+        );
+        assert_eq!(
+            staged.to_string(),
+            "storage: detached manifest put failed",
+            "the wrapper is transparent in the message"
+        );
+        let (cause, evidence) = staged.into_completion_evidence();
+        assert_eq!(evidence, Some(CompletionEvidence::Unpublished));
+        assert!(matches!(cause, OmniError::Storage(_)));
+
+        // A sub-operation's own no-effect proof is the stronger definite
+        // claim and survives; a composer that staged effects since strips
+        // it first, and then the no-publication mark applies.
+        let refused = OmniError::manifest_internal("table reached commit without a transaction")
+            .before_effect();
+        assert_eq!(
+            refused.to_string(),
+            OmniError::manifest_internal("table reached commit without a transaction").to_string()
+        );
+        assert_eq!(
+            OmniError::manifest_internal("refused before any effect")
+                .before_effect()
+                .unpublished()
+                .completion_evidence(),
+            Some(CompletionEvidence::BeforeEffect)
+        );
+        assert_eq!(
+            OmniError::manifest_internal("refused before any effect")
+                .before_effect()
+                .without_pre_effect_evidence()
+                .unpublished()
+                .completion_evidence(),
+            Some(CompletionEvidence::Unpublished)
+        );
+        assert_eq!(
+            OmniError::Io(std::io::Error::other("marked twice"))
+                .unpublished()
+                .unpublished()
+                .completion_evidence(),
+            Some(CompletionEvidence::Unpublished),
+            "a repeated mark adds nothing"
+        );
+        for opaque in [
+            OmniError::Io(std::io::Error::other("data file put failed")),
+            OmniError::DataFusion("execution failure".into()),
+            OmniError::blob_integrity("descriptor mismatch"),
+            OmniError::manifest_internal("coordinator view is stale"),
+        ] {
+            let message = opaque.to_string();
+            assert_eq!(
+                opaque.unpublished().completion_evidence(),
+                Some(CompletionEvidence::Unpublished),
+                "{message}"
+            );
+        }
+
+        // A typed outcome already says what happened: it keeps its shape, so
+        // a caller matching on the variant sees the same error.
+        for typed in [
+            OmniError::manifest("bad request"),
+            OmniError::manifest_conflict("authority conflict"),
+            OmniError::manifest_read_set_changed("graph_head:main", None, None),
+            OmniError::KeyConflict {
+                type_key: "node:Person".into(),
+                entity_id: Some("alice".into()),
+            },
+            OmniError::PreconditionFailed {
+                branch: "main".into(),
+                expected: "old".into(),
+                actual: Some("current".into()),
+            },
+            OmniError::Policy("denied".into()),
+        ] {
+            let message = typed.to_string();
+            let marked = typed.unpublished();
+            assert_eq!(marked.completion_evidence(), None, "{message}");
+            assert!(!matches!(marked, OmniError::Completion { .. }), "{message}");
+        }
+
+        for uncertain in [
+            OmniError::manifest_publish_in_doubt("01JCOMMIT", "publish acknowledgement lost"),
+            OmniError::recovery_required("commit", "contract pending"),
+            OmniError::manifest("returned after effects")
+                .with_completion_evidence(CompletionEvidence::Uncertain),
+        ] {
+            let message = uncertain.to_string();
+            let marked = uncertain.unpublished();
+            assert_eq!(
+                marked.completion_evidence(),
+                Some(CompletionEvidence::Uncertain),
+                "{message}"
+            );
+            assert_eq!(
+                marked.to_string(),
+                message,
+                "explicit uncertainty is returned as it was"
+            );
+        }
+        assert_eq!(
+            OmniError::Io(std::io::Error::other("no publication"))
+                .unpublished()
+                .without_pre_effect_evidence()
+                .completion_evidence(),
+            None,
+            "composition after earlier published work drops the definite proof"
+        );
+    }
+
+    /// A step that fails after an earlier step of the same operation
+    /// published says so: the mark outlives the step's own definite proofs
+    /// and keeps them beside it, keeps the typed cause, and never hides
+    /// uncertainty.
+    #[test]
+    fn an_earlier_publication_outlives_definite_evidence_and_never_hides_uncertainty() {
+        let partly =
+            |step_unpublished| Some(CompletionEvidence::PartlyPublished { step_unpublished });
+        let refused = || OmniError::key_conflict("node:Person", "Bob");
+        let marked = refused().before_effect().after_earlier_publication();
+        assert_eq!(marked.completion_evidence(), partly(true));
+        assert_eq!(marked.to_string(), refused().to_string());
+        for (composed, step_unpublished) in [
+            (refused().after_earlier_publication(), false),
+            (refused().after_earlier_publication().before_effect(), false),
+            (refused().after_earlier_publication().unpublished(), false),
+            (
+                refused()
+                    .before_effect()
+                    .after_earlier_publication()
+                    .without_pre_effect_evidence(),
+                false,
+            ),
+            (
+                OmniError::Io(std::io::Error::other("row write failed"))
+                    .unpublished()
+                    .after_earlier_publication()
+                    .unpublished(),
+                true,
+            ),
+            (
+                refused()
+                    .before_effect()
+                    .after_earlier_publication()
+                    .after_earlier_publication(),
+                true,
+            ),
+            // Wrappers built directly: an inner earlier publication outranks
+            // an outer definite claim, and an inner definite proof is the
+            // failing step's own under an outer earlier publication.
+            (
+                OmniError::Completion {
+                    evidence: CompletionEvidence::BeforeEffect,
+                    source: Box::new(refused().after_earlier_publication()),
+                },
+                false,
+            ),
+            (
+                OmniError::Completion {
+                    evidence: CompletionEvidence::PartlyPublished {
+                        step_unpublished: false,
+                    },
+                    source: Box::new(OmniError::Completion {
+                        evidence: CompletionEvidence::Unpublished,
+                        source: Box::new(OmniError::Io(std::io::Error::other("put failed"))),
+                    }),
+                },
+                true,
+            ),
+        ] {
+            let message = composed.to_string();
+            assert_eq!(
+                composed.completion_evidence(),
+                partly(step_unpublished),
+                "{message}"
+            );
+        }
+        let (cause, evidence) = marked.into_completion_evidence();
+        assert_eq!(evidence, partly(true));
+        assert!(matches!(cause, OmniError::KeyConflict { .. }));
+
+        for uncertain in [
+            OmniError::manifest_publish_in_doubt("01JCOMMIT", "rows publish in doubt")
+                .after_earlier_publication(),
+            refused()
+                .with_completion_evidence(CompletionEvidence::Uncertain)
+                .after_earlier_publication(),
+            refused()
+                .after_earlier_publication()
+                .with_completion_evidence(CompletionEvidence::Uncertain),
+            OmniError::Io(std::io::Error::other("rows publish lost"))
+                .unpublished()
+                .after_earlier_publication()
+                .with_completion_evidence(CompletionEvidence::Uncertain),
+        ] {
+            let message = uncertain.to_string();
+            assert_eq!(
+                uncertain.completion_evidence(),
+                Some(CompletionEvidence::Uncertain),
+                "{message}"
+            );
+        }
+    }
+
+    /// A detached-commit failure the engine settled keeps that proof after a
+    /// fork: the operation published only the fork, and the failing step
+    /// itself published nothing. Without the step's proof, only the earlier
+    /// publication is known.
+    #[test]
+    fn a_settled_step_after_an_earlier_publication_keeps_its_proof() {
+        let settled = OmniError::Io(std::io::Error::other("detached manifest put failed"))
+            .unpublished()
+            .after_earlier_publication();
+        assert_eq!(
+            settled.completion_evidence(),
+            Some(CompletionEvidence::PartlyPublished {
+                step_unpublished: true
+            })
+        );
+        let (cause, _) = settled.into_completion_evidence();
+        assert!(matches!(cause, OmniError::Io(_)));
+        assert_eq!(
+            OmniError::Io(std::io::Error::other("no proof"))
+                .after_earlier_publication()
+                .completion_evidence(),
+            Some(CompletionEvidence::PartlyPublished {
+                step_unpublished: false
+            })
+        );
+        // The step's proof arrives after the earlier publication was recorded.
+        let marked_late = OmniError::Io(std::io::Error::other("staged write failed"))
+            .after_earlier_publication()
+            .unpublished();
+        assert_eq!(
+            marked_late.completion_evidence(),
+            Some(CompletionEvidence::PartlyPublished {
+                step_unpublished: true
+            })
+        );
+        let (cause, _) = marked_late.into_completion_evidence();
+        assert!(matches!(cause, OmniError::Io(_)));
+    }
+
     fn supported_stream_failures() -> Vec<OmniError> {
         vec![
             OmniError::Storage(StorageFailure::new(
@@ -1288,7 +1770,8 @@ mod tests {
                 Some("commit-before".to_string()),
                 Some("commit-after".to_string()),
             ),
-            OmniError::manifest_publish_in_doubt("exact in-doubt outcome").with_context("merge"),
+            OmniError::manifest_publish_in_doubt("01JCOMMIT", "exact in-doubt outcome")
+                .with_context("merge"),
             OmniError::ResourceLimitExceeded {
                 resource: "blob materialization bytes".to_string(),
                 limit: 10,
@@ -1393,6 +1876,13 @@ mod tests {
         use lance::Error;
 
         assert_lance_kind(Error::timeout("timeout"), StorageFailureKind::Transient);
+        assert_lance_kind(Error::backpressure("busy"), StorageFailureKind::Transient);
+        // A refused substrate write does not prove that the whole graph
+        // operation had no earlier effects, and does not authorize replay.
+        assert_eq!(
+            OmniError::storage(Error::backpressure("busy")).completion_evidence(),
+            None
+        );
 
         for error in [
             Error::disk_cap_exceeded(1, 2),
@@ -1501,6 +1991,7 @@ mod tests {
             for source in [
                 lance::Error::not_found("manifest probe"),
                 lance::Error::timeout("manifest probe"),
+                lance::Error::backpressure("manifest probe"),
                 lance::Error::version_conflict("manifest probe", 43, 42),
             ] {
                 let error = lance::Error::commit_status_unknown_source(42, Box::new(source));
@@ -1754,6 +2245,24 @@ mod tests {
         ));
     }
 
+    /// An in-doubt publication names its graph commit, through context,
+    /// completion evidence and the DataFusion stream carrier, so a log can
+    /// name it without the message. Nothing else names one.
+    #[test]
+    fn an_in_doubt_publication_names_its_commit_issue_1067() {
+        let in_doubt = OmniError::manifest_publish_in_doubt("01JCOMMIT", "acknowledgement lost")
+            .with_context("merge");
+        assert_eq!(in_doubt.publication_id(), Some("01JCOMMIT"));
+        let wrapped = in_doubt.with_completion_evidence(CompletionEvidence::Uncertain);
+        assert_eq!(wrapped.publication_id(), Some("01JCOMMIT"));
+        let carried = OmniError::datafusion(wrapped.into_datafusion_external());
+        assert_eq!(carried.publication_id(), Some("01JCOMMIT"));
+        assert_eq!(
+            OmniError::manifest_internal("not a publication").publication_id(),
+            None
+        );
+    }
+
     #[test]
     fn datafusion_stream_carrier_preserves_every_supported_failure() {
         for (carried, expected) in supported_stream_failures()
@@ -1968,29 +2477,27 @@ mod tests {
     }
 
     #[test]
-    fn lance_top_level_multiply_owned_shared_has_a_pinned_upstream_type_loss() {
+    fn lance_top_level_multiply_owned_shared_preserves_typed_failures() {
         use datafusion::error::DataFusionError;
         use std::sync::Arc;
 
-        let shared = Arc::new(
-            OmniError::BlobIntegrity {
-                reason: "top-level multiply-owned shared".to_string(),
-            }
-            .into_datafusion_external(),
-        );
-        let retained = Arc::clone(&shared);
-        let lance = lance::Error::from(DataFusionError::Shared(shared));
-        assert!(matches!(lance, lance::Error::Execution { .. }));
-        let lance_message = lance.to_string();
+        for (carried, expected) in supported_stream_failures()
+            .into_iter()
+            .zip(supported_stream_failures())
+        {
+            let shared = Arc::new(carried.into_datafusion_external());
+            let retained = Arc::clone(&shared);
+            assert_eq!(Arc::strong_count(&retained), 2);
 
-        let recovered = OmniError::lance_stream(lance);
-        assert_eq!(
-            recovered.storage_failure().map(|failure| failure.kind),
-            Some(StorageFailureKind::Unknown)
-        );
-        assert_eq!(recovered.to_string(), format!("storage: {lance_message}"));
-        assert!(!matches!(recovered, OmniError::BlobIntegrity { .. }));
-        drop(retained);
+            // Lance 13 keeps a typed Shared source when Arc::try_unwrap cannot
+            // take ownership. The retained consumer must remain live through
+            // recovery, including preservation of explicit completion evidence.
+            let lance = lance::Error::from(DataFusionError::Shared(shared));
+            assert!(matches!(lance, lance::Error::External { .. }));
+            assert_eq!(Arc::strong_count(&retained), 2);
+            assert_same_stream_failure(OmniError::lance_stream(lance), expected);
+            assert_eq!(Arc::strong_count(&retained), 1);
+        }
     }
 
     #[test]

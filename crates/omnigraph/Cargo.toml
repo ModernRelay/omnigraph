@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-engine"
-version = "0.14.0"
+version = "0.14.1"
 edition = "2024"
 description = "Runtime engine for the Omnigraph graph database."
 license = "MIT"
@@ -16,12 +16,10 @@ default = []
 failpoints = ["omnigraph-seams/decide", "omnigraph-core/failpoints", "omnigraph-catalog/failpoints"]
 # Test-only authority (PR #527 review P1-5): the DST seams' INSTALLERS
 # (seeded IDs, logical clock, gate hook), the mutable Lance registry
-# re-export, the harness-added injected-storage constructors
-# (init_with_storage, open_read_only_with_storage), and the
-# bottom-listing (`dst_list_all_keys`) exist only under this non-default
+# re-export and bottom-listing (`dst_list_all_keys`) exist only under this non-default
 # feature. Default builds keep direct real-ID/real-clock paths and
-# expose no dst_* authority. Deliberate exception: `open_with_storage`
-# predates the harness and stays public unconditionally. Scope note:
+# expose no dst_* authority. Explicit-storage constructors are production APIs
+# for captured provider bindings, as well as embedding/test consumers. Scope note:
 # "default builds" means per-package builds (`-p`, and bare cargo via
 # default-members); any `--workspace` invocation unifies this feature IN
 # through the omnigraph-dst dev crate — release artifacts build with
@@ -32,13 +30,13 @@ dst = ["omnigraph-storage/dst", "omnigraph-seams/install", "omnigraph-core/dst",
 test-util = ["omnigraph-catalog/test-util"]
 
 [dependencies]
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.14.0" }
-omnigraph-policy = { path = "../omnigraph-policy", version = "0.14.0" }
-omnigraph-storage = { path = "../omnigraph-storage", version = "0.14.0" }
-omnigraph-seams = { path = "../omnigraph-seams", version = "0.14.0" }
-omnigraph-core = { path = "../omnigraph-core", version = "0.14.0" }
-omnigraph-catalog = { path = "../omnigraph-catalog", version = "0.14.0" }
-omnigraph-planner = { path = "../omnigraph-planner", version = "0.14.0" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.14.1" }
+omnigraph-policy = { path = "../omnigraph-policy", version = "0.14.1" }
+omnigraph-storage = { path = "../omnigraph-storage", version = "0.14.1" }
+omnigraph-seams = { path = "../omnigraph-seams", version = "0.14.1" }
+omnigraph-core = { path = "../omnigraph-core", version = "0.14.1" }
+omnigraph-catalog = { path = "../omnigraph-catalog", version = "0.14.1" }
+omnigraph-planner = { path = "../omnigraph-planner", version = "0.14.1" }
 lance = { workspace = true }
 lance-core = { workspace = true }
 lance-select = { workspace = true }
@@ -80,14 +78,14 @@ csv-core = "0.1.13"
 arc-swap = { workspace = true }
 
 [dev-dependencies]
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.14.0" }
-omnigraph-core = { path = "../omnigraph-core", version = "0.14.0", features = ["test-util"] }
-omnigraph-catalog = { path = "../omnigraph-catalog", version = "0.14.0", features = ["test-util"] }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.14.1" }
+omnigraph-core = { path = "../omnigraph-core", version = "0.14.1", features = ["test-util"] }
+omnigraph-catalog = { path = "../omnigraph-catalog", version = "0.14.1", features = ["test-util"] }
 tokio = { workspace = true }
 lance-namespace-impls = { workspace = true }
 # test-util gates IoStats.requests + assert_io_eq! (failure diagnostics only); dev-dep,
 # so production builds (which exclude dev-deps) never see it.
-lance-io = { version = "11.0.0", features = ["test-util"] }
+lance-io = { version = "13.0.0", features = ["test-util"] }
 serial_test = "3"
 proptest = "1"
 # tests/forbidden_apis.rs walks the engine's sources.
