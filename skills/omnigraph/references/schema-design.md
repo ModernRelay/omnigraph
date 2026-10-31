@@ -54,11 +54,11 @@ Ontologies Used for Knowledge Sharing* (Int. J. Human-Computer Studies
 5. **Minimal ontological commitment**: make as few claims about the world as
    the use case requires. In Omnigraph: no required properties, closed enums or
    `@card(1..1)` "in case". Changing a commitment later is a rebuild, not an
-   in-place `schema apply`: adding `@key`/`@unique`/`@range`/`@check`, changing
-   cardinality in either direction, removing a constraint from a property
-   that stays, and `T?` ↔ `T` are
-   refused; only `@index` additions, nullable additions, enum widening, renames
-   and drops apply in place.
+   in-place `schema apply`: adding `@key`/`@unique`/`@range`/`@check` or a
+   required edge to an existing type, changing cardinality in either
+   direction, removing a constraint from a property that stays, and `T?` ↔ `T`
+   are refused; only `@index` additions, nullable additions, enum widening,
+   renames and drops apply in place.
 
 The criteria trade off: Clarity wants tight definitions, Minimal Commitment
 wants weak ones. Gruber's resolution is to decide conservatively what to model
@@ -327,8 +327,9 @@ on their source and position; give extracted nodes an edge to their span and
 an `extracted_by` property; link synthesized nodes to what they derive from.
 Drive enrichment from `omnigraph changes poll`, and run a re-extraction on a
 branch so its effect can be reviewed before it replaces the old layer. Declare
-the lineage edges `@card(1..)`, and run an orphan check for each on the branch
-before merging: `@card` does not catch a node written without its edge
+the lineage edges `@card(1..)` and write each extracted node in the same load as
+its lineage edge, which `@card` then requires; run an orphan check for each on
+the branch before merging, for nodes older versions wrote without it
 ([principle 9](#9-enforce-meaning-and-keep-the-rules-in-the-graph)).
 
 **Example:**
@@ -476,14 +477,15 @@ server's Cedar policy, which governs who may perform which actions (see
 structure, `GraphPolicy` nodes for everything else, and a stored query per
 mechanical rule.
 
-`@card` has a gap to plan for. It counts a source node's edges only when a
-write adds, moves or removes one of them, so a node written with no edge of
-that type is never counted. A non-zero minimum such as `@card(1..)` refuses a
-write that removes a node's last link, but not a node that arrives without
-one, and a traversal along that link silently misses the node. Give every
-required link an orphan check, the same `not { ... }` shape as the example
-below ([principle 6](#6-layer-derived-knowledge-over-raw-sources) shows one for
-extraction lineage).
+`@card` counts a source node's edges whenever a write inserts or updates the
+node or adds, moves or removes one of its edges, so a non-zero minimum such as
+`@card(1..)` makes a required link arrive with its node, in one mutation or one
+load, and schema apply refuses a new required link from an existing node type.
+It does not count a node until a write touches it, so nodes older versions
+wrote without the link can sit below the minimum, and a traversal along that
+link silently misses them. Give every required link an orphan check, the same `not { ... }`
+shape as the example below ([principle 6](#6-layer-derived-knowledge-over-raw-sources)
+shows one for extraction lineage).
 
 **Example:** "every strategic customer has an owner" is conditional
 cardinality, which `@card` cannot express, so it becomes a policy with a check
@@ -575,9 +577,9 @@ found and what it missed. Search is a schema decision too: decide up front
 which text is embedded and which properties are indexed.
 
 **In Omnigraph:** write the questions first as `.gq` queries and lint them
-against the schema. Declare links that must exist with `@card(1..)` and give
-each an orphan check, because `@card` does not catch a node written without
-any link ([principle 9](#9-enforce-meaning-and-keep-the-rules-in-the-graph)).
+against the schema. Declare links that must exist with `@card(1..)`, which
+refuses a node written without them, and give each an orphan check for nodes
+older versions wrote without them ([principle 9](#9-enforce-meaning-and-keep-the-rules-in-the-graph)).
 Scope with traversal and filters, then rank with `nearest`, `bm25` or `rrf`
 inside the scoped set (see [`search.md`](search.md)), and put `@embed` on the
 unit you want back, not on a whole document.

@@ -102,6 +102,15 @@ pub enum ValidateCheck {
         edge_table: String,
         endpoint: Endpoint,
     },
+    /// A node load's rows counted as sources of `edge_table`, whose `@card`
+    /// minimum is non-zero: each written node's committed edges of the type
+    /// must lie within the bounds, so a node loaded without its edges fails.
+    SourceCardinality {
+        edge_table: String,
+        min: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max: Option<u32>,
+    },
 }
 
 impl ValidateCheck {
@@ -113,6 +122,7 @@ impl ValidateCheck {
             ValidateCheck::EdgeRi { .. } => "edge_ri",
             ValidateCheck::Cardinality { .. } => "cardinality",
             ValidateCheck::RetainedEdges { .. } => "retained_edges",
+            ValidateCheck::SourceCardinality { .. } => "source_cardinality",
         }
     }
 }
@@ -152,8 +162,10 @@ fn mapped_columns(catalog: &Catalog, stmt: &LoadStmt) -> usize {
 }
 
 /// Evaluator order: value, the target's `@key` then `@unique` groups, an
-/// edge's two endpoint references and its `@card`, and for a node overwrite
-/// the retained edges of every incident edge type in name order.
+/// edge's two endpoint references and its `@card`; for a node, per incident
+/// edge type in name order, an overwrite's retained edges and then, when the
+/// node is the edge type's source and its `@card` minimum is non-zero, the
+/// written nodes' edge count.
 fn checks(catalog: &Catalog, target: &LoadTarget, mode: LoadStmtMode) -> Vec<LoadCheck> {
     let table = target.table_key();
     let overwrite = mode == LoadStmtMode::Overwrite;
@@ -176,26 +188,35 @@ fn checks(catalog: &Catalog, target: &LoadTarget, mode: LoadStmtMode) -> Vec<Loa
                     overwrite,
                 );
             }
-            if !overwrite {
-                return checks;
-            }
             let mut edge_types: Vec<_> = catalog.edge_types.iter().collect();
             edge_types.sort_by(|a, b| a.0.cmp(b.0));
             for (edge_name, edge_type) in edge_types {
                 let edge_table = format!("edge:{edge_name}");
-                for (endpoint, node_type) in [
-                    (Endpoint::From, &edge_type.from_type),
-                    (Endpoint::To, &edge_type.to_type),
-                ] {
-                    if node_type != name {
-                        continue;
+                if overwrite {
+                    for (endpoint, node_type) in [
+                        (Endpoint::From, &edge_type.from_type),
+                        (Endpoint::To, &edge_type.to_type),
+                    ] {
+                        if node_type != name {
+                            continue;
+                        }
+                        checks.push(LoadCheck {
+                            check: ValidateCheck::RetainedEdges {
+                                edge_table: edge_table.clone(),
+                                endpoint,
+                            },
+                            consults: Some(edge_table.clone()),
+                        });
                     }
+                }
+                if &edge_type.from_type == name && edge_type.cardinality.min > 0 {
                     checks.push(LoadCheck {
-                        check: ValidateCheck::RetainedEdges {
+                        check: ValidateCheck::SourceCardinality {
                             edge_table: edge_table.clone(),
-                            endpoint,
+                            min: edge_type.cardinality.min,
+                            max: edge_type.cardinality.max,
                         },
-                        consults: Some(edge_table.clone()),
+                        consults: Some(edge_table),
                     });
                 }
             }

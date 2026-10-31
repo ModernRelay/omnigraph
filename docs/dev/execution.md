@@ -1133,6 +1133,23 @@ edge referential integrity, and cardinality against the operation's pinned base
 plus its complete delta. A physical index may accelerate a probe but may never
 be a validation prerequisite.
 
+Cardinality counts the sources the delta can move out of bounds: the new
+source of every delta edge, the old committed source of every removed or moved
+edge, and, under a non-zero minimum, every source node row the delta writes. A
+source node row is recounted whether it is new or updated, as uniqueness and
+referential integrity recheck every row a delta writes. Committed edges are
+counted per source in sorted filtered scans of at most 8,192 sources each,
+streamed and kept as one count per source, as the uniqueness probe chunks its
+keys, since a merge delta is not row-capped. An overwritten edge
+table's committed view is empty, so under a minimum every source of its
+replaced image holds only its delta edges: one bounded scan of the replaced
+image's source column keeps the smallest source the delta leaves without an
+edge (`evaluate_replaced_cardinality`), and memory stays with the delta. A
+`load csv` plan names that scan as the `cardinality` check's `scan` access and
+the node-side count as the typed `source_cardinality` check; the overwrite
+judge (`validate/load.rs`) refuses a plan whose minimum lacks the scan, and
+append and merge reach the evaluator.
+
 Validation completes before recovery arm and table effects. For selected
 external Blob inputs, policy and retained-metadata accounting complete before
 target I/O; source probing, any required materialization, and payload-size

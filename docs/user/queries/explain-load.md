@@ -24,13 +24,17 @@ root down:
 | `CsvSource` | `format`, `source`, `source_bytes`, `estimated_rows`, `delimiter`, `header`, `columns`, `table`, `version`; the physical row adds `max_partitions` (the streams that parse the source: one per 8 MiB of it, at most `stage_write_concurrency`), `max_workers`, `fallback` |
 
 Each entry of `checks` carries `check` (`value`, `unique`, `edge_ri`,
-`cardinality` or `retained_edges`), its identity fields, `consults` (the
-committed table it reads, or `null`) and, on the physical node, `access`:
+`cardinality`, `retained_edges` or `source_cardinality`), its identity fields,
+`consults` (the committed table it reads, or `null`) and, on the physical
+node, `access`:
 
 - `unique` carries `columns` and `role` (`key` or `unique`).
 - `edge_ri` and `cardinality` carry `endpoint` (`from` or `to`) and
   `node_type`.
 - `retained_edges`, on a node overwrite, carries `edge_table` and `endpoint`.
+- `source_cardinality`, on a node load whose type is the source of an edge
+  type with a non-zero `@card` minimum, carries `edge_table`, `min` and an
+  optional `max`: each loaded node's committed edges of that type are counted.
 
 `access` is the path the check reads committed state by:
 
@@ -46,7 +50,10 @@ version. A probe first pays its key list, one entry per input row, so an
 unindexed endpoint check scans, and a partially or fully indexed table keeps
 `probe` only while the key list is small against it. Unknown counts and equal
 costs keep `probe`; statistics record `index_coverage` and both costs.
-`cardinality` and `retained_edges` always use `probe`. An `edge_ri` check
+`retained_edges` and `source_cardinality` always use `probe`, and so does
+`cardinality` except on an overwrite under a non-zero minimum: there it uses
+`scan`, one projected scan of the replaced table's source column for a source
+the new edges leave without one. An `edge_ri` check
 also carries `probe`, where it reads the committed ids: `swept` when both
 endpoint checks of the edge use `scan` and both node types carry one
 `I32`, `I64` or `U32` `@key`, so the committed sets load while the source

@@ -83,8 +83,10 @@ target write stages detached on that same dataset from the adopted pin; no
 table fork is created. Pointer adoption still computes any required
 validation delta and runs the shared constraint evaluator, except for a
 `FastForward` whose candidates are all proven pure inserts into node types
-with no `@unique`, `@range`, `@check` or enum property
-(`proven_fast_forward_needs_no_validation`). For that delta the evaluator reads
+with no `@unique`, `@range`, `@check` or enum property and no edge type with a
+non-zero `@card` minimum from them (`proven_fast_forward_needs_no_validation`):
+a source node inserted alone is below such a minimum, which only a branch
+written before inserted nodes were counted can hold. For that delta the evaluator reads
 nothing from the target; it would only check that no two new rows share a key,
 which the source's certified exact-`id` inserts already rule out. The skip
 follows the outcome, so it also bypasses the 32 MiB validation budget: such a
