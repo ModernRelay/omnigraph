@@ -147,7 +147,8 @@ when opened; empty input need not open it. Bound plans use a versioned envelope
 and require regeneration when the stored version is unsupported.
 Envelope version 7 requires aggregate expressions to carry their `distinct`
 flag; version 8 types each node's ordering and declares ranked scans'
-eligibility and policy; version 9 records every `AntiJoin`'s `strategy`.
+eligibility and policy; version 9 records every `AntiJoin`'s `strategy`;
+version 11 carries an integer outside the `i64` range as its decimal text.
 Plans saved with earlier binaries must be regenerated before replay.
 
 ### Expand path selection

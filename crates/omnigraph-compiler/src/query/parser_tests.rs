@@ -506,7 +506,7 @@ fn prop(variable: &str, property: &str) -> Expr {
 }
 
 fn int(value: i64) -> Expr {
-    Expr::Literal(Literal::Integer(value))
+    Expr::Literal(Literal::Integer(i128::from(value)))
 }
 
 fn and(left: Expr, right: Expr) -> Expr {
