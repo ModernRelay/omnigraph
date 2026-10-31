@@ -5,7 +5,7 @@
 - Version-matched skill (skill export, skill show)
 - Inspect state (snapshot, export)
 - Branches · commits · changes · graphs
-- Blob reads
+- Blob values (get, stat, put, clear)
 - Schema · offline storage upgrade · lint · embed · init
 - Load (bulk JSONL)
 - Query / mutate
@@ -29,10 +29,10 @@ prints the exact flags of the installed binary.
 | Command | Subcommands | Use |
 |---|---|---|
 | `catalogue` | — | Query this binary's engine registries with `-e` or `--query`, optionally `--json`; no store, operator config or credentials |
-| `query` | — | Run a read query: a served stored query by name, or ad-hoc `--query`/`-e` source; also the `branch list` and `explain` statements |
-| `mutate` | — | Run a mutation, or a `branch create`/`delete`/`merge` or `commit publish`/`drop` statement |
+| `query` | — | Run a read query: a served stored query by name, or ad-hoc `--query`/`-e` source; also a branch read (`branch list`, `branch diff`, `branch merge-base`, `branch merge … dry run`), `show` or `explain` statement |
+| `mutate` | — | Run a mutation, or a `branch create`/`delete`/`merge`, `commit publish`/`drop` or `load csv` statement |
 | `alias` | — | Invoke an operator alias's stored read query |
-| `load` | — | Bulk-load JSONL; `--mode` is required |
+| `load` | — | Bulk-load JSONL; `--mode` is required. CSV loads are `load csv` statements run through `mutate` |
 | `branch` | `create` `list` `delete` `merge` `diff` `merge-base` | Manage graph branches; `diff` reviews what a branch changed since its merge base, `merge-base` prints that base |
 | `snapshot` | — | Show one branch's types, entity counts and dataset versions |
 | `export` | — | Stream a branch as JSONL |
@@ -114,17 +114,25 @@ Use repeatable `--type` to filter node or edge types.
 Entity identity is top-level `id`; `data` holds user properties. Query/export
 JSON omits null cells and renders dates as strings. See [data envelopes](data.md).
 
-## Blob Reads
+## Blob Values
 
 ```bash
 omnigraph blob stat node Document manual content --target "$REPO" --json
 omnigraph blob get node Document manual content --target "$REPO" --out manual.bin
 omnigraph blob get node Document manual content --target "$REPO" --offset 0 --length 4096
+omnigraph blob put node Document manual content --file manual.pdf --if-match '"<etag>"' --target "$REPO" --json
+omnigraph blob clear node Document manual content --target "$REPO" --json
 ```
 
-The selector is `<node|edge> <TYPE> <ID> <PROPERTY>`. Choose a branch or
-snapshot; `get` streams managed bytes and `stat` inspects metadata. See
-[`blobs.md`](blobs.md) before handling external references or ranged reads.
+The selector is `<node|edge> <TYPE> <ID> <PROPERTY>`. Reads choose a branch or
+snapshot; `get` streams managed bytes and `stat` inspects metadata. `put`
+replaces one cell of an existing entity with raw bytes from `--file` or stdin
+(at most 32 MiB and within `write_max_bytes`) and `clear` nulls it; each is one
+graph commit on `--branch` (default `main`), needs `change`, and prints the
+receipt. `--if-match` takes the ETag from `stat` (or `*`); a failed precondition
+exits 4. Each write is sent once: after an unknown outcome, `stat` before
+writing again. See [`blobs.md`](blobs.md) before handling external references,
+ranged reads or HTTP `GET`/`HEAD`/`PUT`/`DELETE /graphs/{graph_id}/blob`.
 
 ## Branches
 
@@ -138,6 +146,9 @@ omnigraph branch delete <branch-name> --target $REPO
 All support `--json`. `--from` and `--into` default to `main`. `branch create
 --from-commit <commit-id>` starts the branch at a published commit instead.
 `--delete-branch` removes the source only after a successful merge publication.
+`branch merge --dry-run` reports the outcome or conflicts and writes nothing;
+`--as-commit` leaves the merge unpublished until `commit publish`. Neither
+combines with `--delete-branch`.
 A served `branch delete --json` needs `--yes`. `branch list --detailed` adds
 each branch's head, the branch (`from`) and commit (`from_commit_id`) it
 started from, and `created_at`/`updated_at`, without reading commit history.
@@ -182,8 +193,9 @@ omnigraph graphs list --target <name> --json
 
 Lists the graphs a multi-graph server serves, with each graph's `state`. Remote
 servers only (rejects local URIs); a cluster-scoped policy bundle must grant
-`graph_list`. `--discovery` (implied for managed targets) returns only graph
-ids and names to an identity credential and needs no `graph_list`. See
+`graph_list`, on managed targets too. `--discovery` returns only graph ids and
+names to an identity credential and needs no `graph_list`; pass it explicitly,
+since the CLI never infers it from the target or credential. See
 [`server-policy.md`](server-policy.md).
 
 ## Schema
@@ -205,8 +217,7 @@ omnigraph upgrade --target "$REPO" --json
 omnigraph schema upgrade-system-columns --target "$REPO" --check --json
 ```
 
-`omnigraph upgrade` converts a standalone v8 or v9 graph (written by 0.11) or
-a v13 graph in place to the storage format this binary writes, the first
+`omnigraph upgrade` converts a standalone v8, v9 or v13 graph in place to the storage format this binary writes, the first
 number `omnigraph version` reports, keeping branches, commit ids and commit
 history. A graph at an older format this binary serves is only stamped to it,
 with one metadata-only commit per live branch. `--to-format` accepts only the
@@ -216,11 +227,8 @@ this binary serves: it respells the legacy
 starting with `_`. Both are standalone, offline operations: stop every process
 using the graph and keep a verified whole-root backup; cluster-managed roots
 refuse. Read
-[upgrading from v0.11](migrations.md#upgrade-v011-to-storage-format-14) and
-the other [migration preconditions](migrations.md) before executing.
-
-With the 0.11 binary the default target was v9, and `--to-format 8` kept
-legacy system spellings and could preserve live branches.
+[converting a graph](migrations.md#convert-a-v8-v9-or-v13-graph) before
+executing.
 
 ## Lint
 
@@ -268,7 +276,14 @@ omnigraph load --data delta.jsonl --branch feature-x --from main --mode merge --
 ```
 
 `--mode` is **required** (no default): `merge`, `append`, or `overwrite`.
-Address either direct storage or a served graph. See `references/data.md`.
+Address either direct storage or a served graph. See [`data.md`](data.md).
+
+`omnigraph load` reads JSONL only. Load one CSV object into one type with a
+`load csv` statement: `omnigraph mutate --target $REPO -e 'load csv
+"file:///data/person.csv" into node:Person mode append header'` (optional
+`delimiter "|"`, `columns (…)`, `--branch`). A served graph reads only `s3://`
+sources its external Blob policy admits. See
+[CSV loading](../../../docs/user/mutations/index.md#csv-loading).
 
 ## Query / Mutate
 
@@ -327,7 +342,7 @@ The remedy for `FullTextIndexRequired` on any branch.
 omnigraph index rebuild --kind full-text --target "$REPO" --branch main --json
 ```
 
-`--kind` is required. `rebuild-full-text-indexes` is the deprecated spelling.
+`--kind` is required.
 
 Direct storage only; `--target <root> --graph <id>` also works. Stop overlapping
 writers, preserve a verified whole-store backup, and rebuild every live branch
@@ -354,9 +369,13 @@ both, a graph commit must be outside both windows. Duration units: `s`, `m`,
 
 `--keep N` retains the newest `N` graph commits of every live branch and every
 table version they pin; it counts graph commits, not Lance versions of a
-dataset. Each live branch's head, selected merge bases and natively tagged
-snapshots are always retained. Cleanup also reclaims table forks left by
-earlier builds and retired branch refs once nothing needs them. Branch
+dataset. Each live branch's head, a named branch's starting commit, selected
+merge bases and natively tagged snapshots are always retained. `--keep` alone
+reads only the commits it keeps and the merge bases, so an unreadable commit it
+drops does not stop it; `--older-than` reads every other commit's time and
+stops on one it cannot read. Without `--confirm`, cleanup only echoes the
+policy and exits 0; it lists no candidates. Cleanup also reclaims table forks
+and deleted branches' refs once nothing needs them. Branch
 deletion and `optimize` leave this reclamation to `cleanup`.
 
 ## Stored Queries
@@ -369,8 +388,8 @@ omnigraph queries list --target prod --graph knowledge --json # a server's catal
 
 `validate` operates on applied cluster state, not a graph URI, and checks every
 registry against its applied schema. `list` reads a direct cluster root, where
-`--graph` may select one graph, or one served graph, which a server target
-selects with `--graph` or its `default_graph`; there `--json` prints the body of
+`--graph` may select one graph, or one served graph, which a server or
+managed target selects with `--graph` or its `default_graph`; there `--json` prints the body of
 `GET /graphs/{graph_id}/queries`.
 Distinct from `lint`, which validates authoring source. See
 [`stored-queries.md`](stored-queries.md).
@@ -378,7 +397,7 @@ Distinct from `lint`, which validates authoring source. See
 ## Operator Config & Credentials
 
 Use the primary [operator reference](../../../docs/user/cli/targets.md).
-The format is `version: 1`; there is no legacy import or compatibility layer.
+The format is `version: 1`.
 `--operator-config FILE` replaces the default operator file without merging.
 Secrets never belong in YAML. Login/logout are platform-session operations;
 static tokens use explicit owner/profile commands:
@@ -456,7 +475,7 @@ bridge never starts a server. A lost answer is never resent: an
 omnigraph studio --target staging --graph knowledge --json
 ```
 
-`omnigraph studio` opens OmniGraph Studio on an existing server target with an
+`omnigraph studio` opens Omnigraph Studio on an existing server target with an
 `omnigraph-studio://open?target=NAME&binding=…&home=…[&graph=G]` link, prints
 the link and exits. It sends no request and reads no credential; Studio
 resolves the target itself and refuses a link whose `binding` or `home`
@@ -554,11 +573,13 @@ omnigraph organization members offboard person@example.com --profile work --idem
 The caller needs current provider `members_manage` permission. WorkOS owns
 organization membership and service roles; applied cluster configuration owns
 graph and deployment permissions. No local enrollment or member-patch command
-is required. Member operations accept an email or exact user ID; role assignment
-requires an existing active member and a configured service-role slug. Invitation
+is required. Member operations accept an email or exact user ID. `members set`
+replaces the member's whole service-role set: repeat `--role` for every role
+they should keep. It requires an existing active member and configured
+service-role slugs; every new invitation needs one `--role`. Invitation
 resend/revoke accepts email or exact invitation ID. Optional
 `--expected-membership` asserts an exact offboarding membership,
-or `absent` only to finish cleanup after that membership is gone. Deploy Cedar
+or `absent` with an exact user ID only to finish cleanup after that membership is gone. Deploy Cedar
 revocation before offboarding and verify denial with an existing data credential.
 Writes require exact idempotency keys and uncertain outcomes must be reconciled;
 a partial offboard stays partial on replay. Keep the same operator home and profile:
@@ -594,7 +615,12 @@ omnigraph cluster apply --target managed-production --plan PREVIEW_ID --json
 ```
 
 Creation and pull never switch targets or bind folders. Managed plan/apply use
-pushed revisions and reject `--config`. Cluster identity and incarnation are
+pushed revisions and reject `--config`. `plan` waits until `--timeout`
+(default 300 s, at most 3600) for its preview to be ready and prints
+`data.preview_id`; `--no-wait` returns the accepted record without cancelling
+it. A local timeout exits 5 and cancels nothing: rerun the same
+`plan --rev REV` with the `--idempotency-key` it printed to resume. A `failed`
+or `expired` preview needs a fresh plan with a new key. Cluster identity and incarnation are
 pinned; data requests additionally require the target endpoint. Auth providers never fall back to each other. Retain
 operator-home lifecycle custody after an uncertain request; reconcile old work
 with compatible tooling before retiring its configuration. See [managed clusters](cluster.md#managed-clusters).

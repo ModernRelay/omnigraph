@@ -1021,7 +1021,10 @@ impl std::fmt::Display for AggFunc {
 pub enum Literal {
     Null,
     String(String),
-    Integer(i64),
+    /// An integer value, exact for every declared integer type: `I32`, `I64`,
+    /// `U32` and `U64` share the one spelling, and a value is narrowed only at
+    /// a typed boundary, from the declared type.
+    Integer(i128),
     Float(f64),
     Bool(bool),
     Date(String),

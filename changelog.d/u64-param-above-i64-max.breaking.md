@@ -1,0 +1,3 @@
+- Saved query plans now use envelope version 11, which carries a `U64` parameter above `i64::MAX` as its decimal text. Regenerate plans saved with earlier binaries; older binaries reject version 11 plans. See [saved plans][u64-param-above-i64-max-plans].
+
+[u64-param-above-i64-max-plans]: ../docs/user/queries/explain.md#profile
