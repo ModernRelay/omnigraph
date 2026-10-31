@@ -7,8 +7,8 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-10-29
-updated: 2026-10-29
-discussion: https://github.com/ModernRelay/omnigraph/pull/1190
+updated: 2026-10-31
+discussion: https://github.com/ModernRelay/omnigraph/pull/1214
 supersedes: []
 superseded_by: []
 blocked_on:
