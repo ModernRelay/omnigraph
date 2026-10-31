@@ -281,13 +281,8 @@ pub(crate) async fn judge_load_swept(
                 let moved_from = committed
                     .committed_edges(table, system_columns.id, &plan.changed_ids, system_columns)
                     .await?;
-                let affected = card_affected(
-                    &plan,
-                    &[],
-                    &moved_from,
-                    &HashSet::new(),
-                    &HashSet::new(),
-                );
+                let affected =
+                    card_affected(&plan, &[], &moved_from, &HashSet::new(), &HashSet::new());
                 if affected.is_empty() {
                     continue;
                 }
