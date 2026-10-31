@@ -216,6 +216,15 @@ only as far as the contract requires. Fewer lines is evidence of lower
 liability, not proof. Justify every new API, state, invariant, or maintenance
 burden against the [governing principle](#governing-principle).
 
+Prefer a small set of primitives and abstractions that compose to cover the
+whole scope over many special-purpose ones. Each primitive should own one
+guarantee completely, so combinations inherit correctness, efficiency, and
+security instead of re-proving them. The measure is what the system guarantees
+across its full scope (correctness, efficiency, security) divided by the code
+and concepts it takes to get there. A change that adds a narrow mechanism where
+composing existing primitives would do lowers that ratio. A change that lets
+one primitive replace several raises it.
+
 A regression counts only when it fails before the fix for the predicted reason
 and passes after the fix. A compile error, a setup failure, a skipped test, or
 a run that executed no tests does not count. Keep query behavior on the tier
@@ -256,6 +265,8 @@ constraints on the system that exists now.
   for every case, caller, and workload that shares the cause?
 - Does new machinery extend or remove an existing abstraction, and is every
   new API, state, invariant, or maintenance burden justified?
+- Do a few composable primitives cover the scope, or does the change add a
+  special-purpose mechanism that composing existing ones would replace?
 - Did the regression fail before the fix for the predicted reason, and are
   local runs, CI on that commit, code reading, and performance claims separate
   evidence?
