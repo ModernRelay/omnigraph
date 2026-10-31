@@ -1017,6 +1017,16 @@ edge referential integrity, and cardinality against the operation's pinned base
 plus its complete delta. A physical index may accelerate a probe but may never
 be a validation prerequisite.
 
+Cardinality counts the sources the delta can move out of bounds: the new
+source of every delta edge, the old source of every removed or moved edge
+(read from the pre-write image, so an overwritten edge table, whose committed
+view is empty, still recounts the sources it empties), and, under a non-zero
+minimum, every source node row the delta writes. A source node row is
+recounted whether it is new or updated, as uniqueness and referential
+integrity recheck every row a delta writes. A `load csv` plan names the
+node-side count as the typed `source_cardinality` check; the overwrite judge
+(`validate/load.rs`) runs it, and append and merge reach the evaluator.
+
 Validation completes before recovery arm and table effects. For selected
 external Blob inputs, policy and retained-metadata accounting complete before
 target I/O; source probing, any required materialization, and payload-size

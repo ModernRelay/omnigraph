@@ -12,6 +12,7 @@
 //! load validate edge_ri edge:Knows from Person: access probe
 //! load validate cardinality edge:Knows from Person
 //! load validate retained_edges node:Person edge:Knows from: access probe
+//! load validate source_cardinality node:Person edge:WorksAt: access probe
 //! load write: overwrite fragments
 //! load executed: partitions 1 rows 3
 //! ```
@@ -23,7 +24,7 @@
 use omnigraph::loader::LoadExecuted;
 use serde_json::Value;
 
-const FORMS: &str = "forms: `load route: <plan|pipeline>`, `load scan: partitions <n> fallback single_scan`, `load validate value <table> [a, b]`, `load validate unique <table> <key|unique> [a, b]: access <delta|probe|scan>`, `load validate edge_ri <edge> <from|to> <Node>: access <delta|probe|scan>`, `load validate cardinality <edge> <from|to> <Node>`, `load validate retained_edges <node> <edge> <from|to>: access <delta|probe|scan>`, `load write: <overwrite fragments|append strict_insert|merge upsert>`, `load executed: partitions <n> rows <m>`";
+const FORMS: &str = "forms: `load route: <plan|pipeline>`, `load scan: partitions <n> fallback single_scan`, `load validate value <table> [a, b]`, `load validate unique <table> <key|unique> [a, b]: access <delta|probe|scan>`, `load validate edge_ri <edge> <from|to> <Node>: access <delta|probe|scan>`, `load validate cardinality <edge> <from|to> <Node>`, `load validate retained_edges <node> <edge> <from|to>: access <delta|probe|scan>`, `load validate source_cardinality <node> <edge>: access <delta|probe|scan>`, `load write: <overwrite fragments|append strict_insert|merge upsert>`, `load executed: partitions <n> rows <m>`";
 
 const ACCESS: [&str; 3] = ["delta", "probe", "scan"];
 const ENDPOINTS: [&str; 2] = ["from", "to"];
@@ -71,6 +72,11 @@ pub(crate) enum LoadFact {
         endpoint: String,
         access: String,
     },
+    SourceCardinality {
+        node: String,
+        edge: String,
+        access: String,
+    },
     Write(String),
     Executed {
         partitions: u32,
@@ -115,6 +121,9 @@ impl LoadFact {
                 endpoint,
                 access,
             } => format!("load validate retained_edges {node} {edge} {endpoint}: access {access}"),
+            LoadFact::SourceCardinality { node, edge, access } => {
+                format!("load validate source_cardinality {node} {edge}: access {access}")
+            }
             LoadFact::Write(write) => format!("load write: {write}"),
             LoadFact::Executed { partitions, rows } => {
                 format!("load executed: partitions {partitions} rows {rows}")
@@ -253,6 +262,18 @@ fn parse_validate_fact(text: &str) -> Option<LoadFact> {
             access: access_word(access)?,
         });
     }
+    if let Some(source) = text.strip_prefix("source_cardinality ") {
+        let (identity, access) = source.rsplit_once(": access ")?;
+        let words: Vec<&str> = identity.split_whitespace().collect();
+        let [node, edge] = words.as_slice() else {
+            return None;
+        };
+        return Some(LoadFact::SourceCardinality {
+            node: table_key(node)?,
+            edge: table_key(edge)?,
+            access: access_word(access)?,
+        });
+    }
     None
 }
 
@@ -358,6 +379,11 @@ fn node_facts(node: &Value, facts: &mut Vec<LoadFact>) {
                         endpoint: text(&check["endpoint"]),
                         access,
                     },
+                    Some("source_cardinality") => LoadFact::SourceCardinality {
+                        node: table.clone(),
+                        edge: text(&check["edge_table"]),
+                        access,
+                    },
                     _ => continue,
                 };
                 facts.push(fact);
@@ -412,6 +438,7 @@ mod tests {
             "load validate edge_ri edge:Knows from Person: access probe",
             "load validate cardinality edge:Knows from Person",
             "load validate retained_edges node:Person edge:Knows to: access probe",
+            "load validate source_cardinality node:Person edge:WorksAt: access probe",
             "load write: overwrite fragments",
             "load write: append strict_insert",
             "load executed: partitions 1 rows 3",
@@ -438,6 +465,9 @@ mod tests {
             "load validate retained_edges node:Person edge:Knows",
             "load validate retained_edges node:Person edge:Knows from",
             "load validate retained_edges node:Person edge:Knows from: access index",
+            "load validate source_cardinality node:Person edge:WorksAt",
+            "load validate source_cardinality node:Person WorksAt: access probe",
+            "load validate source_cardinality node:Person edge:WorksAt from: access probe",
             "load write: overwrite batches",
             "load publish: 1",
             "load executed: partitions 1",

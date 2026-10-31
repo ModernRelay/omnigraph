@@ -192,10 +192,22 @@ pub(crate) async fn judge_load(
                     delta_by_id,
                     removed_ids: Vec::new(),
                 };
-                let moved_from = committed
-                    .committed_edges(table, system_columns.id, &plan.changed_ids, system_columns)
+                // An overwrite's committed view is empty, so the edges it
+                // removes or re-places leave their sources from the prior
+                // image; `removed` is empty unless this load overwrites.
+                let removed_edges = committed
+                    .prior_edges(table, system_columns.id, &removed, system_columns)
                     .await?;
-                let affected = card_affected(&plan, &[], &moved_from, &HashSet::new());
+                let moved_from = committed
+                    .prior_edges(table, system_columns.id, &plan.changed_ids, system_columns)
+                    .await?;
+                let affected = card_affected(
+                    &plan,
+                    &removed_edges,
+                    &moved_from,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                );
                 if affected.is_empty() {
                     continue;
                 }
@@ -209,6 +221,24 @@ pub(crate) async fn judge_load(
                     &plan,
                     &affected,
                     &committed_for_affected,
+                    &mut first.sink(),
+                )?;
+                first.refuse_pending()?;
+            }
+            ValidateCheck::SourceCardinality { edge_table, .. } => {
+                // A node load adds and removes no edge, so each written node
+                // counts only its committed edges; a new node has none.
+                let edge_type = edge_type_of(catalog, edge_table)?;
+                let written: Vec<String> = extracted.ids.iter().cloned().collect();
+                let committed_for_written = committed
+                    .committed_edges(edge_table, system_columns.src, &written, system_columns)
+                    .await?;
+                card_violations(
+                    edge_table,
+                    edge_type,
+                    &CardPlan::default(),
+                    &extracted.ids,
+                    &committed_for_written,
                     &mut first.sink(),
                 )?;
                 first.refuse_pending()?;
@@ -260,7 +290,8 @@ pub(crate) async fn judge_load(
 struct Extracted {
     /// The first value violation in batch order.
     value: Option<Violation>,
-    /// Every non-null id of the delta.
+    /// Every non-null id of the delta, when a consulted uniqueness or a
+    /// source cardinality check reads it.
     ids: HashSet<String>,
     /// Per uniqueness check (by list index): its image under construction and
     /// the first key repeated anywhere in the input.
@@ -287,8 +318,10 @@ impl Extracted {
         let needs_edges = checks
             .iter()
             .any(|spec| matches!(spec.check, ValidateCheck::EdgeRi { .. }));
-        let needs_ids = checks.iter().any(|spec| {
-            matches!(spec.check, ValidateCheck::Unique { .. }) && spec.consults.is_some()
+        let needs_ids = checks.iter().any(|spec| match spec.check {
+            ValidateCheck::Unique { .. } => spec.consults.is_some(),
+            ValidateCheck::SourceCardinality { .. } => true,
+            _ => false,
         });
         let needs_card = checks
             .iter()

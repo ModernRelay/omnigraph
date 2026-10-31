@@ -566,7 +566,9 @@ impl ValidateCostInputs {
 pub fn choose_validate_access(check: &ValidateCheck, inputs: ValidateCostInputs) -> ValidateAccess {
     if matches!(
         check,
-        ValidateCheck::RetainedEdges { .. } | ValidateCheck::Cardinality { .. }
+        ValidateCheck::RetainedEdges { .. }
+            | ValidateCheck::Cardinality { .. }
+            | ValidateCheck::SourceCardinality { .. }
     ) {
         return ValidateAccess::Probe;
     }

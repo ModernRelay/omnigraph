@@ -183,7 +183,13 @@ pub fn plan_schema_migration(
     let mut steps = Vec::new();
     plan_interfaces(&accepted.interfaces, &desired.interfaces, &mut steps);
     plan_nodes(&accepted.nodes, &desired.nodes, &mut steps, system_columns);
-    plan_edges(&accepted.edges, &desired.edges, &mut steps, system_columns);
+    plan_edges(
+        &accepted.nodes,
+        &accepted.edges,
+        &desired.edges,
+        &mut steps,
+        system_columns,
+    );
 
     if steps.is_empty() && accepted != desired {
         steps.push(SchemaMigrationStep::UnsupportedChange {
@@ -483,6 +489,7 @@ fn plan_nodes(
 }
 
 fn plan_edges(
+    accepted_nodes: &[NodeIR],
     accepted: &[EdgeIR],
     desired: &[EdgeIR],
     steps: &mut Vec<SchemaMigrationStep>,
@@ -492,14 +499,33 @@ fn plan_edges(
         .iter()
         .map(|edge| (edge.type_id, edge))
         .collect::<HashMap<_, _>>();
+    let accepted_node_ids = accepted_nodes
+        .iter()
+        .map(|node| node.type_id)
+        .collect::<HashSet<_>>();
     let mut consumed = HashSet::new();
 
     for edge in desired {
         let Some(existing) = accepted_by_id.get(&edge.type_id).copied() else {
-            steps.push(SchemaMigrationStep::AddType {
-                type_kind: SchemaTypeKind::Edge,
-                name: edge.name.clone(),
-            });
+            // A non-zero minimum counts every source node, and the nodes of
+            // an existing source type have none of the new edges. Like a
+            // required property, it needs a backfill, which apply cannot do.
+            if edge.cardinality.min > 0 && accepted_node_ids.contains(&edge.from_type.type_id) {
+                steps.push(SchemaMigrationStep::UnsupportedChange {
+                    entity: format!("edge:{}", edge.name),
+                    reason: format!(
+                        "adding edge '{}' with a @card minimum of {} from existing node type '{}' \
+                         requires a backfill and is not supported in schema migration v1",
+                        edge.name, edge.cardinality.min, edge.from_type.type_name
+                    ),
+                    code: Some(crate::lint::codes::OG_MF_107.code.to_string()),
+                });
+            } else {
+                steps.push(SchemaMigrationStep::AddType {
+                    type_kind: SchemaTypeKind::Edge,
+                    name: edge.name.clone(),
+                });
+            }
             continue;
         };
 
@@ -1574,6 +1600,60 @@ node Person {
                 if entity.contains("Person.age")
                     && code.as_deref() == Some(crate::lint::codes::OG_MF_103.code)
         )));
+    }
+
+    /// A new edge type with a non-zero `@card` minimum needs every node of its
+    /// source type to hold one, which existing nodes cannot: the plan refuses
+    /// it from an existing source type, and admits it without a minimum, from
+    /// a source type added in the same plan, or toward an existing type.
+    #[test]
+    fn plan_rejects_card_minimum_edge_from_existing_node_type() {
+        let accepted = ir(r#"
+node Person {
+    name: String @key
+}
+node Company {
+    name: String @key
+}
+"#);
+        let desired = evolve(
+            &accepted,
+            r#"
+node Person {
+    name: String @key
+}
+node Company {
+    name: String @key
+}
+edge WorksAt: Person -> Company @card(1..)
+"#,
+        );
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(!plan.supported);
+        assert_eq!(
+            plan.steps,
+            vec![UnsupportedChange {
+                entity: "edge:WorksAt".to_string(),
+                reason: "adding edge 'WorksAt' with a @card minimum of 1 from existing node type \
+                         'Person' requires a backfill and is not supported in schema migration v1"
+                    .to_string(),
+                code: Some(crate::lint::codes::OG_MF_107.code.to_string()),
+            }]
+        );
+
+        for admitted in [
+            "edge WorksAt: Person -> Company @card(0..1)",
+            "node Badge {\n    slug: String @key\n}\nedge HeldBy: Badge -> Person @card(1..1)",
+        ] {
+            let desired = evolve(
+                &accepted,
+                &format!(
+                    "node Person {{\n    name: String @key\n}}\nnode Company {{\n    name: String @key\n}}\n{admitted}\n"
+                ),
+            );
+            let plan = plan_schema_migration(&accepted, &desired).unwrap();
+            assert!(plan.supported, "{admitted}: {plan:?}");
+        }
     }
 
     #[test]

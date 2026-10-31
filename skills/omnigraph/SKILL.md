@@ -235,10 +235,10 @@ schema is their coordinate system: it decides where a fact goes, what a stored
 value means, and which paths agents reason along. Design for **convergence**:
 two agents given the same input should write the same graph and read the same
 meaning back. Decide conservatively what to model; once modeled, constrain
-precisely, because tightening later is a rebuild (adding
-`@key`/`@unique`/`@range`/`@check`, changing cardinality, and `T?` → `T` are
-refused; only `@index` additions, nullable additions, enum widening, renames and
-drops apply in place).
+precisely, because tightening later is a rebuild (adding `@key`/`@unique`/
+`@range`/`@check` or a required edge to an existing type, changing cardinality,
+and `T?` → `T` are refused; only `@index` additions, nullable additions, enum
+widening, renames and drops apply in place).
 
 In short: Gruber's five criteria (clarity · coherence · extendibility · minimal
 encoding bias · minimal commitment) · neither too loose (one meaning, many
@@ -253,8 +253,8 @@ extracted and synthesized knowledge over raw spans, with lineage back to them,
 keyed per fact (span + extractor + statement digest) · store decisions, compute
 derived facts · narrow types and closed vocabularies · constraints in the
 schema; rules it cannot express as `GraphPolicy` nodes agents lint the graph
-against, including an orphan check per required link (`@card` never counts a
-node written with no edge) · compose around shared identities (modules add
+against, including an orphan check per required link (`@card` counts a node
+only when a write touches it) · compose around shared identities (modules add
 facets, never modify the core) from general primitives that combine · optimize
 retrieval: links for recall, specific edges, filters and answer-sized units for
 precision · write names, `@description` and `@instruction` for a reader without

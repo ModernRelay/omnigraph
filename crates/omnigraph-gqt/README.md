@@ -197,7 +197,8 @@ single_scan`; `load validate value <table> [a, b]`; `load validate unique
 <table> <key|unique> [a, b]: access <delta|probe|scan>`; `load validate
 edge_ri <edge> <from|to> <Node>: access <delta|probe|scan>`; `load validate
 cardinality <edge> <from|to> <Node>`; `load validate retained_edges <node>
-<edge> <from|to>: access <delta|probe|scan>`; `load write: <overwrite fragments|append strict_insert|
+<edge> <from|to>: access <delta|probe|scan>`; `load validate source_cardinality
+<node> <edge>: access <delta|probe|scan>`; `load write: <overwrite fragments|append strict_insert|
 merge upsert>`; `load executed: partitions <n> rows <m>`. The validate lines
 are the one `Validate` node's checks. Tables are qualified (`node:Person`, `edge:Knows`);
 an endpoint's referenced type is bare. A served environment refuses the
@@ -238,7 +239,8 @@ The schema declares the types and keys. A load requires `mode: append` or
 `mode: merge`; `branch:` defaults to `main` and must already exist. Its expect
 is `ok` or `error: <substring>`, with no params, affected-count, row or shape
 section. Table batches publish independently; a later failure does not undo
-earlier batches. A load in a loop repeats its unchanged recipe. Interpolation
+earlier batches. A node batch therefore carries no edges, and a node type that
+is the source of an edge type with a non-zero `@card` minimum refuses it. A load in a loop repeats its unchanged recipe. Interpolation
 in generator bodies and headers is refused. Seed headers require an explicit
 unsigned 64-bit seed and `generate: v1`; load headers additionally require a
 mode. A load requires at least one nonempty batch; empty recipes are admitted
@@ -640,6 +642,7 @@ load validate unique <table> key|unique [<cols>]: access delta|probe|scan
 load validate edge_ri <edge-table> from|to <node-type>: access probe|scan
 load validate cardinality <edge-table> from <node-type>
 load validate retained_edges <node-table> <edge-table> from|to: access delta|probe|scan
+load validate source_cardinality <node-table> <edge-table>: access delta|probe|scan
 load write: overwrite fragments
 load write: append strict_insert
 load write: merge upsert

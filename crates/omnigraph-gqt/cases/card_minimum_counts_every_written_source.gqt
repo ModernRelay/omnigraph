@@ -1,0 +1,106 @@
+# issue: none
+# notes: A non-zero @card minimum counts every source node a write inserts or updates, not only the
+# notes: sources whose edges it touches. A mutation inserting a person without a WorksAt is refused,
+# notes: also when it inserts another person with one; the person and the edge in one mutation are
+# notes: admitted, and so is an update of a person who keeps a committed edge. A generated load
+# notes: publishes its person batch alone, so a person table loaded without its edges is refused.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    title: String?
+}
+node Company {
+    name: String @key
+}
+edge WorksAt: Person -> Company @card(1..)
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+{"type":"Company","data":{"name":"acme"}}
+{"edge":"WorksAt","from":"alice","to":"acme","data":{}}
+
+--- mutate
+query hire_without_employer() {
+    insert Person { name: "bob" }
+}
+
+--- expect error: @card violation on edge WorksAt: source 'bob' has 0 edges (min 1)
+
+--- mutate
+query hire_two_with_one_employer() {
+    insert Person { name: "bob" }
+    insert Person { name: "carol" }
+    insert WorksAt { from: "carol", to: "acme" }
+}
+
+--- expect error: @card violation on edge WorksAt: source 'bob' has 0 edges (min 1)
+
+--- mutate
+query hire_with_employer() {
+    insert Person { name: "bob" }
+    insert WorksAt { from: "bob", to: "acme" }
+}
+
+--- expect affected: nodes=1 edges=1
+
+--- mutate
+query retitle() {
+    update Person set { title: "cto" } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- load generate: v1 seed: 0 mode: append
+tables:
+  - kind: node
+    name: Person
+    rows: 1
+    commits: 1
+    columns:
+      name: {kind: key, prefix: gen-, width: 1}
+
+--- expect error: @card violation on edge WorksAt: source 'gen-0' has 0 edges (min 1)
+
+--- query
+query people() {
+    match { $p: Person }
+    return { $p.name, $p.title }
+}
+
+--- expect unordered
+{"p.name": "alice", "p.title": "cto"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String
+p.title: String?
+
+--- query
+query employment() {
+    match {
+        $p: Person
+        $c: Company
+        $p worksAt $c
+    }
+    return { $p.name, $c.name }
+}
+
+--- expect unordered
+{"p.name": "alice", "c.name": "acme"}
+{"p.name": "bob", "c.name": "acme"}
+
+--- expect shape
+p.name: String
+c.name: String

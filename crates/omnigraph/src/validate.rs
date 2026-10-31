@@ -41,8 +41,8 @@ use crate::error::{MergeConflict, MergeConflictKind, OmniError, Result};
 use crate::loader::{validate_enum_constraints, validate_value_constraints};
 use crate::table_store::{ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, TableStore};
 use kernels::{
-    HoldersByKey, card_affected, card_plan, card_violations, deleted_endpoints, edge_ri_delta,
-    match_unique_holders, orphans_in_delta, orphans_retained, partition_endpoints,
+    CardPlan, HoldersByKey, card_affected, card_plan, card_violations, deleted_endpoints,
+    edge_ri_delta, match_unique_holders, orphans_in_delta, orphans_retained, partition_endpoints,
     unique_coalesced_dups, unique_committed_collisions, unique_image, unique_probe_keys,
 };
 
@@ -607,23 +607,42 @@ impl<'a> CommittedState<'a> {
         keys: &[String],
         system_columns: SystemColumns,
     ) -> Result<Vec<(String, String)>> {
-        let Some(ds) = self.open_cardinality(edge_table).await? else {
-            return Ok(Vec::new());
-        };
+        // No keys, no open: on the write path an open refreshes the branch
+        // snapshot.
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let expr = col(key_col).in_list(keys.iter().map(|k| lit(k.clone())).collect(), false);
-        let batches = scan_filtered(&ds, &[system_columns.id, system_columns.src], expr).await?;
-        let mut out = Vec::new();
-        for batch in &batches {
-            let ids = string_col(batch, system_columns.id)?;
-            let srcs = string_col(batch, system_columns.src)?;
-            for i in 0..batch.num_rows() {
-                out.push((ids.value(i).to_string(), srcs.value(i).to_string()));
-            }
+        let Some(ds) = self.open_cardinality(edge_table).await? else {
+            return Ok(Vec::new());
+        };
+        edges_matching(&ds, key_col, keys, system_columns).await
+    }
+
+    /// Edges `(id, src)` of `edge_table` matching `keys` on `key_col` as they
+    /// stood before this write. An overwritten table's committed view is
+    /// empty, but the sources its removed or re-placed edges left still lose
+    /// them, so they are read from the pre-overwrite snapshot; every other
+    /// table reads the cardinality view.
+    async fn prior_edges(
+        &self,
+        edge_table: &str,
+        key_col: &str,
+        keys: &[String],
+        system_columns: SystemColumns,
+    ) -> Result<Vec<(String, String)>> {
+        if !self.overwritten.contains(edge_table) {
+            return self
+                .committed_edges(edge_table, key_col, keys, system_columns)
+                .await;
         }
-        Ok(out)
+        let Some(committed) = self.committed else {
+            return Ok(Vec::new());
+        };
+        if keys.is_empty() || committed.dataset(edge_table).is_none() {
+            return Ok(Vec::new());
+        }
+        let ds = committed.open_lance_dataset(edge_table).await?;
+        edges_matching(&ds, key_col, keys, system_columns).await
     }
 
     /// The first committed edge a single-table node overwrite would strand.
@@ -755,6 +774,29 @@ async fn scan_filtered(ds: &Dataset, projection: &[&str], expr: Expr) -> Result<
     .try_collect()
     .await
     .map_err(OmniError::storage)
+}
+
+/// Edges `(id, src)` of `ds` whose `key_col` (id or src) is one of `keys`.
+async fn edges_matching(
+    ds: &Dataset,
+    key_col: &str,
+    keys: &[String],
+    system_columns: SystemColumns,
+) -> Result<Vec<(String, String)>> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let expr = col(key_col).in_list(keys.iter().map(|k| lit(k.clone())).collect(), false);
+    let batches = scan_filtered(ds, &[system_columns.id, system_columns.src], expr).await?;
+    let mut out = Vec::new();
+    for batch in &batches {
+        let ids = string_col(batch, system_columns.id)?;
+        let srcs = string_col(batch, system_columns.src)?;
+        for i in 0..batch.num_rows() {
+            out.push((ids.value(i).to_string(), srcs.value(i).to_string()));
+        }
+    }
+    Ok(out)
 }
 
 /// Stream `ds` projecting `projection` in bounded batches, unfiltered. The
@@ -1055,22 +1097,33 @@ where
                     }
                 }
                 Constraint::Cardinality { table_key } => {
-                    if let Some(change) = changeset.get(table_key) {
-                        let Some(type_name) = table_key.strip_prefix("edge:") else {
-                            continue;
-                        };
-                        if let Some(edge_type) = catalog.edge_types.get(type_name) {
-                            evaluate_cardinality(
-                                table_key,
-                                edge_type,
-                                change,
-                                changeset,
-                                committed,
-                                system_columns,
-                                &mut emit,
-                            )
-                            .await?;
-                        }
+                    let Some(edge_type) = table_key
+                        .strip_prefix("edge:")
+                        .and_then(|type_name| catalog.edge_types.get(type_name))
+                    else {
+                        continue;
+                    };
+                    // Run when the edge table has a delta OR, under a non-zero
+                    // minimum, when the write inserts or updates a source node:
+                    // a source node written with no edge of the type is below
+                    // the minimum although no edge of the type moved.
+                    let change = changeset.get(table_key);
+                    let written_sources = changeset
+                        .get(&format!("node:{}", edge_type.from_type))
+                        .filter(|_| edge_type.cardinality.min > 0)
+                        .filter(|change| change.value_batches().next().is_some());
+                    if change.is_some() || written_sources.is_some() {
+                        evaluate_cardinality(
+                            table_key,
+                            edge_type,
+                            change,
+                            written_sources,
+                            changeset,
+                            committed,
+                            system_columns,
+                            &mut emit,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -1233,17 +1286,22 @@ async fn merged_node_existence(
     Ok(exist)
 }
 
-/// `@card` for an edge type, scoped to the srcs the delta affects. The delta is
+/// `@card` for an edge type, scoped to the srcs the change affects. The delta is
 /// coalesced by edge id (last-wins, as commit does); the merged edge set per src
 /// = (committed edges with that src, minus those deleted or re-placed by the
 /// delta) ∪ (coalesced delta edges with that src). The affected set includes the
-/// new src of each delta edge AND the old committed src of each changed/deleted
-/// edge id, so moving an edge off a src recounts the vacated src. A src that is
-/// itself a deleted node is skipped.
+/// new src of each delta edge AND the old src of each changed/deleted edge id
+/// (read from the pre-write image, an overwritten table included), so moving an
+/// edge off a src recounts the vacated src. Under a non-zero minimum it also
+/// includes every source node the write inserts or updates (`written_sources`),
+/// so a node written without its edges is counted. A src that is itself a
+/// deleted node is skipped.
+#[allow(clippy::too_many_arguments)]
 async fn evaluate_cardinality<F>(
     edge_table: &str,
     edge_type: &EdgeType,
-    change: &TableChange,
+    change: Option<&TableChange>,
+    written_sources: Option<&TableChange>,
     changeset: &ChangeSet,
     committed: &CommittedState<'_>,
     system_columns: SystemColumns,
@@ -1254,18 +1312,21 @@ where
 {
     let card = &edge_type.cardinality;
     // Default unbounded cardinality can never be violated — skip the lookups.
-    if card.min == 0 && card.max.is_none() {
+    if card.is_default() {
         return Ok(());
     }
-    let plan = card_plan(change, system_columns)?;
+    let plan = match change {
+        Some(change) => card_plan(change, system_columns)?,
+        None => CardPlan::default(),
+    };
 
-    // Committed srcs of the edges this delta touches. `removed_edges` are the
+    // Prior srcs of the edges this delta touches. `removed_edges` are the
     // deleted ids (direct deletes; a node-delete cascade already lands those ids
-    // in `deleted_ids`). `moved_from` are the changed ids' OLD committed srcs: an
-    // upsert that moves an edge's src vacates its old src, which must be
-    // recounted or a drop below @card min is missed.
+    // in `deleted_ids`; an overwrite lands the ids its batch omits). `moved_from`
+    // are the changed ids' OLD srcs: an upsert that moves an edge's src vacates
+    // its old src, which must be recounted or a drop below @card min is missed.
     let removed_edges = committed
-        .committed_edges(
+        .prior_edges(
             edge_table,
             system_columns.id,
             &plan.removed_ids,
@@ -1273,19 +1334,29 @@ where
         )
         .await?;
     let moved_from = committed
-        .committed_edges(
+        .prior_edges(
             edge_table,
             system_columns.id,
             &plan.changed_ids,
             system_columns,
         )
         .await?;
+    let written = match written_sources {
+        Some(change) => delta_id_set(change, system_columns)?,
+        None => HashSet::new(),
+    };
 
     let deleted_src_nodes: HashSet<String> = changeset
         .get(&format!("node:{}", edge_type.from_type))
         .map(|change| change.deleted_ids.iter().cloned().collect())
         .unwrap_or_default();
-    let affected = card_affected(&plan, &removed_edges, &moved_from, &deleted_src_nodes);
+    let affected = card_affected(
+        &plan,
+        &removed_edges,
+        &moved_from,
+        &written,
+        &deleted_src_nodes,
+    );
     if affected.is_empty() {
         return Ok(());
     }

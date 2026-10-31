@@ -88,7 +88,7 @@ also have a single-property shorthand.
 | `@index(p, ...)` | node or edge | Declares index intent. Indexes affect performance, not correctness. |
 | `@range(p, min..max)` | node | Restricts a numeric property; either bound may be omitted. |
 | `@check(p, "regex")` | node | Requires a String property to match the expression. |
-| `@card(min..max)` | edge | Restricts the number of edges; omit `max` for an unbounded range, as in `@card(1..)`. The default is unbounded from zero. |
+| `@card(min..max)` | edge | Bounds how many edges of the type start at each source node; omit `max` for an unbounded range, as in `@card(1..)`. The default is unbounded from zero. See [Edge cardinality](#edge-cardinality). |
 
 `Blob`, list, and vector properties cannot be keys. Blob properties also cannot
 be unique or indexed.
@@ -99,6 +99,43 @@ full-text index, and vectors receive a vector index. Composite declarations and
 edge-property declarations are accepted as schema intent but do not currently
 create a property index. Edge endpoints are indexed independently for traversal.
 See [Search](../search/index.md#indexes).
+
+### Edge cardinality
+
+`@card(min..max)` counts, for each node of the edge's source type, the edges of
+that type that start at it. A write is refused before publication when it
+leaves one of these nodes outside the bounds:
+
+- a source node the write inserts or updates, when `min` is above zero;
+- a source node whose edges of the type the write adds, removes, or moves,
+  including the edges an `overwrite` load omits and the edges a node delete
+  cascades to.
+
+A source node the write deletes is not counted. A node whose type needs edges
+(`min` above zero) must therefore arrive in the same write as those edges: one
+mutation query that inserts the node and its edges, or one JSONL load that
+carries both. A load of the node type alone cannot add such a node, and neither
+can a [`load csv`](../mutations/index.md#csv-loading) into it, which carries no
+edges.
+
+Schema apply refuses a new edge type with a non-zero minimum whose source node
+type already exists (`OG-MF-107`): its existing nodes have none of the new
+edges. Declare such an edge with its source type, or without a minimum.
+
+Earlier OmniGraph versions did not count inserted source nodes, so a graph they
+wrote can hold nodes below the minimum. Each is counted the next time a write
+inserts or updates it or changes its edges of the type, and a load that
+rebuilds the graph from an export refuses it. An orphan query lists them:
+
+```gq
+query people_without_employer() {
+    match {
+        $p: Person
+        not { $p worksAt $c }
+    }
+    return { $p.email }
+}
+```
 
 ## IDs
 
@@ -168,7 +205,8 @@ source in one graph commit even when no table changes are needed. Applying the
 same accepted source again leaves the graph unchanged.
 
 Changes such as adding a required property to existing entities, changing a property
-type (except enum widening), changing edge endpoints or cardinality, changing a
+type (except enum widening), changing edge endpoints or cardinality, adding an
+edge type with a non-zero `@card` minimum from an existing node type, changing a
 node's implemented interfaces, and adding or removing most constraints are
 rejected. The plan reports the exact unsupported step before anything changes.
 
@@ -208,5 +246,6 @@ code rather than the message text.
 | `OG-DS-104` | Drop a populated property. |
 | `OG-MF-103` | Add a required property to a populated type. |
 | `OG-MF-106` | Change a property's type, including enum narrowing or renaming. |
+| `OG-MF-107` | Add an edge type with a non-zero `@card` minimum from an existing node type. |
 
 `omnigraph schema plan` includes these codes in human and JSON output.

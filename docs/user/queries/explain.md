@@ -308,13 +308,15 @@ A load plan has three nodes, from the root down:
 | `CsvSource` | `format`, `source`, `source_bytes`, `estimated_rows`, `delimiter`, `header`, `columns`, `table`, `version`; the physical row adds `max_partitions`, `max_workers`, `fallback` |
 
 Each entry of `checks` carries `check` (`value`, `unique`, `edge_ri`,
-`cardinality` or `retained_edges`), its identity fields, `consults` (the
-committed table it reads, or `null`) and, on the physical node, `access`:
+`cardinality`, `retained_edges` or `source_cardinality`), its identity fields,
+`consults` (the committed table it reads, or `null`) and, on the physical node,
+`access`:
 
 - `unique` carries `columns` and `role` (`key` or `unique`).
 - `edge_ri` and `cardinality` carry `endpoint` (`from` or `to`) and
   `node_type`.
 - `retained_edges`, on a node overwrite, carries `edge_table` and `endpoint`.
+- `source_cardinality`, on a node load under a `@card` minimum, carries `edge_table`, `min`, `max`.
 
 `access` is the path the check reads committed state by:
 
@@ -328,7 +330,7 @@ Overwrite endpoint checks cost probes and scans using estimated input rows,
 the consulted table's row count, and usable BTREE coverage at the accepted
 version. Partial or missing coverage gets no index discount. Unknown counts
 and equal costs keep `probe`; statistics record the inputs and both costs.
-`cardinality` and `retained_edges` always use `probe`. Node overwrite scans
+`cardinality`, `retained_edges` and `source_cardinality` always use `probe`. Node overwrite scans
 old node IDs to find removals; retained-edge access describes the filtered
 lookup in the incident edge table. Append and merge always use `probe`.
 
