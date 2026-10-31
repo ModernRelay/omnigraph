@@ -138,7 +138,9 @@ omnigraph branch delete <branch-name> --target $REPO
 All support `--json`. `--from` and `--into` default to `main`. `branch create
 --from-commit <commit-id>` starts the branch at a published commit instead.
 `--delete-branch` removes the source only after a successful merge publication.
-A served `branch delete --json` needs `--yes`.
+A served `branch delete --json` needs `--yes`. `branch list --detailed` adds
+each branch's head, the branch (`from`) and commit (`from_commit_id`) it
+started from, and `created_at`/`updated_at`, without reading commit history.
 
 The same operations are GQ branch statements, useful when a client already
 sends `.gq` source:
@@ -442,8 +444,7 @@ with the target's credential, which the agent never sees. Managed targets
 exchange their pinned profile's credential for a resource identity. It is bound to one
 graph (`--graph` or `default_graph`): calls that omit `graph` get it, and calls
 or resource URIs naming another graph are refused. Without `--write` only tools
-the server annotates read-only are listed and admitted; the server lists write
-tools only with `--mcp-allow-writes`. On server targets, `--as` asserts the actor
+the server annotates read-only are listed and admitted. On server targets, `--as` asserts the actor
 on every request; managed targets refuse `--as`. Direct targets refuse with
 `target_kind_unsupported`; the
 bridge never starts a server. A lost answer is never resent: an

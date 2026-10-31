@@ -1480,3 +1480,44 @@ Amendments before 2026-10-12 are recorded in §14 and in the dispositions above.
     rest of that paragraph through "D1–D3 ship through the CLI and HTTP."
   - The 2026-10-12 review entry's "GQ exposure of the diff surfaces is
     deferred to RFC 0056 (ModernRelay/omnigraph#670), not rejected (§8.5)."
+- **2026-10-28: row-identity discovery across a window.** ModernRelay/omnigraph#969
+  measured both wider diffs reading every row of each changed type's two
+  versions, growing with the table (277 data reads and 6.9 MB at 100,000 rows
+  for ten changed rows), because §4.2's candidate pruning follows one adjacent
+  transaction and a window of several commits fell back to the exact ordered
+  merge. The amendment keeps the exact merge as the oracle and adds one
+  discovery rule before it, for an interval with no adjacency proof
+  (`changes::candidate_scan::row_identity_plan`): pair the two pinned
+  versions' fragments by id and skip the pairs whose data files and deletion
+  file are identical; decode the live `(_rowid, _row_last_updated_at_version)`
+  pairs of the rest from the inline fragment metadata, the deletion vector
+  applied; a row id live on both sides with equal stamps is one unchanged row,
+  every other id is a candidate; each side then runs §4.2's ordered merge over
+  its touched fragments narrowed to its candidate ids. Compaction preserves
+  row ids and stamps, so a window across an `optimize` stays flat; an
+  overwrite allocates fresh ids, so its window is the table, as it should be.
+  The rule rests on Lance facts the `lance_surface_guards` row "Row version
+  stamps" pins, one of which bounds it: the stamp a commit writes is its read
+  manifest's version plus one, not the detached version the commit receives,
+  so two sibling first commits over one parent stamp a row they both update
+  alike. Stamp equality therefore proves a shared row only where the `from`
+  side is on the `to` side's first-parent chain, which the diff decides from
+  the lineage the `to` branch's coordinator holds (its head and buffered
+  commits with no read, a page walk down to `from`'s generation below them);
+  a two-point diff of diverged heads takes the exact merge, and so does a
+  fragment whose sequences are absent, spilled or short, a candidate list over
+  65,536 ids, or more than 8 million live rows in touched fragments. The
+  `change_lineage` session setting (`off`, `on`, `verify`; `on` by default,
+  `verify` in a debug build, as `merge_lineage`) selects the rule for the
+  commit page, the feed and both diffs; `verify` runs the exact merge beside
+  it and refuses the page at the first change on which they disagree.
+  Evidence: `lance_surface_guards::row_identity_discovery_stamps_row_ids_and_rewrites_lance_13`;
+  `integration/changes_cost.rs` `graph_diff_over_several_commits_reads_data_flat_in_table_extent`,
+  `graph_diff_across_a_compaction_reads_data_flat_in_table_extent` and
+  `graph_diff_of_diverged_heads_takes_the_exact_merge` (the route each
+  window shape takes, through the `change_intervals_*` probes); GQT
+  `issue_969_graph_diff_wider_windows.gqt`. This entry supersedes §4.2's
+  "An interval wider than one version falls back before any transaction
+  read" as the whole story: it still holds for the transaction read, and the
+  row-identity rule runs after it. The §9 cost evidence row "every changed
+  type is compared in full" for a multi-commit window no longer holds.

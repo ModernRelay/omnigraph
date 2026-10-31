@@ -34,7 +34,7 @@ pub(super) const BEST_PRACTICES: &[BestPractice] = &[
     BestPractice {
         key: "queries",
         title: "GQ query best practices",
-        description: "Read before writing a query for `read`, `query` or `mutate`. Covers .gq grammar, choosing a declared query by name, parameter declarations, the PascalCase to lowerCamelCase edge casing trap, search operators that need a trailing `limit`, and the non-nullable lint rule.",
+        description: "Read before writing a query for `query` or `mutate`. Covers .gq grammar, choosing a declared query by name, parameter declarations, the PascalCase to lowerCamelCase edge casing trap, search operators that need a trailing `limit`, and the non-nullable lint rule.",
     },
     BestPractice {
         key: "data",

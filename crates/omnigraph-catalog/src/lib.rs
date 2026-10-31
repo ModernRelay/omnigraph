@@ -14,6 +14,7 @@ pub(crate) use omnigraph_core::{
     branch_control, branch_names, dataset_index, error, handle_cache, instrumentation,
     lance_access, lance_clone, manifest_request, metadata, seams, staging, storage,
 };
+pub mod branch_detail;
 pub mod commit_graph;
 
 mod commit;
@@ -63,6 +64,7 @@ pub mod retention;
 pub mod state;
 pub mod unattached;
 pub mod unpublished;
+pub use branch_detail::{GraphBranchDetail, GraphBranchListing, list_graph_branches_detailed};
 pub use branch_names::is_merge_input_tag;
 pub use migrations::{
     UNATTACHED_BRANCHES_STAMP, UNPUBLISHED_COMMITS_STAMP, require_unattached_branches,
@@ -1179,18 +1181,59 @@ impl CollectorBranch {
         .with_registry(Arc::new(rows.registry), &self.dataset))
     }
 
-    /// The version history up to the opened version; a version published
-    /// after the open is listed by the store and dropped here.
-    pub async fn versions(&self) -> Result<Vec<lance::dataset::Version>> {
+    /// The attached version numbers up to the opened version, ascending, from
+    /// the `_versions/` listing alone: `Dataset::version_refs` reads no
+    /// manifest (`Dataset::versions` reads and decodes every one, one after
+    /// another). A version published after the open is listed by the store
+    /// and dropped here.
+    pub async fn version_numbers(&self) -> Result<Vec<u64>> {
         let head = self.head_version();
         Ok(self
             .dataset
-            .versions()
+            .version_refs()
             .await
             .map_err(OmniError::storage)?
             .into_iter()
-            .filter(|version| version.version <= head)
+            .map(|version| version.version)
+            .filter(|version| *version <= head)
             .collect())
+    }
+
+    /// The listed `versions`' manifests, read through the opened branch in
+    /// the order given, as many at once as the store's I/O parallelism allows
+    /// (Lance's own bound: 8 on a local store, 64 on object storage). Each
+    /// read resolves the version's manifest path with a HEAD (V2, else V1),
+    /// then reads the manifest. A manifest whose body names another version
+    /// than the listed path it was read from is refused: `checkout_version`
+    /// does not compare them, and a caller keyed by the body's number would
+    /// lose the listed version.
+    pub async fn read_versions(&self, versions: &[u64]) -> Result<Vec<lance::dataset::Version>> {
+        use futures::{StreamExt, TryStreamExt};
+        let concurrency = self
+            .dataset
+            .object_store(None)
+            .await
+            .map_err(OmniError::storage)?
+            .io_parallelism();
+        futures::stream::iter(versions.iter().copied())
+            .map(|version| async move {
+                let read = self
+                    .dataset
+                    .checkout_version(version)
+                    .await
+                    .map_err(OmniError::storage)?
+                    .version();
+                if read.version != version {
+                    return Err(OmniError::manifest_internal(format!(
+                        "__manifest version {version} holds a manifest of version {}",
+                        read.version
+                    )));
+                }
+                Ok(read)
+            })
+            .buffered(concurrency.max(1))
+            .try_collect()
+            .await
     }
 
     /// Every pin the branch has held up to the opened version.
@@ -2668,23 +2711,10 @@ impl ManifestCoordinator {
     /// Logical graph branches, `main` first. Each live native ref maps to
     /// exactly one logical name; a duplicate incarnation fails loudly.
     pub async fn list_graph_branches(&self) -> Result<Vec<String>> {
-        let branches = list_live_manifest_branch_contents(&self.dataset).await?;
-        let mut names = Vec::with_capacity(branches.len());
-        let mut seen = HashSet::with_capacity(branches.len());
-        for native in branches.keys().filter(|name| *name != "main") {
-            let logical = crate::branch_names::logical_branch_name(native).to_string();
-            if !seen.insert(logical.clone()) {
-                return Err(OmniError::manifest_conflict(format!(
-                    "branch '{logical}' has more than one live native incarnation; run cleanup \
-                     before using it"
-                )));
-            }
-            names.push(logical);
-        }
-        names.sort();
-        let mut all = vec!["main".to_string()];
-        all.extend(names);
-        Ok(all)
+        let named = branch_detail::live_named_branches(&self.dataset).await?;
+        Ok(std::iter::once("main".to_string())
+            .chain(named.into_iter().map(|branch| branch.name))
+            .collect())
     }
 }
 

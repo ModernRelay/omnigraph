@@ -251,6 +251,10 @@ async fn bound_handle_workload_child() {
     )
     .await
     .unwrap();
+    // A detailed listing reads `feature`'s latest `__manifest` version and the
+    // version it was created from, both through the handle's storage.
+    let listing = db.branch_list_detailed(&mut |_| true).await.unwrap();
+    assert_eq!(listing.details.len(), 2);
     let merged = db.branch_merge("feature", "main").await.unwrap();
     assert_eq!(merged.outcome, MergeOutcome::Merged);
     db.branch_delete("feature").await.unwrap();

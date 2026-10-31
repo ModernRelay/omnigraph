@@ -1,0 +1,1 @@
+- Managed plans now poll the original preview until ready. Timeouts retain its ID, revision and key; `--no-wait` returns on acceptance without cancelling work.

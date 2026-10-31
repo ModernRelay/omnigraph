@@ -44,27 +44,16 @@ fn refusals_delegate_write_context_and_preserve_resource_error_data() {
     }
 }
 
-/// Every tool, with every opt-in on: a write tool is annotated as one and is
-/// absent without `allow_writes`; the arguments its schema requires parse,
-/// and an argument it does not declare is refused.
+/// Every tool: a write tool is annotated as one; the arguments its schema
+/// requires parse, and an argument it does not declare is refused.
 #[test]
-fn every_tool_parses_its_required_arguments_and_writes_need_the_write_gate() {
-    let adhoc = McpSettings {
-        allow_adhoc: true,
-        ..McpSettings::default()
-    };
-    let open = McpSettings {
-        allow_writes: true,
-        ..adhoc.clone()
-    };
-    let without_writes: Vec<_> = tools(&adhoc).into_iter().map(|tool| tool.name).collect();
+fn every_tool_parses_its_required_arguments_and_writes_are_annotated() {
     let mut writes = Vec::new();
-    for tool in tools(&open) {
-        let spec = spec(&open, &tool.name).unwrap();
-        let write = spec.gate == Gate::Writes;
+    for tool in tools() {
+        let spec = spec(&tool.name).unwrap();
+        let write = spec.writes();
         let hints = tool.annotations.as_ref().unwrap();
         assert_eq!(hints.read_only_hint, Some(!write), "{}", tool.name);
-        assert_eq!(without_writes.contains(&tool.name), !write, "{}", tool.name);
         if write {
             writes.push(spec.name);
         }
@@ -155,7 +144,6 @@ fn complete_tool_result_including_legacy_text_has_one_byte_bound() {
     assert_eq!(result.structured_content, Some(small));
     let service = GraphTools {
         host: HeldHost::default(),
-        settings: McpSettings::default(),
         version: "test".into(),
         slots: Arc::new(Semaphore::new(1)),
     };
@@ -248,7 +236,6 @@ async fn cancellation_and_deadline_keep_the_host_owned_permit_until_completion()
             let host = HeldHost::default();
             let service = GraphTools {
                 host: host.clone(),
-                settings: McpSettings::default(),
                 version: "test".into(),
                 slots: Arc::new(Semaphore::new(1)),
             };

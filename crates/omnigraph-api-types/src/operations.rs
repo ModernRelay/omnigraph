@@ -4,7 +4,7 @@
 //! restricted binding names its reason; adding a tool or command does not
 //! silently turn it into another operation. The HTTP rows include distinct
 //! conditional and payload variants because they have distinct wire contracts.
-//! Runtime dispatch, authentication, schemas and MCP boot gates keep their
+//! Runtime dispatch, authentication, schemas and MCP tool definitions keep their
 //! existing owners. In particular, the engine-free MCP crate does not depend on
 //! this module: the server compares its real tool list with this inventory.
 
@@ -521,7 +521,10 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         "/graphs/{graph_id}/query",
         Capability::Read,
         None,
-        Surface::bound(&["read"]),
+        Surface::restricted(
+            &["query"],
+            "query with source selects this route; with only a name it invokes a stored read.",
+        ),
         Surface::restricted(
             &["query"],
             "Ad-hoc source selects this route; a stored name selects query invoke.",

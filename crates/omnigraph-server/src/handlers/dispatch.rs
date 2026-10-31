@@ -231,6 +231,7 @@ pub(super) async fn branch_read_body(
     match read {
         BranchRead::Diff { sides, page } => {
             let scope = omnigraph::changes::ChangeFeedScope::default();
+            let lineage = session.settings().change_lineage();
             let diff = match sides {
                 BranchDiffSides::Branch { source, into } => {
                     branch_diff_page(
@@ -241,12 +242,22 @@ pub(super) async fn branch_read_body(
                         scope,
                         page.after_page,
                         page.limit,
+                        lineage,
                     )
                     .await?
                 }
                 BranchDiffSides::Between { from, to } => {
-                    two_point_diff_page(handle, actor, from, to, scope, page.after_page, page.limit)
-                        .await?
+                    two_point_diff_page(
+                        handle,
+                        actor,
+                        from,
+                        to,
+                        scope,
+                        page.after_page,
+                        page.limit,
+                        lineage,
+                    )
+                    .await?
                 }
             };
             api::branch_diff_read_output(&diff).map_err(render_error)

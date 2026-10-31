@@ -432,7 +432,7 @@ pub struct AppState {
     bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
     data_token_trust: Option<Arc<data_tokens::DataTokenTrust>>,
     oidc_identity_trust: Option<Arc<oidc_identity::OidcIdentityTrust>>,
-    /// MCP boot settings: which opt-in tools `/mcp` lists and admits.
+    /// MCP boot settings: the extra `Host` values `/mcp` admits.
     mcp: Arc<McpSettings>,
     /// Bounded process-wide ownership for queued served-export bytes. The
     /// response body and detached producer jointly retain each reservation.
@@ -980,6 +980,12 @@ impl AppState {
             .settings
             .write_max_bytes()
             .min(omnigraph::BLOB_WRITE_MAX_BYTES)
+    }
+
+    /// The process `change_lineage`, which the REST change routes read
+    /// under: they take no request settings (the Session settings RFC).
+    pub(crate) fn change_lineage(&self) -> omnigraph::settings::ChangeLineage {
+        self.process_defaults.settings.change_lineage()
     }
 
     /// One session for one request: the process defaults, then the typed

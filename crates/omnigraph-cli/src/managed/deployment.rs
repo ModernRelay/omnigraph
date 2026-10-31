@@ -1,6 +1,8 @@
 //! Native managed previews and delivery: submit once, observe the original IDs.
 use super::*;
 
+mod preview;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct Identity {
     deployment_id: String,
@@ -181,11 +183,37 @@ async fn submit(
     stderr: &mut dyn Write,
 ) -> Result<(Value, String)> {
     let key = idempotency_key(run.idempotency_key.as_deref(), stderr)?;
-    let request = api.request(Method::POST, path, Some(body), Some(&key));
+    // A submission is answered only after the service's own work, such as a
+    // plan's preview capture, which can outlast the bound of an ordinary
+    // control call. The local deadline bounds the request instead.
+    let request = api.request_with_timeout(
+        Method::POST,
+        path,
+        Some(body),
+        Some(&key),
+        deadline.saturating_duration_since(Instant::now()),
+    );
+    let deadline_reached = || {
+        Failure::new(
+            "wait_timeout",
+            "local submission deadline reached; acceptance is unknown; retain the original idempotency key",
+            5,
+        )
+    };
     let result = if run.no_wait {
         request.await
     } else {
-        tokio::time::timeout_at(deadline, request).await.unwrap_or_else(|_| Err(Failure::new("wait_timeout", "local submission deadline reached; acceptance is unknown; retain the original idempotency key", 5)))
+        match tokio::time::timeout_at(deadline, request).await {
+            // The request's own bound ends no earlier than the deadline and
+            // can fire in the same timer tick: that is the deadline too.
+            Ok(Err(error))
+                if error.body["type"] == "transport_failed" && Instant::now() >= deadline =>
+            {
+                Err(deadline_reached())
+            }
+            Ok(result) => result,
+            Err(_) => Err(deadline_reached()),
+        }
     };
     result.map(|body| (body, key.clone())).map_err(|error| {
         if error.exit == 2
@@ -341,7 +369,7 @@ pub(super) async fn dispatch(
                 ));
             }
             let request = json!({"revision":revision});
-            let (body, key) = submit(
+            let submission = submit(
                 api,
                 &format!("{base}/plans"),
                 &request,
@@ -350,9 +378,7 @@ pub(super) async fn dispatch(
                 stderr,
             )
             .await?;
-            let exit = preview_exit(&body, context, &revision)
-                .map_err(|error| retain_submission(error, &key, &request))?;
-            Ok((body, exit))
+            preview::finish(api, context, submission, &revision, run, deadline, stderr).await
         }
         ClusterCommand::Apply { plan, run, .. } => {
             let plan = plan.as_deref().ok_or_else(|| {

@@ -129,9 +129,11 @@ impl Output {
                     self.body["type"].as_str().unwrap_or("error")
                 )?;
                 for field in [
+                    "accepted_preview",
                     "accepted_deployment",
                     "requested_deployment_id",
                     "submission",
+                    "idempotency_key",
                 ] {
                     if let Some(value) = self.body.get(field) {
                         writeln!(stderr, "{field}: {value}")?;
@@ -140,6 +142,9 @@ impl Output {
                 if self.body["type"] == "output_delivery_failed" {
                     let recovery = recovery_evidence(&self.body);
                     for field in ["accepted_operation", "idempotency_key", "original_error"] {
+                        if field == "idempotency_key" && self.body.get(field).is_some() {
+                            continue;
+                        }
                         if let Some(value) = recovery.get(field) {
                             writeln!(stderr, "{field}: {value}")?;
                         }
@@ -192,6 +197,7 @@ fn accepted_recovery_output(body: &Value, recovery: Option<&Value>) -> Option<Va
     let mut output = Failure::output_delivery().body;
     let mut accepted = false;
     for (name, fields) in [
+        ("accepted_preview", &["preview_id", "revision"][..]),
         (
             "accepted_deployment",
             &["deployment_id", "native_deployment_id", "preview_id"][..],
@@ -253,6 +259,7 @@ fn recovery_evidence(body: &Value) -> Value {
         "title",
         "detail",
         "accepted_operation",
+        "accepted_preview",
         "accepted_deployment",
         "requested_deployment_id",
         "operation_id",
@@ -945,7 +952,21 @@ impl Api {
         body: Option<&Value>,
         key: Option<&str>,
     ) -> Result<Value> {
-        let response = self.raw(method, path, body, key).await?;
+        self.request_with_timeout(method, path, body, key, REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+        key: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let response = self
+            .raw_with_timeout(method, path, body, key, timeout)
+            .await?;
         if response.status.is_success() {
             Ok(response.body)
         } else {

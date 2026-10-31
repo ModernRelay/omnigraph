@@ -173,6 +173,13 @@ pub struct QueryIoProbes {
     /// over all-changing rows should inspect only the emitted row plus one
     /// continuation sentinel.
     pub candidate_rows_examined: Arc<AtomicU64>,
+    /// Change intervals with no adjacent-transaction proof that paired their
+    /// live rows by stable row id (`change_lineage` on or verify), and those
+    /// that ran the exact ordered merge of both versions. A cost test asserts
+    /// the route a window shape took, since the read counts alone cannot tell
+    /// a flat route from a small table.
+    pub change_intervals_row_identity: Arc<AtomicU64>,
+    pub change_intervals_exact_merge: Arc<AtomicU64>,
     /// Largest row/byte scanner target requested by a candidate emitter in the
     /// measured operation. Both are maxima (not sums) because parent and child
     /// streams use the same current-page target.
@@ -1282,6 +1289,22 @@ pub fn record_candidate_fragment_metadata_steps(steps: u64) {
 
 pub fn record_candidate_row_examined() {
     let _ = current(|p| p.candidate_rows_examined.fetch_add(1, Ordering::Relaxed));
+}
+
+/// One change interval with no adjacency proof discovered by row identity.
+pub fn record_change_interval_row_identity() {
+    let _ = current(|p| {
+        p.change_intervals_row_identity
+            .fetch_add(1, Ordering::Relaxed)
+    });
+}
+
+/// One change interval with no adjacency proof read by the exact merge.
+pub fn record_change_interval_exact_merge() {
+    let _ = current(|p| {
+        p.change_intervals_exact_merge
+            .fetch_add(1, Ordering::Relaxed)
+    });
 }
 
 pub fn record_candidate_scan_targets(rows: usize, bytes: u64) {
