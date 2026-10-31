@@ -194,6 +194,46 @@ Cases an RFC has argued: the flat locator objects and legacy data files under
 These are constraints, not roadmap ledgers. Change one only with the owning
 code, tests, guide, and—when irreversible—RFC.
 
+## Root cause and change discipline
+
+Name the broken invariant and the full set of cases it affects. Fix it at the
+layer that owns the contract, and trace nearby callers and workloads so the
+cause cannot return through another path. A symptomatic patch, or a special
+case that leaves the cause in place, does not count as a fix.
+
+Before adding a mechanism, check whether an existing abstraction already gives
+that guarantee. Prefer extending that abstraction, or removing it, over adding
+a parallel one. [Hard invariant 1](#hard-invariants) already requires the
+matching Lance pages before new substrate machinery or reliance on an
+undocumented behavior, and [hard invariant 12](#hard-invariants) already
+forbids a shadow copy that can drift. When a change still adds machinery, name
+the cost: duplicated state that can drift, or reliance on another component's
+undocumented internals.
+
+When a concept is handled implicitly or in several places, propose one owner,
+a type or a module, only when that owner lowers ongoing liability. Generalize
+only as far as the contract requires. Fewer lines is evidence of lower
+liability, not proof. Justify every new API, state, invariant, or maintenance
+burden against the [governing principle](#governing-principle).
+
+A regression counts only when it fails before the fix for the predicted reason
+and passes after the fix. A compile error, a setup failure, a skipped test, or
+a run that executed no tests does not count. Keep query behavior on the tier
+that [Testing](testing.md#plan-replay) already assigns. When GQT cannot express
+the contract, say why. A `.gqt` case that does not state the contract is not
+that reason.
+
+Report a local run, CI on the exact commit, a reading of the code, and a
+performance claim with no checked-in instrument as separate kinds of evidence.
+A cost claim still needs the instrument in
+[hard invariant 13](#hard-invariants). Storage gates stay separate, as
+[Lance compatibility](testing.md#lance-compatibility) describes.
+
+Other open pull requests, the documented direction, and future Lance versions
+are context. A change does not treat them as shipped behavior or as new
+requirements. The [support boundaries](#current-support-boundaries) record
+constraints on the system that exists now.
+
 ## Review checklist
 
 - Does one snapshot or authority token cover the whole operation?
@@ -212,3 +252,12 @@ code, tests, guide, and—when irreversible—RFC.
 - Is current truth stated once and linked elsewhere?
 - Did the change extend the existing test owner and read the complete relevant
   Lance domain?
+- Does the change name the broken invariant and fix it at the owning layer,
+  for every case, caller, and workload that shares the cause?
+- Does new machinery extend or remove an existing abstraction, and is every
+  new API, state, invariant, or maintenance burden justified?
+- Did the regression fail before the fix for the predicted reason, and are
+  local runs, CI on that commit, code reading, and performance claims separate
+  evidence?
+- Do open pull requests, documented direction, and future Lance versions
+  stay context for this change?

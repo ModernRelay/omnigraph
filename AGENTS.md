@@ -185,6 +185,8 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
 - Make the smallest coherent change that closes the behavior and test surface.
 - For a bug, reproduce the predicted failure at the tier the regression rule
   below names, then fix the root cause and prove the regression turns green.
+- Where a fix lands, and what counts as a regression or as evidence, is
+  [Root cause and change discipline](docs/dev/invariants.md#root-cause-and-change-discipline).
 - Query-behavior tests default to `.gqt` logic tests under
   `crates/omnigraph-gqt/cases/`; a Rust test needs a reason the
   logic test format cannot express (mechanism assertions, scale symptoms,
