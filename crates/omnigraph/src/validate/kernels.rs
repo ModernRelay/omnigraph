@@ -759,19 +759,22 @@ pub(super) fn card_plan(change: &TableChange, system_columns: SystemColumns) -> 
     })
 }
 
-/// The srcs whose edge count the change can move: the new src of every delta
-/// edge and the old committed src of every removed or changed edge, minus
-/// srcs that are themselves deleted nodes.
+/// The srcs a `@card` check counts: the new src of every delta edge, the old
+/// src of every removed or changed edge, and every source node the change
+/// writes (`written`, filled under a non-zero minimum), minus srcs that are
+/// themselves deleted nodes.
 pub(super) fn card_affected(
     plan: &CardPlan,
     removed_edges: &[(String, String)],
     moved_from: &[(String, String)],
+    written: &HashSet<String>,
     deleted_src_nodes: &HashSet<String>,
 ) -> HashSet<String> {
     let mut affected: HashSet<String> = plan.delta_by_id.values().cloned().collect();
     for (_, src) in removed_edges.iter().chain(moved_from.iter()) {
         affected.insert(src.clone());
     }
+    affected.extend(written.iter().cloned());
     affected.retain(|src| !deleted_src_nodes.contains(src));
     affected
 }
@@ -1195,10 +1198,21 @@ mod tests {
 
         let removed_edges = vec![("e9".to_string(), "s9".to_string())];
         let deleted_src: HashSet<String> = ["s3".to_string()].into_iter().collect();
-        let affected = card_affected(&plan, &removed_edges, &[], &deleted_src);
+        let affected = card_affected(&plan, &removed_edges, &[], &HashSet::new(), &deleted_src);
         assert_eq!(
             affected,
             ["s2".to_string(), "s9".to_string()].into_iter().collect()
+        );
+
+        // A written source node with no delta edge is counted; a written
+        // source that is also a deleted node is not.
+        let written: HashSet<String> = ["s4".to_string(), "s3".to_string()].into_iter().collect();
+        let affected = card_affected(&plan, &removed_edges, &[], &written, &deleted_src);
+        assert_eq!(
+            affected,
+            ["s2".to_string(), "s4".to_string(), "s9".to_string()]
+                .into_iter()
+                .collect()
         );
     }
 }

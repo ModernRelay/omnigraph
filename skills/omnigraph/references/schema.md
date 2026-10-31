@@ -164,8 +164,10 @@ Changing the key field is effectively a replace — it invalidates every externa
 ### Constraints: only `@index` is added in place
 
 Adding a constraint other than `@index` (`@key`, `@unique`, `@range`, `@check`)
-to an existing type, removing a constraint from a property that stays, and
-changing edge cardinality or endpoints are refused as unsupported. Dropping a
+to an existing type, removing a constraint from a property that stays,
+changing edge cardinality or endpoints, and adding an edge type with a non-zero
+`@card` minimum from an existing node type (OG-MF-107) are refused as
+unsupported. Dropping a
 property drops every constraint that names only dropped properties (its own
 `@index`, `@unique`, `@range` or `@check`); a drop that would remove a `@key`,
 or a constraint that also names a field that stays, is refused. In-place
@@ -193,7 +195,7 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 - `@description("...")` — metadata (no migration impact)
 
 **Edge-level:**
-- `@card(min..max)` — edge cardinality (default: unbounded from zero; write an open upper bound as `@card(1..)`). Checked only for source nodes whose edges a write adds, moves or removes: a node written with no edge of the type is never counted, so a non-zero minimum needs an orphan check ([`schema-design.md`](schema-design.md#9-enforce-meaning-and-keep-the-rules-in-the-graph))
+- `@card(min..max)` — bounds the edges of the type that start at each source node (default: unbounded from zero; write an open upper bound as `@card(1..)`). A write is refused when it leaves out of bounds a source node it inserts or updates (when `min > 0`) or one whose edges of the type it adds, moves or removes, so a node with a non-zero minimum arrives in the same mutation query or load as its edges, and a `load csv` into its type cannot add one. Schema apply refuses a new edge type with a minimum from an existing node type (OG-MF-107). Nodes older versions wrote without edges are counted only when next written: keep an orphan check for them ([`schema-design.md`](schema-design.md#9-enforce-meaning-and-keep-the-rules-in-the-graph))
 
 **Type-level (nodes/edges):**
 - `@instruction("...")` — semantic hint for LLMs/operators

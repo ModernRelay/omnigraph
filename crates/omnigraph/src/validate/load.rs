@@ -253,10 +253,36 @@ pub(crate) async fn judge_load_swept(
                     delta_by_id,
                     removed_ids: Vec::new(),
                 };
+                // An overwrite's committed view is empty, but a source of the
+                // replaced image the delta leaves without an edge is below the
+                // minimum; only the plan's scan of those sources finds it.
+                if overwrite && edge_type.cardinality.min > 0 {
+                    if spec.access != Some(ValidateAccess::Scan) {
+                        return Err(OmniError::manifest_internal(format!(
+                            "Validate: the plan reads the replaced sources of {table} under {:?}, \
+                             not a scan, so a source the overwrite empties would go uncounted",
+                            spec.access
+                        )));
+                    }
+                    super::evaluate_replaced_cardinality(
+                        table,
+                        edge_type,
+                        &plan,
+                        &HashSet::new(),
+                        &HashSet::new(),
+                        &committed,
+                        system_columns,
+                        &mut first.sink(),
+                    )
+                    .await?;
+                    first.refuse_pending()?;
+                    continue;
+                }
                 let moved_from = committed
                     .committed_edges(table, system_columns.id, &plan.changed_ids, system_columns)
                     .await?;
-                let affected = card_affected(&plan, &[], &moved_from, &HashSet::new());
+                let affected =
+                    card_affected(&plan, &[], &moved_from, &HashSet::new(), &HashSet::new());
                 if affected.is_empty() {
                     continue;
                 }
@@ -270,6 +296,24 @@ pub(crate) async fn judge_load_swept(
                     &plan,
                     &affected,
                     &committed_for_affected,
+                    &mut first.sink(),
+                )?;
+                first.refuse_pending()?;
+            }
+            ValidateCheck::SourceCardinality { edge_table, .. } => {
+                // A node load adds and removes no edge, so each written node
+                // counts only its committed edges; a new node has none.
+                let edge_type = edge_type_of(catalog, edge_table)?;
+                let written: Vec<String> = extracted.ids.iter().cloned().collect();
+                let committed_for_written = committed
+                    .committed_edges(edge_table, system_columns.src, &written, system_columns)
+                    .await?;
+                card_violations(
+                    edge_table,
+                    edge_type,
+                    &CardPlan::default(),
+                    &extracted.ids,
+                    &committed_for_written,
                     &mut first.sink(),
                 )?;
                 first.refuse_pending()?;
@@ -386,8 +430,10 @@ impl SweepPlan {
             needs_value: checks
                 .iter()
                 .any(|spec| matches!(spec.check, ValidateCheck::Value { .. })),
-            needs_ids: checks.iter().any(|spec| {
-                matches!(spec.check, ValidateCheck::Unique { .. }) && spec.consults.is_some()
+            needs_ids: checks.iter().any(|spec| match spec.check {
+                ValidateCheck::Unique { .. } => spec.consults.is_some(),
+                ValidateCheck::SourceCardinality { .. } => true,
+                _ => false,
             }),
             needs_card: checks
                 .iter()
@@ -671,7 +717,8 @@ pub(crate) struct Extracted {
     /// The first value violation: the first constraint in declaration order
     /// with a violating row anywhere in the delta, at its earliest row.
     value: Option<Violation>,
-    /// Every non-null id of the delta.
+    /// Every non-null id of the delta, when a consulted uniqueness or a
+    /// source cardinality check reads it.
     ids: HashSet<String>,
     /// Per uniqueness check (by list index): its image and the first key
     /// repeated anywhere in the input.

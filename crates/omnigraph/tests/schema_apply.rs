@@ -2441,6 +2441,61 @@ async fn apply_schema_rejects_adding_a_required_property_without_backfill() {
     );
 }
 
+/// A new edge type with a non-zero `@card` minimum from an existing node type
+/// would leave every existing source node below the minimum, so apply refuses
+/// it before effects, like a required property. The same edge from a node type
+/// the apply adds is admitted, and the minimum holds from the first write.
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn apply_schema_rejects_a_card_minimum_edge_from_an_existing_node_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let before_version = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .graph_manifest_version();
+
+    let err = db
+        .apply_schema(&format!(
+            "{TEST_SCHEMA}\nedge Mentors: Person -> Person @card(1..)\n"
+        ))
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("OG-MF-107") && msg.contains("existing node type 'Person'"),
+        "expected schema-lint code OG-MF-107 in error, got: {msg}"
+    );
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .graph_manifest_version(),
+        before_version,
+        "the refused apply must not publish"
+    );
+
+    db.apply_schema(&format!(
+        "{TEST_SCHEMA}\nnode Team {{\n    name: String @key\n}}\n\
+         edge LedBy: Team -> Person @card(1..1)\n"
+    ))
+    .await
+    .expect("a @card minimum from a node type added in the same apply has no existing source");
+    let err = db
+        .load_jsonl(
+            r#"{"type":"Team","data":{"name":"core"}}"#,
+            LoadMode::Append,
+        )
+        .await
+        .expect_err("a Team written without its LedBy edge is below @card(1..1)");
+    assert!(
+        err.to_string()
+            .contains("@card violation on edge LedBy: source 'core' has 0 edges (min 1)"),
+        "got: {err}"
+    );
+}
+
 #[tokio::test]
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn plan_schema_for_property_type_narrowing_is_not_supported() {
