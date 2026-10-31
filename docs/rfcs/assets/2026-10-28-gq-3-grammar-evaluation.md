@@ -12,8 +12,10 @@ and ES|QL), LanceDB (query builder and DataFusion SQL), and Vespa (YQL,
 grouping, rank profiles).
 **Status:** a design evaluation, not an RFC. Where it recommends, it ranks.
 **Outcome:** the [GQ 3 grammar RFC](../2026-10-28-gq-3-grammar.md), which
-cites this document as its evidence; §12 to §14 were added after that RFC
-was drafted and are folded into it.
+cites this document as its evidence, and the
+[GQ 3 programme RFC](../2026-10-31-gq-3-programme.md), which turns §10.7 and
+§11 into the sequence and the slot ownership; §12 to §14 were added after the
+grammar RFC was drafted and are folded into both.
 
 ---
 

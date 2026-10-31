@@ -257,3 +257,4 @@ then dated RFCs by date.
 | [2026-10-26](2026-10-26-change-discovery-by-fragment-identity.md) | Change discovery by fragment and row identity | maintainer | draft | in-progress |
 | [2026-10-28](2026-10-28-gq-3-grammar.md) | GQ 3 grammar: the one break and the slots it freezes | maintainer | draft | not-started |
 | [2026-10-29](2026-10-29-remote-optimize-through-the-serving-owner.md) | Remote optimize through the serving owner | maintainer | draft | not-started |
+| [2026-10-31](2026-10-31-gq-3-programme.md) | GQ 3 programme: the sequence, the slot owners and the open RFCs | maintainer | draft | not-started |
