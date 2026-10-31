@@ -261,14 +261,15 @@ current branch heads and accepted merge inputs. Native tags protect the exact
 snapshots they name. A tagged graph snapshot retains all its table versions; a
 tagged table snapshot retains that version, including a detached version or a
 version on main.
-`--keep` counts graph commits on that branch, never Lance versions of a
-dataset: `--keep 10` keeps the last ten graph commits of each live branch
-readable, with every table version one of them pins, whatever their age. A pre-v11 fork that no
-registration references is collected once the graph branch incarnation in
-its name is gone: immediately with `--keep` alone, and with `--older-than`
-only after every object of the fork is older than the cutoff. Native tags,
-readable graph snapshots and required native ancestors also protect forks. Choose a policy that matches
-your rollback and audit needs.
+`--keep` counts graph commits on that branch, never Lance versions of a dataset: `--keep 10` keeps the
+last ten graph commits of each live branch readable, with every table version one of them pins, whatever
+their age. A pre-v11 fork that no registration references is collected once the graph branch incarnation
+in its name is gone: immediately with `--keep` alone, and with `--older-than` only after every object of
+the fork is older than the cutoff. Native tags, readable graph snapshots and required native ancestors
+also protect forks. Choose a policy that matches your rollback and audit needs. Planning lists each live
+branch's graph commits. `--keep` alone reads only the commits it retains and the merge bases, so an
+unreadable commit it drops no longer stops it; `--older-than` also reads the time of every commit not
+otherwise retained, up to 64 at once on object storage, and stops on one it cannot read.
 
 Before cleanup:
 
