@@ -50,7 +50,7 @@ The service can shorten the requested lifetime. Issuer clock tolerance is
 
 ## Discover graphs
 
-With a cached identity credential, `graphs list --target production`
+With a cached identity credential, `graphs list --target production --discovery`
 shows every graph ID and display name in the server's applied inventory,
 including graphs that failed to open. It does not reveal availability,
 storage locations, schema, stored queries, or graph contents. A display name
@@ -65,6 +65,18 @@ credential, refuses without falling back to another inventory.
 
 ## Cached access and routing
 
+New human sessions can renew for 30 days from login. Refresh and repeated login
+preserve saved deadlines, including older shorter sessions; provider inactivity
+or revocation can end them sooner. Rotation stays in OS custody. Access JWTs
+last at most 15 minutes, independently of graph credentials. Transient renewal
+and identity-verification failures receive bounded retries; exhausted recovery
+or a secure-store failure may still require explicit login. No graph operation
+is replayed to repair authentication.
+
+Use an upgraded CLI consistently for a profile. Older binaries reject a new
+30-day cache; before deliberately downgrading, log out using the newer binary,
+then sign in with the older one. Cache contents are never silently deleted.
+
 Data credentials belong to the selected profile and resource binding,
 including endpoint and incarnation. They remain separate from control sessions;
 there is no plaintext cache or control-token fallback at the graph endpoint.
@@ -72,8 +84,9 @@ Use [credential export](targets.md#manage-credentials) to explicitly release a
 cluster-bound data token to another process through a pipe.
 
 Managed and standalone access use the shared served graph client: query/mutation,
-load, schema reads, branches, snapshots, history, export, Blob operations and
-change feeds remain subject to server capabilities and policy. Direct-only
+load, schema reads, access introspection, stored-query catalogs, branches,
+snapshots, history, export, Blob operations, change feeds and the stdio MCP
+bridge remain subject to server capabilities and policy. Direct-only
 maintenance, schema changes and root administration do not acquire storage
 access. `--as` remains refused on managed targets.
 

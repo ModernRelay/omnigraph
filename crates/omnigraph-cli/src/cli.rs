@@ -4,6 +4,8 @@
 pub(crate) use crate::commands::cluster::{ClusterCommand, ClusterMembersCommand, ClusterRunArgs};
 pub(crate) use crate::commands::control::{GraphsCommand, PolicyCommand, QueriesCommand};
 pub(crate) use crate::commands::local::SkillCommand;
+pub(crate) use crate::commands::mcp::McpArgs;
+pub(crate) use crate::commands::studio::StudioArgs;
 pub(crate) use crate::commands::targets::{AccessArgs, CredentialCommand, TargetCommand};
 pub(crate) use crate::managed::args::{
     OrganizationArgs, OrganizationCommand, OrganizationInvitationsCommand,
@@ -13,6 +15,7 @@ use clap::{Parser, Subcommand};
 
 pub(crate) use crate::commands::history::{BranchCommand, ChangesCommand, CommitCommand};
 use crate::commands::history::{DiffArgs, SnapshotArgs};
+pub(crate) use crate::commands::maintenance::IndexCommand;
 use crate::commands::maintenance::{
     CleanupArgs, OptimizeArgs, RebuildFullTextIndexesArgs, RepairArgs, UpgradeArgs,
 };
@@ -30,7 +33,8 @@ use crate::embed::EmbedArgs;
 #[command(
     after_help = "Select resources with --target and account operations with --profile.
 --operator-config selects one operator file.
---config supplies deployment sources. Use config validate and target inspect for offline checks."
+--config supplies deployment sources. Use config validate and target inspect for offline checks.
+First time using Omnigraph: call the omnigraph skill (`omnigraph skill show`) before a schema or query."
 )]
 pub(crate) struct Cli {
     #[arg(long, global = true, help = "Named profile for control-plane operations; otherwise defaults.profile", conflicts_with = "target", value_parser = crate::invocation::single_selector("--profile"))]
@@ -42,8 +46,8 @@ pub(crate) struct Cli {
     pub(crate) target: Option<String>,
 
     /// Actor id for direct-engine writes and actor-bound cluster operations;
-    /// On a served write it is an assertion: the
-    /// request carries `omnigraph-if-actor`, and the server refuses it
+    /// On a served write, and on every request `mcp` relays, it is an assertion:
+    /// the request carries `omnigraph-if-actor`, and the server refuses it
     /// before anything runs when the bearer token resolves to another actor.
     /// With a policy configured but no actor set, a direct operation is
     /// denied — see docs/user/operations/policy.md.
@@ -145,9 +149,13 @@ pub(crate) enum Command {
     Upgrade(UpgradeArgs),
     /// Compact small Lance fragments in every backing dataset of the graph
     Optimize(OptimizeArgs),
-    /// Rebuild all full-text indexes from one branch's current rows
-    ///
-    /// Uses the default English analyzer; replaces any custom tokenizer settings.
+    /// Build or rebuild one branch's declared indexes
+    Index {
+        #[command(subcommand)]
+        command: IndexCommand,
+    },
+    /// Deprecated spelling of `index rebuild --kind full-text`
+    #[command(hide = true)]
     RebuildFullTextIndexes(RebuildFullTextIndexesArgs),
     /// Diagnose foreign Lance HEAD movement without adopting it.
     Repair(RepairArgs),
@@ -210,6 +218,26 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: CredentialCommand,
     },
+    /// Relay an agent's MCP over stdio to an existing server or managed target's `/mcp`.
+    ///
+    /// For agents that start their tools as child processes. The bridge sends
+    /// the target's stored credential, which the agent never sees, and is
+    /// bound to one graph: `--graph`, else the target's `default_graph`.
+    /// It only connects: a direct target refuses, and it never starts,
+    /// discovers or hosts a server. stdout carries only MCP messages and
+    /// diagnostics go to stderr.
+    Mcp(McpArgs),
+    /// Open OmniGraph Studio on an existing server target, print its link
+    /// and exit.
+    ///
+    /// The `omnigraph-studio://open` link names the target, `--graph` when
+    /// given, and digests of the target's binding and of this operator home,
+    /// which Studio checks against its own resolution of the target. It
+    /// carries no secret and acquires no credential. Direct and managed
+    /// targets refuse. Without Studio, or anything on this platform that
+    /// handles its links, it prints the link and refuses with
+    /// `studio_unavailable`; it never opens a browser.
+    Studio(StudioArgs),
     #[command(
         about = "Validate operator configuration, rename bindings, or recover interrupted edits"
     )]

@@ -2149,10 +2149,10 @@ async fn branch_merge_conflict_response_includes_structured_conflicts() {
     assert_eq!(error.code, Some(omnigraph_server::api::ErrorCode::Conflict));
     assert!(error.error.contains("merge conflict"));
     assert!(error.merge_conflicts.iter().any(|conflict| {
-        conflict.entity_kind == omnigraph_server::api::EntityKindOutput::Node
+        conflict.entity_kind == omnigraph_server::api::EntityKind::Node
             && conflict.type_name == "Person"
             && conflict.entity_id.as_deref() == Some("Alice")
-            && conflict.kind == omnigraph_server::api::MergeConflictKindOutput::DivergentUpdate
+            && conflict.kind == omnigraph_server::api::MergeConflictKind::DivergentUpdate
     }));
 }
 
@@ -3253,7 +3253,7 @@ async fn parse_error_precedes_policy_denial_on_every_door() {
         let suggestion = diagnostic.suggestion.unwrap();
         assert_eq!(
             suggestion.applicability,
-            omnigraph_api_types::ApplicabilityOutput::MachineApplicable
+            omnigraph_api_types::Applicability::MachineApplicable
         );
         assert_eq!(
             suggestion.edits,
@@ -3304,17 +3304,53 @@ async fn propose_person(app: &axum::Router, name: &str) -> Value {
 async fn commit_routes_list_publish_and_drop_unpublished_commits() {
     let (_temp, app) = app_for_loaded_graph().await;
     let head_before = main_head_commit_id(&app).await;
+    // Retired selectors must refuse even when false or empty, never silently
+    // select history, and never become valid alongside the replacement.
+    for key in ["unpublished", "unattached"] {
+        for value in ["true", "false", ""] {
+            for suffix in [
+                "",
+                "&listing=history",
+                "&listing=unpublished",
+                "&listing=unattached",
+            ] {
+                let (status, body) =
+                    get_json(&app, g(&format!("/commits?{key}={value}{suffix}"))).await;
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_REQUEST,
+                    "{key}={value}{suffix}: {body}"
+                );
+                assert_eq!(body["code"], "bad_request", "{body}");
+            }
+        }
+    }
+    for query in ["listing=unknown", "listing=history&listing=unpublished"] {
+        let (status, body) = get_json(&app, g(&format!("/commits?{query}"))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert_eq!(body["code"], "bad_request", "{body}");
+    }
+    assert_eq!(main_head_commit_id(&app).await, head_before);
     let pia = propose_person(&app, "Pia").await;
     let pia_id = pia["graph_commit_id"].as_str().unwrap().to_string();
     assert_eq!(main_head_commit_id(&app).await, head_before);
 
-    let (status, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    let (status, listed) = get_json(&app, g("/commits?listing=unpublished")).await;
     assert_eq!(status, StatusCode::OK, "{listed}");
     assert_eq!(listed["commits"], json!([pia]));
-    let (status, listed) = get_json(&app, g("/commits?unpublished=true&branch=main")).await;
+    let (status, listed) = get_json(&app, g("/commits?listing=unpublished&branch=main")).await;
     assert_eq!(status, StatusCode::OK, "{listed}");
     assert_eq!(listed["commits"], json!([pia]));
     let (_, history) = get_json(&app, g("/commits")).await;
+    let (status, explicit_history) = get_json(&app, g("/commits?listing=history")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(explicit_history, history);
+    let (status, with_unknown) = get_json(&app, g("/commits?future_option=ignored")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        with_unknown, history,
+        "only the two retired keys change unknown-key handling"
+    );
     assert!(
         history["commits"]
             .as_array()
@@ -3339,7 +3375,7 @@ async fn commit_routes_list_publish_and_drop_unpublished_commits() {
         again, published,
         "a repeat publish answers the published commit"
     );
-    let (_, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    let (_, listed) = get_json(&app, g("/commits?listing=unpublished")).await;
     assert_eq!(listed["commits"], json!([]));
     let (_, history) = get_json(&app, g("/commits")).await;
     assert_eq!(history["commits"][0], published);
@@ -3369,7 +3405,7 @@ async fn commit_routes_list_publish_and_drop_unpublished_commits() {
         let (status, body) = json_response(&app, request).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     }
-    let (_, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    let (_, listed) = get_json(&app, g("/commits?listing=unpublished")).await;
     assert_eq!(listed["commits"], json!([]));
 
     // An ordinary write past a proposal's parent expires it: reads at its id
@@ -3393,7 +3429,7 @@ async fn commit_routes_list_publish_and_drop_unpublished_commits() {
         let (status, body) = get_json(&app, g(&path)).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
     }
-    let (_, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    let (_, listed) = get_json(&app, g("/commits?listing=unpublished")).await;
     assert_eq!(listed["commits"], json!([]));
     let (status, body) = json_response(
         &app,
@@ -3492,20 +3528,20 @@ async fn commit_routes_create_list_refuse_publish_and_drop_unattached_branches()
         "a child holds its ancestors' effects and its own"
     );
 
-    let (status, listed) = get_json(&app, g("/commits?unattached=true")).await;
+    let (status, listed) = get_json(&app, g("/commits?listing=unattached")).await;
     assert_eq!(status, StatusCode::OK, "{listed}");
     assert_eq!(listed["commits"], json!([child, root]), "newest first");
-    let (status, listed) = get_json(&app, g("/commits?unattached=true&branch=main")).await;
+    let (status, listed) = get_json(&app, g("/commits?listing=unattached&branch=main")).await;
     assert_eq!(status, StatusCode::OK, "{listed}");
     assert_eq!(listed["commits"], json!([child, root]));
-    let (status, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    let (status, listed) = get_json(&app, g("/commits?listing=unpublished")).await;
     assert_eq!(status, StatusCode::OK, "{listed}");
     assert_eq!(
         listed["commits"],
         json!([]),
         "unattached is not unpublished"
     );
-    let (status, body) = get_json(&app, g("/commits?unattached=true&unpublished=true")).await;
+    let (status, body) = get_json(&app, g("/commits?listing=unattached&listing=unpublished")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     let (_, history) = get_json(&app, g("/commits")).await;
     assert!(
@@ -3602,7 +3638,7 @@ async fn commit_routes_create_list_refuse_publish_and_drop_unattached_branches()
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {body}");
     }
-    let (_, listed) = get_json(&app, g("/commits?unattached=true")).await;
+    let (_, listed) = get_json(&app, g("/commits?listing=unattached")).await;
     assert_eq!(
         listed["commits"],
         json!([]),
@@ -3702,8 +3738,11 @@ async fn stored_unattached_mutation_keeps_its_clause_per_invocation() {
         StatusCode::BAD_REQUEST,
         "a missing base is 400: {body}"
     );
-    let (status, body) =
-        json_response(&app, get_request(&g("/commits?unattached=true"), "t-full")).await;
+    let (status, body) = json_response(
+        &app,
+        get_request(&g("/commits?listing=unattached"), "t-full"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["commits"].as_array().unwrap().len(), 3, "{body}");
 }
@@ -3772,7 +3811,7 @@ async fn commit_publish_refuses_a_moved_head_and_merge_as_commit_excludes_delete
     assert_eq!(merged["branch_deleted"], Value::Null);
     assert_eq!(main_head_commit_id(&app).await, head_before);
     let merge_id = merged["commit"]["graph_commit_id"].as_str().unwrap();
-    let (_, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    let (_, listed) = get_json(&app, g("/commits?listing=unpublished")).await;
     assert_eq!(listed["commits"], json!([merged["commit"]]));
     let (status, published) = json_response(
         &app,
@@ -3906,6 +3945,16 @@ fn show_output(rows: &[Value]) -> Value {
 /// The `merge_lineage` value the definition's defaults carry: `verify` in
 /// a debug build, the row's `on` otherwise.
 fn default_merge_lineage() -> &'static str {
+    if cfg!(debug_assertions) {
+        "verify"
+    } else {
+        "on"
+    }
+}
+
+/// The `change_lineage` value the definition's defaults carry: `verify` in
+/// a debug build, the row's `on` otherwise.
+fn default_change_lineage() -> &'static str {
     if cfg!(debug_assertions) {
         "verify"
     } else {
@@ -4154,6 +4203,13 @@ async fn settings_show_all_lists_the_definition_in_order() {
                 "default",
                 "request"
             ),
+            show_row(
+                "change_lineage",
+                default_change_lineage(),
+                "on",
+                "default",
+                "request"
+            ),
             show_row("ann_nprobes", "20", "20", "default", "request"),
             show_row("stage_write_concurrency", "8", "8", "default", "process"),
             show_row(
@@ -4309,7 +4365,7 @@ async fn settings_reset_all_at_the_http_door_returns_to_the_process_defaults() {
         &app,
         json_post(
             "/query",
-            &json!({"query": "set engine = v2;\nset merge_lineage = off;\nreset all;\nshow all;"}),
+            &json!({"query": "set engine = v2;\nset merge_lineage = off;\nset change_lineage = off;\nreset all;\nshow all;"}),
         ),
     )
     .await;
@@ -4332,6 +4388,17 @@ async fn settings_reset_all_at_the_http_door_returns_to_the_process_defaults() {
     );
     assert_eq!(
         body["rows"][3],
+        show_row(
+            "change_lineage",
+            default_change_lineage(),
+            "on",
+            "default",
+            "request"
+        ),
+        "{body}"
+    );
+    assert_eq!(
+        body["rows"][4],
         show_row("ann_nprobes", "5", "20", "env", "request"),
         "reset all returns to the process value, not the definition's: {body}"
     );
@@ -5662,6 +5729,31 @@ async fn remote_branch_list_create_merge_flow_works() {
     assert_eq!(change_body["branch"], "feature");
     assert_eq!(change_body["affected_nodes"], 1);
 
+    // `detailed=true` adds what `GET /commits?branch=` would otherwise be read
+    // for, per branch, and says where each branch started as its create
+    // receipt did; the plain listing stays names only.
+    assert!(list_body.get("details").is_none(), "{list_body}");
+    let (status, detailed) = get_json(&app, g("/branches?detailed=true")).await;
+    assert_eq!(status, StatusCode::OK, "{detailed}");
+    assert_eq!(detailed["branches"], json!(["feature", "main"]));
+    let (_, main_commits) = get_json(&app, g("/commits?branch=main")).await;
+    let main_head = &main_commits["commits"][0];
+    let main = &detailed["details"][1];
+    assert_eq!(main["name"], "main");
+    assert_eq!(&main["head"], main_head);
+    for absent in ["from", "from_commit_id", "created_at"] {
+        assert!(main.get(absent).is_none(), "{main}");
+    }
+    assert_eq!(main["updated_at"], main_head["created_at"]);
+    let feature = &detailed["details"][0];
+    assert_eq!(feature["name"], "feature");
+    assert_eq!(feature["head"], change_body["commit"]);
+    assert_eq!(feature["updated_at"], change_body["commit"]["created_at"]);
+    assert_eq!(feature["from"], create_body["from"]);
+    assert_eq!(feature["from_commit_id"], create_body["from_commit_id"]);
+    assert_eq!(feature["from_commit_id"], main_head["graph_commit_id"]);
+    assert!(feature["created_at"].as_i64().unwrap() > 0, "{feature}");
+
     let read_main_before = QueryRequest {
         query: fs::read_to_string(fixture("test.gq")).unwrap(),
         name: Some("get_person".to_string()),
@@ -6315,6 +6407,87 @@ query vector_search_string($q: String) {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["row_count"], 3);
     assert_eq!(body["rows"][0]["d.slug"], "alpha-doc");
+    // The ranking carries no trace of the text it embedded, and no column
+    // returns the distance. Three unindexed rows are scored flat.
+    assert_eq!(
+        body["ranking"],
+        json!({
+            "by": "nearest",
+            "order": "ascending",
+            "exhaustive": true,
+            "score_columns": []
+        })
+    );
+}
+
+/// A ranked read's envelope reports its ranking: the fusion, the direction
+/// its score orders, that two `bm25` arms score every match, and both
+/// columns that read the fused score; since the object is compared whole, no
+/// parameter value appears. An unranked read carries none.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_envelope_reports_its_ranking() {
+    const SCHEMA: &str = "node Doc {\n    slug: String @key\n    title: String @index\n}\n";
+    const QUERIES: &str = r#"
+query fused($a: String, $b: String) {
+    match { $d: Doc }
+    return {
+        $d.slug,
+        rrf(bm25($d.title, $a), bm25($d.title, $b)) as fused,
+        rrf(bm25($d.title, $a), bm25($d.title, $b)) as again
+    }
+    order { rrf(bm25($d.title, $a), bm25($d.title, $b)) }
+    limit 2
+}
+query unranked() {
+    match { $d: Doc }
+    return { $d.slug }
+    order { $d.slug }
+}
+"#;
+    let data = [
+        r#"{"type":"Doc","data":{"slug":"a","title":"needle guide"}}"#,
+        r#"{"type":"Doc","data":{"slug":"b","title":"needle"}}"#,
+        r#"{"type":"Doc","data":{"slug":"c","title":"handbook"}}"#,
+    ]
+    .join("\n");
+    let temp = init_graph_with_schema_and_data(SCHEMA, &data).await;
+    let graph = graph_path(temp.path());
+    let app = build_app(
+        AppState::open(graph.to_string_lossy().to_string())
+            .await
+            .unwrap(),
+    );
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({
+                "query": QUERIES,
+                "name": "fused",
+                "params": {"a": "needle", "b": "guide"}
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["ranking"],
+        json!({
+            "by": "rrf",
+            "order": "descending",
+            "exhaustive": true,
+            "score_columns": ["fused", "again"]
+        })
+    );
+
+    let (status, body) = json_response(
+        &app,
+        json_post("/query", &json!({"query": QUERIES, "name": "unranked"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("ranking").is_none(), "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -7544,6 +7717,93 @@ async fn diff_routes_review_a_branch_against_its_merge_base() {
     }
 }
 
+/// The route the change intervals of one served call took, read through the
+/// engine's request probes: (row identity, exact merge).
+async fn change_routes_taken<F: std::future::Future>(op: F) -> (F::Output, (u64, u64)) {
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+    let probes = QueryIoProbes::default();
+    let row_identity = Arc::clone(&probes.change_intervals_row_identity);
+    let exact_merge = Arc::clone(&probes.change_intervals_exact_merge);
+    let out = with_query_io_probes(probes, Box::pin(op)).await;
+    (
+        out,
+        (
+            row_identity.load(Ordering::Relaxed),
+            exact_merge.load(Ordering::Relaxed),
+        ),
+    )
+}
+
+/// `OMNIGRAPH_CHANGE_LINEAGE` is the process default every change route runs
+/// under, and the query route's `settings` field selects over it for the
+/// `branch diff` statement.
+#[tokio::test(flavor = "multi_thread")]
+async fn changes_routes_run_under_the_process_change_lineage() {
+    let (settings, sources) = omnigraph::settings::from_env_with(|variable| {
+        (variable == "OMNIGRAPH_CHANGE_LINEAGE").then(|| "off".to_string())
+    })
+    .unwrap();
+    let (_temp, app) =
+        app_for_loaded_graph_with_process_defaults(ProcessDefaults { settings, sources }).await;
+    let fork = main_head_commit_id(&app).await;
+    branch_one_commit_ahead(&app, "feature", "Featured").await;
+    insert_person_on(&app, "feature", "Second").await;
+    insert_person_on(&app, "main", "First").await;
+    insert_person_on(&app, "main", "Later").await;
+
+    let two_commits = format!("/diff?from={fork}&to=main");
+    let ((status, page), routes) = change_routes_taken(get_json(&app, g(&two_commits))).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        change_ids(&page),
+        vec![
+            ("First".to_string(), "insert".to_string()),
+            ("Later".to_string(), "insert".to_string()),
+        ]
+    );
+    assert_eq!(
+        routes,
+        (0, 1),
+        "`off` from the environment takes the exact merge on GET /diff"
+    );
+    let ((status, page), routes) =
+        change_routes_taken(get_json(&app, g("/branches/diff?source=feature"))).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(routes, (0, 1), "and on GET /branches/diff");
+    let ((status, rows), routes) =
+        change_routes_taken(query_statement(&app, "branch diff feature")).await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(routes, (0, 1), "and on the `branch diff` statement");
+
+    let ((status, rows), routes) = change_routes_taken(json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({"query": "branch diff feature", "settings": {"change_lineage": "on"}}),
+        ),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(
+        routes,
+        (1, 0),
+        "the request's `change_lineage` selects over the process default"
+    );
+
+    let (_temp, app) = app_for_loaded_graph().await;
+    let fork = main_head_commit_id(&app).await;
+    insert_person_on(&app, "main", "First").await;
+    insert_person_on(&app, "main", "Later").await;
+    let ((status, page), routes) =
+        change_routes_taken(get_json(&app, g(&format!("/diff?from={fork}&to=main")))).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        routes,
+        (1, 0),
+        "the definition's default pairs the two-commit window's rows by identity"
+    );
+}
+
 /// One statement at the read door, sent bare.
 async fn query_statement(app: &axum::Router, statement: &str) -> (StatusCode, Value) {
     json_response(
@@ -7828,11 +8088,11 @@ async fn commit_list_pages_answer_for_the_head_their_first_page_named() {
         ),
         ("/commits?limit=0".to_string(), StatusCode::BAD_REQUEST),
         (
-            "/commits?limit=2&unpublished=true".to_string(),
+            "/commits?limit=2&listing=unpublished".to_string(),
             StatusCode::BAD_REQUEST,
         ),
         (
-            format!("/commits?page_token={token}&unattached=true"),
+            format!("/commits?page_token={token}&listing=unattached"),
             StatusCode::BAD_REQUEST,
         ),
         (

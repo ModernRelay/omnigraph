@@ -1,6 +1,5 @@
 //! Complete target bindings and conservative operator-file administration.
 
-#[cfg(test)]
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
@@ -12,9 +11,14 @@ use serde::{Deserialize, Serialize};
 use crate::graph_http::RequestTarget;
 use crate::operator::OperatorConfig;
 
-pub(crate) const TARGET_PROTOCOL: u32 = 1;
-pub(crate) const CREDENTIAL_PROTOCOL: u32 = 1;
-pub(crate) const ACCESS_PROTOCOL: u32 = 1;
+// Compatibility generations across published binaries, independent of the YAML
+// document version. Incompatible configuration/command changes bump these.
+pub(crate) const TARGET_PROTOCOL: u32 = 2;
+pub(crate) const CREDENTIAL_PROTOCOL: u32 = 2;
+pub(crate) const ACCESS_PROTOCOL: u32 = 2;
+/// The `omnigraph-studio://open` link and `studio --json`, with the `home`
+/// and `binding` digests `target inspect --json` reports for recomputing them.
+pub(crate) const STUDIO_PROTOCOL: u32 = 1;
 
 #[derive(Debug)]
 pub(crate) struct TargetError {
@@ -132,7 +136,14 @@ impl StorageProvider {
             _ => bail!("provider kind does not match the storage URI"),
         }
     }
-    #[cfg(test)]
+    /// An inline cloud address captures ambient destination settings once.
+    /// Registered targets never call this.
+    pub(crate) fn capture(uri: &str) -> Result<Self> {
+        let environment = std::env::vars_os()
+            .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+            .collect();
+        Self::capture_from(uri, &environment)
+    }
     fn capture_from(uri: &str, environment: &BTreeMap<String, String>) -> Result<Self> {
         let nonempty = |names: &[&str]| {
             names.iter().find_map(|name| {
@@ -191,7 +202,7 @@ impl StorageProvider {
                 .or(aliases(&["AWS_ENDPOINT_URL", "AWS_ENDPOINT"])?);
             if nonempty(&["AWS_PROFILE"]).is_some() && endpoint.is_none() {
                 bail!(
-                    "inline S3 with AWS_PROFILE needs an explicit AWS_ENDPOINT_URL_S3 so its endpoint can be captured; alternatively register a target with provider settings"
+                    "inline S3 with AWS_PROFILE needs an explicit AWS_ENDPOINT_URL_S3 so its endpoint can be captured"
                 );
             }
             Self::S3 {
@@ -807,6 +818,33 @@ pub(crate) fn resolve_server_token_for(
     server_root: &str,
     request_url: &str,
 ) -> Result<Option<String>> {
+    match frozen_server_credential(auth, server_root, request_url)? {
+        Some(selected) => selected.cached_token(server_root),
+        None => Ok(None),
+    }
+}
+
+/// The credential of [`resolve_server_token_for`] read from its source
+/// again, for a long-lived client whose server refused it. Only the client
+/// holds the new token; the invocation's own credential is unchanged.
+pub(crate) async fn reread_server_credential_for(
+    auth: &ServerAuth,
+    server_root: &str,
+    request_url: &str,
+) -> Result<Option<crate::credential_sources::AcquiredCredential>> {
+    match frozen_server_credential(auth, server_root, request_url)? {
+        Some(selected) => selected.reacquire(server_root).await,
+        None => Ok(None),
+    }
+}
+
+/// The invocation's frozen owner/profile binding for a request under the
+/// captured endpoint, or none for anonymous access.
+fn frozen_server_credential(
+    auth: &ServerAuth,
+    server_root: &str,
+    request_url: &str,
+) -> Result<Option<std::sync::Arc<crate::operator_routing::Authentication>>> {
     let ServerAuth::Token { .. } = auth else {
         return Ok(None);
     };
@@ -818,10 +856,9 @@ pub(crate) fn resolve_server_token_for(
         ));
     }
     crate::operator_routing::AUTH
-        .try_with(|auth| {
-            auth.as_ref()
-                .ok_or_else(|| refusal("credential_missing", "no frozen owner/profile binding"))?
-                .cached_token(server_root)
-        })
-        .map_err(|_| refusal("credential_missing", "no frozen owner/profile binding"))?
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .map(Some)
+        .ok_or_else(|| refusal("credential_missing", "no frozen owner/profile binding"))
 }

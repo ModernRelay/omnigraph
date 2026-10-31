@@ -36,11 +36,10 @@ selected root. Direct commands resolve a relative assertion against the source
 directory. Server submission requires an absolute assertion or no `storage:`.
 Omitting `storage:` never sends writes to the source directory.
 
-Registered direct targets pin storage URI and provider destination settings.
-S3 region, endpoint and addressing style, and Azure account/endpoint/emulator
-settings are destination identity; credentials continue through the appropriate
-provider chain. Ambient cloud settings cannot redirect a registered target.
-Inline storage addresses capture their provider settings for that invocation.
+Registered direct targets pin a local filesystem URI. Inline direct targets
+also accept only local paths and `file://` URIs. To operate a cloud-backed
+cluster through the CLI, select a registered server or managed target;
+cloud storage settings and credentials belong to the serving or embedded host.
 
 ## Direct bootstrap
 

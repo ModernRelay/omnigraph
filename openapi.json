@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.14.0"
+    "version": "0.14.1"
   },
   "paths": {
     "/.well-known/oauth-protected-resource": {
@@ -110,7 +110,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DeploymentStatusResponse"
+                  "$ref": "#/components/schemas/DeploymentStatusOutput"
                 }
               }
             }
@@ -280,6 +280,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`) while evaluating deployment access",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "Deployment ownership changed during the bounded ledger observation; retry this GET within the caller deadline; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -369,7 +390,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DeploymentResponse"
+                  "$ref": "#/components/schemas/DeploymentOutput"
                 }
               }
             }
@@ -390,7 +411,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DeploymentResponse"
+                  "$ref": "#/components/schemas/DeploymentOutput"
                 }
               }
             }
@@ -644,6 +665,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled deployment completion (code `outcome_unknown`); reconcile the original deployment identity before submitting another deployment",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -679,7 +721,7 @@
         ]
       }
     },
-    "/cluster/deployments/{id}": {
+    "/cluster/deployments/{deployment_id}": {
       "get": {
         "tags": [
           "cluster"
@@ -687,7 +729,7 @@
         "operationId": "deployment_lookup",
         "parameters": [
           {
-            "name": "id",
+            "name": "deployment_id",
             "in": "path",
             "description": "Original deployment identity",
             "required": true,
@@ -734,7 +776,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DeploymentResponse"
+                  "$ref": "#/components/schemas/DeploymentOutput"
                 }
               }
             }
@@ -1249,6 +1291,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`) while evaluating deployment access or planning",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -1332,7 +1395,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GraphListResponse"
+                  "$ref": "#/components/schemas/GraphListOutput"
                 }
               }
             }
@@ -1474,6 +1537,27 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Internal failure (code `internal`) before a successful response",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -1529,7 +1613,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GraphDiscoveryResponse"
+                  "$ref": "#/components/schemas/GraphDiscoveryOutput"
                 }
               }
             }
@@ -1687,12 +1771,12 @@
         ],
         "summary": "What the caller's own credential may do on this graph.",
         "description": "Evaluates the graph's installed policy for the resolved actor once per\naction, with each action's branch and target branch shaped as the route\nthat performs it shapes them. It needs no graph action itself, reads no\ngraph data, and never checks whether a named branch exists.",
-        "operationId": "cluster_getAccess",
+        "operationId": "access",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -1905,7 +1989,7 @@
             }
           },
           "500": {
-            "description": "The installed policy could not be evaluated",
+            "description": "The installed policy could not be evaluated (code `internal`)",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -1967,12 +2051,12 @@
         ],
         "summary": "Deliver one logical node or edge Blob cell.",
         "description": "Managed content is streamed through the bounded transport. External\ndescriptors redirect without target-store I/O. Authorization and target\nresolution share the exact helper used by `/query`.",
-        "operationId": "cluster_getBlob",
+        "operationId": "blobGet",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -1984,7 +2068,7 @@
             "description": "Select a logical node or edge cell.",
             "required": true,
             "schema": {
-              "$ref": "#/components/schemas/BlobEntityKind"
+              "$ref": "#/components/schemas/EntityKind"
             }
           },
           {
@@ -2494,7 +2578,7 @@
             }
           },
           "500": {
-            "description": "Stored Blob integrity or pre-header delivery refusal, including ranged external descriptors that cannot be redirected",
+            "description": "Stored Blob integrity failure (code `internal`) or pre-header delivery refusal, including ranged external descriptors that cannot be redirected",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -2554,12 +2638,12 @@
         ],
         "summary": "Replace one Blob value of an existing node or edge with the request body.",
         "description": "The cell's old value is never read; the entity's other cells are carried\nunchanged. Authorization of `change` on the branch runs before the body is\nread. Once admitted the write is owned by the server: a disconnect loses\nonly the response, never cancels or replays the write.",
-        "operationId": "cluster_putBlob",
+        "operationId": "blobPut",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -2571,7 +2655,7 @@
             "description": "Select a logical node or edge cell.",
             "required": true,
             "schema": {
-              "$ref": "#/components/schemas/BlobEntityKind"
+              "$ref": "#/components/schemas/EntityKind"
             }
           },
           {
@@ -2961,6 +3045,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "Write admission is closed or an overlapping durable recovery intent must be resolved before retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -3001,12 +3106,12 @@
         ],
         "summary": "Set one nullable Blob value of an existing node or edge to null.",
         "description": "Clearing a cell that is already null publishes nothing. Like a put, the\nclear is owned by the server once admitted.",
-        "operationId": "cluster_clearBlob",
+        "operationId": "blobClear",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -3018,7 +3123,7 @@
             "description": "Select a logical node or edge cell.",
             "required": true,
             "schema": {
-              "$ref": "#/components/schemas/BlobEntityKind"
+              "$ref": "#/components/schemas/EntityKind"
             }
           },
           {
@@ -3347,6 +3452,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "Write admission is closed or an overlapping durable recovery intent must be resolved before retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -3387,12 +3513,12 @@
         ],
         "summary": "Return the status and representation headers for one Blob cell.",
         "description": "This is a distinct handler rather than Axum's automatic GET-to-HEAD\nfallback. It never calls `BlobReader::read_range`; Range and If-Range are\ndeliberately ignored while If-None-Match is still evaluated.",
-        "operationId": "cluster_headBlob",
+        "operationId": "blobStat",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -3404,7 +3530,7 @@
             "description": "Select a logical node or edge cell.",
             "required": true,
             "schema": {
-              "$ref": "#/components/schemas/BlobEntityKind"
+              "$ref": "#/components/schemas/EntityKind"
             }
           },
           {
@@ -3764,7 +3890,7 @@
             }
           },
           "500": {
-            "description": "Stored Blob integrity or pre-header delivery refusal, including ranged external descriptors that cannot be redirected; HEAD responses have no body",
+            "description": "Stored Blob integrity failure (code `internal`) or pre-header delivery refusal, including ranged external descriptors that cannot be redirected; HEAD responses have no body",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -3811,16 +3937,25 @@
           "branches"
         ],
         "summary": "List all branches.",
-        "description": "Returns branch names sorted by name in byte order. Read-only. The GQ statement\n`branch list` on `POST /query` runs the same body.",
-        "operationId": "cluster_listBranches",
+        "description": "Returns branch names sorted by name in byte order. Read-only. The GQ statement\n`branch list` on `POST /query` runs the same body.\n\n`detailed=true` adds `details`: for each branch the caller may `read`, its\nhead commit, the branch and commit it started from, when it was created,\nand when it last moved. Each listed branch costs a read of its latest\nversion, and of the version it was created from once it has written a\ncommit; no commit history is read.",
+        "operationId": "branchList",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "detailed",
+            "in": "query",
+            "description": "`true` adds `details`: each branch's head, the branch and commit it\nstarted from, when it was created, and when it last moved. Defaults\nto `false`. Reads each listed branch's latest version, and the version\nit was created from once it has written a commit, never its commit\nhistory; the names alone read neither.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           },
           {
@@ -3868,7 +4003,7 @@
             }
           },
           "400": {
-            "description": "api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "description": "Invalid `detailed`; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -4032,6 +4167,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`) before a successful response",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -4072,12 +4228,12 @@
         ],
         "summary": "Create a new branch.",
         "description": "Forks `name` off of `from` (defaults to `main`) at its head, or starts it\nat the published graph commit `from_commit` with that commit's data and\nhistory. The receipt names the branch forked and the commit the new\nbranch starts at. The new branch shares backing dataset data with its\nparent until it is mutated. Returns 409 if `name` already exists. The GQ\nstatement `branch create` on `POST /mutate` runs the same body.",
-        "operationId": "cluster_createBranch",
+        "operationId": "branchCreate",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -4386,6 +4542,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "An overlapping durable recovery intent must be resolved before retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -4428,12 +4605,12 @@
         ],
         "summary": "What a branch changed since its merge base with a target.",
         "description": "The merge base is the commit `POST /branches/merge` would classify\nagainst; it and the source head are captured together. Changes the target\nmade after the base do not appear. Paged like `GET /diff`.",
-        "operationId": "cluster_getBranchDiff",
+        "operationId": "branchDiff",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -4469,11 +4646,13 @@
           {
             "name": "limit",
             "in": "query",
-            "description": "Maximum changes per page, as for `GET /diff`.",
+            "description": "Maximum changes per page, 1 to 8192; defaults to 1000. Above 8192\nthe request fails with 413; zero is refused with 400.",
             "required": false,
             "schema": {
               "type": "integer",
-              "minimum": 0
+              "default": 1000,
+              "maximum": 8192,
+              "minimum": 1
             }
           },
           {
@@ -4484,7 +4663,7 @@
             "schema": {
               "type": "array",
               "items": {
-                "$ref": "#/components/schemas/EntityKindOutput"
+                "$ref": "#/components/schemas/EntityKind"
               }
             }
           },
@@ -4508,7 +4687,7 @@
             "schema": {
               "type": "array",
               "items": {
-                "$ref": "#/components/schemas/ChangeOpOutput"
+                "$ref": "#/components/schemas/ChangeOp"
               }
             }
           },
@@ -4785,7 +4964,7 @@
             }
           },
           "500": {
-            "description": "Internal failure while reading changes",
+            "description": "Internal failure (code `internal`) while reading changes",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -4847,12 +5026,12 @@
         ],
         "summary": "Merge one branch into another.",
         "description": "Merges `source` into `target` (defaults to `main`). Outcome is one of\n`already_up_to_date`, `fast_forward`, or `merged`. Returns 409 with the\nlist of conflicts if the merge cannot be completed; the target is left\nunchanged in that case. **Destructive** to `target` on success. `commit`\ncarries this merge's own target publication, including for a fast-forward;\nan already-up-to-date merge returns `commit: null`.\n\nWith `dry_run: true` the merge stops after classification and validation:\nthe response reports the outcome it would have now (`commit: null`,\n`dry_run: true`), a conflict answers the same 409, and nothing is written.\nA dry run is a read of both branches and needs no `branch_merge` grant.\n\nWith `delete_branch: true` the source branch is deleted after a successful\nmerge, under its own `branch_delete` policy check. The merge is durable by\nthen, so a deletion refusal or failure never fails the request; it is\nreported via `branch_deleted: false` + `branch_delete_error_details`.\n\nThe GQ statement `branch merge` on `POST /mutate` runs the same body\n(without the deletion composition) and answers the same 409 on conflict.",
-        "operationId": "cluster_mergeBranches",
+        "operationId": "branchMerge",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -5161,6 +5340,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "An overlapping durable recovery intent must be resolved before retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -5203,12 +5403,12 @@
         ],
         "summary": "The merge base of two branches.",
         "description": "Reads lineage only, by the rule `POST /branches/merge` uses.",
-        "operationId": "cluster_getMergeBase",
+        "operationId": "branchMergeBase",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -5442,7 +5642,7 @@
             }
           },
           "500": {
-            "description": "Internal failure while reading lineage",
+            "description": "Internal failure (code `internal`) while reading lineage",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -5497,26 +5697,26 @@
         ]
       }
     },
-    "/graphs/{graph_id}/branches/{branch}": {
+    "/graphs/{graph_id}/branches/{branch_name}": {
       "delete": {
         "tags": [
           "branches"
         ],
         "summary": "Delete a branch.",
         "description": "**Irreversible.** Removes the branch pointer; commits remain reachable\nonly if referenced by another branch. Returns 404 if the branch does not\nexist. The GQ statement `branch delete` on `POST /mutate` runs the same\nbody.",
-        "operationId": "cluster_deleteBranch",
+        "operationId": "branchDelete",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
             }
           },
           {
-            "name": "branch",
+            "name": "branch_name",
             "in": "path",
             "description": "Branch name to delete",
             "required": true,
@@ -5733,6 +5933,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "An overlapping durable recovery intent must be resolved before retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -5775,12 +5996,12 @@
         ],
         "summary": "Poll the change feed of one branch.",
         "description": "At-least-once: retrying a cursor may replay the complete next commit, so\nconsumers apply blocks idempotently by `graph_commit_id` and persist the\nterminal cursor together with its blocks. The server holds no consumer\nstate. `set=` values are validated and select nothing in this release.",
-        "operationId": "cluster_pollChanges",
+        "operationId": "changesPoll",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -5825,26 +6046,31 @@
           {
             "name": "limit",
             "in": "query",
+            "description": "Maximum changes per page, 1 to 8192; defaults to 1000. Above 8192\nthe request fails with 413; zero is refused with 400.",
             "required": false,
             "schema": {
               "type": "integer",
-              "minimum": 0
+              "default": 1000,
+              "maximum": 8192,
+              "minimum": 1
             }
           },
           {
             "name": "kind",
             "in": "query",
+            "description": "Repeatable filter: node | edge.",
             "required": false,
             "schema": {
               "type": "array",
               "items": {
-                "$ref": "#/components/schemas/EntityKindOutput"
+                "$ref": "#/components/schemas/EntityKind"
               }
             }
           },
           {
             "name": "type",
             "in": "query",
+            "description": "Repeatable filter: accepted-schema type name.",
             "required": false,
             "schema": {
               "type": "array",
@@ -5856,11 +6082,12 @@
           {
             "name": "op",
             "in": "query",
+            "description": "Repeatable filter: insert | update | delete.",
             "required": false,
             "schema": {
               "type": "array",
               "items": {
-                "$ref": "#/components/schemas/ChangeOpOutput"
+                "$ref": "#/components/schemas/ChangeOp"
               }
             }
           },
@@ -6149,7 +6376,7 @@
             }
           },
           "500": {
-            "description": "Internal failure while reading changes",
+            "description": "Internal failure (code `internal`) while reading changes",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -6211,12 +6438,12 @@
         ],
         "summary": "Capture a change-feed baseline: one exact entity snapshot plus the cursor\nthat resumes the feed immediately after it.",
         "description": "A baseline is a full data export, so it requires the export action. The\nsnapshot honors the scope's kind and type dimensions; `op` binds only the\nresume cursor's feed scope.",
-        "operationId": "cluster_captureChangeBaseline",
+        "operationId": "changesBaseline",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -6484,7 +6711,7 @@
             }
           },
           "500": {
-            "description": "Internal failure while capturing the baseline",
+            "description": "Internal failure (code `internal`) while capturing the baseline",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -6545,13 +6772,13 @@
           "commits"
         ],
         "summary": "List commits, most recent first.",
-        "description": "`branch` selects which history to list: a named branch returns the history\nreachable from that branch's head (the main commits inherited up to the\nfork plus the branch-authored commits); omitting it returns `main`'s\nhistory. There is no cross-branch listing. Ordering is part of the\ncontract: newest first along the branch's first-parent chain, which is\nfalling generation and falling (graph-manifest version, created-at, commit\nid). Read-only.\n\n`limit` pages the history: each page names the head its listing resolved\n(`head_commit_id`) and continues with `next_page_token`, sent back as\n`page_token` with the same `branch`; later pages answer for that head's\nchain even after the branch moves. A page reads only the history it\nreturns. Without `limit` and `page_token` the whole history is one answer.\nA caller whose `read` does not cover every branch continues only from a\ncommit of `branch`'s history: one the branch still holds or a readable\nbranch published costs nothing more; any other is looked for down the\nbranch's history, which costs what the whole listing costs, and a commit\nthe history does not reach is refused (400).\n\n`unpublished=true` lists instead the unpublished commits whose recorded\ntarget is `branch` (writes `as commit` awaiting `commit publish`), newest\nfirst; each carries `published: false`. `unattached=true` lists instead\nthe live unattached snapshots whose recorded target is `branch` (writes\n`as unattached branch`), newest first, each with `kind: \"unattached\"`;\nthe two filters together are refused (400), as is either with `limit` or\n`page_token`.",
-        "operationId": "cluster_listCommits",
+        "description": "`branch` selects which history to list: a named branch returns the history\nreachable from that branch's head (the main commits inherited up to the\nfork plus the branch-authored commits); omitting it returns `main`'s\nhistory. There is no cross-branch listing. Ordering is part of the\ncontract: newest first along the branch's first-parent chain, which is\nfalling generation and falling (graph-manifest version, created-at, commit\nid). Read-only.\n\n`limit` pages the history: each page names the head its listing resolved\n(`head_commit_id`) and continues with `next_page_token`, sent back as\n`page_token` with the same `branch`; later pages answer for that head's\nchain even after the branch moves. A page reads only the history it\nreturns. Without `limit` and `page_token` the whole history is one answer.\nA caller whose `read` does not cover every branch continues only from a\ncommit of `branch`'s history: one the branch still holds or a readable\nbranch published costs nothing more; any other is looked for down the\nbranch's history, which costs what the whole listing costs, and a commit\nthe history does not reach is refused (400).\n\n`listing=unpublished` lists instead the unpublished commits whose recorded\ntarget is `branch` (writes `as commit` awaiting `commit publish`), newest\nfirst; each carries `published: false`. `listing=unattached` lists instead\nthe live unattached snapshots whose recorded target is `branch` (writes\n`as unattached branch`), newest first, each with `kind: \"unattached\"`;\nnon-history listings refuse `limit` and `page_token` (400). The retired\n`unpublished` and `unattached` keys are rejected regardless of value.",
+        "operationId": "commitList",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -6560,33 +6787,30 @@
           {
             "name": "branch",
             "in": "query",
+            "description": "Branch whose commits to list. Defaults to `main`.",
             "required": false,
             "schema": {
               "type": "string"
             }
           },
           {
-            "name": "unpublished",
+            "name": "listing",
             "in": "query",
-            "description": "`true` lists the unpublished commits whose recorded target is `branch`\n(writes `as commit` awaiting `commit publish`), newest first, instead\nof the branch's history.",
+            "description": "Collection to list: `history` (default), `unpublished` proposals, or\n`unattached` snapshots whose recorded target is `branch`, newest first.",
             "required": false,
             "schema": {
-              "type": "boolean"
-            }
-          },
-          {
-            "name": "unattached",
-            "in": "query",
-            "description": "`true` lists the live unattached snapshots whose recorded target is\n`branch` (writes `as unattached branch`), newest first, instead of\nthe branch's history. Refused together with `unpublished`.",
-            "required": false,
-            "schema": {
-              "type": "boolean"
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/CommitListing"
+                }
+              ],
+              "default": "history"
             }
           },
           {
             "name": "limit",
             "in": "query",
-            "description": "Commits per page of the branch's history, 1 to 1000; the page names\nthe head it resolved and a `next_page_token`. Without `limit` and\n`page_token` the whole history is listed. Refused with `unpublished`\nor `unattached`; above 1000 the request fails with 413.",
+            "description": "Commits per page of the branch's history, 1 to 1000; defaults to 100\nwhen `page_token` is supplied. The page names the head it resolved\nand a `next_page_token`. Without `limit` and\n`page_token` the whole history is listed. Refused with a `listing` other\nthan `history`; above 1000 the request fails with 413.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -6648,7 +6872,7 @@
             }
           },
           "400": {
-            "description": "Two listings selected, a page parameter with `unpublished` or `unattached`, a zero `limit`, or a rejected page token; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "description": "Invalid `listing`, a retired `unpublished` or `unattached` selector, paging a non-history listing, a zero `limit`, or a rejected page token; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -6833,6 +7057,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`) before a successful response",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -6875,12 +7120,12 @@
         ],
         "summary": "Get a single commit.",
         "description": "Returns the commit's graph-manifest version, parent commit(s), and creation\nmetadata. Read-only.",
-        "operationId": "cluster_getCommit",
+        "operationId": "commitShow",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -7104,6 +7349,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`) before a successful response",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -7144,12 +7410,12 @@
         ],
         "summary": "Drop an unpublished commit or an unattached snapshot.",
         "description": "**Irreversible.** Runs under `commit_drop` on the commit's recorded target\nbranch; a denial answers the 404 an unknown id answers. A published commit\nis never dropped (409). Dropping an unattached snapshot also drops every\nunattached descendant, the root's whole chain included. The GQ statement\n`commit drop \"<id>\"` on `POST /mutate` runs the same body.",
-        "operationId": "cluster_dropCommit",
+        "operationId": "commitDrop",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -7366,6 +7632,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "An overlapping durable recovery intent must be resolved before retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -7408,12 +7695,12 @@
         ],
         "summary": "Entity changes one commit made relative to its first parent.",
         "description": "Read-only, in graph vocabulary with exact before/after images. Bounded:\na large commit continues via the opaque `page_token`. `set=` values are\nvalidated and select nothing in this release.",
-        "operationId": "cluster_getCommitChanges",
+        "operationId": "commitChanges",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -7440,11 +7727,13 @@
           {
             "name": "limit",
             "in": "query",
-            "description": "Maximum changes per page. Server default applies when absent; above\nthe public ceiling the request fails with 413.",
+            "description": "Maximum changes per page, 1 to 8192; defaults to 1000. Above 8192\nthe request fails with 413; zero is refused with 400.",
             "required": false,
             "schema": {
               "type": "integer",
-              "minimum": 0
+              "default": 1000,
+              "maximum": 8192,
+              "minimum": 1
             }
           },
           {
@@ -7455,7 +7744,7 @@
             "schema": {
               "type": "array",
               "items": {
-                "$ref": "#/components/schemas/EntityKindOutput"
+                "$ref": "#/components/schemas/EntityKind"
               }
             }
           },
@@ -7479,7 +7768,7 @@
             "schema": {
               "type": "array",
               "items": {
-                "$ref": "#/components/schemas/ChangeOpOutput"
+                "$ref": "#/components/schemas/ChangeOp"
               }
             }
           },
@@ -7747,7 +8036,7 @@
             }
           },
           "500": {
-            "description": "Internal failure while reading changes",
+            "description": "Internal failure (code `internal`) while reading changes",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -7809,12 +8098,12 @@
         ],
         "summary": "Publish an unpublished commit onto its recorded target branch.",
         "description": "The target is the branch the commit recorded when it was written `as\ncommit`, so the request carries no body. Runs under `commit_publish` on\nthat branch; a denial answers the 404 an unknown id answers. An\nunattached snapshot (`as unattached branch`) never publishes: 409 with\ncode `unattached_cannot_publish`, after the same authorization. The GQ\nstatement `commit publish \"<id>\"` on `POST /mutate` runs the same body.",
-        "operationId": "cluster_publishCommit",
+        "operationId": "commitPublish",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -8038,6 +8327,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "An overlapping durable recovery intent must be resolved before retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -8080,12 +8390,12 @@
         ],
         "summary": "Net entity changes between two read targets.",
         "description": "`from` and `to` each name a branch (its head now) or a graph commit\n(published, an unpublished proposal, or an unattached snapshot); a string\nnaming both is refused. The first page resolves both sides to exact\ncommits and names them; a large result continues via the opaque\n`page_token`, and every page answers for those same commits.",
-        "operationId": "cluster_getDiff",
+        "operationId": "diff",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -8121,11 +8431,13 @@
           {
             "name": "limit",
             "in": "query",
-            "description": "Maximum changes per page. Server default applies when absent; above\nthe public ceiling the request fails with 413.",
+            "description": "Maximum changes per page, 1 to 8192; defaults to 1000. Above 8192\nthe request fails with 413; zero is refused with 400.",
             "required": false,
             "schema": {
               "type": "integer",
-              "minimum": 0
+              "default": 1000,
+              "maximum": 8192,
+              "minimum": 1
             }
           },
           {
@@ -8136,7 +8448,7 @@
             "schema": {
               "type": "array",
               "items": {
-                "$ref": "#/components/schemas/EntityKindOutput"
+                "$ref": "#/components/schemas/EntityKind"
               }
             }
           },
@@ -8160,7 +8472,7 @@
             "schema": {
               "type": "array",
               "items": {
-                "$ref": "#/components/schemas/ChangeOpOutput"
+                "$ref": "#/components/schemas/ChangeOp"
               }
             }
           },
@@ -8416,7 +8728,7 @@
             }
           },
           "500": {
-            "description": "Internal failure while reading changes",
+            "description": "Internal failure (code `internal`) while reading changes",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -8478,12 +8790,12 @@
         ],
         "summary": "Stream the contents of a branch as NDJSON.",
         "description": "Emits one JSON object per line (`application/x-ndjson`). Filter with\n`type_names` (node/edge type names); an empty list streams the entire branch.\nSuitable for large exports — the response is streamed, not buffered.\nRead-only.",
-        "operationId": "cluster_export",
+        "operationId": "export",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -8788,6 +9100,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`) before a successful response",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "Recovery required; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -8830,12 +9163,12 @@
         ],
         "summary": "Compatibility-load NDJSON data through a JSON envelope.",
         "description": "`data` is NDJSON with one record per line. `mode` controls behavior on\nexisting entities: `merge` upserts by id (default), `append` strictly inserts\nabsent ids, and `overwrite` replaces type data. Branch creation is opt-in by\npresence of `from`: with `from` set, a missing `branch` is created from\nit; without `from`, `branch` must already exist — a missing branch is a\n404, never an implicit fork. **Destructive** when `mode` is `overwrite`\nor when the load produces conflicting writes.",
-        "operationId": "cluster_load",
+        "operationId": "load",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -9144,6 +9477,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "An overlapping durable recovery intent must be resolved before retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -9186,12 +9540,12 @@
         ],
         "summary": "Load one strict, bounded graph-level NDJSON batch.",
         "description": "Bearer authentication runs in middleware. This handler completes both\nbranch authorization checks before polling the raw body. A successful\nresponse describes logical schema declarations only and is returned after\nthe ordinary graph commit is visible.",
-        "operationId": "cluster_loadNdjson",
+        "operationId": "loadNdjson",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -9549,6 +9903,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "An overlapping durable recovery intent must be resolved before retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -9591,12 +9966,12 @@
         ],
         "summary": "Apply a GQ mutation to a branch (canonical mutation endpoint).",
         "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 when the prepared\nwrite authority changes before effects.\n\nConditional callers use `POST /mutate/if-graph-commit`, which requires and\nvalidates `Omnigraph-If-Graph-Commit`. This endpoint rejects that header.\n\nPairs with `POST /query` (read-only).\n\nThe GQ statements `branch create`, `branch delete`, and `branch merge`\n(grammar: `BranchStmt` in `omnigraph-compiler`) are also served\nhere, with no `branch`, `name`, or `params`: each runs the handler body\nof its `/branches` route (same Cedar action, admission check, and errors,\nincluding the 409 of a conflicting merge) and answers a `ChangeOutput`\nwhose `outcome` names the effect. `branch list` and the branch control\nreads (`branch diff`, `branch merge-base`, `branch merge … dry run`) are\nrejected with 400; send them to `POST /query`.",
-        "operationId": "cluster_mutate",
+        "operationId": "mutate",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -9726,7 +10101,7 @@
             }
           },
           "404": {
-            "description": "`branch delete` of a branch that does not exist, as DELETE /branches/{branch} answers; not_found when no graph `graph_id` is served or the caller may not see it, or when no route serves the path",
+            "description": "`branch delete` of a branch that does not exist, as DELETE /branches/{branch_name} answers; not_found when no graph `graph_id` is served or the caller may not see it, or when no route serves the path",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -9905,6 +10280,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "An overlapping durable recovery intent must be resolved before retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -9947,12 +10343,12 @@
         ],
         "summary": "Apply a mutation only while the branch still has the required graph head.",
         "description": "This explicit conditional route requires `Omnigraph-If-Graph-Commit` and\nvalidates its precondition before mutation effects. `/mutate` rejects the\nprecondition header; conditional callers must use this route.",
-        "operationId": "cluster_mutate_if_graph_commit",
+        "operationId": "mutateIfGraphCommit",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -10270,6 +10666,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "An overlapping durable recovery intent must be resolved before retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -10312,12 +10729,12 @@
         ],
         "summary": "List the graph's exposed stored queries as a typed tool catalog.",
         "description": "Returns every stored query in the `queries:` registry, each\nwith its MCP tool name, read/mutate flag, description/instruction, and\ntyped parameters — enough for a client to register them as tools without\nfetching `.gq` source. Cluster-served graphs have no per-query expose flag,\nso the catalog lists them all. Read-gated; the catalog is graph-wide (branch\nindependent — `read` is authorized against `main`). **Not** Cedar-filtered\nper query yet, so it can list a query whose `invoke_query` the caller\nlacks (a known gap until per-query authorization lands).",
-        "operationId": "cluster_list_queries",
+        "operationId": "queriesList",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -10532,6 +10949,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`) before a successful response",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -10567,26 +11005,26 @@
         ]
       }
     },
-    "/graphs/{graph_id}/queries/{name}": {
+    "/graphs/{graph_id}/queries/{query_name}": {
       "post": {
         "tags": [
           "queries"
         ],
         "summary": "Invoke a curated, server-side stored query by name.",
         "description": "The query source comes from the graph's `queries:` registry, not the\nrequest body — callers send only runtime inputs (`params`, `branch`,\n`snapshot`). Gated by the `invoke_query` Cedar action at the boundary;\na stored *mutation* additionally passes the engine's `change` gate\n(double-gated). An actor **without** `invoke_query` cannot tell a denied\nquery from a missing one — both return the same 404, so the catalog\ncan't be probed without the grant. Once `invoke_query` is held, the\ninner `read`/`change` gate may surface a 403 for an existing query the\nactor can't run (the intended double-gate signal).",
-        "operationId": "cluster_invoke_query",
+        "operationId": "queryInvoke",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
             }
           },
           {
-            "name": "name",
+            "name": "query_name",
             "in": "path",
             "description": "Stored query name (the registry key)",
             "required": true,
@@ -10649,7 +11087,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/InvokeStoredQueryResponse"
+                  "$ref": "#/components/schemas/InvokeStoredQueryOutput"
                 }
               }
             }
@@ -10904,7 +11342,7 @@
             }
           },
           "500": {
-            "description": "Policy evaluation error (a denial is reported as 404, not 500)",
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -10959,26 +11397,26 @@
         ]
       }
     },
-    "/graphs/{graph_id}/queries/{name}/if-graph-commit": {
+    "/graphs/{graph_id}/queries/{query_name}/if-graph-commit": {
       "post": {
         "tags": [
           "queries"
         ],
         "summary": "Invoke one stored mutation with a required graph-head precondition.",
         "description": "A distinct path makes support observable before any mutation runs; older\nservers return 404 instead of ignoring an unknown conditional header.",
-        "operationId": "cluster_invoke_query_if_graph_commit",
+        "operationId": "queryInvokeIfGraphCommit",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
             }
           },
           {
-            "name": "name",
+            "name": "query_name",
             "in": "path",
             "description": "Stored mutation name (the registry key)",
             "required": true,
@@ -11305,7 +11743,7 @@
             }
           },
           "500": {
-            "description": "Policy evaluation error (a denial is reported as 404, not 500)",
+            "description": "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -11367,12 +11805,12 @@
         ],
         "summary": "Execute an inline read query.",
         "description": "Designed for ad-hoc exploration and AI-agent tool-use: short field\nnames (`query`, `name`) match the CLI `-e` flag and the GQ `query`\nkeyword. Mutations (`insert`/`update`/`delete`) are rejected with 400\n-- use `POST /mutate` for writes. Select a branch or snapshot and obtain\nthe pinned graph-commit token with the response. Cedar authorizes Read for\nread queries and Change for `explain load csv`.\n\nThe GQ statement `branch list` is also served here, with no `branch`,\n`snapshot`, `name`, or `params`: it answers one result per branch (field\n`name`, byte order) under the same `read` check as `GET /branches`. So are\nthe branch control reads, each under its route's checks and errors:\n`branch diff <source> [into <target>]` and `branch diff <from> to <to>`\n(one result per entity change, fields `kind`, `type`, `id`, `op`,\n`before`, `after`; the compared commits and the continuation token in\n`page`; `after page \"<token>\"` and `limit <n>` continue and bound it),\n`branch merge-base <source> [into <target>]` and\n`branch merge <source> [into <target>] dry run` (one result each).\n`branch create`, `branch delete`, and `branch merge` are rejected with\n400; send them to `POST /mutate`.\n\nThe GQ statement `explain query …` is served here too: the query is not\nrun, and the result describes its v2 logical, physical and available\nDataFusion trees, one result per node (fields `tree`, `depth`, `node`, `detail`), followed by\n`plan` entries for the passes and the document's other fields, under the\nrequest's target and `params`. `explain load csv …` answers the accepted\nload plan the same way (`logical_initial`, `logical`, `physical`, then\n`plan` entries), under the request's `branch` alone. It requires the load's\nChange decision before probing the external source's metadata; it reads\nno payload byte and publishes nothing.",
-        "operationId": "cluster_query",
+        "operationId": "query",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -11681,6 +12119,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`) before a successful response",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -11723,12 +12182,12 @@
         ],
         "summary": "Read the current schema source.",
         "description": "Returns the project's schema as a single string in `.pg` source form.\nUseful for clients that want to introspect available types and properties\nbefore constructing GQ queries. Read-only.",
-        "operationId": "cluster_getSchema",
+        "operationId": "schemaShow",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -11943,6 +12402,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`) before a successful response",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -11985,12 +12465,12 @@
         ],
         "summary": "Read the current snapshot of a branch.",
         "description": "Returns the graph-manifest version plus per-dataset metadata (path,\npublished dataset version, entity count) for every backing dataset on the\nbranch. Defaults to `main` when `branch` is omitted. Read-only.",
-        "operationId": "cluster_getSnapshot",
+        "operationId": "snapshot",
         "parameters": [
           {
             "name": "graph_id",
             "in": "path",
-            "description": "Graph id to route the request to.",
+            "description": "Graph id to route the request to. The `og_` prefix is reserved for system graphs. `og_catalog` is the built-in, storage-free catalogue: it serves only POST /query and GET /schema with their ordinary response bodies. Its query refuses `branch` and `snapshot`; every other route under /graphs/og_catalog returns 405 `method_not_allowed` before effects.",
             "required": true,
             "schema": {
               "type": "string"
@@ -11999,6 +12479,7 @@
           {
             "name": "branch",
             "in": "query",
+            "description": "Branch whose snapshot to read. Defaults to `main`.",
             "required": false,
             "schema": {
               "type": "string"
@@ -12213,6 +12694,27 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`) before a successful response",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
             "description": "graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
@@ -12410,7 +12912,7 @@
             },
             "description": "With `branch`, the actions allowed on it, including `branch_delete`,\n`commit_publish`, `commit_drop` and `schema_apply` with it as their\ntarget. With `target_branch` as well, also `branch_create` and\n`branch_merge` from `branch` into it. Empty without `branch`."
           },
-          "actor": {
+          "actor_id": {
             "type": [
               "string",
               "null"
@@ -12423,6 +12925,13 @@
               "null"
             ],
             "description": "The branch asked about, when one was."
+          },
+          "client_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The OAuth client the credential was issued to, when it is a verified\nOIDC access token. The actor stays the person's principal across\nclients. Opaque text the client chose: render it escaped."
           },
           "graph_id": {
             "type": "string"
@@ -12443,20 +12952,12 @@
           }
         }
       },
-      "ApplicabilityOutput": {
+      "Applicability": {
         "type": "string",
         "description": "Whether a suggested source edit can be applied mechanically.",
         "enum": [
           "machine_applicable",
           "needs_review"
-        ]
-      },
-      "BlobEntityKind": {
-        "type": "string",
-        "description": "Logical graph entity selected by the Blob delivery surface.\n\nThis is intentionally graph vocabulary: callers select a node or edge.",
-        "enum": [
-          "node",
-          "edge"
         ]
       },
       "BlobPreconditionFailureOutput": {
@@ -12508,7 +13009,7 @@
         ],
         "properties": {
           "entity": {
-            "$ref": "#/components/schemas/BlobEntityKind"
+            "$ref": "#/components/schemas/EntityKind"
           },
           "id": {
             "type": "string"
@@ -12559,7 +13060,7 @@
             ]
           },
           "kind": {
-            "$ref": "#/components/schemas/BlobWriteStateOutput"
+            "$ref": "#/components/schemas/BlobWriteState"
           },
           "selector": {
             "$ref": "#/components/schemas/BlobSelectorOutput"
@@ -12574,7 +13075,7 @@
           }
         }
       },
-      "BlobWriteStateOutput": {
+      "BlobWriteState": {
         "type": "string",
         "description": "The state a Blob write left its cell in. Separate from\n[`BlobContentKindOutput`]: a write can leave the cell null, a stat never\ndescribes one.",
         "enum": [
@@ -12659,6 +13160,53 @@
           }
         }
       },
+      "BranchDetailOutput": {
+        "type": "object",
+        "description": "One live branch as `GET /branches?detailed=true` reports it. `from` and\n`from_commit_id` say where the branch started, as its `POST /branches`\nreceipt did. A branch deleted and created again under the same name is a\nnew lifetime: its start and creation time are the later creation's. The\noptional fields are absent on `main`.",
+        "required": [
+          "name",
+          "head",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the branch was created, as Unix epoch microseconds recorded to\nthe second.",
+            "example": 1714000000000000
+          },
+          "from": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The branch this one started from, as that branch was named then; it\nmay since have been deleted or recreated."
+          },
+          "from_commit_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The commit the branch started at. A later merge does not move it;\n`GET /branches/merge-base` answers where two branches last met."
+          },
+          "head": {
+            "$ref": "#/components/schemas/CommitOutput",
+            "description": "The commit a read of the branch sees: its newest commit, or the commit\nit started at while it has written none."
+          },
+          "name": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the head last moved, as Unix epoch microseconds: the time of the\nbranch's newest commit, or `created_at` while it has written none.",
+            "example": 1714000000000000
+          }
+        }
+      },
       "BranchListOutput": {
         "type": "object",
         "required": [
@@ -12669,7 +13217,18 @@
             "type": "array",
             "items": {
               "type": "string"
-            }
+            },
+            "description": "Every live branch, sorted by name in byte order."
+          },
+          "details": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/BranchDetailOutput"
+            },
+            "description": "Present only with `detailed=true`: one entry per branch the caller\nmay `read`, in the order of `branches`. A branch the caller may not\nread is listed in `branches` alone."
           }
         }
       },
@@ -12979,14 +13538,14 @@
           "kind": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/EntityKindOutput"
+              "$ref": "#/components/schemas/EntityKind"
             },
             "description": "Feed scope the resume cursor is bound to. The snapshot honors `kind`\nand `type`; `op` constrains only subsequent polls."
           },
           "op": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/ChangeOpOutput"
+              "$ref": "#/components/schemas/ChangeOp"
             }
           },
           "type": {
@@ -13249,7 +13808,7 @@
           }
         }
       },
-      "ChangeOpOutput": {
+      "ChangeOp": {
         "type": "string",
         "description": "Logical operation of one change. Ordering rank is frozen:\ninsert before update before delete within one entity.",
         "enum": [
@@ -13411,7 +13970,7 @@
           }
         }
       },
-      "CommitKindOutput": {
+      "CommitKind": {
         "type": "string",
         "description": "`published`: a commit of a branch's lineage. `unpublished`: a proposal\n(`as commit`) awaiting `commit publish`. `unattached`: an unattached\nsnapshot (`as unattached branch`), which never publishes.",
         "enum": [
@@ -13447,6 +14006,15 @@
             "description": "Continue THIS listing below the last commit of the page. Absent on the\nlast page and on an unpaged listing."
           }
         }
+      },
+      "CommitListing": {
+        "type": "string",
+        "description": "Which commit collection to list. Only branch history supports pagination.",
+        "enum": [
+          "history",
+          "unpublished",
+          "unattached"
+        ]
       },
       "CommitOutput": {
         "type": "object",
@@ -13484,7 +14052,7 @@
             "minimum": 0
           },
           "kind": {
-            "$ref": "#/components/schemas/CommitKindOutput",
+            "$ref": "#/components/schemas/CommitKind",
             "description": "Which kind of commit this is. Required on the wire; a legacy receipt\nwithout it derives `published` or `unpublished` from `published`."
           },
           "merged_parent_commit_id": {
@@ -13512,23 +14080,7 @@
           }
         }
       },
-      "DeploymentRequest": {
-        "type": "object",
-        "required": [
-          "deployment_id",
-          "deployment"
-        ],
-        "properties": {
-          "deployment": {
-            "type": "object"
-          },
-          "deployment_id": {
-            "type": "string"
-          }
-        },
-        "additionalProperties": false
-      },
-      "DeploymentResponse": {
+      "DeploymentOutput": {
         "type": "object",
         "required": [
           "deployment",
@@ -13547,7 +14099,23 @@
           }
         }
       },
-      "DeploymentStatusResponse": {
+      "DeploymentRequest": {
+        "type": "object",
+        "required": [
+          "deployment_id",
+          "deployment"
+        ],
+        "properties": {
+          "deployment": {
+            "type": "object"
+          },
+          "deployment_id": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeploymentStatusOutput": {
         "type": "object",
         "required": [
           "status",
@@ -13727,17 +14295,17 @@
             "type": "string"
           },
           "kind": {
-            "$ref": "#/components/schemas/EntityKindOutput"
+            "$ref": "#/components/schemas/EntityKind"
           },
           "op": {
-            "$ref": "#/components/schemas/ChangeOpOutput"
+            "$ref": "#/components/schemas/ChangeOp"
           },
           "type": {
             "$ref": "#/components/schemas/ChangeTypeOutput"
           }
         }
       },
-      "EntityKindOutput": {
+      "EntityKind": {
         "type": "string",
         "description": "Logical graph entity namespace.",
         "enum": [
@@ -13747,10 +14315,11 @@
       },
       "ErrorCode": {
         "type": "string",
-        "description": "The registry of error codes. A server sends each code under the HTTP statuses named with it; a code without one never appears in an HTTP response.\n\n- `unauthorized` (401): The request carries no credential the server accepts: a bearer token is missing, unknown or expired. Supply one the server is configured to verify.\n- `forbidden` (403): The credential's actor may not do this: policy denies the action, or the action needs a policy permit the server has not been given.\n- `bad_request` (400): The request is malformed or invalid: a body, query string, path parameter or header that does not decode, a query the compiler refuses (see `diagnostic`), or a value refused before any effect.\n- `api_contract_mismatch` (400): The request lacks exactly one `Omnigraph-Http-Api` header naming the contract this server speaks. Authentication and this check precede graph access and effects.\n- `actor_mismatch` (412): The request's `Omnigraph-If-Actor` header names another actor than its credential resolves to. Nothing ran.\n- `outcome_unknown` (500): A write whose completion the server could not settle: it may or may not have published. Read the target before writing again; never replay the write blindly. An MCP write call that was cancelled or passed its deadline answers it too.\n- `precondition_failed` (412): A request precondition no longer holds: the branch head moved past `Omnigraph-If-Graph-Commit` (see `precondition_failure`), or a Blob's `If-Match` names a value the cell no longer holds (a write's `blob_precondition_failure` names the current one). Nothing was written.\n- `recovery_required` (503): An overlapping durable recovery intent must be resolved first; see `recovery_required`.\n- `external_blob_source` (424): An admitted external Blob source could not be probed or read; see `external_blob_source`.\n- `change_feed_gap` (410): Retained history can no longer reconstruct a change continuation; see `change_feed_gap`. Resume from a new baseline.\n- `not_found` (404): The graph, branch, commit, query, entity or route the request names does not exist, or the caller may not learn that it does.\n- `method_not_allowed` (405): The request path is served, but not with the request's method.\n- `request_timeout` (408): The request body did not arrive before its deadline; nothing was admitted.\n- `conflict` (409): The request conflicts with the graph's current state: a concurrent change, an existing id, a merge conflict, an index that must be built first, or a commit that cannot be diffed. The details say which.\n- `branch_start_refusal` (409, 410): `branch create` could not start the branch at the commit `from_commit` named, and nothing was created; see `branch_start_refusal`, whose `not_retained` reason answers 410.\n- `unattached_cannot_publish` (409): The commit is an unattached snapshot, a kind that never publishes. Distinct from `conflict`, the authority-moved refusal of a publishable proposal.\n- `payload_too_large` (413): The request body, or the work it asks for, exceeds a bounded limit; `resource_limit` names the limit when it is the operation's. Split or reduce the request.\n- `unsupported_media_type` (415): The request body's content type is not one the route accepts.\n- `range_not_satisfiable` (416): The requested Blob byte range lies outside the value; see `blob_range`.\n- `too_many_requests` (429): Admission capacity is exhausted: an actor's, the server's, or the MCP endpoint's concurrent tool calls. Nothing started; retry after `Retry-After`.\n- `service_unavailable` (503): Operation admission is closed, or a deployment observation raced an owner change. Nothing started; retry after `Retry-After`, reconciling any earlier write first.\n- `graph_unavailable` (503): A known graph is not being served. The request did not start, so it may be retried once the graph is served again.\n- `internal` (500): The server failed. An error before any write took no effect; see the server log.\n- `cancelled` (no HTTP status): MCP only: the client cancelled a read tool call. A cancelled write answers `outcome_unknown`.\n- `deadline_exceeded` (no HTTP status): MCP only: a read tool call passed its deadline. A write that does answers `outcome_unknown`.\n- `result_too_large` (no HTTP status): MCP only: a tool result exceeds the result limit. Narrow the read.",
+        "description": "The registry of error codes. A server sends each code under the HTTP statuses named with it; a code without one never appears in an HTTP response.\n\n- `unauthorized` (401): The request carries no credential the server accepts: a bearer token is missing, unknown or expired. Supply one the server is configured to verify.\n- `forbidden` (403): The credential's actor may not do this: policy denies the action, or the action needs a policy permit the server has not been given.\n- `not_admitted` (403): The OIDC access token is valid, but the server admits no principal for its subject. Signing in again issues a token for the same subject and cannot help; the server's operator must admit the identity.\n- `bad_request` (400): The request is malformed or invalid: a body, query string, path parameter or header that does not decode, a query the compiler refuses (see `diagnostic`), or a value refused before any effect.\n- `api_contract_mismatch` (400): The request lacks exactly one `Omnigraph-Http-Api` header naming the contract this server speaks. Authentication and this check precede graph access and effects.\n- `actor_mismatch` (412): The request's `Omnigraph-If-Actor` header names another actor than its credential resolves to. Nothing ran.\n- `outcome_unknown` (500): A write whose completion the server could not settle: it may or may not have published. Read the target before writing again; never replay the write blindly. An MCP write call that was cancelled or passed its deadline answers it too.\n- `precondition_failed` (412): A request precondition no longer holds: the branch head moved past `Omnigraph-If-Graph-Commit` (see `precondition_failure`), or a Blob's `If-Match` names a value the cell no longer holds (a write's `blob_precondition_failure` names the current one). Nothing was written.\n- `recovery_required` (503): An overlapping durable recovery intent must be resolved first; see `recovery_required`.\n- `external_blob_source` (424): An admitted external Blob source could not be probed or read; see `external_blob_source`.\n- `change_feed_gap` (410): Retained history can no longer reconstruct a change continuation; see `change_feed_gap`. Resume from a new baseline.\n- `not_found` (404): The graph, branch, commit, query, entity or route the request names does not exist, or the caller may not learn that it does.\n- `method_not_allowed` (405): The request path is served, but not with the request's method.\n- `request_timeout` (408): The request body did not arrive before its deadline; nothing was admitted.\n- `conflict` (409): The request conflicts with the graph's current state: a concurrent change, an existing id, a merge conflict, an index that must be built first, or a commit that cannot be diffed. The details say which.\n- `branch_start_refusal` (409, 410): `branch create` could not start the branch at the commit `from_commit` named, and nothing was created; see `branch_start_refusal`, whose `not_retained` reason answers 410.\n- `unattached_cannot_publish` (409): The commit is an unattached snapshot, a kind that never publishes. Distinct from `conflict`, the authority-moved refusal of a publishable proposal.\n- `payload_too_large` (413): The request body, or the work it asks for, exceeds a bounded limit; `resource_limit` names the limit when it is the operation's. Split or reduce the request.\n- `unsupported_media_type` (415): The request body's content type is not one the route accepts.\n- `range_not_satisfiable` (416): The requested Blob byte range lies outside the value; see `blob_range`.\n- `too_many_requests` (429): Admission capacity is exhausted: an actor's, the server's, or the MCP endpoint's concurrent tool calls. Nothing started; retry after `Retry-After`.\n- `service_unavailable` (503): Operation admission is closed, or a deployment observation raced an owner change. Nothing started; retry after `Retry-After`, reconciling any earlier write first.\n- `graph_unavailable` (503): A known graph is not being served. The request did not start, so it may be retried once the graph is served again.\n- `internal` (500): The server failed. An error before any write took no effect; see the server log.\n- `cancelled` (no HTTP status): MCP only: the client cancelled a read tool call. A cancelled write answers `outcome_unknown`.\n- `deadline_exceeded` (no HTTP status): MCP only: a read tool call passed its deadline. A write that does answers `outcome_unknown`.\n- `result_too_large` (no HTTP status): MCP only: a tool result exceeds the result limit. Narrow the read.",
         "enum": [
           "unauthorized",
           "forbidden",
+          "not_admitted",
           "bad_request",
           "api_contract_mismatch",
           "actor_mismatch",
@@ -14026,7 +14595,7 @@
       },
       "FullTextIndexRequiredOutput": {
         "type": "object",
-        "description": "A full-text call read a declared full-text index that has no segment at\nthe query's snapshot (HTTP 409), so no segment carries its analyzer. This\nis not a retryable conflict: an operator builds the branch's index\n(`omnigraph optimize` on main, `omnigraph rebuild-full-text-indexes\n--branch` elsewhere). Historical snapshots stay unchanged.",
+        "description": "A full-text call read a declared full-text index that has no segment at\nthe query's snapshot (HTTP 409), so no segment carries its analyzer. This\nis not a retryable conflict: an operator builds the branch's index\n(`omnigraph index build --branch <branch>`). Historical snapshots stay\nunchanged.",
         "required": [
           "index"
         ],
@@ -14168,7 +14737,7 @@
         },
         "additionalProperties": false
       },
-      "GraphDiscoveryResponse": {
+      "GraphDiscoveryOutput": {
         "type": "object",
         "description": "Authenticated minimal inventory from `GET /graphs/discovery`.",
         "required": [
@@ -14227,7 +14796,7 @@
           }
         }
       },
-      "GraphListResponse": {
+      "GraphListOutput": {
         "type": "object",
         "description": "Response from `GET /graphs`. Lists every graph registered with the\nserver in alphabetical order by `graph_id` (sorted server-side so\nclients get deterministic output across requests).",
         "required": [
@@ -14398,6 +14967,17 @@
           }
         }
       },
+      "InvokeStoredQueryOutput": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ReadOutput"
+          },
+          {
+            "$ref": "#/components/schemas/ChangeOutput"
+          }
+        ],
+        "description": "Response for `POST /queries/{name}`: the read envelope for a stored\nread, or the mutation envelope for a stored mutation. Serialized\n**untagged**, so the wire shape is exactly [`ReadOutput`] or\n[`ChangeOutput`] — classification follows the stored query, not a\nwrapper field."
+      },
       "InvokeStoredQueryRequest": {
         "type": "object",
         "description": "Body for `POST /queries/{name}` — invokes the server-side stored query\nnamed in the path. The query source and name come from the registry,\nnever the body; only the runtime inputs are supplied here.",
@@ -14428,17 +15008,6 @@
           }
         }
       },
-      "InvokeStoredQueryResponse": {
-        "oneOf": [
-          {
-            "$ref": "#/components/schemas/ReadOutput"
-          },
-          {
-            "$ref": "#/components/schemas/ChangeOutput"
-          }
-        ],
-        "description": "Response for `POST /queries/{name}`: the read envelope for a stored\nread, or the mutation envelope for a stored mutation. Serialized\n**untagged**, so the wire shape is exactly [`ReadOutput`] or\n[`ChangeOutput`] — classification follows the stored query, not a\nwrapper field."
-      },
       "KeyConflictOutput": {
         "type": "object",
         "description": "A strict insert rejected because `entity_id` already names an entity in the\nselected node or edge type. The refused write changed nothing; an earlier\nstep of the same request, such as the branch a load forks, may already have\npublished, which the error's `disposition` states. Partial or ambiguous\nattempts surface `recovery_required` instead.",
@@ -14454,7 +15023,7 @@
             ]
           },
           "entity_kind": {
-            "$ref": "#/components/schemas/EntityKindOutput"
+            "$ref": "#/components/schemas/EntityKind"
           },
           "type_name": {
             "type": "string"
@@ -14546,16 +15115,85 @@
             "type": "string",
             "description": "The operator the node built."
           },
+          "partitions": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The output partitions the operator ran, each its own stream: a\n`CsvSource`'s parsers, 1 for every other operator.",
+            "minimum": 0
+          },
           "rows": {
             "type": "integer",
             "format": "int64",
             "description": "What the operator emitted; the sink counts what it staged.",
             "minimum": 0
           },
+          "slices": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LoadSliceExecutedOutput"
+            },
+            "description": "The slices of the source a `CsvSource` cut and parsed, in slice order;\nabsent for every other operator."
+          },
           "wall_ns": {
             "type": "integer",
             "format": "int64",
             "description": "Nanoseconds from the operator's first poll to its end, waits included;\n`0` where no end was recorded.",
+            "minimum": 0
+          }
+        }
+      },
+      "LoadSliceExecutedOutput": {
+        "type": "object",
+        "description": "What one slice of a `CsvSource` measured: a byte range of the capture\nparsed whole by one partition.",
+        "required": [
+          "slice",
+          "partition",
+          "rows",
+          "elapsed_compute_ns",
+          "start_ns",
+          "end_ns"
+        ],
+        "properties": {
+          "elapsed_compute_ns": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Nanoseconds the slice's parse and normalization took.",
+            "minimum": 0
+          },
+          "end_ns": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Nanoseconds after the source's first poll at which the slice's last\nbatch was sent.",
+            "minimum": 0
+          },
+          "partition": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The partition that claimed the slice; which one varies between runs.",
+            "minimum": 0
+          },
+          "read_ns": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Nanoseconds the slice's partition waited for the source's bytes.",
+            "minimum": 0
+          },
+          "rows": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The records the slice held.",
+            "minimum": 0
+          },
+          "slice": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The slice's position in the source, from 0; a slice's rows are the\nsame on every run.",
+            "minimum": 0
+          },
+          "start_ns": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Nanoseconds after the source's first poll at which the slice was\nclaimed.",
             "minimum": 0
           }
         }
@@ -14588,7 +15226,7 @@
           }
         }
       },
-      "MergeConflictKindOutput": {
+      "MergeConflictKind": {
         "type": "string",
         "enum": [
           "divergent_insert",
@@ -14616,10 +15254,10 @@
             ]
           },
           "entity_kind": {
-            "$ref": "#/components/schemas/EntityKindOutput"
+            "$ref": "#/components/schemas/EntityKind"
           },
           "kind": {
-            "$ref": "#/components/schemas/MergeConflictKindOutput"
+            "$ref": "#/components/schemas/MergeConflictKind"
           },
           "message": {
             "type": "string"
@@ -14758,7 +15396,7 @@
             "minimum": 0
           },
           "entity_kind": {
-            "$ref": "#/components/schemas/EntityKindOutput"
+            "$ref": "#/components/schemas/EntityKind"
           },
           "expected_published_dataset_version": {
             "type": "integer",
@@ -14877,6 +15515,45 @@
         },
         "additionalProperties": false
       },
+      "RankOrder": {
+        "type": "string",
+        "description": "The direction a ranking's score orders rows.",
+        "enum": [
+          "ascending",
+          "descending"
+        ]
+      },
+      "RankingOutput": {
+        "type": "object",
+        "description": "The ranking a read ordered its rows by.",
+        "required": [
+          "by",
+          "order",
+          "exhaustive",
+          "score_columns"
+        ],
+        "properties": {
+          "by": {
+            "$ref": "#/components/schemas/SearchFunction",
+            "description": "The search function the leading `order` key names."
+          },
+          "exhaustive": {
+            "type": "boolean",
+            "description": "Whether no row the search admitted and did not return outranks a\nreturned one. `bm25` scores every match, so it is always exhaustive.\n`nearest` is exhaustive when the run searched every partition of the\nvector index, scored every row flat or returned every row it\nadmitted, and `false` when a probe cap left partitions unsearched, so\na nearer row may exist. `rrf` is exhaustive when its `nearest` arms\nare."
+          },
+          "order": {
+            "$ref": "#/components/schemas/RankOrder",
+            "description": "`ascending` for a `nearest` distance (smaller is nearer),\n`descending` for a `bm25` or `rrf` score (larger is more relevant)."
+          },
+          "score_columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The returned columns that hold the ranking's own score, in return\norder; empty when the read returns none. A column computed from the\nscore is not one."
+          }
+        }
+      },
       "ReadOutput": {
         "type": "object",
         "required": [
@@ -14912,6 +15589,17 @@
           },
           "query_name": {
             "type": "string"
+          },
+          "ranking": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RankingOutput",
+                "description": "How the read ordered its rows when its order is a search: the\nsearch function, the direction its score ranks, whether the run's\nsearch was exhaustive, and the returned columns holding the score.\nAbsent when the order is no search."
+              }
+            ]
           },
           "row_count": {
             "type": "integer",
@@ -15129,6 +15817,15 @@
           }
         }
       },
+      "SearchFunction": {
+        "type": "string",
+        "description": "The search function a ranked read orders by.",
+        "enum": [
+          "nearest",
+          "bm25",
+          "rrf"
+        ]
+      },
       "SettingsRequest": {
         "type": "object",
         "description": "The `settings` field of a request: one optional value per `request`-scope\nsetting of the definition, applied to the request's session before the\nsource's own `set` lines, so a `set` line in the request's text overrides\nthe field. An absent field is empty. A `process` setting has no field\nhere, so `{\"stage_write_concurrency\": 64}` is refused as an unknown field.",
@@ -15137,6 +15834,15 @@
             "type": "integer",
             "description": "the partition cap per index delta of a `nearest` scan; `0` is no cap",
             "minimum": 0
+          },
+          "change_lineage": {
+            "type": "string",
+            "description": "how a graph diff or commit page finds the entities it compares across a window with no adjacent transaction: the exact ordered merge of both versions, the entities paired by stable identity, or both compared",
+            "enum": [
+              "off",
+              "on",
+              "verify"
+            ]
           },
           "engine": {
             "type": "string",
@@ -15203,7 +15909,7 @@
             "minimum": 0
           },
           "entity_kind": {
-            "$ref": "#/components/schemas/EntityKindOutput"
+            "$ref": "#/components/schemas/EntityKind"
           },
           "native_dataset_branch": {
             "type": [
@@ -15261,7 +15967,7 @@
         ],
         "properties": {
           "applicability": {
-            "$ref": "#/components/schemas/ApplicabilityOutput"
+            "$ref": "#/components/schemas/Applicability"
           },
           "edits": {
             "type": "array",
@@ -15320,5 +16026,55 @@
         "scheme": "bearer"
       }
     }
-  }
+  },
+  "tags": [
+    {
+      "name": "access",
+      "description": "Actions available to the authenticated actor"
+    },
+    {
+      "name": "blobs",
+      "description": "Graph Blob values and conditional byte delivery"
+    },
+    {
+      "name": "branches",
+      "description": "Graph branches and merges"
+    },
+    {
+      "name": "changes",
+      "description": "Bounded graph differences and change feeds"
+    },
+    {
+      "name": "cluster",
+      "description": "Cluster deployment planning and execution"
+    },
+    {
+      "name": "commits",
+      "description": "Graph commit history and publication"
+    },
+    {
+      "name": "health",
+      "description": "Process health and readiness probes"
+    },
+    {
+      "name": "management",
+      "description": "Server graph inventory and OAuth resource metadata"
+    },
+    {
+      "name": "mutations",
+      "description": "Graph mutations and data loading"
+    },
+    {
+      "name": "queries",
+      "description": "Inline and stored queries, and graph exports"
+    },
+    {
+      "name": "schema",
+      "description": "Accepted graph schemas"
+    },
+    {
+      "name": "snapshots",
+      "description": "Coherent graph snapshot metadata"
+    }
+  ]
 }

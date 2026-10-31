@@ -62,7 +62,7 @@ fn version_command_prints_cli_version_http_contract_and_storage_formats_issue_97
             "channel": channel,
             "commit": commit,
             "http_contract": HTTP_API_CONTRACT,
-            "protocols": {"target": 1, "credential": 1, "access": 1},
+            "protocols": {"studio": 1, "target": 2, "credential": 2, "access": 2},
             "internal_schema": { "writes": WRITES, "serves": [LOWEST, WRITES] },
         }),
     );
@@ -349,7 +349,10 @@ fn help_groups_commands_by_capability() {
                 .contains("Select resources with --target and account operations with --profile")
             && !stdout.contains("--auth")
             && stdout.contains("--operator-config selects one operator file")
-            && stdout.contains("--config supplies deployment sources"),
+            && stdout.contains("--config supplies deployment sources")
+            && stdout.contains(
+                "First time using Omnigraph: call the omnigraph skill (`omnigraph skill show`) before a schema or query."
+            ),
         "target/capability guidance missing from --help:\n{stdout}"
     );
 

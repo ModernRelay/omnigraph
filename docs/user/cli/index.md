@@ -1,5 +1,9 @@
 # CLI guide
 
+Upgrading an existing installation? Start with the
+[0.13 → 0.14 checklist](../operations/upgrade-0.14.md) for before/after YAML
+and command examples.
+
 Select resources with `--target NAME|LOCAL_PATH`, or `defaults.target` when
 omitted. Account operations use `--profile NAME` or `defaults.profile`.
 These selectors are mutually exclusive. Source files select what to run; they
@@ -144,8 +148,8 @@ omnigraph query sources_for_claim --target standalone --graph knowledge \
 omnigraph credentials status --target standalone --json
 ```
 
-The profile's declared source is the only credential source. There is no
-implicit environment override or plaintext credential file. `login` and `logout`
+The server target's declared `auth` is the only credential source. There is no
+implicit environment override or plaintext credential fallback. `login` and `logout`
 manage platform sessions; static tokens use `credentials set/remove`.
 The server resolves the actor from authentication; on a served write `--as`
 only asserts it. Register remote endpoints rather than passing inline URLs.
@@ -210,7 +214,7 @@ and the [managed command reference](reference.md#managed-cluster-commands).
 
 For `query` and `alias`, output selection follows `--json`, then `--format`,
 then operator `defaults.output`, then `table`. Aliases have no format field.
-Structured execution errors use the selected JSON or JSONL format. Mutations
+Structured execution errors use the selected JSON, JSONL, or TOON format. Mutations
 require explicit `--json` for structured errors. Target diagnostics go to
 stderr and cannot be suppressed by a quiet flag.
 
@@ -233,7 +237,7 @@ omnigraph skill export ~/.claude/skills/omnigraph --force --json
 omnigraph skill show references/queries.md
 ```
 
-The binary carries the agent skill matching its commands and HTTP contract.
+Running `omnigraph` or `omnigraph help` says to call that skill before a first schema or query. The binary carries the agent skill matching its commands and HTTP contract.
 Export refuses existing files unless `--force`; a later forced export removes
 obsolete recorded files only while their bytes remain unchanged. Neither
 command reads operator configuration or contacts a server.

@@ -44,7 +44,10 @@ enum AdmissionClass {
 
 async fn classify(parts: &mut Parts, route: &str) -> Result<AdmissionClass, ApiError> {
     if parts.method == Method::POST
-        && matches!(route, "/queries/{name}" | "/queries/{name}/if-graph-commit")
+        && matches!(
+            route,
+            "/queries/{query_name}" | "/queries/{query_name}/if-graph-commit"
+        )
     {
         let handle = parts
             .extensions
@@ -68,11 +71,12 @@ async fn classify(parts: &mut Parts, route: &str) -> Result<AdmissionClass, ApiE
                 return Err(ApiError::not_found("stored query not found"));
             }
         }
-        let Path(crate::handlers::QueryNamePath { name }) = Path::from_request_parts(parts, &())
-            .await
-            .map_err(|error| {
-                ApiError::bad_request(format!("invalid stored query path: {error}"))
-            })?;
+        let Path(crate::handlers::QueryNamePath { query_name: name }) =
+            Path::from_request_parts(parts, &())
+                .await
+                .map_err(|error| {
+                    ApiError::bad_request(format!("invalid stored query path: {error}"))
+                })?;
         return Ok(
             if handle
                 .queries

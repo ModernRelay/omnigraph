@@ -70,7 +70,7 @@ use crate::blob::{
 };
 use crate::dataset_index::{
     has_btree_index_on, has_fts_index_on, has_fts_postings_on, has_vector_index_on,
-    is_full_text_index, is_untrained_full_text, validate_full_text_demand, validate_full_text_scan,
+    is_full_text_index, validate_full_text_demand, validate_full_text_scan,
 };
 use crate::db::manifest::{TableVersionMetadata, open_dataset_entry};
 use crate::db::{DatasetEntry, Snapshot};
@@ -555,6 +555,127 @@ pub(crate) async fn load_deleted_ids(
     }
 }
 
+/// A data file's physical identity, `(owning root, relative path)`, with
+/// `base_id` resolved through the manifest's base paths; `None` when that base
+/// path is missing, which callers treat as a changed fragment.
+fn resolved_data_file_key<'a>(
+    dataset: &'a Dataset,
+    base_id: Option<u32>,
+    path: &'a str,
+) -> Option<(&'a str, &'a str)> {
+    let root = match base_id {
+        None => dataset.uri(),
+        Some(base_id) => dataset
+            .manifest
+            .base_paths
+            .get(&base_id)
+            .map(|base_path| base_path.path.as_str())?,
+    };
+    Some((scheme_free_root(root), path))
+}
+
+/// One local root spelled `file:///abs/path` by a dataset URI and `/abs/path`
+/// by a stored base path compares equal; a non-file scheme stays as it is.
+fn scheme_free_root(root: &str) -> &str {
+    root.strip_prefix("file://")
+        .unwrap_or(root)
+        .trim_end_matches('/')
+}
+
+/// Whether two fragment incarnations hold byte-identical row data: same
+/// resolved data files (base-path indirection resolved on each side) and the
+/// same overlay list. Deletion state is compared separately — a deletion-file
+/// mismatch is self-correcting through the deletion-vector content diff.
+/// Overlay data files carry the same `base_id` indirection, and one `base_id`
+/// can resolve to different roots in the two manifests, so overlays compare by
+/// resolved physical identity too, never by struct equality: a false `true`
+/// here is the one direction that breaks the candidate superset.
+pub(crate) fn fragment_data_identical(
+    base_dataset: &Dataset,
+    base_meta: &lance_table::format::Fragment,
+    side_dataset: &Dataset,
+    side_meta: &lance_table::format::Fragment,
+) -> bool {
+    if base_meta.files.len() != side_meta.files.len()
+        || base_meta.overlays.len() != side_meta.overlays.len()
+    {
+        return false;
+    }
+    let overlays_identical = base_meta
+        .overlays
+        .iter()
+        .zip(side_meta.overlays.iter())
+        .all(|(base_overlay, side_overlay)| {
+            base_overlay.coverage == side_overlay.coverage
+                && base_overlay.committed_version == side_overlay.committed_version
+                && data_file_identical(
+                    base_dataset,
+                    &base_overlay.data_file,
+                    side_dataset,
+                    &side_overlay.data_file,
+                )
+        });
+    if !overlays_identical {
+        return false;
+    }
+    base_meta
+        .files
+        .iter()
+        .zip(side_meta.files.iter())
+        .all(|(base_file, side_file)| {
+            data_file_identical(base_dataset, base_file, side_dataset, side_file)
+        })
+}
+
+/// Whether two data-file references name the same physical file with the same
+/// column layout, `base_id` indirection resolved on each side.
+fn data_file_identical(
+    base_dataset: &Dataset,
+    base_file: &lance_table::format::DataFile,
+    side_dataset: &Dataset,
+    side_file: &lance_table::format::DataFile,
+) -> bool {
+    base_file.fields == side_file.fields
+        && base_file.column_indices == side_file.column_indices
+        && match (
+            resolved_data_file_key(base_dataset, base_file.base_id, &base_file.path),
+            resolved_data_file_key(side_dataset, side_file.base_id, &side_file.path),
+        ) {
+            (Some(base_key), Some(side_key)) => base_key == side_key,
+            _ => false,
+        }
+}
+
+/// Whether two deletion-file references name the same physical deletion file.
+/// `(read_version, id, file_type, base_id)` pins the uniquely-named file; a
+/// false negative only costs two deletion-vector reads whose content diff
+/// comes back empty (superset-safe).
+pub(crate) fn deletion_file_identical(
+    base_meta: &lance_table::format::Fragment,
+    side_meta: &lance_table::format::Fragment,
+) -> bool {
+    match (&base_meta.deletion_file, &side_meta.deletion_file) {
+        (None, None) => true,
+        (Some(base_file), Some(side_file)) => {
+            base_file.read_version == side_file.read_version
+                && base_file.id == side_file.id
+                && base_file.file_type == side_file.file_type
+                && base_file.base_id == side_file.base_id
+        }
+        _ => false,
+    }
+}
+
+pub(crate) async fn fragment_deletion_vector(
+    fragment: &lance::dataset::fragment::FileFragment,
+) -> Result<Arc<lance_core::utils::deletion::DeletionVector>> {
+    Ok(fragment
+        .get_deletion_vector()
+        .await
+        .map_err(OmniError::storage)?
+        .unwrap_or_default())
+}
+
 /// Stamp [`NO_BY_SOURCE_DELETE_PROPERTY`] on a keyed-write transaction before it
 /// is committed. Unconditional: every OmniGraph keyed `merge_insert` is
 /// no-by-source-delete by construction. Mirrors `certify_insert_absence`'s
@@ -570,22 +691,16 @@ fn stamp_no_by_source_delete(transaction: &mut Transaction) {
     );
 }
 
-/// Whether `transaction`, read at `expected_read_version`, only declares
-/// full-text indexes ([`TableStore::stage_full_text_declarations`]): a
-/// `CreateIndex` that adds untrained full-text segments (empty fragment
-/// bitmaps) and removes nothing. It moves no row.
-pub(crate) fn is_full_text_declaration(
-    transaction: &Transaction,
-    expected_read_version: u64,
-) -> bool {
+/// Whether `transaction`, read at `expected_read_version`, only changes
+/// indexes: a `CreateIndex`, such as a full-text declaration
+/// ([`TableStore::stage_full_text_declarations`]), an index build or a fold.
+/// Lance applies `CreateIndex` with every fragment of the version it read
+/// unchanged, so it moves no row; the
+/// `rfc_0067_create_index_keeps_every_fragment_of_its_read_version` guard pins
+/// that apply.
+pub(crate) fn is_index_only_commit(transaction: &Transaction, expected_read_version: u64) -> bool {
     transaction.read_version == expected_read_version
-        && matches!(
-            &transaction.operation,
-            Operation::CreateIndex { new_indices, removed_indices }
-                if removed_indices.is_empty()
-                    && !new_indices.is_empty()
-                    && new_indices.iter().all(is_untrained_full_text)
-        )
+        && matches!(&transaction.operation, Operation::CreateIndex { .. })
 }
 
 /// Verify one persisted link of the insertion-absence proof chain and return
@@ -730,6 +845,73 @@ struct IndexLag {
 pub struct StagedIndexFold {
     pub staged: Option<StagedWrite>,
     pub skipped: Vec<(String, String)>,
+}
+
+/// A staged index reconciliation: one `CreateIndex` holding the declared
+/// indexes a table lacked and a whole rebuild of every lagging foldable
+/// index, if either had work, the columns whose lagging index was rebuilt,
+/// and the columns whose vector index could not be trained.
+#[derive(Default)]
+pub struct StagedIndexReconciliation {
+    pub staged: Option<StagedWrite>,
+    pub refreshed: Vec<RefreshedIndex>,
+    pub skipped: Vec<(String, String)>,
+}
+
+/// A lagging index rebuilt whole over the current fragments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshedIndex {
+    pub column: String,
+    pub vector: bool,
+}
+
+/// The segments one index batch adds and the segments they replace, all
+/// built from one pinned version and wrapped in one `CreateIndex`.
+#[derive(Default)]
+struct IndexBatch {
+    new_indices: Vec<IndexMetadata>,
+    removed_indices: Vec<IndexMetadata>,
+}
+
+impl IndexBatch {
+    /// Add `other`, built from the same version. Two builders that produce
+    /// one name would publish two definitions of one index; a segment both
+    /// replace is removed once.
+    fn extend(&mut self, other: IndexBatch) -> Result<()> {
+        for index in &other.new_indices {
+            if self.new_indices.iter().any(|new| new.name == index.name) {
+                return Err(OmniError::manifest_internal(format!(
+                    "index batch produced duplicate index name '{}'",
+                    index.name
+                )));
+            }
+        }
+        self.new_indices.extend(other.new_indices);
+        for index in other.removed_indices {
+            if !self
+                .removed_indices
+                .iter()
+                .any(|removed| removed.uuid == index.uuid)
+            {
+                self.removed_indices.push(index);
+            }
+        }
+        Ok(())
+    }
+
+    fn stage(self, read_version: u64) -> Option<StagedWrite> {
+        (!self.new_indices.is_empty()).then(|| {
+            let transaction = TransactionBuilder::new(
+                read_version,
+                Operation::CreateIndex {
+                    new_indices: self.new_indices,
+                    removed_indices: self.removed_indices,
+                },
+            )
+            .build();
+            StagedWrite::new(transaction, Vec::new(), Vec::new())
+        })
+    }
 }
 
 /// A staged compaction: the `Rewrite` to commit detached and the metrics its
@@ -1043,6 +1225,52 @@ fn external_object_changed(uri: &str) -> OmniError {
     )
 }
 
+/// One external object a `load csv` statement reads from: the probe's handle
+/// (store, path, size, validators), so every read of a byte range is bound
+/// to the incarnation the probe saw and a changed object refuses.
+#[derive(Clone)]
+pub(crate) struct ExternalSource {
+    blob: Arc<PreflightedExternalBlob>,
+}
+
+impl std::fmt::Debug for ExternalSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalSource")
+            .field("uri", &self.blob.normalized_uri.as_str())
+            .field("size", &self.blob.object_size)
+            .field("e_tag", &self.blob.e_tag)
+            .finish()
+    }
+}
+
+impl ExternalSource {
+    pub(crate) fn size(&self) -> u64 {
+        self.blob.object_size
+    }
+
+    pub(crate) fn uri(&self) -> &str {
+        self.blob.normalized_uri.as_str()
+    }
+
+    /// `range` of the object as one response pinned to the probe's validators.
+    pub(crate) async fn read_range(&self, range: std::ops::Range<u64>) -> Result<Arc<[u8]>> {
+        self.blob.read_range_pinned(range).await
+    }
+
+    /// The whole object as one response pinned to the probe's validators,
+    /// `admit` called with its size before the first payload byte.
+    pub(crate) async fn read_whole(
+        &self,
+        max_bytes: u64,
+        resource: &str,
+        admit: impl FnOnce(u64) -> Result<()>,
+    ) -> Result<CapturedSource> {
+        self.blob
+            .read_full_bounded(max_bytes, resource, admit)
+            .await
+    }
+}
+
 impl PreflightedExternalBlob {
     fn range_size(&self, offset: u64, length: Option<u64>) -> Result<u64> {
         let payload_size = match length {
@@ -1174,6 +1402,73 @@ impl PreflightedExternalBlob {
             .read_one_range(&self.path, 0..end)
             .await
             .map_err(|error| OmniError::external_blob_source(&uri, error.to_string()))?;
+        crate::instrumentation::record_blob_payload_read();
+        crate::instrumentation::record_external_blob_payload_read();
+        Ok(Arc::<[u8]>::from(bytes.as_ref()))
+    }
+
+    /// `range` as one `get_opts` response under the probe's `If-Match` and
+    /// version, its size, validator and range checked against the probe; a
+    /// local object's range is one blocking read, never the 8 KiB chunk stream.
+    async fn read_range_pinned(&self, range: std::ops::Range<u64>) -> Result<Arc<[u8]>> {
+        let uri = self.normalized_uri.as_str();
+        let length = range.end.checked_sub(range.start).ok_or_else(|| {
+            OmniError::external_blob_source(
+                uri,
+                format!("external Blob range {range:?} is reversed"),
+            )
+        })?;
+        self.range_size(range.start, Some(length))?;
+        if length == 0 {
+            return Ok(Arc::<[u8]>::from([]));
+        }
+        let capacity = usize::try_from(length).map_err(|_| {
+            OmniError::external_blob_source(uri, "external Blob range does not fit usize")
+        })?;
+        crate::instrumentation::external_payload_read_stall().await;
+        let options = object_store::GetOptions {
+            if_match: self.e_tag.clone(),
+            version: self.version.clone(),
+            range: Some(object_store::GetRange::Bounded(range.clone())),
+            ..Default::default()
+        };
+        let response = self
+            .store
+            .inner
+            .get_opts(&self.path, options)
+            .await
+            .map_err(|error| match error {
+                object_store::Error::Precondition { .. }
+                | object_store::Error::NotModified { .. } => external_object_changed(uri),
+                other => OmniError::external_blob_source(uri, other.to_string()),
+            })?;
+        if response.meta.size != self.object_size
+            || (self.e_tag.is_some() && response.meta.e_tag != self.e_tag)
+        {
+            return Err(external_object_changed(uri));
+        }
+        if response.range != range {
+            return Err(OmniError::external_blob_source(
+                uri,
+                format!(
+                    "external object response covered {:?} of the {range:?} requested",
+                    response.range
+                ),
+            ));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| OmniError::external_blob_source(uri, error.to_string()))?;
+        if bytes.len() != capacity {
+            return Err(OmniError::external_blob_source(
+                uri,
+                format!(
+                    "external object response held {} bytes of the {capacity} requested",
+                    bytes.len()
+                ),
+            ));
+        }
         crate::instrumentation::record_blob_payload_read();
         crate::instrumentation::record_external_blob_payload_read();
         Ok(Arc::<[u8]>::from(bytes.as_ref()))
@@ -1645,37 +1940,21 @@ impl TableStore {
         })
     }
 
-    /// One whole external object for a `load csv` statement: authorized by
-    /// the graph's external Blob policy, its size checked against `max_bytes`
-    /// before any payload byte is read, then read in full as one response
-    /// bound to the version the probe reported (`If-Match` on its validator);
-    /// an object that changed in between refuses as an external-source error.
-    /// Shares the preflight the Blob ingress path runs, so every refusal the
-    /// policy knows (`Deny`, a URI outside every base, a `file://` target
-    /// escaping its base) is the same refusal here.
-    pub(crate) async fn read_external_object(
+    /// One external object for a `load csv` statement, probed and not read:
+    /// authorized by the graph's external Blob policy, its size from the
+    /// `HEAD` checked against `max_bytes` before any payload byte is read.
+    /// Every read through the handle is bound to the version the probe
+    /// reported (`If-Match` on its validator); an object that changed in
+    /// between refuses as an external-source error. Shares the preflight the
+    /// Blob ingress path runs, so every refusal the policy knows (`Deny`, a
+    /// URI outside every base, a `file://` target escaping its base) is the
+    /// same refusal here.
+    pub(crate) async fn external_source(
         &self,
         uri: &str,
         max_bytes: u64,
         resource: &'static str,
-        admit: impl FnOnce(u64) -> Result<()>,
-    ) -> Result<CapturedSource> {
-        let preflight = self.preflight_external_blob_uri_iter(1, [uri]).await?;
-        let entry = preflight.by_input.get(uri).ok_or_else(|| {
-            OmniError::manifest_internal("external object preflight dropped its one input")
-        })?;
-        entry.read_full_bounded(max_bytes, resource, admit).await
-    }
-
-    /// The size of one external object from its metadata probe alone, for
-    /// `explain load csv`: the policy authorization, `HEAD` and `max_bytes`
-    /// refusal of [`Self::read_external_object`], and no payload byte read.
-    pub(crate) async fn external_object_size(
-        &self,
-        uri: &str,
-        max_bytes: u64,
-        resource: &'static str,
-    ) -> Result<u64> {
+    ) -> Result<ExternalSource> {
         let preflight = self.preflight_external_blob_uri_iter(1, [uri]).await?;
         let entry = preflight.by_input.get(uri).ok_or_else(|| {
             OmniError::manifest_internal("external object preflight dropped its one input")
@@ -1687,7 +1966,9 @@ impl TableStore {
                 entry.object_size,
             ));
         }
-        Ok(entry.object_size)
+        Ok(ExternalSource {
+            blob: Arc::clone(entry),
+        })
     }
 
     // Sealed storage surface, pinned by name in tests/forbidden_apis.rs; no
@@ -2800,14 +3081,58 @@ impl TableStore {
     /// Lance's merge would. A vector index the builder cannot train (a column
     /// with no non-null rows) is skipped and reported by column.
     pub async fn stage_index_fold(&self, ds: &Dataset) -> Result<StagedIndexFold> {
+        let (batch, _, skipped) = Self::index_fold_batch(ds).await?;
+        Ok(StagedIndexFold {
+            staged: batch.stage(ds.manifest.version),
+            skipped,
+        })
+    }
+
+    /// Stage, as one `CreateIndex` from `ds`, the declared indexes the table
+    /// lacks (`specs`, as [`Self::stage_create_indices`] builds them) and the
+    /// whole rebuild of every lagging foldable index (as
+    /// [`Self::stage_index_fold`] builds it): one detached commit leaves every
+    /// buildable declared index present and covering every current fragment.
+    /// Full-text coverage is not folded (`can_fold_index`).
+    pub async fn stage_index_reconciliation(
+        &self,
+        ds: &Dataset,
+        specs: &[IndexBuildSpec],
+    ) -> Result<StagedIndexReconciliation> {
+        let (mut batch, refreshed, skipped) = Self::index_fold_batch(ds).await?;
+        let mut vector_builds = 0;
+        if !specs.is_empty() {
+            let (created, builds) = Self::create_index_batch(ds, specs).await?;
+            batch.extend(created)?;
+            vector_builds = builds;
+        }
+        let staged = batch.stage(ds.manifest.version);
+        if staged.is_some() {
+            for _ in 0..vector_builds {
+                crate::instrumentation::record_stage_vector_index();
+            }
+        }
+        Ok(StagedIndexReconciliation {
+            staged,
+            refreshed,
+            skipped,
+        })
+    }
+
+    /// The fold batch: every lagging foldable index rebuilt whole under its
+    /// name, the columns rebuilt, and the vector columns that could not train.
+    async fn index_fold_batch(
+        ds: &Dataset,
+    ) -> Result<(IndexBatch, Vec<RefreshedIndex>, Vec<(String, String)>)> {
         let lag = Self::foldable_index_lag(ds).await?;
         if lag.is_empty() {
-            return Ok(StagedIndexFold::default());
+            return Ok((IndexBatch::default(), Vec::new(), Vec::new()));
         }
         let existing = ds.load_indices().await.map_err(OmniError::storage)?;
         let read_version = ds.manifest.version;
         let mut new_indices = Vec::new();
         let mut removed_indices = Vec::new();
+        let mut refreshed = Vec::new();
         let mut skipped = Vec::new();
         for item in lag {
             let Some(column) = item
@@ -2876,20 +3201,20 @@ impl TableStore {
             if item.vector {
                 crate::instrumentation::record_stage_vector_index();
             }
+            refreshed.push(RefreshedIndex {
+                column,
+                vector: item.vector,
+            });
             new_indices.push(new_idx);
         }
-        let staged = (!new_indices.is_empty()).then(|| {
-            let transaction = TransactionBuilder::new(
-                read_version,
-                Operation::CreateIndex {
-                    new_indices,
-                    removed_indices,
-                },
-            )
-            .build();
-            StagedWrite::new(transaction, Vec::new(), Vec::new())
-        });
-        Ok(StagedIndexFold { staged, skipped })
+        Ok((
+            IndexBatch {
+                new_indices,
+                removed_indices,
+            },
+            refreshed,
+            skipped,
+        ))
     }
 
     pub async fn count_rows(&self, ds: &Dataset, filter: Option<String>) -> Result<usize> {
@@ -4705,10 +5030,6 @@ impl TableStore {
         writers: usize,
         chunk_rows: usize,
     ) -> Result<StagedWrite> {
-        // Existing graph datasets retain stable row IDs through Overwrite;
-        // keep the flag explicit at this write site too. This is not the
-        // separate Lance migration API for legacy datasets without stable IDs.
-        // See `stage_overwrite_preserves_stable_row_ids` and docs/dev/lance.md.
         let schema = batches.first().map(RecordBatch::schema);
         let mut filled = batches.iter().filter(|batch| batch.num_rows() > 0);
         if let Some(first) = filled.next()
@@ -4719,84 +5040,182 @@ impl TableStore {
                 first_schema_difference(&first.schema(), &other.schema())
             )));
         }
-        let chunks = overwrite_chunks(batches, chunk_rows);
-        let (transaction, mut new_fragments) = if chunks.is_empty() {
-            let schema = match schema {
-                Some(schema) => {
-                    LanceSchema::try_from(schema.as_ref()).map_err(OmniError::lance_internal)?
-                }
-                None => ds.schema().clone(),
-            };
-            let transaction = TransactionBuilder::new(
-                ds.manifest.version,
-                Operation::Overwrite {
-                    fragments: Vec::new(),
-                    schema,
-                    config_upsert_values: None,
-                    initial_bases: None,
-                },
-            )
-            .build();
-            (transaction, Vec::new())
-        } else {
-            let params = WriteParams {
-                mode: WriteMode::Overwrite,
-                file_writer_options: Some(budgeted_file_writer_options(write_budget)),
-                enable_stable_row_ids: true,
-                allow_external_blob_outside_bases: true,
-                auto_cleanup: None,
-                skip_auto_cleanup: true,
-                ..Default::default()
-            };
-            let writers = writers.clamp(1, chunks.len());
-            let ds = Arc::new(ds.clone());
-            let transactions = futures::stream::iter(chunks)
-                .map(|chunk| {
-                    let ds = Arc::clone(&ds);
-                    let params = &params;
-                    async move {
-                        InsertBuilder::new(ds)
-                            .with_params(params)
-                            .execute_uncommitted(chunk)
-                            .await
-                            .map_err(|error| OmniError::storage(error).unpublished())
-                    }
+        let chunks = overwrite_chunks(batches, chunk_rows)
+            .into_iter()
+            .enumerate()
+            .map(|(index, batches)| {
+                Ok(OverwriteChunk {
+                    order: (0, index as u64),
+                    batches,
+                    lease: None,
                 })
-                .buffered(writers)
-                .try_collect::<Vec<Transaction>>()
-                .await?;
-            let mut transactions = transactions.into_iter();
-            let mut transaction = transactions.next().ok_or_else(|| {
-                OmniError::manifest_internal("stage_overwrite_batches: no chunk was written")
-            })?;
-            let fragments = match &mut transaction.operation {
-                Operation::Overwrite { fragments, .. } => fragments,
-                other => {
-                    return Err(OmniError::manifest_internal(format!(
-                        "stage_overwrite_batches: unexpected Lance operation {:?}",
-                        std::mem::discriminant(other)
-                    )));
+            });
+        self.stage_overwrite_stream(
+            ds,
+            futures::stream::iter(chunks),
+            schema,
+            write_budget,
+            writers,
+        )
+        .await
+    }
+
+    /// [`Self::stage_overwrite_batches`] over chunks as a producer cuts them:
+    /// each chunk goes to a Lance writer as it arrives, `writers` in flight,
+    /// and pulling pauses while they are; the finished calls' fragments are
+    /// joined in `order` into one `Operation::Overwrite`, whatever order the
+    /// writers returned in. A refusal from a writer waits for the writers in
+    /// flight, deletes every file the finished calls wrote, and is returned; a
+    /// producer's refusal first follows the producer to its end, dropping every
+    /// later chunk unwritten, so the operator that owns the refused row parks
+    /// its own verdict for the caller before the same deletion and return. A
+    /// drop mid-stream deletes them off the runtime. `schema` is the
+    /// transaction's when no chunk carries a row.
+    pub(crate) async fn stage_overwrite_stream(
+        &self,
+        ds: &Dataset,
+        chunks: impl futures::Stream<Item = Result<OverwriteChunk>> + Send,
+        schema: Option<SchemaRef>,
+        write_budget: WriteBudget,
+        writers: usize,
+    ) -> Result<StagedWrite> {
+        let params = Arc::new(WriteParams {
+            mode: WriteMode::Overwrite,
+            file_writer_options: Some(budgeted_file_writer_options(write_budget)),
+            enable_stable_row_ids: true,
+            allow_external_blob_outside_bases: true,
+            auto_cleanup: None,
+            skip_auto_cleanup: true,
+            ..Default::default()
+        });
+        let writers = writers.max(1);
+        let ds = Arc::new(ds.clone());
+        let mut written = WrittenChunks::new(Arc::clone(&ds));
+        let mut in_flight = futures::stream::FuturesUnordered::new();
+        let mut chunks = std::pin::pin!(chunks);
+        let mut first_schema: Option<SchemaRef> = None;
+        let mut failure: Option<OmniError> = None;
+        let mut producer_refused = false;
+        while failure.is_none() {
+            while in_flight.len() >= writers {
+                match in_flight.next().await {
+                    Some(Ok(finished)) => written.push(finished),
+                    Some(Err(error)) => {
+                        failure = Some(error);
+                        break;
+                    }
+                    None => break,
                 }
+            }
+            if failure.is_some() {
+                break;
+            }
+            let chunk = match chunks.next().await {
+                Some(Ok(chunk)) => chunk,
+                Some(Err(error)) => {
+                    failure = Some(error);
+                    producer_refused = true;
+                    break;
+                }
+                None => break,
             };
-            for later in transactions {
-                match later.operation {
+            let OverwriteChunk {
+                order,
+                mut batches,
+                lease,
+            } = chunk;
+            batches.retain(|batch| batch.num_rows() > 0);
+            let Some(first) = batches.first() else {
+                continue;
+            };
+            let seen = first_schema.get_or_insert_with(|| first.schema());
+            if let Some(other) = batches.iter().find(|batch| batch.schema() != *seen) {
+                failure = Some(OmniError::manifest_internal(format!(
+                    "stage_overwrite_batches: all batches must share one schema, {}",
+                    first_schema_difference(seen, &other.schema())
+                )));
+                break;
+            }
+            let ds = Arc::clone(&ds);
+            let params = Arc::clone(&params);
+            in_flight.push(async move {
+                let transaction = InsertBuilder::new(ds)
+                    .with_params(&params)
+                    .execute_uncommitted(batches)
+                    .await
+                    .map_err(|error| OmniError::storage(error).unpublished())?;
+                drop(lease);
+                Ok::<_, OmniError>((order, transaction))
+            });
+        }
+        while let Some(result) = in_flight.next().await {
+            match result {
+                Ok(finished) => written.push(finished),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = failure {
+            if producer_refused {
+                while chunks.next().await.is_some() {}
+            }
+            written.discard().await;
+            return Err(error);
+        }
+        let mut transactions = written.take();
+        transactions.sort_by_key(|(order, _)| *order);
+        let mut transactions = transactions.into_iter().map(|(_, transaction)| transaction);
+        let (transaction, mut new_fragments) = match transactions.next() {
+            None => {
+                let schema = match schema.or(first_schema) {
+                    Some(schema) => {
+                        LanceSchema::try_from(schema.as_ref()).map_err(OmniError::lance_internal)?
+                    }
+                    None => ds.schema().clone(),
+                };
+                let transaction = TransactionBuilder::new(
+                    ds.manifest.version,
                     Operation::Overwrite {
-                        fragments: chunk_fragments,
-                        ..
-                    } => fragments.extend(chunk_fragments),
+                        fragments: Vec::new(),
+                        schema,
+                        config_upsert_values: None,
+                        initial_bases: None,
+                    },
+                )
+                .build();
+                (transaction, Vec::new())
+            }
+            Some(mut transaction) => {
+                let fragments = match &mut transaction.operation {
+                    Operation::Overwrite { fragments, .. } => fragments,
                     other => {
                         return Err(OmniError::manifest_internal(format!(
                             "stage_overwrite_batches: unexpected Lance operation {:?}",
-                            std::mem::discriminant(&other)
+                            std::mem::discriminant(other)
                         )));
                     }
+                };
+                for later in transactions {
+                    match later.operation {
+                        Operation::Overwrite {
+                            fragments: chunk_fragments,
+                            ..
+                        } => fragments.extend(chunk_fragments),
+                        other => {
+                            return Err(OmniError::manifest_internal(format!(
+                                "stage_overwrite_batches: unexpected Lance operation {:?}",
+                                std::mem::discriminant(&other)
+                            )));
+                        }
+                    }
                 }
+                let mut new_fragments = fragments.clone();
+                new_fragments
+                    .iter_mut()
+                    .for_each(|fragment| fragment.id = 0);
+                (transaction, new_fragments)
             }
-            let mut new_fragments = fragments.clone();
-            new_fragments
-                .iter_mut()
-                .for_each(|fragment| fragment.id = 0);
-            (transaction, new_fragments)
         };
         // These IDs belong only to the pre-commit scan view. All committed
         // fragments are removed below, so provisional fragment IDs starting
@@ -4842,7 +5261,28 @@ impl TableStore {
                 "stage_create_indices requires at least one index specification",
             ));
         }
+        let (batch, vector_builds) = Self::create_index_batch(ds, specs).await?;
+        let staged = batch.stage(ds.manifest.version).ok_or_else(|| {
+            OmniError::manifest_internal(
+                "stage_create_indices built no index for its specifications",
+            )
+        })?;
+        // Preserve the existing build-count probe while moving the vector
+        // operation from inline commit to staged publication. Record only once
+        // the entire batch staged successfully.
+        for _ in 0..vector_builds {
+            crate::instrumentation::record_stage_vector_index();
+        }
+        Ok(staged)
+    }
 
+    /// The batch `specs` build from `ds`, with the number of vector indexes
+    /// in it. Each new index replaces any index of its name and, for full
+    /// text, every full-text segment on its column.
+    async fn create_index_batch(
+        ds: &Dataset,
+        specs: &[IndexBuildSpec],
+    ) -> Result<(IndexBatch, usize)> {
         let read_version = ds.manifest.version;
         let existing_indices = ds
             .load_indices()
@@ -4940,22 +5380,13 @@ impl TableStore {
             })
             .cloned()
             .collect();
-        let transaction = TransactionBuilder::new(
-            read_version,
-            Operation::CreateIndex {
+        Ok((
+            IndexBatch {
                 new_indices,
                 removed_indices,
             },
-        )
-        .build();
-
-        // Preserve the existing build-count probe while moving the vector
-        // operation from inline commit to staged publication. Record only once
-        // the entire batch staged successfully.
-        for _ in 0..vector_builds {
-            crate::instrumentation::record_stage_vector_index();
-        }
-        Ok(StagedWrite::new(transaction, Vec::new(), Vec::new()))
+            vector_builds,
+        ))
     }
 
     /// Run a scan with optional uncommitted staged writes visible
@@ -5517,9 +5948,90 @@ fn prior_stages_fragment_count(prior_stages: &[StagedWrite]) -> u64 {
 }
 
 /// The rows one overwrite chunk holds: Lance's file target, so a chunk is
-/// the file one call would cut there.
-fn overwrite_chunk_rows() -> usize {
-    WriteParams::default().max_rows_per_file
+/// the file one call would cut there; a test pins it lower through
+/// `with_overwrite_chunk_rows`.
+pub(crate) fn overwrite_chunk_rows() -> usize {
+    crate::instrumentation::overwrite_chunk_rows()
+        .unwrap_or_else(|| WriteParams::default().max_rows_per_file)
+}
+
+/// One overwrite chunk as a producer hands it to
+/// [`TableStore::stage_overwrite_stream`]: the batches one Lance call writes,
+/// their place in the source (`order`: the source partition, then the chunk's
+/// index within it), and whatever the producer holds for them until the
+/// writer returns.
+pub(crate) struct OverwriteChunk {
+    pub(crate) order: (u32, u64),
+    pub(crate) batches: Vec<RecordBatch>,
+    pub(crate) lease: Option<Box<dyn Send>>,
+}
+
+/// The overwrite chunks whose Lance calls returned, with the files they wrote:
+/// taken whole by the join, deleted by a refusal, and deleted off the runtime
+/// when the staging is dropped before either.
+struct WrittenChunks {
+    ds: Arc<Dataset>,
+    transactions: Vec<((u32, u64), Transaction)>,
+}
+
+impl WrittenChunks {
+    fn new(ds: Arc<Dataset>) -> Self {
+        Self {
+            ds,
+            transactions: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, finished: ((u32, u64), Transaction)) {
+        self.transactions.push(finished);
+    }
+
+    fn take(&mut self) -> Vec<((u32, u64), Transaction)> {
+        std::mem::take(&mut self.transactions)
+    }
+
+    async fn discard(&mut self) {
+        let transactions = self.take();
+        delete_overwrite_files(&self.ds, &transactions).await;
+    }
+}
+
+impl Drop for WrittenChunks {
+    fn drop(&mut self) {
+        if self.transactions.is_empty() {
+            return;
+        }
+        let transactions = self.take();
+        let ds = Arc::clone(&self.ds);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move { delete_overwrite_files(&ds, &transactions).await });
+        }
+    }
+}
+
+/// Delete the data files the finished overwrite calls wrote under the
+/// dataset's `data/`; a file that stays is logged and left to cleanup, the
+/// refusal that brought us here still wins.
+async fn delete_overwrite_files(ds: &Dataset, transactions: &[((u32, u64), Transaction)]) {
+    let store = match ds.object_store(None).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::warn!(%error, "a refused overwrite's fragment files stayed; cleanup reclaims them");
+            return;
+        }
+    };
+    let data_dir = ds.data_dir();
+    for (_, transaction) in transactions {
+        let Operation::Overwrite { fragments, .. } = &transaction.operation else {
+            continue;
+        };
+        for file in fragments.iter().flat_map(|fragment| fragment.files.iter()) {
+            let path = data_dir.clone().join(file.path.as_str());
+            if let Err(error) = store.delete(&path).await {
+                tracing::warn!(%path, %error, "a refused overwrite's fragment file stayed; cleanup reclaims it");
+            }
+        }
+    }
 }
 
 /// Cut `batches` into contiguous runs of exactly `chunk_rows` rows, the last

@@ -8,11 +8,10 @@ use axum::extract::{RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
 use axum::{Extension, Json, Router};
 use omnigraph_mcp::{
-    AdmissionError, Host, HostError, Pending, ProtocolError, ResourceOutput, ResourceRequest,
-    ToolCall, ToolRequest, ToolResult, change_query,
+    AdmissionError, ChangeFilters, Host, HostError, Pending, ProtocolError, ResourceOutput,
+    ResourceRequest, ToolCall, ToolRequest, ToolResult, change_query,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -104,14 +103,30 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
         .oidc_resource_url()
         .and_then(|resource| advertised_metadata_url(&resource))
         .map(|url| AdvertisedMetadataPath(Arc::from(url.path())));
-    let mut discovery = Router::new().route(RESOURCE_METADATA_PATH, get(resource_metadata));
+    metadata_routes(advertised).into_router().merge(protected)
+}
+
+/// The protocol-defined discovery routes keep their boot-time availability
+/// and layers while sharing registration with the operation inventory.
+fn metadata_routes(
+    advertised: Option<AdvertisedMetadataPath>,
+) -> crate::http_operations::HttpRoutes {
+    let mut discovery = crate::http_operations::HttpRoutes::new("")
+        .route("oauth protected resource metadata", resource_metadata);
     if let Some(advertised) = advertised {
-        discovery = discovery.route(
-            &format!("{RESOURCE_METADATA_PATH}/{{*resource_path}}"),
-            get(resource_metadata_at_resource_path).layer(Extension(advertised)),
-        );
+        discovery = discovery.resource_metadata(resource_metadata_at_resource_path, |route| {
+            route.layer(Extension(advertised))
+        });
     }
-    discovery.merge(protected)
+    discovery
+}
+
+#[cfg(test)]
+pub(crate) fn metadata_http_operations() -> Vec<(crate::api::operations::HttpMethod, String)> {
+    metadata_routes(Some(AdvertisedMetadataPath(Arc::from(
+        "/.well-known/oauth-protected-resource/mcp",
+    ))))
+    .registered()
 }
 
 #[utoipa::path(get, path = "/.well-known/oauth-protected-resource", tag = "management",
@@ -289,7 +304,7 @@ fn project_error(error: ApiError, write: bool) -> HostError {
 
 /// MCP refusals use the server's one error-code and disposition registry.
 fn protocol_error(error: ProtocolError, write: bool) -> ApiError {
-    let unknown = "The write keeps running and its outcome is unknown. Before replaying it, read the target (`read` or `snapshot`, comparing `graph_commit_id`) or list the branch with `commits_list`, and replay a `mutate` with `if_graph_commit`.";
+    let unknown = "The write keeps running and its outcome is unknown. Before replaying it, read the target (`query` or `snapshot`, comparing `graph_commit_id`) or list the branch with `commits_list`, and replay a `mutate` with `if_graph_commit`.";
     let wait_ended = |code, reason: &str| {
         let mut error = ApiError::new(code, format!("{reason} {unknown}")).after_owned_write();
         error.completion_uncertain = true;
@@ -373,38 +388,41 @@ impl ServerHost {
             }
             ToolCall::Queries(args) => {
                 let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let mut output =
+                let output =
                     handlers::server_list_queries(Extension(handle), Some(Extension(actor)))
-                        .await?
-                        .0;
-                output.queries.retain(|query| !query.mutation);
-                bounded_result(&output)
+                        .await?;
+                bounded_result(&output.0)
             }
             ToolCall::Query(args) => {
                 let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let body = serde_json::to_vec(&InvokeStoredQueryRequest {
-                    params: args.params.map(Value::Object),
-                    branch: args.branch,
-                    snapshot: None,
-                    expect_mutation: Some(false),
-                })
-                .map_err(|_| ApiError::bad_request("invalid query parameters"))?;
-                let output = handlers::server_invoke_query(
-                    state(),
-                    Extension(handle),
-                    Extension(input),
-                    Some(Extension(actor)),
-                    ApiPath(QueryNamePath { name: args.name }),
-                    HeaderMap::new(),
-                    Bytes::from(body),
-                )
-                .await?;
-                bounded_result(&output.0)
-            }
-            ToolCall::Read(args) => {
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let Some(query) = args.query else {
+                    // A stored read, as `omnigraph query NAME` runs it.
+                    let name = args.name.ok_or_else(|| {
+                        ApiError::bad_request(
+                            "query needs `query` (GQ source) or `name` (a stored read)",
+                        )
+                    })?;
+                    let body = serde_json::to_vec(&InvokeStoredQueryRequest {
+                        params: args.params.map(Value::Object),
+                        branch: args.branch,
+                        snapshot: args.snapshot,
+                        expect_mutation: Some(false),
+                    })
+                    .map_err(|_| ApiError::bad_request("invalid query parameters"))?;
+                    let output = handlers::server_invoke_query(
+                        state(),
+                        Extension(handle),
+                        Extension(input),
+                        Some(Extension(actor)),
+                        ApiPath(QueryNamePath { query_name: name }),
+                        HeaderMap::new(),
+                        Bytes::from(body),
+                    )
+                    .await?;
+                    return bounded_result(&output.0);
+                };
                 let request = request_body(json!({
-                    "query": args.query,
+                    "query": query,
                     "name": args.name,
                     "params": args.params,
                     "branch": args.branch,
@@ -445,19 +463,28 @@ impl ServerHost {
             }
             ToolCall::BranchesList(args) => {
                 let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let output =
-                    handlers::server_branch_list(Extension(handle), Some(Extension(actor))).await?;
+                let output = handlers::server_branch_list(
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    ApiQuery(crate::api::BranchListQuery {
+                        detailed: args.detailed,
+                    }),
+                )
+                .await?;
                 bounded_result(&output.0)
             }
             ToolCall::CommitsList(args) => {
                 let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let listing = match args.listing {
+                    Some(listing) => request_body(Value::String(listing))?,
+                    None => crate::api::CommitListing::History,
+                };
                 let output = handlers::server_commit_list(
                     Extension(handle),
                     Some(Extension(actor)),
                     ApiQuery(crate::api::CommitListQuery {
                         branch: args.branch,
-                        unpublished: false,
-                        unattached: false,
+                        listing,
                         limit: args.limit,
                         page_token: args.page_token,
                     }),
@@ -481,6 +508,7 @@ impl ServerHost {
                 let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
                 let query = change_query(&[], &args.filters);
                 let output = handlers::server_commit_changes(
+                    state(),
                     Extension(handle),
                     Some(Extension(actor)),
                     ApiPath(handlers::CommitPath {
@@ -502,6 +530,7 @@ impl ServerHost {
                     &args.filters,
                 );
                 let output = handlers::server_changes_feed(
+                    state(),
                     Extension(handle),
                     Some(Extension(actor)),
                     RawQuery(query),
@@ -509,24 +538,139 @@ impl ServerHost {
                 .await?;
                 bounded_result(&output.0)
             }
+            ToolCall::Diff(args) => {
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let query = change_query(
+                    &[
+                        ("from", Some(args.from.as_str())),
+                        ("to", Some(args.to.as_str())),
+                    ],
+                    &args.filters,
+                );
+                let output = handlers::server_diff(
+                    state(),
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    RawQuery(query),
+                )
+                .await?;
+                bounded_result(&output.0)
+            }
+            ToolCall::BranchesDiff(args) => {
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let query = change_query(
+                    &[
+                        ("source", Some(args.source.as_str())),
+                        ("target", args.target.as_deref()),
+                    ],
+                    &args.filters,
+                );
+                let output = handlers::server_branch_diff(
+                    state(),
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    RawQuery(query),
+                )
+                .await?;
+                bounded_result(&output.0)
+            }
+            ToolCall::BranchesMergeBase(args) => {
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let query = change_query(
+                    &[
+                        ("source", Some(args.source.as_str())),
+                        ("target", args.target.as_deref()),
+                    ],
+                    &ChangeFilters::default(),
+                );
+                let output = handlers::server_merge_base(
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    RawQuery(query),
+                )
+                .await?;
+                bounded_result(&output.0)
+            }
+            ToolCall::BlobsStat(args) => {
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let query: crate::api::BlobReadQuery = request_body(json!({
+                    "entity": args.entity,
+                    "type": args.r#type,
+                    "id": args.id,
+                    "property": args.property,
+                    "branch": args.branch,
+                    "snapshot": args.snapshot,
+                }))?;
+                let response = handlers::server_blob_head(
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    HeaderMap::new(),
+                    ApiQuery(query.clone()),
+                )
+                .await?;
+                bounded_result(&blob_stat_output(&query, &response)?)
+            }
             ToolCall::Mutate(args) => {
                 let ingress = write_ingress()?;
                 let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let precondition = args
+                    .if_graph_commit
+                    .as_deref()
+                    .map(graph_commit_precondition)
+                    .transpose()?;
+                let Some(query) = args.query else {
+                    // A stored mutation, as `omnigraph mutate NAME` runs it:
+                    // the precondition selects the conditional route that
+                    // requires it; the plain route refuses one.
+                    let name = args.name.ok_or_else(|| {
+                        ApiError::bad_request(
+                            "mutate needs `query` (GQ source) or `name` (a stored mutation)",
+                        )
+                    })?;
+                    let body = serde_json::to_vec(&InvokeStoredQueryRequest {
+                        params: args.params.map(Value::Object),
+                        branch: args.branch,
+                        snapshot: None,
+                        expect_mutation: Some(true),
+                    })
+                    .map_err(|_| ApiError::bad_request("invalid mutation parameters"))?;
+                    let path = ApiPath(QueryNamePath { query_name: name });
+                    let output = match precondition {
+                        Some(headers) => {
+                            handlers::server_invoke_query_if_graph_commit(
+                                state(),
+                                Extension(handle),
+                                Extension(ingress),
+                                Some(Extension(actor)),
+                                path,
+                                headers,
+                                Bytes::from(body),
+                            )
+                            .await?
+                        }
+                        None => {
+                            handlers::server_invoke_query(
+                                state(),
+                                Extension(handle),
+                                Extension(ingress),
+                                Some(Extension(actor)),
+                                path,
+                                HeaderMap::new(),
+                                Bytes::from(body),
+                            )
+                            .await?
+                        }
+                    };
+                    return bounded_result(&output.0);
+                };
                 let request = ApiJson(request_body(json!({
-                    "query": args.query,
+                    "query": query,
                     "name": args.name,
                     "params": args.params,
                     "branch": args.branch,
                 }))?);
-                let output = match args.if_graph_commit {
-                    Some(head) => {
-                        let mut headers = HeaderMap::new();
-                        headers.insert(
-                            crate::api::GRAPH_COMMIT_PRECONDITION_HEADER,
-                            HeaderValue::from_str(&head).map_err(|_| {
-                                ApiError::bad_request("if_graph_commit is not a valid commit id")
-                            })?,
-                        );
+                let output = match precondition {
+                    Some(headers) => {
                         handlers::server_mutate_if_graph_commit(
                             state(),
                             Extension(handle),
@@ -570,6 +714,37 @@ impl ServerHost {
                 .await?;
                 bounded_result(&output.0)
             }
+            ToolCall::BlobsClear(args) => {
+                let ingress = write_ingress()?;
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let query = request_body(json!({
+                    "entity": args.entity,
+                    "type": args.r#type,
+                    "id": args.id,
+                    "property": args.property,
+                    "branch": args.branch,
+                }))?;
+                // The route's `If-Match` field, parsed by the route's own rule.
+                let mut headers = HeaderMap::new();
+                if let Some(tags) = args.if_match {
+                    headers.insert(
+                        header::IF_MATCH,
+                        HeaderValue::from_str(&tags).map_err(|_| {
+                            ApiError::bad_request("if_match is not a valid If-Match value")
+                        })?,
+                    );
+                }
+                let output = handlers::blob_clear_body(
+                    &self.state,
+                    &handle,
+                    ingress,
+                    Some(&actor),
+                    &headers,
+                    query,
+                )
+                .await?;
+                bounded_result(&output)
+            }
             ToolCall::BranchesCreate(args) => {
                 let ingress = write_ingress()?;
                 let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
@@ -595,7 +770,9 @@ impl ServerHost {
                     Extension(handle),
                     Extension(ingress),
                     Some(Extension(actor)),
-                    ApiPath(handlers::BranchPath { branch: args.name }),
+                    ApiPath(handlers::BranchPath {
+                        branch_name: args.name,
+                    }),
                 )
                 .await?;
                 bounded_result(&output.0)
@@ -616,6 +793,37 @@ impl ServerHost {
                 )
                 .await?;
                 bounded_result(&output.0)
+            }
+            ToolCall::CommitsPublish(args) => {
+                let ingress = write_ingress()?;
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let output = handlers::server_commit_publish(
+                    state(),
+                    Extension(handle),
+                    Extension(ingress),
+                    Some(Extension(actor)),
+                    ApiPath(handlers::CommitPath {
+                        commit_id: args.commit_id,
+                    }),
+                )
+                .await?;
+                bounded_result(&output.0)
+            }
+            ToolCall::CommitsDrop(args) => {
+                let ingress = write_ingress()?;
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                handlers::server_commit_drop(
+                    state(),
+                    Extension(handle),
+                    Extension(ingress),
+                    Some(Extension(actor)),
+                    ApiPath(handlers::CommitPath {
+                        commit_id: args.commit_id,
+                    }),
+                )
+                .await?;
+                // The route answers 204; structured content must be an object.
+                bounded_result(&json!({}))
             }
         }
     }
@@ -640,8 +848,12 @@ impl ServerHost {
             }
             ResourceRequest::Branches(name) => {
                 let (handle, actor) = self.graph(&name, actor, &graph)?;
-                let output =
-                    handlers::server_branch_list(Extension(handle), Some(Extension(actor))).await?;
+                let output = handlers::server_branch_list(
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    ApiQuery(Default::default()),
+                )
+                .await?;
                 Ok(("application/json", pretty(&output.0)?))
             }
         }
@@ -653,7 +865,7 @@ impl ServerHost {
     async fn discover(
         &self,
         actor: AuthenticatedActor,
-    ) -> Result<crate::api::GraphDiscoveryResponse, ApiError> {
+    ) -> Result<crate::api::GraphDiscoveryOutput, ApiError> {
         let state = State(self.state.clone());
         if actor.is_identity() {
             return Ok(
@@ -665,7 +877,7 @@ impl ServerHost {
         let listed = handlers::server_graphs_list(state, Some(Extension(actor)))
             .await?
             .0;
-        Ok(crate::api::GraphDiscoveryResponse {
+        Ok(crate::api::GraphDiscoveryOutput {
             graphs: listed
                 .graphs
                 .into_iter()
@@ -716,6 +928,55 @@ fn request_body<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, ApiEr
     serde_json::from_value(value).map_err(|_| ApiError::bad_request("invalid MCP tool arguments"))
 }
 
+/// `if_graph_commit` as the one `Omnigraph-If-Graph-Commit` header a
+/// conditional route requires; that route judges the value, so an empty or
+/// malformed one is refused there rather than dropped here.
+fn graph_commit_precondition(head: &str) -> Result<HeaderMap, ApiError> {
+    let value = HeaderValue::from_str(head)
+        .map_err(|_| ApiError::bad_request("if_graph_commit is not a valid commit id"))?;
+    let mut headers = HeaderMap::new();
+    headers.insert(crate::api::GRAPH_COMMIT_PRECONDITION_HEADER, value);
+    Ok(headers)
+}
+
+/// `blob stat`'s JSON for a `HEAD /blob` answer, read from its headers as the
+/// CLI reads them: a managed value's length, validator and snapshot, or an
+/// external value's location and snapshot. Without conditional request
+/// headers the route answers no other success.
+fn blob_stat_output(
+    query: &crate::api::BlobReadQuery,
+    response: &Response,
+) -> Result<crate::api::BlobStatOutput, ApiError> {
+    let value = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ApiError::internal("the Blob stat answer omitted a header"))
+    };
+    let snapshot = value(crate::api::SNAPSHOT_ID_HEADER)?;
+    match response.status() {
+        StatusCode::OK => {
+            let size = value(header::CONTENT_LENGTH.as_str())?
+                .parse::<u64>()
+                .map_err(|_| ApiError::internal("the Blob stat answer has an invalid length"))?;
+            Ok(crate::api::BlobStatOutput::managed(
+                query,
+                snapshot,
+                size,
+                value(header::ETAG.as_str())?,
+            ))
+        }
+        StatusCode::FOUND => Ok(crate::api::BlobStatOutput::external(
+            query,
+            snapshot,
+            value(header::LOCATION.as_str())?,
+        )),
+        _ => Err(ApiError::internal("unexpected Blob stat answer")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,6 +1021,62 @@ mod tests {
             let body = error_body(host_error(error, write));
             assert_eq!(body["error"]["code"], code, "{body}");
             assert_eq!(body["error"]["disposition"], disposition, "{body}");
+        }
+    }
+
+    /// `blobs_stat` reads the HEAD answer's headers as the CLI does, for a
+    /// managed and an external value; a missing header or another status is
+    /// the server's own failure, never a guessed body.
+    #[test]
+    fn blob_stat_reads_a_head_answer_as_the_cli_does() {
+        let query: crate::api::BlobReadQuery = serde_json::from_value(
+            json!({"entity":"node","type":"Doc","id":"a","property":"body","branch":"main"}),
+        )
+        .unwrap();
+        let answer = |status, headers: &[(&'static str, &str)]| {
+            let mut response = StatusCode::into_response(status);
+            for (name, value) in headers {
+                response
+                    .headers_mut()
+                    .insert(*name, HeaderValue::from_str(value).unwrap());
+            }
+            response
+        };
+        let selector = json!({"entity":"node","type":"Doc","id":"a","property":"body"});
+        let target = json!({"branch":"main","resolved_snapshot":"s1"});
+        let managed = answer(
+            StatusCode::OK,
+            &[
+                ("content-length", "5"),
+                ("etag", "\"e1\""),
+                ("omnigraph-snapshot-id", "s1"),
+            ],
+        );
+        assert_eq!(
+            serde_json::to_value(blob_stat_output(&query, &managed).unwrap()).unwrap(),
+            json!({"selector":selector,"kind":"managed","size":5,"etag":"\"e1\"","target":target})
+        );
+        let external = answer(
+            StatusCode::FOUND,
+            &[
+                ("location", "s3://bucket/key"),
+                ("omnigraph-snapshot-id", "s1"),
+            ],
+        );
+        assert_eq!(
+            serde_json::to_value(blob_stat_output(&query, &external).unwrap()).unwrap(),
+            json!({"selector":selector,"kind":"external","uri":"s3://bucket/key","target":target})
+        );
+        for response in [
+            answer(
+                StatusCode::OK,
+                &[("etag", "\"e1\""), ("omnigraph-snapshot-id", "s1")],
+            ),
+            answer(StatusCode::FOUND, &[("omnigraph-snapshot-id", "s1")]),
+            answer(StatusCode::NOT_MODIFIED, &[("omnigraph-snapshot-id", "s1")]),
+        ] {
+            let error = blob_stat_output(&query, &response).unwrap_err();
+            assert_eq!(error.code, ErrorCode::Internal);
         }
     }
 

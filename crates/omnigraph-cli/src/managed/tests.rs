@@ -201,45 +201,56 @@ fn managed_output_preserves_bytes_and_recovery_details_on_delivery_failure() {
         }
     }
 
-    // A lifecycle identity receives the same narrow fallback. Extra fields and
+    // Accepted identities receive the same narrow fallback. Extra fields and
     // reflected error text must never turn recovery into source/secret export.
-    let identity = json!({"cluster_id":"cluster-original","incarnation":"incarnation-original","operation_id":"operation-original","kind":"create"});
-    for fault in [OutputFault::PartialWrite, OutputFault::Flush] {
-        let mut body = json!({"type":"output_delivery_failed","detail":"private-error-content","accepted_operation":identity,"submission":{"idempotency_key":"original-key","request":{"source":"private-request-content"}},"access_token":"private-token-extra","data":{"files":{"secret.pg":"private-source-content"}}});
-        body["accepted_operation"]["token"] = json!("private-identity-extra");
-        let mut stdout = Vec::new();
-        assert_eq!(
-            Output::from_result(
-                Err(Failure {
-                    body,
-                    exit: 1,
-                    response_status: None
-                }),
-                false,
+    for (field, identity) in [
+        (
+            "accepted_operation",
+            json!({"cluster_id":"cluster-original","incarnation":"incarnation-original","operation_id":"operation-original","kind":"create"}),
+        ),
+        (
+            "accepted_preview",
+            json!({"preview_id":"preview-original","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}),
+        ),
+    ] {
+        for fault in [OutputFault::PartialWrite, OutputFault::Flush] {
+            let mut body = json!({"type":"output_delivery_failed","detail":"private-error-content","submission":{"idempotency_key":"original-key","request":{"source":"private-request-content"}},"access_token":"private-token-extra","data":{"files":{"secret.pg":"private-source-content"}}});
+            body[field] = identity.clone();
+            body[field]["token"] = json!("private-identity-extra");
+            let mut stdout = Vec::new();
+            assert_eq!(
+                Output::from_result(
+                    Err(Failure {
+                        body,
+                        exit: 1,
+                        response_status: None
+                    }),
+                    false,
+                    1
+                )
+                .emit(&mut stdout, &mut FailedOutput::new(fault, 0))
+                .unwrap(),
                 1
+            );
+            let recovery: Value = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(recovery[field], identity);
+            assert_eq!(recovery["idempotency_key"], "original-key");
+            assert!(!String::from_utf8(stdout).unwrap().contains("private-"));
+
+            let mut stdout = Vec::new();
+            let error = Output::from_result(
+                Err(Failure::refused(
+                    "invalid_input",
+                    "no operation was accepted",
+                )),
+                false,
+                2,
             )
             .emit(&mut stdout, &mut FailedOutput::new(fault, 0))
-            .unwrap(),
-            1
-        );
-        let recovery: Value = serde_json::from_slice(&stdout).unwrap();
-        assert_eq!(recovery["accepted_operation"], identity);
-        assert_eq!(recovery["idempotency_key"], "original-key");
-        assert!(!String::from_utf8(stdout).unwrap().contains("private-"));
-
-        let mut stdout = Vec::new();
-        let error = Output::from_result(
-            Err(Failure::refused(
-                "invalid_input",
-                "no operation was accepted",
-            )),
-            false,
-            2,
-        )
-        .emit(&mut stdout, &mut FailedOutput::new(fault, 0))
-        .unwrap_err();
-        assert!(stdout.is_empty());
-        assert!(format!("{error:#}").contains("invalid_input"));
+            .unwrap_err();
+            assert!(stdout.is_empty());
+            assert!(format!("{error:#}").contains("invalid_input"));
+        }
     }
 }
 

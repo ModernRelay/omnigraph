@@ -373,7 +373,8 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
     // nothing with no branch named or on `main`.
     let (status, body) = json_response(&app, get_request(&g("/access?branch=main"), &token)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(body["actor"].is_string(), "{body}");
+    assert!(body["actor_id"].is_string(), "{body}");
+    assert!(body.get("actor").is_none(), "{body}");
     assert_eq!(body["graph_wide"], json!([]), "{body}");
     assert_eq!(body["actions"], json!([]), "{body}");
     let (status, _) = json_response(
@@ -648,6 +649,7 @@ async fn api_contract_refuses_before_graph_resolution_body_or_mutation() {
         vec![HeaderValue::from_static("0.11")],
         vec![HeaderValue::from_static("0.12")],
         vec![HeaderValue::from_static("0.13")],
+        vec![HeaderValue::from_static("0.15")],
         vec![HeaderValue::from_str(&format!("{HTTP_API_CONTRACT}, {HTTP_API_CONTRACT}")).unwrap()],
         vec![
             HeaderValue::from_static(HTTP_API_CONTRACT),
@@ -880,6 +882,10 @@ async fn malformed_and_unrouted_requests_answer_the_error_body() {
             request(Method::PUT, &g("/snapshot"), ""),
             StatusCode::METHOD_NOT_ALLOWED,
         ),
+        (
+            request(Method::POST, "/healthz", ""),
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
     ];
     for (request, status) in cases {
         let what = format!("{} {}", request.method(), request.uri());
@@ -928,6 +934,7 @@ async fn an_unserved_method_on_a_protected_route_answers_after_every_guard() {
     let (_temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
     let routes = [
         (Method::PUT, g("/snapshot"), "GET,HEAD"),
+        (Method::POST, g("/blob"), "GET,HEAD,PUT,DELETE"),
         (Method::PUT, g("/branches/feature"), "DELETE"),
         (Method::PUT, "/graphs".to_string(), "GET,HEAD"),
         (Method::PUT, "/cluster/plan".to_string(), "POST"),
@@ -1025,6 +1032,54 @@ fn concrete_path(path: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// Two OAuth clients acting for one admitted person resolve to the person's
+/// one actor, and the access answer names the client each credential was
+/// issued to. A static token names none.
+#[tokio::test(flavor = "multi_thread")]
+async fn issue_1173_the_access_answer_names_the_oidc_client() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path()).to_string_lossy().to_string();
+    let policy = temp.path().join("policy.yaml");
+    fs::write(
+        &policy,
+        permit_all_policy_yaml(&["principal:stable_alice", "default"]),
+    )
+    .unwrap();
+    let app = build_app(
+        AppState::open_with_bearer_tokens_and_policy(
+            graph,
+            vec![("default".into(), "secret".into())],
+            Some(&policy),
+        )
+        .await
+        .unwrap()
+        .with_oidc_identity_trust(oidc::trust(temp.path())),
+    );
+    for client in [
+        "https://studio.example/oauth/client",
+        "https://agent.example/oauth/client",
+    ] {
+        let token = oidc::token_for_client("alice", oidc::RESOURCE, client);
+        let (status, body) =
+            json_response(&app, get_request(&g("/access?branch=main"), &token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["actor_id"], "principal:stable_alice", "{body}");
+        assert_eq!(body["client_id"], client, "{body}");
+        assert!(
+            body["actions"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("change")),
+            "{body}"
+        );
+    }
+    let (status, body) =
+        json_response(&app, get_request(&g("/access?branch=main"), "secret")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["actor_id"], "default", "{body}");
+    assert!(body.get("client_id").is_none(), "{body}");
 }
 
 /// Every protected operation the served OpenAPI document declares answers a
@@ -1205,6 +1260,87 @@ async fn issue_1020_every_401_carries_the_one_bearer_challenge() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(response.headers()[WWW_AUTHENTICATE], "Bearer");
+}
+
+/// A valid OIDC token whose subject the admission file does not name is not an
+/// invalid token: signing in again issues a token for the same subject, so a
+/// challenge would send an OAuth client round a sign-in loop. Tokens that fail
+/// their own checks keep the `invalid_token` challenge.
+#[tokio::test]
+async fn issue_1172_an_unadmitted_subject_is_refused_without_a_sign_in_challenge() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path()).to_string_lossy().to_string();
+    let policy = temp.path().join("policy.yaml");
+    fs::write(&policy, permit_all_policy_yaml(&["default"])).unwrap();
+    let app = build_app(
+        AppState::open_with_bearer_tokens_and_policy(
+            graph,
+            vec![("default".into(), "secret".into())],
+            Some(&policy),
+        )
+        .await
+        .unwrap()
+        .with_oidc_identity_trust(oidc::trust(temp.path())),
+    );
+    let send = |token: String, method: &str, uri: &str| {
+        let app = app.clone();
+        let request = Request::builder()
+            .method(Method::from_bytes(method.as_bytes()).unwrap())
+            .uri(uri)
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("host", "localhost")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+            ))
+            .unwrap();
+        async move {
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let challenge = response.headers().get(WWW_AUTHENTICATE).cloned();
+            let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            (
+                status,
+                challenge,
+                serde_json::from_slice::<Value>(&body).ok(),
+            )
+        }
+    };
+    let stranger = oidc::token("user_unadmitted", oidc::RESOURCE);
+    for (method, uri) in [("GET", "/graphs/discovery"), ("POST", "/mcp")] {
+        let (status, challenge, body) = send(stranger.clone(), method, uri).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+        assert!(challenge.is_none(), "{method} {uri}: {challenge:?}");
+        let body = body.unwrap();
+        assert_eq!(body["code"], "not_admitted", "{method} {uri}: {body}");
+        assert_eq!(body["disposition"]["action"], "fix", "{body}");
+        assert_eq!(body["disposition"]["effects"], "none", "{body}");
+        assert!(!body.to_string().contains("user_unadmitted"), "{body}");
+
+        let (status, _, _) = send(oidc::token("alice", oidc::RESOURCE), method, uri).await;
+        assert!(
+            status.is_success(),
+            "{method} {uri}: admitted subject got {status}"
+        );
+
+        let tampered = tamper_signature(&oidc::token("alice", oidc::RESOURCE));
+        for refused in [
+            tampered,
+            oidc::token("alice", "https://data.example/clusters/B/incarnations/one"),
+        ] {
+            let (status, challenge, _) = send(refused, method, uri).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+            assert_eq!(
+                challenge.unwrap(),
+                format!(
+                    "Bearer error=\"invalid_token\", resource_metadata=\"{}\"",
+                    oidc::RESOURCE_METADATA
+                ),
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1739,7 +1875,7 @@ async fn policy_commit_publish_and_drop_denials_are_indistinguishable_from_unkno
         .to_string();
     let (status, body) = json_response(
         &app,
-        get_request(&g("/commits?unpublished=true"), "writer-token"),
+        get_request(&g("/commits?listing=unpublished"), "writer-token"),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -1800,7 +1936,7 @@ async fn policy_commit_publish_and_drop_denials_are_indistinguishable_from_unkno
     }
     let (status, body) = json_response(
         &app,
-        get_request(&g("/commits?unpublished=true"), "writer-token"),
+        get_request(&g("/commits?listing=unpublished"), "writer-token"),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -2995,12 +3131,14 @@ async fn branch_list_is_denied_by_a_branch_scoped_read_rule_as_the_route_is() {
             &format!("{statement} under a protected-only read rule"),
         );
     }
-    let (status, body) = json_response(&app, get_request(&g("/branches"), "team-token")).await;
-    assert_forbidden(
-        status,
-        body,
-        "GET /branches under a protected-only read rule",
-    );
+    for route in ["/branches", "/branches?detailed=true"] {
+        let (status, body) = json_response(&app, get_request(&g(route), "team-token")).await;
+        assert_forbidden(
+            status,
+            body,
+            &format!("GET {route} under a protected-only read rule"),
+        );
+    }
 }
 
 const SHOW_SOURCES: [&str; 1] = ["show all;"];
@@ -4257,32 +4395,32 @@ async fn access_reports_the_callers_own_actions_as_routes_decide_them() {
         (
             "bruno-token",
             "",
-            json!({"actor":"act-bruno","graph_id":"default","graph_wide":["read"],
+            json!({"actor_id":"act-bruno","graph_id":"default","graph_wide":["read"],
                    "branch":null,"target_branch":null,"actions":[]}),
         ),
         (
             "bruno-token",
             "?branch=main",
-            json!({"actor":"act-bruno","graph_id":"default","graph_wide":["read"],
+            json!({"actor_id":"act-bruno","graph_id":"default","graph_wide":["read"],
                    "branch":"main","target_branch":null,"actions":["read"]}),
         ),
         (
             "bruno-token",
             "?branch=feature&target_branch=main",
-            json!({"actor":"act-bruno","graph_id":"default","graph_wide":["read"],
+            json!({"actor_id":"act-bruno","graph_id":"default","graph_wide":["read"],
                    "branch":"feature","target_branch":"main","actions":["read","change"]}),
         ),
         (
             "ragnor-token",
             "?branch=main",
-            json!({"actor":"act-ragnor","graph_id":"default","graph_wide":["read","export"],
+            json!({"actor_id":"act-ragnor","graph_id":"default","graph_wide":["read","export"],
                    "branch":"main","target_branch":null,
                    "actions":["read","export","branch_delete"]}),
         ),
         (
             "ragnor-token",
             "?branch=feature&target_branch=main",
-            json!({"actor":"act-ragnor","graph_id":"default","graph_wide":["read","export"],
+            json!({"actor_id":"act-ragnor","graph_id":"default","graph_wide":["read","export"],
                    "branch":"feature","target_branch":"main",
                    "actions":["read","export","change","branch_merge"]}),
         ),
@@ -4390,7 +4528,7 @@ rules:
     let app = build_app(AppState::open(graph).await.unwrap());
     let (status, body) = access(&app, "?branch=main&target_branch=feature", None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["actor"], Value::Null);
+    assert_eq!(body["actor_id"], Value::Null);
     assert_eq!(
         body["graph_wide"],
         json!([
@@ -4420,4 +4558,15 @@ rules:
             "branch_merge"
         ])
     );
+}
+
+/// The token with one character changed in the middle of its signature. The
+/// last base64url character can carry only padding bits, so changing it may
+/// leave the signature bytes unchanged.
+fn tamper_signature(token: &str) -> String {
+    let (head, signature) = token.rsplit_once('.').unwrap();
+    let mut signature: Vec<char> = signature.chars().collect();
+    let middle = signature.len() / 2;
+    signature[middle] = if signature[middle] == 'A' { 'B' } else { 'A' };
+    format!("{head}.{}", signature.into_iter().collect::<String>())
 }

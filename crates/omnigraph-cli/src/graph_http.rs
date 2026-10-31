@@ -271,6 +271,7 @@ impl std::error::Error for ApiContractError {}
 
 /// The explicit server root owns discovery, including any proxy path prefix.
 /// Never derive it from a graph URL: a proxy prefix may itself contain `graphs`.
+#[derive(Clone)]
 pub(crate) struct GraphHttpClient {
     operator_transport: Option<crate::operator_transport::CapturedTransport>,
     client: reqwest::Client,
@@ -459,6 +460,65 @@ impl GraphHttpClient {
     }
 
     pub(crate) async fn send(&self, request: RequestBuilder) -> Result<Response> {
+        let request = self.discovered(request).await?;
+        let bearer = self.validate_credential(&request)?;
+        crate::command_outcome::dispatched(request.method());
+        let mut response = self.client.execute(request).await?;
+        crate::command_outcome::response(response.status(), response.headers(), bearer.as_deref());
+        if !has_contract(&response) {
+            return Err(ApiContractError::response(response.status()).into());
+        }
+        if response.status() == StatusCode::UNAUTHORIZED
+            && bearer.is_none()
+            && let Some(missing) = &self.missing_credential
+        {
+            response
+                .extensions_mut()
+                .insert(MissingCredential::clone(missing));
+        }
+        Ok(response)
+    }
+
+    /// Discovery can outlive a credential. Check its exact bearer and
+    /// destination immediately before dispatch on both HTTP protocols.
+    fn validate_credential(&self, request: &reqwest::Request) -> Result<Option<String>> {
+        let bearer = request
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::to_owned);
+        if let Some(credential) = &self.credential {
+            let binding = credential.request();
+            let endpoint = RequestTarget::of(binding.endpoint(), binding.endpoint())?;
+            if !RequestTarget::from_sent(&self.transport, request.url()).is_under(&endpoint)
+                || Some(
+                    credential
+                        .bearer_for(binding, time::OffsetDateTime::now_utc())?
+                        .expose(),
+                ) != bearer.as_deref()
+            {
+                return Err(crate::credential_sources::CredentialError::BindingMismatch.into());
+            }
+        }
+        Ok(bearer)
+    }
+
+    /// [`Self::send`] for `/mcp`, which follows the MCP transport instead of
+    /// the graph contract: the request is scoped, asserts its actor and is
+    /// preceded by discovery as every other is, but the server stamps no
+    /// contract header on an MCP answer, so none is required. Every answer,
+    /// a 401 included, is the caller's to read.
+    pub(crate) async fn send_mcp(&self, request: RequestBuilder) -> Result<Response> {
+        let request = self.discovered(request).await?;
+        self.validate_credential(&request)?;
+        Ok(self.client.execute(request).await?)
+    }
+
+    /// The request with its contract and actor headers, once its route lies
+    /// in the captured scope and a fresh discovery probe established the
+    /// contract. Nothing of the request has been sent when this fails.
+    async fn discovered(&self, request: RequestBuilder) -> Result<reqwest::Request> {
         let mut request = request.header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT);
         if let Some(actor) = &self.expected_actor {
             request = request.header(IF_ACTOR_HEADER, actor);
@@ -480,41 +540,7 @@ impl GraphHttpClient {
         if !discovery.status().is_success() || !has_contract(&discovery) {
             return Err(ApiContractError::discovery(Some(discovery.status())).into());
         }
-        drop(discovery);
-        let bearer = request
-            .headers()
-            .get(reqwest::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .map(str::to_owned);
-        if let Some(credential) = &self.credential {
-            let binding = credential.request();
-            let endpoint = RequestTarget::of(binding.endpoint(), binding.endpoint())?;
-            if !RequestTarget::from_sent(&self.transport, request.url()).is_under(&endpoint)
-                || Some(
-                    credential
-                        .bearer_for(binding, time::OffsetDateTime::now_utc())?
-                        .expose(),
-                ) != bearer.as_deref()
-            {
-                return Err(crate::credential_sources::CredentialError::BindingMismatch.into());
-            }
-        }
-        crate::command_outcome::dispatched(request.method());
-        let mut response = self.client.execute(request).await?;
-        crate::command_outcome::response(response.status(), response.headers(), bearer.as_deref());
-        if !has_contract(&response) {
-            return Err(ApiContractError::response(response.status()).into());
-        }
-        if response.status() == StatusCode::UNAUTHORIZED
-            && bearer.is_none()
-            && let Some(missing) = &self.missing_credential
-        {
-            response
-                .extensions_mut()
-                .insert(MissingCredential::clone(missing));
-        }
-        Ok(response)
+        Ok(request)
     }
 }
 

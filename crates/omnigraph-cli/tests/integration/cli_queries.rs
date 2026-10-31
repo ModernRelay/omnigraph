@@ -13,6 +13,31 @@ use crate::support::*;
 
 const STATEMENT_GRAPH_ID: &str = "knowledge";
 
+#[test]
+fn managed_query_catalog_uses_issued_identity_without_local_source() {
+    use crate::support::managed_http::{IntentApiFixture, IntentReply};
+    let catalog = serde_json::json!({"queries":[]});
+    let data = IntentApiFixture::graph(vec![IntentReply::json(200, catalog.clone())]);
+    let (api, tokens) = IntentApiFixture::identity_issuer(&data.origin, 1);
+    let config = tempdir().unwrap();
+    write_managed_data_target(config.path(), &api.origin, &data.origin);
+    let output = output_success(
+        managed_command(config.path(), &api.origin, "managed-test")
+            .args(["queries", "list", "--json"]),
+    );
+    assert_eq!(parse_stdout_json(&output), catalog);
+    let requests = data.workflow_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/graphs/knowledge/queries");
+    assert_eq!(
+        requests[0].headers.get("authorization"),
+        Some(&format!("Bearer {}", tokens[0]))
+    );
+    assert!(!stdout_string(&output).contains(&tokens[0]));
+    api.assert_complete();
+    data.assert_complete();
+}
+
 /// A loaded graph for the embedded (`--target`) arm.
 fn loaded_graph() -> (TempDir, PathBuf) {
     let temp = tempdir().unwrap();
@@ -1666,6 +1691,21 @@ fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
     assert_eq!(line["diagnostic"]["code"], "Q002");
     assert_eq!(line["diagnostic"]["suggestion"], suggestion);
 
+    let toon_output = output_failure(
+        embedded("query", &graph)
+            .arg("-e")
+            .arg(refused)
+            .args(["--format", "toon"]),
+    );
+    let toon = stdout_string(&toon_output);
+    assert!(toon.starts_with("error:"), "{toon}");
+    assert!(toon.contains("code: Q002"), "{toon}");
+    assert!(toon.contains("fix: query name()"), "{toon}");
+    assert!(
+        !stderr_string(&toon_output).contains("error[Q002]:"),
+        "the TOON lane does not also print the human diagnostic"
+    );
+
     let human = output_failure(embedded("query", &graph).arg("-e").arg(refused));
     let stderr = stderr_string(&human);
     assert!(
@@ -1735,6 +1775,15 @@ fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
     assert_eq!(json["diagnostic"]["code"], "Q002");
     assert_eq!(json["diagnostic"]["suggestion"], suggestion);
     assert_eq!(json["diagnostic"]["fix"], "query name()");
+    let served_toon_output = output_failure(
+        served("query", &server)
+            .arg("-e")
+            .arg(refused)
+            .args(["--format", "toon"]),
+    );
+    let served_toon = stdout_string(&served_toon_output);
+    assert!(served_toon.contains("code: Q002"), "{served_toon}");
+    assert!(served_toon.contains("fix: query name()"), "{served_toon}");
     let served_human = output_failure(served("query", &server).arg("-e").arg(refused));
     let stderr = stderr_string(&served_human);
     assert!(stderr.contains("error[Q002]:"), "{stderr}");

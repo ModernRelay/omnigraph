@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-16
-updated: 2026-10-21
+updated: 2026-10-30
 discussion: https://github.com/ModernRelay/omnigraph/pull/1017
 supersedes: []
 superseded_by: []
@@ -283,7 +283,7 @@ Declared exceptions, by reason:
 |---|---|
 | Runs where the storage is | `init`, `upgrade`, `repair`, `optimize`, `cleanup`, `index rebuild`, `schema plan` and `schema apply` on a direct target, and `cluster validate`, `observe`, `force-unlock` and `upgrade-ledger` |
 | Local tooling with no graph | `lint`, `embed`, `policy test` and `explain`, `queries validate`, `skill`, `version` |
-| Byte streams, which MCP tools do not carry | Blob payloads and export streams; `blob stat` is a tool |
+| Byte streams, which MCP tools do not carry | Blob payloads, export streams and the change-feed baseline, an NDJSON snapshot whose cursor is valid only after the snapshot is installed; `blob stat` is a tool |
 | Deployment control, which is not an agent tool | `/cluster/*` over MCP |
 | Process probes, not graph operations | `/healthz` and `/readyz` in the CLI |
 
@@ -291,8 +291,8 @@ Gaps on main that this closes:
 
 | Gap | Change |
 |---|---|
-| MCP has no commit diff, commit publish or drop, change-feed baseline, branch diff or merge-base tool, and no `blob stat` | Add the tools; write tools stay behind `--mcp-allow-writes` |
-| MCP refuses stored mutations | Admit them as write tools behind `--mcp-allow-writes`, or declare the reason in the table |
+| MCP has no commit diff, commit publish or drop, branch diff or merge-base tool, and no `blob stat` or `blob clear` | Add the tools; write tools stay behind `--mcp-allow-writes` |
+| MCP refuses stored mutations | Admit them as write tools behind `--mcp-allow-writes`: `mutate` with a stored mutation's `name` and no `query`, through the stored-query routes and their preconditions |
 | The CLI cannot list a server's stored queries | `queries list --target NAME` reads `GET …/queries` for a server target |
 | `load --json` prints a CLI-only `LoadOutput`, which adds `uri`, drops `actor_id` and omits a null `base_branch` | Print the route's body |
 
@@ -497,9 +497,13 @@ owns.
 
 - On macOS it opens Studio by bundle identifier (`open -b`). On Linux and
   Windows it opens the link only when the platform names a handler for the
-  scheme (`xdg-mime query default x-scheme-handler/omnigraph-studio`, or the
-  scheme's registry association), because `xdg-open`'s generic path hands an
-  unhandled scheme to a web browser. Without Studio or a handler it prints the
+  scheme. On Linux the CLI launches that handler itself: it finds the desktop
+  entry `xdg-mime query default x-scheme-handler/omnigraph-studio` names
+  under `$XDG_DATA_HOME` and `$XDG_DATA_DIRS`, and runs the entry's `Exec`,
+  without a shell, with the link in place of `%u`. It never runs `xdg-open`,
+  whose generic path, with no display set, skips the registered handler and
+  hands the link to a web browser. On Windows it requires the scheme's
+  registry association. Without Studio or a handler it prints the
   link and how to install Studio, and refuses (`studio_unavailable`), until
   [installing Studio](#installing-studio) ships. It never opens a browser.
 - With `--json` it prints
@@ -607,10 +611,10 @@ in a terminal. It connects to an existing server target:
   resource URI naming another graph, and lists only its graph. An agent that
   needs several graphs is configured with one bridge per graph.
 
-Write tools need two consents. The existing server is the ceiling: without
-`--mcp-allow-writes` it lists no write tools, and its applied policy still
-controls every call. The agent's configuration is the other: without `--write`,
-the bridge lists and admits only tools the server annotates `readOnlyHint`.
+Write tools need two consents. The server's applied policy is the ceiling: it
+lists every tool and authorizes each call under its HTTP route's action. The
+agent's configuration is the other: without `--write`, the bridge lists and
+admits only tools the server annotates `readOnlyHint`.
 Opening a graph in Studio does not give a connected agent write access. Tool
 logic, refusals and the write contract stay at the server; the bridge adds no
 tool and no serving mode.
@@ -676,7 +680,7 @@ server as a target. Four settings decide how complete a client's experience is:
 | Edits attributed to people | Named actors through `OMNIGRAPH_SERVER_BEARER_TOKENS_JSON`, `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` or `OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET`. A single `OMNIGRAPH_SERVER_BEARER_TOKEN` is the actor `default`. |
 | Edits at all | An applied graph policy granting the actor its write actions. Without one a static token only reads, which `omnigraph access` now shows before the first refused write. |
 | Listing the deployment's graphs | `graph_list` in the cluster policy. Without it a client opens the target's `default_graph` or the graph the person names; `/graphs/discovery` serves verified identities only. |
-| Agents over MCP | `--mcp-allowed-host <public host>`, because `/mcp` admits only loopback `Host` values by default (OIDC identity trust admits its resource's host by itself), and `--mcp-allow-writes` for write tools. |
+| Agents over MCP | `--mcp-allowed-host <public host>`, because `/mcp` admits only loopback `Host` values by default (OIDC identity trust admits its resource's host by itself). Write tools are listed by default; the policy for the agent's credential decides what it may write. |
 
 ## Design
 
@@ -1300,6 +1304,30 @@ and start managed servers with OIDC identity trust, which also admits the
 resource's host for MCP. A client must not depend on `/openapi.json` being
 reachable through every deployment's proxy. Studio would implement the client.
 
+**Interim exception for Studio.** Until the managed control plane enables that
+resource profile and registers Studio, and Studio implements this client,
+Studio may reach a managed cluster with the CLI's data token for it. The
+launcher stays refused (the target table's "Deferred to A2" and Opening
+Studio): Studio uses the token only after a person selects a managed target
+inside Studio. It takes the token from `omnigraph credentials export --target
+NAME`, the one credential command that accepts a managed target, which writes
+only to a Unix FIFO and never starts an interactive login. Export returns the
+CLI's cached data token while it validates and asks the issuer for a new one
+only when the cache is missing, expired or for another principal. That request
+asks for 3600 seconds, which the issuer may shorten, and the CLI refuses an
+expiry later than that plus 30 seconds; a token stored by `cluster token --ttl`
+can last up to 86400 seconds. After a 401, a new export returns the same token
+while the cache validates, and a target whose endpoint pin no longer matches
+fails the export. Studio keeps the token in memory, and only while `target
+inspect` still names that managed target at that endpoint; that is Studio's
+obligation, since the pipe's reader could store it, and for an `omnigraph`
+profile the CLI's own copy stays in the OS keychain. The exception accepts
+what the first paragraph rules out: Studio and the CLI hold the same bearer as
+one Cedar principal, so the server cannot give Studio less authority; the
+token stays valid until it expires or its signing key retires, and removing
+the person's issuer membership does not cut that short, though a policy change
+denies both on their next request.
+
 **Recommendation:** control-plane and Studio spec changes, tracked in
 [#1025](https://github.com/ModernRelay/omnigraph/issues/1025). No OmniGraph RFC is needed unless the server contract
 changes beyond A1.
@@ -1547,3 +1575,42 @@ proposal.
   otherwise" (a refused credential carries `error="invalid_token"` with or
   without OIDC), "The challenge would move into the authentication middleware
   every route shares", and A1's recommendation, now its disposition.
+- 2026-10-22: MCP parity implemented as phase 3 of
+  [RFC 0003](0003-mcp-server-surface.md). The change-feed
+  baseline joins the byte-stream exceptions: its route answers an NDJSON entity
+  snapshot, an export stream, whose cursor is valid only once the snapshot is
+  installed, so no bounded tool result can carry it. Stored mutations are
+  admitted through `mutate`, since a caller allowed `change` can already run
+  any mutation there. Superseded sentences: the gap row "MCP has no commit
+  diff, commit publish or drop, change-feed baseline, branch diff or
+  merge-base tool, and no `blob stat`", the exception "Blob payloads and
+  export streams; `blob stat` is a tool", and the stored-mutation change "or
+  declare the reason in the table".
+- 2026-10-22: The Linux opener launches the `Exec` of the desktop entry `xdg-mime` names instead of running `xdg-open`, which without a display hands the link to a browser.
+- 2026-10-25: A2 gains one exception. Until the managed control plane enables
+  the resource profile and registers Studio, and Studio implements the client,
+  Studio may reach a managed cluster that a person selects inside Studio with
+  the CLI's data token from `credentials export`. It qualifies the sentence "A
+  client other than the CLI should reach an OIDC-enabled server, self-hosted
+  or managed, as a standard OAuth public client rather than borrow the CLI's
+  credentials" for that case only: the rule stays in force for self-hosted
+  OIDC servers and every other client, and the launcher's refusal of a managed
+  target (the target table and Opening Studio) is unchanged.
+
+- 2026-10-29: Pending amendment. [Remote optimize through the serving
+  owner](2026-10-29-remote-optimize-through-the-serving-owner.md), a draft, runs a served
+  cluster root's `optimize` in the process that holds the cluster lock,
+  through graph-scoped routes with a durable operation record. Once it is
+  accepted, `optimize` leaves the "Runs where the storage is" row of the
+  exception table for served cluster roots and stays there for direct
+  targets. The other commands in that row are unchanged. The table stands
+  unchanged until acceptance.
+- 2026-10-30: The server's `--mcp-allow-adhoc` and `--mcp-allow-writes` boot
+  settings are removed ([RFC 0003](0003-mcp-server-surface.md), decision log
+  2026-10-29): `/mcp` lists every tool and the applied policy is the write
+  ceiling. Superseded sentences: "The existing server is the ceiling: without
+  `--mcp-allow-writes` it lists no write tools, and its applied policy still
+  controls every call"; the self-hosted table's "and `--mcp-allow-writes` for
+  write tools". The gap table's "write tools stay behind `--mcp-allow-writes`"
+  and "Admit them as write tools behind `--mcp-allow-writes`" are history of
+  the change this RFC closed, not the current ceiling.

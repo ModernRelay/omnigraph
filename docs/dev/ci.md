@@ -294,13 +294,22 @@ refusals, runtime type invariants and each output/CLI mode. When editing the
 checker, also run `python3 -m mypy --strict scripts/check-pr-title.py` in a
 development environment with mypy installed. The enum dispatches are exhaustive.
 
+On a pull request `PR Title` also checks its release notes with
+`scripts/check-release-note.py`, which reads the type and `!` from the title
+`scripts/check-pr-title.py` accepted: a `feat`, `fix` or `perf` pull request
+adds a `changelog.d` note and a `!` title adds a `.breaking.md` note, unless
+the pull request carries the `skip-changelog` label
+([release notes](documentation.md#release-notes)).
+
 It is a policy check on
 `pull_request_target` like the regression gate, re-run on every title edit,
-and the pull request head is never fetched. On the merge queue's branch it
+push and label change; the pull request head is fetched only as data for the
+release-note diff range, never checked out or executed. On the merge queue's branch it
 checks the first line of the group commit's message, minus the ` (#N)`
 suffix: the subject the queue lands, fixed when the group is built, so a
 title edit after queueing cannot change what lands unchecked
-([branch-protection.md](branch-protection.md), Merge queue).
+([branch-protection.md](branch-protection.md), Merge queue). The notes were
+checked on the pull request, so the merge-group run does not check them again.
 
 The `Check AGENTS.md Links` context also runs `scripts/check-docs.py`, which
 validates local documentation links, user/developer audience boundaries, RFC
@@ -579,6 +588,10 @@ red fails the run; it is not a required context.
 
 ## Local pre-push checks
 
+Run the applicable commands before pushing. They report as checks on the pull
+request page (`actionlint` and `shellcheck` run only locally), so the pull
+request description mentions only what CI does not run.
+
 For Rust changes:
 
 ```bash
@@ -645,7 +658,10 @@ derives the GitHub body from that same snapshot with links pinned to the release
 tag. Earlier manual backfills keep their asset-only route. Edge builds need no
 snapshot: `scripts/edge_release.py body` puts the build's compatibility facts,
 read from its own `omnigraph version --json` and the latest stable release's,
-before the unreleased preview rendered at the build's commit.
+before the unreleased preview rendered at the build's commit. A stable release
+before 0.14 does not report its HTTP contract, so the composer reads it from
+`HTTP_API_CONTRACT` in the tag's `crates/omnigraph-api-types/src/lib.rs`; a
+release that reports it must agree with that source.
 
 | Workflow | Trigger and output |
 |---|---|
@@ -656,10 +672,11 @@ before the unreleased preview rendered at the build's commit.
 | `publish-image.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; builds the bookworm-compatible public server image for GHCR and, when configured, Docker Hub. Its binaries carry the commit and `stable` channel stamp, checked in the image before it is pushed, and the pushed GHCR digest is attested. As in `release.yml`, a backfill from v0.14.0 is dispatched at the tag itself, and an older tag backfilled from elsewhere publishes without provenance. Manual backfills do not move `latest`. |
 | `package.yml` / `omnigraph-package.yml` | Manual AWS CodeBuild packaging for default and AWS-feature artifacts, with checksums, digests, and attestations. |
 | `refresh-docs-site.yml` | Documentation changes on `main` or manual dispatch; requests a docs-site redeploy. |
+| `nix.yml` | A change to `flake.nix`, `flake.lock`, `rust-toolchain.toml` or the workflow, weekly, and by manual dispatch; builds the flake on each of its three systems and checks the binaries run and report their commit. Nothing waits on it. The flake sets `RUSTFLAGS` and the release packages and features as `build-release-archives.yml` does, and reads the toolchain from `rust-toolchain.toml` with that channel manifest's hash, which a toolchain bump updates in `flake.nix`. |
 
 Release archives and containers include the CLI, server, and Azure admission wrapper where their packaging contract requires all three. Keep the reusable package workflow, Dockerfile, and binary-contract check aligned.
 
-Every release build sets `RUSTFLAGS` itself (`build-release-archives.yml`, `publish-image.yml`, `omnigraph-package.yml`, `scripts/install-source.sh`, the documented source build): empty everywhere except the macOS archive row's `-C code-model=large`. A set `RUSTFLAGS`, empty included, replaces the workspace `.cargo/config.toml` `[build] rustflags`, so shipped binaries never carry `--cfg tokio_unstable`. A plain `cargo build --release` outside these paths still inherits the cfg. The cfg serves the DST suite and the GQT DST runner only.
+Every release build sets `RUSTFLAGS` itself (`build-release-archives.yml`, `publish-image.yml`, `omnigraph-package.yml`, `scripts/install-source.sh`, `flake.nix`, the documented source build): empty everywhere except the macOS archive row's `-C code-model=large`. A set `RUSTFLAGS`, empty included, replaces the workspace `.cargo/config.toml` `[build] rustflags`, so shipped binaries never carry `--cfg tokio_unstable`. A plain `cargo build --release` outside these paths still inherits the cfg. The cfg serves the DST suite and the GQT DST runner only.
 
 ## Changing CI
 

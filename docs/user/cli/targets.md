@@ -1,6 +1,6 @@
 # Operator configuration
 
-Use profiles for service/organization access and targets for resource access.
+Use profiles for service/organization access and targets for resource access. This is [target and credential protocol 2](../install.md#verify), with YAML `version: 1`.
 The operator file is `~/.omnigraph/config.yaml`, or `config.yaml` under
 `OMNIGRAPH_HOME`. `--operator-config FILE` replaces it for one invocation;
 files are never merged or discovered by searching parent directories.
@@ -73,7 +73,7 @@ Credential, helper and CA availability are checked only for selected operations.
 | Managed authentication | The selected profile's single `auth` provider |
 | Standalone authentication | The selected server target's single `auth` provider |
 | Graph | `--graph ID`, then target `default_graph`; otherwise graph-scoped operations refuse |
-| Read output | Explicit `--format`, then `defaults.output`, then `table`; `--json` selects JSON where offered |
+| Read output | Explicit `--format`, then `defaults.output`, then `table`; `--json` selects JSON where offered. `toon` encodes the same read document as `json` |
 
 Profile and target selectors are mutually exclusive; their defaults never infer each other. Managed targets
 always use their pinned `profile`; neither `defaults.profile` nor a global `--profile` can override that
@@ -82,13 +82,13 @@ implicit single-profile selection. A direct graph rejects a separate graph selec
 the first graph. Graph IDs are exact API identifiers, not display-name lookups; cluster incarnation pinning
 does not protect against recreation of a graph with the same ID.
 
-Inline targets are local paths or `file://` URIs only, such as
-`--target ./graph.omni`. Bare names select registered targets. Remote endpoints
-must be registered. `init ./graph.omni --schema schema.pg` retains its positional
-local creation shorthand. Defaults and aliases require registered names.
-There are no environment overrides for destination fields.
+Inline targets are local paths or `file://` URIs, such as `--target ./graph.omni`,
+and an [S3 cluster root](../operations/s3-cluster-roots.md) for deployment,
+recovery and maintenance commands. Bare names select registered targets. Remote endpoints
+must be registered. `init ./graph.omni --schema schema.pg` keeps its local shorthand.
+Defaults and aliases require registered names. Registered destinations have no environment overrides.
 
-`defaults.output` accepts only `table`, `json`, `jsonl`, `csv` or `kv` and
+`defaults.output` accepts only `table`, `json`, `jsonl`, `csv`, `kv`, or `toon` and
 applies to supported read-result formatting. Action receipts retain their own
 contracts. Unsupported formats refuse. Diagnostics go to stderr, results to stdout.
 
@@ -103,10 +103,12 @@ Each profile or server target chooses one provider:
 | Environment token | `{provider: token, source: {env: OG_SERVICE_TOKEN}}` |
 | Mounted token | `{provider: token, source: {file: /var/run/omnigraph/token}}` |
 | Credential helper | `{provider: exec, command: [/usr/local/bin/credential-helper, get], timeout: 30s}` |
+| Managed OAuth client credentials | `{provider: oauth_client_credentials, token_endpoint: https://auth.example.com/oauth2/token, client_id: client_example, client_secret: {env: OG_CLIENT_SECRET}}` |
 | Explicit anonymous server | `{provider: anonymous}` |
 
-`omnigraph` is managed-only; `anonymous` is standalone-only. Names grant no privileges,
-and token/exec sources do not qualify arbitrary workload federation.
+`omnigraph` and `oauth_client_credentials` are managed-only; `anonymous` is
+standalone-only. Names grant no privileges, and token/exec sources do not qualify
+arbitrary workload federation.
 
 Token profiles declare exactly one source. `store` uses secure local custody;
 `env` reads only the named variable; `file` reads one bounded regular-file
@@ -124,10 +126,9 @@ The helper receives one version-1 JSON request on stdin with purpose, endpoint,
 `interactive: false` and applicable identity constraints. It returns one object
 with `version: 1`, `credential: {type: bearer, token: ...}` and optional RFC 3339
 `expires_at`. Unknown fields, expired results and unsupported types refuse.
-Expiry is checked again immediately before an authenticated request is sent,
-including after discovery. An expired credential refuses before submission;
-the CLI does not replay a mutation to refresh credentials. Managed control and
-data credentials retain their independent expiry times.
+Expiry is rechecked before authenticated dispatch, including after discovery.
+Renewal can precede submission but never replay a mutation. Managed control and
+data credentials have independent expiry times.
 Without expiry the result is not cached across invocations. Timeout terminates
 the helper process group; stderr is not echoed in routine errors.
 Output cannot change routing or prove identity. Helpers inherit the process
@@ -144,11 +145,10 @@ profile credential for a cluster-bound data credential; control and refresh
 tokens never go to the graph endpoint. Service and graph policy still authorize
 operations independently of credential acquisition.
 
-For managed resource commands and managed-target credential export, env/file/exec
-profiles keep exchanged credentials only in invocation memory, without requiring
-an OS store. This is explicit source-based custody, not a store-failure fallback.
-Human profiles, stored tokens and explicit `cluster token` administration retain
-secure-store requirements.
+For managed resource commands and managed-target credential export, env/file/exec/OAuth
+profiles keep exchanged credentials in invocation memory. Human profiles, stored
+tokens and existing providers' explicit `cluster token` require secure storage.
+OAuth always uses invocation memory ([workload setup](managed-team.md#configure-an-unattended-workload-profile)); store failure never changes custody.
 
 ## Login and registration
 
@@ -179,12 +179,12 @@ endpoint preserves the old pin and reports `endpoint_available: false`.
 Normal requests never adopt changed endpoints or follow redirects.
 
 `target list` shows each destination, its managed profile, and the default marker.
-`target list`, `target inspect NAME [--resolved]` and `config validate` are
-offline, with optional `--json`. `target add NAME` without `--cluster` reads a
-complete target JSON object from piped stdin (64 KiB limit); terminal or empty
-input produces setup guidance. Managed add uses `--profile` or `defaults.profile`.
-`target remove NAME` preserves credentials and journals; references must remain
-valid. Add/remove never switch defaults.
+`target list`, `target inspect NAME [--resolved]` and `config validate` are offline, with optional
+`--json`. `target inspect --json` also reports `home` and, for a server target, `binding`: the digests
+a [Studio link](studio.md#the-link) carries. `target add NAME` without `--cluster` reads a complete
+target JSON object from piped stdin (64 KiB limit); terminal or empty input produces setup guidance.
+Managed add uses `--profile` or `defaults.profile`. `target remove NAME` preserves credentials and
+journals; references must remain valid. Add/remove never switch defaults.
 Discovery-backed add and refresh contact the service. Resolved inspection expands
 the profile and provider; identity is unknown and transport availability is not checked.
 
@@ -209,10 +209,10 @@ credentials without rerouting existing operations.
 omnigraph access --target standalone --graph knowledge --branch main --json
 ```
 
-`access` reports your actor and permissions for direct and standalone graphs.
+`access` reports your actor and permissions for direct, server and managed graphs.
 Use `--branch` for branch permissions and `--target-branch` for create/merge
-permissions. See [access semantics](../operations/policy.md#learn-your-access)
-for actor selection, JSON fields and supported destinations.
+permissions. JSON uses `protocol: 2` and `actor_id`; see
+[access semantics](../operations/policy.md#learn-your-access) and [JSON protocols](../install.md#verify).
 
 ## Rename registrations and profiles
 
@@ -295,7 +295,7 @@ borrow credentials from, or carry the parent's token into, a more-specific
 registered endpoint. Targets at the same root do not override the selected
 owner. These boundaries are captured for the invocation.
 
-Version 1 does not support cloud-direct targets, catalogue targets, Unix sockets,
+Version 1 does not support other cloud-direct targets, catalogue targets, Unix sockets,
 mTLS, tunnels or arbitrary private identity-provider transport. Server storage
 and deployment retain separate contracts. This rewrite does not qualify BYOC
 private routes or workload federation. Managed and standalone targets share
@@ -319,32 +319,32 @@ are refused. Alias `args` and `format` fields and positional arguments are unsup
 
 ## Upgrade from the old format
 
-There is no backward compatibility or config importer. Replace `connections` with `profiles`, flatten every `auth`
-to one provider object and remove `default_auth`. Change target `connection` to `profile` and
-`defaults.connection` to `defaults.profile`. Split identities into separate profiles and pin each target to
-its intended profile. For standalone identities, create separate targets, then
-install stored tokens again with `credentials set --target NAME --stdin`; the
-CLI never guesses which old named auth entry to reuse. Existing managed credential
-ownership and unfinished-operation evidence are preserved. Old fields, `--connection`,
-`--auth`, `config rename-auth`, `target register` and `login --register` are rejected.
-Use `login --create-profile NAME` for new profile setup. For the
-older target-only format, replace account targets with profiles and static login with `credentials set
---stdin`. Remove alias `args`/`format`, use `--as` for direct actors, and register remote endpoints. Never put
-plaintext credentials in YAML. Preserve old operator homes and unresolved journals; config replacement changes
-no graph data.
+For released **0.13 → 0.14**, follow the [upgrade checklist](../operations/upgrade-0.14.md)
+with paired YAML and commands. Old resource-binding `profiles` become `targets`;
+new profiles hold managed sign-in settings. There is no config importer.
 
-Before converting a file with an interrupted old-format server rename, finish
-`config recover-rename` with the previous CLI. The new CLI preserves incompatible
-journals and refuses; compatible managed-profile rename journals can still recover.
+For intermediate 0.14 formats, replace `connections`/account targets with profiles,
+target `connection` with `profile`, and `defaults.connection` with `defaults.profile`.
+Flatten each `auth` to one provider and remove `default_auth`. Split identities into
+separate profiles or server targets; reinstall stored server tokens with
+`credentials set --target NAME --stdin`. Use `login --create-profile NAME` for setup.
+Old `--connection`, `--auth`, `config rename-auth`, `target register` and
+`login --register` refuse. Remove alias `args`/`format`; use explicit `--as` for direct actors.
 
-Recover legacy folder lifecycle evidence explicitly:
+Preserve old homes and journals; config replacement changes no graph data. Finish
+interrupted old server renames with the previous CLI's `config recover-rename`.
+The new CLI refuses incompatible journals; compatible profile renames can recover.
+
+For version-2 folder contexts carrying an organization ID, recover lifecycle evidence:
 ```bash
 omnigraph config recover-operations --source /path/to/old-workspace --profile work --json
 ```
 
-It checks the profile's API and organization against the source's `.omnigraph`
-evidence, durably copies matching pending/accepted records to the operator home,
-then retires the originals. Conflicts refuse; preserve both copies. This neither
-converts config nor submits operations or imports arbitrary operator histories.
-Resume with the original verified principal and explicit original idempotency
-key; observe accepted operations by their IDs. Exclude older CLIs after migration.
+It verifies API/organization against `.omnigraph` evidence, durably copies matching
+pending/accepted records, then retires originals. Conflicts refuse; preserve both
+copies. It neither converts config nor submits operations. Resume with the original
+verified principal/key; observe accepted IDs. Exclude older CLIs after migration.
+
+The version-1 context shipped in 0.13 lacks an organization ID and is unsupported.
+Settle its pending/accepted work with the originating build before cutover; preserve
+identity, keys and journals. Never edit versions or invent identity fields to import.

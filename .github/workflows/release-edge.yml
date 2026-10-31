@@ -215,7 +215,7 @@ jobs:
 
       - name: Attest build provenance
         if: steps.taggable.outputs.go == 'true' && steps.existing.outputs.published != 'true'
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/*.tar.gz
@@ -236,6 +236,13 @@ jobs:
             # Releases before 0.14 print text only.
             "$RUNNER_TEMP/stable-bin/omnigraph" version --json > "$RUNNER_TEMP/stable-version.out" 2>/dev/null \
               || "$RUNNER_TEMP/stable-bin/omnigraph" version > "$RUNNER_TEMP/stable-version.out"
+            # Releases before 0.14 do not report their HTTP contract; the
+            # composer reads it from the source the tag built.
+            git rev-parse --verify --quiet "refs/tags/${stable_tag}^{commit}" > /dev/null
+            contract_source="${stable_tag}:crates/omnigraph-api-types/src/lib.rs"
+            if git cat-file -e "$contract_source" 2>/dev/null; then
+              git show "$contract_source" > "$RUNNER_TEMP/stable-api-types.rs"
+            fi
           fi
           echo "stable_tag=${stable_tag}" >> "$GITHUB_OUTPUT"
 
@@ -252,6 +259,9 @@ jobs:
           stable=()
           if [[ -n "$STABLE_TAG" ]]; then
             stable=(--stable-tag "$STABLE_TAG" --stable-version "$RUNNER_TEMP/stable-version.out")
+            if [[ -f "$RUNNER_TEMP/stable-api-types.rs" ]]; then
+              stable+=(--stable-source "$RUNNER_TEMP/stable-api-types.rs")
+            fi
           fi
           for kind in build rolling; do
             rolling=()
@@ -473,11 +483,14 @@ jobs:
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
       - name: Attest image provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ steps.ghcr.outputs.image }}
           subject-digest: ${{ steps.ghcr.outputs.digest }}
           push-to-registry: true
+          # Storage records need `artifact-metadata: write`, which this job does
+          # not grant; left on, every run would fail to create one and warn.
+          create-storage-record: false
 
       # The `edge` image tag follows the rolling release as it is now, not as
       # this run left it: a rerun of an older run's failed job must not move it
@@ -549,7 +562,7 @@ jobs:
       # oci://docker.io/...` reads by digest.
       - name: Attest Docker Hub image provenance
         if: steps.dockerhub.outputs.digest != ''
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ steps.dockerhub.outputs.image }}
           subject-digest: ${{ steps.dockerhub.outputs.digest }}

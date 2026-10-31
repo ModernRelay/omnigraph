@@ -62,7 +62,10 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_namespace::LanceNamespace;
+use lance_table::format::RowIdMeta;
 use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
+use lance_table::rowids::read_row_ids;
+use lance_table::rowids::version::{RowDatasetVersionMeta, read_dataset_versions};
 use omnigraph_compiler::schema::parser::parse_schema;
 
 use helpers::{init_and_load, open_pinned_dataset_for_test, snapshot_main};
@@ -7373,6 +7376,93 @@ async fn rfc_0067_detached_commit_from_a_pin_is_private_chains_and_needs_a_retry
     );
 }
 
+/// The pure-insert merge proof crosses a `CreateIndex` link as a commit that
+/// moves no row (`is_index_only_commit` in `table_store.rs`). Lance 13
+/// applies `CreateIndex` with every fragment of the version it read and
+/// changes only the index list, for a first build and for a whole rebuild
+/// that removes the older segment, both committed detached as the engine
+/// commits them. Red when an apply rewrites fragments inside `CreateIndex`,
+/// even with the same ids and row counts: a fast-forward would then adopt
+/// bytes the proof never certified.
+#[tokio::test]
+async fn rfc_0067_create_index_keeps_every_fragment_of_its_read_version() {
+    use lance_table::format::{Fragment, IndexMetadata};
+
+    fn fragments(ds: &Dataset) -> Vec<Fragment> {
+        ds.get_fragments()
+            .iter()
+            .map(|fragment| fragment.metadata().clone())
+            .collect()
+    }
+
+    async fn segments(ds: &Dataset) -> Vec<IndexMetadata> {
+        ds.load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|index| index.name == "value_idx")
+            .cloned()
+            .collect()
+    }
+
+    async fn build_detached(base: &Dataset, removed_indices: Vec<IndexMetadata>) -> Dataset {
+        let mut staging = base.clone();
+        let params = ScalarIndexParams::default();
+        let segment = staging
+            .create_index_builder(&["value"], IndexType::BTree, &params)
+            .name("value_idx".to_string())
+            .replace(true)
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let transaction = Transaction::new(
+            base.version().version,
+            Operation::CreateIndex {
+                new_indices: vec![segment],
+                removed_indices,
+            },
+            None,
+        );
+        CommitBuilder::new(Arc::new(base.clone()))
+            .with_detached(true)
+            .with_skip_auto_cleanup(true)
+            .execute(transaction)
+            .await
+            .unwrap()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("t.lance");
+    let uri = uri.to_str().unwrap();
+    let v1 = rfc0067_create(uri).await;
+    let parent = rfc0067_append(v1, &["b1", "b2"]).await;
+    assert_eq!(parent.get_fragments().len(), 2, "two fragments to keep");
+    let parent_fragments = fragments(&parent);
+    let parent_ids = rfc0067_ids(&parent).await;
+
+    let built = build_detached(&parent, Vec::new()).await;
+    let built = rfc0067_pinned(uri, built.version().version).await;
+    assert_eq!(
+        fragments(&built),
+        parent_fragments,
+        "a first build keeps every fragment: ids, physical rows, data files, deletions"
+    );
+    let first = segments(&built).await;
+    assert_eq!(first.len(), 1, "the build added one segment");
+
+    let rebuilt = build_detached(&built, first.clone()).await;
+    let rebuilt = rfc0067_pinned(uri, rebuilt.version().version).await;
+    assert_eq!(
+        fragments(&rebuilt),
+        parent_fragments,
+        "a rebuild that removes the older segment keeps every fragment too"
+    );
+    let second = segments(&rebuilt).await;
+    assert_eq!(second.len(), 1, "the rebuild replaced the segment");
+    assert_ne!(second[0].uuid, first[0].uuid, "the older segment is gone");
+    assert_eq!(rfc0067_ids(&rebuilt).await, parent_ids, "rows unchanged");
+}
+
 /// RFC 0067 §Promotion: replaying the transaction recorded in a detached
 /// manifest linearly at its base lands an identical twin: same uuid, same
 /// fragment ids, same rows, and the linear row stamps the change feed and
@@ -8707,5 +8797,209 @@ async fn packed_struct_refuses_null_values_and_lone_child_projection_lance_11() 
             .as_primitive::<arrow_array::types::UInt64Type>()
             .value(0),
         0
+    );
+}
+
+const ROW_IDENTITY_SCHEMA: &str = "node Person {\n    name: String @key\n    age: I32?\n}\n";
+
+fn row_identity_rows(range: std::ops::Range<u64>, age: i32) -> String {
+    range
+        .map(|index| format!(r#"{{"type":"Person","data":{{"name":"p{index:03}","age":{age}}}}}"#))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Every live row's `(_rowid, _row_last_updated_at_version)` by key.
+async fn row_identity_stamps(ds: &Dataset) -> HashMap<String, (u64, u64)> {
+    let mut scanner = ds.scan();
+    scanner
+        .project(&["__id", ROW_ID, ROW_LAST_UPDATED_AT_VERSION])
+        .unwrap();
+    let batches: Vec<RecordBatch> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut out = HashMap::new();
+    for batch in batches {
+        let ids = batch.column_by_name("__id").unwrap().as_string::<i32>();
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<arrow_array::types::UInt64Type>();
+        let stamps = batch
+            .column_by_name(ROW_LAST_UPDATED_AT_VERSION)
+            .unwrap()
+            .as_primitive::<arrow_array::types::UInt64Type>();
+        for row in 0..batch.num_rows() {
+            out.insert(
+                ids.value(row).to_string(),
+                (row_ids.value(row), stamps.value(row)),
+            );
+        }
+    }
+    out
+}
+
+/// Every fragment carries both sequences inline and decodable, one entry per
+/// physical row (a deleted row keeps its entry; the deletion vector masks it).
+/// Returns the fragment count.
+fn row_identity_inline_sequences(ds: &Dataset) -> usize {
+    let fragments = ds.get_fragments();
+    for fragment in &fragments {
+        let meta = fragment.metadata();
+        let Some(RowIdMeta::Inline(row_id_bytes)) = &meta.row_id_meta else {
+            panic!("fragment {} has no inline row id sequence", meta.id);
+        };
+        let Some(RowDatasetVersionMeta::Inline(stamp_bytes)) = &meta.last_updated_at_version_meta
+        else {
+            panic!("fragment {} has no inline last-updated sequence", meta.id);
+        };
+        let row_ids = read_row_ids(&row_id_bytes[..]).unwrap();
+        let stamps = read_dataset_versions(&stamp_bytes[..]).unwrap();
+        let physical_rows = meta.physical_rows.unwrap() as u64;
+        assert_eq!(
+            row_ids.len(),
+            physical_rows,
+            "fragment {}: one row id per physical row",
+            meta.id
+        );
+        assert_eq!(
+            stamps.len(),
+            physical_rows,
+            "fragment {}: one stamp per physical row",
+            meta.id
+        );
+    }
+    fragments.len()
+}
+
+/// The Lance 13 facts `changes::candidate_scan::row_identity_plan` rests on,
+/// through the engine's writers; each assertion names its fact, and a bump
+/// that moves one is a design review of the rule, not a test to weaken.
+#[tokio::test]
+async fn row_identity_discovery_stamps_row_ids_and_rewrites_lance_13() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = helpers::session(
+        omnigraph::db::Omnigraph::init(uri, ROW_IDENTITY_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let merge = omnigraph::loader::LoadMode::Merge;
+    db.load_with_receipt("main", &row_identity_rows(0..32, 0), merge)
+        .await
+        .unwrap();
+    db.load_with_receipt("main", &row_identity_rows(32..64, 0), merge)
+        .await
+        .unwrap();
+    let loaded = open_pinned_dataset_for_test(&db, "main", "node:Person").await;
+    assert!(
+        row_identity_inline_sequences(&loaded) >= 2,
+        "two loads write at least two fragments"
+    );
+    let before = row_identity_stamps(&loaded).await;
+    assert_eq!(before.len(), 64);
+
+    db.load_with_receipt("main", &row_identity_rows(1..2, 1), merge)
+        .await
+        .unwrap();
+    let updated = open_pinned_dataset_for_test(&db, "main", "node:Person").await;
+    row_identity_inline_sequences(&updated);
+    let after = row_identity_stamps(&updated).await;
+    assert_eq!(
+        after["p001"].0, before["p001"].0,
+        "an updated row keeps its stable row id"
+    );
+    assert!(lance_table::format::is_detached_version(
+        updated.version().version
+    ));
+    assert_eq!(
+        after["p001"].1,
+        loaded.version().version + 1,
+        "the stamp is the read manifest's version plus one"
+    );
+    assert_ne!(
+        after["p001"].1,
+        updated.version().version,
+        "the stamp is not the detached version the commit received"
+    );
+    for (name, pair) in &before {
+        if name != "p001" {
+            assert_eq!(
+                after[name], *pair,
+                "{name}: an untouched row keeps id and stamp"
+            );
+        }
+    }
+
+    db.branch_create("sibling-a").await.unwrap();
+    db.branch_create("sibling-b").await.unwrap();
+    db.load_with_receipt("sibling-a", &row_identity_rows(2..3, 2), merge)
+        .await
+        .unwrap();
+    db.load_with_receipt("sibling-b", &row_identity_rows(2..3, 3), merge)
+        .await
+        .unwrap();
+    let on_a =
+        row_identity_stamps(&open_pinned_dataset_for_test(&db, "sibling-a", "node:Person").await)
+            .await;
+    let on_b =
+        row_identity_stamps(&open_pinned_dataset_for_test(&db, "sibling-b", "node:Person").await)
+            .await;
+    assert_eq!(
+        on_a["p002"].0, on_b["p002"].0,
+        "the row id survives both updates"
+    );
+    assert_eq!(
+        on_a["p002"].1, on_b["p002"].1,
+        "sibling first commits after one fork stamp the row alike: equality proves a shared \
+         row only along one lineage"
+    );
+    assert_eq!(on_a["p002"].1, updated.version().version + 1);
+    assert_ne!(on_a["p002"].1, after["p002"].1);
+
+    db.mutate(
+        "main",
+        "query d() { delete Person where name = \"p003\" }",
+        "d",
+        &omnigraph_compiler::ir::ParamMap::new(),
+    )
+    .await
+    .unwrap();
+    let deleted = open_pinned_dataset_for_test(&db, "main", "node:Person").await;
+    let fragments_before_compaction = row_identity_inline_sequences(&deleted);
+    let surviving = row_identity_stamps(&deleted).await;
+    assert!(!surviving.contains_key("p003"));
+    assert_eq!(surviving.len(), 63);
+    for (name, pair) in &surviving {
+        assert_eq!(
+            after[name], *pair,
+            "{name}: a deletion-only commit restamps no surviving row"
+        );
+    }
+
+    let stats = db.optimize().await.unwrap();
+    let person = stats
+        .iter()
+        .find(|stat| stat.type_key == "node:Person")
+        .expect("optimize reports the Person table");
+    assert!(
+        person.fragments_removed >= 2 && person.fragments_added >= 1,
+        "the small fragments must be rewritten: removed {} added {}",
+        person.fragments_removed,
+        person.fragments_added
+    );
+    let compacted = open_pinned_dataset_for_test(&db, "main", "node:Person").await;
+    assert!(
+        row_identity_inline_sequences(&compacted) < fragments_before_compaction,
+        "the rewritten fragments keep their sequences inline"
+    );
+    assert_eq!(
+        row_identity_stamps(&compacted).await,
+        surviving,
+        "compaction carries every live row's id and stamp into the rewritten fragments"
     );
 }

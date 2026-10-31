@@ -1,6 +1,5 @@
 //! Existing organization CLI grammar.
 use clap::{Args, Subcommand};
-use std::path::PathBuf;
 
 #[derive(Debug, Args)]
 pub(crate) struct OrganizationArgs {
@@ -11,12 +10,12 @@ pub(crate) struct OrganizationArgs {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum OrganizationCommand {
-    /// Inspect or change local enrollment, admission and control permissions.
+    /// List members, set service roles or offboard a member.
     Members {
         #[command(subcommand)]
         command: OrganizationMembersCommand,
     },
-    /// Manage provider invitations; acceptance does not grant cluster access.
+    /// Manage organization invitations; native permissions remain in cluster policy.
     Invitations {
         #[command(subcommand)]
         command: OrganizationInvitationsCommand,
@@ -25,22 +24,27 @@ pub(crate) enum OrganizationCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum OrganizationMembersCommand {
-    /// List provider members and retained local enrollment, including current versions.
+    /// List members, stable identities, service roles and permissions.
     List,
-    /// Apply a versioned YAML add/update/remove patch; graph policy is unchanged.
-    Apply {
-        file: PathBuf,
+    /// Replace an existing active member's service roles; graph policy is unchanged.
+    Set {
+        /// Organization member email or exact user ID.
+        selector: String,
+        /// Existing service-role slug; repeat for every role the member should retain.
+        #[arg(long = "role", value_name = "ROLE", required = true)]
+        roles: Vec<String>,
         /// Stable request key; retain it if the result is uncertain.
         #[arg(long)]
         idempotency_key: String,
     },
-    /// Remove local access, organization membership and its sessions.
+    /// Remove organization membership and its organization-bound sessions.
     /// Deploy Cedar revocation and verify old graph credentials first.
     Offboard {
-        user_id: String,
-        /// Current local grant version; zero for an unenrolled person.
-        #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
-        expected_version: i64,
+        /// Organization member email or exact user ID.
+        selector: String,
+        /// Assert an exact membership ID, or `absent` with an exact user ID.
+        #[arg(long)]
+        expected_membership: Option<String>,
         /// Stable request key; retain it if the result is uncertain.
         #[arg(long)]
         idempotency_key: String,
@@ -58,19 +62,22 @@ pub(crate) enum OrganizationInvitationsCommand {
     /// Email an invitation to join this organization.
     Send {
         email: String,
+        /// Existing service-role slug; required for new invitations.
+        #[arg(long)]
+        role: Option<String>,
         /// Stable request key; retain it if the result is uncertain.
         #[arg(long)]
         idempotency_key: String,
     },
-    /// Resend one exact pending invitation.
+    /// Resend a pending invitation by email or exact invitation ID.
     Resend {
-        invitation_id: String,
+        selector: String,
         #[arg(long)]
         idempotency_key: String,
     },
-    /// Revoke one exact pending invitation.
+    /// Revoke a pending invitation by email or exact invitation ID.
     Revoke {
-        invitation_id: String,
+        selector: String,
         #[arg(long)]
         idempotency_key: String,
     },

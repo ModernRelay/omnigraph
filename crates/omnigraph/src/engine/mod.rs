@@ -99,12 +99,29 @@ pub(crate) struct EngineContext<'a> {
 }
 
 /// What a load plan's operators need beside the snapshot: the statement as
-/// the loader resolved it, the one captured response its source parses, and
-/// the write verb's facts, `None` where no write runs (an explain).
+/// the loader resolved it, the probed source its partitions read by range,
+/// and the write verb's facts, `None` where no write runs (an explain).
 pub(crate) struct LoadFacts {
     pub(crate) request: crate::loader::csv::CsvLoadRequest,
-    pub(crate) capture: Arc<crate::table_store::CapturedSource>,
+    pub(crate) bytes: Arc<crate::loader::csv::CsvBytes>,
     pub(crate) write: Option<LoadWrite>,
+    /// The bytes one slice of the source is cut at and one piece of it is
+    /// read at: the planner's partition size, or what a test installed with
+    /// `with_csv_slice_bytes`.
+    pub(crate) slice_bytes: usize,
+    /// Run the source as one partition whatever the plan's `max_partitions`:
+    /// the loader's rerun after a partitioned run refused, so the refusal
+    /// numbers its record from the source.
+    pub(crate) single_partition: bool,
+    /// Set by the source when a run of more than one partition refused.
+    pub(crate) source_refused: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The slice size this task's loads cut their sources at.
+pub(crate) fn csv_slice_bytes() -> usize {
+    crate::instrumentation::csv_slice_bytes().unwrap_or_else(|| {
+        usize::try_from(omnigraph_planner::SOURCE_PARTITION_BYTES).unwrap_or(usize::MAX)
+    })
 }
 
 /// The write verb's facts: the graph handle and the open transaction the
@@ -473,10 +490,19 @@ pub(crate) async fn execute(
     // fusion row keys; only what depends on this run's admission is left.
     let (bound, evidence) = accepted.into_parts();
     let traversal_limit = validate_traversal_admission(&bound.plan)?;
+    let ranking = omnigraph_planner::planned_ranking(&bound.plan)
+        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
     let ctx =
         QueryContext::with_traversal_limit(bound.plan.assumptions().memory_limit, traversal_limit)?;
-    ctx.run_owned(execute_with_context(bound, evidence, context, &ctx))
-        .await
+    let (mut run, scans) = ctx
+        .run_owned(execute_with_context(bound, evidence, context, &ctx))
+        .await?;
+    // A nearest scan the run never reached reported nothing and is not
+    // exact; the ranking is exhaustive only on evidence.
+    run.result = run.result.with_ranking(ranking.map(|ranking| {
+        ranking.ranking(|scan| scans.get(&scan).is_some_and(|report| report.exact))
+    }));
+    Ok(run)
 }
 
 /// What a load plan run produced: the sink's count and what each node's
@@ -513,12 +539,14 @@ pub(crate) async fn execute_load(
     .await
 }
 
+/// The run, with what each nearest scan reported in the pass whose rows it
+/// returns.
 async fn execute_with_context(
     bound: BoundPlan,
     evidence: Evidence,
     context: &EngineContext<'_>,
     ctx: &QueryContext,
-) -> Result<PlanRun> {
+) -> Result<(PlanRun, ScanReports)> {
     let mut executed = ExecutionReport::default();
     let policy = bound.plan.assumptions().gate_policy;
     let lowering = Lowering::new(&bound, context);
@@ -547,15 +575,16 @@ async fn execute_with_context(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        for (scan, report) in reports {
-            executed.record_probes(scan, 0, &report);
+        for (scan, report) in &reports {
+            executed.record_probes(*scan, 0, report);
         }
-        return Ok(PlanRun {
+        let run = PlanRun {
             result: QueryResult::new(fused.schema(), vec![fused]),
             plan: bound,
             evidence,
             report: executed,
-        });
+        };
+        return Ok((run, reports));
     }
 
     let mut pass = Pass::default();
@@ -577,18 +606,20 @@ async fn execute_with_context(
 
     let (result_batch, reports, rows) = Box::pin(run_once(&lowering, ctx, &pass, 0)).await?;
     executed.record(rows);
-    let nearest_report = |mut reports: ScanReports| {
+    let nearest_report = |reports: &ScanReports| {
         nearest
             .as_ref()
-            .and_then(|scan| reports.remove(&scan.id))
+            .and_then(|scan| reports.get(&scan.id))
+            .cloned()
             .unwrap_or_default()
     };
-    let report = nearest_report(reports);
+    let report = nearest_report(&reports);
     if let Some(NearestScan { id, .. }) = &nearest {
         executed.record_probes(*id, 0, &report);
     }
     let mut result_batch = result_batch;
     let mut report = report;
+    let mut reports = reports;
     let aggregate = bound
         .plan
         .live()
@@ -652,10 +683,11 @@ async fn execute_with_context(
                 let (retried, retried_reports, rows) =
                     Box::pin(run_once(&lowering, ctx, &wider, rung)).await?;
                 executed.record(rows);
-                let retried_report = nearest_report(retried_reports);
+                let retried_report = nearest_report(&retried_reports);
                 executed.record_probes(id, rung, &retried_report);
                 result_batch = retried;
                 report = retried_report;
+                reports = retried_reports;
                 if let PassStep::Exact { k } = step {
                     if result_batch.num_rows() > rows_before {
                         tracing::warn!(
@@ -678,12 +710,13 @@ async fn execute_with_context(
         }
     }
 
-    Ok(PlanRun {
+    let run = PlanRun {
         result: QueryResult::new(result_batch.schema(), vec![result_batch]),
         plan: bound,
         evidence,
         report: executed,
-    })
+    };
+    Ok((run, reports))
 }
 
 #[cfg(test)]

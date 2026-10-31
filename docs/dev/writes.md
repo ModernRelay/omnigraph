@@ -266,10 +266,15 @@ unpublished staging the collector reclaims once it is dead. A strict mutation
 prepared before Optimize's publication reports the same read-set conflict as
 it would after any other writer.
 
-The index writer (`ensure_indices` and the explicit full-text rebuild)
-follows the same protocol: it opens each productive table at its pin, stages
-the complete BTREE/FTS/vector batch before the gates, commits every batch as
-a detached version of the pin and publishes the pins once. A failure before
+The index writer (`ensure_indices`, which `omnigraph index build` runs on any
+branch, and the explicit full-text rebuild) follows the same protocol: it
+opens each productive table at its pin, stages the complete BTREE/FTS/vector
+batch before the gates, commits every batch as a detached version of the pin
+and publishes the pins once. For `ensure_indices` one table's batch holds the
+declared indexes the table lacks and a whole rebuild of each BTREE or vector
+index whose coverage lags (`TableStore::stage_index_reconciliation`), the two
+index links optimize chains after its compaction; full-text coverage stays
+with the explicit rebuild. A failure before
 publication leaves no graph-visible residue; after publication reads,
 including full-text search through the batch's certificate, serve from the
 staged version.
@@ -416,8 +421,14 @@ overwrite the number of Lance writers (`TableStore::stage_overwrite_batches`
 cuts the batches at Lance's file target into contiguous chunks, runs one
 `execute_uncommitted` per chunk with that many in flight, and joins the
 chunks' fragments in chunk order into the one `Operation::Overwrite`, so the
-files and their order are those of a single call). Delete transactions remain
-serial. The setting changes only
+files and their order are those of a single call), and the most partitions of
+its `CsvSourceExec` (the planner's `max_partitions`, one per 8 MiB of source
+up to this width; the resolve pass cuts the capture on record ends into
+slices, each partition claims the next slice from a shared counter, tags its
+batches with the slice index, and `ValidateExec` drains every partition and
+sorts the held batches by slice before judging them, so the rows reach the
+sink in source order and a refusal names the lowest failed slice's record).
+Delete transactions remain serial. The setting changes only
 fragment preparation: every participant still commits detached and crosses
 one graph-manifest publication.
 
@@ -455,7 +466,9 @@ materialized row and payload accounts are checked again before staging.
 
 Delete mutations, cascades and Overwrite's removed-ID detection stream matches
 under one `write_max_bytes` removed-ID allowance per operation, charging each
-ID's UTF-8 length plus one 24-byte `String` slot before copying it.
+ID's UTF-8 length plus one 24-byte `String` slot before copying it. Overwrite
+runs that detection only when its plan's `removal` is `scan`, a populated node
+target an edge type references; under `none` it detects and charges nothing.
 Overwrite's bulk input is not subject to the keyed aggregate row/batch limits.
 These are representation limits, not a combined allocator/RSS budget; native
 scan buffers, conversion copies and validation's derived state are outside them.
@@ -517,6 +530,17 @@ listing, with final validation of the graph and tag capture before deletion.
 Cached write admission checks the ref's identifier and retirement metadata
 through the existing lookup, with no additional storage request. Cold branch
 enumeration reads active refs; creation does not scan retired histories.
+
+A detailed listing (`list_graph_branches_detailed` in `omnigraph-catalog`)
+derives every field from the same authority and writes nothing: each live
+ref's `BranchContents` (`parent_branch`, `parent_version`, `create_at`), the
+head row of the branch's latest `__manifest` version and, once the branch has
+written a commit, the head row of its clone at `parent_version`, the commit it
+started at (a start at a past commit clones that commit's version, so the
+same read answers it). It reads no lineage, so its cost per branch is flat in
+history (`branch_control_cost.rs`). The collector keeps each live branch's
+oldest own `__manifest` version (`retained_versions` with `keep_base`), which
+is that clone; a reclamation that dropped it would lose the start.
 
 Stable table/incarnation identity, not `table_key`, determines whether a
 registration, rename, tombstone, or pointer belongs to the same lifetime.

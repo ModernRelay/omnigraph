@@ -262,6 +262,8 @@ impl OperationRuntime {
         R: Send + 'static,
         F: Future<Output = OwnedResult<T>> + Send + 'static,
     {
+        use tracing::instrument::WithSubscriber as _;
+
         {
             let mut state = locked(&self.inner.state);
             if state.closed {
@@ -275,6 +277,8 @@ impl OperationRuntime {
             reservation: Some(Box::new(reservation)),
         };
         let (sender, receiver) = oneshot::channel();
+        // A span retains its subscriber, but entering it does not install that
+        // subscriber for Span::current() or events on a detached task.
         tokio::spawn(
             async move {
                 // The write runs as its request's submitted write: an error it
@@ -296,6 +300,12 @@ impl OperationRuntime {
                 // Mark the error as its waiter receives it, so the log below
                 // records the status its response sends.
                 let result = result.map_err(ApiError::after_owned_write);
+                // Process containment and completion uncertainty are distinct:
+                // scoped storage uncertainty leaves admission open, but remains
+                // an uncertain outcome in telemetry.
+                let telemetry_uncertain =
+                    uncertain || result.as_ref().is_err_and(ApiError::completion_uncertain);
+                crate::telemetry::operation_finished("write", result.is_ok(), telemetry_uncertain);
                 // A known result carries its reservation through pending delivery.
                 // Consumption releases admission before the handler can respond;
                 // abandonment destroys the output before releasing its ownership.
@@ -324,7 +334,8 @@ impl OperationRuntime {
                     owner,
                 });
             }
-            .in_current_span(),
+            .instrument(crate::telemetry::operation_span("write"))
+            .with_current_subscriber(),
         );
         Ok(OwnedResponse(receiver))
     }
@@ -471,19 +482,32 @@ impl ReadObserver {
     ///
     /// The task serves a request, or a part of one such as an MCP tool call,
     /// so it keeps its own record of the writes that request submits, and an
-    /// error leaving it carries that record to the waiter.
+    /// error leaving it carries that record to the waiter. The caller's engine
+    /// io probes, a test's, cross with it: a Tokio task local does not.
     pub(crate) fn spawn_read<T, R, F>(self, reservation: R, operation: F) -> OwnedReadResponse<T>
     where
         T: Send + 'static,
         R: Send + 'static,
         F: Future<Output = Result<T, ApiError>> + Send + 'static,
     {
+        use tracing::instrument::WithSubscriber as _;
+
         let (sender, receiver) = oneshot::channel();
         let response_observer = self.clone();
+        let callers_probes = omnigraph::instrumentation::capture_query_io_probes();
         tokio::spawn(
             async move {
                 let _observer = self;
                 let _reservation = reservation;
+                let operation = async move {
+                    match callers_probes {
+                        Some(probes) => {
+                            omnigraph::instrumentation::with_query_io_probes(probes, operation)
+                                .await
+                        }
+                        None => operation.await,
+                    }
+                };
                 let result = scope_request(async move {
                     // Catch completed future Drop panics too.
                     #[allow(clippy::redundant_async_block)]
@@ -494,10 +518,12 @@ impl ReadObserver {
                     result.map_err(ApiError::with_request_facts)
                 })
                 .await;
+                crate::telemetry::operation_finished("read", result.is_ok(), false);
                 // No result history: an absent waiter drops the result here.
                 let _ = sender.send(result);
             }
-            .in_current_span(),
+            .instrument(crate::telemetry::operation_span("read"))
+            .with_current_subscriber(),
         );
         OwnedReadResponse {
             receiver,
@@ -816,6 +842,18 @@ mod tests {
 
     #[test]
     fn disconnected_owned_operation_keeps_its_request_span() {
+        fn request_parent() -> Option<tracing::Id> {
+            use tracing_subscriber::registry::LookupSpan;
+            tracing::Span::current()
+                .with_subscriber(|(id, dispatch)| {
+                    let registry = dispatch.downcast_ref::<tracing_subscriber::Registry>()?;
+                    let operation = registry.span(id)?;
+                    assert_eq!(operation.name(), "native.operation");
+                    operation.parent().map(|parent| parent.id())
+                })
+                .flatten()
+        }
+
         let subscriber =
             tracing_subscriber::registry().with(tracing_subscriber::filter::LevelFilter::DEBUG);
         use tracing_subscriber::prelude::*;
@@ -832,7 +870,7 @@ mod tests {
                         let _entered = span.enter();
                         runtime
                             .submit((), async move {
-                                sent.send(tracing::Span::current().id()).unwrap();
+                                sent.send(request_parent()).unwrap();
                                 Ok::<_, ApiError>(()).into()
                             })
                             .unwrap()
@@ -843,7 +881,7 @@ mod tests {
                     let response = {
                         let _entered = span.enter();
                         runtime.try_observe().unwrap().spawn_read((), async move {
-                            sent.send(tracing::Span::current().id()).unwrap();
+                            sent.send(request_parent()).unwrap();
                             Ok::<_, ApiError>(())
                         })
                     };
@@ -875,7 +913,8 @@ mod tests {
                 true,
             ),
             (
-                OmniError::manifest_publish_in_doubt("uncertain publication").before_effect(),
+                OmniError::manifest_publish_in_doubt("01JCOMMIT", "uncertain publication")
+                    .before_effect(),
                 false,
             ),
             (
@@ -900,7 +939,10 @@ mod tests {
             ),
             (OmniError::manifest_internal("internal failure"), true),
             (
-                OmniError::manifest_publish_in_doubt("publication acknowledgement unavailable"),
+                OmniError::manifest_publish_in_doubt(
+                    "01JCOMMIT",
+                    "publication acknowledgement unavailable",
+                ),
                 false,
             ),
             (OmniError::manifest("invalid request"), false),
@@ -964,8 +1006,11 @@ mod tests {
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
             (
-                OmniError::manifest_publish_in_doubt("manifest publish outcome is in doubt")
-                    .unpublished(),
+                OmniError::manifest_publish_in_doubt(
+                    "01JCOMMIT",
+                    "manifest publish outcome is in doubt",
+                )
+                .unpublished(),
                 true,
                 false,
                 StatusCode::INTERNAL_SERVER_ERROR,

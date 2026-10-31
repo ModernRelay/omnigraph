@@ -39,7 +39,7 @@ pub struct GraphHandle {
     pub policy: Option<Arc<PolicyEngine>>,
     /// Per-graph stored-query registry, loaded and validated at
     /// startup. `None` means the operator declared no stored queries for
-    /// this graph — `POST /queries/{name}` then 404s. Mirrors the
+    /// this graph — `POST /queries/{query_name}` then 404s. Mirrors the
     /// optional `policy` shape.
     pub queries: Option<Arc<QueryRegistry>>,
 }

@@ -22,11 +22,11 @@ Machine results remain on stdout.
 
 A registered direct target declares `scope: graph` or `scope: root`; a root or
 server requires `--graph` or its own `default_graph` for graph operations. No
-request discovers a graph to select automatically. Inline addresses are local paths or `file://` URIs only. Register remote
-endpoints; cloud-direct and catalogue targets are unsupported. Use `./name` for a
+request discovers a graph to select automatically. Inline addresses are local paths or `file://` URIs, plus
+[S3 cluster roots](../operations/s3-cluster-roots.md) for deployment, recovery and maintenance commands. Register remote
+endpoints; other cloud-direct and catalogue targets are unsupported. Use `./name` for a
 relative filesystem address; a bare name selects a registered target.
-`init --schema graph.pg ./graph.omni` remains a creation convenience; it cannot
-be combined with `--target`.
+`init --schema graph.pg ./graph.omni` remains a creation convenience and refuses `--target`.
 
 `--as ACTOR` attributes supported direct operations. A served target derives its
 actor from its credential and sends `--as` as the `Omnigraph-If-Actor` assertion,
@@ -44,7 +44,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `mutate` | Run an insert/update/delete query (`as commit` leaves it unpublished; `as unattached branch [on "<id>"]` records a snapshot that never publishes), or a `branch create`, `branch delete`, `branch merge`, `commit publish`, `commit drop`, or [`load csv`](../mutations/index.md#csv-loading) statement | direct or served |
 | `load` | Load graph JSONL in `overwrite`, `append`, or `merge` mode | direct or served |
 | `blob get/stat/put/clear` | Read, inspect, replace or clear one Blob cell | direct or served |
-| `branch create/list/delete/merge/diff/merge-base` | Manage graph branches; `create --from-commit` starts a branch at a commit, `merge --as-commit` leaves the merge unpublished, `merge --dry-run` reports the outcome or conflicts and writes nothing, `diff` reviews what a branch changed since its merge base, `merge-base` prints that base | direct or served |
+| `branch create/list/delete/merge/diff/merge-base` | Manage graph branches; `create --from-commit` starts a branch at a commit, `list --detailed` adds each branch's head, start and times, `merge --as-commit` leaves the merge unpublished, `merge --dry-run` reports the outcome or conflicts and writes nothing, `diff` reviews what a branch changed since its merge base, `merge-base` prints that base | direct or served |
 | `snapshot` | Show a branch snapshot: `internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version | direct or served |
 | `commit list/show/changes/publish/drop` | Inspect history (`list --limit`/`--page-token` for one page of it, `list --unpublished` for a branch's unpublished commits, `list --unattached` for its live unattached snapshots; the two flags exclude each other and paging) or one commit's entity changes; publish an unpublished commit onto its recorded target branch (an unattached snapshot refuses with `unattached_cannot_publish`), or drop it (an unattached snapshot takes every descendant with it); `publish` and `drop` take `--as`, the reads refuse it | direct or served |
 | `diff` | Net entity changes between two points: branches or commit ids (`--from`, `--to`) | direct or served |
@@ -56,8 +56,9 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `schema upgrade-system-columns` | Respell a graph's system columns in place; needs a graph that normal open accepts and keeps its storage format | direct |
 | `lint` | Validate `.gq` source | local schema or direct graph |
 | `upgrade` | Convert a v8, v9 or v13 graph's storage to the format this binary serves, offline; `--check` writes nothing | direct standalone |
-| `optimize` | Compact data and reconcile declared indexes | direct |
-| `rebuild-full-text-indexes` | Replace full-text indexes on one branch | direct |
+| `optimize` | Compact data and reconcile declared indexes on `main` | direct |
+| `index build` | Build a branch's missing declared indexes and refresh lagging BTREE and vector coverage ([Maintenance](../operations/maintenance.md#build-indexes)) | direct |
+| `index rebuild --kind full-text` | Replace full-text indexes on one branch; `rebuild-full-text-indexes` is its deprecated spelling | direct |
 | `repair` | Report each table's Lance history against its registration (`no_drift` or `foreign_drift`) | direct |
 | `cleanup` | Delete table versions that no retained graph commit pins, under an explicit retention policy ([Maintenance](../operations/maintenance.md#cleanup)) | direct |
 | `graphs list` | List graph metadata or minimal identity discovery | served |
@@ -73,11 +74,13 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `config validate` | Validate the whole operator file offline | local |
 | `config rename-profile/rename-target/recover-rename` | Rename local bindings while preserving custody, or finish an interrupted rename ([syntax](targets.md#rename-registrations-and-profiles)) | local |
 | `config recover-operations --source DIR` | Preserve legacy folder lifecycle evidence; no operation submission | profile, local evidence |
-| `access` | Say who you are at a target and which actions its policy grants, graph-wide and on a branch ([access](targets.md#what-you-may-do-at-a-target)) | direct or served |
+| `access` | Say who you are at a target and which actions its policy grants, graph-wide and on a branch ([access](targets.md#what-you-may-do-at-a-target)) | direct, server or managed |
+| `mcp` | Relay an agent's stdio MCP to the target's `/mcp` with its resource credential, bound to one graph; write tools need `--write` ([stdio agents](../operations/mcp.md#connect-a-stdio-agent)) | server or managed |
+| `studio` | Open Omnigraph Studio on a server target through an `omnigraph-studio://open` link and print it; no request or credential; `--json` adds the `binding` and `home` digests ([Open Studio](studio.md)) | server |
 | `alias` | Invoke a personal stored-query alias bound to one target | served |
-| `organization members/invitations` | Administer organization membership and invitations | profile |
+| `organization members/invitations` | List members, set service roles, offboard and manage invitations; see [team access](managed-team.md) | profile |
 | `skill export/show` | Export the agent skill built into this binary, or print one of its files ([matching skill](index.md#give-an-agent-the-matching-skill)) | local |
-| `version` | Print the package version, HTTP contract and storage formats; `--json` includes `version`, `http_contract`, `protocols` (`target`, `credential`, `access`) and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
+| `version` | Print the package version, HTTP contract and storage formats; `--json` includes `version`, `http_contract`, `protocols` (`studio: 1`, `target: 2`, `credential: 2`, `access: 2`) and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
 
 ## Query inputs and output
 
@@ -94,16 +97,26 @@ params; see [Work with branches](index.md#work-with-branches)), or one
 `explain` statement, `query -e 'explain query q() { … }'`, answering the plan
 as rows under the query's own target and params; see [Explain](../queries/explain.md).
 
-Read output supports `table`, `json`, `jsonl`, `csv`, and `kv`. `--json` is the
+Read output supports `table`, `json`, `jsonl`, `csv`, `kv`, and `toon`. With no
+`--format`, no `--json`, and no `defaults.output`, a read prints a table. `--json` is the
 stable machine-readable form for commands that do not use `--format`. Result
 cells use the [JSON result spelling](../queries/index.md#json-result-spelling);
 `table`, `csv`, and `kv` print strings unquoted. `--format json` prints the
-envelope pretty and the `rows` array compact; a refusal follows [Diagnostics](../queries/diagnostics.md).
+envelope pretty and the `rows` array compact. `--format toon` encodes that same
+document as [TOON](https://github.com/toon-format/spec) (specification 4.4,
+comma delimiter, two-space indent). `rows` declares its fields once when every
+row has the same keys. A null cell omits its key, so one null makes the rows
+non-uniform and TOON repeats every key. Numbers use TOON's canonical spelling,
+so an integral value is `1` where the JSON writer may spell `1.0`. The CLI ends
+the TOON document with a newline. The HTTP API returns JSON. A refusal follows
+[Diagnostics](../queries/diagnostics.md).
 
 ### Machine-readable read and write positions
 
-`query --json` returns `graph_commit_id` when its read snapshot has a graph head. The id and
-rows share one pinned snapshot; use that id for a later conditional mutation.
+`query --json` and `query --format toon` return `graph_commit_id` when the read snapshot has a graph head. The id and
+rows share one pinned snapshot; use that id for a later conditional mutation. A ranked read also
+returns `ranking` on that document, and in the `--format jsonl` metadata line too
+([what a ranked read reports](../search/index.md#what-a-ranked-read-reports)).
 
 Successful `mutate --json` and `load --json` responses include `commit`, the exact commit published by
 that attempt: `graph_commit_id`, optional `graph_branch`, `graph_manifest_version`, optional parent and
@@ -111,7 +124,7 @@ merged-parent ids, optional `actor_id`, and `created_at` in Unix microseconds. A
 that changes no entities returns `"commit": null`. On every target `load --json` prints the body of
 `POST /graphs/{id}/load/ndjson`, with the write's `actor_id` and a `base_branch` that is `null` without `--from`.
 
-`--json` and read `--format json` preserve structured errors on stdout. Data-write and read failures
+`--json`, read `--format json`, and read `--format toon` preserve structured errors on stdout. `--format toon` encodes the same error document as `--format json`. Data-write and read failures
 report [whole-command outcomes and exits](../operations/troubleshooting.md#failed-data-write-commands); a refused command line exits 64.
 Verified conditional mismatches exit 4, embedded or served, when nothing else in the command ran.
 
@@ -211,7 +224,7 @@ retarget an invocation.
 |---|---|
 | `login` / `logout` | Selected `omnigraph` profile (also via a managed target) |
 | `cluster create NAME`, `cluster list` | Profile; create returns identity without binding a folder |
-| `cluster members list` | Cluster target; list explicit enrollment |
+| `cluster members list` | Cluster target; list active organization members and identity eligibility |
 | `cluster pull --out NEW_DIR [--rev REVISION]` | Download configuration into a new directory |
 | `cluster push --config DIR --expected-revision REVISION --message TEXT` | Upload source using an exact revision |
 | `cluster plan [--rev REVISION]` | Preview pushed source |
@@ -257,7 +270,9 @@ progress and idempotency information go to stderr.
 ## Managed data access
 
 A managed target uses the common served graph client, including schema reads,
-branches, snapshots, history, exports, Blob operations and change feeds. Select a graph explicitly or use its configured
+access introspection, stored-query catalogs, the stdio MCP bridge, branches,
+snapshots, history, exports, Blob operations and change feeds. Select a graph
+explicitly or use its configured
 `default_graph`; discovery only lists available IDs. A separate identity
 credential authenticates the data endpoint, and applied Cedar policy decides
 permissions. Direct-only maintenance, schema changes and root administration

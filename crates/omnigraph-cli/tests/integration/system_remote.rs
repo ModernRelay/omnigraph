@@ -932,7 +932,7 @@ fn remote_commit_delivery_loss_never_replays_committed_effect() {
                 );
             }
             assert_eq!(
-                get_json("commits?branch=main&unpublished=true")["commits"],
+                get_json("commits?branch=main&listing=unpublished")["commits"],
                 json!([])
             );
             let rows = client

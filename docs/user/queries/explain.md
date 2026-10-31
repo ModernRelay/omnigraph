@@ -163,10 +163,11 @@ planned document carries `pipelines`, the physical plan cut at each node whose
 operator emits nothing before it has seen its whole input (`Sort`, `Aggregate`,
 `AntiJoin`, `RankFuse`, a load's `Validate`, a costed multi-hop `Expand`) and
 at a join's build side (a hash join's build, the collected left side of a
-cross join or a contains join): each entry names its `source`, its streaming
-`operators` in run order, the `sink` it drains into (the breaker node, a
-join's build side, or the `consumer`) and `depends_on`, the pipelines drained
-before it starts. The pipelines describe the plan: a correlated block the
+cross join or a contains join): each entry names its `source`, its
+`partitions` (the streams its source runs: a `load csv` source's
+`max_partitions`, 1 for every other source), its streaming `operators` in run
+order, the `sink` it drains into (the breaker node, a join's build side, or
+the `consumer`) and `depends_on`, the pipelines drained before it starts. The pipelines describe the plan: a correlated block the
 engine answers from the bulk CSR degree (a single-hop, filter-free existence
 or row-count test) prints its inner pipeline without running it. Query plans
 omit node `properties.schema`: complete pipeline

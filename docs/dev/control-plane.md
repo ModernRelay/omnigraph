@@ -4,6 +4,16 @@ The cluster control plane turns a local declarative bundle into a durable applie
 
 ## Authority model
 
+Server telemetry is separate from deployment authority. The optional OTLP
+subscriber exports an explicit span allowlist with W3C request context; it
+does not export arbitrary dependency spans or protocol payloads. Owned reads
+and writes carry child spans through their existing process-owned futures.
+Exporter loss or shutdown does not alter native admission, publication, recovery
+or clean-exit evidence. JSON logs use the same restricted dependency-target
+filter as text logs. Configuration is in the
+[observability guide](../user/operations/observability.md); telemetry and log-filter
+unit tests own context propagation, redaction and the actual OTLP transport.
+
 There are three distinct views:
 
 1. **Desired configuration** — `cluster.yaml` and referenced files in an operator workspace.
@@ -409,7 +419,7 @@ views with new epochs. Uncertain effects use existing process containment.
 Activation identity is installed in the same immutable registry snapshot as
 serving bindings: canonical root, process incarnation, original ID/input digest,
 achieved revision and config digest. The durable achieved receipt stays unchanged;
-there is no second ledger write after activation. `GET /cluster/deployments/{id}`
+there is no second ledger write after activation. `GET /cluster/deployments/{deployment_id}`
 reports active only for that exact current identity while its affected bindings
 are ready under their installed schema contracts, deleted entries are absent,
 and process admission remains open. An unrelated blocked graph does not invalidate

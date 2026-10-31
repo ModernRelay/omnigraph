@@ -1,0 +1,1 @@
+- Require Tokio 1.53.3 or newer to address [RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386), an I/O safety issue in its Unix file-descriptor registration API.

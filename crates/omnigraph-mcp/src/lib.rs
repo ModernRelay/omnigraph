@@ -12,15 +12,16 @@ mod result;
 mod settings;
 
 pub use arguments::{
-    AccessArguments, BranchArguments, BranchCreateArguments, BranchDeleteArguments,
-    BranchMergeArguments, ChangeFilters, ChangesPollArguments, CommitArguments,
-    CommitChangesArguments, CommitsListArguments, GraphArguments, InvalidArguments, LoadArguments,
-    MutateArguments, QueryArguments, ReadArguments, ToolCall, ToolRequest, change_query,
+    AccessArguments, BlobClearArguments, BlobStatArguments, BranchArguments, BranchCreateArguments,
+    BranchDeleteArguments, BranchDiffArguments, BranchMergeArguments, BranchesListArguments,
+    ChangeFilters, ChangesPollArguments, CommitArguments, CommitChangesArguments,
+    CommitsListArguments, DiffArguments, GraphArguments, InvalidArguments, LoadArguments,
+    MergeBaseArguments, MutateArguments, QueryArguments, ToolCall, ToolRequest, change_query,
 };
 pub use resources::{ResourceOutput, ResourceRequest};
 pub use result::{HostError, bounded_result};
 pub use rmcp::model::CallToolResult as ToolResult;
-pub use settings::{MCP_ALLOW_ADHOC_ENV, MCP_ALLOW_WRITES_ENV, MCP_ALLOWED_HOSTS_ENV, McpSettings};
+pub use settings::{MCP_ALLOWED_HOSTS_ENV, McpSettings};
 
 use axum::Router;
 use axum::http::{StatusCode, request::Parts};
@@ -138,7 +139,6 @@ where
     }
     let handler = GraphTools {
         host,
-        settings,
         version,
         slots: Arc::new(Semaphore::new(16)),
     };
@@ -153,7 +153,6 @@ where
 #[derive(Clone)]
 struct GraphTools<H> {
     host: H,
-    settings: McpSettings,
     version: String,
     slots: Arc<Semaphore>,
 }
@@ -271,7 +270,7 @@ impl<H: Host> ServerHandler for GraphTools<H> {
             "omnigraph-server",
             self.version.clone(),
         ))
-        .with_instructions(instructions(&self.settings))
+        .with_instructions(INSTRUCTIONS)
     }
 
     async fn list_tools(
@@ -279,13 +278,11 @@ impl<H: Host> ServerHandler for GraphTools<H> {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(tools(&self.settings)))
+        Ok(ListToolsResult::with_all_items(tools()))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        tools(&self.settings)
-            .into_iter()
-            .find(|tool| tool.name == name)
+        tools().into_iter().find(|tool| tool.name == name)
     }
 
     async fn call_tool(
@@ -293,10 +290,10 @@ impl<H: Host> ServerHandler for GraphTools<H> {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let Some(spec) = spec(&self.settings, &request.name) else {
+        let Some(spec) = spec(&request.name) else {
             return Err(ErrorData::invalid_params("unknown MCP tool", None));
         };
-        let write = spec.gate == Gate::Writes;
+        let write = spec.writes();
         let admitted = match self.host.admit(context.extensions.get::<Parts>()) {
             Ok(admitted) => admitted,
             Err(refusal) => {

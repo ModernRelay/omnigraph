@@ -16,6 +16,12 @@ pub(crate) enum Requirement {
         catalogue: bool,
     },
     Standalone,
+    /// One graph of an existing server, reached only over HTTP: a client of
+    /// the server, never of its storage.
+    ServedGraph,
+    /// An existing server as a whole, handed to another client: `--graph` may
+    /// name one of its graphs but is not required, and no request is sent.
+    ServedTarget,
     Registry,
     Root,
     /// A whole direct root, optionally filtered by `--graph`, or one served
@@ -87,6 +93,7 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
             command: SchemaCommand::Plan { .. },
         }
         | Command::Optimize(_)
+        | Command::Index { .. }
         | Command::RebuildFullTextIndexes(_)
         | Command::Repair(_)
         | Command::Cleanup(_) => Graph {
@@ -108,6 +115,8 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
             }
         }
         Command::Graphs { .. } => Registry,
+        Command::Mcp(_) => ServedGraph,
+        Command::Studio(_) => ServedTarget,
         Command::Queries {
             command: QueriesCommand::List { .. },
         } => RootOrServedGraph,
@@ -172,12 +181,36 @@ pub(crate) fn root_input(command: &Command) -> bool {
     )
 }
 
+/// The commands that may name an `s3://` cluster root inline: stopped-writer
+/// deployment and recovery, and the direct maintenance commands. A cluster
+/// whose server is down has no served route for any of them (#1163, #1082).
+/// Every other command reaches cloud storage through a server.
+pub(crate) fn admits_inline_s3_root(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Cluster {
+            command: ClusterCommand::Plan { .. }
+                | ClusterCommand::Apply { .. }
+                | ClusterCommand::Status { .. }
+                | ClusterCommand::ForceUnlock { .. }
+                | ClusterCommand::UpgradeLedger { .. },
+        } | Command::Optimize(_)
+            | Command::Index { .. }
+            | Command::Cleanup(_)
+            | Command::Repair(_)
+            | Command::RebuildFullTextIndexes(_)
+    )
+}
+
 /// Whether the operation addresses one graph of `target`, so `--graph` or the
 /// target's `default_graph` must select it before any I/O.
 pub(crate) fn selects_graph(command: &Command, target: &ResolvedTarget) -> bool {
     match requirement(command) {
-        Requirement::Graph { .. } => true,
-        Requirement::RootOrServedGraph => matches!(target.binding, TargetBinding::Server { .. }),
+        Requirement::Graph { .. } | Requirement::ServedGraph => true,
+        Requirement::RootOrServedGraph => matches!(
+            target.binding,
+            TargetBinding::Server { .. } | TargetBinding::Managed(_)
+        ),
         _ => false,
     }
 }
@@ -239,7 +272,11 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
     if cli.graph.is_some()
         && !matches!(
             need,
-            Requirement::Graph { .. } | Requirement::Root | Requirement::RootOrServedGraph
+            Requirement::Graph { .. }
+                | Requirement::Root
+                | Requirement::RootOrServedGraph
+                | Requirement::ServedGraph
+                | Requirement::ServedTarget
         )
     {
         bail!("{} does not accept --graph", command_label(&cli.command));
@@ -259,7 +296,12 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
 /// credential and carries `--as` as the `Omnigraph-If-Actor` assertion.
 fn accepts_actor(command: &Command) -> bool {
     match command {
-        Command::Mutate(_) | Command::Load(_) | Command::RebuildFullTextIndexes(_) => true,
+        // The bridge asserts the actor on every request it relays.
+        Command::Mutate(_)
+        | Command::Load(_)
+        | Command::Index { .. }
+        | Command::RebuildFullTextIndexes(_)
+        | Command::Mcp(_) => true,
         // The actor a direct target's policy decides for.
         Command::Access(_) => true,
         Command::Branch { command } => match command {
@@ -332,6 +374,7 @@ fn accepts_actor(command: &Command) -> bool {
         | Command::Target { .. }
         | Command::Config { .. }
         | Command::Credential { .. }
+        | Command::Studio(_)
         | Command::Skill { .. }
         | Command::Version { .. } => false,
     }
@@ -346,6 +389,27 @@ pub(crate) fn validate_target(
     use Requirement::*;
     use TargetBinding::*;
     let need = requirement(&cli.command);
+    if (need == ServedGraph && !matches!(target.binding, Server { .. } | Managed(_)))
+        || (need == ServedTarget && !matches!(target.binding, Server { .. }))
+    {
+        let label = command_label(&cli.command);
+        let why = match &target.binding {
+            Managed(_) => {
+                format!("{label} does not open a managed target; it opens a server target")
+            }
+            _ => format!(
+                "{label} connects to an existing server, and target '{}' is direct storage; \
+                 select a {} target for a server that serves the graph",
+                target.label(),
+                if need == ServedGraph {
+                    "served"
+                } else {
+                    "server"
+                }
+            ),
+        };
+        return Err(crate::targets::refusal("target_kind_unsupported", why));
+    }
     let allowed = match (&need, &target.binding) {
         (Graph { .. } | Standalone | Alias, DirectGraph { .. }) => true,
         (
@@ -362,6 +426,8 @@ pub(crate) fn validate_target(
             Graph {
                 direct_only: false, ..
             }
+            | ServedGraph
+            | ServedTarget
             | Registry
             | RootOrServedGraph
             | Deployment
@@ -374,12 +440,14 @@ pub(crate) fn validate_target(
             Graph {
                 direct_only: false, ..
             }
+            | ServedGraph
+            | RootOrServedGraph
             | Registry
             | Deployment
             | ManagedCluster
             | Alias,
             Managed(binding),
-        ) => binding.cluster.is_some() && !matches!(cli.command, Command::Access(_)),
+        ) => binding.cluster.is_some(),
         (ManagedAccount, Managed(binding)) => binding.cluster.is_none(),
         (ManagedOperation | Authentication | Credential, Managed(_)) => true,
         _ => false,
@@ -535,6 +603,8 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Config { .. } => "config",
         Command::Credential { .. } => "credential",
         Command::Access(_) => "access",
+        Command::Mcp(_) => "mcp",
+        Command::Studio(_) => "studio",
         Command::Skill { command } => match command {
             SkillCommand::Export { .. } => "skill export",
             SkillCommand::Show { .. } => "skill show",
@@ -588,6 +658,10 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Policy { .. } => "policy",
         Command::Upgrade(_) => "upgrade",
         Command::Optimize(_) => "optimize",
+        Command::Index { command } => match command {
+            IndexCommand::Build(_) => "index build",
+            IndexCommand::Rebuild(_) => "index rebuild",
+        },
         Command::RebuildFullTextIndexes(_) => "rebuild-full-text-indexes",
         Command::Repair(_) => "repair",
         Command::Cleanup(_) => "cleanup",
@@ -660,6 +734,8 @@ mod tests {
             (&["mutate", "-e", "q"], true),
             (&["load", "--data", "d.jsonl", "--mode", "append"], true),
             (&["rebuild-full-text-indexes"], true),
+            (&["index", "build"], true),
+            (&["index", "rebuild", "--kind", "full-text"], true),
             (&["access"], true),
             (&["branch", "create", "b"], true),
             (&["branch", "delete", "b"], true),
@@ -738,6 +814,10 @@ mod tests {
             (&["changes", "baseline", "--out", "out"], false),
             (&["optimize"], false),
             (&["cleanup"], false),
+            (&["mcp"], true),
+            (&["mcp", "--write"], true),
+            // Studio's actor is its credential's; the link asserts none.
+            (&["studio"], false),
         ];
         for &(args, accepts_actor) in cases {
             let argv = ["omnigraph"]

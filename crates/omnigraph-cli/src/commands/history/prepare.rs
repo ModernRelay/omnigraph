@@ -1,6 +1,6 @@
 //! Pure history selections, prepared after the existing client-resolution boundary.
 
-use omnigraph_api_types::{ChangeOpOutput, EntityKindOutput};
+use omnigraph_api_types::{ChangeOp, EntityKind};
 
 use super::args::{ChangeKindArg, ChangeOpArg};
 use crate::client::ChangeFilterArgs;
@@ -32,9 +32,9 @@ impl Pagination {
 }
 
 pub(super) struct ChangeFilter {
-    kinds: Vec<EntityKindOutput>,
+    kinds: Vec<EntityKind>,
     types: Vec<String>,
-    ops: Vec<ChangeOpOutput>,
+    ops: Vec<ChangeOp>,
 }
 
 impl ChangeFilter {

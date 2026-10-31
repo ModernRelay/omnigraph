@@ -343,6 +343,11 @@ fn write_machine<T: Serialize>(
             writeln!(writer, "{}", serde_json::to_string(value)?)?;
             Ok(())
         }
+        MachineErrors::Toon => {
+            let value = serde_json::to_value(value)?;
+            writeln!(writer, "{}", crate::toon::encode(&value))?;
+            Ok(())
+        }
     }
 }
 
@@ -586,6 +591,34 @@ async fn run_bound(
             )
             .await?
         }
+        Command::Mcp(args) => {
+            return commands::mcp::run(
+                args,
+                commands::mcp::McpScope {
+                    operator: &operator,
+                    target: required_target(),
+                    graph: cli.graph.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                },
+                stdout,
+                stderr,
+            )
+            .await;
+        }
+        Command::Studio(args) => {
+            return commands::studio::run(
+                args,
+                commands::studio::StudioScope {
+                    operator: &operator,
+                    target: required_target(),
+                    graph: cli.graph.as_deref(),
+                },
+                commands::studio::Platform::current(),
+                &mut commands::studio::SystemRunner,
+                stdout,
+                stderr,
+            );
+        }
         Command::Skill { command } => commands::local::run_skill(command, stdout)?,
         Command::Version { json } => commands::local::run_version(json, stdout)?,
         Command::Embed(args) => commands::local::run_embed(args, stdout).await?,
@@ -828,6 +861,21 @@ async fn run_bound(
         Command::Optimize(args) => {
             return commands::maintenance::run_optimize(
                 args,
+                commands::maintenance::MaintenanceScope {
+                    operator: &operator,
+                    target: required_target(),
+                    graph: cli.graph.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                    yes: cli.yes,
+                },
+                stdout,
+                stderr,
+            )
+            .await;
+        }
+        Command::Index { command } => {
+            return commands::maintenance::run_index(
+                command,
                 commands::maintenance::MaintenanceScope {
                     operator: &operator,
                     target: required_target(),

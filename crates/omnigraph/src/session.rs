@@ -173,6 +173,60 @@ impl Session {
             .collect()
     }
 
+    /// [`Omnigraph::commit_changes_page`] under this session's
+    /// `change_lineage`.
+    pub async fn commit_changes_page(
+        &self,
+        commit_id: &str,
+        scope: &crate::changes::ChangeFeedScope,
+        page_token: Option<&str>,
+        max_changes: Option<usize>,
+        max_bytes: Option<u64>,
+    ) -> Result<crate::changes::CommitChangesPage> {
+        self.db
+            .commit_changes_page_under(
+                commit_id,
+                scope,
+                page_token,
+                max_changes,
+                max_bytes,
+                self.settings.change_lineage(),
+            )
+            .await
+    }
+
+    /// [`Omnigraph::poll_change_feed`] under this session's `change_lineage`.
+    pub async fn poll_change_feed(
+        &self,
+        request: crate::changes::ChangeFeedRequest,
+    ) -> Result<crate::changes::ChangeFeedPage> {
+        self.db
+            .poll_change_feed_under(request, self.settings.change_lineage())
+            .await
+    }
+
+    /// [`Omnigraph::diff_page`] under this session's `change_lineage`.
+    pub async fn diff_page(
+        &self,
+        request: &crate::changes::GraphDiffRequest,
+    ) -> Result<crate::changes::GraphDiffPage> {
+        self.db
+            .diff_page_under(request, self.settings.change_lineage())
+            .await
+    }
+
+    /// [`Omnigraph::diff_page_readable`] under this session's
+    /// `change_lineage`.
+    pub async fn diff_page_readable(
+        &self,
+        request: &crate::changes::GraphDiffRequest,
+        can_read: &mut crate::db::ReadCheck<'_>,
+    ) -> Result<crate::changes::GraphDiffPage> {
+        self.db
+            .diff_page_readable_under(request, can_read, self.settings.change_lineage())
+            .await
+    }
+
     /// Answer a branch control read (`branch diff`, `branch merge-base`,
     /// `branch merge … dry run`) with the engine call it names, an unspelled
     /// `into` meaning `main`. It reads lineage and tables and writes nothing;

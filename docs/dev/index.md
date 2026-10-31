@@ -32,6 +32,7 @@ change boundaries, and test ownership. Design history and proposals belong in
 | Task | Guide |
 |---|---|
 | Find the owning suite, helpers, failpoints, and cloud gates | [Testing](testing.md) |
+| Maintain HTTP naming, OpenAPI coverage, and compatibility | [HTTP API conventions](http-api.md) |
 | Understand PR and release workflows | [CI and releases](ci.md) |
 | Change required checks, repository policy, or who is requested to review | [Branch protection](branch-protection.md) |
 | Write or reorganize documentation | [Documentation guide](documentation.md) |

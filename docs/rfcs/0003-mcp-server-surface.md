@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-06-01
-updated: 2026-10-20
+updated: 2026-10-30
 discussion: https://github.com/ModernRelay/omnigraph/issues/991
 supersedes: []
 superseded_by: []
@@ -38,11 +38,11 @@ transport:
 
 1. **Self-contained discovery and useful read tools.** Protected-resource
    metadata is served at the path the OAuth challenge advertises; a refused
-   bearer gets `error="invalid_token"`; a `schema` tool and an opt-in ad-hoc
-   `read` tool let a model answer questions about a graph.
+   bearer gets `error="invalid_token"`; a `schema` tool and an ad-hoc
+   read through `query` let a model answer questions about a graph.
 2. **MCP for every authenticated deployment.** `/mcp` is mounted whenever the
    server has a bearer credential source (static tokens, signed data tokens or
-   OIDC); read parity with the `@modernrelay/omnigraph-mcp` npm package; opt-in
+   OIDC); read parity with the `@modernrelay/omnigraph-mcp` npm package;
    write tools that keep the package's write contract.
 
 After a release ships both phases, the npm package is deprecated in favour of the
@@ -160,15 +160,12 @@ settings: a flag and an equivalent environment variable, read once at boot.
 
 | Flag | Environment | Default | Effect |
 |---|---|---|---|
-| `--mcp-allow-adhoc` | `OMNIGRAPH_MCP_ALLOW_ADHOC=1` | off | lists and admits the ad-hoc `read` tool |
-| `--mcp-allow-writes` | `OMNIGRAPH_MCP_ALLOW_WRITES=1` | off | lists and admits the write tools |
 | `--mcp-allowed-host <host[:port]>` (repeatable) | `OMNIGRAPH_MCP_ALLOWED_HOSTS=a,b` | none | adds allowed `Host` values |
 
-Both opt-ins default off even when an applied Cedar policy would deny the actions:
-they are defence in depth that an operator turns on deliberately, independent of
-policy. A tool that is off is absent from `tools/list` and a call to it is refused
-as an unknown tool. These settings never grant anything: an enabled tool still
-runs only what Cedar allows the actor.
+No setting selects tools. Every tool is listed, and each runs under its HTTP
+route's Cedar action, so the policy for a credential is the one place that
+decides what that credential may do, over HTTP and MCP alike. An operator who
+wants an agent narrower than a person grants the agent's credential less.
 
 ### Tool catalog
 
@@ -179,10 +176,9 @@ request does (unknown and denied graphs are 404, an authorized unavailable graph
 | Tool | Phase | Handler (HTTP route) | Cedar action | Annotations |
 |---|---|---|---|---|
 | `graphs` | shipped | `server_graphs_discovery` (`GET /graphs/discovery`) for an identity credential; otherwise `server_graphs_list` (`GET /graphs`) narrowed to ids and names | identity, or `graph_list` | read-only |
-| `queries` | shipped | `server_list_queries` (`GET /graphs/{id}/queries`), mutations filtered out | `read` | read-only |
-| `query` | shipped | `server_invoke_query` (`POST /graphs/{id}/queries/{name}`), `expect_mutation: false` | `invoke_query`, then `read` | read-only |
+| `queries` | shipped | `server_list_queries` (`GET /graphs/{id}/queries`) | `read` | read-only |
+| `query` | shipped; source in 1 | with `name` only, `server_invoke_query` (`POST /graphs/{id}/queries/{name}`), `expect_mutation: false`; with `query`, `server_query` (`POST /graphs/{id}/query`) | `invoke_query`, then `read`; source: `read` | read-only |
 | `schema` | 1 | `server_schema_get` (`GET /graphs/{id}/schema`) | `read` | read-only |
-| `read` | 1, opt-in | `server_query` (`POST /graphs/{id}/query`) | `read` | read-only |
 | `health` | 2 | `server_health` (`GET /healthz`) | none | read-only |
 | `snapshot` | 2 | `server_snapshot` (`GET /graphs/{id}/snapshot`) | `read` | read-only |
 | `branches_list` | 2 | `server_branch_list` (`GET /graphs/{id}/branches`) | `read` | read-only |
@@ -190,36 +186,55 @@ request does (unknown and denied graphs are 404, an authorized unavailable graph
 | `commits_get` | 2 | `server_commit_show` (`GET /graphs/{id}/commits/{commit_id}`) | `read` | read-only |
 | `commits_changes` | 2 | `server_commit_changes` (`GET /graphs/{id}/commits/{commit_id}/changes`) | `read` | read-only |
 | `changes_poll` | 2 | `server_changes_feed` (`GET /graphs/{id}/changes`) | `read` | read-only |
-| `mutate` | 2, opt-in | `server_mutate` / `server_mutate_if_graph_commit` | `change` (branch statements: their branch action) | destructive |
-| `load` | 2, opt-in | `server_load` (`POST /graphs/{id}/load`) | `change` (+ `branch_create` with `from`) | destructive |
-| `branches_create` | 2, opt-in | `server_branch_create` (`POST /graphs/{id}/branches`) | `branch_create` | not destructive |
-| `branches_delete` | 2, opt-in | `server_branch_delete` (`DELETE /graphs/{id}/branches/{name}`) | `branch_delete` | destructive, idempotent |
-| `branches_merge` | 2, opt-in | `server_branch_merge` (`POST /graphs/{id}/branches/merge`) | `branch_merge` | destructive |
+| `diff` | 3 | `server_diff` (`GET /graphs/{id}/diff`) | `read` on each side's branch | read-only |
+| `branches_diff` | 3 | `server_branch_diff` (`GET /graphs/{id}/branches/diff`) | `read` on both branches | read-only |
+| `branches_merge_base` | 3 | `server_merge_base` (`GET /graphs/{id}/branches/merge-base`) | `read` on both branches | read-only |
+| `blobs_stat` | 3 | `server_blob_head` (`HEAD /graphs/{id}/blob`), its headers as `blob stat` JSON | `read` | read-only |
+| `mutate` | 2 | `server_mutate` / `server_mutate_if_graph_commit`; with `name` and no `query` (phase 3), `server_invoke_query` / `server_invoke_query_if_graph_commit` | `change` (branch statements: their branch action; stored mutations: `invoke_query`, then `change`) | destructive |
+| `load` | 2 | `server_load` (`POST /graphs/{id}/load`) | `change` (+ `branch_create` with `from`) | destructive |
+| `blobs_clear` | 3 | `server_blob_delete` (`DELETE /graphs/{id}/blob`) | `change` | destructive, idempotent |
+| `branches_create` | 2 | `server_branch_create` (`POST /graphs/{id}/branches`) | `branch_create` | not destructive |
+| `branches_delete` | 2 | `server_branch_delete` (`DELETE /graphs/{id}/branches/{name}`) | `branch_delete` | destructive, idempotent |
+| `branches_merge` | 2 | `server_branch_merge` (`POST /graphs/{id}/branches/merge`) | `branch_merge` | destructive |
+| `commits_publish` | 3 | `server_commit_publish` (`POST /graphs/{id}/commits/{commit_id}/publish`) | `commit_publish` on the recorded target | destructive, idempotent |
+| `commits_drop` | 3 | `server_commit_drop` (`DELETE /graphs/{id}/commits/{commit_id}`), an empty object for its 204 | `commit_drop` on the recorded target | destructive, idempotent |
+
+Phase 3 is the one set of operations of
+[Graph access and cross-process writes](2026-10-16-graph-access-serving-and-cross-process-writes.md):
+every graph operation that is not a byte stream has a tool, and `commits_list`
+takes the route's `listing`.
 
 Names follow the shipped tools. The package's `schema_get` is `schema`; its ad-hoc
-`query` is `read`, because the shipped `query` already names the stored read; its
-`graphs_list` is the shipped `graphs`. Discovery admits only identity
+`query` is the shipped `query` given source, as `mutate` takes source or a
+stored name; its `graphs_list` is the shipped `graphs`. Discovery admits only identity
 credentials (OIDC or signed identity tokens), so for any other credential, such
 as a static token, `graphs` calls `GET /graphs` under `graph_list`, as the
 package did, and returns only ids and names. `graph_list` is server-scoped, and
 without an applied cluster policy every server-scoped action is denied, so on a
 default static-token server `graphs` returns 403. The tool description and the
 server instructions say so, and tell a model to ask for a `graph_list` permit or
-to use a graph id the user supplies. `read` also serves what `POST /query`
-serves: `branch list`, `branch diff`, `branch merge-base`, `branch merge … dry run`
+to use a graph id the user supplies. `query` with source also serves what
+`POST /query` serves: `branch list`, `branch diff`, `branch merge-base`, `branch merge … dry run`
 and `explain query …`. `mutate` serves the branch write statements `POST /mutate`
-serves. Stored mutations stay unavailable through `query`; they arrive with
-per-query tools (deferred).
+serves. Stored mutations stay unavailable through `query`, which is read-only.
+`mutate` runs one when given `name` and no `query`, as `omnigraph mutate NAME`
+does, through the stored-query route and its `invoke_query` then `change`
+gates. This adds no capability: a caller allowed `change` can already run any
+mutation through `mutate`, and the stored route is gated more narrowly.
+Per-query tools stay deferred.
 
 Schema application, deployment and cluster configuration are never MCP tools;
-they are operator-owned through `omnigraph cluster plan/apply`.
+they are operator-owned through `omnigraph cluster plan/apply`. Byte streams are
+not tools: Blob payloads, `export` and the change-feed baseline, whose cursor is
+valid only after its NDJSON snapshot is installed.
 
 ### Tool results
 
 - Success: `structuredContent` is the handler's JSON response body, equal in
   value to the HTTP route's body except where the catalog names a projection
-  (`queries` without stored mutations, the `graphs` fallback's ids and names),
-  plus the SDK's text duplicate for older clients.
+  (the `graphs` fallback's ids and names, `blobs_stat`'s headers as `blob stat`
+  JSON, `commits_drop`'s empty object for a 204), plus the SDK's text duplicate
+  for older clients.
 - Failure: `isError: true` with `structuredContent` either
   `{"status": <http status>, "error": <the route's ErrorOutput>}` for a handler
   refusal, or `{"code": "...", "message": "..."}` for an MCP-side refusal
@@ -229,11 +244,11 @@ they are operator-owned through `omnigraph cluster plan/apply`.
 - Tools whose success shape is fixed declare an `outputSchema`; it admits both the
   success shape and the error envelope, because clients validate any
   `structuredContent` they receive against it.
-- `queries` returns each stored read's typed parameter descriptors, so a model can
-  call `query` correctly.
+- `queries` returns each stored query's typed parameter descriptors, so a model
+  can call `query` or `mutate` correctly.
 
 Server `instructions` and tool descriptions tell a model to call `schema` (or read
-the schema resource) first, then `read` or a stored `query`, and summarize the
+the schema resource) first, then `query` with source or a stored name, and summarize the
 write contract below.
 
 ### Resources (phase 2)
@@ -258,8 +273,11 @@ written beside its source.
 The write tools keep the npm package's contract:
 
 - **Conditional writes.** `mutate` takes `if_graph_commit`; when present it calls
-  the conditional route (`/mutate/if-graph-commit`), so a stale head fails with 412
-  before effects. A read's `graph_commit_id` is the value to pass.
+  the conditional route (`/mutate/if-graph-commit`, or
+  `/queries/{name}/if-graph-commit` for a stored mutation), so a stale head fails
+  with 412 before effects. The value always selects the route that requires it,
+  so an empty or malformed one is refused rather than written unconditionally.
+  A read's `graph_commit_id` is the value to pass.
 - **No automatic retry.** The server never replays a tool call.
 - **A lost response is an unknown outcome.** Writes register through the server's
   owned-write boundary, so the end of the caller's wait never cancels them. The
@@ -273,7 +291,7 @@ The write tools keep the npm package's contract:
   must treat that the same way. Atomic publication does not make a write
   exactly-once after a lost acknowledgement ([first-principles data systems,
   §B.1](../dev/systems.md#b1-a-guarantee-record)). Before replaying, reconcile: read the target with
-  `read` or `snapshot` and compare its `graph_commit_id` with the one the write was
+  `query` or `snapshot` and compare its `graph_commit_id` with the one the write was
   based on, or list the branch's commits with `commits_list` and look for the
   write's effect. A replay of `mutate` should carry `if_graph_commit` so a write
   that did land fails with 412 instead of applying twice.
@@ -286,16 +304,16 @@ The write tools keep the npm package's contract:
   cannot block writes; `/mcp` is one read-class route whose operation is known
   only after its body is parsed. A separate MCP write slot pool with the write
   observer, or classifying on the `Mcp-Method` and `Mcp-Name` headers before body
-  collection, would close the gap; this RFC accepts the trade-off because MCP
-  writes are opt-in and the refusal is explicit and retryable.
+  collection, would close the gap; this RFC accepts the trade-off because the
+  refusal is explicit and retryable.
 
 ## Design
 
 ### One handler, many tools
 
 `GraphTools` implements the SDK's `ServerHandler`. Each tool is a static
-definition (name, description, input schema, optional output schema, annotations,
-the setting that enables it) and one dispatch arm that deserializes its arguments
+definition (name, description, input schema, optional output schema and
+annotations derived from its declared effect) and one dispatch arm that deserializes its arguments
 (`deny_unknown_fields`) and calls the HTTP handler function with the request's
 `AuthenticatedActor`. No business logic or authorization is duplicated.
 
@@ -348,6 +366,15 @@ path, and never reflect the credential or a refusal reason. `/mcp` keeps only
 its own `Cache-Control: no-store`. The OpenAPI document records the header on
 every protected operation's 401.
 
+A token that passes its own checks is not a refused one, so it never gets
+`invalid_token`: when the OIDC admission file names no principal for its
+subject the answer is 403 `not_admitted`, and while the admission snapshot is
+expired it is 503 `service_unavailable` with `Retry-After`. Neither carries a
+challenge, since signing in again issues a token for the same subject and
+cannot help; a challenge there sends a standard OAuth client round a sign-in
+loop. The token's own checks run first, so a caller without a validly signed
+token learns nothing about the admission file.
+
 ## Invariants
 
 - **Trust at the boundary, enforcement at the engine (invariant 10).** Actors come
@@ -375,7 +402,16 @@ every protected operation's 401.
   is read case-insensitively; a response body and status are unchanged. A
   client that read a missing challenge as "no OAuth" now reads the
   `resource_metadata` parameter's presence instead.
-- Turning the opt-ins off removes tools without affecting HTTP.
+- Removing `--mcp-allow-adhoc` and `--mcp-allow-writes` lists every tool on
+  every server. A server started with either flag refuses to start until the
+  flag is removed; the old `OMNIGRAPH_MCP_ALLOW_ADHOC` and
+  `OMNIGRAPH_MCP_ALLOW_WRITES` variables are ignored. A token with no applied
+  policy still only reads, and its listed write calls are refused 403. A deployment that relied on them to keep agents read-only
+  narrows the policy for the agents' credentials instead.
+- Phase 3 adds tools and optional arguments. Two results change: `queries`
+  lists stored mutations too, marked `mutation: true`, and `mutate` no longer
+  requires `query`. A client that cached tool schemas refreshes them with
+  `tools/list`.
 - The npm package's users move by pointing their client at `https://<server>/mcp`
   with the same token. Tool names differ where noted above. Reverting this RFC means
   keeping the package; nothing durable depends on the server surface.
@@ -393,9 +429,11 @@ every protected operation's 401.
 - **Dynamic per-stored-query tools now.** Without per-query `invoke_query` scope
   every actor would see every stored query as a tool; deferred until that scope
   exists.
-- **Default the opt-ins on when a policy is applied.** Rejected for now: a policy
-  written for HTTP clients was not reviewed for an LLM caller, and an explicit
-  switch costs one flag.
+- **Boot opt-ins for `read` and the write tools** (the shipped design until
+  2026-10-29). Rejected: they restrict only the MCP route, while the same
+  credential runs the same ad-hoc read or write over HTTP, so they protect
+  nothing; and they hide tools a caller is allowed to use, which looks like a
+  missing feature rather than a decision. Access is decided once, by policy.
 - **A hand-rolled JSON-RPC layer.** The SDK already shipped and owns framing,
   negotiation and cancellation.
 
@@ -405,16 +443,22 @@ The owner is `crates/omnigraph-server/tests/integration/mcp.rs`, extended rather
 than duplicated:
 
 - discovery at both metadata paths, 404 for other suffixes, both challenge forms;
-- `tools/list` snapshot per setting combination (names, annotations, presence of
-  `outputSchema`, absence of disabled tools) and `initialize` instructions;
-- `schema` and `read` results equal to the HTTP routes' bodies for an allowed actor;
-  denied actors get the same refusal envelope as other tools; `read` refuses
+- one `tools/list` snapshot (names, annotations, required arguments, presence of
+  `outputSchema`), compared with the shared operation inventory, and
+  `initialize` instructions;
+- `schema` and `query` results equal to the HTTP routes' bodies for an allowed actor;
+  denied actors get the same refusal envelope as other tools; `query` refuses
   `insert`/`update`/`delete` and `branch create` with the manifest version
   unchanged; the 64 KiB, 1 MiB and deadline bounds hold;
 - phase 2: a static-token server answers with the token and 401 without it, refuses
   a foreign `Host` and any `Origin`; each parity tool equals its route; resources
-  list and read; write tools are absent by default, honour `if_graph_commit` (412
-  with no effect), and report `outcome_unknown` when the wait ends first.
+  list and read; write tools are listed, refused 403 for a token with no applied
+  policy with the manifest version unchanged, honour `if_graph_commit` (412
+  with no effect), and report `outcome_unknown` when the wait ends first;
+- phase 3: each new tool's result equals its route's for the same request, and
+  a policy denial equals the route's refusal; a stored mutation runs through
+  `mutate` under `change`, refuses a stale or empty `if_graph_commit` without effect, and
+  never reaches the unconditional route with a precondition.
 
 `openapi.json` and its drift test cover the new route. In-source `mcp.rs` tests keep
 owning `run_read` ownership through cancellation and the result bound.
@@ -449,7 +493,11 @@ reading.
 4. **Package retirement**, after a release contains phases 1 and 2: a final
    `@modernrelay/omnigraph-mcp` version whose README and binary print a
    deprecation pointing at the server's `/mcp`, then npm deprecation.
-5. **Deferred, separate decisions:** per-stored-query `invoke_query` scope (a query
+5. **Operation parity (phase 3):** the read tools `diff`, `branches_diff`,
+   `branches_merge_base` and `blobs_stat`, `listing` on `commits_list`, the write
+   tools `blobs_clear`, `commits_publish` and `commits_drop`, stored mutations
+   through `mutate`, and the full `queries` catalog.
+6. **Deferred, separate decisions:** per-stored-query `invoke_query` scope (a query
    name in `PolicyRequest` and the Cedar schema); one MCP tool per stored query
    filtered by that scope; a Rust stdio bridge only if local desktop clients need
    it; a token-lifetime cap separate from the 300 second admission-snapshot bound
@@ -464,6 +512,46 @@ a deferred item or the existing allowed-origin rule.
 
 ## Decision log
 
+- 2026-10-30: The ad-hoc `read` tool is folded into `query`, which takes GQ
+  source in `query` or a stored read's `name`, the shape `mutate` already has
+  for writes and the CLI's `query` has: one tool per effect, with the same
+  arguments meaning the same thing. A stored read now also accepts
+  `snapshot`, which its route already took. Superseded sentences: the catalog
+  row for `read`; "its ad-hoc `query` is `read`, because the shipped `query`
+  already names the stored read"; "`read` also serves what `POST /query`
+  serves"; "then `read` or a stored `query`"; "read the target with `read` or
+  `snapshot`"; and Evidence's "`schema` and `read` results" and "`read`
+  refuses".
+- 2026-10-29: The `--mcp-allow-adhoc` and `--mcp-allow-writes` boot settings
+  are removed, and every tool is listed. Each tool already ran under its HTTP
+  route's Cedar action, so the settings narrowed only the MCP route of an
+  access the credential held over HTTP. Superseded sentences: the settings
+  table's two opt-in rows; "Both opt-ins default off even when an applied
+  Cedar policy would deny the actions: they are defence in depth that an
+  operator turns on deliberately, independent of policy"; the catalog's
+  "opt-in" phase labels; "because MCP writes are opt-in"; the rejected
+  alternative "Default the opt-ins on when a policy is applied"; Design's
+  "the setting that enables it"; and Evidence's "`tools/list` snapshot per
+  setting combination", "absence of disabled tools", "write tools are absent
+  by default" and "a stored mutation runs only with writes enabled".
+- 2026-10-27: An unadmitted subject and an expired admission snapshot no
+  longer answer 401 `invalid_token` (issue
+  [#1172](https://github.com/ModernRelay/omnigraph/issues/1172)); they answer
+  403 `not_admitted` and 503 `service_unavailable` without a challenge. This
+  narrows "a bearer token that does not authenticate is a refused one" to a
+  token that fails its own checks.
+- 2026-10-22: Amended for operation parity (phase 3), from the one set of
+  operations of
+  [Graph access and cross-process writes](2026-10-16-graph-access-serving-and-cross-process-writes.md).
+  New tools for the graph diff, branch diff, merge base, Blob stat, Blob clear,
+  commit publish and commit drop; `listing` on `commits_list`; stored mutations
+  through `mutate` with `name` and no `query`, since a caller allowed `change`
+  can already run any mutation there; the change-feed baseline stays a byte
+  stream. Superseded sentences: "Stored mutations stay unavailable through
+  `query`; they arrive with per-query tools (deferred)"; the catalog's
+  "mutations filtered out" for `queries` and its projection "`queries` without
+  stored mutations"; "`queries` returns each stored read's typed parameter
+  descriptors, so a model can call `query` correctly".
 - 2026-10-20: Amended for the server-wide challenge (issue
   [#1020](https://github.com/ModernRelay/omnigraph/issues/1020)). Every 401
   carries `WWW-Authenticate`, `error="invalid_token"` follows a refused bearer

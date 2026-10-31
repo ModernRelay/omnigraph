@@ -6,7 +6,7 @@ mod access;
 mod args;
 use crate::credential_sources::{self as credentials, SecretStore};
 use crate::operator::InvocationConfig;
-use crate::operator_schema::{AuthProfile, Target, TokenSource};
+use crate::operator_schema::{AuthProfile, ClientSecretSource, Target, TokenSource};
 use crate::targets::{self, ResolvedTarget, TargetBinding};
 pub(crate) use access::run_access;
 pub(crate) use args::{AccessArgs, ConfigCommand, CredentialCommand, TargetCommand};
@@ -215,6 +215,12 @@ pub(crate) async fn run_target(
                 .get(&name)
                 .ok_or_else(|| eyre!("unknown target '{name}'"))?;
             let mut output = serde_json::json!({"name":name,"target":target});
+            // The digests a Studio link carries, recomputed for this home, so
+            // a client resolving the target itself can compare them.
+            if let Some(binding) = crate::target_identity::binding_digest(target)? {
+                output["binding"] = binding.into();
+            }
+            output["home"] = crate::target_identity::home_digest(input)?.into();
             if resolved {
                 if let Target::Managed { profile, .. } = target {
                     output["profile"] = serde_json::to_value(&source.profiles[profile])?;
@@ -489,6 +495,10 @@ pub(crate) async fn run_credential(
                 } => "unknown",
                 AuthProfile::Token {
                     source: TokenSource::Env { env },
+                }
+                | AuthProfile::OauthClientCredentials {
+                    client_secret: ClientSecretSource::Env { env },
+                    ..
                 } => {
                     if std::env::var_os(env).is_some() {
                         "present"
@@ -498,6 +508,10 @@ pub(crate) async fn run_credential(
                 }
                 AuthProfile::Token {
                     source: TokenSource::File { file },
+                }
+                | AuthProfile::OauthClientCredentials {
+                    client_secret: ClientSecretSource::File { file },
+                    ..
                 } => {
                     if std::fs::metadata(file).is_ok_and(|m| m.is_file()) {
                         "present"

@@ -28,6 +28,19 @@ omnigraph branch list --target ./graph.omni
 omnigraph branch delete review/abandoned --target ./graph.omni
 ```
 
+`branch list --detailed` (served: `GET /branches?detailed=true`; MCP:
+`branches_list` with `detailed`) adds a `details` array. Per branch it reports
+`head`, the commit a read sees; `from` and `from_commit_id`, the branch and
+commit it started from, as its create receipt named them (a later merge moves
+the merge base, not these); `created_at`, recorded to the second; and
+`updated_at`, the newest commit's time, or `created_at` while the branch has
+written none. Times are Unix microseconds. `main` omits `from`,
+`from_commit_id` and `created_at`. A branch deleted and created again reports
+its new creation. Each branch costs a read of its own manifest, two once it has
+written a commit, whatever its history, and the branches are not read as one
+cut. The served listing needs the `read` that `GET /branches` needs, and has
+details only for branches the caller may `read`.
+
 Creating a branch defaults to `main` when `--from` is omitted. To start a
 branch at a past commit instead of a branch head, use `--from-commit`; see
 [start a branch at a commit](#start-a-branch-at-a-commit). A load can create a
@@ -57,7 +70,7 @@ and `_x` are bare. A control write answers a
 (`outcome.merge` holds the merge result), with zero affected counts; a merge
 that publishes a commit reports it in `commit`. `branch list` answers one row
 per branch in column `name`, sorted by name. Each statement runs under the same
-policy check as its HTTP route (`POST /branches`, `DELETE /branches/{branch}`,
+policy check as its HTTP route (`POST /branches`, `DELETE /branches/{branch_name}`,
 `POST /branches/merge`, `GET /branches`), and `branch list` is a read, so it is
 refused on `POST /mutate` as a control write is refused on `POST /query`. The
 branch reads `branch diff`, `branch merge-base` and `branch merge … dry run`
@@ -148,9 +161,14 @@ and is refused with `400` otherwise: a commit the branch still holds, or one a
 branch the caller may read published, costs nothing more, and any other is
 looked for down the branch's history, which costs what the whole listing
 costs. Served, the same listing is
-`GET /commits?branch=<name>&limit=<n>` continued with `page_token=<token>`.
-Paging applies to a branch's history, not to `--unpublished` or
-`--unattached`.
+`GET /commits?listing=history&branch=<name>&limit=<n>` continued with
+`page_token=<token>`; omitting `listing` also selects history. Paging applies
+to a branch's history, not to `--unpublished` or `--unattached`.
+
+HTTP `listing` accepts `history`, `unpublished` or `unattached`; non-history
+listings refuse `limit` and `page_token`. The retired query keys `unpublished`
+and `unattached` return `400 bad_request` even when false or combined with
+`listing`; omit them or use `listing=history` for ordinary history.
 
 ### Start a branch at a commit
 
@@ -223,7 +241,7 @@ omnigraph commit drop <commit-id> --target ./graph.omni
 
 Served, the same control writes are `POST /commits/{commit_id}/publish`
 (the published commit), `DELETE /commits/{commit_id}` (204), and
-`GET /commits?unpublished=true&branch=<name>`; `POST /branches/merge` takes
+`GET /commits?listing=unpublished&branch=<name>`; `POST /branches/merge` takes
 `as_commit`, which excludes `delete_branch`. Publishing and dropping run under
 the `commit_publish` and `commit_drop` policy actions on the recorded target
 branch ([Policy](../operations/policy.md)).
@@ -275,10 +293,9 @@ first write captured, or when the branch is deleted or recreated: expired
 snapshots answer `not found` to reads and writes and leave the listing. Dropping or expiring
 a snapshot promises no storage reclamation; `cleanup` reports what it retains.
 
-Served, the listing is `GET /commits?unattached=true&branch=<name>`
-(`unattached` and `unpublished` together are refused) and the drop is the same
-`DELETE /commits/{commit_id}` (204). Writing needs `change` on the recorded
-branch; listing and reading a snapshot need `read` on it
+Served, the listing is `GET /commits?listing=unattached&branch=<name>`
+and the drop is the same `DELETE /commits/{commit_id}` (204). Writing needs
+`change` on the recorded branch; listing and reading a snapshot need `read` on it
 ([Policy](../operations/policy.md)).
 
 ## Historical reads

@@ -1,27 +1,8 @@
-//! MCP tool descriptions, gates, annotations and JSON schemas.
+//! MCP tool descriptions, annotations and JSON schemas.
 
-use crate::McpSettings;
 use rmcp::model::{Tool, ToolAnnotations};
 use serde_json::{Value, json};
 use std::sync::Arc;
-
-/// Which boot setting, if any, lists and admits a tool.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Gate {
-    Always,
-    Adhoc,
-    Writes,
-}
-
-impl Gate {
-    fn open(self, settings: &McpSettings) -> bool {
-        match self {
-            Gate::Always => true,
-            Gate::Adhoc => settings.allow_adhoc,
-            Gate::Writes => settings.allow_writes,
-        }
-    }
-}
 
 /// What a tool does to the graph, as MCP annotation hints.
 #[derive(Clone, Copy)]
@@ -44,7 +25,14 @@ pub(super) struct ToolSpec {
     /// content against it, including an `isError` result's.
     output: Option<fn() -> Value>,
     effect: Effect,
-    pub(super) gate: Gate,
+}
+
+impl ToolSpec {
+    /// Whether the tool can publish: it carries the write contract, the write
+    /// deadline and the write result disposition.
+    pub(super) fn writes(&self) -> bool {
+        !matches!(self.effect, Effect::Read)
+    }
 }
 
 const WRITE_CONTRACT: &str = " Never retried by the server. If the result says `outcome_unknown`, the write may or may not have happened: read the target and reconcile before replaying.";
@@ -57,7 +45,6 @@ const TOOLS: &[ToolSpec] = &[
         input: no_arguments_schema,
         output: Some(health_output_schema),
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "graphs",
@@ -66,7 +53,6 @@ const TOOLS: &[ToolSpec] = &[
         input: no_arguments_schema,
         output: Some(graphs_output_schema),
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "schema",
@@ -75,34 +61,22 @@ const TOOLS: &[ToolSpec] = &[
         input: graph_schema,
         output: Some(schema_output_schema),
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "queries",
-        title: "List stored reads",
-        description: "List a graph's stored reads: each `name`, its description and instruction, and typed `params` (`name`, `kind`, `nullable`; `item_kind` for lists, `vector_dim` for vectors). A non-nullable parameter is required. Run one with `query`. Invocation is authorized separately, so a listed read can still be refused.",
+        title: "List stored queries",
+        description: "List a graph's stored queries: each `name`, its description and instruction, whether it is a `mutation`, and typed `params` (`name`, `kind`, `nullable`; `item_kind` for lists, `vector_dim` for vectors). A non-nullable parameter is required. Run a stored read with `query` and a stored mutation with `mutate`, each passing its `name` and no `query`. Invocation is authorized separately, so a listed query can still be refused.",
         input: graph_schema,
         output: Some(queries_output_schema),
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "query",
-        title: "Run a stored read",
-        description: "Run a stored read by `name` with `params` keyed by its declared parameter names (see `queries`). Reads `branch`, `main` when omitted. Returns `rows`, `row_count` and the read's `graph_commit_id`. Stored mutations are refused.",
+        title: "Run a read",
+        description: "Run a read: GQ source you write in `query`, or a stored read by `name` (see `queries`), with `params` keyed by the declared parameter names. Call `schema` before writing source. Declare every value as a typed parameter (`query people($min: I32) { match { $p: Person $p.age >= $min } return { $p.name } }`) and pass the values in `params`; with source, `name` picks one declared query when it declares several. Reads `branch` (default `main`) or a `snapshot`, never both. Search operators (`nearest`, `bm25`, `rrf`) need a trailing `limit`. Source may also be `branch list`, `branch diff <source> [into <target>]`, `branch merge-base …`, `branch merge … dry run` or `explain query …`, sent without `branch`, `snapshot`, `name` or `params`; or `explain load csv …`, which requires `change` permission before probing source metadata and answers the accepted load plan without reading payload bytes or publishing (`branch` allowed, never `snapshot`). Mutations, stored mutations and branch writes are refused here; `mutate` runs them. Returns `rows`, `row_count` and `graph_commit_id`, plus `ranking` for a search order: `exhaustive: false` means the vector search left index partitions unsearched, so a nearer row may exist.",
         input: query_schema,
         output: None,
         effect: Effect::Read,
-        gate: Gate::Always,
-    },
-    ToolSpec {
-        name: "read",
-        title: "Run a GQ read",
-        description: "Run a GQ read query you write. Call `schema` first. Declare every value as a typed parameter (`query people($min: I32) { match { $p: Person $p.age >= $min } return { $p.name } }`) and pass the values in `params`; pick one declared query with `name` when the source declares several. Reads `branch` (default `main`) or a `snapshot`, never both. Search operators (`nearest`, `bm25`, `rrf`) need a trailing `limit`. Also answers `branch list`, `branch diff <source> [into <target>]`, `branch merge-base …`, `branch merge … dry run` and `explain query …`, sent without `branch`, `snapshot`, `name` or `params`; and `explain load csv …`, which requires `change` permission before probing source metadata and answers the accepted load plan without reading payload bytes or publishing (`branch` allowed, never `snapshot`). Mutations and branch writes are refused. Returns `rows`, `row_count` and `graph_commit_id`.",
-        input: read_schema,
-        output: None,
-        effect: Effect::Read,
-        gate: Gate::Adhoc,
     },
     ToolSpec {
         name: "snapshot",
@@ -111,34 +85,46 @@ const TOOLS: &[ToolSpec] = &[
         input: branch_schema,
         output: None,
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "access",
         title: "Your access",
-        description: "Return what your credential may do on a graph: your `actor`, the actions allowed whatever the branch (`graph_wide`), and, for a `branch` you name, the actions allowed on it (`actions`). Name a `target_branch` too to learn whether you may create it from `branch` or merge `branch` into it. Check this before a write instead of learning from a refusal. Branches are judged by name and need not exist.",
+        description: "Return what your credential may do on a graph: your `actor_id`, the actions allowed whatever the branch (`graph_wide`), and, for a `branch` you name, the actions allowed on it (`actions`). Name a `target_branch` too to learn whether you may create it from `branch` or merge `branch` into it. Check this before a write instead of learning from a refusal. Branches are judged by name and need not exist.",
         input: access_schema,
         output: Some(access_output_schema),
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "branches_list",
         title: "List branches",
-        description: "List a graph's branch names.",
-        input: graph_schema,
+        description: "List a graph's branch names. With `detailed`, also each readable branch's head commit, the branch and commit it started from, and when it was created and last moved.",
+        input: branches_list_schema,
         output: Some(branches_output_schema),
         effect: Effect::Read,
-        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "branches_diff",
+        title: "What a branch changed",
+        description: "Return one bounded page of what branch `source` changed since its merge base with `target` (default `main`): the net entity changes from that base to the source head, each with `before` and `after`, which is what `branches_merge` would bring. Changes `target` made after the base do not appear. Filter by `kind`, `type` and `op`, and continue with the returned `next_page_token` as `page_token`, keeping the other arguments.",
+        input: branch_diff_schema,
+        output: None,
+        effect: Effect::Read,
+    },
+    ToolSpec {
+        name: "branches_merge_base",
+        title: "Merge base of two branches",
+        description: "Return the commit a merge of branch `source` into `target` (default `main`) would compare against, with the two heads it was found from (`source_commit_id`, `target_commit_id`). Reads lineage only.",
+        input: merge_base_schema,
+        output: None,
+        effect: Effect::Read,
     },
     ToolSpec {
         name: "commits_list",
         title: "List commits",
-        description: "List a branch's commits (default `main`), newest first, each with its `graph_commit_id`, parents, actor and time. Pass `limit` to page a long history: the page names `head_commit_id` and continues with its `next_page_token` as `page_token`, keeping the same `branch`.",
+        description: "List a branch's commits (default `main`), newest first, each with its `graph_commit_id`, parents, actor and time. Pass `limit` to page a long history: the page names `head_commit_id` and continues with its `next_page_token` as `page_token`, keeping the same `branch`. Pass `listing` as `unpublished` for the proposals written `as commit` that await `commits_publish`, or `unattached` for snapshots written `as unattached branch`, whose recorded target is `branch`; these listings take no `limit` or `page_token`.",
         input: commits_list_schema,
         output: None,
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "commits_get",
@@ -147,7 +133,6 @@ const TOOLS: &[ToolSpec] = &[
         input: commit_schema,
         output: None,
         effect: Effect::Read,
-        gate: Gate::Always,
     },
     ToolSpec {
         name: "commits_changes",
@@ -156,25 +141,38 @@ const TOOLS: &[ToolSpec] = &[
         input: commit_changes_schema,
         output: None,
         effect: Effect::Read,
-        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "diff",
+        title: "Diff two read targets",
+        description: "Return one bounded page of the net entity changes between `from` and `to`, each a branch name (its head now) or a graph commit id (published, an unpublished proposal or an unattached snapshot), each change with `before` and `after`. The first page names the two commits it resolved; continue with the returned `next_page_token` as `page_token`, keeping the other arguments, and every page answers for those same commits. Filter by `kind`, `type` and `op`. A side you cannot read is reported as not found.",
+        input: diff_schema,
+        output: None,
+        effect: Effect::Read,
     },
     ToolSpec {
         name: "changes_poll",
         title: "Poll a change feed",
-        description: "Read one bounded page of a branch's change feed (default `main`), at least once, in first-parent commit order. Start from `start` (`now`, the default, `beginning`, or `after:<commit id>`), a durable `cursor` from an earlier terminal page, or a `page_token`; these three are mutually exclusive. Keep filters unchanged across pages. Only a terminal page's `cursor` is durable: apply its complete commit blocks idempotently by `graph_commit_id`, then keep the cursor. A 410 `change_feed_gap` needs a new baseline, which this tool does not take.",
+        description: "Read one bounded page of a branch's change feed (default `main`), at least once, in first-parent commit order. Start from `start` (`now`, the default, `beginning`, or `after:<commit id>`), a durable `cursor` from an earlier terminal page, or a `page_token`; these three are mutually exclusive. Keep filters unchanged across pages. Only a terminal page's `cursor` is durable: apply its complete commit blocks idempotently by `graph_commit_id`, then keep the cursor. A 410 `change_feed_gap` needs a new baseline, a full snapshot stream that MCP does not carry: capture it over HTTP or with the CLI.",
         input: changes_poll_schema,
         output: None,
         effect: Effect::Read,
-        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "blobs_stat",
+        title: "Describe a Blob cell",
+        description: "Describe one non-null Blob cell, selected by `entity` (`node` or `edge`), `type`, `id` and `property`, on `branch` (default `main`) or at a `snapshot`, never both: a `managed` value's `size` and strong `etag`, or an `external` value's `uri`, with the resolved `target`. Reads no payload bytes, and payloads are not served over MCP. A null cell or an unknown entity is not found.",
+        input: blobs_stat_schema,
+        output: None,
+        effect: Effect::Read,
     },
     ToolSpec {
         name: "mutate",
         title: "Run a GQ mutation",
-        description: "Run a GQ mutation (`insert`, `update`, `delete`) on `branch` (default `main`) as one atomic commit, with every value passed as a declared, typed parameter in `params`. For read-modify-write, pass the `graph_commit_id` of your read as `if_graph_commit`: if the branch moved, the call fails with 412 and nothing is written; read again and reconsider, never retry without it. Returns affected counts and the exact `commit` (null for a successful no-op). Also runs `branch create`, `branch delete` and `branch merge` statements, sent without `branch`, `name` or `params`.",
+        description: "Run a GQ mutation (`insert`, `update`, `delete`) on `branch` (default `main`) as one atomic commit, with every value passed as a declared, typed parameter in `params`. To run a stored mutation from `queries` instead, pass its `name` and `params` without `query`. For read-modify-write, pass the `graph_commit_id` of your read as `if_graph_commit`: if the branch moved, the call fails with 412 and nothing is written; read again and reconsider, never retry without it. Returns affected counts and the exact `commit` (null for a successful no-op). Also runs `branch create`, `branch delete` and `branch merge` statements, sent without `branch`, `name` or `params`.",
         input: mutate_schema,
         output: None,
         effect: Effect::Destructive { idempotent: false },
-        gate: Gate::Writes,
     },
     ToolSpec {
         name: "load",
@@ -183,7 +181,14 @@ const TOOLS: &[ToolSpec] = &[
         input: load_schema,
         output: None,
         effect: Effect::Destructive { idempotent: false },
-        gate: Gate::Writes,
+    },
+    ToolSpec {
+        name: "blobs_clear",
+        title: "Clear a Blob cell",
+        description: "Set one nullable Blob cell, selected by `entity` (`node` or `edge`), `type`, `id` and `property`, to null on `branch` (default `main`) as one commit. A cell that is already null publishes nothing and returns `commit: null`. Pass the `etag` from `blobs_stat` as `if_match`, or `*` to require a value: if the cell no longer matches, the call fails with 412 and nothing is written.",
+        input: blobs_clear_schema,
+        output: None,
+        effect: Effect::Destructive { idempotent: true },
     },
     ToolSpec {
         name: "branches_create",
@@ -192,7 +197,6 @@ const TOOLS: &[ToolSpec] = &[
         input: branch_create_schema,
         output: None,
         effect: Effect::Additive,
-        gate: Gate::Writes,
     },
     ToolSpec {
         name: "branches_delete",
@@ -201,52 +205,51 @@ const TOOLS: &[ToolSpec] = &[
         input: branch_delete_schema,
         output: None,
         effect: Effect::Destructive { idempotent: true },
-        gate: Gate::Writes,
     },
     ToolSpec {
         name: "branches_merge",
         title: "Merge a branch",
-        description: "Merge branch `source` into `target` (default `main`). A merge that publishes returns its exact commit; an already up-to-date merge returns none. A conflict fails with 409 and `merge_conflicts`, writing nothing. To preview, run `branch merge <source> into <target> dry run` with `read`.",
+        description: "Merge branch `source` into `target` (default `main`). A merge that publishes returns its exact commit; an already up-to-date merge returns none. A conflict fails with 409 and `merge_conflicts`, writing nothing. To preview, run `branch merge <source> into <target> dry run` with `query`.",
         input: branch_merge_schema,
         output: None,
         effect: Effect::Destructive { idempotent: false },
-        gate: Gate::Writes,
+    },
+    ToolSpec {
+        name: "commits_publish",
+        title: "Publish a proposal",
+        description: "Publish an unpublished commit, one written `as commit` (list them with `commits_list` and `listing: unpublished`), onto the branch it recorded, and return it as published. A commit already published is returned as it stands. If that branch moved past the commit's parent, the call fails with 412 and the commit can only be dropped. An unattached snapshot never publishes (409).",
+        input: commit_schema,
+        output: None,
+        effect: Effect::Destructive { idempotent: true },
+    },
+    ToolSpec {
+        name: "commits_drop",
+        title: "Drop a proposal or snapshot",
+        description: "Drop an unpublished commit or an unattached snapshot by its `graph_commit_id`, together with every unattached descendant. Irreversible. A published commit is never dropped (409). Returns an empty object.",
+        input: commit_schema,
+        output: None,
+        effect: Effect::Destructive { idempotent: true },
     },
 ];
 
-pub(super) fn spec(settings: &McpSettings, name: &str) -> Option<&'static ToolSpec> {
-    TOOLS
-        .iter()
-        .find(|spec| spec.name == name && spec.gate.open(settings))
+pub(super) fn spec(name: &str) -> Option<&'static ToolSpec> {
+    TOOLS.iter().find(|spec| spec.name == name)
 }
 
-pub(super) fn instructions(settings: &McpSettings) -> String {
-    let mut text = String::from(
-        "OmniGraph serves typed property graphs. Every call runs under the applied policy for your credential; a listed tool or graph can still be refused.\n\
-         1. Call `graphs` for graph ids. With a credential that is not an identity, it needs a `graph_list` permit, which a server without a cluster policy refuses; then ask the user for the graph id.\n\
-         2. Call `schema` for the graph (or read `omnigraph://graphs/{graph}/schema`) before writing a query: it declares the types, properties, keys and edges a query may name.\n\
-         3. Prefer a stored read: `queries` lists them with typed parameters, and `query` runs one.\n",
-    );
-    if settings.allow_adhoc {
-        text.push_str(
-            "4. Otherwise write a GQ read and run it with `read`, with every value passed as a declared, typed parameter. `read` refuses mutations.\n",
-        );
-    }
-    if settings.allow_writes {
-        text.push_str(
-            "Writes: `mutate`, `load` and the `branches_*` tools each publish at most one commit. For read-modify-write, pass your read's `graph_commit_id` to `mutate` as `if_graph_commit`; a 412 means nothing was written. The server never retries a write. A result with `outcome_unknown`, or no response at all (a client timeout, a cancellation or a dropped connection), means the write may or may not have happened: read the target or list its commits and reconcile before replaying, and replay a `mutate` with `if_graph_commit`. Schema and deployment changes are operator-owned and not available here.\n",
-        );
-    }
-    text.push_str(
-        "Reads carry their `graph_commit_id`. A result is limited to 1 MiB and a read to 30 seconds; narrow the query with filters or `limit` when a result is too large. A refused call returns `isError` with the HTTP `status` and the server's `error` body, or an MCP `code` and `message`.",
-    );
-    text
-}
+/// The instructions every MCP session receives.
+pub(super) const INSTRUCTIONS: &str = concat!(
+    "OmniGraph serves typed property graphs. Every call runs under the applied policy for your credential; a listed tool or graph can still be refused.\n",
+    "1. Call `graphs` for graph ids. With a credential that is not an identity, it needs a `graph_list` permit, which a server without a cluster policy refuses; then ask the user for the graph id.\n",
+    "2. Call `schema` for the graph (or read `omnigraph://graphs/{graph}/schema`) before writing a query: it declares the types, properties, keys and edges a query may name.\n",
+    "3. Prefer a stored read: `queries` lists stored queries with typed parameters, and `query` runs one by `name`.\n",
+    "4. Otherwise write a GQ read and pass it to `query` as `query`, with every value passed as a declared, typed parameter. `query` refuses mutations.\n",
+    "Writes: `mutate`, `load`, `blobs_clear`, `branches_create`, `branches_delete`, `branches_merge`, `commits_publish` and `commits_drop` each publish at most one commit. `mutate` with `name` and no `query` runs a stored mutation from `queries`. For read-modify-write, pass your read's `graph_commit_id` to `mutate` as `if_graph_commit`; a 412 means nothing was written. The server never retries a write. A result with `outcome_unknown`, or no response at all (a client timeout, a cancellation or a dropped connection), means the write may or may not have happened: read the target or list its commits and reconcile before replaying, and replay a `mutate` with `if_graph_commit`. Schema and deployment changes are operator-owned and not available here.\n",
+    "Reads carry their `graph_commit_id`. A result is limited to 1 MiB and a read to 30 seconds; narrow the query with filters or `limit` when a result is too large. A refused call returns `isError` with the HTTP `status` and the server's `error` body, or an MCP `code` and `message`.",
+);
 
-pub(super) fn tools(settings: &McpSettings) -> Vec<Tool> {
+pub(super) fn tools() -> Vec<Tool> {
     TOOLS
         .iter()
-        .filter(|spec| spec.gate.open(settings))
         .map(|spec| {
             let annotations = match spec.effect {
                 Effect::Read => ToolAnnotations::new().read_only(true),
@@ -259,7 +262,7 @@ pub(super) fn tools(settings: &McpSettings) -> Vec<Tool> {
                     .destructive(true)
                     .idempotent(idempotent),
             };
-            let description = if spec.gate == Gate::Writes {
+            let description = if spec.writes() {
                 format!("{}{WRITE_CONTRACT}", spec.description)
             } else {
                 spec.description.to_owned()
@@ -314,6 +317,13 @@ pub(super) fn graph_schema() -> Value {
     arguments(json!({}), &[])
 }
 
+pub(super) fn branches_list_schema() -> Value {
+    arguments(
+        json!({"detailed": {"type": "boolean", "description": "`true` adds `details`: for each branch the caller may read, its `head` commit, the branch (`from`) and commit (`from_commit_id`) it started from, and `created_at` and `updated_at`. Defaults to `false`."}}),
+        &[],
+    )
+}
+
 pub(super) fn branch_schema() -> Value {
     arguments(
         json!({"branch": text_schema("Branch. Defaults to `main`.")}),
@@ -335,6 +345,7 @@ pub(super) fn commits_list_schema() -> Value {
     arguments(
         json!({
             "branch": text_schema("Branch. Defaults to `main`."),
+            "listing": {"type": "string", "enum": ["history", "unpublished", "unattached"], "description": "`history` (default), or the `unpublished` proposals or `unattached` snapshots whose recorded target is `branch`. Only `history` pages."},
             "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Commits in this page; without it and `page_token`, the whole history."},
             "page_token": text_schema("The previous page's `next_page_token`."),
         }),
@@ -352,24 +363,13 @@ pub(super) fn commit_schema() -> Value {
 pub(super) fn query_schema() -> Value {
     arguments(
         json!({
-            "name": text_schema("Stored read name, from `queries`."),
-            "params": {"type": "object", "description": "Values keyed by the read's declared parameter names."},
-            "branch": text_schema("Branch to read. Defaults to `main`."),
-        }),
-        &["name"],
-    )
-}
-
-pub(super) fn read_schema() -> Value {
-    arguments(
-        json!({
-            "query": text_schema("GQ source declaring one or more read queries, or one branch read or `explain` statement (`explain query …` or `explain load csv …`)."),
-            "name": text_schema("Which declared query to run when `query` declares several."),
+            "query": text_schema("GQ source declaring one or more read queries, or one branch read or `explain` statement (`explain query …` or `explain load csv …`). Omit it to run the stored read `name`."),
+            "name": text_schema("With `query`, which declared query to run when it declares several. Without `query`, the stored read to run, from `queries`."),
             "params": {"type": "object", "description": "Values keyed by the query's declared parameter names, without `$`."},
             "branch": text_schema("Branch to read. Defaults to `main`. Not with `snapshot`."),
             "snapshot": text_schema("Graph commit id to read instead of a branch head."),
         }),
-        &["query"],
+        &[],
     )
 }
 
@@ -406,16 +406,94 @@ pub(super) fn changes_poll_schema() -> Value {
     arguments(Value::Object(properties), &[])
 }
 
+pub(super) fn diff_schema() -> Value {
+    let mut properties = change_filter_properties();
+    properties.insert(
+        "from".into(),
+        text_schema("Where the diff starts: a branch name (its head now) or a graph commit id."),
+    );
+    properties.insert(
+        "to".into(),
+        text_schema("Where the diff ends, a branch name or a graph commit id."),
+    );
+    arguments(Value::Object(properties), &["from", "to"])
+}
+
+pub(super) fn branch_diff_schema() -> Value {
+    let mut properties = change_filter_properties();
+    properties.insert(
+        "source".into(),
+        text_schema("The branch whose changes to report."),
+    );
+    properties.insert(
+        "target".into(),
+        text_schema("The branch `source` is compared against. Defaults to `main`."),
+    );
+    arguments(Value::Object(properties), &["source"])
+}
+
+pub(super) fn merge_base_schema() -> Value {
+    arguments(
+        json!({
+            "source": text_schema("The branch that would be merged."),
+            "target": text_schema("The branch that would receive the merge. Defaults to `main`."),
+        }),
+        &["source"],
+    )
+}
+
+/// One Blob cell's selector, named as the Blob routes' query parameters.
+pub(super) fn blob_cell_properties() -> serde_json::Map<String, Value> {
+    object(json!({
+        "entity": {"type": "string", "enum": ["node", "edge"], "description": "Whether `type` is a node or an edge type."},
+        "type": text_schema("The node or edge type, from `schema`."),
+        "id": text_schema("The entity's id within `type`: a node's key, or an edge's id."),
+        "property": text_schema("A Blob property of `type`."),
+    }))
+}
+
+pub(super) fn blobs_stat_schema() -> Value {
+    let mut properties = blob_cell_properties();
+    properties.insert(
+        "branch".into(),
+        text_schema("Branch to read. Defaults to `main`. Not with `snapshot`."),
+    );
+    properties.insert(
+        "snapshot".into(),
+        text_schema("Graph commit id to read instead of a branch head."),
+    );
+    arguments(
+        Value::Object(properties),
+        &["entity", "type", "id", "property"],
+    )
+}
+
+pub(super) fn blobs_clear_schema() -> Value {
+    let mut properties = blob_cell_properties();
+    properties.insert(
+        "branch".into(),
+        text_schema("Branch to write. Defaults to `main`."),
+    );
+    properties.insert(
+        "if_match".into(),
+        text_schema("The route's `If-Match`: `*` to require a value, or strong entity tags such as an `etag` from `blobs_stat`, one of which must be the cell's current one."),
+    );
+    arguments(
+        Value::Object(properties),
+        &["entity", "type", "id", "property"],
+    )
+}
+
 pub(super) fn mutate_schema() -> Value {
     arguments(
         json!({
-            "query": text_schema("GQ source declaring one or more mutations, or one branch write statement."),
-            "name": text_schema("Which declared mutation to run when `query` declares several."),
+            "query": text_schema("GQ source declaring one or more mutations, or one branch write statement. Omit it to run the stored mutation `name`."),
+            "name": text_schema("With `query`, which declared mutation to run when it declares several. Without `query`, the stored mutation to run, from `queries`."),
             "params": {"type": "object", "description": "Values keyed by the mutation's declared parameter names, without `$`."},
             "branch": text_schema("Branch to write. Defaults to `main`."),
             "if_graph_commit": text_schema("Write only while the branch head is still this `graph_commit_id`."),
         }),
-        &["query"],
+        &[],
     )
 }
 
@@ -518,21 +596,35 @@ pub(super) fn access_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "actor": {"type": ["string", "null"]},
+            "actor_id": {"type": ["string", "null"]},
             "graph_id": {"type": "string"},
             "graph_wide": actions,
             "branch": {"type": ["string", "null"]},
             "target_branch": {"type": ["string", "null"]},
             "actions": actions,
         },
-        "required": ["actor", "graph_id", "graph_wide", "branch", "target_branch", "actions"],
+        "required": ["actor_id", "graph_id", "graph_wide", "branch", "target_branch", "actions"],
     })
 }
 
 pub(super) fn branches_output_schema() -> Value {
     json!({
         "type": "object",
-        "properties": {"branches": {"type": "array", "items": {"type": "string"}}},
+        "properties": {
+            "branches": {"type": "array", "items": {"type": "string"}},
+            "details": {"type": "array", "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "head": {"type": "object"},
+                    "from": {"type": "string"},
+                    "from_commit_id": {"type": "string"},
+                    "created_at": {"type": "integer"},
+                    "updated_at": {"type": "integer"},
+                },
+                "required": ["name", "head", "updated_at"],
+            }},
+        },
         "required": ["branches"],
     })
 }

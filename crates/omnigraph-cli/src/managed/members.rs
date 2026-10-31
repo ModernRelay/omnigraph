@@ -1,4 +1,4 @@
-//! Read-only cluster enrollment. Applied Cedar owns graph permissions separately.
+//! Organization membership eligibility. Applied Cedar owns native permissions.
 use super::*;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -6,27 +6,32 @@ use std::fmt::Write as _;
 #[derive(Deserialize)]
 struct Directory {
     cluster_id: String,
+    organization_id: String,
+    provider_observed_at: String,
+    provider_expires_at: String,
     members: Vec<Member>,
 }
 
 #[derive(Deserialize)]
 struct Member {
     user_id: String,
-    principal_id: String,
+    membership_id: String,
+    #[serde(deserialize_with = "Option::deserialize")]
+    principal_id: Option<String>,
     name: Option<String>,
     email: Option<String>,
-    admitted: bool,
-    control_grants: Vec<String>,
+    eligible: bool,
+    service_permissions: Vec<String>,
 }
 
-fn directory(body: &Value, cluster: &str) -> Result<Directory> {
+fn directory(body: &Value, cluster: &str, organization: &str) -> Result<Directory> {
     cluster_matches(body, cluster)?;
     let directory: Directory =
         serde_json::from_value(body["data"].clone()).map_err(|_| Failure::protocol())?;
-    if directory.cluster_id != cluster {
+    if directory.cluster_id != cluster || directory.organization_id != organization {
         return Err(Failure::refused(
             "context_mismatch",
-            "the member list belongs to another cluster",
+            "the member list belongs to another cluster or organization",
         ));
     }
     let incarnation = body["meta"]["incarnation"]
@@ -37,20 +42,27 @@ fn directory(body: &Value, cluster: &str) -> Result<Directory> {
     }
     let mut users = BTreeSet::new();
     let mut principals = BTreeSet::new();
+    let mut memberships = BTreeSet::new();
+    provider_observation(
+        &directory.provider_observed_at,
+        &directory.provider_expires_at,
+    )?;
     for member in &directory.members {
+        validate_service_permissions(&member.service_permissions)?;
         if identifier(&member.user_id).is_err()
-            || identifier(&member.principal_id).is_err()
+            || identifier(&member.membership_id).is_err()
+            || !member.membership_id.starts_with("om_")
+            || member
+                .principal_id
+                .as_ref()
+                .is_some_and(|id| identifier(id).is_err())
             || !users.insert(&member.user_id)
-            || !principals.insert(&member.principal_id)
-            || (!member.admitted && member.control_grants.is_empty())
+            || !memberships.insert(&member.membership_id)
             || member
-                .control_grants
-                .iter()
-                .any(|grant| identifier(grant).is_err())
-            || member
-                .control_grants
-                .windows(2)
-                .any(|pair| pair[0] >= pair[1])
+                .principal_id
+                .as_ref()
+                .is_some_and(|id| !principals.insert(id))
+            || !member.eligible
             || [(&member.name, 256), (&member.email, 320)]
                 .into_iter()
                 .any(|(value, limit)| {
@@ -68,25 +80,28 @@ fn directory(body: &Value, cluster: &str) -> Result<Directory> {
 fn human(directory: &Directory) -> String {
     let mut output = format!("Cluster {} members\n", directory.cluster_id);
     if directory.members.is_empty() {
-        output.push_str("No explicitly enrolled members.\n");
+        output.push_str("No active organization members.\n");
     } else {
         let rows: Vec<_> = std::iter::once(vec![
             "NAME".to_owned(),
             "EMAIL".to_owned(),
             "PRINCIPAL".to_owned(),
-            "ADMITTED".to_owned(),
-            "CONTROL GRANTS".to_owned(),
+            "ELIGIBLE".to_owned(),
+            "ORG SERVICE PERMISSIONS".to_owned(),
         ])
         .chain(directory.members.iter().map(|member| {
             vec![
                 member.name.clone().unwrap_or_else(|| "—".into()),
                 member.email.clone().unwrap_or_else(|| "—".into()),
-                member.principal_id.clone(),
-                if member.admitted { "yes" } else { "no" }.into(),
-                if member.control_grants.is_empty() {
+                member
+                    .principal_id
+                    .clone()
+                    .unwrap_or_else(|| "not yet signed in".into()),
+                "yes".into(),
+                if member.service_permissions.is_empty() {
                     "—".into()
                 } else {
-                    member.control_grants.join(", ")
+                    member.service_permissions.join(", ")
                 },
             ]
         }))
@@ -106,7 +121,13 @@ fn human(directory: &Directory) -> String {
             writeln!(output, "{}", row[4]).expect("writing a string");
         }
     }
-    output.push_str("\nExplicit cluster enrollment only; invitations are not listed.\nGraph permissions are evaluated by Cedar separately.\n");
+    writeln!(
+        output,
+        "\nOrganization {} · provider observed: {} · expires: {}",
+        directory.organization_id, directory.provider_observed_at, directory.provider_expires_at
+    )
+    .expect("writing a string");
+    output.push_str("Active organization membership establishes identity eligibility.\nGraph permissions are evaluated by Cedar separately.\n");
     output
 }
 
@@ -122,7 +143,7 @@ pub(super) async fn list(context: &Context, json: bool) -> Output {
             )
             .await?;
         context.verify(&body)?;
-        let directory = directory(&body, &context.cluster)?;
+        let directory = directory(&body, &context.cluster, api.account_id()?)?;
         Ok((body, human(&directory)))
     }
     .await;

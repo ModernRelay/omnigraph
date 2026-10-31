@@ -120,7 +120,7 @@ omnigraph cluster apply \
   --target production --config ./company-brain --json
 ```
 
-`production` names a server target with an owner-local authentication profile.
+`production` names a server target with its own `auth` provider.
 Configure it and install a token or declare an external source using the
 [operator reference](../cli/targets.md). No implicit token environment override
 or static-token login remains.
@@ -273,6 +273,10 @@ omnigraph --target file:///srv/company-brain cluster force-unlock '<LOCK_ID>'
 omnigraph --target file:///srv/company-brain \
   cluster apply --deployment-id '<DEPLOYMENT_ID>' --writers-stopped --json
 ```
+
+An S3 root works the same way inline, for example
+`--target s3://bucket/company-brain`; see
+[S3 cluster roots](../operations/s3-cluster-roots.md).
 
 Reconciliation uses captured input and exact publication evidence; it never
 replays an uncertain schema or graph-creation invocation. Unstarted schema or

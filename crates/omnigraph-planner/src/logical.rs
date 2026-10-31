@@ -458,12 +458,15 @@ pub struct ConsultedImage {
 
 /// One check of a load's validation: the committed image it consults (`None`
 /// when the delta alone decides it) and, once physical, how that image is
-/// read; `None` on a logical node.
+/// read; `None` on a logical node. An `edge_ri` check also says, once
+/// physical, where it probes (`probe`); every other check leaves it `None`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidateSpec {
     pub check: ValidateCheck,
     pub consults: Option<ConsultedImage>,
     pub access: Option<crate::cost::ValidateAccess>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<crate::cost::EndpointProbe>,
 }
 
 /// The write of a load plan: the target table at the version the base pins
@@ -1143,7 +1146,8 @@ pub(crate) fn csv_source_json(spec: &CsvSourceSpec) -> Value {
 }
 
 /// The judged table, then every check in refusal order: its own fields under
-/// the `check` tag, the consulted image and, once physical, the access.
+/// the `check` tag, the consulted image and, once physical, the access and,
+/// on an `edge_ri` check, where it probes.
 pub(crate) fn validate_json(table: &str, checks: &[ValidateSpec]) -> Value {
     let checks: Vec<Value> = checks
         .iter()
@@ -1152,6 +1156,9 @@ pub(crate) fn validate_json(table: &str, checks: &[ValidateSpec]) -> Value {
             value["consults"] = json!(spec.consults);
             if let Some(access) = spec.access {
                 value["access"] = json!(access);
+            }
+            if let Some(probe) = spec.probe {
+                value["probe"] = json!(probe);
             }
             value
         })

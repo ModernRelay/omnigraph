@@ -35,29 +35,32 @@ paths and a 64 MiB JSON response (allowing JSON escaping). Its HTTP deadline is
 120 seconds. Traversal, symlinks, conflicting paths and reserved directories
 are refused. `.git`, credentials and server-side control records are not
 downloaded, and no local routing context is created.
-The service requires cluster admission and `source_read`; an external repository
-binding must be checked out through its own Git provider instead.
+The service requires active membership and organization-wide `source_read`
+permission from WorkOS. An external repository binding must be checked out
+through its own Git provider instead.
 
 ## List cluster members
 
-Use the selected cluster target to list enrolled people:
+Use the selected cluster target to list active organization members:
 
 ```sh
 omnigraph cluster members list --target production
 omnigraph cluster members list --target production --json
 ```
 
-The command requires the selected cluster's `status` permission. It shows names,
-emails, stable principal IDs, cluster admission and this cluster's control grants.
-`--json` returns the API envelope.
-Name and email may be unavailable; stable IDs and enrollment remain visible.
-The list contains people with explicit cluster admission or a cluster-specific
-control grant, up to 1,000 members; exceeding the limit refuses instead of
-truncating. It does not list invitations or calculate effective graph permissions:
-applied Cedar policy authorizes graph operations separately. This command is
-read-only and does not invite people or change their permissions.
-Organization administrators use [team administration](managed-team.md) to invite,
-enroll and remove people through the same cached CLI login.
+The command requires the organization's current `status` permission. It shows
+provider user and membership IDs, available stable principal IDs, identity
+eligibility and organization-wide service permissions. Names and emails may be
+unavailable. A null principal means no stable identity mapping exists yet; it
+is not a missing enrollment requirement. `--json` returns the API envelope,
+including the provider observation time and expiry.
+
+The list derives from the cluster's owning organization, with a limit of 1,000
+provider memberships. An overflow or incomplete provider read refuses instead
+of truncating. This read-only command does not calculate effective graph
+permissions: applied Cedar policy authorizes those separately. Organization
+administrators use [team administration](managed-team.md) to invite and remove
+people and WorkOS to assign service roles.
 
 ## Create an empty cluster
 
@@ -84,7 +87,7 @@ omnigraph cluster operation OPERATION_ID --profile work --json
 omnigraph cluster operation OPERATION_ID --profile work --wait --timeout 600 --json
 ```
 
-Connections can observe creation before a cluster target exists. A cluster
+Profiles can observe creation before a cluster target exists. A cluster
 target can observe only an operation for its pinned cluster and incarnation.
 A `ready` cluster does not imply a reachable endpoint. The selected service must
 attest the route; this configuration rewrite does not qualify private/BYOC routes
@@ -122,6 +125,21 @@ omnigraph cluster plan --target production --rev NEW_COMMIT --json
 omnigraph cluster apply --target production --plan PREVIEW_ID --json
 ```
 
+`plan` waits for the accepted preview by reading its original ID. `--no-wait`
+returns the accepted record immediately; `--timeout SECONDS` bounds only the
+local wait (300 seconds by default). A timeout or disconnect does not cancel
+the preview or submit another one. Progress goes to stderr; stdout contains
+the final response, including the native plan when ready.
+
+The `plan` and `apply` submissions also stay open until that deadline, so a
+service that captures the preview before answering is not cut off. Each
+source lookup and poll keeps its own 10-second bound.
+
+To resume waiting, repeat `plan` with the same `--rev` and
+`--idempotency-key` printed by the first invocation. The original preview's
+deadline does not change. A `failed` or `expired` preview requires a fresh
+plan with a new key; its `failure_code` explains the terminal outcome.
+
 `push` uploads only `cluster.yaml`, referenced schemas, stored queries and
 policy files. Query-directory declarations discover immediate `.gq` files;
 they do not recurse. Unrelated files, folder context and credentials are not
@@ -149,8 +167,8 @@ omnigraph cluster delete --target production --incarnation INCARNATION \
   --idempotency-key customer-demo-delete --json
 ```
 
-Delete needs current scoped delete permission. It closes run and data-token
-issuance; the service then withdraws routing and verifies quiescence. The
+Delete needs current organization-wide `delete` permission. It closes new
+deployment and data-token issuance; the service then withdraws routing and verifies quiescence. The
 default undo interval is 86,400 seconds. With a nonzero interval, the command
 returns when the service confirms `tombstoned`, including its deadline and
 operation ID. Canonical `data.state` remains `running` until the service's
@@ -168,8 +186,9 @@ omnigraph cluster undo-delete --target production --incarnation INCARNATION \
   --deletion-id DELETE_OPERATION_ID --json
 ```
 
-Undo needs current delete, plan and apply permissions. It preserves the cluster
-identity and restores service through the normal bootstrap. The service decides
+Undo needs current organization-wide `delete` permission. It preserves the
+cluster identity and restores the retained service; it does not authorize a new
+configuration deployment. The service decides
 whether the retained window is still open; the CLI never clears retirement or
 creates a replacement. The configured target remains available after deletion for status and history.
 

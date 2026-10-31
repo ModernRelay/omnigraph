@@ -1,0 +1,1 @@
+- Graph diffs and branch reviews across several commits now read only the changed rows, flat in table size; the new `change_lineage` setting selects or verifies the row pairing (#969).

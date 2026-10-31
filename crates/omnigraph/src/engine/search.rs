@@ -155,6 +155,13 @@ pub(super) type ScanReports = std::collections::BTreeMap<NodeId, ScanReport>;
 #[derive(Debug, Default, Clone)]
 pub(super) struct ScanReport {
     pub(super) nearest_scan: Option<NearestScanReport>,
+    /// The scan's last attempt in this pass ranked exactly: no row it
+    /// admitted and did not return is nearer than a returned one. It was
+    /// proven empty, scored every admitted row flat (by the ladder's choice,
+    /// or for want of a vector index covering the column), searched every
+    /// partition of the IVF_FLAT index, or returned every admitted row, with
+    /// none left unreached. `false` when partitions went unsearched.
+    pub(super) exact: bool,
     /// Every Lance attempt of that nearest scan in this pass, in order: the
     /// probe cap it ran under and whether it scored flat.
     pub(super) probes: Vec<ProbeAttempt>,
