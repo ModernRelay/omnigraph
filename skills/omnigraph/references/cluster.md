@@ -36,10 +36,16 @@ selected root. Direct commands resolve a relative assertion against the source
 directory. Server submission requires an absolute assertion or no `storage:`.
 Omitting `storage:` never sends writes to the source directory.
 
-Registered direct targets pin a local filesystem URI. Inline direct targets
-also accept only local paths and `file://` URIs. To operate a cloud-backed
-cluster through the CLI, select a registered server or managed target;
-cloud storage settings and credentials belong to the serving or embedded host.
+Registered direct targets pin a local `file://` URI. Inline direct targets
+accept local paths and `file://` URIs and, with the server stopped, an inline
+`s3://` cluster root for `cluster plan`, `apply`, `status`, `force-unlock` and
+`upgrade-ledger` and for direct maintenance with `--graph` (region from
+`AWS_REGION`; see [S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)).
+Each such command keeps the cluster lock afterwards: read `lock_id` from
+`cluster status --json` and `force-unlock` it before the next writer or the
+server starts. Every other command and any `az://` address refuses an inline
+cloud target: select a registered server or managed target, whose host holds
+the cloud storage settings and credentials.
 
 ## Direct bootstrap
 
@@ -129,8 +135,7 @@ failure also leaves outcome uncertain, so retain the ID, root and lock.
 For recognized prior ledger formats or obsolete completed-result fields, stop
 all owners and run `cluster upgrade-ledger --target ROOT --writers-stopped`.
 This changes ledger representation only. Finish outstanding work with its
-originating build before upgrading. No legacy executor or automatic migration
-remains. Missing graph roots and schema drift require authoritative repair or
+originating build before upgrading. Missing graph roots and schema drift require authoritative repair or
 backup restoration; apply does not adopt or recreate them.
 
 ## Managed clusters

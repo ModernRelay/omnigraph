@@ -7,15 +7,23 @@ commands can instead open local graph storage directly when their help permits i
 
 ```bash
 export OMNIGRAPH_SERVER_BEARER_TOKENS_JSON='{"act-alice":"replace-with-a-secret"}'
-omnigraph-server --cluster ./company-brain --bind 127.0.0.1:8080
+omnigraph-server --cluster file:///absolute/company-data --bind 127.0.0.1:8080
 omnigraph-server --cluster s3://bucket/prefix --bind 0.0.0.0:8080
 ```
 
+A scheme-qualified `--cluster` (`file://`, `s3://`, `az://`) is the storage
+root `cluster apply` wrote. A bare path boots as a config directory, using its
+`cluster.yaml` `storage:` root, or the directory itself when none is declared.
+
 The server loads the cluster's applied revision and serves each graph under
-`/graphs/{graph_id}`. `cluster apply --target` activates schema and stored-query
-changes and new graphs without a restart; a direct `cluster apply` needs the
-server stopped. There is no single-graph server mode. A stopped server, even
-after a clean exit, leaves the cluster lock: once its writes have settled,
+`/graphs/{graph_id}`. `cluster apply --target <server>` activates schema,
+stored-query, policy, provider and Blob-rule changes, new graphs and graph
+removals without a restart; a direct `cluster apply` needs the server stopped.
+There is no single-graph server mode. On local and S3 roots a clean shutdown
+releases the server's cluster lock, and on S3 a restarted server takes over a
+crashed predecessor's lock through its lease. A local server that exited
+uncertainly, any Azure server, and every direct CLI writer (`cluster apply`,
+`load`, maintenance) keep the lock: once that owner's writes have settled,
 clear it with `cluster force-unlock <LOCK_ID>` before the next start (see
 [cluster mode](cluster.md)).
 
@@ -37,11 +45,13 @@ termination grace. Check rollout readiness with `GET /readyz`, not `/healthz`.
 | `/graphs/{graph_id}/mutate/if-graph-commit` | Conditional inline mutation (header `Omnigraph-If-Graph-Commit`) |
 | `/graphs/{graph_id}/queries` | List/invoke stored queries; `/queries/{query_name}/if-graph-commit` for conditional writes |
 | `/graphs/{graph_id}/load`, `/load/ndjson` | Bounded atomic loads |
-| `/graphs/{graph_id}/blob` | GET/HEAD one Blob cell |
-| `/graphs/{graph_id}/branches` | Branch operations and merge |
-| `/graphs/{graph_id}/snapshot`, `/commits` | Snapshot and history |
-| `/graphs/{graph_id}/commits/{commit}/changes` | One first-parent commit diff |
+| `/graphs/{graph_id}/blob` | GET/HEAD one Blob cell; PUT/DELETE replace or clear it (`change`) |
+| `/graphs/{graph_id}/branches` | Create, list (`?detailed=true` adds head, start and times), delete and merge (`dry_run: true` previews); `GET /branches/diff` and `/branches/merge-base` review a branch |
+| `/graphs/{graph_id}/snapshot`, `/commits` | Snapshot and paged history; `GET /commits?listing=unpublished\|unattached`, `POST /commits/{commit_id}/publish`, `DELETE /commits/{commit_id}` |
+| `/graphs/{graph_id}/commits/{commit}/changes`, `GET /graphs/{graph_id}/diff` | One first-parent commit diff; net change between two branches or commit ids |
 | `GET /graphs/{graph_id}/changes`, `POST /graphs/{graph_id}/changes/baseline` | Poll a feed or capture a baseline |
+| `GET /graphs/discovery` | Graph ids and names for any valid identity credential |
+| `/mcp` | MCP endpoint; see [MCP, OIDC sign-in and logs](#mcp-oidc-sign-in-and-logs) |
 | `/graphs/{graph_id}/schema` | Read the accepted schema |
 | `/graphs/{graph_id}/export` | Stream a branch snapshot |
 | `GET /graphs/{graph_id}/access` | The caller's actor and allowed actions (`?branch=`, `&target_branch=`); check before a write instead of learning from a 403 |
@@ -52,18 +62,19 @@ refused with `400 api_contract_mismatch` before graph access. Responses carry
 the same header. `/healthz`, `/readyz` and `/openapi.json` need none. Upgrade
 the CLI, server and HTTP clients together.
 
-`/read`, `/change`, `/ingest` and `POST /graphs/{graph_id}/schema/apply`
-are removed. Use `/query`, `/mutate`, `/load` and `cluster plan`/`cluster apply`
-respectively.
+There is no schema-apply route: change a served graph's schema with
+`cluster plan`/`cluster apply`.
 
 Canonical `/query` JSON includes the graph commit pinned with its rows when the
 read snapshot has an effective graph head; a fresh pre-commit graph can omit it. Exact
 write receipts and conditional semantics are summarized in
 [commit changes and feeds](changes.md). Blob delivery is in [Blob values](blobs.md).
 
-Canonical `/query` accepts `branch list`; `/mutate` accepts `branch create`,
-`branch delete` and `branch merge` with no request target, name or params. These
-return branch outcomes, not ordinary data-mutation receipts; see
+Canonical `/query` accepts `branch list` and the branch reads `branch diff`,
+`branch merge-base` and `branch merge … dry run`; `/mutate` accepts `branch
+create`, `branch delete`, `branch merge`, `commit publish` and `commit drop`
+with no request target, name or params, and `load csv` with the request
+`branch` as its target. Branch and commit statements return branch outcomes, not ordinary data-mutation receipts; see
 [branch statements](changes.md#branch-statements). `/schema` reports the graph's
 physical `system_columns`; GQ uses `@id`/`@src`/`@dst` on either storage vintage.
 
@@ -99,14 +110,40 @@ actions remain denied.
 
 Managed signed data credentials are a separate token source, enabled with
 `--data-token-trust <file>`. The trust file binds keys to the exact deployment;
-tokens select an immutable principal actor. An identity credential carries no
-permissions; a legacy restricted one also narrows current Cedar grants.
+tokens select an immutable principal actor. The server accepts only
+version-2 identity credentials, which carry no permissions; version-1
+restricted credentials are not accepted.
 That actor (`principal:<immutable-id>`) must itself be permitted by the applied
 Cedar policy, or every graph request is denied; an identity credential can
 still list graph ids through `GET /graphs/discovery`. Trust changes need a
 restart.
 Control-plane login does not grant data access. See
 [managed data credentials](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/managed-data.md).
+
+## MCP, OIDC sign-in and logs
+
+`/mcp` is mounted whenever the server has a credential source (static tokens,
+`--data-token-trust` or `--oidc-identity-trust`). It lists a tool for every
+non-streaming graph operation, writes included, and each call runs its HTTP
+route under the caller's actor and that route's Cedar action: narrow an
+agent's policy to keep it read-only. The `query` tool takes GQ source or a
+stored read's `name`. No server flag narrows the tool list; policy alone
+decides. List every non-loopback `Host` with `--mcp-allowed-host`. `/mcp`
+needs no `Omnigraph-Http-Api` header.
+
+`--oidc-identity-trust <file>` admits OIDC access tokens (for example an MCP
+client's OAuth sign-in) as `principal:<id>` actors and serves the
+protected-resource metadata. Tokens carry no permissions; applied Cedar
+decides. An unadmitted identity gets `403 not_admitted`, and an expired
+admission snapshot `503` with `Retry-After`; signing in again fixes neither.
+`GET /graphs/{graph_id}/access` also reports the token's OAuth `client_id`.
+
+Logs go to stdout (`OMNIGRAPH_LOG_FORMAT=json` for JSON, level from
+`RUST_LOG`). OTLP trace export is off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is
+set; JSON logs carry `trace_id`/`span_id`. A publication with an unknown
+outcome is logged with its graph commit in a `publication` field. See
+[MCP](../../../docs/user/operations/mcp.md) and
+[logs and traces](../../../docs/user/operations/observability.md).
 
 ## Cedar actions
 
@@ -116,7 +153,7 @@ Graph-scoped actions are:
 |---|---|
 | `read` | Queries, snapshots, branches, commits, Blob reads, and change polling |
 | `export` | Export and change-feed baseline capture |
-| `change` | Mutations and loads |
+| `change` | Mutations, loads, `load csv` (and its `explain` source probe), and Blob put/clear |
 | `schema_apply` | Schema changes: `cluster apply --target` needs it on each existing graph whose schema changes |
 | `branch_create`, `branch_delete`, `branch_merge` | Corresponding branch operation |
 | `commit_publish`, `commit_drop` | Publish or drop an unpublished commit; drop an unattached commit |
@@ -173,9 +210,9 @@ protected branches are the bundle's top-level `protected_branches: [main, …]`
 list. `invoke_query`, `graph_list` and `config_manage` take no branch scope.
 
 ```bash
-omnigraph policy validate --target . --graph knowledge
-omnigraph policy test --target . --graph knowledge --tests policy.tests.yaml
-omnigraph policy explain --target . --graph knowledge \
+omnigraph policy validate --target ./company-data --graph knowledge
+omnigraph policy test --target ./company-data --graph knowledge --tests policy.tests.yaml
+omnigraph policy explain --target ./company-data --graph knowledge \
   --actor act-alice --action read --branch main
 ```
 

@@ -17,15 +17,18 @@ graphs:
     queries: queries/            # discover every `query <name>` in queries/*.gq
 ```
 
-`queries` also accepts an explicit file list (`[a.gq, b.gq]`) or a fine-grained `name: { file: … }` map; an unparseable `.gq` or a duplicate query name across files fails `cluster validate`. A relative `queries` path must stay inside the config
+`queries` also accepts an explicit file list (`[a.gq, b.gq]`) or a fine-grained `name: { file: … }` map; an unparseable `.gq`, a query that does not type-check against the graph's desired schema, or a duplicate query name across files fails `cluster validate`. A relative `queries` path must stay inside the config
 directory: a `..` segment fails with `config_path_escape`, and a symbolic link
 on the path (or a symlinked discovered `.gq` file) fails with
 `config_path_symlink`. `cluster apply` publishes them to the content-addressed catalog, and the `--target` server type-checks and serves every applied query. Every applied query is listed.
 
-A standalone `branch create`, `branch delete`, `branch merge`, or `branch list`
-statement cannot be registered as a stored query. Registry files must contain
-named `query` declarations; `lint`, `cluster validate`, and server registry
-loading reject branch-statement files.
+Registry files must contain only named `query` declarations: a statement
+(`branch …`, `commit …`, `load csv`, `show`, `explain`) fails `lint`,
+`cluster validate` and server registry loading, and a `set`/`reset` line,
+which `lint` accepts, fails `cluster validate` and registry loading. A stored
+query runs under the server's process defaults: the invoke body takes no
+`settings` field, and `omnigraph query <name>` without `-e`/`--query` refuses
+`--set`.
 
 ## CLI
 
@@ -68,7 +71,8 @@ conditional form is `POST /graphs/{graph_id}/queries/{query_name}/if-graph-commi
 Stored reads share the [query result contract](queries.md#system-fields-and-result-values):
 system identities use `@id`, bare node projections return objects, null fields
 are omitted from JSON rows, and DateTime strings are UTC without a trailing
-`Z`. Check consumer expectations when upgrading the stored-query surface.
+`Z`. A ranked stored read also carries the `ranking` object
+([`search.md`](search.md#what-a-ranked-read-reports)). Check consumer expectations when upgrading the stored-query surface.
 
 ## Policy gating (`invoke_query`)
 
@@ -82,8 +86,13 @@ are omitted from JSON rows, and DateTime strings are UTC without a trailing
 ## MCP exposure
 
 Every applied query is listed in `GET /graphs/{graph_id}/queries`, which the
-MCP `queries` tool returns whole. MCP's `query` runs a stored read, and
-`mutate` runs a stored mutation when given its `name` and no `query`, through the conditional route when `if_graph_commit` is given.
+MCP `queries` tool returns whole (`mutation: true` marks a stored mutation).
+MCP's `query` tool takes either a stored read's `name` (gated `invoke_query`,
+then `read`) or GQ source in `query` (gated `read`, like `POST /query`), and
+refuses a stored mutation. `mutate` runs a stored mutation when given its
+`name` and no `query` (`invoke_query`, then `change`), through the conditional
+route when `if_graph_commit` is given. `/mcp` lists every tool whatever the
+caller's policy; a denied call returns the route's refusal.
 There is no per-query `mcp:` flag in cluster mode.
 
 ## Note on per-query authorization

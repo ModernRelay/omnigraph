@@ -24,6 +24,7 @@ edits.
 | Additive-only bulk | `load --mode append` | fails on key collision |
 | Replace complete batches by type | `load --mode overwrite` | **destructive for represented types**; absent types remain |
 | Bulk load onto a fresh review branch | `load --from main --mode merge --branch <name>` | forks `<name>` from `main`, loads onto it, leaves it for review |
+| Load one CSV object into one type | `mutate -e 'load csv "<uri>" into node:<Type> mode merge header'` | typed by the `.pg`; `omnigraph load` reads JSONL only; the source must sit under the graph's external Blob policy (a direct run admits its own `file://` directory) and within `load_source_max_bytes` |
 
 > **`--mode` is required** — there is no default. Overwrite is destructive, so
 > the CLI never picks a mode for you.
@@ -40,6 +41,10 @@ edits.
 > input path also limits its request body and decoded Arrow memory to 32 MiB,
 > including `overwrite`; ordinary streamed overwrite can exceed the keyed
 > envelope. Check the selected transport's limits before splitting an import.
+> Each 32 MiB allowance above, except the HTTP request body, is the
+> `write_max_bytes` setting (default 32 MiB). Raise it for a direct load with
+> `--set write_max_bytes=<bytes>` or `OMNIGRAPH_WRITE_MAX_BYTES`; a served JSONL
+> load uses the server's value and refuses `--set`.
 > Against a non-local
 > target, `--mode overwrite` (like `cleanup` and `branch delete`) requires
 > explicit `--yes` consent in non-interactive runs.
@@ -92,9 +97,7 @@ JSONL format:
 property and `data.__id` is refused. A legacy graph (physical `id`/`src`/`dst`)
 also accepts `data.id` as identity when top-level `id` is absent; supplying
 both identity placements is refused.
-Exports put entity `id` at the top level on both vintages. Before loading a
-predecessor export into a new graph, relocate its identity as described in
-[migration guidance](migrations.md).
+Exports put entity `id` at the top level on both vintages.
 
 `Date` accepts integer day counts or calendar-date strings; a datetime string is
 refused. `DateTime` accepts integer millisecond counts or datetime strings; a
@@ -170,6 +173,10 @@ omnigraph load --data delta.jsonl --branch staging-2026-04-14 --mode merge --tar
 # 3. Verify on the branch (reads can target --branch or --snapshot)
 omnigraph query recent_signals --query queries/signals.gq --branch staging-2026-04-14 --target $REPO
 
+# 3b. Review what changed and whether the merge would succeed (writes nothing)
+omnigraph branch diff staging-2026-04-14 --into main --target $REPO --json
+omnigraph branch merge staging-2026-04-14 --into main --dry-run --target $REPO --json
+
 # 4. Merge to main and delete the source only after publication
 omnigraph branch merge staging-2026-04-14 --into main --delete-branch --target $REPO
 ```
@@ -189,8 +196,8 @@ happens after a successful merge publication.
 
 Deleting a parent branch is supported while descendants remain. Logical deletion
 retains the native history descendants need; only explicit `cleanup` reclaims
-unretained table versions, retired refs, and table forks left by branches
-created under 0.11 or earlier. `optimize` does not perform that collection.
+unretained table versions, deleted branches' refs and table forks.
+`optimize` does not perform that collection.
 
 ### Merge conflicts
 
@@ -226,7 +233,11 @@ omnigraph branch merge recovery-2026-04-14 --into main --delete-branch --target 
 
 ```bash
 omnigraph branch create --from main <branch-name> --target $REPO
+omnigraph branch create fix/import --from-commit <commit-id> --target $REPO
 omnigraph branch list --target $REPO
+omnigraph branch list --detailed --target $REPO          # head, start commit, created/updated times
+omnigraph branch diff <branch-name> --into main --target $REPO --json
+omnigraph branch merge <branch-name> --into main --dry-run --target $REPO --json
 omnigraph branch merge <branch-name> --into main --delete-branch --target $REPO
 omnigraph branch delete <branch-name> --target $REPO
 ```
@@ -245,8 +256,12 @@ omnigraph commit list --target $REPO --branch main --json        # history
 
 `export` is the right tool for large-snapshot inspection — don't try to page through the whole graph with read queries.
 
-> **Cluster note:** the control plane owns schema/queries/policies; rows,
+> **Cluster note:** `cluster apply` owns schema/queries/policies; rows,
 > loads and branches use the same data commands with a registered server or
 > managed target and `--graph ID` (or its default graph). For direct local
-> access, select the cluster root with `--target ROOT --graph ID` and stop the
-> serving owner before writing. Cloud storage URIs are not CLI direct targets.
+> access, stop the server, select the cluster root with `--target ROOT --graph
+> ID`, and before restarting the server release the lock the direct write
+> keeps: read `lock_id` from `cluster status --target ROOT --json`, then
+> `cluster force-unlock <LOCK_ID> --target ROOT`. Data commands refuse an
+> inline cloud URI; an `s3://` root reaches only cluster and maintenance
+> commands.
