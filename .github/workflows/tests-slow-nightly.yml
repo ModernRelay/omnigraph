@@ -92,7 +92,7 @@ jobs:
             cli_cluster::managed_lifecycle_bad_acceptance_and_deadline_keep_recovery_identity \
             repro_issue_723::grouped_transfer_aggregation_streams_at_scale_issue_723 \
             repro_issue_703::expand_projection_avoids_offset_overflow_scale_issue_703 \
-            writes::mutation_keyed_write_row_cap_accepts_limit_and_rejects_one_over_pre_effect \
+            mutation_keyed_write_row_cap_accepts_limit_and_rejects_one_over_pre_effect \
             merge_fast_forward::hydration_chunks_stay_bounded_when_row_widths_step_up \
             merge_fast_forward::hydration_chunks_stay_bounded_when_wide_rows_interleave
           do
