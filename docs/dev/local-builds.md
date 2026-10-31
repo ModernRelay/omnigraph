@@ -1,6 +1,6 @@
 # Local builds
 
-**Audience:** anyone building or testing OmniGraph locally, often in many
+**Audience:** anyone building or testing Omnigraph locally, often in many
 worktrees at once
 **Authority:** how the workspace's build configuration is meant to be used;
 `.cargo/config.toml` and the scripts it and this page name are the source
