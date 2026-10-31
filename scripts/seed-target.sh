@@ -4,7 +4,8 @@
 # workspace crates instead of all ~770 dependencies. The clone shares disk
 # blocks with its source until either side rewrites a file.
 #
-# Run it from the new worktree. Source: $OMNIGRAPH_WARM_TARGET, else the
+# Claude Code runs it at session start (`.claude/settings.json`); run it by
+# hand from any other new worktree. Source: $OMNIGRAPH_WARM_TARGET, else the
 # `target/` of the repository's main worktree (the first `git worktree list`
 # entry). Keep that source warm with `cargo dev-build-tests` on `main`.
 #

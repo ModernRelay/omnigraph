@@ -22,7 +22,8 @@ demo/*.omni/
 
 # Local-only working files (not for the public repo)
 /archived/
-.claude/
+.claude/*
+!.claude/settings.json
 .idea/
 .worktrees/
 /CLAUDE.md

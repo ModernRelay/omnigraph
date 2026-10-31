@@ -129,10 +129,10 @@ changes the invariant.
 `protoc` is a build dependency. The engine directory is `crates/omnigraph`, but
 its Cargo package is `omnigraph-engine`.
 
-In a new worktree, run `sh scripts/seed-target.sh` once to clone a warm
-`target/`, and prefer the `cargo dev-test` / `dev-nextest` / `dev-clippy`
-aliases, which share one feature set; see
-[local builds](docs/dev/local-builds.md).
+In a new worktree, run `sh scripts/seed-target.sh` once before the first build
+to clone a warm `target/` (a Claude Code session-start hook already does), and
+prefer the `cargo dev-test` / `dev-nextest` / `dev-clippy` aliases, which share
+one feature set; see [local builds](docs/dev/local-builds.md).
 
 ```bash
 cargo build --workspace --locked

@@ -43,7 +43,9 @@ sccache's main branch as of 0.19), and Cargo runs every rustc, registry crates
 included, from the workspace root, so a compile in one worktree never hits an
 entry another worktree wrote. `SCCACHE_BASEDIRS` normalizes C and C++ only.
 
-`scripts/seed-target.sh`, run once in a new worktree, instead seeds its
+`scripts/seed-target.sh`, which Claude Code runs at session start through the
+checked-in `.claude/settings.json` hook and any other agent runs once in a new
+worktree before its first build, instead seeds its
 `target/` as an APFS copy-on-write clone (`cp -c -R -p`) of a warm checkout's
 `target/`: by default the repository's main worktree (the first
 `git worktree list` entry), or `$OMNIGRAPH_WARM_TARGET` when set. The clone
