@@ -875,7 +875,7 @@ mod render_tests {
 
     fn int(value: i64) -> IRExpr {
         IRExpr::Literal(
-            Literal::Integer(value),
+            Literal::Integer(i128::from(value)),
             crate::types::ExprType::from_prop(&crate::types::PropType::scalar(
                 crate::types::ScalarType::I64,
                 false,

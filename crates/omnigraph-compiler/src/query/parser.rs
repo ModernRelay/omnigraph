@@ -1567,7 +1567,7 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
                 .as_str()
                 .parse()
                 .map_err(|e| query_error_at(format!("invalid integer: {}", e), &inner))?;
-            Ok(Literal::Integer(n))
+            Ok(Literal::Integer(i128::from(n)))
         }
         Rule::float_lit => {
             let f: f64 = inner
