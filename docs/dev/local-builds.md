@@ -36,12 +36,15 @@ only that crate is built in this `target/`.
 
 ## Warm worktrees
 
-A cold `target/` costs a full dependency build and about 20 GB. sccache does
-not remove that cost across worktrees: its Rust cache key includes the
-compile's working directory (`src/compiler/rust.rs`, step 9, unchanged on
-sccache's main branch as of 0.19), and Cargo runs every rustc, registry crates
-included, from the workspace root, so a compile in one worktree never hits an
-entry another worktree wrote. `SCCACHE_BASEDIRS` normalizes C and C++ only.
+A cold `target/` costs a full dependency build and about 10 GB for the engine's
+test binaries alone. sccache removes only part of that cost across worktrees.
+Its Rust cache key includes the compile's working directory
+(`src/compiler/rust.rs`, step 9, unchanged on sccache's main branch as of
+0.19). Cargo runs a registry crate's rustc from that crate's own directory, so
+those compiles can hit, but runs every workspace crate from the workspace root,
+so the workspace crates, and everything they feed, miss in every new worktree.
+`SCCACHE_BASEDIRS` normalizes C and C++ only. sccache also never caches a
+proc-macro, a link or a build-script run, and those repeat in full.
 
 `scripts/seed-target.sh`, which Claude Code runs at session start through the
 checked-in `.claude/settings.json` hook and any other agent runs once in a new
