@@ -33,7 +33,8 @@ dev=$(df "$src_real" | awk 'NR == 2 { print $1 }')
 # worktree's checked-out sources, and Cargo would skip rebuilding a
 # workspace crate whose source differs from the warm checkout's.
 tmp="$dest.cloning.$$"
-if cp -c -R -p "$src_real" "$tmp" 2>/dev/null && mv "$tmp" "$dest" 2>/dev/null; then
+# A build that created `target/` meanwhile wins; `mv` would nest the clone.
+if cp -c -R -p "$src_real" "$tmp" 2>/dev/null && [ ! -e "$dest" ] && mv "$tmp" "$dest" 2>/dev/null; then
   echo "seed-target: cloned target/ from $src_real"
 else
   rm -rf "$tmp"
