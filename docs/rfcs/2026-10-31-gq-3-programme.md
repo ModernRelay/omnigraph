@@ -8,7 +8,7 @@ authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-10-31
 updated: 2026-10-31
-discussion: null
+discussion: "https://github.com/ModernRelay/omnigraph/pull/1213"
 supersedes: []
 superseded_by: []
 blocked_on:
