@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-16
-updated: 2026-10-25
+updated: 2026-10-30
 discussion: https://github.com/ModernRelay/omnigraph/pull/1017
 supersedes: []
 superseded_by: []
@@ -611,10 +611,10 @@ in a terminal. It connects to an existing server target:
   resource URI naming another graph, and lists only its graph. An agent that
   needs several graphs is configured with one bridge per graph.
 
-Write tools need two consents. The existing server is the ceiling: without
-`--mcp-allow-writes` it lists no write tools, and its applied policy still
-controls every call. The agent's configuration is the other: without `--write`,
-the bridge lists and admits only tools the server annotates `readOnlyHint`.
+Write tools need two consents. The server's applied policy is the ceiling: it
+lists every tool and authorizes each call under its HTTP route's action. The
+agent's configuration is the other: without `--write`, the bridge lists and
+admits only tools the server annotates `readOnlyHint`.
 Opening a graph in Studio does not give a connected agent write access. Tool
 logic, refusals and the write contract stay at the server; the bridge adds no
 tool and no serving mode.
@@ -680,7 +680,7 @@ server as a target. Four settings decide how complete a client's experience is:
 | Edits attributed to people | Named actors through `OMNIGRAPH_SERVER_BEARER_TOKENS_JSON`, `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` or `OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET`. A single `OMNIGRAPH_SERVER_BEARER_TOKEN` is the actor `default`. |
 | Edits at all | An applied graph policy granting the actor its write actions. Without one a static token only reads, which `omnigraph access` now shows before the first refused write. |
 | Listing the deployment's graphs | `graph_list` in the cluster policy. Without it a client opens the target's `default_graph` or the graph the person names; `/graphs/discovery` serves verified identities only. |
-| Agents over MCP | `--mcp-allowed-host <public host>`, because `/mcp` admits only loopback `Host` values by default (OIDC identity trust admits its resource's host by itself), and `--mcp-allow-writes` for write tools. |
+| Agents over MCP | `--mcp-allowed-host <public host>`, because `/mcp` admits only loopback `Host` values by default (OIDC identity trust admits its resource's host by itself). Write tools are listed by default; the policy for the agent's credential decides what it may write. |
 
 ## Design
 
@@ -1596,3 +1596,12 @@ proposal.
   credentials" for that case only: the rule stays in force for self-hosted
   OIDC servers and every other client, and the launcher's refusal of a managed
   target (the target table and Opening Studio) is unchanged.
+- 2026-10-30: The server's `--mcp-allow-adhoc` and `--mcp-allow-writes` boot
+  settings are removed ([RFC 0003](0003-mcp-server-surface.md), decision log
+  2026-10-29): `/mcp` lists every tool and the applied policy is the write
+  ceiling. Superseded sentences: "The existing server is the ceiling: without
+  `--mcp-allow-writes` it lists no write tools, and its applied policy still
+  controls every call"; the self-hosted table's "and `--mcp-allow-writes` for
+  write tools". The gap table's "write tools stay behind `--mcp-allow-writes`"
+  and "Admit them as write tools behind `--mcp-allow-writes`" are history of
+  the change this RFC closed, not the current ceiling.

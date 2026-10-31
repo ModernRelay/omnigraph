@@ -17,7 +17,8 @@ use omnigraph_compiler::types::Direction;
 use omnigraph_compiler::{
     SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_META, SYSTEM_COLUMNS_V3, SystemColumns,
 };
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::aggregate::AggregateSpec;
 use crate::bound::{BoundPlan, ValueTable};
@@ -1380,12 +1381,37 @@ impl From<DirectionMirror> for Direction {
     }
 }
 
+/// An integer outside the `i64` range, carried as its decimal text.
+///
+/// The pinned serde buffers no `i128` value, so a wide integer travels as a
+/// string. A text that is not an integer refuses the decode instead of
+/// becoming another value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WideInteger(i128);
+
+impl Serialize for WideInteger {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for WideInteger {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.parse::<i128>()
+            .map(WideInteger)
+            .map_err(D::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "literal", content = "value", rename_all = "snake_case")]
 pub enum LiteralMirror {
     Null,
     String(String),
     Integer(i64),
+    /// An integer outside the `i64` range, as its decimal text.
+    WideInteger(WideInteger),
     Float(f64),
     Bool(bool),
     Date(String),
@@ -1398,7 +1424,10 @@ impl From<&Literal> for LiteralMirror {
         match literal {
             Literal::Null => Self::Null,
             Literal::String(text) => Self::String(text.clone()),
-            Literal::Integer(value) => Self::Integer(*value),
+            Literal::Integer(value) => match i64::try_from(*value) {
+                Ok(value) => Self::Integer(value),
+                Err(_) => Self::WideInteger(WideInteger(*value)),
+            },
             Literal::Float(value) => Self::Float(*value),
             Literal::Bool(value) => Self::Bool(*value),
             Literal::Date(text) => Self::Date(text.clone()),
@@ -1413,7 +1442,8 @@ impl From<LiteralMirror> for Literal {
         match mirror {
             LiteralMirror::Null => Self::Null,
             LiteralMirror::String(text) => Self::String(text),
-            LiteralMirror::Integer(value) => Self::Integer(value),
+            LiteralMirror::Integer(value) => Self::Integer(i128::from(value)),
+            LiteralMirror::WideInteger(value) => Self::Integer(value.0),
             LiteralMirror::Float(value) => Self::Float(value),
             LiteralMirror::Bool(value) => Self::Bool(value),
             LiteralMirror::Date(text) => Self::Date(text),

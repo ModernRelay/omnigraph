@@ -360,7 +360,7 @@ async fn measure(
             ty: ty.clone(),
         },
         CompOp::Eq,
-        IRExpr::Literal(Literal::Integer(value), ty),
+        IRExpr::Literal(Literal::Integer(i128::from(value)), ty),
     )];
     let params = ParamMap::new();
     let read =

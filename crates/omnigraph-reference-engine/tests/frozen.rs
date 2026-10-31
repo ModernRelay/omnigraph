@@ -46,11 +46,11 @@ const FROZEN: &[(&str, &str)] = &[
     ),
     (
         "projection.rs",
-        "be11d4ce201b212c0e8e2963a5ad5f0e3b8cd874e033eefef24874f02d6a4631",
+        "98c6599a042a8eb79a7cb19a25812b48135f2bbcf077c4bf9c4fb6141d25f9be",
     ),
     (
         "query.rs",
-        "97ffde90e498a9b1568567cd1cc3dc2d284e9111360ce85abacb1a0b2341c1a1",
+        "1b70d771d32f1c3e2b848aa2f37f2c4c17c244e062db6f98743b0099c16c5602",
     ),
     (
         "table_store.rs",

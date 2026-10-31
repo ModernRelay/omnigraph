@@ -318,7 +318,7 @@ fn literal_round_trips(value: &Literal, source: Domain, target: Domain) -> bool 
                 };
                 float_round_trips(value, target)
             } else {
-                integer_round_trips(i128::from(*value), target)
+                integer_round_trips(*value, target)
             }
         }
         Literal::Float(value) => {
@@ -460,8 +460,8 @@ mod tests {
     fn literal_narrowing_is_exact_and_keeps_a_cast() {
         use ScalarType::*;
         for (owner, literal, source, expected) in [
-            (I32, Literal::Integer(i64::from(i32::MAX)), I64, I32),
-            (I32, Literal::Integer(i64::from(i32::MAX) + 1), I64, I64),
+            (I32, Literal::Integer(i128::from(i32::MAX)), I64, I32),
+            (I32, Literal::Integer(i128::from(i32::MAX) + 1), I64, I64),
             (U32, Literal::Integer(-1), I64, I64),
             (I64, Literal::Float(2_f64.powi(63)), F64, F64),
             (I64, Literal::Float(-2_f64.powi(63)), F64, I64),

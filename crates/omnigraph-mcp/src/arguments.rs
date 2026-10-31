@@ -57,17 +57,9 @@ pub struct CommitArguments {
 #[serde(deny_unknown_fields)]
 pub struct QueryArguments {
     pub graph: String,
-    pub name: String,
+    /// Ad-hoc GQ source. Without it, `name` names a stored read.
     #[serde(default)]
-    pub params: Option<serde_json::Map<String, Value>>,
-    #[serde(default)]
-    pub branch: Option<String>,
-}
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReadArguments {
-    pub graph: String,
-    pub query: String,
+    pub query: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -268,7 +260,6 @@ impl ToolRequest {
             "schema" => Ok(ToolCall::Schema(arguments_as(arguments)?)),
             "queries" => Ok(ToolCall::Queries(arguments_as(arguments)?)),
             "query" => Ok(ToolCall::Query(arguments_as(arguments)?)),
-            "read" => Ok(ToolCall::Read(arguments_as(arguments)?)),
             "snapshot" => Ok(ToolCall::Snapshot(arguments_as(arguments)?)),
             "access" => Ok(ToolCall::Access(arguments_as(arguments)?)),
             "branches_list" => Ok(ToolCall::BranchesList(arguments_as(arguments)?)),
@@ -314,7 +305,6 @@ pub enum ToolCall {
     Schema(GraphArguments),
     Queries(GraphArguments),
     Query(QueryArguments),
-    Read(ReadArguments),
     Snapshot(BranchArguments),
     Access(AccessArguments),
     BranchesList(BranchesListArguments),

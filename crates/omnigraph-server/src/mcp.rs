@@ -304,7 +304,7 @@ fn project_error(error: ApiError, write: bool) -> HostError {
 
 /// MCP refusals use the server's one error-code and disposition registry.
 fn protocol_error(error: ProtocolError, write: bool) -> ApiError {
-    let unknown = "The write keeps running and its outcome is unknown. Before replaying it, read the target (`read` or `snapshot`, comparing `graph_commit_id`) or list the branch with `commits_list`, and replay a `mutate` with `if_graph_commit`.";
+    let unknown = "The write keeps running and its outcome is unknown. Before replaying it, read the target (`query` or `snapshot`, comparing `graph_commit_id`) or list the branch with `commits_list`, and replay a `mutate` with `if_graph_commit`.";
     let wait_ended = |code, reason: &str| {
         let mut error = ApiError::new(code, format!("{reason} {unknown}")).after_owned_write();
         error.completion_uncertain = true;
@@ -395,31 +395,34 @@ impl ServerHost {
             }
             ToolCall::Query(args) => {
                 let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let body = serde_json::to_vec(&InvokeStoredQueryRequest {
-                    params: args.params.map(Value::Object),
-                    branch: args.branch,
-                    snapshot: None,
-                    expect_mutation: Some(false),
-                })
-                .map_err(|_| ApiError::bad_request("invalid query parameters"))?;
-                let output = handlers::server_invoke_query(
-                    state(),
-                    Extension(handle),
-                    Extension(input),
-                    Some(Extension(actor)),
-                    ApiPath(QueryNamePath {
-                        query_name: args.name,
-                    }),
-                    HeaderMap::new(),
-                    Bytes::from(body),
-                )
-                .await?;
-                bounded_result(&output.0)
-            }
-            ToolCall::Read(args) => {
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let Some(query) = args.query else {
+                    // A stored read, as `omnigraph query NAME` runs it.
+                    let name = args.name.ok_or_else(|| {
+                        ApiError::bad_request(
+                            "query needs `query` (GQ source) or `name` (a stored read)",
+                        )
+                    })?;
+                    let body = serde_json::to_vec(&InvokeStoredQueryRequest {
+                        params: args.params.map(Value::Object),
+                        branch: args.branch,
+                        snapshot: args.snapshot,
+                        expect_mutation: Some(false),
+                    })
+                    .map_err(|_| ApiError::bad_request("invalid query parameters"))?;
+                    let output = handlers::server_invoke_query(
+                        state(),
+                        Extension(handle),
+                        Extension(input),
+                        Some(Extension(actor)),
+                        ApiPath(QueryNamePath { query_name: name }),
+                        HeaderMap::new(),
+                        Bytes::from(body),
+                    )
+                    .await?;
+                    return bounded_result(&output.0);
+                };
                 let request = request_body(json!({
-                    "query": args.query,
+                    "query": query,
                     "name": args.name,
                     "params": args.params,
                     "branch": args.branch,

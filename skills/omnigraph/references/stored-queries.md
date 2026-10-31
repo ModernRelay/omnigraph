@@ -82,9 +82,8 @@ are omitted from JSON rows, and DateTime strings are UTC without a trailing
 ## MCP exposure
 
 Every applied query is listed in `GET /graphs/{graph_id}/queries`, which the
-MCP `queries` tool returns whole. MCP's `query` runs a stored read. With
-`--mcp-allow-writes`, `mutate` runs a stored mutation when given its `name` and
-no `query`, through the conditional route when `if_graph_commit` is given.
+MCP `queries` tool returns whole. MCP's `query` runs a stored read, and
+`mutate` runs a stored mutation when given its `name` and no `query`, through the conditional route when `if_graph_commit` is given.
 There is no per-query `mcp:` flag in cluster mode.
 
 ## Note on per-query authorization
