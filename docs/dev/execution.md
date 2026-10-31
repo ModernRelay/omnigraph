@@ -1136,7 +1136,10 @@ Cardinality counts the sources the delta can move out of bounds: the new
 source of every delta edge, the old committed source of every removed or moved
 edge, and, under a non-zero minimum, every source node row the delta writes. A
 source node row is recounted whether it is new or updated, as uniqueness and
-referential integrity recheck every row a delta writes. An overwritten edge
+referential integrity recheck every row a delta writes. Committed edges are
+counted per source in sorted filtered scans of at most 8,192 sources each,
+streamed and kept as one count per source, as the uniqueness probe chunks its
+keys, since a merge delta is not row-capped. An overwritten edge
 table's committed view is empty, so under a minimum every source of its
 replaced image holds only its delta edges: one bounded scan of the replaced
 image's source column keeps the smallest source the delta leaves without an

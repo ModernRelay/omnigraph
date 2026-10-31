@@ -779,38 +779,35 @@ pub(super) fn card_affected(
     affected
 }
 
-/// Count the merged edge-id set per affected src and report each bound it
-/// breaks, srcs in sorted order, `max` before `min`. A committed edge leaves
-/// its src when the delta deletes or re-places it; the coalesced delta edges
-/// then count at their last-wins src.
+/// Count the merged edges per affected src and report each bound it breaks,
+/// srcs in sorted order, `max` before `min`. `committed_counts` holds each
+/// src's committed edges the delta neither deletes nor re-places; the
+/// coalesced delta edges then count at their last-wins src.
 pub(super) fn card_violations<F>(
     edge_table: &str,
     edge_type: &EdgeType,
     plan: &CardPlan,
     affected: &HashSet<String>,
-    committed_for_affected: &[(String, String)],
+    committed_counts: &HashMap<String, u32>,
     sink: &mut F,
 ) -> Result<()>
 where
     F: FnMut(Violation) -> Result<()>,
 {
     let card = &edge_type.cardinality;
-    let removed_id_set: HashSet<&String> = plan.removed_ids.iter().collect();
-    let mut per_src: HashMap<&String, HashSet<&String>> = HashMap::new();
-    for (id, src) in committed_for_affected {
-        if removed_id_set.contains(id) || plan.delta_by_id.contains_key(id) {
-            continue;
-        }
-        per_src.entry(src).or_default().insert(id);
-    }
-    for (id, src) in &plan.delta_by_id {
-        per_src.entry(src).or_default().insert(id);
+    let mut delta_counts: HashMap<&str, u32> = HashMap::new();
+    for src in plan.delta_by_id.values() {
+        *delta_counts.entry(src.as_str()).or_insert(0) += 1;
     }
 
     let mut srcs: Vec<&String> = affected.iter().collect();
     srcs.sort();
     for src in srcs {
-        let count = per_src.get(src).map(|ids| ids.len() as u32).unwrap_or(0);
+        let count = committed_counts
+            .get(src.as_str())
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(delta_counts.get(src.as_str()).copied().unwrap_or(0));
         if let Some(max) = card.max {
             if count > max {
                 sink(cardinality_violation(

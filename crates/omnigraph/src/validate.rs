@@ -370,10 +370,10 @@ pub(crate) fn constraints_for(catalog: &Catalog) -> Vec<Constraint> {
     out
 }
 
-/// Keys per batched committed-uniqueness scan. Bounds the pushed-down filter
-/// size on the merge path (whose deltas are not row-capped); Mutation/Load
-/// deltas are already capped at this many rows, so they probe in one chunk.
-const UNIQUE_PROBE_CHUNK_KEYS: usize = 8_192;
+/// Keys per batched committed probe: uniqueness holders and `@card` edges.
+/// Bounds the pushed-down filter size, since a merge delta is not row-capped
+/// and a load holds many keyed batches of `KEYED_WRITE_MAX_ROWS` rows.
+const PROBE_CHUNK_KEYS: usize = 8_192;
 
 /// Index-backed view of committed target state for the merge delta's lookups.
 /// Every method reads the (indexed) target table via a structured `filter_expr`
@@ -583,7 +583,7 @@ impl<'a> CommittedState<'a> {
     }
 
     /// Committed holders of the `columns` tuples in `table_key`, holder lists in
-    /// scan order: `Probe` filters per [`UNIQUE_PROBE_CHUNK_KEYS`] chunk, `Scan`
+    /// scan order: `Probe` filters per [`PROBE_CHUNK_KEYS`] chunk, `Scan`
     /// reads the id and group columns once; both match exact tuples in Rust.
     async fn unique_holders(
         &self,
@@ -605,7 +605,7 @@ impl<'a> CommittedState<'a> {
             .collect();
         match access {
             AccessPath::Probe => {
-                for chunk in keys.chunks(UNIQUE_PROBE_CHUNK_KEYS) {
+                for chunk in keys.chunks(PROBE_CHUNK_KEYS) {
                     let wanted: HashSet<&Vec<String>> =
                         chunk.iter().map(|(canonical, _)| canonical).collect();
                     let batches =
@@ -642,34 +642,94 @@ impl<'a> CommittedState<'a> {
         Ok(holders)
     }
 
-    /// Committed edges `(id, src)` in `edge_table` matching `keys` on `key_col`
-    /// (id or src). Index-backed.
-    async fn committed_edges(
+    /// Committed edges `(id, src)` in `edge_table` whose id is one of `ids`,
+    /// probed in filtered scans of at most [`PROBE_CHUNK_KEYS`] ids each. An id
+    /// names at most one edge, so the result is bounded by `ids`.
+    async fn committed_edges_by_id(
         &self,
         edge_table: &str,
-        key_col: &str,
-        keys: &[String],
+        ids: &[String],
         system_columns: SystemColumns,
     ) -> Result<Vec<(String, String)>> {
         // No keys, no open: on the write path an open refreshes the branch
         // snapshot.
-        if keys.is_empty() {
+        if ids.is_empty() {
             return Ok(Vec::new());
         }
         let Some(ds) = self.open_cardinality(edge_table).await? else {
             return Ok(Vec::new());
         };
-        let expr = col(key_col).in_list(keys.iter().map(|k| lit(k.clone())).collect(), false);
-        let batches = scan_filtered(&ds, &[system_columns.id, system_columns.src], expr).await?;
         let mut out = Vec::new();
-        for batch in &batches {
-            let ids = string_col(batch, system_columns.id)?;
-            let srcs = string_col(batch, system_columns.src)?;
-            for i in 0..batch.num_rows() {
-                out.push((ids.value(i).to_string(), srcs.value(i).to_string()));
+        for chunk in ids.chunks(PROBE_CHUNK_KEYS) {
+            let expr = col(system_columns.id)
+                .in_list(chunk.iter().map(|id| lit(id.clone())).collect(), false);
+            let batches =
+                scan_filtered(&ds, &[system_columns.id, system_columns.src], expr).await?;
+            for batch in &batches {
+                let ids = string_col(batch, system_columns.id)?;
+                let srcs = string_col(batch, system_columns.src)?;
+                for i in 0..batch.num_rows() {
+                    out.push((ids.value(i).to_string(), srcs.value(i).to_string()));
+                }
             }
         }
         Ok(out)
+    }
+
+    /// Committed edges of `edge_table` per source among `srcs`, an edge whose
+    /// id `excluded` names (removed or re-placed by the change) left out.
+    /// The sources are probed in sorted filtered scans of at most
+    /// [`PROBE_CHUNK_KEYS`] each and the edges stream past batch by batch, so
+    /// memory holds one count per source, never the edges themselves.
+    async fn committed_source_counts(
+        &self,
+        edge_table: &str,
+        srcs: &HashSet<String>,
+        system_columns: SystemColumns,
+        excluded: impl Fn(&str) -> bool,
+    ) -> Result<HashMap<String, u32>> {
+        let mut counts = HashMap::new();
+        if srcs.is_empty() {
+            return Ok(counts);
+        }
+        let Some(ds) = self.open_cardinality(edge_table).await? else {
+            return Ok(counts);
+        };
+        let mut sorted: Vec<&String> = srcs.iter().collect();
+        sorted.sort();
+        for chunk in sorted.chunks(PROBE_CHUNK_KEYS) {
+            let expr = col(system_columns.src)
+                .in_list(chunk.iter().map(|src| lit((*src).clone())).collect(), false);
+            let projection = [system_columns.id, system_columns.src];
+            let mut stream = TableStore::scan_stream_with(
+                &ds,
+                Some(&projection),
+                None,
+                None,
+                false,
+                move |scanner| {
+                    scanner.filter_expr(expr);
+                    Ok(())
+                },
+            )
+            .await?;
+            while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+                let ids = string_col(&batch, system_columns.id)?;
+                let batch_srcs = string_col(&batch, system_columns.src)?;
+                for i in 0..batch.num_rows() {
+                    if excluded(ids.value(i)) {
+                        continue;
+                    }
+                    let count = counts
+                        .entry(batch_srcs.value(i).to_string())
+                        .or_insert(0u32);
+                    *count = count.checked_add(1).ok_or_else(|| {
+                        OmniError::manifest_internal("@card edge count overflows u32")
+                    })?;
+                }
+            }
+        }
+        Ok(counts)
     }
 
     /// The smallest source in `edge_table`'s image before this write that
@@ -1189,12 +1249,24 @@ where
                         .filter(|_| edge_type.cardinality.min > 0)
                         .filter(|change| change.value_batches().next().is_some());
                     if change.is_some() || written_sources.is_some() {
+                        let plan = match change {
+                            Some(change) => card_plan(change, system_columns)?,
+                            None => CardPlan::default(),
+                        };
+                        let written = match written_sources {
+                            Some(change) => delta_id_set(change, system_columns)?,
+                            None => HashSet::new(),
+                        };
+                        let deleted_src_nodes: HashSet<String> = changeset
+                            .get(&format!("node:{}", edge_type.from_type))
+                            .map(|change| change.deleted_ids.iter().cloned().collect())
+                            .unwrap_or_default();
                         evaluate_cardinality(
                             table_key,
                             edge_type,
-                            change,
-                            written_sources,
-                            changeset,
+                            &plan,
+                            &written,
+                            &deleted_src_nodes,
                             committed,
                             system_columns,
                             &mut emit,
@@ -1362,23 +1434,25 @@ async fn merged_node_existence(
     Ok(exist)
 }
 
-/// `@card` for an edge type, scoped to the srcs the change affects. The delta is
-/// coalesced by edge id (last-wins, as commit does); the merged edge set per src
-/// = (committed edges with that src, minus those deleted or re-placed by the
-/// delta) ∪ (coalesced delta edges with that src). The affected set includes the
-/// new src of each delta edge AND the old committed src of each changed/deleted
-/// edge id, so moving an edge off a src recounts the vacated src. Under a
-/// non-zero minimum it also includes every source node the write inserts or
-/// updates (`written_sources`), so a node written without its edges is counted,
-/// and an overwritten edge table takes [`evaluate_replaced_cardinality`]. A src
-/// that is itself a deleted node is skipped.
+/// `@card` for an edge type, scoped to the srcs the change affects: the one
+/// rule every write route counts by, the evaluator's and the `load csv`
+/// judge's alike. `plan` is the edge delta coalesced by edge id (last-wins, as
+/// commit does); the merged edge count per src = (committed edges with that
+/// src, minus those deleted or re-placed by the delta) + (coalesced delta edges
+/// with that src). The affected set includes the new src of each delta edge
+/// AND the old committed src of each changed/deleted edge id, so moving an edge
+/// off a src recounts the vacated src. Under a non-zero minimum it also
+/// includes every source node the write inserts or updates (`written`), so a
+/// node written without its edges is counted, and an overwritten edge table
+/// takes [`evaluate_replaced_cardinality`]. A src in `deleted_src_nodes` is
+/// skipped.
 #[allow(clippy::too_many_arguments)]
 async fn evaluate_cardinality<F>(
     edge_table: &str,
     edge_type: &EdgeType,
-    change: Option<&TableChange>,
-    written_sources: Option<&TableChange>,
-    changeset: &ChangeSet,
+    plan: &CardPlan,
+    written: &HashSet<String>,
+    deleted_src_nodes: &HashSet<String>,
     committed: &CommittedState<'_>,
     system_columns: SystemColumns,
     sink: &mut F,
@@ -1391,25 +1465,13 @@ where
     if card.is_default() {
         return Ok(());
     }
-    let plan = match change {
-        Some(change) => card_plan(change, system_columns)?,
-        None => CardPlan::default(),
-    };
-    let written = match written_sources {
-        Some(change) => delta_id_set(change, system_columns)?,
-        None => HashSet::new(),
-    };
-    let deleted_src_nodes: HashSet<String> = changeset
-        .get(&format!("node:{}", edge_type.from_type))
-        .map(|change| change.deleted_ids.iter().cloned().collect())
-        .unwrap_or_default();
     if card.min > 0 && committed.overwritten.contains(edge_table) {
         return evaluate_replaced_cardinality(
             edge_table,
             edge_type,
-            &plan,
-            &written,
-            &deleted_src_nodes,
+            plan,
+            written,
+            deleted_src_nodes,
             committed,
             system_columns,
             sink,
@@ -1423,47 +1485,34 @@ where
     // upsert that moves an edge's src vacates its old src, which must be
     // recounted or a drop below @card min is missed.
     let removed_edges = committed
-        .committed_edges(
-            edge_table,
-            system_columns.id,
-            &plan.removed_ids,
-            system_columns,
-        )
+        .committed_edges_by_id(edge_table, &plan.removed_ids, system_columns)
         .await?;
     let moved_from = committed
-        .committed_edges(
-            edge_table,
-            system_columns.id,
-            &plan.changed_ids,
-            system_columns,
-        )
+        .committed_edges_by_id(edge_table, &plan.changed_ids, system_columns)
         .await?;
     let affected = card_affected(
-        &plan,
+        plan,
         &removed_edges,
         &moved_from,
-        &written,
-        &deleted_src_nodes,
+        written,
+        deleted_src_nodes,
     );
     if affected.is_empty() {
         return Ok(());
     }
 
-    let affected_vec: Vec<String> = affected.iter().cloned().collect();
-    let committed_for_affected = committed
-        .committed_edges(
-            edge_table,
-            system_columns.src,
-            &affected_vec,
-            system_columns,
-        )
+    let removed: HashSet<&str> = plan.removed_ids.iter().map(String::as_str).collect();
+    let committed_counts = committed
+        .committed_source_counts(edge_table, &affected, system_columns, |id| {
+            removed.contains(id) || plan.delta_by_id.contains_key(id)
+        })
         .await?;
     card_violations(
         edge_table,
         edge_type,
-        &plan,
+        plan,
         &affected,
-        &committed_for_affected,
+        &committed_counts,
         sink,
     )
 }
@@ -1499,7 +1548,14 @@ where
         .await?;
     let mut affected = card_affected(plan, &[], &[], written, deleted_src_nodes);
     affected.extend(emptied);
-    card_violations(edge_table, edge_type, plan, &affected, &[], sink)
+    card_violations(
+        edge_table,
+        edge_type,
+        plan,
+        &affected,
+        &HashMap::new(),
+        sink,
+    )
 }
 
 #[cfg(test)]

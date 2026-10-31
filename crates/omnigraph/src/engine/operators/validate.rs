@@ -941,14 +941,14 @@ fn admit_validation(
             .iter()
             .any(|spec| matches!(spec.check, ValidateCheck::SourceCardinality { .. }))
         {
-            // The written ids as probe keys and their literals, a committed
-            // `(id, src)` pair per written node at the minimum, and the
-            // per-source count.
+            // The affected set (a copy of the written ids), its sorted probe
+            // keys, one chunk of literals at most, and one committed count
+            // per written node: the probe streams the edges and keeps none.
             memory.entries::<String>(rows)?;
+            memory.entries::<&String>(rows)?;
             memory.entries::<Expr>(rows)?;
-            memory.entries::<(String, String)>(rows)?;
-            memory.entries::<&String>(rows.saturating_mul(2))?;
-            memory.string(id_bytes.saturating_mul(4))?;
+            memory.entries::<(String, u32)>(rows)?;
+            memory.string(id_bytes.saturating_mul(3))?;
         }
     }
     Ok(())

@@ -581,6 +581,41 @@ async fn jsonl_load_refuses_a_source_node_without_its_required_edge() {
     assert_eq!(count_rows(&db, "edge:WorksAt").await, 2);
 }
 
+/// A write that counts more sources than one committed probe filters (8,192)
+/// counts them chunk by chunk. A node-table overwrite writes every row of its
+/// image, uncapped by the keyed-write row limit: 9,000 people who keep their
+/// committed WorksAt reload without a refusal, which needs the sources of the
+/// second chunk counted, and the same image with one more person who has none
+/// is refused for that person, who sorts into the second chunk.
+#[tokio::test]
+async fn card_minimum_counts_written_sources_across_probe_chunks() {
+    let people: Vec<String> = (0..9_000)
+        .map(|i| format!(r#"{{"type":"Person","data":{{"name":"p{i:05}"}}}}"#))
+        .collect();
+    let mut seed = vec![r#"{"type":"Company","data":{"name":"Acme"}}"#.to_string()];
+    seed.extend(people.iter().cloned());
+    seed.extend(
+        (0..9_000)
+            .map(|i| format!(r#"{{"edge":"WorksAt","from":"p{i:05}","to":"Acme","data":{{}}}}"#)),
+    );
+    let (_dir, db) = init_with(CARD_MIN_SCHEMA, &seed.join("\n")).await;
+
+    let mut reload = people.clone();
+    reload.push(r#"{"type":"Person","data":{"name":"p99999"}}"#.to_string());
+    let err = db
+        .load_jsonl(&reload.join("\n"), LoadMode::Overwrite)
+        .await
+        .expect_err("p99999 is written with no WorksAt");
+    assert_eq!(
+        err.to_string(),
+        "@card violation on edge WorksAt: source 'p99999' has 0 edges (min 1)"
+    );
+    db.load_jsonl(&people.join("\n"), LoadMode::Overwrite)
+        .await
+        .expect("every reloaded person keeps a committed WorksAt");
+    assert_eq!(count_rows(&db, "node:Person").await, 9_000);
+}
+
 /// An edge-table overwrite removes every committed edge its batch omits, so
 /// it must recount the sources those edges leave. Overwriting WorksAt with
 /// Bob's edge alone drops Alice to zero, below @card(1..). The overwritten
