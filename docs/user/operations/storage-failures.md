@@ -73,13 +73,15 @@ restart on failure (Railway `ON_FAILURE`, Kubernetes `restartPolicy: Always`).
 - The lock's owner renews the lease with heartbeat objects under
   `__cluster/lease/` every third of a lease. Heartbeats retry on their own, and
   one whose answer was lost counts once a retry finds it. When no heartbeat
-  is answered for two thirds of a lease, or a successor claims the lock, the
-  owner stops every storage write at once and exits 2 without releasing. A
-  server whose first heartbeat is not answered within that time does not
-  start serving.
+  is answered for two thirds of a lease, or a successor claims the lock, or
+  `lock.json` no longer names the owner (after a takeover or a
+  `cluster force-unlock` of its ID), the owner stops every storage write at
+  once and exits 2 without releasing. A server whose first heartbeat is not
+  answered within that time does not start serving.
 - A restarted server that finds the lock held watches those heartbeats. It
   refuses with `state_lock_held` while they continue, and takes the lock over
-  once they have been silent for a lease and a half.
+  once they have been silent for a lease and a half. A takeover leaves the
+  previous owner's lease directory, its claim and last heartbeats, in place.
 - The lease is 30 seconds by default, so a restart after a crash waits about
   45 seconds. `OMNIGRAPH_CLUSTER_LEASE_SECONDS` sets it between 2 and 600
   seconds; a successor waits on the value the owner recorded.

@@ -112,7 +112,7 @@ impl StateLockFile {
     }
 
     /// The released marker older binaries also read: version 2, no lease.
-    fn mark_released(mut self) -> Self {
+    pub(crate) fn mark_released(mut self) -> Self {
         self.version = RELEASED_LOCK_VERSION;
         self.release_id = Some(Ulid::new().to_string());
         self.lease_seconds = None;
@@ -134,6 +134,15 @@ impl StateLockFile {
     pub(crate) fn pid(&self) -> u32 {
         self.pid
     }
+}
+
+/// A held, leased serving record for `lock_id`, as an acquisition or a
+/// takeover writes it, for simulations that drive the lease directly.
+#[cfg(any(test, feature = "test-util"))]
+pub fn leased_lock_record(lock_id: &str, lease_seconds: u32) -> String {
+    let mut lock = StateLockFile::held(SERVE_OPERATION, StorageKind::S3, lease_seconds);
+    lock.lock_id = lock_id.to_owned();
+    serde_json::to_string_pretty(&lock).expect("a lock record encodes")
 }
 
 /// Result of storage-native conditional lock acquisition.
@@ -186,6 +195,7 @@ impl StateLockGuard {
                     let keeper = crate::lease::LeaseKeeper::start(
                         lease_adapter,
                         &root,
+                        &self.uri,
                         self.lock.lock_id(),
                         seconds,
                         lock_sent,
@@ -389,6 +399,10 @@ async fn acquire_state_lock_leased(
 /// the loser refuses. A replacement that does not apply leaves `lock.json` at
 /// that version, so the next start takes it over the same way. Returns when
 /// the replacement was sent, if it applied.
+///
+/// The previous owner's lease directory stays: an owner whose clock stopped
+/// through its silence resumes with its own deadline ahead, and its claim
+/// and the replaced record are what stop it at its next beat.
 #[allow(clippy::too_many_arguments)]
 async fn take_over(
     adapter: &Arc<dyn StorageAdapter>,
@@ -428,9 +442,6 @@ async fn take_over(
             successor = lock.lock_id(),
             "took over a silent owner's cluster lock"
         );
-        let _ = lease_adapter
-            .delete_prefix(&crate::lease::lease_dir(root, previous.lock_id()))
-            .await;
     }
     Ok(replaced.then_some(sent))
 }
@@ -729,9 +740,92 @@ mod tests {
                 .list_dir(&crate::lease::lease_dir(&root, &previous))
                 .await
                 .unwrap()
-                .is_empty(),
-            "the superseded owner's beats are removed"
+                .iter()
+                .any(|uri| uri.ends_with("/superseded.json")),
+            "the superseded owner's claim stays"
         );
+    }
+
+    /// An owner whose clock stopped, as in a suspended VM, misses the silence
+    /// a successor waited out: when it resumes, its own deadline is still
+    /// ahead. It must stop at its next beat all the same, before it admits a
+    /// lease's worth of work beside the successor. The takeover leaves the
+    /// claim in place, and the owner reads `lock.json` before each beat,
+    /// which never names it again, so it fences even when the lease
+    /// directory is gone, as an earlier binary's takeover left it. Each
+    /// process has a paused runtime of its own; the owner's is not driven
+    /// while the successor watches, so its clock and its beats stop.
+    #[test]
+    fn a_superseded_owner_whose_clock_stopped_fences_at_its_next_beat_issue_1067() {
+        const LEASE: u32 = 2;
+        let paused = || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .unwrap()
+        };
+        for directory_removed in [false, true] {
+            let (owner_runtime, successor_runtime) = (paused(), paused());
+            let store: Arc<dyn StorageAdapter> =
+                Arc::new(omnigraph_storage::ObjectStorageAdapter::in_memory());
+            let lock_uri = "/lease-tests/__cluster/lock.json";
+            let root = cluster_root_from_lock_uri(lock_uri).unwrap();
+            let acquire = || {
+                acquire_state_lock_leased(
+                    store.clone(),
+                    store.clone(),
+                    StorageKind::S3,
+                    lock_uri,
+                    SERVE_OPERATION,
+                    LEASE,
+                )
+            };
+            let StateLockAcquire::Acquired(owner) = owner_runtime.block_on(acquire()).unwrap()
+            else {
+                panic!("a fresh root is free");
+            };
+            let StateLockAcquire::Acquired(successor) =
+                successor_runtime.block_on(acquire()).unwrap()
+            else {
+                panic!("an owner whose clock stopped is silent, and is taken over");
+            };
+            let dir = crate::lease::lease_dir(&root, owner.lock_id());
+            if directory_removed {
+                successor_runtime
+                    .block_on(store.delete_prefix(&dir))
+                    .unwrap();
+            }
+            // The owner's clock resumes where it stopped.
+            let fenced = crate::lease::LeaseFence(owner.lease_fenced()).fenced();
+            let fence = owner_runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(u64::from(LEASE)), fenced)
+                    .await
+                    .ok()
+            });
+            assert_eq!(
+                fence,
+                Some(crate::lease::LeaseFenced::Superseded),
+                "directory removed: {directory_removed}"
+            );
+            let stored = successor_runtime
+                .block_on(store.read_text(lock_uri))
+                .unwrap();
+            assert_eq!(
+                StateLockFile::parse(&stored).unwrap().lock_id(),
+                successor.lock_id()
+            );
+            if !directory_removed {
+                assert!(
+                    successor_runtime
+                        .block_on(store.list_dir(&dir))
+                        .unwrap()
+                        .iter()
+                        .any(|uri| uri.ends_with("/superseded.json")),
+                    "the takeover keeps the claim"
+                );
+            }
+        }
     }
 
     /// A successor that claimed and then stopped before its if-match leaves

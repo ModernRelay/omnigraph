@@ -40,6 +40,7 @@ pub use lease::{LeaseFence, LeaseFenced};
 #[cfg(any(test, feature = "test-util"))]
 pub mod lease_protocol {
     pub use crate::lease::{LeaseKeeper, Watch, lease_dir, watch_and_claim};
+    pub use crate::state_lock::leased_lock_record;
 }
 pub use admission::{
     ClusterAdmission, ClusterAdmissionPurpose, acquire_cluster_admission, acquire_graph_admission,

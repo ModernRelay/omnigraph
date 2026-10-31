@@ -6839,13 +6839,16 @@ async fn dst_publication_requests_get_a_definite_outcome_issue_1067() {
 /// at a seeded moment that can fall before, during or after a successor's
 /// watch. A beat that lands during the watch sends the successor away, which
 /// is the safe direction; the successor that claims the lock does so only
-/// after a lease and a half of silence since the last beat it saw; and the
-/// dead owner's beats that land after the claim fence nothing: the
-/// successor keeps renewing, and a third process watching it refuses.
+/// after a lease and a half of silence since the last beat it saw, then
+/// replaces the record by if-match on the version it read; and the dead
+/// owner's beats that land after the claim fence nothing: the successor
+/// keeps renewing, and a third process watching it refuses.
 #[test]
 #[serial]
 fn dst_successor_takes_over_a_dead_owners_lease_issue_1067() {
-    use omnigraph_cluster::lease_protocol::{LeaseKeeper, Watch, lease_dir, watch_and_claim};
+    use omnigraph_cluster::lease_protocol::{
+        LeaseKeeper, Watch, lease_dir, leased_lock_record, watch_and_claim,
+    };
     use std::time::Duration;
     use tokio::time::Instant;
 
@@ -6863,10 +6866,27 @@ fn dst_successor_takes_over_a_dead_owners_lease_issue_1067() {
             let store: Arc<dyn omnigraph_storage::StorageAdapter> =
                 Arc::new(omnigraph_storage::ObjectStorageAdapter::in_memory());
             let root = "cluster";
-            let owner =
-                LeaseKeeper::start(store.clone(), root, "owner", SECONDS, Instant::now(), None)
-                    .await
-                    .expect("the owner's first beat lands");
+            let lock_uri = format!("{root}/{}", omnigraph_cluster::CLUSTER_LOCK_FILE);
+            let lock_sent = Instant::now();
+            store
+                .write_text(&lock_uri, &leased_lock_record("owner", SECONDS))
+                .await
+                .unwrap();
+            let (_, version) = store
+                .read_text_versioned(&lock_uri)
+                .await
+                .expect("the owner's record is visible");
+            let owner = LeaseKeeper::start(
+                store.clone(),
+                root,
+                &lock_uri,
+                "owner",
+                SECONDS,
+                lock_sent,
+                None,
+            )
+            .await
+            .expect("the owner's first beat lands");
             tokio::time::sleep(Duration::from_millis(rng.below(90_000))).await;
             drop(owner);
             let died = Instant::now();
@@ -6919,12 +6939,26 @@ fn dst_successor_takes_over_a_dead_owners_lease_issue_1067() {
                 "seed {seed}"
             );
 
+            let replaced = Instant::now();
+            assert!(
+                store
+                    .write_text_if_match(
+                        &lock_uri,
+                        &leased_lock_record("successor", SECONDS),
+                        &version
+                    )
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "seed {seed}: the successor's if-match applies"
+            );
             let successor = LeaseKeeper::start(
                 store.clone(),
                 root,
+                &lock_uri,
                 "successor",
                 SECONDS,
-                Instant::now(),
+                replaced,
                 None,
             )
             .await

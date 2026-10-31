@@ -316,26 +316,34 @@ On S3 roots a server's held lock is version 3 and carries `lease_seconds`
 (`lease.rs`, `state_lock.rs`); a CLI writer or deployment holds an unleased
 lock, because nothing would stop its writes when a lease fenced. Its owner
 creates `__cluster/lease/<lock_id>/beat-<seq>.json` put-if-absent every third
-of a lease, first before it admits work, and checks for
-`__cluster/lease/<lock_id>/superseded.json` before each beat. The lease's
+of a lease, first before it admits work. Before each beat it reads
+`__cluster/lease/<lock_id>/superseded.json` and `lock.json`, and sends the
+beat only when both reads answer, no claim exists and the record still holds
+its lock id; reads that get no answer are retried like an unanswered beat.
+The lease's
 requests go through the root outside the owner's storage scope, on a client
 with the backend's retries (`ClusterStore::lease_adapter`): a failed beat
 neither unsettles the scope nor stops when the scope closes for a release.
 A beat already present is the owner's own earlier request and counts from
-the first send of that beat; an unanswered beat is sent again after a
-quarter of a beat interval. A timer of its own fences the owner two thirds
-of a lease after the first send of its last acknowledged beat, or at once on
-a claim. The first beat races the same deadline counted from the send of the
-lock's own write, because a successor may count silence from the moment the
-record is visible; when it lapses, or the claim read after beat 0 finds a
-claim, acquisition fails and the server does not serve. A fence fences the
+the start of that beat's first attempt, before its reads; an unanswered beat
+is sent again after a quarter of a beat interval. A timer of its own fences
+the owner two thirds of a lease after the start of its last acknowledged
+beat, or at once on a claim or a record that no longer holds its lock id: a
+takeover, a release or an exact-ID unlock. The first beat races the same
+deadline counted from the send of the lock's own write, because a successor
+may count silence from the moment the record is visible; when it lapses, or
+the reads after beat 0 find a claim or a lost record, acquisition fails and
+the server does not serve. A fence fences the
 owner's storage scope (`StorageIoScope::fence`) before it is reported: every
 later request is refused, the parts and cleanup of an admitted multipart
 upload included, and every admitted request is cancelled, so the owner sends
 nothing after the fence however long its shutdown grace lasts. The server
 then closes admission and exits 2 without releasing. A
 serving acquisition that finds a version-3 lock watches the beat listing on
-its own monotonic clock. A new beat refuses it. An empty listing starts the
+its own monotonic clock, and counts silence only up to the send of a listing
+that found no newer beat: storage reads a listing no earlier than its send,
+so an answer that stalls, or that a paused successor reads late, proves no
+silence after that send. A new beat refuses it. An empty listing starts the
 silence and the first beat that appears restarts it, because the owner
 writes its lock before its first beat lands; an empty listing after a beat
 was seen refuses, like a new beat. A lease and a half of silence
@@ -345,7 +353,10 @@ replace `lock.json` by if-match on the version it first read. That if-match
 alone decides the next owner: of two successors, or of a successor and the
 owner's clean release (if-match on the version it read), exactly one
 applies. A successor that stops between its claim and its if-match leaves
-`lock.json` unchanged, so the next start takes it over the same way. A clean release stops
+`lock.json` unchanged, so the next start takes it over the same way. The
+takeover leaves the old lease directory, claim included: an owner whose
+clock stopped, as in a suspended VM, resumes with its timer still ahead, and
+the claim, or the replaced record, stops it at its next beat. A clean release stops
 beating, deletes the lease directory, then releases as above. The lease
 coordinates liveness only; requests a dead owner sent before it fenced are
 fresh keys, conditional publications or audited mutable keys, which the
