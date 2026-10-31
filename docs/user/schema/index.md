@@ -137,7 +137,7 @@ Schema apply refuses a new edge type with a non-zero minimum whose source node
 type already exists (`OG-MF-107`): its existing nodes have none of the new
 edges. Declare such an edge with its source type, or without a minimum.
 
-Earlier OmniGraph versions did not count inserted source nodes, so a graph they
+Earlier Omnigraph versions did not count inserted source nodes, so a graph they
 wrote can hold nodes below the minimum. Each is counted the next time a write
 inserts or updates it or changes its edges of the type, and a load that
 rebuilds the graph from an export refuses it. An orphan query lists them:

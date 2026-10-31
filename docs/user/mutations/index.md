@@ -92,8 +92,7 @@ visible on the target in one atomic step. See
   values (an upsert), and an unkeyed edge by delete and re-insert.
 
 All declared value, uniqueness, endpoint, and cardinality constraints are
-checked before publication; a node that a `@card` minimum requires edges for
-arrives in the same query or load as them ([edge cardinality](../schema/index.md#edge-cardinality)).
+checked before publication; a node a `@card` minimum needs edges for arrives with them in one query or load ([edge cardinality](../schema/index.md#edge-cardinality)).
 
 ## Bulk loading
 
@@ -191,9 +190,7 @@ is retained, and each staged-write input against `write_max_bytes`.
 
 Node ids derive from the `@key` as in a JSONL load; an edge's `from` and `to`
 are the canonical ids of its endpoints, so a single-property integer key is
-written as its decimal value. The statement never forks a branch. A node file
-carries no edges, so it cannot add a node that a `@card` minimum requires
-edges for.
+written as its decimal value. The statement never forks a branch.
 
 The source is a URI the engine reads under the graph's external Blob policy
 ([External Blob references](../clusters/config.md#external-blob-references)):

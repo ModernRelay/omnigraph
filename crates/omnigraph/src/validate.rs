@@ -1366,12 +1366,12 @@ async fn merged_node_existence(
 /// coalesced by edge id (last-wins, as commit does); the merged edge set per src
 /// = (committed edges with that src, minus those deleted or re-placed by the
 /// delta) ∪ (coalesced delta edges with that src). The affected set includes the
-/// new src of each delta edge AND the old src of each changed/deleted edge id
-/// (read from the pre-write image, an overwritten table included), so moving an
-/// edge off a src recounts the vacated src. Under a non-zero minimum it also
-/// includes every source node the write inserts or updates (`written_sources`),
-/// so a node written without its edges is counted. A src that is itself a
-/// deleted node is skipped.
+/// new src of each delta edge AND the old committed src of each changed/deleted
+/// edge id, so moving an edge off a src recounts the vacated src. Under a
+/// non-zero minimum it also includes every source node the write inserts or
+/// updates (`written_sources`), so a node written without its edges is counted,
+/// and an overwritten edge table takes [`evaluate_replaced_cardinality`]. A src
+/// that is itself a deleted node is skipped.
 #[allow(clippy::too_many_arguments)]
 async fn evaluate_cardinality<F>(
     edge_table: &str,

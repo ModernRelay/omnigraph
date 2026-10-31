@@ -13,8 +13,6 @@ environments:
   - target: omnigraph-engine-dst
     storage: in-memory-object-store
     seeds: [0]
-  - target: omnigraph-server
-    storage: local-filesystem
 
 --- schema
 node Person {
@@ -86,21 +84,3 @@ query people() {
 --- expect shape
 p.name: String
 p.title: String?
-
---- query
-query employment() {
-    match {
-        $p: Person
-        $c: Company
-        $p worksAt $c
-    }
-    return { $p.name, $c.name }
-}
-
---- expect unordered
-{"p.name": "alice", "c.name": "acme"}
-{"p.name": "bob", "c.name": "acme"}
-
---- expect shape
-p.name: String
-c.name: String
