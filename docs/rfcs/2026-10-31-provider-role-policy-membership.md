@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-10-31
-updated: 2026-10-31
+updated: 2026-11-01
 discussion: null
 supersedes: []
 superseded_by: []
@@ -148,7 +148,8 @@ validation.
 - Snapshot validation mirrors OIDC admission: exact binding to the served
   root and identity, positive monotonic revision, `expires_at - generated_at`
   at most 300 seconds, 30 seconds of clock skew, local reload every five
-  seconds, at most 256 KiB, 1,000 members, 32 roles per member and 128-byte
+  seconds, at most 256 KiB, 1,000 members, 256 roles per member (the
+  role-set limit of [RFC 0059](0059-config-cli-coherency.md)) and 128-byte
   slugs with the provider's slug alphabet.
 - An invalid refresh leaves the previous snapshot usable only until its own
   expiry. After expiry, role-derived membership is empty. Literal
@@ -211,6 +212,26 @@ membership with no stored-state migration.
 - Explain and access routes distinguish literal and role-derived groups.
 - Engine-direct writers ignore role-derived membership.
 
+## Related RFCs
+
+- [Identity credentials and applied policy authorization](2026-09-09-identity-credentials-and-applied-policy.md):
+  the snapshot reuses its OIDC admission model (binding, revision, lifetime,
+  reload and size bounds) and keeps its rule that credentials carry no groups
+  or grants. Its sentence that admission has no Cedar groups stays true:
+  membership is a separate file. On acceptance, that RFC gets a disposition
+  note pointing here.
+- [RFC 0059](0059-config-cli-coherency.md): the managed CLI's
+  `organization members set --role` already says the identity provider owns
+  role definitions and service roles. This RFC lets the same role slugs
+  select policy groups; it adds no role command and no grant command.
+- Open drafts on finer authority: [#951](https://github.com/ModernRelay/omnigraph/pull/951)
+  and [#1210](https://github.com/ModernRelay/omnigraph/pull/1210) model
+  memberships as rows in the graph, for data audiences. Those are graph data
+  that the graph's owner writes. Provider roles are identity facts the
+  provider owns, and they select policy groups. A deployment can use both;
+  neither replaces the other. [#1197](https://github.com/ModernRelay/omnigraph/pull/1197)
+  grants queries through Cedar; its grants can name the same groups.
+
 ## Rollout
 
 Ship parsing and evaluation behind the absent flag. A deployment enables it
@@ -230,5 +251,7 @@ provider observation, pagination and outage behavior.
 
 ## Decision log
 
+- 2026-11-01: related RFCs reviewed; the per-member role bound raised from
+  32 to 256 to match the managed role-set limit.
 - 2026-10-31: drafted. The publisher lists only actors holding a referenced
   role, and over-bound snapshots refuse rather than truncate.

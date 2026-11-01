@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-10-31
-updated: 2026-10-31
+updated: 2026-11-01
 discussion: null
 supersedes: []
 superseded_by: []
@@ -122,9 +122,15 @@ Non-goals:
   reads on any graph its actor may read, and nothing else.
 - `GET /graphs/{graph_id}/access` reports the intersection, and states that a
   ceiling narrowed the result.
-- A refusal caused by the ceiling uses the existing permission-denied shape
-  with a distinct reason, so a client can ask the user for more scope instead
-  of reporting a policy gap.
+- A refusal caused by the ceiling answers 403 with code `ceiling_exceeded`
+  in the ordinary error body, and a typed detail naming the scope the action
+  needs. A policy denial keeps 403 `forbidden`, so a client can ask the user
+  for more scope instead of reporting a policy gap. When OIDC is configured,
+  the response also carries `WWW-Authenticate: Bearer
+  error="insufficient_scope"` with that scope (RFC 6750), which MCP clients
+  use to ask for consent to a wider scope.
+- `/mcp` keeps listing every tool, as [RFC 0003](0003-mcp-server-surface.md)
+  requires; a call outside the ceiling refuses.
 - Graph discovery stays independent of policy and ceiling, as now.
 - A change made through a delegated credential records the user as actor and
   the client as delegate.
@@ -149,7 +155,10 @@ Scopes do not imply each other. A writer that must also read lists both.
 Bulk `export` is separate from `graph.read` so a read-only agent cannot take
 a full copy of a graph. The table covers every action in the current policy
 vocabulary; a new action is uncovered by any ceiling until the vocabulary
-version that names it.
+version that names it. The open `maintain` and `reclaim` actions
+([#1175](https://github.com/ModernRelay/omnigraph/pull/1175))
+would get `graph.maintain` and `graph.reclaim` in the version that follows
+their release.
 
 ### Signed credentials
 
@@ -265,6 +274,38 @@ support means refusing version 3 again; no stored state changes.
 - Audit records carry the delegate and policy ignores it.
 - Access route reports the intersection and the narrowing.
 
+## Related RFCs
+
+- [Identity credentials and applied policy authorization](2026-09-09-identity-credentials-and-applied-policy.md):
+  this RFC is the restricted delegation that RFC deferred. It keeps version 2
+  identity-only and enables the disabled delegated OIDC profile only through
+  `delegation: act`. On acceptance, that RFC gets a disposition note naming
+  the sentence that delegated profiles remain disabled.
+- [RFC 0003](0003-mcp-server-surface.md): says an operator who wants an
+  agent narrower than a person "grants the agent's credential less". That
+  holds for agents with their own principal; a ceiling covers agents signed
+  in as a person. On acceptance, RFC 0003 gets a disposition note. Its rule
+  that every tool is listed and visibility is not permission is unchanged.
+- [HTTP API conventions](2026-10-19-http-api-conventions.md): the refusal
+  uses its single error body; `ceiling_exceeded` is a new code beside
+  `forbidden`.
+- [Operator profiles and credential providers](2026-10-20-operator-connections-and-credential-providers.md):
+  the managed exchange keeps issuing identity credentials without a ceiling.
+  A profile that wants a delegated credential is a later extension.
+- Open drafts on finer authority, which narrow data rather than actions:
+  - [#1210](https://github.com/ModernRelay/omnigraph/pull/1210) (views and
+    reach) also defines delegated credentials, with the agent as actor, the
+    person as subject, Cedar checked for both, and a data `over`. That
+    conflicts with this RFC's identity rule (the person is the actor and the
+    agent a delegate that policy never matches). One must be chosen before
+    either is accepted; the action ceiling and a data `over` can share one
+    credential.
+  - [#951](https://github.com/ModernRelay/omnigraph/pull/951) (actor views)
+    and [#1197](https://github.com/ModernRelay/omnigraph/pull/1197) (query
+    contracts and Cedar grants) restrict what an actor's queries can see or
+    run. A ceiling composes with either: it is checked before their filters
+    and never widens them.
+
 ## Rollout
 
 Ship parsing and evaluation first. Issuers emit version 3 only for client
@@ -278,9 +319,14 @@ qualifying their MCP clients' consent and scope flows.
 - Whether `graph.write` should split merge and publish from ordinary changes.
 - Whether policy should later be able to name delegates, for example to
   deny a specific client.
+- Which identity rule wins against #1210: the person as actor with the agent
+  as delegate, or the agent as actor with the person as subject.
 
 ## Decision log
 
+- 2026-11-01: related RFCs reviewed: refusal code aligned with the HTTP
+  conventions, maintenance actions noted, the identity conflict with #1210
+  recorded as unresolved.
 - 2026-10-31: drafted. Delegation through `act`, delegate attribution and
   the 300-second bound for delegated credentials added after reviewing WorkOS
   Agent Registration and Agent Auth token shapes.
