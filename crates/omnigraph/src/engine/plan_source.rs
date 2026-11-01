@@ -926,7 +926,7 @@ query people() { match { $p: Person } return { count($p) as n } }
             )
             .await
             .unwrap();
-        session.ensure_indices().await.unwrap();
+        session.ensure_indices_as(None).await.unwrap();
         let settings = SessionSettings::default();
         let (view, catalog) = db
             .capture_read_view(ReadTarget::branch("main"))

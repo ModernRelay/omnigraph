@@ -413,7 +413,7 @@ async fn indexed_single_hop_switches_to_the_csr_between_input_batches() {
     db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.optimize().await.unwrap();
+    db.optimize_as(None).await.unwrap();
     let v2 = with_setting(&db, "engine", "v2");
 
     let pinned = first_column_sorted(
@@ -1187,7 +1187,7 @@ edge Likes: Person -> Doc
     )
     .await
     .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     for (source, name, params) in [
         (ADULTS, "adults", int_params(&[("min", 18)])),
         (RANKED, "ranked", params(&[("q", "graph")])),

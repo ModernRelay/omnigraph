@@ -36,7 +36,7 @@ async fn repeated_merge_keeps_its_selected_base_through_cleanup() {
     for age in 1..=3 {
         set_age(&db, "source", "p", age).await;
         set_age(&db, "target", "q", age).await;
-        let rows = db.cleanup(keep_one()).await.unwrap();
+        let rows = db.cleanup_as(keep_one(), None).await.unwrap();
         assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
         let reopened = helpers::session(Omnigraph::open(uri).await.unwrap());
         assert_eq!(
@@ -106,7 +106,7 @@ async fn imported_merge_base_survives_owner_retirement_and_recreation() {
                     .starts_with("zz-unrelated.")
             })
             .expect("unrelated retirement archive exists before cleanup");
-        let rows = db.cleanup(keep_one()).await.unwrap();
+        let rows = db.cleanup_as(keep_one(), None).await.unwrap();
         assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
         assert!(
             !unrelated.exists(),

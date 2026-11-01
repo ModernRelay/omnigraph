@@ -28,7 +28,7 @@ pub async fn initialize_local_fixture(
     let optimized_user_tables = match plan.compaction_recency {
         CompactionRecency::Optimized => {
             let outcomes = db
-                .optimize()
+                .optimize_as(None)
                 .await
                 .map_err(|error| fixture_error(format!("optimize fixture main branch: {error}")))?;
             let intended_keys = (0..plan.node_tables())

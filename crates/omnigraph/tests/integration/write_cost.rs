@@ -38,7 +38,7 @@ use crate::helpers::{
 // `_graph_commits`/`_graph_commit_actors` tables are retired), so the manifest scan
 // also covers the lineage and actor rows the authenticated write path appends.
 // Without internal-table compaction these scans are O(fragments) and grow forever;
-// step 2 brings the internal tables into `db.optimize()`, so after compaction the
+// step 2 brings the internal tables into `db.optimize_as(None)`, so after compaction the
 // per-write scan is flat. The test runs the **authenticated (actorful) write path**
 // — every commit carries an actor — and compacts at each depth checkpoint before
 // measuring, pinning the production invariant "a periodically-compacted graph's
@@ -62,7 +62,7 @@ async fn internal_table_scans_are_flat_in_history() {
             }
             // Step 2: compaction folds all three internal tables' O(depth) fragments back
             // to a small constant, so the following write's scan of them is flat.
-            db.optimize().await.unwrap();
+            db.optimize_as(None).await.unwrap();
             let io = measure_insert_as(&db, &format!("lock_{d}"), ACTOR).await;
             current += 1; // the measured write advanced depth by one
             eprintln!(
@@ -87,7 +87,7 @@ async fn compacted_graph_at_depth(depth: u64) -> (u64, tempfile::TempDir, helper
     let dir = tempfile::tempdir().unwrap();
     let db = local_graph(&dir).await;
     commit_many(&db, depth as usize).await;
-    db.optimize().await.unwrap();
+    db.optimize_as(None).await.unwrap();
     (depth, dir, db)
 }
 
@@ -106,7 +106,7 @@ async fn ensure_indices_manifest_reads_are_flat_in_history() {
         for (depth, _dir, db) in [graphs.0, graphs.1] {
             let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
             db.apply_schema(&indexed_schema).await.unwrap();
-            let (result, io) = measure(db.ensure_indices()).await;
+            let (result, io) = measure(db.ensure_indices_as(None)).await;
             result.unwrap();
             eprintln!(
                 "ensure_indices depth~{depth}: __manifest={} data={}",
@@ -147,7 +147,7 @@ async fn ensure_indices_writes_no_control_object() {
 
     let before_write_text = counts.write_text();
     let before_delete = counts.delete();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     assert_eq!(
         counts.write_text() - before_write_text,
         0,
@@ -274,7 +274,7 @@ async fn optimize_writes_no_control_object() {
 
     let before_write_text = counts.write_text();
     let before_delete = counts.delete();
-    let stats = db.optimize().await.unwrap();
+    let stats = db.optimize_as(None).await.unwrap();
     assert!(
         stats
             .iter()
@@ -310,7 +310,7 @@ async fn optimize_manifest_reads_are_flat_in_history() {
             commit_many(&db, 3).await;
 
             let commits_before = db.list_commits(None).await.unwrap().len();
-            let (result, io) = measure(db.optimize()).await;
+            let (result, io) = measure(db.optimize_as(None)).await;
             result.unwrap();
             assert_eq!(
                 db.list_commits(None).await.unwrap().len(),
@@ -357,7 +357,7 @@ async fn internal_table_scans_are_flat_without_compaction() {
                 commit_many_as(&db, (d - current) as usize, ACTOR).await;
                 current = d;
             }
-            // NO `db.optimize()` here — that omission is the whole point. The flat gate
+            // NO `db.optimize_as(None)` here — that omission is the whole point. The flat gate
             // above compacts before measuring and so never exercises this served regime.
             let io = measure_insert_as(&db, &format!("served_{d}"), ACTOR).await;
             current += 1; // the measured write advanced depth by one

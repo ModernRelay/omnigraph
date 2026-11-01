@@ -141,7 +141,7 @@ async fn ranked_read_with_join_returns_top_limit_issue_563() {
         db.load_jsonl(&edges, LoadMode::Append).await.unwrap();
     }
 
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
 
     // The ranked read without the join stays under the i32 offset ceiling.
     let no_join = query_main(

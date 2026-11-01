@@ -2121,6 +2121,9 @@ fn access_slot(action: omnigraph_policy::PolicyAction) -> Option<AccessSlot> {
         P::InvokeQuery => Some(AccessSlot::GraphWide),
         // Server- or operator-scoped: no graph's access report names them.
         P::Admin | P::GraphList | P::ConfigManage => None,
+        // Maintenance runs only through the direct CLI and embedded callers;
+        // no served operation performs it, so the report does not name it.
+        P::Maintain | P::Reclaim => None,
     }
 }
 

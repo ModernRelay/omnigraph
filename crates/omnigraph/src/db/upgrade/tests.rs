@@ -2784,7 +2784,7 @@ async fn cleanup_after_upgrade_with_keep_four_and_older_than() {
         .collect();
     assert_eq!(links.len(), 1, "{links:?}");
     for (round, options) in [week, keep(4)].into_iter().enumerate() {
-        let stats = graph.cleanup(options).await.unwrap();
+        let stats = graph.cleanup_as(options, None).await.unwrap();
         let reclaimed = |table_key: &str| {
             if round == 0 && table_key == PERSON {
                 links.len() as u64
@@ -2832,7 +2832,7 @@ async fn merge_with_legacy_base_pins_and_collector_keeps_it() {
         "the merge base of feature and main pins Person version {}: {roots:?}",
         source.a_root
     );
-    let stats = graph.cleanup(keep(1)).await.unwrap();
+    let stats = graph.cleanup_as(keep(1), None).await.unwrap();
     assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
 
     session(&graph)
@@ -2929,7 +2929,7 @@ async fn leftover_merge_input_tag_on_bookkeeping_version_resolves() {
         roots.is_superset(&[source.b_root, source.c_root].into()),
         "{roots:?}"
     );
-    let stats = graph.cleanup(keep(1)).await.unwrap();
+    let stats = graph.cleanup_as(keep(1), None).await.unwrap();
     assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
     assert_eq!(
         open(root, None)

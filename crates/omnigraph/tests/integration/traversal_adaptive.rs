@@ -83,7 +83,7 @@ async fn clique_db(dir: &tempfile::TempDir) -> Session {
         .unwrap();
     // The endpoint BTREEs must exist, or dispatch prices a degraded scan and
     // takes CSR outright — the switch under test would never arm.
-    db.optimize().await.unwrap();
+    db.optimize_as(None).await.unwrap();
     db
 }
 
@@ -189,7 +189,7 @@ query far($name: String) {
     jsonl.push('\n');
     let db = session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
     db.load_jsonl(&jsonl, LoadMode::Overwrite).await.unwrap();
-    db.optimize().await.unwrap();
+    db.optimize_as(None).await.unwrap();
 
     let p = params(&[("$name", "p0")]);
     let csr_db = with_traversal(&db, Traversal::Csr);
@@ -322,7 +322,7 @@ async fn corrupt_artifact_falls_back_to_the_scan_build() {
 async fn stale_artifact_is_rejected_after_an_edge_write() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
-    db.optimize().await.unwrap();
+    db.optimize_as(None).await.unwrap();
     let artifact = dir.path().join("__graph_index/csr-current.bin");
     assert!(artifact.is_file());
 

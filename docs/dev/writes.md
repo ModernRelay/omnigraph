@@ -598,6 +598,15 @@ callers must pass one when a policy checker is installed. Actor attribution
 travels with the pre-minted graph lineage and is published with the same
 manifest CAS.
 
+Maintenance has no actor-less public form. `optimize_as`, `ensure_indices_as`,
+`ensure_indices_on_as` and `rebuild_full_text_indices_on_as` check `maintain`
+on the branch they maintain, `main` for optimize; the full-text rebuild also
+admits `change`, its grant before `maintain` existed (`Omnigraph::enforce_any`,
+`PolicyChecker::check_any`). `cleanup_as` checks `reclaim` with no branch, and
+the read-only `repair_report_as` checks `maintain` on `main`.
+`forbidden_apis.rs::maintenance_entry_points_take_an_actor` keeps every
+registered maintenance surface an `_as` form with an `actor` parameter.
+
 Bearer authentication (`401 unauthorized`), the HTTP contract check
 (`400 api_contract_mismatch`) and policy (`403 forbidden`) refuse a served
 write only before its first durable effect. The server runs

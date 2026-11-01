@@ -956,10 +956,13 @@ async fn assert_cached_borrower_survives_branch_delete(
             "{branch} payload changed"
         );
     }
-    db.cleanup(omnigraph::db::CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    db.cleanup_as(
+        omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
     assert!(
@@ -995,10 +998,13 @@ async fn assert_cached_borrower_survives_branch_delete(
         .unwrap();
     let recreated_pin = helpers::pinned_version(writer, "feature", "node:Person").await;
     assert_ne!(recreated_pin, source_pin);
-    db.cleanup(omnigraph::db::CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    db.cleanup_as(
+        omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
     let pins = helpers::collector::detached_versions(&table_uri).await;

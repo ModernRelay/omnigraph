@@ -8,7 +8,10 @@
 //! PR #2 wired `apply_schema_as`. PR #3 fans the same `enforce()` call
 //! out to the remaining six writers — `mutate_as`, `load_as`,
 //! `ingest_as`, `branch_create_as` / `branch_create_from_as`,
-//! `branch_delete_as`, `branch_merge_as`. Each writer pair below
+//! `branch_delete_as`, `branch_merge_as`. The maintenance entry points —
+//! `optimize_as`, `ensure_indices_as` / `ensure_indices_on_as`,
+//! `rebuild_full_text_indices_on_as`, `repair_report_as` (`maintain`) and
+//! `cleanup_as` (`reclaim`) — are covered the same way. Each writer pair below
 //! covers allow + deny via the engine-side gate; the allow case proves
 //! the enforce call is correctly scoped (i.e. doesn't reject a legit
 //! actor), the deny case proves it actually denies an unauthorized
@@ -110,6 +113,31 @@ async fn init_with_policy_and_feature_branch(
 
 /// One JSONL record for `load_as` / `ingest_as` exercises.
 const ONE_PERSON_JSONL: &str = r#"{"type": "Person", "data": {"name": "Eve"}}"#;
+
+/// Every directory and file under `root`, with file bytes: what a refused
+/// call must leave as it found it.
+fn physical_tree(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+    fn visit(
+        root: &Path,
+        path: &Path,
+        entries: &mut std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>,
+    ) {
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            if entry.file_type().unwrap().is_dir() {
+                entries.insert(relative, None);
+                visit(root, &path, entries);
+            } else {
+                entries.insert(relative, Some(fs::read(path).unwrap()));
+            }
+        }
+    }
+    let mut entries = std::collections::BTreeMap::new();
+    visit(root, root, &mut entries);
+    entries
+}
 
 fn assert_denied(result: Result<impl std::fmt::Debug, OmniError>, what: &str) {
     match result {
@@ -801,99 +829,91 @@ async fn non_canonical_branch_names_cannot_reach_a_protected_branch() {
 }
 
 #[tokio::test]
-async fn index_maintenance_enforces_selected_branch_before_effects_and_records_actor_issue_840() {
-    fn physical_tree(
-        root: &Path,
-    ) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
-        fn visit(
-            root: &Path,
-            path: &Path,
-            entries: &mut std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>,
-        ) {
-            for entry in fs::read_dir(path).unwrap() {
-                let entry = entry.unwrap();
-                let path = entry.path();
-                let relative = path.strip_prefix(root).unwrap().to_path_buf();
-                if entry.file_type().unwrap().is_dir() {
-                    entries.insert(relative, None);
-                    visit(root, &path, entries);
-                } else {
-                    entries.insert(relative, Some(fs::read(path).unwrap()));
-                }
-            }
-        }
-        let mut entries = std::collections::BTreeMap::new();
-        visit(root, root, &mut entries);
-        entries
-    }
-
+async fn full_text_rebuild_enforces_change_or_maintain_on_the_selected_branch_and_records_actor() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
     db.branch_create("feature").await.unwrap();
-    // A row on feature leaves its Person identity index lagging, so an
-    // index build there has real work to refuse or publish.
-    db.load("feature", ONE_PERSON_JSONL, LoadMode::Merge)
-        .await
-        .unwrap();
     drop(db);
-    // This actor can change unprotected feature, but not protected main.
-    // A hardcoded main scope or a different maintenance action must fail.
-    let policy = POLICY_YAML.replace("      branch_scope: any", "      branch_scope: unprotected");
+    // `act-allowed` can change unprotected feature, `act-maintainer` can
+    // maintain it, and neither reaches protected main. A hardcoded main scope
+    // or an action other than `change` or `maintain` must fail.
+    let policy = format!(
+        "{}  - id: maintainers\n    allow:\n      actors: {{ group: maintainers }}\n      actions: [maintain]\n      branch_scope: unprotected\n",
+        POLICY_YAML
+            .replace("      branch_scope: any", "      branch_scope: unprotected")
+            .replace(
+                "  readers: [act-denied]\n",
+                "  readers: [act-denied]\n  maintainers: [act-maintainer]\n",
+            )
+    );
     let db = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
     let (db, _engine) = install_policy_source(db, dir.path(), &policy);
     let main_before = db.list_commits(None).await.unwrap();
     let feature_before = db.list_commits(Some("feature")).await.unwrap();
     let files_before = physical_tree(dir.path());
 
-    for (branch, actor) in [("feature", "act-denied"), ("main", "act-allowed")] {
-        assert_denied(
-            db.rebuild_full_text_indices_on_as(branch, Some(actor))
-                .await,
-            "rebuild_full_text_indices_on_as",
+    for (branch, actor) in [
+        ("feature", "act-denied"),
+        ("main", "act-allowed"),
+        ("main", "act-maintainer"),
+    ] {
+        let result = db
+            .rebuild_full_text_indices_on_as(branch, Some(actor))
+            .await;
+        // Either grant would admit the rebuild, so the refusal names both.
+        assert!(
+            matches!(&result, Err(OmniError::Policy(message))
+                if message.contains("'maintain'") && message.contains("'change'")),
+            "{actor} on {branch}: {result:?}"
         );
-        assert_denied(
-            db.ensure_indices_on_as(branch, Some(actor)).await,
-            "ensure_indices_on_as",
-        );
+        assert_denied(result, "rebuild_full_text_indices_on_as");
         assert_eq!(
             physical_tree(dir.path()),
             files_before,
             "policy refusal must not write index artifacts, native refs, sidecars, or publications"
         );
     }
-    for error in [
-        db.rebuild_full_text_indices_on("feature")
-            .await
-            .unwrap_err(),
-        db.ensure_indices_on("feature").await.unwrap_err(),
-    ] {
-        assert!(
-            matches!(&error, OmniError::Policy(message) if message.contains("no actor")),
-            "{error}"
-        );
-    }
+    let error = db
+        .rebuild_full_text_indices_on_as("feature", None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, OmniError::Policy(message) if message.contains("no actor")),
+        "{error}"
+    );
     assert_eq!(
         physical_tree(dir.path()),
         files_before,
-        "the no-actor wrappers must not bypass policy"
+        "a missing actor must not bypass policy"
     );
 
-    let result = db
-        .rebuild_full_text_indices_on_as("feature", Some("act-allowed"))
-        .await
-        .expect("Change on the selected unprotected branch must permit a real rebuild");
-    assert_eq!(result.branch, "feature");
-    assert_eq!(result.rebuilt_indexes.len(), 2);
-    let feature_after = db.list_commits(Some("feature")).await.unwrap();
-    assert_eq!(feature_after.len(), feature_before.len() + 1);
+    let mut parent = feature_before[0].graph_commit_id.clone();
+    for (actor, grant) in [("act-allowed", "change"), ("act-maintainer", "maintain")] {
+        let result = db
+            .rebuild_full_text_indices_on_as("feature", Some(actor))
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{grant} on the selected unprotected branch must permit a real rebuild: {error}"
+                )
+            });
+        assert_eq!(result.branch, "feature");
+        assert_eq!(result.rebuilt_indexes.len(), 2);
+        let feature_after = db.list_commits(Some("feature")).await.unwrap();
+        assert_eq!(
+            result.graph_commit_id.as_deref(),
+            Some(feature_after[0].graph_commit_id.as_str())
+        );
+        assert_eq!(feature_after[0].actor_id.as_deref(), Some(actor));
+        assert_eq!(
+            feature_after[0].parent_commit_id.as_deref(),
+            Some(parent.as_str())
+        );
+        parent = feature_after[0].graph_commit_id.clone();
+    }
     assert_eq!(
-        result.graph_commit_id.as_deref(),
-        Some(feature_after[0].graph_commit_id.as_str())
-    );
-    assert_eq!(feature_after[0].actor_id.as_deref(), Some("act-allowed"));
-    assert_eq!(
-        feature_after[0].parent_commit_id.as_deref(),
-        Some(feature_before[0].graph_commit_id.as_str())
+        db.list_commits(Some("feature")).await.unwrap().len(),
+        feature_before.len() + 2
     );
     let main_after = db.list_commits(None).await.unwrap();
     assert_eq!(main_after.len(), main_before.len());
@@ -901,11 +921,123 @@ async fn index_maintenance_enforces_selected_branch_before_effects_and_records_a
         main_after[0].graph_commit_id,
         main_before[0].graph_commit_id
     );
+}
 
-    let built = db
-        .ensure_indices_on_as("feature", Some("act-allowed"))
+/// Maintenance grants, apart from data writes: `act-maintainer` may maintain
+/// any branch and `act-branch-maintainer` only unprotected ones;
+/// `act-reclaimer` may reclaim; `act-writer` holds `change` everywhere and no
+/// maintenance grant; `act-denied` holds nothing.
+const MAINTENANCE_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  maintainers: [act-maintainer]
+  branch-maintainers: [act-branch-maintainer]
+  reclaimers: [act-reclaimer]
+  writers: [act-writer]
+  readers: [act-denied]
+protected_branches: [main]
+rules:
+  - id: maintainers
+    allow:
+      actors: { group: maintainers }
+      actions: [maintain]
+      branch_scope: any
+  - id: branch-maintainers
+    allow:
+      actors: { group: branch-maintainers }
+      actions: [maintain]
+      branch_scope: unprotected
+  - id: reclaimers
+    allow:
+      actors: { group: reclaimers }
+      actions: [reclaim]
+  - id: writers
+    allow:
+      actors: { group: writers }
+      actions: [change]
+      branch_scope: any
+"#;
+
+/// A graph with a `feature` branch whose Person identity index lags one
+/// loaded row, so an index build there has work to publish, and two extra
+/// Person fragments on main, so optimize has a compaction to publish, under
+/// [`MAINTENANCE_POLICY_YAML`].
+async fn init_with_maintenance_policy(dir: &tempfile::TempDir) -> Session {
+    let db = init_and_load(dir).await;
+    db.branch_create("feature").await.unwrap();
+    db.load("feature", ONE_PERSON_JSONL, LoadMode::Merge)
         .await
-        .expect("Change on the selected unprotected branch must permit an index build");
+        .unwrap();
+    for (name, age) in [("Eve", 40), ("Frank", 41)] {
+        let params = mixed_params(&[("$name", name)], &[("$age", age)]);
+        db.mutate("main", MUTATION_QUERIES, "insert_person", &params)
+            .await
+            .unwrap();
+    }
+    drop(db);
+    let db = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+    install_policy_source(db, dir.path(), MAINTENANCE_POLICY_YAML).0
+}
+
+fn assert_no_actor(result: Result<impl std::fmt::Debug, OmniError>, what: &str) {
+    match result {
+        Err(OmniError::Policy(message)) if message.contains("no actor") => {}
+        other => panic!("{what}: expected the no-actor refusal, got {other:?}"),
+    }
+}
+
+/// Optimize, index builds and the repair report require `maintain` on the
+/// branch they maintain, before any effect: `change` does not imply it, a
+/// grant on unprotected branches does not reach main, and a missing actor is
+/// refused. An allowed index build or optimize records its actor on the
+/// commit it publishes, and an index build on a branch leaves main alone.
+#[tokio::test]
+async fn maintenance_entry_points_enforce_maintain_on_their_branch_before_effects_issue_840() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_with_maintenance_policy(&dir).await;
+    let main_before = db.list_commits(None).await.unwrap();
+    let files_before = physical_tree(dir.path());
+
+    for actor in [
+        "act-denied",
+        "act-writer",
+        "act-reclaimer",
+        "act-branch-maintainer",
+    ] {
+        let actor = Some(actor);
+        assert_denied(db.optimize_as(actor).await, "optimize_as");
+        assert_denied(db.ensure_indices_as(actor).await, "ensure_indices_as");
+        assert_denied(
+            db.ensure_indices_on_as("main", actor).await,
+            "ensure_indices_on_as(main)",
+        );
+        assert_denied(db.repair_report_as(actor).await, "repair_report_as");
+    }
+    for actor in ["act-denied", "act-writer", "act-reclaimer"] {
+        assert_denied(
+            db.ensure_indices_on_as("feature", Some(actor)).await,
+            "ensure_indices_on_as(feature)",
+        );
+    }
+    assert_no_actor(db.optimize_as(None).await, "optimize_as");
+    assert_no_actor(db.ensure_indices_as(None).await, "ensure_indices_as");
+    assert_no_actor(
+        db.ensure_indices_on_as("feature", None).await,
+        "ensure_indices_on_as",
+    );
+    assert_no_actor(db.repair_report_as(None).await, "repair_report_as");
+    assert_eq!(
+        physical_tree(dir.path()),
+        files_before,
+        "a refused maintenance call must not write index artifacts, compactions or publications"
+    );
+    assert_eq!(db.list_commits(None).await.unwrap(), main_before);
+
+    let feature_before = db.list_commits(Some("feature")).await.unwrap();
+    let built = db
+        .ensure_indices_on_as("feature", Some("act-branch-maintainer"))
+        .await
+        .expect("maintain on an unprotected branch admits its index builds");
     assert_eq!(built.branch, "feature");
     assert!(
         built
@@ -915,16 +1047,77 @@ async fn index_maintenance_enforces_selected_branch_before_effects_and_records_a
                 && index.action == omnigraph::db::BuiltIndexAction::Refreshed),
         "{built:?}"
     );
-    let feature_built = db.list_commits(Some("feature")).await.unwrap();
-    assert_eq!(feature_built.len(), feature_after.len() + 1);
+    let feature_after = db.list_commits(Some("feature")).await.unwrap();
+    assert_eq!(feature_after.len(), feature_before.len() + 1);
     assert_eq!(
         built.graph_commit_id.as_deref(),
-        Some(feature_built[0].graph_commit_id.as_str())
+        Some(feature_after[0].graph_commit_id.as_str())
     );
-    assert_eq!(feature_built[0].actor_id.as_deref(), Some("act-allowed"));
     assert_eq!(
-        db.list_commits(None).await.unwrap()[0].graph_commit_id,
-        main_before[0].graph_commit_id
+        feature_after[0].actor_id.as_deref(),
+        Some("act-branch-maintainer")
+    );
+    assert_eq!(db.list_commits(None).await.unwrap(), main_before);
+    let report = db
+        .repair_report_as(Some("act-maintainer"))
+        .await
+        .expect("maintain on main admits the repair report");
+    assert!(!report.datasets.is_empty());
+    db.ensure_indices_as(Some("act-maintainer"))
+        .await
+        .expect("maintain on main admits index builds");
+
+    let head_before_optimize = db.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    let stats = db
+        .optimize_as(Some("act-maintainer"))
+        .await
+        .expect("maintain on main admits optimize");
+    assert!(
+        stats
+            .iter()
+            .any(|stat| stat.type_key == "node:Person" && stat.committed),
+        "{stats:?}"
+    );
+    let main_after = db.list_commits(None).await.unwrap();
+    assert_eq!(
+        main_after[0].parent_commit_id.as_deref(),
+        Some(head_before_optimize.as_str())
+    );
+    assert_eq!(main_after[0].actor_id.as_deref(), Some("act-maintainer"));
+}
+
+/// Cleanup requires `reclaim`, which no other grant implies, before any
+/// effect.
+#[tokio::test]
+async fn cleanup_as_enforces_reclaim_before_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_with_maintenance_policy(&dir).await;
+    let keep_one = || omnigraph::db::CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    };
+    let files_before = physical_tree(dir.path());
+    for actor in ["act-denied", "act-writer", "act-maintainer"] {
+        assert_denied(db.cleanup_as(keep_one(), Some(actor)).await, "cleanup_as");
+    }
+    assert_no_actor(db.cleanup_as(keep_one(), None).await, "cleanup_as");
+    assert_eq!(
+        physical_tree(dir.path()),
+        files_before,
+        "a refused cleanup must not delete anything"
+    );
+
+    let rows = db
+        .cleanup_as(keep_one(), Some("act-reclaimer"))
+        .await
+        .expect("reclaim admits cleanup");
+    assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
+    assert_ne!(
+        physical_tree(dir.path()),
+        files_before,
+        "the admitted cleanup reclaims the history keep 1 does not retain"
     );
 }
 

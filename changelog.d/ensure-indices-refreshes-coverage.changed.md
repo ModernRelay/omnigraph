@@ -1,3 +1,3 @@
-- `ensure_indices` and `ensure_indices_on` also rebuild lagging BTREE/vector
-  indexes, report lagging full-text coverage as pending, and under a policy
-  need an actor with `Change`: use `ensure_indices_on_as`.
+- The engine's index build (`ensure_indices_as`, `ensure_indices_on_as`) also
+  rebuilds lagging BTREE and vector indexes and reports lagging full-text
+  coverage as pending.

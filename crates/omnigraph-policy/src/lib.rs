@@ -30,6 +30,16 @@ pub enum PolicyAction {
     /// Drop an unpublished graph commit (`commit drop "<id>"`). Target-branch
     /// scoped: the branch the proposal would have landed on.
     CommitDrop,
+    /// Content-preserving maintenance: optimize, index builds, the full-text
+    /// rebuild and the repair report. Branch scoped like `change`: the scope
+    /// is the branch whose tables the operation maintains, `main` for
+    /// optimize and repair. It grants no right to change data or to delete
+    /// history.
+    Maintain,
+    /// Reclaim storage: cleanup, which permanently deletes table versions and
+    /// files no retained commit needs. A run covers every branch's history,
+    /// so the action is graph scoped and takes no branch scope.
+    Reclaim,
     /// Reserved action; no current engine or HTTP operation uses this grant.
     Admin,
     /// List the server's graph registry. This is server-scoped, with no branch
@@ -57,6 +67,8 @@ impl PolicyAction {
             Self::BranchMerge => "branch_merge",
             Self::CommitPublish => "commit_publish",
             Self::CommitDrop => "commit_drop",
+            Self::Maintain => "maintain",
+            Self::Reclaim => "reclaim",
             Self::Admin => "admin",
             Self::GraphList => "graph_list",
             Self::InvokeQuery => "invoke_query",
@@ -65,7 +77,10 @@ impl PolicyAction {
     }
 
     fn uses_branch_scope(self) -> bool {
-        matches!(self, Self::Read | Self::Export | Self::Change)
+        matches!(
+            self,
+            Self::Read | Self::Export | Self::Change | Self::Maintain
+        )
     }
 
     fn uses_target_branch_scope(self) -> bool {
@@ -98,6 +113,8 @@ impl PolicyAction {
             | Self::BranchMerge
             | Self::CommitPublish
             | Self::CommitDrop
+            | Self::Maintain
+            | Self::Reclaim
             | Self::Admin
             | Self::InvokeQuery => PolicyResourceKind::Graph,
         }
@@ -160,6 +177,8 @@ impl FromStr for PolicyAction {
             "branch_merge" => Ok(Self::BranchMerge),
             "commit_publish" => Ok(Self::CommitPublish),
             "commit_drop" => Ok(Self::CommitDrop),
+            "maintain" => Ok(Self::Maintain),
+            "reclaim" => Ok(Self::Reclaim),
             "admin" => Ok(Self::Admin),
             "graph_list" => Ok(Self::GraphList),
             "invoke_query" => Ok(Self::InvokeQuery),
@@ -942,6 +961,8 @@ namespace Omnigraph {
     action "branch_merge" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "commit_publish" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "commit_drop" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "maintain" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "reclaim" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "admin" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "invoke_query" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
 
@@ -1095,6 +1116,35 @@ pub trait PolicyChecker: Send + Sync {
         scope: &ResourceScope,
         actor: &str,
     ) -> Result<(), PolicyError>;
+
+    /// Gate for an operation that any one of `actions` admits on `scope`,
+    /// such as the full-text rebuild, which `maintain` and its older grant
+    /// `change` both admit. Each action is decided as [`Self::check`] decides
+    /// it, in order, and the first allowed one admits the operation. An
+    /// evaluation failure is returned at once rather than passed over for
+    /// the next action, so a broken rule never widens access. When every
+    /// action is denied, the denial names each one.
+    fn check_any(
+        &self,
+        actions: &[PolicyAction],
+        scope: &ResourceScope,
+        actor: &str,
+    ) -> Result<(), PolicyError> {
+        if actions.is_empty() {
+            return Err(PolicyError::Internal(
+                "no policy action to check".to_string(),
+            ));
+        }
+        let mut denials = Vec::with_capacity(actions.len());
+        for &action in actions {
+            match self.check(action, scope, actor) {
+                Ok(()) => return Ok(()),
+                Err(PolicyError::Denied(message)) => denials.push(message),
+                Err(internal) => return Err(internal),
+            }
+        }
+        Err(PolicyError::Denied(denials.join("; ")))
+    }
 }
 
 impl PolicyChecker for PolicyEngine {
@@ -1950,5 +2000,226 @@ rules:
             );
             assert!(PolicyEngine::load_cluster_from_source(&mixed).is_err());
         }
+    }
+
+    #[test]
+    fn every_action_round_trips_through_its_name() {
+        use clap::ValueEnum;
+        for &action in PolicyAction::value_variants() {
+            let name = action.as_str();
+            assert_eq!(action.to_string(), name);
+            assert_eq!(name.parse::<PolicyAction>().unwrap(), action, "{name}");
+            assert_eq!(
+                serde_json::to_value(action).unwrap(),
+                serde_json::Value::String(name.to_string())
+            );
+            assert_eq!(
+                serde_json::from_value::<PolicyAction>(serde_json::json!(name)).unwrap(),
+                action
+            );
+        }
+        assert_eq!(
+            "maintain".parse::<PolicyAction>().unwrap(),
+            PolicyAction::Maintain
+        );
+        assert_eq!(
+            "reclaim".parse::<PolicyAction>().unwrap(),
+            PolicyAction::Reclaim
+        );
+        assert!("maintenance".parse::<PolicyAction>().is_err());
+    }
+
+    /// A rule granting any one action compiles under the Cedar schema and
+    /// allows that action, so no action can be added to the enum without its
+    /// declaration.
+    #[test]
+    fn every_action_is_declared_in_the_cedar_schema() {
+        use clap::ValueEnum;
+        for &action in PolicyAction::value_variants() {
+            let source = format!(
+                "version: 1\ngroups:\n  g: [act]\nrules:\n  - id: r\n    allow:\n      actors: {{ group: g }}\n      actions: [{}]\n",
+                action.as_str()
+            );
+            let engine = match action.resource_kind() {
+                PolicyResourceKind::Graph => PolicyEngine::load_graph_from_source(&source, "graph"),
+                PolicyResourceKind::Server => PolicyEngine::load_server_from_source(&source),
+                PolicyResourceKind::Cluster => PolicyEngine::load_cluster_from_source(&source),
+            }
+            .unwrap_or_else(|error| panic!("{action}: {error}"));
+            let decision = engine
+                .authorize(
+                    "act",
+                    &PolicyRequest {
+                        action,
+                        branch: None,
+                        target_branch: None,
+                    },
+                )
+                .unwrap();
+            assert!(decision.allowed, "{action}: {}", decision.message);
+        }
+    }
+
+    #[test]
+    fn maintain_is_branch_scoped_and_reclaim_takes_no_branch_scope() {
+        let policy: PolicyConfig = yaml_serde::from_str(
+            r#"
+version: 1
+groups:
+  automation: [act-bot]
+  writers: [act-writer]
+protected_branches: [main]
+rules:
+  - id: automation-maintains-unprotected
+    allow:
+      actors: { group: automation }
+      actions: [maintain]
+      branch_scope: unprotected
+  - id: writers-change
+    allow:
+      actors: { group: writers }
+      actions: [change]
+      branch_scope: any
+"#,
+        )
+        .unwrap();
+        let engine = PolicyCompiler::compile(&policy, "graph").unwrap();
+        let decide = |actor: &str, action, branch: Option<&str>| {
+            engine
+                .authorize(
+                    actor,
+                    &PolicyRequest {
+                        action,
+                        branch: branch.map(str::to_string),
+                        target_branch: None,
+                    },
+                )
+                .unwrap()
+                .allowed
+        };
+        assert!(decide("act-bot", PolicyAction::Maintain, Some("feature")));
+        assert!(!decide("act-bot", PolicyAction::Maintain, Some("main")));
+        // Maintenance grants neither data writes nor reclamation.
+        assert!(!decide("act-bot", PolicyAction::Change, Some("feature")));
+        assert!(!decide("act-bot", PolicyAction::Reclaim, None));
+        // And `change` grants no maintenance.
+        assert!(!decide(
+            "act-writer",
+            PolicyAction::Maintain,
+            Some("feature")
+        ));
+        assert!(!decide("act-writer", PolicyAction::Reclaim, None));
+
+        let reclaim = r#"
+version: 1
+groups:
+  automation: [act-bot]
+rules:
+  - id: automation-reclaims
+    allow:
+      actors: { group: automation }
+      actions: [reclaim]
+"#;
+        let engine = PolicyEngine::load_graph_from_source(reclaim, "graph").unwrap();
+        let allowed = engine
+            .authorize(
+                "act-bot",
+                &PolicyRequest {
+                    action: PolicyAction::Reclaim,
+                    branch: None,
+                    target_branch: None,
+                },
+            )
+            .unwrap();
+        assert!(allowed.allowed);
+        assert_eq!(
+            PolicyAction::Reclaim.resource_kind(),
+            PolicyResourceKind::Graph
+        );
+        for scope in ["branch_scope", "target_branch_scope"] {
+            let scoped = reclaim.replace(
+                "actions: [reclaim]",
+                &format!("actions: [reclaim]\n      {scope}: any"),
+            );
+            let Err(error) = PolicyEngine::load_graph_from_source(&scoped, "graph") else {
+                panic!("{scope} on reclaim must be refused");
+            };
+            assert!(
+                error.to_string().contains("unsupported action 'reclaim'"),
+                "{scope}: {error}"
+            );
+        }
+        let target_scoped_maintain = reclaim.replace("[reclaim]", "[maintain]").replace(
+            "actions: [maintain]",
+            "actions: [maintain]\n      target_branch_scope: any",
+        );
+        assert!(PolicyEngine::load_graph_from_source(&target_scoped_maintain, "graph").is_err());
+    }
+
+    #[test]
+    fn check_any_admits_on_any_allowed_action_and_names_every_denial() {
+        use super::{PolicyChecker, PolicyError, ResourceScope};
+
+        let policy = PolicyEngine::load_graph_from_source(
+            r#"
+version: 1
+groups:
+  maintainers: [act-maintainer]
+  writers: [act-writer]
+  readers: [act-reader]
+rules:
+  - id: maintainers
+    allow:
+      actors: { group: maintainers }
+      actions: [maintain]
+  - id: writers
+    allow:
+      actors: { group: writers }
+      actions: [change]
+"#,
+            "graph",
+        )
+        .unwrap();
+        let either = [PolicyAction::Maintain, PolicyAction::Change];
+        let scope = ResourceScope::Branch("main".to_string());
+        for actor in ["act-maintainer", "act-writer"] {
+            policy.check_any(&either, &scope, actor).unwrap();
+        }
+        match policy.check_any(&either, &scope, "act-reader") {
+            Err(PolicyError::Denied(message)) => {
+                assert!(
+                    message.contains("'maintain'") && message.contains("'change'"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected a denial naming both actions, got {other:?}"),
+        }
+        assert!(matches!(
+            policy.check_any(&[], &scope, "act-maintainer"),
+            Err(PolicyError::Internal(_))
+        ));
+
+        /// Fails to evaluate `maintain` and allows everything else.
+        struct BrokenMaintain;
+        impl PolicyChecker for BrokenMaintain {
+            fn check(
+                &self,
+                action: PolicyAction,
+                _scope: &ResourceScope,
+                _actor: &str,
+            ) -> Result<(), PolicyError> {
+                match action {
+                    PolicyAction::Maintain => Err(PolicyError::Internal("broken".to_string())),
+                    _ => Ok(()),
+                }
+            }
+        }
+        assert!(
+            matches!(
+                BrokenMaintain.check_any(&either, &scope, "act"),
+                Err(PolicyError::Internal(message)) if message == "broken"
+            ),
+            "an evaluation failure must not fall through to the next action"
+        );
     }
 }
