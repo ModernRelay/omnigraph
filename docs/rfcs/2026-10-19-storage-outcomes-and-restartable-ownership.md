@@ -276,7 +276,12 @@ it can land.
   re-issue and compare the stored bytes with their payload. Equal bytes mean
   this request landed. An update that finds other bytes reports a
   precondition failure. Its callers already re-read and re-decide, so
-  reporting a superseded update as a conflict is safe.
+  reporting a superseded update as a conflict is safe. Implemented by #1176,
+  with one refinement: a re-issue's conflict settles its key only through the
+  read-back. S3 answers 409, which `object_store` reports as "already
+  exists", while another conditional write to the key is in flight, and that
+  write can be the earlier copy, so the conflict alone does not show that the
+  key holds an object.
 
 ### 3. Retries by class
 

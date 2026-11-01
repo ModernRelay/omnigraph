@@ -83,7 +83,7 @@ pub use lance_access::store_registry as dst_lance_store_registry;
 /// see `omnigraph_core::manifest_request`.
 #[cfg(feature = "dst")]
 pub fn manifest_request_reissues() -> usize {
-    omnigraph_core::manifest_request::MANIFEST_REQUEST_REISSUES as usize
+    omnigraph_core::manifest_request::CONDITIONAL_REQUEST_REISSUES as usize
 }
 
 /// The Lance-realm object-store seam; see `lance_access::object_store_seam`.
