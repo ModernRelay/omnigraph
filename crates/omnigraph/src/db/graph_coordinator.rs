@@ -480,16 +480,23 @@ impl GraphCoordinator {
         self.manifest.held_commit(commit_id).is_some()
     }
 
-    /// Whether the head this coordinator holds descends from `commit_id`
-    /// through first parents with no merge commit after it: the head and the
-    /// buffered commits answer with no read, [`descends_linearly_from_in`]
-    /// walks the chain below them.
+    /// Whether `descendant`, a commit of this coordinator's branch, descends
+    /// from `commit_id` through first parents with no merge commit after it:
+    /// the head and the buffered commits answer with no read,
+    /// [`descends_linearly_from_in`] walks the chain below them.
     pub(crate) async fn descends_linearly_from(
         &self,
+        descendant: &str,
         commit_id: &str,
         generation: u64,
     ) -> Result<bool> {
-        descends_linearly_from_in(&self.manifest.commit_graph(), commit_id, generation).await
+        descends_linearly_from_in(
+            &self.manifest.commit_graph(),
+            descendant,
+            commit_id,
+            Some(generation),
+        )
+        .await
     }
 
     pub async fn branch_list(&self) -> Result<Vec<String>> {
@@ -1094,17 +1101,19 @@ impl GraphCoordinator {
     }
 }
 
-/// Whether `graph`'s head descends from `commit_id` through first parents
-/// with no merge commit after it ([`CommitGraph::descends_linearly_from`]), a
-/// page of [`FIRST_PARENT_WALK_COMMITS`] at a time; a commit `__history` no
-/// longer holds answers `false`, and the caller takes the exact merge.
+/// Whether `descendant` descends from `commit_id` through first parents with
+/// no merge commit after it, walked in `graph`
+/// ([`CommitGraph::descends_linearly_from`]) a page of
+/// [`FIRST_PARENT_WALK_COMMITS`] at a time; a commit `__history` no longer
+/// holds answers `false`, and the caller takes the exact merge.
 pub(crate) async fn descends_linearly_from_in(
     graph: &CommitGraph,
+    descendant: &str,
     commit_id: &str,
-    generation: u64,
+    generation: Option<u64>,
 ) -> Result<bool> {
     graph
-        .descends_linearly_from(commit_id, generation, FIRST_PARENT_WALK_COMMITS)
+        .descends_linearly_from(descendant, commit_id, generation, FIRST_PARENT_WALK_COMMITS)
         .await
 }
 

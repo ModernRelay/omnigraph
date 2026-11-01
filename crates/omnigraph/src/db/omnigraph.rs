@@ -3136,10 +3136,18 @@ impl Omnigraph {
                 };
                 let (from_commit_id, from_snapshot) = self.open_diff_side(from, from_side).await?;
                 let to_side = self.authorized_diff_side(to, can_read).await?;
-                let linear_descent = lineage != ChangeLineage::Off
-                    && self
-                        .diff_descends_linearly(&from_commit_id, from_commit.as_ref(), &to_side)
-                        .await?;
+                let linear_descent = match to_side.commit_id() {
+                    Some(to_commit_id) if lineage != ChangeLineage::Off => {
+                        self.diff_descends_linearly(
+                            &from_commit_id,
+                            from_commit.as_ref(),
+                            to_commit_id,
+                            &to_side,
+                        )
+                        .await?
+                    }
+                    _ => false,
+                };
                 let (to_commit_id, to_snapshot) = self.open_diff_side(to, to_side).await?;
                 Ok(DiffEndpoints {
                     from_commit_id,
@@ -3153,7 +3161,12 @@ impl Omnigraph {
             crate::changes::GraphDiffSides::Branch { source, target } => {
                 let captured = self.capture_merge_base(source, target).await?;
                 let linear_descent = lineage != ChangeLineage::Off
-                    && captured.source_descends_linearly_from_base().await?;
+                    && captured
+                        .source_descends_linearly(
+                            &captured.merge_base.graph_commit_id,
+                            &captured.source_head,
+                        )
+                        .await?;
                 let CapturedMergeBase {
                     source_head,
                     target_head,
@@ -3186,34 +3199,38 @@ impl Omnigraph {
         }
     }
 
-    /// Whether the branch `to` names descends from `from` through first
-    /// parents with no merge commit after it, from the lineage that branch's
-    /// coordinator holds; `to` spelled as a commit, or a `from` of unknown
-    /// generation, answers `false`.
+    /// Whether a two-point diff page may pair rows by identity across the
+    /// commits it opens: `to` descends from `from` through first parents with
+    /// no merge commit after it, walked from `to` in the lineage of the branch
+    /// the side `to_side` names. Every page asks for its own two commits: the
+    /// first page for what its sides resolve to, a later one for what its
+    /// token names, never the branch's head now. A side spelled as a commit,
+    /// or a `from` of unknown generation, answers `false`.
     async fn diff_descends_linearly(
         &self,
         from: &str,
         from_commit: Option<&GraphCommit>,
-        to: &DiffReadTarget,
+        to: &str,
+        to_side: &DiffReadTarget,
     ) -> Result<bool> {
-        let DiffReadTarget::Branch(resolved) = to else {
+        let DiffReadTarget::Branch(resolved) = to_side else {
             return Ok(false);
         };
-        if resolved.graph_commit_id.as_deref() == Some(from) {
+        if to == from {
             return Ok(true);
         }
         let branch = resolved.branch.as_deref();
         {
             let coord = self.coordinator.read().await;
             if branch == coord.current_branch() {
-                return Self::descends_linearly_from(&coord, from, from_commit).await;
+                return Self::descends_linearly_from(&coord, from, from_commit, to).await;
             }
         }
         let cache = self.validated_cached_coordinator(branch).await?;
         let (_, coord) = cache
             .as_ref()
             .expect("validated authority cache entry is present");
-        Self::descends_linearly_from(coord, from, from_commit).await
+        Self::descends_linearly_from(coord, from, from_commit, to).await
     }
 
     /// [`GraphCoordinator::descends_linearly_from`] for `from`, whose
@@ -3223,6 +3240,7 @@ impl Omnigraph {
         coord: &GraphCoordinator,
         from: &str,
         from_commit: Option<&GraphCommit>,
+        to: &str,
     ) -> Result<bool> {
         let generation = match from_commit {
             Some(commit) => commit.generation,
@@ -3231,7 +3249,7 @@ impl Omnigraph {
                 None => return Ok(false),
             },
         };
-        coord.descends_linearly_from(from, generation).await
+        coord.descends_linearly_from(to, from, generation).await
     }
 
     /// Reopen the commits a diff page token names, once its sides reach them.
@@ -3278,7 +3296,7 @@ impl Omnigraph {
                 };
                 linear_descent = lineage != ChangeLineage::Off
                     && self
-                        .diff_descends_linearly(from, from_commit.as_ref(), &to_now)
+                        .diff_descends_linearly(from, from_commit.as_ref(), to, &to_now)
                         .await?;
                 (
                     self.reach_side(from, from_side, from_now, can_read).await?,
@@ -3293,7 +3311,7 @@ impl Omnigraph {
                 let target_branch = normalize_branch_name(target)?;
                 let captured = self.capture_merge_base(source, target).await?;
                 linear_descent = lineage != ChangeLineage::Off
-                    && captured.source_descends_linearly_from_base().await?;
+                    && captured.source_descends_linearly(from, to).await?;
                 let CapturedMergeBase {
                     source_head,
                     target_head,
@@ -5495,6 +5513,15 @@ enum DiffReadTarget {
 }
 
 impl DiffReadTarget {
+    /// The commit this endpoint resolves to: a branch's head when the side was
+    /// classified, or the named commit.
+    fn commit_id(&self) -> Option<&str> {
+        match self {
+            Self::Branch(resolved) => resolved.graph_commit_id.as_deref(),
+            Self::Commit(commit) => Some(&commit.graph_commit_id),
+        }
+    }
+
     /// The branch a caller authorizes `read` on: the branch itself, or the
     /// authored branch of the commit (an unpublished proposal's or unattached
     /// snapshot's recorded target).
@@ -5532,18 +5559,20 @@ struct CapturedMergeBase {
 }
 
 impl CapturedMergeBase {
-    /// Whether the source head descends from the merge base through first
-    /// parents with no merge commit above it. A source that merged its target
-    /// holds the base as a merge commit's second parent, where sibling first
-    /// commits stamp their rows alike; a merge above the base can take another
-    /// branch's table pins, whose history never read the base's.
-    async fn source_descends_linearly_from_base(&self) -> Result<bool> {
-        descends_linearly_from_in(
-            &self.source_graph,
-            &self.merge_base.graph_commit_id,
-            self.merge_base.generation,
-        )
-        .await
+    /// Whether a branch review page may pair rows by identity across the
+    /// commits it opens: the source's commit `to` descends from `from`
+    /// through first parents with no merge commit above it, walked from `to`
+    /// in the source's lineage. The first page asks for the merge base and
+    /// the source head; a later page asks for the commits its token names,
+    /// which the base and head now may have moved past. A source that merged
+    /// its target holds the base as a merge commit's second parent, where
+    /// sibling first commits stamp their rows alike; a merge above the base
+    /// can take another branch's table pins, whose history never read the
+    /// base's.
+    async fn source_descends_linearly(&self, from: &str, to: &str) -> Result<bool> {
+        let generation =
+            (from == self.merge_base.graph_commit_id).then_some(self.merge_base.generation);
+        descends_linearly_from_in(&self.source_graph, to, from, generation).await
     }
 }
 
@@ -5554,9 +5583,9 @@ struct DiffEndpoints {
     to_commit_id: String,
     base_commit_id: Option<String>,
     /// `to` descends from `from` through first parents with no merge commit
-    /// after it (the branch form's source head from its merge base, a
-    /// two-point `to` branch from `from`) and the session pairs rows: never
-    /// under `change_lineage = off`.
+    /// after it, decided for these two commits whether a first page resolved
+    /// them or a token named them, and the session pairs rows: never under
+    /// `change_lineage = off`.
     linear_descent: bool,
     from_snapshot: Snapshot,
     to_snapshot: Snapshot,

@@ -294,17 +294,23 @@ take the exact merge, which is what they took before this rule. Proving such a
 type's own lineage (its pin's `read_version` chain back to `from`'s pin) would
 restore the pairing there and is left to a later change.
 
-Both diff forms decide it from lineage already held, with no commit listing.
-The branch form walks the source's captured commit graph, which computing the
-merge base loaded. The two-point form (`Omnigraph::diff_descends_linearly`)
-takes `to` resolved to `from` itself as an empty window; otherwise the `to`
-branch's `GraphCoordinator` answers `descends_linearly_from`, from its head
-and buffered commits with no read, then a first-parent page walk down to
-`from`'s generation that stops at the first merge commit. The coordinator is
-the handle's own when `to` is its branch and the merge-authority cache's
+Both diff forms decide it from lineage already held, with no commit listing,
+and every page decides it for the two commits it opens: the first page for
+what its sides resolve to, a later page for what its token names. A later page
+never asks the sides' heads or merge base now, which may have moved past the
+token's commits: once the target fast-forwards to the source, the merge base
+now is the source head, while the token's window still crosses the source's
+merge commit. The walk starts at `to` and goes down first parents to `from`'s
+generation, stopping at the first merge commit; held and buffered commits cost
+no read. The branch form walks the source's captured commit graph, which
+computing the merge base loaded, and reads a token's `from` there when it is
+no longer the merge base. The two-point form
+(`Omnigraph::diff_descends_linearly`) takes `to` equal to `from` as an empty
+window; otherwise it walks in the `to` branch's `GraphCoordinator`, the
+handle's own when `to` is its branch and the merge-authority cache's
 otherwise. A `to` spelled as a commit id, a `from` of unknown generation, or a
-commit of the chain below the buffered commits that `__history` no longer
-holds answers `false` and takes the exact merge, which needs no lineage.
+commit of the chain that `__history` no longer holds answers `false` and takes
+the exact merge, which needs no lineage.
 
 Drop the restriction at the Lance bump whose stamp is the commit's own version;
 diverged heads then pair directly.
@@ -560,3 +566,8 @@ Follow-ups, each its own change:
   and the pairing reported the target's own row as inserted in place of the
   merged branch's. A merge commit's types without an adjacency proof take the
   exact merge until their lineage is proven per type.
+- 2026-11-01: a diff continuation decides the pairing for the commits its
+  token names, walked from the token's `to`, not from the sides' heads or
+  merge base now: a branch review's second page after the target
+  fast-forwarded to the source had found the source head as the merge base
+  and paired rows across the source's merge commit.

@@ -766,22 +766,35 @@ impl CommitGraph {
         }
     }
 
-    /// Whether the head descends from `commit_id` through first parents with
-    /// no merge commit after it: `commit_id` is on the first-parent chain from
-    /// the head, read as [`Self::first_parent_page`] reads it, `limit` commits
-    /// at a time, and no commit above it on that chain names a merged parent.
-    /// The walk stops at the commit, at the first merge commit above it, or at
-    /// the first commit below `generation`, the commit's own, so the reads
-    /// follow the distance from the head to the commit. A commit the chain
-    /// names that neither the held commits nor `__history` hold ends the walk
-    /// with `false`: the caller's fallback needs no lineage.
+    /// Whether `descendant` descends from `commit_id` through first parents
+    /// with no merge commit after it: `commit_id` is on the first-parent chain
+    /// from `descendant`, read as [`Self::first_parent_page`] reads it, `limit`
+    /// commits at a time, and no commit above it on that chain names a merged
+    /// parent. The walk stops at the commit, at the first merge commit above
+    /// it, or at the first commit below the commit's own generation, so the
+    /// reads follow the distance between the two. `generation` is that
+    /// generation when the caller knows it; otherwise the commit is read
+    /// first. A commit neither the held commits nor `__history` hold, either
+    /// end or one the chain names, ends the walk with `false`: the caller's
+    /// fallback needs no lineage.
     pub async fn descends_linearly_from(
         &self,
+        descendant: &str,
         commit_id: &str,
-        generation: u64,
+        generation: Option<u64>,
         limit: usize,
     ) -> Result<bool> {
-        let mut start = self.head().graph_commit_id.clone();
+        if descendant == commit_id {
+            return Ok(true);
+        }
+        let generation = match generation {
+            Some(generation) => generation,
+            None => match self.read_first_parents(commit_id, 1).await?.0.first() {
+                Some(commit) => commit.generation,
+                None => return Ok(false),
+            },
+        };
+        let mut start = descendant.to_string();
         loop {
             let (commits, end) = self.read_first_parents(&start, limit).await?;
             for commit in &commits {
