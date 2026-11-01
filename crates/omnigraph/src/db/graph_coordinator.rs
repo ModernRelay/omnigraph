@@ -480,18 +480,16 @@ impl GraphCoordinator {
         self.manifest.held_commit(commit_id).is_some()
     }
 
-    /// Whether `commit_id` is on the first-parent chain from the head this
-    /// coordinator holds: the head and the buffered commits answer with no
-    /// read, [`first_parent_chain_holds_in`] walks the chain below them.
-    pub(crate) async fn first_parent_chain_holds(
+    /// Whether the head this coordinator holds descends from `commit_id`
+    /// through first parents with no merge commit after it: the head and the
+    /// buffered commits answer with no read, [`descends_linearly_from_in`]
+    /// walks the chain below them.
+    pub(crate) async fn descends_linearly_from(
         &self,
         commit_id: &str,
         generation: u64,
     ) -> Result<bool> {
-        if self.holds_commit(commit_id) {
-            return Ok(true);
-        }
-        first_parent_chain_holds_in(&self.manifest.commit_graph(), commit_id, generation).await
+        descends_linearly_from_in(&self.manifest.commit_graph(), commit_id, generation).await
     }
 
     pub async fn branch_list(&self) -> Result<Vec<String>> {
@@ -1096,17 +1094,17 @@ impl GraphCoordinator {
     }
 }
 
-/// Whether `commit_id` is on the first-parent chain from `graph`'s head
-/// ([`CommitGraph::first_parent_chain_holds`]), a page of
-/// [`FIRST_PARENT_WALK_COMMITS`] at a time; a commit `__history` no longer
-/// holds answers `false`, and the caller takes the exact merge.
-pub(crate) async fn first_parent_chain_holds_in(
+/// Whether `graph`'s head descends from `commit_id` through first parents
+/// with no merge commit after it ([`CommitGraph::descends_linearly_from`]), a
+/// page of [`FIRST_PARENT_WALK_COMMITS`] at a time; a commit `__history` no
+/// longer holds answers `false`, and the caller takes the exact merge.
+pub(crate) async fn descends_linearly_from_in(
     graph: &CommitGraph,
     commit_id: &str,
     generation: u64,
 ) -> Result<bool> {
     graph
-        .first_parent_chain_holds(commit_id, generation, FIRST_PARENT_WALK_COMMITS)
+        .descends_linearly_from(commit_id, generation, FIRST_PARENT_WALK_COMMITS)
         .await
 }
 

@@ -3392,6 +3392,98 @@ async fn change_feed_merge_commit_is_first_parent_relative_with_merged_parent_on
     );
 }
 
+/// A fast-forward merge commit takes the source's table pins, whose history
+/// never read the target's. Main and feature each insert one person in their
+/// first commit after the fork, which Lance gives one row id and one version
+/// stamp; feature merges main in, re-inserting main's person under a new row
+/// id, and main fast-forwards to feature. The fast forward's commit page, the
+/// feed across it and the two-point diff from its parent report feature's
+/// person alone, under every `change_lineage`.
+#[tokio::test]
+async fn commit_changes_feed_and_diff_across_a_fast_forward_report_the_source_rows() {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedStart};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    let main_after_eve = write_on(&db, "main", "insert_person", &person("Eve", 22)).await;
+    write_on(&db, "feature", "insert_person", &person("Frank", 60)).await;
+    let caught_up = db.branch_merge("main", "feature").await.unwrap();
+    assert_eq!(caught_up.outcome, MergeOutcome::Merged);
+    let fast_forward = db.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(fast_forward.outcome, MergeOutcome::FastForward);
+    let fast_forward = fast_forward
+        .commit
+        .expect("a fast forward publishes one commit");
+    assert_eq!(
+        fast_forward.parent_commit_id.as_deref(),
+        Some(main_after_eve.graph_commit_id.as_str()),
+        "the fast forward's first parent is main's head"
+    );
+
+    let expected = vec![(
+        "Person".to_string(),
+        "Frank".to_string(),
+        ChangeOpKind::Insert,
+    )];
+    for value in ["off", "on", "verify"] {
+        let session = with_setting(&db, "change_lineage", value);
+        let page = session
+            .commit_changes_page(
+                &fast_forward.graph_commit_id,
+                &ChangeFeedScope::default(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            diff_ops(&page.block.changes),
+            expected,
+            "commit page, change_lineage = {value}"
+        );
+
+        let feed = session
+            .poll_change_feed(feed_request(
+                None,
+                ChangeFeedPosition::Start(ChangeFeedStart::AfterCommit(
+                    main_after_eve.graph_commit_id.clone(),
+                )),
+            ))
+            .await
+            .unwrap();
+        let blocks: Vec<(&str, _)> = feed
+            .blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.cause.graph_commit_id.as_str(),
+                    diff_ops(&block.changes),
+                )
+            })
+            .collect();
+        assert_eq!(
+            blocks,
+            vec![(fast_forward.graph_commit_id.as_str(), expected.clone())],
+            "feed, change_lineage = {value}"
+        );
+
+        let diff = session
+            .diff_page(&diff_request(
+                between(&main_after_eve.graph_commit_id, "main"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            diff_ops(&diff.changes),
+            expected,
+            "two-point diff, change_lineage = {value}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn change_feed_cursor_scope_mismatches_are_typed() {
     use omnigraph::changes::{ChangeFeedPosition, ChangeFeedScope, ChangeFeedStart, ChangeOpKind};

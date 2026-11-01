@@ -766,13 +766,16 @@ impl CommitGraph {
         }
     }
 
-    /// Whether `commit_id` is on the first-parent chain from the head, read as
-    /// [`Self::first_parent_page`] reads it, `limit` commits at a time, down
-    /// to the first commit below `generation`, the commit's own, so the reads
+    /// Whether the head descends from `commit_id` through first parents with
+    /// no merge commit after it: `commit_id` is on the first-parent chain from
+    /// the head, read as [`Self::first_parent_page`] reads it, `limit` commits
+    /// at a time, and no commit above it on that chain names a merged parent.
+    /// The walk stops at the commit, at the first merge commit above it, or at
+    /// the first commit below `generation`, the commit's own, so the reads
     /// follow the distance from the head to the commit. A commit the chain
     /// names that neither the held commits nor `__history` hold ends the walk
     /// with `false`: the caller's fallback needs no lineage.
-    pub async fn first_parent_chain_holds(
+    pub async fn descends_linearly_from(
         &self,
         commit_id: &str,
         generation: u64,
@@ -785,7 +788,7 @@ impl CommitGraph {
                 if commit.graph_commit_id == commit_id {
                     return Ok(true);
                 }
-                if commit.generation < generation {
+                if commit.merged_parent_commit_id.is_some() || commit.generation < generation {
                     return Ok(false);
                 }
             }

@@ -89,11 +89,14 @@ Lance's stable row id and reads only the rows whose version stamp differs or
 that exist on one side alone, so the cost follows the changed rows and the
 fragments that hold them, not the table's size, and stays flat across a
 compaction. That pairing applies when the `from` side is on the `to` side's
-history: a branch review whose merge base is on the source's first-parent
-history, and a two-point diff whose `to` names a branch whose first-parent
-chain holds `from`. A diff of two diverged heads compares every row of each changed
-type, and so does a review of a branch that has merged its target since the
-fork. The `change_lineage`
+history with no merge commit after it: a branch review whose merge base is on
+the source's first-parent history, and a two-point diff whose `to` names a
+branch whose first-parent chain holds `from`. A merge, a fast forward included,
+can give a type the merged branch's rows, whose history never passed through
+`from`. A diff of two diverged heads compares every row of each changed type,
+and so do a review of a branch that has merged its target since the fork, a
+window that crosses a merge commit, and a merge commit's own changes, except
+for a type the merge wrote in one step. The `change_lineage`
 [session setting](../queries/settings.md) selects the comparison for every
 change read: `on` (the default) pairs rows by id, `off` compares every row,
 and `verify` runs both and fails the page where they disagree, which a debug
