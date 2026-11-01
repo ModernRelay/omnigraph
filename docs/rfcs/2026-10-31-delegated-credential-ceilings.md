@@ -27,17 +27,93 @@ acting for the user, so audit can tell the two apart.
 
 ## Motivation
 
-[Identity credentials and applied policy authorization](2026-09-09-identity-credentials-and-applied-policy.md)
-removed mandatory token grants because every ordinary credential duplicated
-a second permission list. It notes that a token ceiling "is useful for
-restricted delegation" and leaves delegated profiles disabled.
+### How a client acts for a user today
 
-Delegation is now needed. The MCP surface exposes `mutate`, `load`, branch,
-commit and blob write tools that run with the caller's full applied
-permissions. A user who connects an agent to read a graph also lets it write,
-merge, publish and drop commits wherever they personally can. OAuth scopes
-exist to limit what a client may do on a user's behalf; nothing in the native
-credential can express that today.
+A request carries exactly one identity. A native signed credential is
+version 2 and identity-only: it names `principal:<id>` and nothing about what
+that principal may do. An OIDC token admitted through `--oidc-identity-trust`
+maps to the same kind of principal. Applied Cedar policy then decides every
+action for that principal. There is no second input to the decision.
+
+That design came from
+[Identity credentials and applied policy authorization](2026-09-09-identity-credentials-and-applied-policy.md).
+Version-1 credentials carried mandatory grants, so every ordinary credential
+duplicated a permission list that policy changes could not widen. The RFC
+removed them and kept two notes for later: an explicit ceiling "is useful for
+restricted delegation", and "unqualified machine or delegated profiles remain
+disabled". Today the OIDC profile refuses OAuth-client tokens and delegated
+or impersonated credentials outright.
+
+### What goes wrong
+
+MCP made delegation the ordinary case. The `/mcp` endpoint runs every tool
+through the same handler and policy action as its HTTP route, and the tool
+list includes `mutate`, `load`, branch create, delete and merge, commit
+publish and drop, and `blobs_clear`. The same token also works on every HTTP
+route, including `POST /cluster/deployments`. When a person connects Claude, an IDE
+agent or a scheduled assistant to a graph, the client signs in as that
+person, so it receives their complete applied permissions:
+
+- An analyst who can write in production connects an agent to answer
+  questions. The agent can also merge branches and publish commits.
+- An administrator with `config_manage` tries a third-party MCP client. That
+  client's token can now submit cluster deployments, including policy
+  changes.
+- A prompt injection in data the agent reads can steer it to any write the
+  person could make.
+
+The [MCP guide](../user/operations/mcp.md) says to restrict an agent by
+narrowing "the policy for the agent's credential". That works only when the
+agent has its own principal. A client signed in as a person has no separate
+principal to narrow. Removing the person's write access to protect them from
+their agent also removes it from the person.
+
+Two partial guards exist, and neither is an authorization boundary:
+
+- `omnigraph mcp` without `--write` lists and admits only tools annotated
+  `readOnlyHint`. The bridge enforces this on the client side; a client
+  that calls `/mcp` directly bypasses it.
+- MCP hosts let a user approve tools one by one. That is host behavior the
+  server cannot see or rely on.
+
+### Attribution
+
+Commit and audit records name the actor. When an agent writes as a person,
+the record cannot tell the person's own change from the agent's. Reviewers,
+incident responders and regulated customers need both: who was authorized
+and which client acted.
+
+### Why now
+
+Identity providers now issue the delegation shape directly. RFC 8693 defines
+the `act` claim for "this token's subject acts for that party". WorkOS Agent
+Registration (third-party agents) and Agent Auth (first-party agents) issue
+short-lived tokens in which `sub` names the agent, `act.sub` names the user,
+and `scope` names the permissions granted to that agent. Other OAuth
+providers express client delegation through `scope`, and the MCP
+authorization specification relies on OAuth scopes for consent. Without
+native support, a deployment must either refuse these tokens, as today, or
+treat the agent as the user and give it everything.
+
+### Goals and non-goals
+
+Goals:
+
+- A user can give a client less than their own access, enforced by the
+  server on every path.
+- Applied policy stays the only source of grants. A ceiling only narrows.
+- Credentials without a ceiling behave exactly as today, so ordinary users
+  keep one permission list.
+- Audit names the client acting for the user.
+- Standard provider tokens, including RFC 8693 `act` tokens, work without a
+  provider-specific code path.
+
+Non-goals:
+
+- Data-level narrowing (rows or columns). The scope here is actions.
+- Policy rules that name or match a client.
+- Per-graph or per-branch scopes. They are an unresolved question.
+- Online token introspection. Verification stays offline and bounded.
 
 ## User and operational behavior
 

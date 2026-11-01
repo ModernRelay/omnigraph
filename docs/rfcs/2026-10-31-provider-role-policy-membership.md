@@ -26,20 +26,78 @@ the provider decides who holds each role.
 
 ## Motivation
 
-`PolicyActorSelector` names one group, and a group is a literal list of actor
-ids. Managed deployments allocate `principal:<id>` per environment database,
-so one person has unrelated ids in staging and production, and a policy file
-cannot move between them. Every team change is a policy deployment per
-cluster (and per policy file where management and graph policies both name
-the person), and removing someone from the provider does not
-remove their policy entries. Enterprise customers expect access to follow
-directory and SSO role assignments.
+### How policy membership works today
 
+Applied policy declares groups, and a group is a literal list of actor ids.
+Every rule selects actors through `PolicyActorSelector`, which names one
+group. Credentials are identity-only: a signed credential or an admitted OIDC
+token names `principal:<id>`. Groups and permissions come only from applied
+policy, as
 [Identity credentials and applied policy authorization](2026-09-09-identity-credentials-and-applied-policy.md)
-deliberately refuses membership claims in credentials, so membership must not
-travel in the token. That RFC already admits OIDC subjects from a bounded,
-revisioned snapshot. This RFC adds role facts through the same kind of
-snapshot.
+requires. That RFC also refuses Cedar roles, groups and grants in OIDC
+admission. So the only way to change who may do something is to change the
+policy file and deploy it.
+
+### What goes wrong
+
+This works for a small team that owns one cluster. It breaks for
+organizations whose access is already managed in an identity provider:
+
+- **Every people change is a deployment.** Hiring, moving or offboarding a
+  person means editing a policy file and running `cluster apply` on every
+  cluster that names them. A cluster's management policy and its graph
+  policies declare groups separately, so one person can appear several
+  times.
+- **Offboarding does not revoke.** Removing someone from the identity
+  provider leaves their policy entries in place. Their access then depends on
+  credential expiry and on someone remembering to edit every policy.
+- **Policy is not portable.** A managed service allocates `principal:<id>`
+  values per environment, so the same person has different ids in staging and
+  production. A policy file reviewed in staging cannot move to production
+  unchanged.
+- **It duplicates enterprise process.** Enterprise customers already assign
+  access through directory sync (SCIM) and SSO group mappings, with approvals
+  and access reviews. Copying those decisions into YAML by hand creates a
+  second list that drifts and is not reviewed by the same people.
+
+### Why the obvious fixes are wrong
+
+- **Roles in tokens.** The identity RFC rejected membership claims in
+  credentials. Revocation would wait for credential expiry, and providers such
+  as WorkOS AuthKit put a role in a token only for the organization selected
+  at sign-in.
+- **Rewriting policy from provider events.** Provider events would then
+  deploy configuration. That bypasses the reviewed-change property and the
+  rule that a candidate policy cannot authorize its own installation.
+- **Raw directory groups.** WorkOS and similar providers do not expose them
+  in tokens or membership APIs. Roles already absorb directory and SSO group
+  mappings.
+
+### Why a snapshot fits
+
+The server already admits OIDC subjects from a bounded, revisioned public
+file: the binding is fixed, revisions increase, the lifetime is at most 300
+seconds, and requests make no network call. Role membership has the same
+shape and the same trust: whoever publishes admission already decides who may
+sign in. Reusing that model adds a fact the provider owns, which person holds
+which role, without moving any permission out of policy.
+
+### Goals and non-goals
+
+Goals:
+
+- Policy says what a role may do; the provider says who holds the role.
+- Removing a role in the provider removes role-derived access within a fixed
+  bound, without a deployment.
+- One policy file works in any environment that defines the same role slugs.
+- Credentials stay identity-only, and existing policies behave identically.
+
+Non-goals:
+
+- Roles for machine identities. Automation keeps explicit actors.
+- Provider permissions mapped to native actions.
+- Changing how a policy change is authorized or activated.
+- Authorizing direct CLI or embedded writers from provider facts.
 
 ## User and operational behavior
 
