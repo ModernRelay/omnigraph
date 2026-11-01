@@ -160,7 +160,7 @@ jobs:
         if: needs.classify_changes.outputs.run_gqt == 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       # The `rust-toolchain.toml` pin, not a floating `stable` action (see
       # the `fmt` job in ci.yml): rustc is part of the cache key.

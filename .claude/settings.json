@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && sh scripts/seed-target.sh",
+            "timeout": 600
+          }
+        ]
+      }
+    ]
+  }
+}

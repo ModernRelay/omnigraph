@@ -372,7 +372,7 @@ jobs:
         if: env.VOCABULARY_AUDIT_ENABLED == 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       - name: Restore pinned public-Rust tooling
         if: env.VOCABULARY_AUDIT_ENABLED == 'true'
@@ -585,7 +585,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       # See the toolchain note in `fmt`. Before the cache step so the cache
       # key sees the pinned rustc.
@@ -661,7 +661,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       - name: Install pinned toolchain
         run: rustup toolchain install
@@ -845,7 +845,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       - name: Install pinned toolchain
         run: rustup toolchain install
@@ -1033,7 +1033,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       - name: Install pinned toolchain
         run: rustup toolchain install
@@ -1130,7 +1130,7 @@ jobs:
         if: needs.classify_changes.outputs.run_full_ci == 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       - name: Install pinned toolchain
         if: needs.classify_changes.outputs.run_full_ci == 'true'
@@ -1215,7 +1215,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev python3-pip
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold python3-pip
 
       - name: Install pinned toolchain
         run: rustup toolchain install
@@ -1458,7 +1458,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       - name: Install pinned toolchain
         run: rustup toolchain install

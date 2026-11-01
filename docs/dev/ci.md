@@ -473,6 +473,13 @@ does not control `sccache`. Both caches share the repository's Actions
 cache quota. The vocabulary audit (nightly toolchain, disabled) and the
 release and publish workflows carry no `sccache` step.
 
+The same jobs, and the nightly and DST test jobs, install `mold` with the
+other system packages. `.cargo/config.toml` links every Linux target through
+`scripts/cargo-linker.sh`, which uses mold when it is on `PATH` and the
+default `cc` linker otherwise; linking is the uncached part of each test
+binary. The release and publish workflows do not install it and link as
+before ([local builds](local-builds.md#linker)).
+
 `rust-cache` restores an archive keyed on the toolchain, build environment,
 manifests and `Cargo.lock`, with prefix fallback when dependencies change.
 When Cargo still invokes rustc, `sccache` can reuse retained compilations

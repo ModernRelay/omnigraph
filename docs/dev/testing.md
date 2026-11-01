@@ -509,6 +509,10 @@ is not evidence. Keep its output with the release qualification record.
 
 ## Commands
 
+The `cargo dev-*` aliases build every loop below on the canonical graph's one
+feature set, and new worktrees can start from a cloned warm `target/`; see
+[local builds](local-builds.md).
+
 Focused iteration:
 
 ```bash

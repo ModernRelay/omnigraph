@@ -44,3 +44,28 @@ rustflags = ["--cfg", "tokio_unstable"]
 # 1 GB is comfortable headroom per-test pool; prod and CI-for-prod
 # builds set the variable themselves (or keep the 100 MB default).
 LANCE_MEM_POOL_SIZE = "1073741824"
+
+# Linux links through `scripts/cargo-linker.sh`, which adds `-fuse-ld=mold`
+# when `mold` is on PATH and otherwise runs `cc` unchanged, so a machine
+# without mold builds exactly as before. Only `linker` is set here: a
+# `target.<triple>.rustflags` entry would replace `[build] rustflags` above.
+# The linker is not part of any compile fingerprint, so installing or
+# removing mold relinks binaries without recompiling a crate. macOS keeps
+# the system linker.
+[target.x86_64-unknown-linux-gnu]
+linker = "scripts/cargo-linker.sh"
+
+[target.aarch64-unknown-linux-gnu]
+linker = "scripts/cargo-linker.sh"
+
+# One feature set for every local test loop: the canonical CI graph
+# (docs/dev/testing.md). Building and testing through these aliases keeps
+# one set of artifacts in target/, so switching between `test`, `nextest`,
+# `clippy` and `--no-run` never recompiles a crate for a feature change.
+# Select a subset at run time instead of at build time, e.g.
+# `cargo dev-nextest -E 'package(omnigraph-engine)'`.
+[alias]
+dev-test = "test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints"
+dev-nextest = "nextest run --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints"
+dev-build-tests = "test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --no-run --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints"
+dev-clippy = "clippy --workspace --all-targets --locked -- -D warnings -W clippy::dbg_macro"
