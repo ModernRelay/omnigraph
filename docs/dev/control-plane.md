@@ -328,7 +328,8 @@ A beat already present is the owner's own earlier request and counts from
 the start of that beat's first attempt, before its reads; an unanswered beat
 is sent again after a quarter of a beat interval. A timer of its own fences
 the owner two thirds of a lease after the start of its last acknowledged
-beat, or at once on a claim or a record that no longer holds its lock id: a
+beat. The reads before its next beat, at most a third of a lease later,
+fence it on a claim or a record that no longer holds its lock id: a
 takeover, a release or an exact-ID unlock. The first beat races the same
 deadline counted from the send of the lock's own write, because a successor
 may count silence from the moment the record is visible; when it lapses, or

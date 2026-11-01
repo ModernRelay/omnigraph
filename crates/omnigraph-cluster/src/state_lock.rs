@@ -21,6 +21,9 @@ const RELEASED_LOCK_VERSION: u32 = 2;
 /// take it over nor release it.
 const LEASED_LOCK_VERSION: u32 = 3;
 const CLUSTER_LOCK_FILE: &str = "__cluster/lock.json";
+/// The bound on every read of `lock.json`. An owner that reads with a
+/// smaller one gets a limit error and stops at its deadline.
+pub(crate) const LOCK_RECORD_MAX_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Error)]
 pub(crate) enum StateLockError {
@@ -335,7 +338,7 @@ async fn acquire_state_lock_leased(
         // refresh a failed CAS or adopt a write whose acknowledgement was
         // lost.
         let Some((text, version)) = adapter
-            .read_text_versioned_if_exists_bounded(lock_uri, 64 * 1024)
+            .read_text_versioned_if_exists_bounded(lock_uri, LOCK_RECORD_MAX_BYTES)
             .await?
         else {
             return Ok(StateLockAcquire::Held);
@@ -455,7 +458,7 @@ pub(crate) async fn release_settled_lock(
     lock_id: &str,
 ) -> Result<(), StateLockError> {
     let (text, version) = adapter
-        .read_text_versioned_if_exists_bounded(uri, 64 * 1024)
+        .read_text_versioned_if_exists_bounded(uri, LOCK_RECORD_MAX_BYTES)
         .await?
         .ok_or_else(|| StateLockError::InvalidBinding("held lock is absent".into()))?;
     let lock = StateLockFile::parse(&text)?;
@@ -535,7 +538,7 @@ async fn read_bootstrap_lock(
     uri: &str,
 ) -> Result<(StateLockFile, String), StateLockError> {
     let (text, version) = adapter
-        .read_text_versioned_if_exists_bounded(uri, 64 * 1024)
+        .read_text_versioned_if_exists_bounded(uri, LOCK_RECORD_MAX_BYTES)
         .await?
         .ok_or_else(|| StateLockError::InvalidBinding("bootstrap lock is absent".into()))?;
     let lock = StateLockFile::parse(&text)?;
@@ -902,7 +905,7 @@ mod tests {
             panic!("a fresh root is free");
         };
         let (_, read_by_owner) = store
-            .read_text_versioned_if_exists_bounded(lock_uri, 64 * 1024)
+            .read_text_versioned_if_exists_bounded(lock_uri, LOCK_RECORD_MAX_BYTES)
             .await
             .unwrap()
             .unwrap();

@@ -71,7 +71,7 @@ use omnigraph_storage::{StorageAdapter, StorageIoScope};
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 
-use crate::state_lock::StateLockFile;
+use crate::state_lock::{LOCK_RECORD_MAX_BYTES, StateLockFile};
 
 /// The lease a new lock records unless `OMNIGRAPH_CLUSTER_LEASE_SECONDS`
 /// sets another.
@@ -133,9 +133,6 @@ fn beat_uri(dir: &str, seq: u64) -> String {
 fn claim_uri(dir: &str) -> String {
     format!("{dir}/superseded.json")
 }
-
-/// The bound every read of `lock.json` uses.
-const LOCK_RECORD_MAX_BYTES: u64 = 64 * 1024;
 
 /// The newest beat a listing of `dir` holds.
 async fn newest_beat(
