@@ -8,7 +8,7 @@ authors:
   - Ragnor Comerford
 created: 2026-11-01
 updated: 2026-11-01
-discussion: null
+discussion: https://github.com/ModernRelay/omnigraph/pull/1224
 supersedes: []
 superseded_by: []
 blocked_on: []
@@ -149,6 +149,13 @@ denying bulk export while allowing queries is a reasonable operator choice; a
 client ceiling needs no such distinction. A policy action added later belongs to no scope until the vocabulary
 version that names it, so a ceilinged token can never perform it. This is the
 fail-closed direction.
+
+A scope names a kind of action, not a graph. `graph.read` lets the client
+read on every graph of the cluster where applied policy lets the person read;
+policy still decides graph by graph through `applies_to`, so a client never
+reaches a graph its user cannot. Narrowing a client to one of the user's
+graphs is a different question, answered in OAuth by the resource indicator
+(RFC 8707) rather than by the scope; see the unresolved questions.
 
 Graph discovery (`GET /graphs` and the `graphs` tool for an identity
 credential) names graphs by ID and display name and checks no policy action
@@ -482,8 +489,16 @@ touched.
 
 ## Unresolved questions
 
-- Whether scopes should later be graph-qualified (`graph.read:knowledge`) in
-  a vocabulary version 2, and how that composes with `applies_to`.
+- How a client is narrowed to one graph of a multi-graph cluster. Scope
+  strings are the wrong carrier: WorkOS assigns scopes from an
+  environment-wide permission catalog, which cannot enumerate every tenant's
+  graph IDs, and dynamically registered clients cannot be assigned scopes at
+  all. The OAuth answer is the resource indicator: WorkOS issues `aud` as the
+  concrete URI a client requested under a path-wildcard resource indicator
+  (`https://<graph host>/mcp/*`), so `…/mcp/<graph_id>` could name the graph
+  in the audience and the server could bind the token to that graph. That
+  changes audience admission, resource registration and the served metadata
+  paths, and is its own RFC.
 - Whether `graph.write` should split merge/publish/drop from ordinary change
   once there is a client that needs the distinction.
 - Whether identity-credential graph discovery should require `cluster.list`
