@@ -342,7 +342,7 @@ pub(crate) async fn poll(
             &child_snapshot,
             graph_identity,
             commit_id,
-            ChangeDiscovery::linear(lineage),
+            ChangeDiscovery::for_commit(lineage, commit),
             &request.scope,
             resume.as_ref(),
             &mut budget,

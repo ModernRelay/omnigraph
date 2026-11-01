@@ -1,0 +1,89 @@
+# issue: none
+# red_on: the row-identity rule with the merge base's place on the source's first-parent chain taken as table ancestry: the source's fast forward above the base gave it sub's Person pin, whose history never read the base's, and the two sibling first commits' inserts share a row id and a stamp, so the rule paired `x` with `y` as one unchanged row and the review reported `x` as inserted instead of `y` (refused under `verify`).
+# notes: A branch review whose merge base is on the source's first-parent chain, with a fast-forward
+# notes: merge above it, takes the exact merge. Feature inserts `x` and sub, forked before it, inserts
+# notes: `y`: both are first commits after the fork, so Lance gives both rows the same row id and the
+# notes: same version stamp. Main fast-forwards to feature's `x`, sub merges feature in (re-inserting
+# notes: `x` under a new row id), and feature fast-forwards to sub. The merge base of feature and main
+# notes: is feature's `x` commit, on feature's first-parent chain, but the fast forward above it carries
+# notes: sub's pins; the review must report `y` and nothing for `x`, under every `change_lineage`.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Person","data":{"name":"bob","age":40}}
+
+--- mutate
+branch create feature
+
+--- expect ok
+
+--- mutate
+branch create sub
+
+--- expect ok
+
+--- mutate branch: feature
+query x_on_feature() {
+    insert Person { name: "x", age: 1 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: sub
+query y_on_sub() {
+    insert Person { name: "y", age: 2 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge feature into main
+
+--- expect outcome: fast_forward
+
+--- mutate
+branch merge feature into sub
+
+--- expect outcome: merged
+
+--- mutate
+branch merge sub into feature
+
+--- expect outcome: fast_forward
+
+--- query
+branch diff feature into main
+
+--- expect ordered
+{"after":{"properties":{"age":2,"name":"y"}},"id":"y","kind":"node","op":"insert","type":"Person"}
+
+--- query
+set change_lineage = on;
+branch diff feature into main
+
+--- expect ordered
+{"after":{"properties":{"age":2,"name":"y"}},"id":"y","kind":"node","op":"insert","type":"Person"}
+
+--- query
+set change_lineage = off;
+branch diff feature into main
+
+--- expect ordered
+{"after":{"properties":{"age":2,"name":"y"}},"id":"y","kind":"node","op":"insert","type":"Person"}

@@ -521,7 +521,7 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
-        "first_parent_chain_holds",
+        "descends_linearly_from",
     ),
     (
         "omnigraph-catalog/lib.rs",

@@ -29,6 +29,7 @@ use super::token::{cursor_rejected, opaque_type_id};
 use super::{changed_table_intervals, parse_table_key};
 use crate::db::DatasetEntry;
 use crate::db::Snapshot;
+use crate::db::commit_graph::GraphCommit;
 use crate::db::logical_row_image;
 use crate::db::manifest::system_columns_at_image;
 use crate::error::{OmniError, Result};
@@ -488,25 +489,28 @@ async fn reprove_named_branch_heads(store: &TableStore, snapshot: &Snapshot) -> 
 }
 
 /// How an interval with no adjacent-transaction proof is discovered: the
-/// session's `change_lineage`, and whether `from` lies on `to`'s first-parent
-/// chain, without which stamp equality proves nothing across the two sides.
+/// session's `change_lineage`, and whether `to` descends from `from` through
+/// first parents with no merge commit after `from`, without which stamp
+/// equality proves nothing across the two sides: a merge can take the merged
+/// branch's table pins, whose history never read `from`'s.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ChangeDiscovery {
     pub(crate) lineage: ChangeLineage,
-    pub(crate) from_is_ancestor: bool,
+    pub(crate) linear_descent: bool,
 }
 
 impl ChangeDiscovery {
-    /// A parent-to-child interval, the feed's and the commit page's shape.
-    pub(crate) fn linear(lineage: ChangeLineage) -> Self {
+    /// The interval from `commit`'s first parent to `commit`, the feed's and
+    /// the commit page's shape: linear unless `commit` is a merge commit.
+    pub(crate) fn for_commit(lineage: ChangeLineage, commit: &GraphCommit) -> Self {
         Self {
             lineage,
-            from_is_ancestor: true,
+            linear_descent: commit.merged_parent_commit_id.is_none(),
         }
     }
 
     fn pair_rows_by_identity(self) -> bool {
-        self.from_is_ancestor && self.lineage != ChangeLineage::Off
+        self.linear_descent && self.lineage != ChangeLineage::Off
     }
 }
 

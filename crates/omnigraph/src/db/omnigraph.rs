@@ -20,7 +20,7 @@ use omnigraph_compiler::{
 
 use crate::db::graph_coordinator::{
     CapturedLineage, GraphCoordinator, PublishedSnapshot, commit_not_found,
-    first_parent_chain_holds_in,
+    descends_linearly_from_in,
 };
 use crate::error::{BranchStartRefusal, ManifestErrorKind, OmniError, Result, dataset_subject};
 use crate::runtime_cache::RuntimeCache;
@@ -2706,7 +2706,7 @@ impl Omnigraph {
             &child.snapshot,
             &graph_identity,
             commit_id,
-            crate::changes::enumerate::ChangeDiscovery::linear(lineage),
+            crate::changes::enumerate::ChangeDiscovery::for_commit(lineage, &commit),
             scope,
             resume.as_ref(),
             &mut budget,
@@ -3021,7 +3021,7 @@ impl Omnigraph {
             &endpoints.to_commit_id,
             crate::changes::enumerate::ChangeDiscovery {
                 lineage,
-                from_is_ancestor: endpoints.from_is_ancestor,
+                linear_descent: endpoints.linear_descent,
             },
             &scope,
             resume.as_ref(),
@@ -3118,7 +3118,7 @@ impl Omnigraph {
 
     /// Resolve a graph diff's sides to exact commits and their snapshots, each
     /// two-point side authorized by `can_read` before the next is looked at,
-    /// and whether `from` is on `to`'s first-parent chain unless `lineage` is `Off`.
+    /// and whether `to` descends linearly from `from` unless `lineage` is `Off`.
     async fn resolve_diff_endpoints(
         &self,
         sides: &crate::changes::GraphDiffSides,
@@ -3136,24 +3136,37 @@ impl Omnigraph {
                 };
                 let (from_commit_id, from_snapshot) = self.open_diff_side(from, from_side).await?;
                 let to_side = self.authorized_diff_side(to, can_read).await?;
-                let from_is_ancestor = lineage != ChangeLineage::Off
-                    && self
-                        .diff_from_is_ancestor(&from_commit_id, from_commit.as_ref(), &to_side)
-                        .await?;
+                let linear_descent = match to_side.commit_id() {
+                    Some(to_commit_id) if lineage != ChangeLineage::Off => {
+                        self.diff_descends_linearly(
+                            &from_commit_id,
+                            from_commit.as_ref(),
+                            to_commit_id,
+                            &to_side,
+                        )
+                        .await?
+                    }
+                    _ => false,
+                };
                 let (to_commit_id, to_snapshot) = self.open_diff_side(to, to_side).await?;
                 Ok(DiffEndpoints {
                     from_commit_id,
                     to_commit_id,
                     base_commit_id: None,
-                    from_is_ancestor,
+                    linear_descent,
                     from_snapshot,
                     to_snapshot,
                 })
             }
             crate::changes::GraphDiffSides::Branch { source, target } => {
                 let captured = self.capture_merge_base(source, target).await?;
-                let from_is_ancestor =
-                    lineage != ChangeLineage::Off && captured.base_on_source_chain().await?;
+                let linear_descent = lineage != ChangeLineage::Off
+                    && captured
+                        .source_descends_linearly(
+                            &captured.merge_base.graph_commit_id,
+                            &captured.source_head,
+                        )
+                        .await?;
                 let CapturedMergeBase {
                     source_head,
                     target_head,
@@ -3178,7 +3191,7 @@ impl Omnigraph {
                     from_commit_id: base_commit_id.clone(),
                     to_commit_id: source_head,
                     base_commit_id: Some(base_commit_id),
-                    from_is_ancestor,
+                    linear_descent,
                     from_snapshot: base_snapshot,
                     to_snapshot: source_snapshot,
                 })
@@ -3186,46 +3199,49 @@ impl Omnigraph {
         }
     }
 
-    /// Whether `from` is on the first-parent chain of the branch `to` names,
-    /// from the lineage that branch's coordinator holds; `to` spelled as a
-    /// commit, or a `from` of unknown generation, answers `false`.
-    async fn diff_from_is_ancestor(
+    /// Whether a two-point diff page may pair rows by identity across the
+    /// commits it opens: `to` descends from `from` through first parents with
+    /// no merge commit after it, walked from `to` in the lineage of the branch
+    /// the side `to_side` names. Every page asks for its own two commits: the
+    /// first page for what its sides resolve to, a later one for what its
+    /// token names, never the branch's head now. A side spelled as a commit,
+    /// or a `from` of unknown generation, answers `false`.
+    async fn diff_descends_linearly(
         &self,
         from: &str,
         from_commit: Option<&GraphCommit>,
-        to: &DiffReadTarget,
+        to: &str,
+        to_side: &DiffReadTarget,
     ) -> Result<bool> {
-        let DiffReadTarget::Branch(resolved) = to else {
+        let DiffReadTarget::Branch(resolved) = to_side else {
             return Ok(false);
         };
-        if resolved.graph_commit_id.as_deref() == Some(from) {
+        if to == from {
             return Ok(true);
         }
         let branch = resolved.branch.as_deref();
         {
             let coord = self.coordinator.read().await;
             if branch == coord.current_branch() {
-                return Self::first_parent_chain_holds(&coord, from, from_commit).await;
+                return Self::descends_linearly_from(&coord, from, from_commit, to).await;
             }
         }
         let cache = self.validated_cached_coordinator(branch).await?;
         let (_, coord) = cache
             .as_ref()
             .expect("validated authority cache entry is present");
-        Self::first_parent_chain_holds(coord, from, from_commit).await
+        Self::descends_linearly_from(coord, from, from_commit, to).await
     }
 
-    /// [`GraphCoordinator::first_parent_chain_holds`] for `from`, whose
+    /// [`GraphCoordinator::descends_linearly_from`] for `from`, whose
     /// generation comes from its classified commit or from what the
     /// coordinator already holds.
-    async fn first_parent_chain_holds(
+    async fn descends_linearly_from(
         coord: &GraphCoordinator,
         from: &str,
         from_commit: Option<&GraphCommit>,
+        to: &str,
     ) -> Result<bool> {
-        if coord.holds_commit(from) {
-            return Ok(true);
-        }
         let generation = match from_commit {
             Some(commit) => commit.generation,
             None => match coord.captured_commit(from)? {
@@ -3233,7 +3249,7 @@ impl Omnigraph {
                 None => return Ok(false),
             },
         };
-        coord.first_parent_chain_holds(from, generation).await
+        coord.descends_linearly_from(to, from, generation).await
     }
 
     /// Reopen the commits a diff page token names, once its sides reach them.
@@ -3257,7 +3273,7 @@ impl Omnigraph {
         use crate::changes::GraphDiffSides;
         let from = &decoded.from_commit_id;
         let to = &decoded.to_commit_id;
-        let from_is_ancestor;
+        let linear_descent;
         let (from_reach, to_reach) = match sides {
             GraphDiffSides::Between {
                 from: from_side,
@@ -3278,9 +3294,9 @@ impl Omnigraph {
                     }
                     _ => None,
                 };
-                from_is_ancestor = lineage != ChangeLineage::Off
+                linear_descent = lineage != ChangeLineage::Off
                     && self
-                        .diff_from_is_ancestor(from, from_commit.as_ref(), &to_now)
+                        .diff_descends_linearly(from, from_commit.as_ref(), to, &to_now)
                         .await?;
                 (
                     self.reach_side(from, from_side, from_now, can_read).await?,
@@ -3294,8 +3310,8 @@ impl Omnigraph {
                 let source_branch = normalize_branch_name(source)?;
                 let target_branch = normalize_branch_name(target)?;
                 let captured = self.capture_merge_base(source, target).await?;
-                from_is_ancestor =
-                    lineage != ChangeLineage::Off && captured.base_on_source_chain().await?;
+                linear_descent = lineage != ChangeLineage::Off
+                    && captured.source_descends_linearly(from, to).await?;
                 let CapturedMergeBase {
                     source_head,
                     target_head,
@@ -3328,7 +3344,7 @@ impl Omnigraph {
             from_commit_id: from.clone(),
             to_commit_id: to.clone(),
             base_commit_id: decoded.base_commit_id.clone(),
-            from_is_ancestor,
+            linear_descent,
             from_snapshot: self.open_reached(from, from_reach).await?,
             to_snapshot: self.open_reached(to, to_reach).await?,
         })
@@ -5497,6 +5513,15 @@ enum DiffReadTarget {
 }
 
 impl DiffReadTarget {
+    /// The commit this endpoint resolves to: a branch's head when the side was
+    /// classified, or the named commit.
+    fn commit_id(&self) -> Option<&str> {
+        match self {
+            Self::Branch(resolved) => resolved.graph_commit_id.as_deref(),
+            Self::Commit(commit) => Some(&commit.graph_commit_id),
+        }
+    }
+
     /// The branch a caller authorizes `read` on: the branch itself, or the
     /// authored branch of the commit (an unpublished proposal's or unattached
     /// snapshot's recorded target).
@@ -5534,16 +5559,20 @@ struct CapturedMergeBase {
 }
 
 impl CapturedMergeBase {
-    /// Whether the merge base is on the source head's first-parent chain: a
-    /// source that merged its target holds it as a merge commit's second
-    /// parent, where sibling first commits stamp their rows alike.
-    async fn base_on_source_chain(&self) -> Result<bool> {
-        first_parent_chain_holds_in(
-            &self.source_graph,
-            &self.merge_base.graph_commit_id,
-            self.merge_base.generation,
-        )
-        .await
+    /// Whether a branch review page may pair rows by identity across the
+    /// commits it opens: the source's commit `to` descends from `from`
+    /// through first parents with no merge commit above it, walked from `to`
+    /// in the source's lineage. The first page asks for the merge base and
+    /// the source head; a later page asks for the commits its token names,
+    /// which the base and head now may have moved past. A source that merged
+    /// its target holds the base as a merge commit's second parent, where
+    /// sibling first commits stamp their rows alike; a merge above the base
+    /// can take another branch's table pins, whose history never read the
+    /// base's.
+    async fn source_descends_linearly(&self, from: &str, to: &str) -> Result<bool> {
+        let generation =
+            (from == self.merge_base.graph_commit_id).then_some(self.merge_base.generation);
+        descends_linearly_from_in(&self.source_graph, to, from, generation).await
     }
 }
 
@@ -5553,10 +5582,11 @@ struct DiffEndpoints {
     from_commit_id: String,
     to_commit_id: String,
     base_commit_id: Option<String>,
-    /// `from` lies on `to`'s first-parent chain (the branch form's merge base
-    /// on the source head's chain, a two-point `to` whose chain holds `from`)
-    /// and the session pairs rows: never under `change_lineage = off`.
-    from_is_ancestor: bool,
+    /// `to` descends from `from` through first parents with no merge commit
+    /// after it, decided for these two commits whether a first page resolved
+    /// them or a token named them, and the session pairs rows: never under
+    /// `change_lineage = off`.
+    linear_descent: bool,
     from_snapshot: Snapshot,
     to_snapshot: Snapshot,
 }

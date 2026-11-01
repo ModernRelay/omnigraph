@@ -1259,7 +1259,8 @@ async fn graph_diff_over_several_commits_reads_data_flat_in_table_extent() {
 
 /// A diff of two diverged heads takes the exact merge, as does any window
 /// under `change_lineage = off`; the same window under `on` and `verify`
-/// takes the row-identity route, with the same answer.
+/// takes the row-identity route, with the same answer, until a fast forward
+/// puts a merge commit in it.
 #[tokio::test]
 async fn graph_diff_of_diverged_heads_takes_the_exact_merge() {
     use omnigraph::changes::{ChangeOpKind, GraphDiffRequest, GraphDiffSides};
@@ -1381,6 +1382,34 @@ async fn graph_diff_of_diverged_heads_takes_the_exact_merge() {
             on.internal_open_count,
             on.total_reads()
         );
+
+        // Main fast-forwards to side-a: the same window, now ending at main,
+        // crosses a merge commit, whose pins came from the merged branch.
+        let fast_forward = db.branch_merge("side-a", "main").await.unwrap();
+        assert_eq!(
+            fast_forward.outcome,
+            omnigraph::db::MergeOutcome::FastForward
+        );
+        let across = between(&loaded.commit.graph_commit_id, "main");
+        for value in ["off", "on", "verify"] {
+            let session = helpers::with_setting(&db, "change_lineage", value);
+            let (page, io) = measure(session.diff_page(&across)).await;
+            let page = page.unwrap();
+            let ids: Vec<&str> = page
+                .changes
+                .iter()
+                .map(|change| change.id.as_str())
+                .collect();
+            assert_eq!(ids, vec!["p001", "p003"], "change_lineage = {value}");
+            assert_eq!(
+                (
+                    io.change_intervals_row_identity,
+                    io.change_intervals_exact_merge
+                ),
+                (0, 1),
+                "change_lineage = {value}: a window across a merge commit takes the exact merge"
+            );
+        }
     })
     .await;
 }
