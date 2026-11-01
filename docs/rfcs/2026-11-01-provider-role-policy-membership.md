@@ -8,7 +8,7 @@ authors:
   - ragnorc
 created: 2026-11-01
 updated: 2026-11-01
-discussion: null
+discussion: https://github.com/ModernRelay/omnigraph/pull/1223
 supersedes: []
 superseded_by: []
 blocked_on: []
