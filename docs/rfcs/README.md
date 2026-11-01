@@ -244,10 +244,13 @@ then dated RFCs by date.
 | [2026-09-30](2026-09-30-owned-server-operations.md) | Owned server operations | maintainer | accepted | complete |
 | [2026-09-30](2026-09-30-schema-contract-in-manifest.md) | Schema contract in the manifest | maintainer | draft | in-progress |
 | [2026-10-01](2026-10-01-engine-settlement-and-resource-bounds.md) | Engine settlement and resource bounds | maintainer | accepted | partial |
+| [2026-10-07](2026-10-07-polymorphic-types.md) | Polymorphic types: interfaces, unions and polymorphic edges | maintainer | draft | not-started |
 | [2026-10-08](2026-10-08-index-facts-as-planner-input.md) | Index facts as planner input | maintainer | accepted | complete |
 | [2026-10-10](2026-10-10-unpublished-graph-commits.md) | Unpublished graph commits | maintainer | accepted | partial |
 | [2026-10-10](2026-10-10-merge-base-block-registry.md) | Block registry for merge base lookup | maintainer | draft | in-progress |
 | [2026-10-11](2026-10-11-unattached-graph-branches.md) | Unattached graph branches | maintainer | draft | not-started |
+| [2026-10-12](2026-10-12-distributed-sequence.md) | Distributed sequence | maintainer | draft | not-started |
+| [2026-10-12](2026-10-12-integer-node-identity.md) | Integer node identity | maintainer | draft | not-started |
 | [2026-10-15](2026-10-15-bulk-load-as-a-query-plan.md) | Bulk load as a query plan | maintainer | draft | partial |
 | [2026-10-16](2026-10-16-engine-catalogue.md) | Engine catalogue | maintainer | draft | in-progress |
 | [2026-10-16](2026-10-16-graph-access-serving-and-cross-process-writes.md) | Graph access and cross-process writes | maintainer | accepted | in-progress |
