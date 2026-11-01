@@ -194,6 +194,76 @@ Cases an RFC has argued: the flat locator objects and legacy data files under
 These are constraints, not roadmap ledgers. Change one only with the owning
 code, tests, guide, and—when irreversible—RFC.
 
+## Root cause and change discipline
+
+Name the broken invariant and the full set of cases it affects. Fix it at the
+layer that owns the contract, and trace nearby callers and workloads so the
+cause cannot return through another path. A symptomatic patch, or a special
+case that leaves the cause in place, does not count as a fix.
+
+Before adding a mechanism, check whether an existing abstraction already gives
+that guarantee. Prefer extending that abstraction, or removing it, over adding
+a parallel one. [Hard invariant 1](#hard-invariants) already requires the
+matching Lance pages before new parallel machinery or reliance on an
+undocumented behavior, and [hard invariant 12](#hard-invariants) already
+forbids a shadow copy that can drift. When a change still adds machinery, name
+the cost: duplicated state that can drift, or reliance on another component's
+undocumented internals.
+
+When a concept is handled implicitly or in several places, propose one owner,
+a type or a module, only when that owner lowers ongoing liability. Generalize
+only as far as the contract requires. Fewer lines is evidence of lower
+liability, not proof. Justify every new API, state, invariant, or maintenance
+burden against the [governing principle](#governing-principle).
+
+Prefer orthogonal primitives. In an orthogonal design each operation changes
+one property and has no side effects on others, and there is one way to change
+each property, as Raymond describes under
+[Orthogonality](http://www.catb.org/~esr/writings/taoup/html/ch04s02.html#orthogonality)
+in *The Art of Unix Programming*. A small set of such primitives that compose
+without special rules and together cover the contract keeps the design compact:
+new behavior is a composition of existing primitives, not a new mechanism. When
+a change seems to need a new mechanism, first name the restriction in the
+existing primitives that makes it look necessary, and remove that restriction
+if you can. Composition does not discharge obligations. A composed operation
+still establishes its own end-to-end contract, as
+[Composition carries obligations](systems.md#61-composition-carries-obligations)
+requires, including one publication ([hard invariant 2](#hard-invariants)),
+engine policy, and a measured cost ([hard invariant 13](#hard-invariants)).
+Orthogonality makes that argument shorter. It does not make it optional.
+
+Organize a component around one formal core rather than heuristics. A core with
+a clear model, such as an algebra of operators or one manifest publication,
+has few special cases. A heuristic adds edge cases and a recovery path for when
+it fails. Add one, or a fast path beside a general path, only when it is
+measured to pay for its complexity, keeps the same observable contract, and is
+tested against the general path. Keep data models free of junk and confusion:
+a type should not represent states that cannot exist, and states the problem
+keeps distinct stay distinct in the model.
+
+The aim behind these rules is the most guarantee across the full scope
+(correctness, efficiency, security) for the least code, state, and concepts.
+It is a direction for judgment, not a number a reviewer computes. The checks
+below are how a review applies it.
+
+A regression counts only when it fails before the fix for the predicted reason
+and passes after the fix. A compile error, a setup failure, a skipped test, or
+a run that executed no tests does not count. Keep query behavior on the tier
+that [Testing](testing.md#plan-replay) already assigns. When the contract is
+not visible in rows, counts, result column types, or errors, say why GQT cannot
+express it instead of adding a shallow `.gqt` case.
+
+Report a local run, CI on the exact commit, a reading of the code, and a
+performance claim with no checked-in instrument as separate kinds of evidence.
+A cost claim still needs the instrument in
+[hard invariant 13](#hard-invariants). Storage gates stay separate, as
+[Lance compatibility](testing.md#lance-compatibility) describes.
+
+Other open pull requests, the documented direction, and future Lance versions
+are context. A change does not treat them as shipped behavior or as new
+requirements. The [support boundaries](#current-support-boundaries) record
+constraints on the system that exists now.
+
 ## Review checklist
 
 - Does one snapshot or authority token cover the whole operation?
@@ -212,3 +282,16 @@ code, tests, guide, and—when irreversible—RFC.
 - Is current truth stated once and linked elsewhere?
 - Did the change extend the existing test owner and read the complete relevant
   Lance domain?
+- Does the change name the broken invariant and fix it at the owning layer,
+  and list the callers and workloads that share the cause?
+- Does new machinery extend or remove an existing abstraction, and is every
+  new API, state, invariant, or maintenance burden justified?
+- Is new behavior expressed by composing existing primitives, with no
+  special rule for a pair of them and no side effect on an unrelated property?
+- Is every added heuristic or fast path measured, contract-equal to the
+  general path, and tested against it?
+- Did the regression fail before the fix for the predicted reason, and are
+  local runs, CI on that commit, code reading, and performance claims separate
+  evidence?
+- Do open pull requests, documented direction, and future Lance versions
+  stay context for this change?
