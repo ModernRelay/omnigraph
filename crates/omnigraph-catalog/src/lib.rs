@@ -1426,6 +1426,14 @@ pub struct ManifestCoordinator {
     history: HistoryCache,
 }
 
+/// The history block an addressable commit id names; `None` for any other id.
+fn commit_block(graph_commit_id: &str) -> Option<ulid::Ulid> {
+    omnigraph_core::graph_commit_id::parse_history_block_id(graph_commit_id)
+        .ok()
+        .flatten()
+        .map(|id| id.block)
+}
+
 decide_seam! {
     /// A refresh has opened and decoded a replacement manifest and has not
     /// installed it. Failure here must leave the old coordinator coherent.
@@ -2438,10 +2446,50 @@ impl ManifestCoordinator {
             };
             let rows = state::read_manifest_rows_projected(&branch).await?;
             if let Some(record) = rows.record(graph_commit_id) {
+                if let Some(block) = commit_block(graph_commit_id) {
+                    self.history.remember_block_home(block, native);
+                }
                 return Ok(Some(record));
             }
         }
         Ok(None)
+    }
+
+    /// The record of `graph_commit_id` from the branch where a lookup through
+    /// this coordinator's history cache last found a commit of the same
+    /// history block: one open of `__manifest` and one branch scan, before
+    /// `__history` and [`Self::record_in_live_branches`]. `None` when no such
+    /// branch is known or it no longer holds the commit, released, merged or
+    /// deleted since; the hint is then dropped and the caller looks as before.
+    pub async fn record_in_hinted_branch(
+        &self,
+        graph_commit_id: &str,
+    ) -> Result<Option<HistoryRecord>> {
+        let Some(block) = commit_block(graph_commit_id) else {
+            return Ok(None);
+        };
+        let Some(native) = self.history.block_home(block) else {
+            return Ok(None);
+        };
+        let session = self.dataset.session();
+        let main = open_manifest_dataset_with_session(&self.root_uri, None, &session).await?;
+        let branch = match &native {
+            None => main,
+            Some(native) => match main.checkout_branch(native).await {
+                Ok(branch) => branch,
+                Err(lance::Error::RefNotFound { .. }) => {
+                    self.history.forget_block_home(block);
+                    return Ok(None);
+                }
+                Err(error) => return Err(OmniError::storage(error)),
+            },
+        };
+        let rows = state::read_manifest_rows_projected(&branch).await?;
+        let record = rows.record(graph_commit_id);
+        if record.is_none() {
+            self.history.forget_block_home(block);
+        }
+        Ok(record)
     }
 
     /// Refuse `commit` unless the branch incarnation that wrote it is the live
