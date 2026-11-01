@@ -326,7 +326,11 @@ before it, and cancels every admitted request still running. A cancelled
 request's future is dropped, so its client sends no further attempt and no
 retry. The cancelled request's caller gets an ambiguous error, not the
 scope's definite refusal, because its last attempt may already be on the
-wire. Reads continue.
+wire. Reads continue. A scope can also hold a deadline, the end of its
+owner's lease (§7). From then the first request, multipart part or poll of
+an admitted request to run fences the scope before it sends anything, so a
+pause of the whole process cannot let one task send past the deadline before
+the task that would fence the scope runs.
 
 Each set is capped, at 4096 keys. Past the cap the scope refuses new
 mutations: writes fail fast, and reads continue. Clean release requires an
@@ -462,7 +466,11 @@ fires, or a claim exists, or the record no longer holds its lock id (a
 takeover, a release, or an exact-ID unlock), the owner ***fences***: the lease fences the owner's storage scope (§4) before
 it reports the fence. Every later request is refused and every admitted one
 is cancelled, so from the fence on the owner sends nothing: no new request,
-no retry and no multipart part, however long its process lives. The server
+no retry and no multipart part, however long its process lives. The scope
+holds the deadline too, moved forward with each acknowledged beat, and fences
+itself at it (§4): after a pause of the whole process, whichever task
+resumes first sends nothing past the deadline, and no beat starts at or after
+it. The server
 then closes operation admission and exits nonzero after its shutdown grace. It never resumes, because a successor may
 already act. A clean
 release stops beating, deletes its lease directory, and releases `lock.json`
@@ -523,7 +531,8 @@ became visible, and ends at the send of a listing that still found no newer
 beat, which storage read no earlier than that send. So when storage last
 showed the owner silent, at least `3/2 × lease_seconds` had passed since
 `s`, and a newer acknowledged beat would have been in that listing. The
-owner fenced by `s + 2/3 × lease_seconds`. The gap, five sixths of a lease, covers clock-rate drift and
+owner sends nothing after `s + 2/3 × lease_seconds`, the deadline its
+storage scope holds. The gap, five sixths of a lease, covers clock-rate drift and
 a stalled runtime. A beat that lands after its owner fenced only makes a
 successor refuse once more. The fence sends nothing after it, so the only
 storage effects that can follow the fence are attempts already on the wire.
@@ -646,7 +655,9 @@ The owners to extend:
   per-key refusal; the cap; that a fresh-key failure never blocks another
   key; that a fence cancels an admitted request at every mutation boundary
   with an ambiguous error, and refuses the parts, completion and abort of an
-  upload admitted before it.
+  upload admitted before it; that a scope fences itself at its deadline,
+  sending no attempt of an admitted request after it and refusing a request
+  or part that starts after it.
 - **Core, `manifest_request` and the `lance_clone` handler tests.**
   Re-issue, refusal, the held version and the unresolved outcome. These ship
   with #1092.
@@ -671,7 +682,9 @@ The owners to extend:
   checks it cannot read, a failed beat or read and a beat whose answer was
   lost still renewing, a listing answered late never unseating a beating
   owner, a hung first beat fencing before a successor can claim with the
-  owner's scope closed, a successor recognizing its own claim, a takeover
+  owner's scope closed, a pause of the whole process past the deadline
+  fencing the owner whichever task resumes first, with nothing sent after
+  the deadline, a successor recognizing its own claim, a takeover
   after silence, refusal while beats continue, and one winner between two
   successors. `state_lock` tests on an in-memory store with S3's conditional
   semantics: takeover after silence, refusal of a non-serving acquisition,
@@ -795,3 +808,9 @@ phase 3.
   saw became visible, so the takeover happens at least `3/2 ×
   lease_seconds` after `s`."; and the operations list's "a lease directory
   whose lock id no longer holds the lock".
+- 2026-10-31: The owner's fence ran in the lease's own task, so after a
+  pause of the whole process another task that resumed first could send a
+  request past the deadline before that task fenced the scope. The scope now
+  holds the deadline and fences itself at it (§4), and no beat starts at or
+  after it. Superseded sentence: "The owner fenced by `s + 2/3 ×
+  lease_seconds`."

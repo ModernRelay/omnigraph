@@ -39,7 +39,9 @@
 //! the holder's storage scope before it reports the fence: every later
 //! request is refused and every admitted one is cancelled, so the holder
 //! sends nothing after a successor may claim, however long its process
-//! lives.
+//! lives. The scope also holds the deadline itself, moved forward with each
+//! acknowledged beat, and fences at it whichever task runs first after a
+//! pause of the whole process; no beat starts at or after it either.
 //!
 //! Heartbeats and the reads before them, the watch and the claim go through
 //! the root outside the owner's storage scope, on a client with the
@@ -209,6 +211,8 @@ impl LeaseKeeper {
     ///
     /// When the lease fences, `scope` closes before the fence is published,
     /// so the holder sends no storage mutation after a successor may act.
+    /// `scope` holds the owner's deadline too, and fences itself at it
+    /// before any task sends a request past it.
     pub async fn start(
         adapter: Arc<dyn StorageAdapter>,
         root: &str,
@@ -231,6 +235,9 @@ impl LeaseKeeper {
             acknowledged: lock_sent,
             answered: true,
         };
+        if let Some(scope) = &scope {
+            scope.fence_at(lock_sent + owner_deadline(seconds));
+        }
         let first = tokio::select! {
             biased;
             fence = beat.first(seconds) => fence,
@@ -250,6 +257,13 @@ impl LeaseKeeper {
                     // hangs must not postpone the owner's fence. A beat that
                     // completes at the same moment is counted first.
                     let deadline = beat.acknowledged + owner_deadline(seconds);
+                    // The scope fences itself at the deadline, and fenced
+                    // stays: the lease is over even if a beat counts later.
+                    if let Some(scope) = &scope
+                        && !scope.fence_at(deadline)
+                    {
+                        break LeaseFenced::Lapsed;
+                    }
                     let pause = if beat.answered {
                         beat_interval(seconds)
                     } else {
@@ -257,7 +271,7 @@ impl LeaseKeeper {
                     };
                     let next = async {
                         tokio::time::sleep(pause).await;
-                        beat.once().await
+                        beat.once(deadline).await
                     };
                     tokio::select! {
                         biased;
@@ -344,7 +358,7 @@ impl Beat {
     /// a holder never admits work on a lock a claim already names.
     async fn first(&mut self, seconds: u32) -> Option<LeaseFenced> {
         loop {
-            if let Some(fence) = self.once().await {
+            if let Some(fence) = self.once(self.acknowledged + owner_deadline(seconds)).await {
                 return Some(fence);
             }
             if self.answered {
@@ -381,8 +395,13 @@ impl Beat {
     }
 
     /// Confirm the lock is still this owner's, send beat `seq` (again, if an
-    /// earlier request for it got no answer), and report a fence.
-    async fn once(&mut self) -> Option<LeaseFenced> {
+    /// earlier request for it got no answer), and report a fence. Past
+    /// `deadline` it sends nothing: a beat started then would count from a
+    /// moment the lease no longer covered.
+    async fn once(&mut self, deadline: Instant) -> Option<LeaseFenced> {
+        if Instant::now() >= deadline {
+            return Some(LeaseFenced::Lapsed);
+        }
         // The beat counts from before its reads, so a pause between a read
         // and the send counts against the owner's deadline.
         let started = *self.first_attempt.get_or_insert_with(Instant::now);
@@ -912,6 +931,69 @@ mod tests {
                 .is_err(),
             "a fenced holder's storage scope refuses mutations"
         );
+    }
+
+    /// A pause of the whole process past the owner's deadline ends the
+    /// lease whichever task resumes first. A holder's write that runs first
+    /// is refused before it is sent; the lease, running first, starts no
+    /// beat that would renew it. Either way the owner fences. While the
+    /// owner beats, its deadline moves with each beat and the holder writes.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_owner_sends_nothing_after_its_deadline_issue_1067() {
+        let dir = tempfile::tempdir().unwrap();
+        for writer_first in [true, false] {
+            let store = Beats::new();
+            store
+                .write_text(&lock_uri(), &leased_lock_record("owner", SECONDS))
+                .await
+                .unwrap();
+            let scope = StorageIoScope::new();
+            let keeper = LeaseKeeper::start(
+                store.clone(),
+                ROOT,
+                &lock_uri(),
+                "owner",
+                SECONDS,
+                Instant::now(),
+                Some(scope.clone()),
+            )
+            .await
+            .unwrap();
+            let holder = ObjectStorageAdapter::local_scoped(scope.clone());
+            let file = |name: &str| format!("{}/{writer_first}-{name}", dir.path().display());
+            tokio::time::sleep(lease(SECONDS) * 3).await;
+            holder
+                .write_text(&file("live"), "x")
+                .await
+                .expect("a beating owner's deadline moves with each beat");
+
+            // The clock jumps a lease, and the next line runs before any
+            // other task.
+            let mut pause = std::pin::pin!(tokio::time::advance(lease(SECONDS)));
+            std::future::poll_fn(|cx| {
+                let _ = pause.as_mut().poll(cx);
+                std::task::Poll::Ready(())
+            })
+            .await;
+            if writer_first {
+                let refused = holder.write_text(&file("late"), "x").await.unwrap_err();
+                assert!(
+                    refused.to_string().contains("nothing more is sent"),
+                    "{refused}"
+                );
+            }
+            let fence =
+                tokio::time::timeout(lease(SECONDS), LeaseFence(Some(keeper.fenced())).fenced())
+                    .await;
+            assert_eq!(
+                fence.ok(),
+                Some(LeaseFenced::Lapsed),
+                "writer first: {writer_first}"
+            );
+            assert!(scope.is_fenced());
+            assert!(holder.write_text(&file("after"), "x").await.is_err());
+            assert!(!std::path::Path::new(&file("late")).exists());
+        }
     }
 
     /// A claim that appears while beat 0 is in flight keeps the holder from

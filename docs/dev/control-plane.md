@@ -338,7 +338,12 @@ the server does not serve. A fence fences the
 owner's storage scope (`StorageIoScope::fence`) before it is reported: every
 later request is refused, the parts and cleanup of an admitted multipart
 upload included, and every admitted request is cancelled, so the owner sends
-nothing after the fence however long its shutdown grace lasts. The server
+nothing after the fence however long its shutdown grace lasts. The scope
+also holds the owner's deadline (`StorageIoScope::fence_at`), moved forward
+with each acknowledged beat, and fences itself at it: after a pause of the
+whole process, admission, a multipart part and each poll of an admitted
+request check it before sending, whichever task resumes first, and no beat
+starts at or after it. The server
 then closes admission and exits 2 without releasing. A
 serving acquisition that finds a version-3 lock watches the beat listing on
 its own monotonic clock, and counts silence only up to the send of a listing

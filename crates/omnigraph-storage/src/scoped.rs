@@ -53,11 +53,18 @@
 //! further attempt and no retry. A request already sent may still be
 //! applied by the store, as after a crash, and its caller sees an ambiguous
 //! error rather than this scope's definite refusal.
+//!
+//! [`StorageIoScope::fence_at`] fences the scope at a deadline, the end of
+//! its owner's lease, without the task that set it. After a pause of the
+//! whole process any task may resume first, so admission, a multipart part
+//! and every poll of an admitted request check the deadline before they
+//! send anything, and the first to find it passed fences the scope.
 
 use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -69,6 +76,7 @@ use object_store::{
     ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result,
 };
 use tokio::sync::Notify;
+use tokio::time::Instant;
 
 /// Shared mutation accounting for an explicitly owned storage lifetime.
 ///
@@ -95,6 +103,8 @@ struct ScopeState {
     closed: bool,
     /// The owner lost its right to write: nothing more is sent.
     fenced: bool,
+    /// When the owner's right to write ends, if it is leased.
+    deadline: Option<Instant>,
     /// Mutable keys whose last request has an unknown outcome. Bounded by
     /// [`MAX_UNSETTLED_KEYS`]; past the bound `unsettled_overflow` refuses
     /// every mutation rather than growing.
@@ -121,6 +131,20 @@ impl ScopeState {
             });
         }
         self.unsettled.contains(&request.path)
+    }
+
+    /// Fence when the deadline has passed; whether this call fenced.
+    fn reached_deadline(&mut self) -> bool {
+        if self.fenced
+            || !self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return false;
+        }
+        self.closed = true;
+        self.fenced = true;
+        true
     }
 
     fn unsettle(&mut self, path: &Path) {
@@ -172,8 +196,31 @@ impl StorageIoScope {
         self.inner.fence.notify_waiters();
     }
 
+    /// Fence the scope at `deadline` unless a later call moves it, for an
+    /// owner whose lease ends then: from `deadline` the first request, part
+    /// or check to run fences it, before sending anything, whichever task
+    /// that is. Returns false, and moves nothing, once the scope is fenced.
+    pub fn fence_at(&self, deadline: Instant) -> bool {
+        let mut state = self.inner.state.lock().unwrap();
+        if state.fenced {
+            return false;
+        }
+        state.deadline = Some(deadline);
+        true
+    }
+
+    /// Whether the scope is fenced. Past its deadline it is, from the first
+    /// call that notices.
     pub fn is_fenced(&self) -> bool {
-        self.inner.state.lock().unwrap().fenced
+        let (fenced, reached) = {
+            let mut state = self.inner.state.lock().unwrap();
+            let reached = state.reached_deadline();
+            (state.fenced, reached)
+        };
+        if reached {
+            self.inner.fence.notify_waiters();
+        }
+        fenced
     }
 
     /// Resolves once the scope is fenced.
@@ -191,12 +238,22 @@ impl StorageIoScope {
 
     /// Run an admitted request until it answers or the scope is fenced. A
     /// fence drops the request's future, so its client sends nothing more.
+    /// Every poll checks the fence before the request's own: a request that
+    /// resumes past the deadline sends no further attempt.
     async fn until_fenced<T>(
         &self,
         request: impl std::future::Future<Output = Result<T>>,
     ) -> Result<T> {
+        let checked = std::future::poll_fn(|_| {
+            if self.is_fenced() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        });
         tokio::select! {
             biased;
+            () = checked => Err(fenced_in_flight_error()),
             result = request => result,
             () = self.fenced() => Err(fenced_in_flight_error()),
         }
@@ -244,6 +301,11 @@ impl StorageIoScope {
 
     pub(crate) fn begin(&self, request: Request) -> Result<Mutation> {
         let mut state = self.inner.state.lock().unwrap();
+        if state.reached_deadline() {
+            drop(state);
+            self.inner.fence.notify_waiters();
+            return Err(fenced_error());
+        }
         if state.closed {
             return Err(closed_error());
         }
@@ -279,6 +341,11 @@ impl StorageIoScope {
         // A close lets an admitted upload finish or abort; a fence sends
         // nothing more, its cleanup included. Leftover parts are the
         // bucket's to expire.
+        if state.reached_deadline() {
+            drop(state);
+            self.inner.fence.notify_waiters();
+            return Err(fenced_error());
+        }
         if state.fenced {
             return Err(fenced_error());
         }
@@ -2092,6 +2159,130 @@ mod tests {
             "original",
             "reads continue"
         );
+    }
+
+    /// A store whose put sends a first attempt and, after a backoff, a
+    /// second, the way a retrying client resends.
+    #[derive(Debug, Default)]
+    struct Resending {
+        inner: InMemory,
+        sent: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Resending {
+        fn sent(&self) -> usize {
+            self.sent.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl fmt::Display for Resending {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("Resending")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for Resending {
+        async fn put_opts(&self, p: &Path, d: PutPayload, o: PutOptions) -> Result<PutResult> {
+            self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.put_opts(p, d, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            p: &Path,
+            o: PutMultipartOptions,
+        ) -> Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(p, o).await
+        }
+        async fn get_opts(&self, p: &Path, o: GetOptions) -> Result<GetResult> {
+            self.inner.get_opts(p, o).await
+        }
+        fn delete_stream(
+            &self,
+            paths: BoxStream<'static, Result<Path>>,
+        ) -> BoxStream<'static, Result<Path>> {
+            self.inner.delete_stream(paths)
+        }
+        fn list(&self, p: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+            self.inner.list(p)
+        }
+        async fn list_with_delimiter(&self, p: Option<&Path>) -> Result<ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy_opts(&self, from: &Path, to: &Path, o: CopyOptions) -> Result<()> {
+            self.inner.copy_opts(from, to, o).await
+        }
+    }
+
+    /// A leased owner's scope fences itself at its deadline, without the
+    /// task that set it: after a pause of the whole process any task may
+    /// resume first. A request admitted before the deadline sends no
+    /// attempt after it, a request or part that starts after it is refused
+    /// before it is sent, and a fenced scope's deadline no longer moves. A
+    /// deadline moved forward before it passes keeps the scope open.
+    #[tokio::test(start_paused = true)]
+    async fn a_scope_fences_itself_at_its_deadline_issue_1067() {
+        let refused_unsent = |error: object_store::Error| {
+            assert!(
+                matches!(
+                    error,
+                    object_store::Error::Generic { store, .. } if store == OWNED_STORE_NAME
+                ),
+                "refused before it is sent: {error}"
+            );
+        };
+
+        let scope = StorageIoScope::new();
+        let resending = Arc::new(Resending::default());
+        let store = scope.wrap_object_store(resending.clone());
+        let start = Instant::now();
+        assert!(scope.fence_at(start + Duration::from_secs(3)));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(scope.fence_at(start + Duration::from_secs(6)));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!scope.is_fenced(), "the deadline moved before it passed");
+        let path = Path::from("g/node_Person/data/3f2c4d9e.lance");
+        let mut upload = store.put_multipart(&path).await.unwrap();
+        upload.put_part("data".into()).await.unwrap();
+        // The first attempt goes now; the second would go after the
+        // deadline, when nothing else has run to fence the scope.
+        let error = store
+            .put(&Path::from("target"), "data".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                object_store::Error::Generic { store, .. } if store == FENCED_REQUEST_STORE_NAME
+            ),
+            "{error}"
+        );
+        assert_eq!(resending.sent(), 1, "no attempt is sent past the deadline");
+        assert!(scope.is_fenced());
+        assert!(!scope.fence_at(Instant::now() + Duration::from_secs(60)));
+        refused_unsent(upload.put_part("more".into()).await.unwrap_err());
+        refused_unsent(upload.complete().await.map(|_| ()).unwrap_err());
+        drop(upload);
+        scope.wait_idle().await;
+
+        // A request that is the first to run after the deadline fences the
+        // scope itself.
+        let scope = StorageIoScope::new();
+        let resending = Arc::new(Resending::default());
+        let store = scope.wrap_object_store(resending.clone());
+        assert!(scope.fence_at(Instant::now() + Duration::from_secs(1)));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        refused_unsent(
+            store
+                .put(&Path::from("target"), "data".into())
+                .await
+                .map(|_| ())
+                .unwrap_err(),
+        );
+        assert_eq!(resending.sent(), 0);
+        assert!(scope.is_fenced());
     }
 
     /// A delete the store answers "not found" is definite on any key, and a

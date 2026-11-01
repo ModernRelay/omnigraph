@@ -73,8 +73,8 @@ restart on failure (Railway `ON_FAILURE`, Kubernetes `restartPolicy: Always`).
 - The lock's owner renews the lease with heartbeat objects under
   `__cluster/lease/` every third of a lease. Heartbeats retry on their own, and
   one whose answer was lost counts once a retry finds it. When no heartbeat
-  is answered for two thirds of a lease, the owner stops every storage write
-  and exits 2 without releasing. It stops the same way at its next
+  is answered for two thirds of a lease, the owner stops every storage write,
+  even after a pause of its whole process, and exits 2 without releasing. It stops the same way at its next
   heartbeat, at most a third of a lease later, when a successor has claimed
   the lock or `lock.json` no longer names it (after a takeover or a
   `cluster force-unlock` of its ID). A server whose first heartbeat is not
