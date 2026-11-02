@@ -393,6 +393,28 @@ handle read every fragment a moment before.
    resolve through the id BTREE plus the uncovered tail, which stays small
    only if the reconciler above keeps coverage current.
 
+## Smaller proposals, not attempted
+
+Fixed costs found while tracing, in expected order of value:
+
+- **Seed the new branch's coordinator at `branch create`.** The first write
+  after a create (the `load --from main --branch review` flow) misses the
+  one-entry authority cache and opens the branch coordinator in full: 42
+  requests against 24 for the next write. Lance's `create_branch` returns the
+  cloned dataset, whose rows equal the source capture's; building the
+  coordinator from them would save about 18 requests per review flow. It
+  needs a constructor whose rows provably match the clone version.
+- **H2** above: about 4 requests per named-branch publish attempt.
+- **Branch delete** reads its own ref five times (two inside Lance's
+  `replace_metadata`) and **branch create** lists `_refs/branches` twice;
+  about 3 and 1 requests.
+- **Merge candidates by address.** Inside the scope the merge still filters
+  by `id IN`; discovery already knows the deleted offsets and new fragments.
+- **Latency, not count.** After H3 and H4 a merge is a chain of dependent
+  requests (123 requests, about 1.7 s under the `s3-like` model at depth 0);
+  overlapping the per-table proofs and opens would cut latency more than any
+  further count reduction.
+
 ## Production context, explained from the counts
 
 These are engine counts on a DST memory store; the hosted graph is served,
