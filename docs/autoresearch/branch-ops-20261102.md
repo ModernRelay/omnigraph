@@ -4,7 +4,7 @@ Operation group: `branch create`, `branch merge` (three-way and fast
 forward), `branch delete`, `load` (append and merge), and a one-row `mutate`,
 on `main` and on a named branch, warm and cold, measured as history grows.
 
-- Branch: `autoresearch/branch-ops-20261102`
+- Branch: `autoresearch/branch-ops-20261102` on the fork `ragnorc/omnigraph` (the upstream `fork-only` ruleset refuses branch creation)
 - Base commit: `3e0e467e39756355c981c2f598f63d92a394529f` (main, 2026-11-02)
 - Box: Modal dev box `autoresearch-branch-ops`, Claude Opus 5.5 (`claude-opus-5-5`)
 - No prior runs of this workflow existed.
@@ -514,6 +514,13 @@ green run; CI on a pull request is the authoritative check and has not run.
 - History depth in production means two things here: commit depth (cheap)
   and per-commit fragments (expensive). Naming both in the scope would have
   saved the first, flat, baseline.
+- "Push only the autoresearch branch" does not say where: the upstream
+  `fork-only` ruleset refuses creating any branch there, so it went to the
+  fork `ragnorc/omnigraph`, as the warm-read run's did. Name the fork.
+- `nproc` reports 2 CPUs on the box, but at least 8 run in parallel; with
+  cargo's default parallelism the first build took far longer than with
+  `-j 24`. The warm snapshot's `target/` was built before the rustflags change
+  in `f728f01e`, so every crate rebuilt.
 - The 6-hour budget fits about five hypotheses on this box: an engine change
   rebuilds in 1–7 minutes, but each gate (DST golden, corpus, canonical test
   graph) is 10–60 minutes.
