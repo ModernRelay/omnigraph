@@ -25,8 +25,9 @@ Nothing else changes: the actor is still the person's principal, applied
 policy is still the only grant, a token without a ceiling behaves exactly as
 today, and native signed credentials are untouched.
 
-The vocabulary is fixed in the engine: six scope names, each a set of
-existing policy actions. An OIDC trust document opts in by declaring the
+The vocabulary is fixed in the engine: seven scope names, each a set of
+existing policy actions, one of them limited to the branches applied policy
+does not protect. An OIDC trust document opts in by declaring the
 scope prefix its issuer uses; without that declaration the `scope` claim stays
 ignored, as it is now.
 
@@ -116,7 +117,8 @@ It is not membership, roles, agents or delegation.
 |---|---|
 | Scope | One entry of a token's `scope` claim, as RFC 6749 §3.3 defines it. |
 | Scope prefix | The string an OIDC trust document declares; a scope that starts with it is a ceiling scope, every other scope is ignored. |
-| Ceiling | The set of policy actions a token's ceiling scopes name. A token without ceiling scopes, at a trust document without a prefix, has no ceiling. |
+| Ceiling | The set of policy actions a token's ceiling scopes name, and for the write actions whether they are limited to unprotected branches. A token without ceiling scopes, at a trust document without a prefix, has no ceiling. |
+| Protected branch | A branch the applied policy bundle's `protected_branches` list names, exactly as policy's `branch_scope: protected` means it. The ceiling adds no definition of its own. |
 | Ceiling scope vocabulary | The fixed table below, versioned with the server. |
 
 The existing `Scope` enum in `crates/omnigraph-server/src/identity.rs`
@@ -131,13 +133,42 @@ implementation renames or namespaces it so the two never share a word.
 |---|---|
 | `graph.read` | `read`, `invoke_query`, `export` |
 | `graph.write` | `change`, `branch_create`, `branch_delete`, `branch_merge`, `commit_publish`, `commit_drop` |
+| `graph.write.unprotected` | the `graph.write` actions, only where the branch acted on is not a protected branch |
 | `graph.schema` | `schema_apply` |
 | `graph.admin` | `admin` |
 | `cluster.list` | `graph_list` |
 | `cluster.config` | `config_manage` |
 
-Scopes do not imply one another: a writer that also reads holds both. The
+Scopes do not imply one another, with one exception: `graph.write` covers
+everything `graph.write.unprotected` covers, so a token granted both simply
+has `graph.write`. A writer that also reads holds `graph.read` as well. The
 table covers every one of the thirteen current policy actions.
+
+`graph.write.unprotected` is the ceiling for an agent that may work on
+branches but not land on the ones that matter. The branch it is judged by is
+the branch policy already judges the action by: the written branch for
+`change` and `branch_delete`, the new branch for `branch_create`, and the
+destination for `branch_merge`, `commit_publish` and `commit_drop` (policy's
+`target_branch_scope`). A merge from `main` into a feature branch is inside
+the ceiling; a merge into `main` is not. Schema apply targets `main` only and
+is not a write action here, so this scope never covers it; a client that
+applies schema holds `graph.schema`. Which branches are protected is decided
+by the applied bundle's `protected_branches`, the same list that gives
+`branch_scope: protected` its meaning, so a deployment has one definition of
+a protected branch and changes it in one place. A bundle that names no
+protected branches protects nothing, for policy and for this scope alike;
+preview reports a graph whose bundle lists none when the trust document
+declares a prefix.
+
+This follows the shape GitHub uses for the same problem. Its credentials say
+`contents: write` for a repository and never name a branch; rulesets on the
+repository decide who may bypass branch protection, and an installed app is
+not a bypass actor unless the ruleset lists it, so integrations land on
+unprotected branches by default and a person merges. Here the policy bundle
+is the ruleset, and the scope is the fixed credential-side word for "not a
+bypass actor". Letting policy rules name a client directly, as a ruleset
+names an app, is a complement rather than an alternative; see the
+alternatives below.
 
 `export` sits inside `graph.read` deliberately. The `read` action already
 covers "queries, snapshots, branches, and commits", so a client holding
@@ -146,8 +177,10 @@ snapshot export is a resumable bulk transport for the same data, not a
 confidentiality boundary. A scope that withheld it would protect only
 convenience. Policy keeps `export` as its own action for people, where
 denying bulk export while allowing queries is a reasonable operator choice; a
-client ceiling needs no such distinction. A policy action added later belongs to no scope until the vocabulary
-version that names it, so a ceilinged token can never perform it. This is the
+client ceiling needs no such distinction.
+
+A policy action added later belongs to no scope until the vocabulary version
+that names it, so a ceilinged token can never perform it. This is the
 fail-closed direction.
 
 A scope names a kind of action, not a graph. `graph.read` lets the client
@@ -219,8 +252,14 @@ The ceiling is checked there, after the policy decision:
 
 1. Applied policy decides as today. A denial is 403 `forbidden`, unchanged.
 2. If policy allows and the actor's token has a ceiling, the requested policy
-   action must be in it. Otherwise the request is refused with 403
-   `insufficient_scope`.
+   action must be in it. A write action covered only by
+   `graph.write.unprotected` is in the ceiling only when the branch the
+   request is judged by is not protected in the applied bundle. Otherwise
+   the request is refused with 403 `insufficient_scope`.
+
+The second step sees the same `PolicyRequest` the first did, branch and target
+branch included, and the same applied bundle; it reads nothing the policy
+decision did not.
 
 Policy goes first so `insufficient_scope` is only ever returned for an action
 the person could perform with a wider scope. A client that receives it may ask
@@ -257,7 +296,9 @@ HTTP conventions RFC requires:
 ```
 
 `scope` is the typed detail: the one prefixed scope that would have covered
-the refused action. The response also carries
+the refused action. A write to a protected branch under
+`graph.write.unprotected` names `graph.write`, the scope that would have
+covered it. The response also carries
 
 ```
 WWW-Authenticate: Bearer error="insufficient_scope", scope="omnigraph:graph.write", resource_metadata="<url>"
@@ -282,7 +323,8 @@ adds the RFC 9728 field:
   "authorization_servers": ["https://your-environment.authkit.app"],
   "bearer_methods_supported": ["header"],
   "scopes_supported": [
-    "omnigraph:graph.read", "omnigraph:graph.write", "omnigraph:graph.schema",
+    "omnigraph:graph.read", "omnigraph:graph.write",
+    "omnigraph:graph.write.unprotected", "omnigraph:graph.schema",
     "omnigraph:graph.admin", "omnigraph:cluster.list", "omnigraph:cluster.config"
   ]
 }
@@ -314,6 +356,11 @@ credential has a ceiling:
 permits intersected with the ceiling. An empty `scopes` array is a token
 granted no ceiling scopes; an absent field is a token without a ceiling.
 
+Under `graph.write.unprotected` the report takes the shape policy already
+produces for a rule with `branch_scope: unprotected`: the write actions leave
+`graph_wide`, and `actions` lists them for an unprotected `branch` and omits
+them for a protected one. No new field is needed.
+
 ### What a deployment must know about its authorization server
 
 The server consumes scopes; it does not decide which client gets which. That
@@ -341,23 +388,29 @@ default. A deployment declares it only after its clients can obtain scopes.
 ### Where the ceiling lives
 
 `VerifiedDataToken::Oidc` currently holds `client_id`. It gains the parsed
-ceiling, an immutable set of `PolicyAction`, computed once at admission and
-owned by the actor for the request. `AuthenticatedActor` exposes
-`ceiling() -> Option<&ActionSet>`: `None` for static tokens, native signed
-tokens and OIDC tokens at a trust document without a prefix; `Some` for the
-rest, including `Some(empty)`.
+ceiling, an immutable value computed once at admission and owned by the actor
+for the request: the set of `PolicyAction` the scopes name, and whether the
+write actions are limited to unprotected branches (true when
+`graph.write.unprotected` is present and `graph.write` is not).
+`AuthenticatedActor` exposes `ceiling() -> Option<&Ceiling>`: `None` for
+static tokens, native signed tokens and OIDC tokens at a trust document
+without a prefix; `Some` for the rest, including `Some(empty)`.
 
 ### Where it is checked
 
 `handlers::authorize(actor, policy, request)` gains the second step described
 above. It is the only place; no handler, MCP tool, resource or route checks a
 scope on its own. This preserves RFC 0003's invariant that the MCP layer adds
-no authorization path.
+no authorization path. The branch test for `graph.write.unprotected` asks the
+applied bundle the question policy already answers for `branch_scope`, through
+the same protected-branch lookup, so the two cannot disagree.
 
 ### Vocabulary as code
 
 The table is a `const` in `crates/omnigraph-server` beside the error codes:
-six names, each mapping to a slice of `PolicyAction`. A test asserts that the
+seven names, each mapping to a slice of `PolicyAction`, the unprotected
+variant sharing `graph.write`'s slice and carrying the branch limit as a
+flag. A test asserts that the
 union of all slices equals every `PolicyAction` variant, so adding a policy
 action without placing it in the vocabulary fails to compile the test suite
 rather than silently leaving the action outside every ceiling. A deliberate
@@ -371,7 +424,7 @@ the RFC that decided it.
 | `scope_prefix` | 1–64 bytes, scope-token alphabet |
 | `scope` claim entries | ≤ 256, each 1–128 bytes, distinct |
 | Admitted token lifetime | unchanged, `exp - iat` ≤ 300 s, no leeway |
-| Vocabulary size | 6 names; the whole prefixed list fits in 512 bytes of metadata |
+| Vocabulary size | 7 names; the whole prefixed list fits in 512 bytes of metadata |
 
 The entry bounds equal the Intent API's `validate_scopes`, so the two
 components refuse the same inputs.
@@ -388,6 +441,9 @@ components refuse the same inputs.
   the action.
 - The vocabulary is owned by the server, is versioned with it, and is not
   configurable. A deployment chooses a prefix, never a mapping.
+- A branch is protected for the ceiling exactly when applied policy's
+  `protected_branches` names it. The ceiling never defines, defaults or
+  implies a protected branch of its own.
 
 ## Compatibility and reversibility
 
@@ -426,6 +482,25 @@ touched.
   arbitrary queries, so the data is visible either way; the split would
   withhold a transport, not information, while adding a scope every read
   client must know to request.
+- **Branch-limited writes through policy rules that name the client**, the
+  way a GitHub ruleset names an app as a bypass actor. This is the fuller
+  model and is where #1173 points, but it is not this RFC: `client_id` would
+  have to reach Cedar as a selector, and the clients that most need
+  narrowing, those registered through DCR or CIMD, receive a new `client_id`
+  per registration, so no policy could list them. A fixed scope in the
+  authorization server's environment default is the one lever that reaches
+  them. The two compose: a later client selector can widen or narrow what a
+  scoped client may do on protected branches without changing the scope.
+- **A parametric scope** such as `graph.write:branch=feature/*`. WorkOS
+  assigns scopes from a fixed environment-wide catalog and cannot assign any
+  to dynamically registered clients, so a scope that embeds a branch pattern
+  cannot be issued. Rich Authorization Requests (RFC 9396) are the OAuth home
+  for such parameters and are not available here.
+- **Treating `main` as protected for the scope even when
+  `protected_branches` omits it.** Rejected: it would give a deployment two
+  definitions of a protected branch, one for people and one for clients. A
+  bundle that protects nothing is a policy author's choice, and preview says
+  so.
 - **Delegated credentials** (`act`, `delegate:<actor>/<id>`). A different
   feature with its own identity questions; see #978.
 
@@ -441,6 +516,15 @@ touched.
   allowing and denying, asserting `forbidden` when policy denies and
   `insufficient_scope` only when policy allows.
 - The vocabulary test covers every `PolicyAction`.
+- `graph.write.unprotected`: each write action on a protected and an
+  unprotected branch, judged by the written branch for `change` and
+  `branch_delete`, the new branch for `branch_create` and the destination for
+  `branch_merge`, `commit_publish` and `commit_drop`; a merge from a protected
+  source into an unprotected target succeeds and the reverse refuses with
+  `scope: "<prefix>graph.write"`; `schema_apply` refuses; a bundle with no
+  `protected_branches` permits every branch and preview reports it; a token
+  holding both write scopes behaves as `graph.write`; `/access` matches the
+  shape of a `branch_scope: unprotected` rule.
 - MCP: every write tool refuses under `graph.read` with the structured
   `insufficient_scope`; every read tool succeeds; `access` reports the
   intersection and `scopes`.
@@ -480,9 +564,11 @@ touched.
   is the server side of that observation.
 - RFC 0055 still refers to the RFC 0053 action ceiling, which no longer
   exists; it is unrelated to this one and is not corrected here.
-- #978 (delegated, branch-scoped credentials), #1173 (client beside actor;
-  step 1 landed in #1196), #1025 (OAuth for standard clients), #991 (one MCP
-  surface).
+- #978 (delegated, branch-scoped credentials; `graph.write.unprotected`
+  gives OAuth clients the protected-branch half of that ask without a
+  delegated identity), #1173 (client beside actor; step 1 landed in #1196;
+  a client selector in policy would be its continuation), #1025 (OAuth for
+  standard clients), #991 (one MCP surface).
 - Closed #1218 bundled a version of this with provider-role membership and
   WorkOS Agent Auth; the membership half is #1223, and Agent Auth is out of
   scope here.
@@ -500,7 +586,12 @@ touched.
   changes audience admission, resource registration and the served metadata
   paths, and is its own RFC.
 - Whether `graph.write` should split merge/publish/drop from ordinary change
-  once there is a client that needs the distinction.
+  once there is a client that needs the distinction. The protected-branch
+  limit covers the common case (an agent may merge and publish on its own
+  branches but not onto `main`) without that split.
+- Whether a scope-enabled deployment with a bundle that lists no
+  `protected_branches` should be a preview warning only, as proposed, or a
+  validation failure for that bundle.
 - Whether identity-credential graph discovery should require `cluster.list`
   under a ceiling, or stay free as now.
 - Whether a native signed credential should carry an equivalent field so a
@@ -513,3 +604,6 @@ touched.
   #1218. Scope reduced to the OAuth `scope` claim on admitted OIDC tokens;
   provider-role membership is the separate #1223; Agent Auth, `act`
   delegation and signed-credential ceilings are out of scope.
+- 2026-11-01: added `graph.write.unprotected`, judged by policy's own
+  `protected_branches`, after the question of how a client is kept off
+  `main`; the GitHub ruleset model is recorded as the policy-side complement.
