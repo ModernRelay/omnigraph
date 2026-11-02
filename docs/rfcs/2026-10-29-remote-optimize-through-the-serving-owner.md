@@ -102,7 +102,7 @@ answers each one:
 | Layer | Owns in this RFC | Does not own |
 |---|---|---|
 | **Engine** | The bounded optimize request: per-table work, ceilings, the one graph publication, the before-publish callback, completion evidence on every failure, cancellation boundaries, the post-commit tail, and reader safety. These hold for direct and embedded use too. | Operation identity, retention of results, admission across requests. |
-| **Server** | Authorization of every route, the durable operation record, admission (one active maintenance operation per cluster, request limits within server ceilings), the resume position, execution as an owned operation, lookup, cancellation, resolution of an unfinished run, and the shutdown, deployment and lease interaction. | Scheduling, fairness across clusters, automatic triggers. |
+| **Server** | Authorization of every route, the durable operation record, admission (one active operation per admission scope, request limits within server ceilings), the resume position, execution as an owned operation, lookup, cancellation, resolution of an unfinished run, and the shutdown, deployment and lease interaction. | Scheduling, fairness across clusters, automatic triggers. |
 | **Managed control plane** | Not specified here. It schedules requests, enforces platform budgets and projects status, consuming the server's native operation as defined below. | Graph storage, acceptance, publication, results. |
 
 ## Observable contract
@@ -417,7 +417,7 @@ call per attempt would add a control-object put per retry and would record
 no new fact. If the callback fails, nothing publishes, and the run fails with
 `Unpublished` evidence.
 
-The helper owns the hook, so a later maintenance kind that publishes passes
+The helper owns the hook, so a later kind that publishes passes
 the same argument and uses the same resolution rule. It does not add a second
 hook.
 
@@ -816,7 +816,7 @@ each scope has one in-process admission gate (§3.3).
 |---|---|---|
 | Start route and typed request | `POST …/operations/optimize`, `OptimizeRequest` (§3.1) | its own start route and request; the synchronous merge route is unchanged |
 | Grant, on its start route and on lookup and cancel of its records | `maintain` on main (§1.1) | the grant the synchronous merge requires |
-| Admission scope, each with one in-process gate (§3.3) | one active per cluster, shared by the maintenance kinds (§3.2); one gate | per target branch, independent of the maintenance scope; one gate per target branch, the count of scopes bounded by the kind |
+| Admission scope, each with one in-process gate (§3.3) | the maintenance scope: one active per cluster, shared by `optimize`, cleanup, repair and full-text rebuild (§3.2); one gate | per target branch, independent of the maintenance scope; one gate per target branch, the count of scopes bounded by the kind |
 | Settlement branch, stored in the record and walked by §2.4 | main of the graph | the target branch |
 | Typed outcomes | per-table outcomes and the tail (§1.5, §1.8) | the merge result |
 | Kind-local state, in the header per graph and kind | the resume position (§1.3) | none |
@@ -880,8 +880,8 @@ record. A scheduler or caller cannot widen it. Admission then checks, in order:
    never holds the active slot;
 4. no deployment is outstanding;
 5. the scope's in-process gate is free and taken (§3.3), no other operation
-   is active in the kind's admission scope, one per cluster for the
-   maintenance kinds (§2.6), and fewer than four records are unresolved;
+   is active in the kind's admission scope, one per cluster in the
+   maintenance scope (§2.6), and fewer than four records are unresolved;
 6. the request's `max_gate_hold`, when given, is within the server's ceiling.
 
 The server's ceilings are serve settings, held by the existing server
@@ -892,9 +892,10 @@ ceiling, subject to that measurement. Raising a ceiling, or any resource
 ceiling or the run budget, is an operator decision on the server, never a
 request option.
 
-One active maintenance operation per cluster means that other graphs in that
-cluster wait. That is a sound first slice: cleanup, repair and full-text
-rebuild extend the record by `kind` and a start route and share this scope.
+One active operation in the maintenance scope per cluster means that other
+graphs in that cluster wait. That is a sound first slice: cleanup, repair
+and full-text rebuild extend the record by `kind` and a start route and
+share this scope.
 A kind that is a user write, a merge, declares its own scope in §2.6. None of
 them adds a file, a callback or a restart rule of its own.
 
@@ -1002,8 +1003,8 @@ this document or in an accepted RFC. Stated once:
 | Schema apply, branch create and delete, cleanup from another process | Unchanged: each keeps its single-writer-process boundary. Their cross-process safety is #1018's design, not this RFC's. | [invariants](../dev/invariants.md), support boundaries |
 | A later worker process | Not in this slice. A worker slice must retain the input version while the worker reads it and validate each result against the plan before the owner stages it (§Alternatives). | §Alternatives; §Not in this RFC |
 
-One active maintenance operation per cluster is a coarser grain than a
-per-table claim, and it is the first rule a multi-graph cluster will want
+One active operation in the maintenance scope per cluster is a coarser
+grain than a per-table claim, and it is the first rule a multi-graph cluster will want
 relaxed. It stays coarse here because the record's active slot, the
 deployment gate and the cluster lock then agree on one unit.
 
@@ -1025,7 +1026,7 @@ deployment gate and the cluster lock then agree on one unit.
   | Refused before acceptance, or terminal `failed`, `cancelled` or `interrupted`: no graph effects | 1 |
   | Publication in doubt, `unknown` after a lost response, or the local wait ended before a terminal record | 2 |
   | The same id with a different request | 4 |
-  | Another maintenance operation is active | 75 |
+  | Another operation is active in the scope | 75 |
 
   For `unknown` the CLI prints the operation id and says that the server
   holds no record of it. That proves neither that it ran nor that it did not.
