@@ -366,23 +366,10 @@ pub struct Omnigraph {
     /// session, while mutable control metadata uses a zero-cache session. Both
     /// share one process-wide object-store registry/client pool.
     lance_access: crate::lance_access::LanceAccessContext,
-    /// Coordinator state behind a tokio `RwLock`. PR 2 (MR-686) wraps
-    /// this so engine write APIs can be `&self` (the HTTP server's
-    /// `AppState` holds `Arc<Omnigraph>` and dispatches concurrent
-    /// calls without a global write lock). Reads (`snapshot`, `version`,
-    /// `current_branch`, `branch_list`, `resolve_*`, `head_commit_id`,
-    /// `list_commits`, …) acquire `.read().await` and parallelize.
-    /// Writes (`refresh`, `branch_create`, `branch_delete`, `commit_*`)
-    /// acquire `.write().await` and serialize. The atomic commit invariant —
-    /// table-version rows and the graph commit are one unit — holds by
-    /// construction since RFC-013 Phase 7: both ride a SINGLE manifest publish
-    /// CAS (`commit_changes_with_lineage`), so there is no two-write window to
-    /// keep atomic. PR 2 Phase 2
-    /// converted from `Mutex` to `RwLock` because the bench showed
-    /// the Mutex was the dominant serializer for disjoint-table
-    /// workloads. Lock acquisition order: always before `runtime_cache`
-    /// (when both are needed in one scope).
-    coordinator: Arc<tokio::sync::RwLock<GraphCoordinator>>,
+    /// The installed state of the bound branch: an immutable value readers
+    /// load with no lock, replaced whole by `install_coordinator` once a
+    /// publish or refresh has done its storage round trips on a clone.
+    coordinator: Arc<ArcSwap<GraphCoordinator>>,
     table_store: TableStore,
     runtime_cache: RuntimeCache,
     /// Warm change-feed cut for this handle's bound branch. A cut (head,
@@ -730,7 +717,7 @@ impl Omnigraph {
             storage,
             lance_access,
             history: coordinator.history().clone(),
-            coordinator: Arc::new(tokio::sync::RwLock::new(coordinator)),
+            coordinator: Arc::new(ArcSwap::from_pointee(coordinator)),
             // The graph-scoped data session keeps table metadata/index caches
             // warm across reads, writes, and maintenance. Mutable control
             // metadata uses the context's separate zero-cache session; both
@@ -923,7 +910,7 @@ impl Omnigraph {
             storage,
             lance_access,
             history: coordinator.history().clone(),
-            coordinator: Arc::new(tokio::sync::RwLock::new(coordinator)),
+            coordinator: Arc::new(ArcSwap::from_pointee(coordinator)),
             // The graph-scoped data session keeps table metadata/index caches
             // warm across reads, writes, and maintenance. Mutable control
             // metadata uses the context's separate zero-cache session; both
@@ -1160,7 +1147,7 @@ impl Omnigraph {
     /// holds: a memo hit is a contract validated when it was built; a miss reads
     /// the row once.
     pub(crate) async fn ensure_schema_state_valid(&self) -> Result<()> {
-        let snapshot = self.coordinator.read().await.snapshot();
+        let snapshot = self.coordinator.load_full().snapshot();
         self.accepted_catalog_for_snapshot(&snapshot)
             .await
             .map(|_| ())
@@ -1182,8 +1169,7 @@ impl Omnigraph {
     async fn load_accepted_view_with_schema_gate_held(&self) -> Result<(Arc<Catalog>, Snapshot)> {
         let current_branch = self
             .coordinator
-            .read()
-            .await
+            .load_full()
             .current_branch()
             .unwrap_or("main")
             .to_string();
@@ -1252,7 +1238,7 @@ impl Omnigraph {
     /// A capture without retained content reads its pinned dataset.
     async fn read_schema_contract_row_for(&self, snapshot: &Snapshot) -> Result<SchemaContractRow> {
         {
-            let coord = self.coordinator.read().await;
+            let coord = self.coordinator.load_full();
             if coord.snapshot().same_manifest_image(snapshot) {
                 return coord.read_schema_contract().await;
             }
@@ -1490,7 +1476,7 @@ impl Omnigraph {
     /// one branch-scoped open resolves it through the manifest ref registry.
     pub(crate) async fn native_branch_for(&self, branch: &str) -> Result<String> {
         {
-            let coordinator = self.coordinator.read().await;
+            let coordinator = self.coordinator.load_full();
             if coordinator.current_branch() == Some(branch) {
                 if let Some(native) = coordinator.native_branch() {
                     return Ok(native.to_string());
@@ -1546,7 +1532,7 @@ impl Omnigraph {
         branch: Option<&str>,
     ) -> Result<GraphCoordinator> {
         {
-            let coord = self.coordinator.read().await;
+            let coord = self.coordinator.load_full();
             if branch == coord.current_branch() {
                 let held = coord.manifest_incarnation();
                 if coord.probe_latest_incarnation().await?.matches(&held) {
@@ -1839,7 +1825,7 @@ impl Omnigraph {
     ) -> Result<ResolvedTarget> {
         let requested = ReadTarget::Branch(branch.unwrap_or("main").to_string());
         let normalized = normalize_branch_name(branch.unwrap_or("main"))?;
-        let coord = self.coordinator.read().await;
+        let coord = self.coordinator.load_full();
         if normalized.as_deref() == coord.current_branch() {
             let graph_commit_id = coord.effective_graph_head().await?;
             let snapshot_id = graph_commit_id
@@ -1878,7 +1864,7 @@ impl Omnigraph {
         crate::db::manifest::CapturedManifestProbe,
     )> {
         let bound = {
-            let coord = self.coordinator.read().await;
+            let coord = self.coordinator.load_full();
             let bound = branch == coord.current_branch();
             if bound {
                 let current = if fresh {
@@ -1942,7 +1928,7 @@ impl Omnigraph {
         crate::db::manifest::CapturedManifestProbe,
     )> {
         {
-            let coord = self.coordinator.read().await;
+            let coord = self.coordinator.load_full();
             if branch == coord.current_branch() {
                 let held = coord.manifest_incarnation();
                 if coord.probe_latest_incarnation().await?.matches(&held) {
@@ -2081,7 +2067,7 @@ impl Omnigraph {
     /// Revalidate a prepared mutation/load attempt after its branch/table
     /// gates are held and before any table effect.
     pub(crate) async fn revalidate_write_txn(&self, txn: &WriteTxn) -> Result<Snapshot> {
-        let bound = txn.branch.as_deref() == self.coordinator.read().await.current_branch();
+        let bound = txn.branch.as_deref() == self.coordinator.load_full().current_branch();
         let (branch_identifier, graph_head, effective_graph_head, snapshot) =
             if !bound && txn.manifest_probe.is_current().await? {
                 (
@@ -2238,13 +2224,13 @@ impl Omnigraph {
 
     #[cfg(test)]
     pub(crate) async fn version(&self) -> u64 {
-        self.coordinator.read().await.version()
+        self.coordinator.load_full().version()
     }
 
     /// Return an immutable Snapshot from the known manifest state. No storage I/O.
     #[cfg(test)]
     pub(crate) async fn snapshot(&self) -> Snapshot {
-        self.coordinator.read().await.snapshot()
+        self.coordinator.load_full().snapshot()
     }
 
     pub async fn snapshot_of(&self, target: impl Into<ReadTarget>) -> Result<Snapshot> {
@@ -2302,10 +2288,53 @@ impl Omnigraph {
         let next_snapshot = next.snapshot();
         let (catalog, _) = self.accepted_catalog_for_snapshot(&next_snapshot).await?;
         validate_bound_catalog_against_snapshot(&catalog, &next_snapshot)?;
-        *self.coordinator.write().await = next;
+        self.coordinator.store(Arc::new(next));
         self.invalidate_read_caches().await;
         self.reload_schema_view_from_coordinator().await?;
         Ok(())
+    }
+
+    /// The installed coordinator and an operation-local copy of it: the pair
+    /// a publish or refresh carries to `install_coordinator`, so the install
+    /// can tell a clone of the installed state from a clone of a state since
+    /// replaced.
+    pub(crate) fn installed_coordinator_copy(&self) -> (Arc<GraphCoordinator>, GraphCoordinator) {
+        let installed = self.coordinator.load_full();
+        let copy = GraphCoordinator::clone(&installed);
+        (installed, copy)
+    }
+
+    /// Install `next`, produced on a clone of `derived_from` with no lock
+    /// held, as the bound coordinator: one pointer swap. Refused when the
+    /// binding moved to another branch, or when `derived_from` is no longer
+    /// the installed pointer and `next` does not supersede the installed
+    /// state within its lifetime (`ManifestIncarnation::supersedes`): a clone
+    /// of the installed state always installs, a clone of a replaced state
+    /// installs only a newer version of the same lifetime, never a lifetime
+    /// another install has already left. Returns whether the install happened.
+    pub(crate) fn install_coordinator(
+        &self,
+        next: GraphCoordinator,
+        derived_from: &Arc<GraphCoordinator>,
+    ) -> bool {
+        let next = Arc::new(next);
+        let mut installed = self.coordinator.load();
+        loop {
+            let ordered = Arc::ptr_eq(&installed, derived_from)
+                || next
+                    .manifest_incarnation()
+                    .supersedes(&installed.manifest_incarnation());
+            if installed.current_branch() != next.current_branch() || !ordered {
+                return false;
+            }
+            let previous = self
+                .coordinator
+                .compare_and_swap(&*installed, Arc::clone(&next));
+            if Arc::ptr_eq(&previous, &installed) {
+                return true;
+            }
+            installed = previous;
+        }
     }
 
     async fn invalidate_read_caches(&self) {
@@ -2322,7 +2351,9 @@ impl Omnigraph {
     /// Refresh the coordinator and its schema view from the published contract.
     pub async fn refresh(&self) -> Result<()> {
         let _serial = self.write_queue.acquire_schema_exclusive().await;
-        self.coordinator.write().await.refresh().await?;
+        let (installed, mut next) = self.installed_coordinator_copy();
+        next.refresh().await?;
+        self.install_coordinator(next, &installed);
         self.reload_schema_view_from_coordinator().await?;
         self.invalidate_read_caches().await;
         Ok(())
@@ -2331,7 +2362,7 @@ impl Omnigraph {
     /// Refresh the schema view while the exclusive schema permit is held.
     async fn reload_schema_view_from_coordinator(&self) -> Result<()> {
         fail(&SCHEMA_RELOAD_BEFORE_CONTRACT_READ)?;
-        let live_snapshot = self.coordinator.read().await.snapshot();
+        let live_snapshot = self.coordinator.load_full().snapshot();
         let accepted = self.accepted_schema_for_snapshot(&live_snapshot).await?;
         validate_bound_catalog_against_snapshot(&accepted.catalog, &live_snapshot)?;
         let identity = &accepted.identity;
@@ -2357,7 +2388,9 @@ impl Omnigraph {
 
     /// Refresh coordinator state while the caller owns the applicable schema permit.
     pub(crate) async fn refresh_coordinator_only(&self) -> Result<()> {
-        self.coordinator.write().await.refresh().await?;
+        let (installed, mut next) = self.installed_coordinator_copy();
+        next.refresh().await?;
+        self.install_coordinator(next, &installed);
         self.invalidate_read_caches().await;
         Ok(())
     }
@@ -2365,8 +2398,7 @@ impl Omnigraph {
     pub async fn resolve_snapshot(&self, branch: &str) -> Result<SnapshotId> {
         self.ensure_schema_state_valid().await?;
         self.coordinator
-            .read()
-            .await
+            .load_full()
             .resolve_snapshot_id(branch)
             .await
     }
@@ -2455,8 +2487,7 @@ impl Omnigraph {
         let _schema_permit = self.write_queue().acquire_schema_shared().await;
         let current_branch = self
             .coordinator
-            .read()
-            .await
+            .load_full()
             .current_branch()
             .unwrap_or("main")
             .to_string();
@@ -2478,8 +2509,7 @@ impl Omnigraph {
         let (catalog, live) = self.load_accepted_view_with_schema_gate_held().await?;
         let branch = self
             .coordinator
-            .read()
-            .await
+            .load_full()
             .current_branch()
             .map(str::to_string);
         let mut snapshot = Snapshot::wrap(
@@ -2554,8 +2584,8 @@ impl Omnigraph {
     async fn resolve_target_inner(&self, target: &ReadTarget) -> Result<ResolvedTarget> {
         if let ReadTarget::Branch(branch) = target {
             let normalized = normalize_branch_name(branch)?;
-            {
-                let coord = self.coordinator.read().await;
+            let (installed, mut next) = {
+                let coord = self.coordinator.load_full();
                 if normalized.as_deref() != coord.current_branch() {
                     drop(coord);
                     if let Some(resolved) = self
@@ -2564,37 +2594,25 @@ impl Omnigraph {
                     {
                         return Ok(resolved);
                     }
-                    return self.coordinator.read().await.resolve_target(target).await;
+                    return self.coordinator.load_full().resolve_target(target).await;
                 }
                 let held = coord.manifest_incarnation();
                 if coord.probe_latest_incarnation().await?.matches(&held) {
                     return warm_resolved_target(&coord, target).await;
                 }
-                // Stale: refresh under the write lock below.
+                let copy = GraphCoordinator::clone(&coord);
+                (coord, copy)
+            };
+            next.refresh().await?;
+            let resolved = warm_resolved_target(&next, target).await?;
+            if self.install_coordinator(next, &installed) {
+                self.invalidate_read_caches().await;
             }
-            let mut coord = self.coordinator.write().await;
-            if normalized.as_deref() == coord.current_branch() {
-                // Re-check after taking the write lock; another writer may have
-                // refreshed (tokio RwLock has no read->write upgrade).
-                let held = coord.manifest_incarnation();
-                let mut refreshed = false;
-                if !coord.probe_latest_incarnation().await?.matches(&held) {
-                    coord.refresh().await?;
-                    refreshed = true;
-                }
-                let resolved = warm_resolved_target(&coord, target).await?;
-                drop(coord);
-                if refreshed {
-                    self.invalidate_read_caches().await;
-                }
-                return Ok(resolved);
-            }
-            // Branch changed while waiting for the write lock: cold resolve.
-            return coord.resolve_target(target).await;
+            return Ok(resolved);
         }
 
         // Snapshot target: resolve through the commit graph as before.
-        self.coordinator.read().await.resolve_target(target).await
+        self.coordinator.load_full().resolve_target(target).await
     }
 
     // ─── Change detection ────────────────────────────────────────────────
@@ -2653,7 +2671,7 @@ impl Omnigraph {
             error => error,
         };
 
-        let coord = self.coordinator.read().await;
+        let coord = self.coordinator.load_full();
         let commit = coord.resolve_commit(&SnapshotId::new(commit_id)).await?;
         let Some(parent_id) = commit.parent_commit_id.clone() else {
             return Err(OmniError::CommitHasNoParent {
@@ -2783,7 +2801,7 @@ impl Omnigraph {
         let requested = branch.as_deref();
         let cut =
             {
-                let coord = self.coordinator.read().await;
+                let coord = self.coordinator.load_full();
                 if requested == coord.current_branch() {
                     let held = coord.manifest_incarnation();
                     if coord.probe_latest_incarnation().await?.matches(&held) {
@@ -2808,27 +2826,16 @@ impl Omnigraph {
                             }
                         }
                     } else {
-                        drop(coord);
-                        let mut coord = self.coordinator.write().await;
-                        if requested == coord.current_branch() {
-                            let held = coord.manifest_incarnation();
-                            let mut refreshed = false;
-                            if !coord.probe_latest_incarnation().await?.matches(&held) {
-                                coord.refresh().await?;
-                                refreshed = true;
-                            }
-                            let refreshed_incarnation = coord.manifest_incarnation();
-                            let cut = Arc::new(coord.build_change_feed_cut().await?);
-                            drop(coord);
-                            if refreshed {
-                                self.invalidate_read_caches().await;
-                            }
-                            *self.feed_cut_cache.write().await =
-                                Some((refreshed_incarnation, Arc::clone(&cut)));
-                            cut
-                        } else {
-                            Arc::new(coord.capture_change_cut(requested).await?)
+                        let mut next = GraphCoordinator::clone(&coord);
+                        next.refresh().await?;
+                        let refreshed_incarnation = next.manifest_incarnation();
+                        let cut = Arc::new(next.build_change_feed_cut().await?);
+                        if self.install_coordinator(next, &coord) {
+                            self.invalidate_read_caches().await;
                         }
+                        *self.feed_cut_cache.write().await =
+                            Some((refreshed_incarnation, Arc::clone(&cut)));
+                        cut
                     }
                 } else {
                     Arc::new(coord.capture_change_cut(requested).await?)
@@ -3221,7 +3228,7 @@ impl Omnigraph {
         }
         let branch = resolved.branch.as_deref();
         {
-            let coord = self.coordinator.read().await;
+            let coord = self.coordinator.load_full();
             if branch == coord.current_branch() {
                 return Self::descends_linearly_from(&coord, from, from_commit, to).await;
             }
@@ -3457,8 +3464,7 @@ impl Omnigraph {
     async fn commit_snapshot(&self, commit_id: &str) -> Result<Snapshot> {
         Ok(self
             .coordinator
-            .read()
-            .await
+            .load_full()
             .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(commit_id)))
             .await?
             .snapshot)
@@ -3553,8 +3559,7 @@ impl Omnigraph {
         } else {
             match self
                 .coordinator
-                .read()
-                .await
+                .load_full()
                 .resolve_commit(&SnapshotId::new(target))
                 .await
             {
@@ -3605,8 +3610,7 @@ impl Omnigraph {
     ) -> Result<Snapshot> {
         self.ensure_schema_state_valid().await?;
         self.coordinator
-            .read()
-            .await
+            .load_full()
             .snapshot_at_graph_manifest_version(graph_manifest_version)
             .await
     }
@@ -3816,8 +3820,7 @@ impl Omnigraph {
 
     pub(crate) async fn active_branch(&self) -> Option<String> {
         self.coordinator
-            .read()
-            .await
+            .load_full()
             .current_branch()
             .map(str::to_string)
     }
@@ -3852,8 +3855,7 @@ impl Omnigraph {
     ) -> Result<()> {
         let active = self
             .coordinator
-            .read()
-            .await
+            .load_full()
             .current_branch()
             .map(str::to_string);
         if active.as_deref() == Some(branch) {
@@ -3932,7 +3934,7 @@ impl Omnigraph {
             .acquire_branches(&[source.clone(), Some(target.clone())])
             .await;
         let branches = [source.clone(), Some(target.clone())];
-        let warm_snapshot = self.coordinator.read().await.snapshot();
+        let warm_snapshot = self.coordinator.load_full().snapshot();
         let (control_catalog, identity) = self
             .accepted_catalog_for_snapshot(&warm_snapshot)
             .await
@@ -4066,7 +4068,7 @@ impl Omnigraph {
             .acquire_branches(&[branch.clone(), Some(target_branch.clone())])
             .await;
         let branches = [branch.clone(), Some(target_branch.clone())];
-        let warm_snapshot = self.coordinator.read().await.snapshot();
+        let warm_snapshot = self.coordinator.load_full().snapshot();
         let (control_catalog, identity) = self
             .accepted_catalog_for_snapshot(&warm_snapshot)
             .await
@@ -4261,7 +4263,7 @@ impl Omnigraph {
 
     pub async fn branch_list(&self) -> Result<Vec<String>> {
         self.ensure_schema_state_valid().await?;
-        self.coordinator.read().await.branch_list().await
+        self.coordinator.load_full().branch_list().await
     }
 
     /// [`Self::branch_list`] with the details of each branch `can_read`
@@ -4333,7 +4335,7 @@ impl Omnigraph {
         };
         drop(cache);
         let branches = [Some(branch.clone())];
-        let warm_snapshot = self.coordinator.read().await.snapshot();
+        let warm_snapshot = self.coordinator.load_full().snapshot();
         let (control_catalog, identity) = self
             .accepted_catalog_for_snapshot(&warm_snapshot)
             .await
@@ -4382,8 +4384,7 @@ impl Omnigraph {
     pub async fn get_commit(&self, commit_id: &str) -> Result<GraphCommit> {
         self.ensure_schema_state_valid().await?;
         self.coordinator
-            .read()
-            .await
+            .load_full()
             .resolve_commit(&SnapshotId::new(commit_id))
             .await
     }
@@ -4669,8 +4670,7 @@ impl Omnigraph {
             return Ok(AddressedCommit::Unattached(Box::new(candidate)));
         }
         self.coordinator
-            .read()
-            .await
+            .load_full()
             .resolve_commit(&SnapshotId::new(commit_id))
             .await
             .map(AddressedCommit::Published)
@@ -4748,12 +4748,13 @@ impl Omnigraph {
         };
         candidate.require_publishable()?;
         self.ensure_schema_state_valid().await?;
-        let mut active = self.coordinator.write().await;
-        let published = if target.as_deref() == active.current_branch() {
-            *active = self.open_coordinator_for_branch(target.as_deref()).await?;
-            active.publish_unpublished(&candidate).await?
+        let installed = self.coordinator.load_full();
+        let published = if target.as_deref() == installed.current_branch() {
+            let mut next = self.open_coordinator_for_branch(target.as_deref()).await?;
+            let outcome = next.publish_unpublished(&candidate).await;
+            self.install_coordinator(next, &installed);
+            outcome?
         } else {
-            drop(active);
             let mut coordinator = self.open_coordinator_for_branch(target.as_deref()).await?;
             let published = coordinator.publish_unpublished(&candidate).await?;
             *self.merge_authority_cache.lock().await = Some((target_name, coordinator));
@@ -6449,7 +6450,7 @@ edge WorksAt: Person -> Company
         .await
         .unwrap();
 
-        let all_branches = db.coordinator.read().await.all_branches().await.unwrap();
+        let all_branches = db.coordinator.load_full().all_branches().await.unwrap();
         assert!(
             !all_branches.iter().any(|b| b.starts_with("__run__")),
             "no __run__ branch should exist after publish, got: {:?}",
@@ -6462,6 +6463,43 @@ edge WorksAt: Person -> Company
         );
         let result = db.apply_schema(&desired).await.unwrap();
         assert!(result.applied, "schema apply should have applied");
+    }
+
+    /// A clone of an installed pointer that another install has since replaced
+    /// with another branch lifetime is refused: lifetimes have no order, so
+    /// only provenance tells a late refresh of the dead lifetime apart.
+    #[tokio::test]
+    async fn late_install_of_a_dead_branch_lifetime_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        db.branch_create("feature").await.unwrap();
+        db.sync_branch("feature").await.unwrap();
+        let (dead_pointer, dead_clone) = db.installed_coordinator_copy();
+        let dead = dead_clone.manifest_incarnation();
+
+        let other = Omnigraph::open(uri).await.unwrap();
+        other.branch_delete("feature").await.unwrap();
+        other.branch_create("feature").await.unwrap();
+
+        db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
+        let recreated = db.coordinator.load().manifest_incarnation();
+        assert!(
+            !recreated.same_lifetime(&dead),
+            "the probing read installed the recreated lifetime"
+        );
+
+        assert!(
+            !db.install_coordinator(dead_clone, &dead_pointer),
+            "a clone of a replaced pointer carrying another lifetime is refused"
+        );
+        assert!(
+            db.coordinator
+                .load()
+                .manifest_incarnation()
+                .same_lifetime(&recreated),
+            "the handle stays on the recreated lifetime"
+        );
     }
 
     #[tokio::test]
