@@ -110,6 +110,20 @@ pub(crate) struct GraphCoordinator {
     bound_branch: Option<String>,
 }
 
+/// An operation-local copy of the exact immutable view: table state and head
+/// copied (O(tables)), history cache and Lance session shared; a publish or
+/// refresh runs on the copy and installs it (`Omnigraph::install_coordinator`).
+impl Clone for GraphCoordinator {
+    fn clone(&self) -> Self {
+        Self {
+            root_uri: self.root_uri.clone(),
+            storage: Arc::clone(&self.storage),
+            manifest: self.manifest.capture(),
+            bound_branch: self.bound_branch.clone(),
+        }
+    }
+}
+
 /// What a merge reads of one captured branch beside its write transaction: the
 /// captured head's record, the buffer of the `__manifest` version that holds
 /// it, and the commit graph that can load that exact head's lineage if needed.
@@ -328,12 +342,7 @@ impl GraphCoordinator {
     /// state and the head are copied; the history cache and the Lance session
     /// are shared. Callers must first probe the complete manifest incarnation.
     pub(crate) fn capture_for_branch_control(&self) -> Self {
-        Self {
-            root_uri: self.root_uri.clone(),
-            storage: Arc::clone(&self.storage),
-            manifest: self.manifest.capture(),
-            bound_branch: self.bound_branch.clone(),
-        }
+        self.clone()
     }
 
     pub fn root_uri(&self) -> &str {

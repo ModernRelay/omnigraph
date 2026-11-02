@@ -164,8 +164,7 @@ pub(super) async fn entity_at(
 ) -> Result<Option<serde_json::Value>> {
     let snap = db
         .coordinator
-        .read()
-        .await
+        .load_full()
         .snapshot_at_graph_manifest_version(graph_manifest_version)
         .await?;
     entity_from_snapshot(db, &snap, type_key, id).await
@@ -281,8 +280,7 @@ async fn capture_baseline_parts(
     let normalized_branch = Some(branch).filter(|branch| *branch != "main");
     let cut = db
         .coordinator
-        .read()
-        .await
+        .load_full()
         .capture_change_cut(normalized_branch)
         .await?;
 
