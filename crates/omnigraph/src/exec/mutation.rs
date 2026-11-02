@@ -1071,8 +1071,21 @@ impl Omnigraph {
         // Cardinality reads a fresh manifest-visible branch snapshot (the #298
         // stale-handle fix) via `CommittedState::write`; it never follows an
         // unpublished raw Lance HEAD or a not-yet-created first-touch ref.
-        let committed =
-            crate::validate::CommittedState::write(&txn.base, self, txn.branch.as_deref());
+        //
+        // The base pins exact table versions, which this write's own opens
+        // (`open_pinned_for_write`) already read through the shared session
+        // and the held-handle cache keyed by that pin; validation reads the
+        // same versions through them too, instead of a zero-capacity
+        // statement session, on which each validation's open of a table
+        // rereads its manifest and every index lookup rereads the manifest's
+        // index section.
+        let mut base = txn.base.clone();
+        base.set_read_caches(crate::db::manifest::SnapshotReadCaches {
+            session: self.read_caches().session.clone(),
+            handles: self.read_caches().handles.clone(),
+            table_wrapper: None,
+        });
+        let committed = crate::validate::CommittedState::write(&base, self, txn.branch.as_deref());
         // `to_changeset` carries both constructive batches and the ids the delete
         // ops captured from their own scans (`deleted_ids`), so the evaluator
         // recounts the srcs a delete empties (`@card`) and sees removed rows for
