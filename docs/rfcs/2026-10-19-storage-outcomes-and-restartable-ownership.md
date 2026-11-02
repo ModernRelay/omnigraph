@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-19
-updated: 2026-10-21
+updated: 2026-10-31
 discussion: https://github.com/ModernRelay/omnigraph/issues/1067
 supersedes: []
 superseded_by: []
@@ -407,8 +407,8 @@ The protocol uses these S3 operations:
 - create-if-absent;
 - list;
 - get;
-- delete of lease keys: an owner's own stale beats, and a lease directory
-  whose lock id no longer holds the lock;
+- delete of lease keys: an owner's own stale beats, and its own lease
+  directory at a clean release;
 - the if-match replacement of `lock.json`, at takeover and at release.
 
 It relies on bounded relative clock rates, not synchronized clocks.
@@ -426,8 +426,9 @@ patterns are added:
 Version 1, version 2 released markers and the bootstrap handoff are
 unchanged.
 
-**Where the lease's requests go.** Heartbeats, a successor's watch and
-claim, and the removal of a lease directory go through the root outside the
+**Where the lease's requests go.** Heartbeats and the reads before them, a
+successor's watch and claim, and the removal of a lease directory go through
+the root outside the
 owner's storage scope, on a client with the backend's own retries. A beat is
 a key only its owner creates, under a lock id no other process uses, so a
 copy that lands late only keeps a successor waiting. It needs neither the
@@ -440,11 +441,15 @@ wrote it, and needs not to: any successor's claim only fences the owner.
 
 **Owner.** After acquiring the lock, the owner writes beat 0 before it
 admits work, then a new beat every `lease_seconds / 3`. Before each beat it
-checks for a `superseded.json` claim. Let `s` be the monotonic time the
-owner first sent its last acknowledged beat. A beat that already exists when
+reads the `superseded.json` claim and `lock.json`, and it sends the beat
+only when both reads answer, no claim exists, and the record still holds its
+lock id. A read that gets no answer sends no beat: the beat is tried again
+like an unanswered one, so reads that keep failing end in the timer below.
+Let `s` be the monotonic time the owner started its first attempt at its
+last acknowledged beat, before those reads. A beat that already exists when
 its owner sends it is the owner's own earlier request for it, which landed
-no earlier than its first send, so it counts as acknowledged with `s` its
-first send. A beat that gets no answer is sent again, under the same key,
+no earlier than that start, so it counts as acknowledged with `s` that
+start. A beat that gets no answer is sent again, under the same key,
 after a quarter of a beat interval. A timer of its own fires at
 `s + 2/3 × lease_seconds`, two beat intervals, so a hung beat request cannot
 postpone it. The first beat races the same deadline, counted from the send
@@ -452,8 +457,9 @@ of the request that wrote the lock record, because a successor may count
 silence from the moment that record is visible. If beat 0 is not
 acknowledged by then, acquisition fails and the process does not serve; the
 lock stays for a successor. After beat 0 is acknowledged, the owner reads
-the claim once more before it admits work. When the timer fires, or a claim exists, the
-owner ***fences***: the lease fences the owner's storage scope (§4) before
+the claim and the record once more before it admits work. When the timer
+fires, or a claim exists, or the record no longer holds its lock id (a
+takeover, a release, or an exact-ID unlock), the owner ***fences***: the lease fences the owner's storage scope (§4) before
 it reports the fence. Every later request is refused and every admitted one
 is cancelled, so from the fence on the owner sends nothing: no new request,
 no retry and no multipart part, however long its process lives. The server
@@ -468,7 +474,11 @@ operation refuses a held lock at once. A successor that finds a version-3
 lock observes its beat listing on its own monotonic clock. A new beat means
 the owner is alive: the successor refuses with `state_lock_held` and the
 orchestrator retries it later. The silence is measured from the
-successor's first observation of the newest beat. An empty listing starts
+successor's first observation of the newest beat, and only up to the send of
+a listing that found no newer one. Storage reads a listing at some moment
+after its send, so an answer that stalls, or that a successor paused after
+sending it reads late, proves no silence after that send; the successor
+sends its last listing when the silence would end. An empty listing starts
 it, and the first beat that appears restarts it: the owner writes
 `lock.json` before beat 0 lands, so an empty listing is the normal gap before
 the first beat, and also the gap while beat 0 is slow; the owner's first
@@ -480,14 +490,18 @@ beat. After
 then replaces `lock.json` with its own version-3 record by if-match on the
 ETag it first read.
 
-- The claim elects nobody, and it is not the fence. The owner's own timer
-  fenced it five sixths of a lease before any successor may claim. The claim
-  is a second signal the owner reads before each beat, and nothing may rely
-  on it: a takeover removes the old lease directory, claim included, as soon
-  as its if-match applies, which can be before the owner's next beat. A
-  claim already there, from this successor's earlier request or from another
-  successor, changes nothing, and the silence is always this successor's own
-  observation. No check may compare the claim's body with this successor's
+- The claim elects nobody. An owner whose clock runs fenced on its own
+  timer five sixths of a lease before any successor may claim. An owner
+  whose clock stopped, as in a suspended VM, did not: when it resumes its
+  timer is still ahead, and only the reads before its next beat stop it. The
+  claim stops it before the if-match applies, and `lock.json`, which never
+  names its lock id again, stops it after. The takeover leaves the old lease
+  directory, claim included, in place, so an owner that reads only the
+  claim stops too. Such an owner can still admit work until that next beat,
+  up to a third of a lease; this protocol does not bound a stopped clock
+  more tightly. A claim already there, from this successor's earlier request
+  or from another successor, changes nothing, and the silence is always this
+  successor's own observation. No check may compare the claim's body with this successor's
   lock id: that elects again, and a stopped successor's claim would block
   every later start.
 - The if-match alone decides the next owner. Of two successors, or of a
@@ -501,11 +515,15 @@ ETag it first read.
 
 The successor never takes over a version-1 lock.
 
-**Timing.** Every beat the owner counts became visible no earlier than its
-first send `s`, and the lock record no earlier than its own send. A successor's silence starts no earlier than the moment the
-newest beat it saw became visible, so the takeover happens at least
-`3/2 × lease_seconds` after `s`. The owner fenced by `s + 2/3 ×
-lease_seconds`. The gap, five sixths of a lease, covers clock-rate drift and
+**Timing.** Every beat the owner counts became visible no earlier than the
+start `s` of its first attempt, and the lock record no earlier than its own
+send. A
+successor's silence starts no earlier than the moment the newest beat it saw
+became visible, and ends at the send of a listing that still found no newer
+beat, which storage read no earlier than that send. So when storage last
+showed the owner silent, at least `3/2 × lease_seconds` had passed since
+`s`, and a newer acknowledged beat would have been in that listing. The
+owner fenced by `s + 2/3 × lease_seconds`. The gap, five sixths of a lease, covers clock-rate drift and
 a stalled runtime. A beat that lands after its owner fenced only makes a
 successor refuse once more. The fence sends nothing after it, so the only
 storage effects that can follow the fence are attempts already on the wire.
@@ -649,13 +667,17 @@ The owners to extend:
   lease through the adapter realm, with the old owner's in-flight requests
   landing after the takeover.
 - **Cluster** `lease` tests under paused time: beats, the owner's fence on a
-  lapse and on a claim, a failed beat and a beat whose answer was lost still
-  renewing, a hung first beat fencing before a successor can claim with the
+  lapse, on a claim, on a replaced, released or removed record, and on
+  checks it cannot read, a failed beat or read and a beat whose answer was
+  lost still renewing, a listing answered late never unseating a beating
+  owner, a hung first beat fencing before a successor can claim with the
   owner's scope closed, a successor recognizing its own claim, a takeover
   after silence, refusal while beats continue, and one winner between two
   successors. `state_lock` tests on an in-memory store with S3's conditional
   semantics: takeover after silence, refusal of a non-serving acquisition,
-  and a release and a takeover never both applying; that only a server's S3
+  and a release and a takeover never both applying; an owner whose clock
+  stopped through a takeover fencing at its next beat, with or without its
+  lease directory; that only a server's S3
   lock is leased; and that a local lock, even one with a leased record, is
   refused at once.
 
@@ -753,3 +775,23 @@ phase 3.
   carry disposition notes for the parts this replaces. §7 now says a claim
   proves nothing about its writer, and that the owner's timer, not the claim,
   is the fence.
+- 2026-10-31: After review of the merged lease, two defects let a successor
+  take over from a healthy owner, leaving two serving owners. A successor
+  ended its silence on the clock alone, so a listing whose answer stalled,
+  or that it read late after a pause, counted silence storage never showed;
+  and a takeover deleted the claim, so an owner whose clock stopped resumed
+  to find no claim and kept beating. §7 now counts silence only up to a
+  listing's send, has the owner read `lock.json` with the claim before each
+  beat, keeps the old lease directory at a takeover, and sends no beat when
+  either read gets no answer, where a failed claim read used to count as no
+  claim. Superseded sentences: "Before each beat it checks for a
+  `superseded.json` claim."; "Let `s` be the monotonic time the owner first
+  sent its last acknowledged beat."; "After beat 0 is acknowledged, the
+  owner reads the claim once more before it admits work."; "The claim is a
+  second signal the owner reads before each beat, and nothing may rely on
+  it: a takeover removes the old lease directory, claim included, as soon as
+  its if-match applies, which can be before the owner's next beat."; "A
+  successor's silence starts no earlier than the moment the newest beat it
+  saw became visible, so the takeover happens at least `3/2 ×
+  lease_seconds` after `s`."; and the operations list's "a lease directory
+  whose lock id no longer holds the lock".

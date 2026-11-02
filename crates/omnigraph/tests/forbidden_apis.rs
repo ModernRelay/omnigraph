@@ -2551,12 +2551,6 @@ const MUTABLE_KEY_REQUESTS: &[(&str, &str, usize, &str)] = &[
         "lock release on local roots, where an unlink completes before it returns and a dead process sends nothing late, and on Azure, whose admission wrapper excludes other owners",
     ),
     (
-        "omnigraph-cluster/state_lock.rs",
-        ".delete_prefix(",
-        1,
-        "removes a superseded owner's lease directory after takeover; its lock id is never reused and its fence latched before the claim",
-    ),
-    (
         "omnigraph-cluster/store.rs",
         ".delete(",
         1,
