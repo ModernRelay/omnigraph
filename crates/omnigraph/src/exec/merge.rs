@@ -1734,7 +1734,7 @@ async fn compute_adopt_delta_with(
     materialize_blobs: bool,
     external_preflight: &crate::table_store::ExternalBlobPreflight,
     write_budget: WriteBudget,
-    mut log: Option<&mut Vec<(String, AdoptOutcome)>>,
+    log: Option<&mut Vec<(String, AdoptOutcome)>>,
 ) -> Result<Option<AdoptDelta>> {
     let full_schema = schema_for_table_key(catalog, table_key)?;
     let schema = if materialize_blobs {
@@ -1758,7 +1758,7 @@ async fn compute_adopt_delta_with(
         upsert_writer: &mut upsert_writer,
         deleted_ids: &mut deleted_ids,
         needs_update: false,
-        log: log.as_deref_mut(),
+        log,
     };
     match plan {
         None => {
