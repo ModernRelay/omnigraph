@@ -46,14 +46,17 @@ on local and object storage.
   before any effect and runs it as an owned operation. It answers lookups by
   that id after a lost response. The intent nonce that the graph commit will
   carry is recorded before any manifest request. A live process and a
-  restarted one both resolve an unfinished run from main's history. Neither
-  runs the work again.
+  restarted one both resolve an unfinished run from the history of the
+  branch it would have committed to. Neither runs the work again.
 - **Record.** The record is generic and `optimize` is its first kind. The
   id, the durable acceptance, the states, cancel, lookup, retention and the
   settlement of a commit by history belong to the record; a kind supplies
   its start route, its admission scope, its settlement branch, its grant and
-  its typed outcomes (§2.6). An asynchronous merge is the next kind, with
-  its own admission scope, and is not in this RFC.
+  its typed outcomes (§2.6). The header stores the active operations by
+  admission scope and each kind's state per graph, and a record carries its
+  settlement branch, so a kind adds a row, not a field. An asynchronous
+  merge is the next kind, with its own admission scope, and is not in this
+  RFC.
 
 Cleanup, automatic triggering, external workers and changes to how
 maintenance shares the gates with writers are out of scope. Each needs its
@@ -253,6 +256,11 @@ gates when the earlier capture has moved. No writer in the process can move
 main while the gates are held, so that capture is the attempt's one authority
 (invariant 3: a fresh capture, never a mix). A refusal that remains, on the
 direct path or on a mismatch under the gates, carries `BeforeEffect` (§1.7).
+On this tree `revalidate_write_txn` reports a moved head as
+`manifest_read_set_changed`, which the server translates to a read-set
+conflict with completion certain (`ApiError::translated`); `BeforeEffect`
+is the label §1.7 reads, not what keeps that refusal from containing the
+process.
 
 #### 1.3 Order, stopping and the resume position
 
@@ -581,8 +589,8 @@ its report synchronously, as today.
 
 | Section | Holds |
 |---|---|
-| Header | the ledger id; at most one **active** operation; the **unresolved** operations (§2.4); a bounded list of **terminal** operations, newest first; the eviction mark (§2.5); and each graph's resume position |
-| Per operation | the operation id; the request digest; graph (its id and its ledger lifetime) and branch; kind; exact options; principal; acceptance time; state; the intent nonce and input head (from §1.6); the published commit's history id, written by the terminal write (from the publisher's answer) or by resolution (§2.4), or the resolution cursor while the walk is open; per-table outcomes; tail outcomes; timings (queued, gates held, computing); the terminal reason |
+| Header | the ledger id; the **active** operations, keyed by admission scope, at most one per scope (§2.6); the **unresolved** operations (§2.4); a bounded list of **terminal** operations, newest first; the eviction mark (§2.5); and each kind's state per graph, keyed by graph and kind (for `optimize`, the resume position, §1.3) |
+| Per operation | the operation id; the request digest; graph (its id and its `schema_identity_domain`) and its settlement branch (§2.6); kind; exact options; principal; acceptance time; state; the intent nonce and input head (from §1.6); the published commit's history id, written by the terminal write (from the publisher's answer) or by resolution (§2.4), or the resolution cursor while the walk is open; per-table outcomes; tail outcomes; timings (queued, gates held, computing); the terminal reason |
 
 Terminal records are bounded by count (32), per-record size (1 MiB) and total
 size (4 MiB). The oldest is evicted first. These are the deployment receipts'
@@ -592,9 +600,11 @@ two records cannot drift apart. The deployment ledger's own retention,
 eviction and lookup still apply to deployments only; this record is counted
 and evicted on its own.
 
-The bounds compose. The total counts terminal records only: the active record
-and the unresolved ones (at most four, §2.4) are never evicted, and together
-they add at most five records at the per-record bound, so a full unresolved
+The bounds compose. The total counts terminal records only: the active
+records (one per admission scope; this RFC defines one scope, and a kind
+that adds scopes bounds their count in its §2.6 row) and the unresolved ones
+(at most four, §2.4) are never evicted, and together they add at most one
+record per scope plus four at the per-record bound, so a full unresolved
 list cannot make the record unwritable. A per-table outcome's `detail` is
 capped at 512 bytes, keeping its code and measure. A record lists per-table
 outcomes for at most 1,024 tables and summarizes the rest as counts per
@@ -602,10 +612,13 @@ outcome code, so a catalog larger than one record can describe never makes
 the before-publish write, and with it every run, fail validation.
 
 A record describes the graph that held the graph id at acceptance, and stores
-the ledger's lifetime of that graph beside the id. Deleting and re-adding a
-graph does not rewrite past records, and a graph re-added under the same id
-neither settles nor is judged by an old record; the deletion itself settles
-the graph's unresolved records (§3.4). A lookup returns what happened then,
+that graph's `schema_identity_domain` beside the id: a field of the contract
+digest the ledger stores for the graph (`GraphDeletion.contract`) and that
+deletion recovery compares, so a replacement under the same id is a
+different value. Deleting and re-adding a graph does not rewrite past
+records, and a graph re-added under the same id neither settles nor is
+judged by an old record; the deletion itself settles the graph's
+non-terminal records (§3.4). A lookup returns what happened then,
 and nothing is replayed.
 
 The record is the smallest thing the contract needs, and it is keyed by
@@ -640,8 +653,8 @@ A put that stays in doubt after #1176's re-issue is handled at each point:
 - **`running` in doubt.** No table work starts. The run ends `interrupted`.
 - **`publishing` in doubt.** Nothing publishes, and the run fails
   `Unpublished`. A late landing shows `publishing` with a nonce that no
-  commit will carry. Resolution (§2.4) then finds that main moved past the
-  input head without it and records `failed`.
+  commit will carry. Resolution (§2.4) then finds that the settlement branch
+  moved past the input head without it and records `failed`.
 - **Terminal in doubt.** The graph outcome is already settled. The object is
   an unsettled conditional key. Admission refuses until a re-read settles
   it, and lookups read whatever landed.
@@ -656,28 +669,31 @@ resolves it. The live process applies the rule when its run ends with the
 publication in doubt, and at every later lookup and admission. A restarted
 server applies it before it admits a recorded operation:
 
-- **Main's graph head is still the input head.** The publication stays in
-  doubt, and the record stays `publishing`. The test is the graph head, not
+- **The settlement branch's graph head is still the input head** (§2.6;
+  main for `optimize`). The publication stays in doubt, and the record
+  stays `publishing`. The test is the graph head, not
   the latest `__manifest` version: a configuration commit, such as the clear
   in §1.8, adds a version without a graph commit, and a publisher attempt at
   the version after it can still be in flight.
-- **Main's graph head has moved.** Under the exact head expectation, only the
-  commit on main whose parent is the input head can be this run's. The server
-  walks main's first-parent chain from its tip back toward the input head
-  with `CommitGraph::first_parent_page`, the catalog's own page of that
-  chain, on a coordinator that holds a fresh read of this graph's main. A
+- **The settlement branch's graph head has moved.** Under the exact head
+  expectation, only the commit on that branch whose parent is the input head
+  can be this run's. The server walks the branch's first-parent chain from
+  its tip back toward the input head with `CommitGraph::first_parent_page`,
+  the catalog's own page of that chain, on a coordinator that holds a fresh
+  read of that branch. A
   page returns up to `limit` commits, newest first, and `next`, the parent
   it did not visit. The head row, the commit buffer and the history cache
   cost no request; a released commit is read by its id with the rest of its
   `__history` extent; a chain that names a commit neither the held commits
-  nor `__history` hold ends the page at that missing link. A new commit is
+  nor `__history` hold fails the page at that missing link (below). A new
+  commit is
   the head row and stays in the buffer until a later publish releases it
   (`HISTORY_RELEASE_BYTES`, 256 KiB); the page reads both, which
   `history::read_commit`, over `__history` alone, would not. The page never
   checks out another branch, and this rule says nothing about the order of
   its reads, so a change to the single-id lookup `published_record` (open
-  #1184 adds a branch hint to it) does not drift it. Every commit on main is
-  written on main, a fast-forward merge included, so each step's
+  #1184 adds a branch hint to it) does not drift it. Every commit on a branch
+  is written on that branch, a fast-forward merge included, so each step's
   `graph_manifest_version` is below the one before it. The walk therefore
   stops at the input head, or at the first commit whose version is not above
   the input head's recorded version. It ends in one of three ways:
@@ -691,81 +707,92 @@ server applies it before it admits a recorded operation:
     attempt of this run could have taken is occupied, since a later attempt
     would have read the moved head and refused before its request. Its
     staging becomes collectible.
-  - **Neither.** A page read fails, the page ends at a missing link, or the
+  - **Neither.** A page read fails, the chain has a missing link, or the
     walk passes the input head's version without meeting it.
-    None of these shows that the commit is absent, and a terminal record is
-    never rewritten, so the record stays `publishing`. A lookup of the
-    operation reports where the walk stopped.
+    `first_parent_page` answers `Ok(None)` when no held commit or
+    `__history` extent holds the start id, and `Err` (`missing_parent`)
+    when a later parent is absent; both are this ending, and neither is a
+    short page that stops at the link. None of these shows that the commit
+    is absent, and a terminal record is never rewritten, so the record
+    stays `publishing`. A lookup of the operation reports where the walk
+    stopped.
 
-Only a commit on this graph's main settles the record. A commit on another
+Only a commit on the record's settlement branch settles it. A commit on another
 graph of the cluster or on another branch does not, and a run that publishes
-nothing does not move main. A commit still in main's buffer costs no
-request. A released commit resolves through `__history`, whose cost depends
-on its block: a GET of `blocks/{block}/all.lance` for a closed block written
-as one object, and otherwise that GET's `NotFound`, a list of the block and
-a GET of the range extent, since an ordinary buffer release writes an open
-block as `blocks/{block}/{start}-{end}.lance`. The walk visits one commit
-per commit published on main since the doubt arose, and that count is not
-bounded by the record. One resolution attempt therefore reads one page of at most
+nothing does not move the branch. A commit still in the branch's buffer costs
+no request. A released commit resolves through `__history`, whose cost depends
+on its block: a GET of `blocks/{block}/all.lance` for a closed block written as
+one object, and otherwise that GET's `NotFound`, a list of the block and a GET
+of the range extent, since an ordinary buffer release writes an open block as
+`blocks/{block}/{start}-{end}.lance`. The walk visits one commit per commit
+published on the branch since the doubt arose, and that count is not bounded by
+the record. One resolution attempt therefore reads one page of at most
 `resolution_walk_limit` commits (a serve setting, default 256). A page that
 ends before the input head stores its `next`, the first commit it did not
 visit, in the record as the cursor, leaves the record `publishing`, and the
-next attempt starts its page at the cursor instead of at the tip. The cursor
-is the unvisited parent, never a visited commit, so no commit is skipped: a
-cursor set to the last visited commit and resumed below it would pass over
-that commit, and a record whose child it was would stay `publishing` after
-main had answered. Every commit at and below the cursor is immutable
-history, and the commit the walk looks for is the input head's child, so
-resuming at the cursor loses nothing. Every admission and lookup advances
-each unresolved record by one page, so after a write the exit from a full
-list takes as many attempts as main's growth since the doubt divides by the
-limit, each of bounded cost. A lookup of such a record, and the 409 a full
-list answers, report `resolution: walking` for each such record with its
-cursor and how many commits its walk has covered, so an operator sees a list
-the next attempt advances, not a stuck one.
+next attempt starts its page at the cursor instead of at the tip. The cursor is
+the unvisited parent, never a visited commit, so no commit is skipped: a cursor
+set to the last visited commit and resumed below it would pass over that
+commit, and a record whose child it was would stay `publishing` after the
+branch had answered. Every commit at and below the cursor is immutable history,
+and the commit the walk looks for is the input head's child, so resuming at the
+cursor loses nothing. Every admission and lookup advances each unresolved
+record by one page, so after a write the exit from a full list takes as many
+attempts as the branch's growth since the doubt divides by the limit, each of
+bounded cost. A lookup of such a record, and the 409 a full list answers,
+report `resolution: walking` for each such record with its cursor and how many
+commits its walk has covered, so an operator sees a list the next attempt
+advances, not a stuck one.
 
 The rule is later than the storage-outcomes RFC's test, under which the
 branch's next publication settles an unknown one by taking or finding its
-`__manifest` version. Here only a move of main's graph head settles the
-record. A later version that only changes configuration (`UpdateConfig`)
-leaves it `publishing`. Waiting for the graph head is the safe test. A record
-that was `accepted` or `running`, with no live run in this process, is
-`interrupted`. The callback precedes every manifest request, so no attempt
-sent one.
+`__manifest` version. Here only a move of the settlement branch's graph head
+settles the record. A later version that only changes configuration
+(`UpdateConfig`) leaves it `publishing`. Waiting for the graph head is the safe
+test. A record that was `accepted` or `running`, with no live run in this
+process, is `interrupted`. The callback precedes every manifest request, so no
+attempt sent one.
 
-A run that ends with its publication in doubt leaves the active slot and
-moves to the unresolved list. Other maintenance can then run, and its own
-publication on that graph's main settles the doubt. At most four unresolved
-records are kept, cluster-wide. A fifth refuses admission with 409
-`conflict` until a write settles the earlier ones. The work is never
+A run that ends with its publication in doubt leaves the active slot and moves
+to the unresolved list. Another operation in that scope can then run, and a
+publication on the settlement branch settles the doubt. At most four unresolved
+records are kept, cluster-wide, across every kind. A fifth refuses admission
+with 409 `conflict` until a write settles the earlier ones. The work is never
 executed again. A caller who still wants it submits a new id.
 
-The exit from a full unresolved list is a move of the graph head of main on
-the graph whose record it is, and nothing else: a cancellation does not
+The exit from a full unresolved list is a move of the graph head of the
+record's settlement branch, and nothing else: a cancellation does not
 clear an unresolved record (§1.9), and there is no administrative override,
 because the record would then assert a fact history has not settled. The
-list is cluster-wide and settlement is per graph: a move of graph G's main
-head settles, by the walk above, the unresolved records whose input head is
-on G, and no record of another graph, so a write on the wrong graph leaves
-the list full. Where no ordinary write arrives on that graph, an operator
-makes one there. One event settles a record without a move: the deletion of
-its graph (§3.4). A later slice may add an explicit fence, an empty commit
-on main of the kind the schema-apply settlement publishes, so that an
-operator can settle doubt without changing data; it is not in this RFC.
+list is cluster-wide and settlement is per branch: a move of a branch's
+graph head settles, by the walk above, the unresolved records whose input
+head is on that branch, and no record of another branch or graph, so a write
+on the wrong graph or branch leaves the list full. Where no ordinary write
+arrives on that branch, an operator makes one there. Two events settle a
+record without a move: the deletion of its graph (§3.4), and, for a kind
+whose settlement branch is not main, the deletion of that branch (§2.6). A
+later slice may add an explicit fence, an empty commit on the branch of the
+kind the schema-apply settlement publishes, so that an operator can settle
+doubt without changing data; it is not in this RFC.
 
 #### 2.5 Lookup outcomes
 
 A lookup returns the record, or `unknown`: the record does not hold this id
 for this graph. `unknown` never proves non-execution and never authorizes a
 replay. The record does not keep evicted ids. It keeps one eviction mark: the
-acceptance time of the most recently evicted record, written in the same put
-as the eviction. A submission whose `operation_id` carries a ULID time at
-or before the mark is refused with 409 `conflict` (`operation_id_expired`)
-instead of admitted as new, so a late retry under an evicted id does not run
-the work again; the caller mints a fresh id. The mark compares the caller's
-clock with the server's, and it refuses only an id older than every retained
-record, never a fresh one. A list of evicted ids would say no more, and even
-then it would not allow a replay.
+ULID time of the most recently evicted `operation_id`, written in the same
+put as the eviction, and absent until the first eviction. A submission whose
+`operation_id` carries a ULID time at or before the mark is refused with 409
+`conflict` (`operation_id_expired`) instead of admitted as new. The evicted
+id is itself at the mark, so a late retry under it does not run the work
+again, whatever the caller's clock. The mark compares two values of the same
+clock, the ULID times callers minted, never the server's acceptance time: a
+server time compared with a caller's ULID time would let a caller whose
+clock runs ahead replay an evicted id, and would refuse a fresh id from one
+whose clock runs behind. A fresh id minted at or before the mark is refused
+all the same, and that caller mints a new id; an absent mark refuses nothing.
+A list of evicted ids would say no more, and even then it would not allow a
+replay.
 
 #### 2.6 What a kind supplies
 
@@ -778,14 +805,21 @@ below. `optimize` is the first kind. An asynchronous merge is the next, named
 here so that the split is checked against a second kind, and it is not in
 this RFC.
 
+The header stores the active operations by admission scope and each kind's
+state per graph, and a record carries its settlement branch (§2.2), so a
+kind's row names values of fields the file already has and adds none. The
+walk (§2.4) and the exit from a full list run on the branch the record
+names; lookup and cancel are authorized by the record's kind (§3.1); and
+each scope has one in-process admission gate (§3.3).
+
 | A kind supplies | `optimize` (this RFC) | `merge` (next; not in this RFC) |
 |---|---|---|
 | Start route and typed request | `POST …/operations/optimize`, `OptimizeRequest` (§3.1) | its own start route and request; the synchronous merge route is unchanged |
-| Grant | `maintain` on main (§1.1) | the grant the synchronous merge requires |
-| Admission scope | one active per cluster, shared by the maintenance kinds (§3.2) | per target branch, independent of the maintenance slot |
-| Settlement branch | main of the graph | the target branch |
+| Grant, on its start route and on lookup and cancel of its records | `maintain` on main (§1.1) | the grant the synchronous merge requires |
+| Admission scope, each with one in-process gate (§3.3) | one active per cluster, shared by the maintenance kinds (§3.2); one gate | per target branch, independent of the maintenance scope; one gate per target branch, the count of scopes bounded by the kind |
+| Settlement branch, stored in the record and walked by §2.4 | main of the graph | the target branch |
 | Typed outcomes | per-table outcomes and the tail (§1.5, §1.8) | the merge result |
-| Kind-local state | the resume position (§1.3) | none |
+| Kind-local state, in the header per graph and kind | the resume position (§1.3) | none |
 | Settlement when what the record names is gone | graph deletion, `graph_deleted` (§3.4) | target-branch deletion, `branch_deleted`; graph deletion, `graph_deleted` |
 
 Two things get no record. An operation that commits nothing, a query or an
@@ -823,7 +857,7 @@ Refusals reuse the existing error codes:
 | An outstanding deployment | 409 `conflict` |
 | Four unresolved publications | 409 `conflict` |
 | A record from another ledger at this root | 409 `conflict` (`operation_record_foreign`) |
-| Another active operation in the kind's admission scope (§2.6) | 429 `too_many_requests`, with `Retry-After` and the active id |
+| Another active operation in the kind's admission scope, or that scope's in-process gate held across an acceptance put (§3.3) | 429 `too_many_requests`, with `Retry-After` and the active id once the record names one |
 | Closed admission (draining), or the route not enabled | 503 `service_unavailable` |
 | A `max_gate_hold` above the server's ceiling | 400 `bad_request`; 413 stays the body-size refusal (`http_contract.rs`) |
 | An `operation_id` at or before the eviction mark (§2.5) | 409 `conflict` (`operation_id_expired`) |
@@ -831,9 +865,10 @@ Refusals reuse the existing error codes:
 
 #### 3.2 Authorization and admission
 
-The applied Cedar policy authorizes the request's actual principal for
-`maintain` on the graph's main branch, on every route. A scheduler or caller
-cannot widen it. Admission then checks, in order:
+The applied Cedar policy authorizes the request's actual principal for the
+kind's grant on every route (§3.1): `maintain` on the graph's main branch for
+`optimize`, on its start route and on lookup and cancel of an `optimize`
+record. A scheduler or caller cannot widen it. Admission then checks, in order:
 
 1. the route is enabled, the graph is served, and admission is open;
 2. the record's ledger id matches, and the request's `operation_id` is
@@ -844,9 +879,9 @@ cannot widen it. Admission then checks, in order:
    terminal (§3.4), so a record that landed after an in-doubt acceptance
    never holds the active slot;
 4. no deployment is outstanding;
-5. no other operation is active in the kind's admission scope, one per
-   cluster for the maintenance kinds (§2.6), and fewer than four records are
-   unresolved;
+5. the scope's in-process gate is free and taken (§3.3), no other operation
+   is active in the kind's admission scope, one per cluster for the
+   maintenance kinds (§2.6), and fewer than four records are unresolved;
 6. the request's `max_gate_hold`, when given, is within the server's ceiling.
 
 The server's ceilings are serve settings, held by the existing server
@@ -867,17 +902,27 @@ them adds a file, a callback or a restart rule of its own.
 
 A submission runs as an
 [owned server operation](2026-09-30-owned-server-operations.md). The handler
-registers the operation under the admission gate before anything durable
-happens, and the acceptance write (§2.3, step 1) is the operation's first
-step, not the handler's: the handler only awaits the operation's answer and
-relays it. Nothing can then separate a durable acceptance from execution. A
-client disconnect drops the handler and never the operation, and SIGTERM
-counts the operation and lets it stop at a boundary. The deployment path
-orders its durable acceptance the same way. An acceptance written by the
-handler before registration would leave an accepted id that never runs and,
-under shutdown, a caller told 503 with `effects: none` for an id the record
-holds. Its admission slot is the record's active field, so the record and
-the registry agree on what is running.
+first takes the admission scope's in-process gate, a mutex per scope taken
+with a try-lock, as `DeploymentRuntime` takes its gate before `submit`
+(`deployment.rs`); a held gate answers 429 (§3.1). Under that gate it checks
+the record's active field (§3.2, step 5) and registers the operation under
+the admission gate, before anything durable happens, and the acceptance
+write (§2.3, step 1) is the operation's first step, not the handler's: the
+handler only awaits the operation's answer and relays it. The owned
+operation holds the scope's gate until it drops, as `RunningDeployment`
+holds the deployment gate, so the check, the registration and the
+acceptance put happen under one gate: two submissions cannot both read an
+empty active field and both start. `OperationRuntime::submit` alone would
+not give that, since it counts the owner and spawns the future, and the
+active field is written inside the future. Until the put lands, the
+in-process owner is the slot; after it, the record's active field is, and
+the two agree on what is running. Nothing can separate a durable acceptance
+from execution. A client disconnect drops the handler and never the
+operation, and SIGTERM counts the operation and lets it stop at a boundary.
+The deployment path orders its durable acceptance the same way. An
+acceptance written by the handler before registration would leave an
+accepted id that never runs and, under shutdown, a caller told 503 with
+`effects: none` for an id the record holds.
 
 #### 3.4 Shutdown, deployment and the lease
 
@@ -906,18 +951,28 @@ the registry agree on what is running.
   issued artifact write. The record's terminal reason names the deployment.
 - **Graph deletion.** A deployment that removes a graph declaration
   authorizes deletion of its root and all retained history, so after it no
-  move of that graph's main head can ever settle its records, and a full
-  unresolved list would refuse maintenance on every graph of the cluster
-  with no exit. The deletion therefore settles them: under the same cluster
-  lock, after the ledger records the deletion intent and before the
-  deletion's effects, each unresolved record of that graph becomes terminal
-  with reason `graph_deleted` and its publication `unknown`. That asserts
-  no fact about history; it records that the only authority that could
-  answer is gone. A record names its graph's ledger lifetime (§2.2), so a
-  graph re-added under the same id starts with no record to judge.
+  move of any branch of that graph can ever settle its records, and a full
+  unresolved list would refuse admission on every graph of the cluster with
+  no exit. The deletion owner therefore settles them as one step of the
+  deletion itself, in `complete_graph_deletion` (`omnigraph-cluster`'s
+  `deployment/execution.rs`), on the first pass and on the resume pass
+  alike: after the ledger has recorded `Started` for the graph and before
+  the deployment can record `Deleted`, including a resume that finds the
+  root already absent. The step covers every non-terminal record of that
+  graph lifetime: the unresolved ones and an active `publishing` one left by
+  a process that stopped between record steps 3 and 4 (§2.3). While the
+  root is still readable, it runs the §2.4 walk to its end on each record's
+  settlement branch, since history can still answer, and writes what the
+  walk settles. Only once root absence is verified, and the walk cannot
+  run, does each record still non-terminal become terminal with reason
+  `graph_deleted` and its publication `unknown`. That asserts no fact about
+  history; it records that the only authority that could answer is gone,
+  and a missing root then ends the record instead of failing admission for
+  the cluster. A record names its graph's `schema_identity_domain` (§2.2),
+  so a graph re-added under the same id starts with no record to judge.
 - **Lease.** If the S3 lease fences, storage requests are refused, and the run
   ends unpublished or with its publication in doubt. The successor resolves
-  the record from main's history.
+  the record from the settlement branch's history.
 
 #### 3.5 Observability
 
@@ -936,7 +991,7 @@ this document or in an accepted RFC. Stated once:
 | Hazard | What protects against it | Where |
 |---|---|---|
 | A second process writes the same cluster root | The cluster lock. A direct `optimize`, `cleanup`, `index build`, mutate or load on a cluster root is refused with `state_lock_held` while a server holds it. Only the lock holder writes the record. | Summary; §2.1; [graph access](2026-10-16-graph-access-serving-and-cross-process-writes.md) |
-| The owner loses its S3 lease during a run | Storage requests are refused once the lease fences; the run ends unpublished or with its publication in doubt, and the successor resolves the record from main's history. | §3.4; §2.4; [storage outcomes](2026-10-19-storage-outcomes-and-restartable-ownership.md) |
+| The owner loses its S3 lease during a run | Storage requests are refused once the lease fences; the run ends unpublished or with its publication in doubt, and the successor resolves the record from the settlement branch's history. | §3.4; §2.4; [storage outcomes](2026-10-19-storage-outcomes-and-restartable-ownership.md) |
 | A late manifest put from the previous owner | Every `__manifest` publish is a put-if-absent of the next version. A late put that meets a version the successor already wrote fails as a conflict and overwrites nothing. One that finds the version still absent lands as that commit: that is the in-doubt publication §2.4 exists to resolve, and the successor's resolution finds it by its nonce. | §1.6; §2.4; [Lance fences](../dev/lance.md), "Catalog publication" |
 | A late record put from the previous owner | Each record write is a conditional put over the version it read; a late one fails its precondition. An ambiguous answer is re-issued and read back before it is believed. | §2.3; #1176 |
 | Table work that was durable before a handover | Every rewrite is a detached Lance commit the manifest never pinned: unreachable staging the collector reclaims. Nothing replays it, in either process. | §1.7; Invariants; [recovery](../dev/recovery.md) |
@@ -1160,20 +1215,20 @@ Every row extends an existing owner in [testing](../dev/testing.md).
 | A failed `before_publish` publishes nothing | failpoint | `failpoints.rs` |
 | Writers that pass no callback make no control-object request | unchanged rows for mutate, load and merge | DST storage-cost golden |
 | The recorded nonce resolves a published run through `commit_id_answers`, including an `hb1` id in a new block, and the terminal record stores the child's history id | publish across a block boundary, then resolve | server `operation_routes`, cluster `failpoints.rs` |
-| A run whose commit is still main's head row or in its commit buffer resolves to `succeeded` with no `__history` read, and one whose commit was released resolves through `__history`; a failed page read, a page that ends at a missing link, or a walk that passes the input head's version without meeting it leaves the record `publishing`; only a returned child that does not answer the nonce records `not_committed`; with the child `n` commits deep and any `resolution_walk_limit` `L`, exactly ⌈n / L⌉ attempts reach it, a cursor taken before main grew still resolves, and no attempt skips a commit | resolve right after the in-doubt publish, again after enough publishes to release the buffer, then under history read faults and a fabricated chain; a child 13 deep, partly released, at limits 1 to 256 | server `operation_routes`, `omnigraph-catalog` tests |
-| An in-doubt publication stays `publishing`, leaves the active slot, and is settled by the next move of its graph's main head either way; a configuration-only `__manifest` version, a commit on another graph and a no-op run do not settle it; a cancellation leaves it `publishing`; four unresolved records on one graph refuse admission on every graph with the walking state in the 409, writes on another graph settle none, and the deletion of that graph settles all four as `graph_deleted` | the catalog's unresolved-manifest seam, then each later write; a deployment that deletes the graph | `omnigraph-catalog` tests, server `boot_settings`, `operation_routes` |
+| A run whose commit is still main's head row or in its commit buffer resolves to `succeeded` with no `__history` read, and one whose commit was released resolves through `__history`; a failed page read, an absent start id (`Ok(None)`), a missing later parent (`Err`), or a walk that passes the input head's version without meeting it leaves the record `publishing`; only a returned child that does not answer the nonce records `not_committed`; with the child `n` commits deep and any `resolution_walk_limit` `L`, exactly ⌈n / L⌉ attempts reach it, a cursor taken before the branch grew still resolves, and no attempt skips a commit | resolve right after the in-doubt publish, again after enough publishes to release the buffer, then under history read faults and a fabricated chain; a child 13 deep, partly released, at limits 1 to 256 | server `operation_routes`, `omnigraph-catalog` tests |
+| An in-doubt publication stays `publishing`, leaves the active slot, and is settled by the next move of its settlement branch's graph head either way; a configuration-only `__manifest` version, a commit on another graph or branch and a no-op run do not settle it; a cancellation leaves it `publishing`; four unresolved records on one graph refuse admission on every graph with the walking state in the 409, writes on another graph settle none, and the deletion of that graph settles every non-terminal record: the walk runs while the root is readable, `graph_deleted` is written only after verified absence, a resume after `Started` with the root already absent settles them before `Deleted`, and a `publishing` record left in the active slot is settled too | the catalog's unresolved-manifest seam, then each later write; a deployment that deletes the graph, killed after `Started` and resumed, with a `publishing` record left active | `omnigraph-catalog` tests, server `boot_settings`, `operation_routes`, cluster `failpoints.rs` |
 | A post-commit failure in the configuration clear or the artifact does not fail the operation, and the clear reports `cleared`, `nothing_to_clear`, `failed` or `unknown` | failpoints after the publication | `integration/maintenance.rs` |
 | The pre-check refuses a build whose target arrays and framing alone pass `artifact_write_limit`, before any scan; the counting build stops before it keeps another batch and before `CsrIndex::build`; under the limit, the count is never below the bytes `serialize` writes, and the pre-check never above them | a small limit over a fixture with edges, including edge types whose source and destination types differ and ids seen on one side only, a scan seam that counts batches, and a comparison of both figures with the written object | `integration/maintenance.rs`, in-source `graph_index` tests |
 | A main write proceeds during the artifact scan | seam that holds the scan | `integration/maintenance.rs` |
 | An issued artifact write completes before release; SIGTERM during the scan releases cleanly | served shutdown journey | `boot_settings` (`owned_shutdown`) |
 | Cancellation stops at a safe boundary; a publication in progress completes and the run is `succeeded` | engine and server tests | `integration/maintenance.rs`, `boot_settings` |
-| Acceptance is durable before the response and is written by the registered operation; a disconnect or SIGTERM between the write and the response neither strands the id nor answers `effects: none` for an id the record holds; a repeated POST answers 202 while non-terminal and 200 when terminal; a different request under the same id is refused; an id at or before the eviction mark is refused `operation_id_expired`; GET and cancel require the record kind's grant | route tests; a disconnect and a SIGTERM held at the acceptance write; 32 later operations, then the evicted id | server integration, new `operation_routes` module |
+| Acceptance is durable before the response and is written by the registered operation; a disconnect or SIGTERM between the write and the response neither strands the id nor answers `effects: none` for an id the record holds; a repeated POST answers 202 while non-terminal and 200 when terminal; a different request under the same id is refused; two concurrent POSTs in one scope admit one and answer 429 to the other, the scope's gate held across the acceptance put; the evicted id itself, and a fresh id minted at or before the mark, are refused `operation_id_expired`, an absent mark refuses nothing, and the server clock plays no part; GET and cancel require the record kind's grant | route tests; a disconnect and a SIGTERM held at the acceptance write; two POSTs held at the put; 32 later operations, then the evicted id and ids minted around the mark | server integration, new `operation_routes` module |
 | A put in doubt starts no table work and no publication; an `accepted` record that lands after an in-doubt acceptance is resolved to `interrupted` before the active-slot check | control-object fault injection over #1176's resolver | server `operation_routes` |
 | Lookup after a lost response, after restart and for an evicted id answers `unknown` without replay, with the stated CLI exits | lost-delivery matrix and restart journey | CLI `system_remote`, `cli_cluster_e2e` |
 | Restart resolves `publishing` by history, and `accepted` or `running` to `interrupted` | failpoints before and after publication, with a killed process | cluster `failpoints.rs`, server `boot_settings` |
 | A record from another ledger is refused, never overwritten | route test | `operation_routes` |
-| Four unresolved records plus the active one at the per-record bound still write; 1,024 per-table outcomes with 512-byte details fit one record, and a larger catalog summarizes the rest | record validation at the bounds | cluster `maintenance` tests |
-| A write that lands between the request and the gates does not refuse the run; a refusal at revalidation carries `BeforeEffect` | writers racing optimize | `integration/maintenance.rs`, `failpoints.rs` |
+| Four unresolved records plus one active per scope at the per-record bound still write; 1,024 per-table outcomes with 512-byte details fit one record, and a larger catalog summarizes the rest | record validation at the bounds | cluster `maintenance` tests |
+| On the served path, a write that lands between the request and the gates does not refuse the run; a direct or embedded caller keeps today's refusal; either refusal carries `BeforeEffect` | writers racing optimize, served and direct | `integration/maintenance.rs`, `failpoints.rs` |
 | One active operation per cluster; deployment, drain and unresolved-cap refusals | route tests | `operation_routes`, `boot_settings` |
 | Logical data, row ids, schema, indexes, retained history, live branches and Blob values are unchanged | before/after comparison on a representative fixture | `integration/maintenance.rs` |
 | Storage calls of one optimize request, flat in history depth | labeled scenario at two history depths | DST storage-cost golden |
@@ -1345,3 +1400,25 @@ dated pending entry in its decision log:
   with `optimize` as the first kind and an asynchronous merge as the named
   next one. A job registry with a JSON spec, events, pause and resume was
   considered and left to the control plane (§Alternatives).
+- 2026-11-01: Revised after the review of the generic record (PR #1214):
+  - **The header matches the rows.** Active operations are keyed by
+    admission scope, each kind's state per graph is keyed by graph and
+    kind, and a record stores its settlement branch; §2.4 walks and settles
+    on that branch, and lookup and cancel are authorized by the record's
+    kind on every route. Chosen over calling this the maintenance record,
+    which the first non-maintenance kind would have had to rewrite.
+  - **Graph deletion.** Settlement is a step of `complete_graph_deletion`,
+    on the first pass and the resume pass, before `Deleted`; it covers an
+    active `publishing` record, walks while the root is readable and writes
+    `graph_deleted` only after verified absence. The lifetime is
+    `schema_identity_domain`.
+  - **One gate across acceptance.** Each scope has an in-process gate held
+    by the owned operation across the acceptance put, as deployment's gate
+    is, so two submissions cannot both pass the active-slot check.
+  - **Eviction mark.** The evicted id's own ULID time, absent until the
+    first eviction; the server clock plays no part.
+  - **Missing links.** `Ok(None)` and `Err` from `first_parent_page` both
+    keep the record `publishing`.
+  - **Pending amendment.** The server-runtime entry names
+    `operations.json`.
+  - **Authority row.** The served path alone drops the pre-gate refusal.

@@ -1658,9 +1658,9 @@ Before enabling an affected increment, its owners must implement and qualify:
 
 - 2026-10-29: Pending amendment. [Remote optimize through the serving
   owner](2026-10-29-remote-optimize-through-the-serving-owner.md), a draft, adds one bounded durable
-  record for maintenance operations, `__cluster/maintenance.json`, written
-  only by the lock holder. Once it is accepted, it supersedes the sentence "No
-  job queue, background poller or second durable operation record is
-  introduced." for maintenance operations only: one durable record is added,
-  but no job queue or background poller. The sentence still holds for
+  record for recorded operations, of which `optimize` is the first kind,
+  `__cluster/operations.json`, written only by the lock holder. Once it is
+  accepted, it supersedes the sentence "No job queue, background poller or
+  second durable operation record is introduced." for recorded operations
+  only: one durable record is added, but no job queue or background poller. The sentence still holds for
   deployment. The body stands unchanged until acceptance.
