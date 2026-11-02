@@ -1843,8 +1843,19 @@ impl Omnigraph {
         // Delete is a STRICT op, so collapse #1 never skips its open.
         let ds = handle.expect("strict Delete op always opens its dataset");
 
-        let scan_filter =
-            dedup_delete_filter(&pred_expr, staging.recorded_delete_predicates(&table_key));
+        // A `<key> = v` conjunct on a single String key also selects the
+        // derived `id = v`, so with an id BTREE the scan narrows through
+        // the index instead of reading the key column of every fragment.
+        // The recorded predicate stays the written one.
+        let scan_predicate =
+            match delete_key_id_conjunct(self, &ds, type_name, predicate, params, txn).await? {
+                Some(id_conjunct) => pred_expr.clone().and(id_conjunct),
+                None => pred_expr.clone(),
+            };
+        let scan_filter = dedup_delete_filter(
+            &scan_predicate,
+            staging.recorded_delete_predicates(&table_key),
+        );
         let (deleted_ids, deleted_addrs) = scan_deleted_ids(
             self,
             &ds,
@@ -2028,6 +2039,76 @@ impl Omnigraph {
             affected_edges: affected,
         })
     }
+}
+
+/// The derived-id conjunct of a node delete whose predicate has a top-level
+/// `<key> = <String literal or parameter>` conjunct on the type's single
+/// String `@key`: every write derives a keyed node's id from its key
+/// (`loader::canonical_key_id`), so `key = v` implies `id = derive(v)` and
+/// adding the conjunct selects the same rows. The read planner narrows the
+/// same shape (`scan_access::narrow_key`). Only when the pinned table has an
+/// id BTREE: without one the extra column would only add bytes.
+async fn delete_key_id_conjunct(
+    db: &Omnigraph,
+    ds: &SnapshotHandle,
+    type_name: &str,
+    predicate: &IRExpr,
+    params: &ParamMap,
+    txn: &crate::db::WriteTxn,
+) -> Result<Option<Expr>> {
+    let type_key = format!("node:{type_name}");
+    let Some(node) = txn.catalog.node_types.get(type_name) else {
+        return Ok(None);
+    };
+    let Some([key]) = node.key.as_deref() else {
+        return Ok(None);
+    };
+    let mut derived = None;
+    for conjunct in predicate.clone().into_conjuncts() {
+        let Some((left, omnigraph_compiler::query::ast::CompOp::Eq, right)) =
+            conjunct.comparison_parts()
+        else {
+            continue;
+        };
+        for (property, value) in [(left, right), (right, left)] {
+            let IRExpr::PropAccess { property, .. } = property else {
+                continue;
+            };
+            if property != key {
+                continue;
+            }
+            let literal = match value {
+                IRExpr::Literal(literal, _) => Some(literal),
+                IRExpr::Param(name, _) => params.get(name),
+                _ => None,
+            };
+            let Some(literal) = literal else {
+                continue;
+            };
+            if let Some(id) = crate::engine::plan_source::canonical_key_id_of(
+                &txn.catalog,
+                &type_key,
+                literal,
+                value.ty(),
+            )? {
+                derived = Some(id);
+                break;
+            }
+        }
+        if derived.is_some() {
+            break;
+        }
+    }
+    let Some(id) = derived else {
+        return Ok(None);
+    };
+    let id_column = txn.catalog.system_columns.id;
+    if !db.storage().has_btree_index(ds, id_column).await? {
+        return Ok(None);
+    }
+    Ok(Some(
+        datafusion::prelude::col(id_column).eq(datafusion::prelude::lit(id)),
+    ))
 }
 
 /// Walk the exact typed predicate a batch at a time, admitting each id against
