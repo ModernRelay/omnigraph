@@ -127,9 +127,13 @@ read by the merge from its session) derives candidate IDs from
 compatible pinned fragment and deletion metadata. Deletion differences remain
 compressed until bounded offset chunks are needed; known positions use direct
 reads against the pinned before-image. The 32 MiB candidate budget is checked
-before keys are copied. Candidate row filters may still scan data when a
-usable ID index is absent. A proof or budget miss falls back to the ordered
-walk. `off` uses that walk directly; `verify` executes both classifiers and
+before keys are copied. Candidate rows are read by an `id IN (...)` filter
+scoped to the fragments that can hold them (`LineageMergePlan::three_way_fragments`):
+the base over both sides' base scopes, each side over its own changed
+fragments plus the base fragments the other side changed, since a candidate
+only one side changed is live on the other at its base position. Within those
+fragments the filter may still scan data when a usable ID index is absent. A
+proof or budget miss falls back to the ordered walk. `off` uses that walk directly; `verify` executes both classifiers and
 compares their results.
 
 The same setting selects how an adopt (a table the target left at the base

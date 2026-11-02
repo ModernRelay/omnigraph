@@ -531,6 +531,27 @@ impl OrderedTableCursor {
         .await
     }
 
+    /// A three-way cursor over candidate keys, scanning only `fragments`.
+    async fn from_dataset_scoped(
+        dataset: Option<Dataset>,
+        filter: &str,
+        fragments: Vec<lance_table::format::Fragment>,
+        table_key: &str,
+        role: &'static str,
+        id_col: &'static str,
+    ) -> Result<Self> {
+        Self::from_dataset_with(
+            dataset,
+            true,
+            Some(filter),
+            Some(fragments),
+            table_key,
+            role,
+            id_col,
+        )
+        .await
+    }
+
     /// An adopt cursor over candidate keys, scanning only `fragments`: the
     /// fragments of this end that hold a candidate row (`LineageSideScope`).
     async fn from_dataset_scoped_lazy(
@@ -551,19 +572,6 @@ impl OrderedTableCursor {
             id_col,
         )
         .await
-    }
-
-    /// An ordered cursor restricted to candidate row keys via an exact
-    /// `id IN (...)` filter, so the three-way classification loop touches only
-    /// rows whose fragments changed between the pinned versions.
-    async fn from_dataset_filtered(
-        dataset: Option<Dataset>,
-        filter: &str,
-        table_key: &str,
-        role: &'static str,
-        id_col: &'static str,
-    ) -> Result<Self> {
-        Self::from_dataset_with(dataset, true, Some(filter), None, table_key, role, id_col).await
     }
 
     async fn from_dataset_with(
@@ -2127,6 +2135,38 @@ struct LineageMergePlan {
     /// The fragments of the base and of the source that hold a candidate row
     /// of the base-to-source comparison.
     source_scope: LineageSideScope,
+    /// The same for the base-to-target comparison; empty when the target
+    /// pins the base.
+    target_scope: LineageSideScope,
+}
+
+impl LineageMergePlan {
+    /// The fragments of each end that can hold a live row of a candidate id.
+    /// A candidate one side changed is live on the other side, if at all, at
+    /// its base position, which the changing side's base scope names; so the
+    /// base scans both base scopes, and each side its own changed fragments
+    /// plus the base fragments the other side changed.
+    fn three_way_fragments(&self) -> [Vec<lance_table::format::Fragment>; 3] {
+        let union = |a: &std::collections::BTreeSet<u64>, b: &std::collections::BTreeSet<u64>| {
+            a.union(b)
+                .copied()
+                .collect::<std::collections::BTreeSet<u64>>()
+        };
+        [
+            LineageSideScope::fragments(
+                self.base.as_ref(),
+                &union(&self.source_scope.base, &self.target_scope.base),
+            ),
+            LineageSideScope::fragments(
+                self.source.as_ref(),
+                &union(&self.source_scope.side, &self.target_scope.base),
+            ),
+            LineageSideScope::fragments(
+                self.target.as_ref(),
+                &union(&self.target_scope.side, &self.source_scope.base),
+            ),
+        ]
+    }
 }
 
 /// The fragment ids, on each end of one lineage comparison, that hold every
@@ -2657,6 +2697,7 @@ async fn plan_lineage_merge(
         target,
         candidate_chunks,
         source_scope,
+        target_scope,
     }))
 }
 
@@ -2690,27 +2731,31 @@ async fn stage_lineage_table_merge(
     let mut deleted_ids = DeleteIdChunks::new(id_col, write_budget);
     let mut needs_update = false;
 
+    let [base_fragments, source_fragments, target_fragments] = plan.three_way_fragments();
     for chunk in &plan.candidate_chunks.chunks {
         let filter = chunk.filter(id_col)?;
-        let mut base = OrderedTableCursor::from_dataset_filtered(
+        let mut base = OrderedTableCursor::from_dataset_scoped(
             plan.base.clone(),
             &filter,
+            base_fragments.clone(),
             table_key,
             "base",
             id_col,
         )
         .await?;
-        let mut source = OrderedTableCursor::from_dataset_filtered(
+        let mut source = OrderedTableCursor::from_dataset_scoped(
             plan.source.clone(),
             &filter,
+            source_fragments.clone(),
             table_key,
             "source",
             id_col,
         )
         .await?;
-        let mut target = OrderedTableCursor::from_dataset_filtered(
+        let mut target = OrderedTableCursor::from_dataset_scoped(
             plan.target.clone(),
             &filter,
+            target_fragments.clone(),
             table_key,
             "target",
             id_col,
