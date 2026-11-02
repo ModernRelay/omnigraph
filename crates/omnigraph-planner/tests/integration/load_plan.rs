@@ -485,8 +485,11 @@ fn card_minimum_declares_the_replaced_source_scan_and_the_source_count() {
     );
 }
 
+/// Without consulted statistics an overwrite's endpoint checks keep the
+/// probe at any input size; append and merge keep the endpoint table, so
+/// without index coverage they scan it.
 #[test]
-fn endpoint_checks_keep_probe_without_consulted_statistics() {
+fn endpoint_checks_without_consulted_statistics_probe_only_for_an_overwrite() {
     let mapped_columns = ["from", "to", "w"].len() as u64;
     let narrowest_row = 2 * mapped_columns;
     let within = PROBE_CHUNK_KEYS * narrowest_row;
@@ -494,8 +497,8 @@ fn endpoint_checks_keep_probe_without_consulted_statistics() {
     for (mode, source_bytes, expected) in [
         (LoadStmtMode::Overwrite, within, ValidateAccess::Probe),
         (LoadStmtMode::Overwrite, past, ValidateAccess::Probe),
-        (LoadStmtMode::Append, past, ValidateAccess::Probe),
-        (LoadStmtMode::Merge, past, ValidateAccess::Probe),
+        (LoadStmtMode::Append, past, ValidateAccess::Scan),
+        (LoadStmtMode::Merge, past, ValidateAccess::Scan),
     ] {
         let op = operation(LoadTarget::Edge("Knows".into()), mode, source_bytes);
         let decision = route(&op, &source(), RouteOverride::Registry, &BOUNDS);

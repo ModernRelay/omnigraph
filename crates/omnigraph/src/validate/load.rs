@@ -160,6 +160,7 @@ pub(crate) async fn judge_load_swept(
             committed: Some(cached_base.as_ref().unwrap_or(base)),
             overwritten: overwrite.then(|| table.to_string()).into_iter().collect(),
             live: None,
+            opened: Default::default(),
         };
         match &spec.check {
             ValidateCheck::Value { .. } => first.refuse(extracted.value.take())?,
@@ -501,6 +502,7 @@ pub(crate) async fn admit_swept_sets(
         committed: Some(base),
         overwritten: overwrite.then(|| table.to_string()).into_iter().collect(),
         live: None,
+        opened: Default::default(),
     };
     let mut admitted = AdmittedSets {
         tables: Vec::new(),
@@ -546,7 +548,7 @@ impl AdmittedSets {
         for (node_type, ds, bound) in self.tables {
             let mut keys = Vec::with_capacity(bound);
             if let Some(ds) = ds.filter(|_| bound > 0) {
-                scan_int_ids(&ds, system_columns.id, &mut keys, bound).await?;
+                scan_int_ids(&ds, system_columns.id, &mut keys, bound, &|_| true).await?;
             }
             let layout = IntKeySetLayout::new(keys.len())
                 .ok_or_else(|| integer_capacity_error(keys.len()))?;

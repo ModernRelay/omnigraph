@@ -1,4 +1,4 @@
-AddFriend                    l.get        calls=111
+AddFriend                    l.get        calls=103
 AddFriend                    l.list       calls=9
 AddFriend                    l.put        calls=24
 BranchCreate                 l.get        calls=6

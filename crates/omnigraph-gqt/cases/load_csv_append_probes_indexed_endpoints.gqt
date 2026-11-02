@@ -1,0 +1,48 @@
+# issue: none
+# traversal: auto
+# notes: A CSV edge append into a text-keyed Person table whose key is fully indexed checks both
+# notes: endpoints by index probe, not by a scan of the table, and the load keeps both edges.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    id: String @key
+}
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 8
+    commits: 1
+    columns:
+      id: {kind: key, prefix: p, width: 6}
+
+--- csv edges.csv
+from,to
+p000000,p000001
+p000002,p000003
+
+--- mutate
+load csv "edges.csv" into edge:Knows mode append header
+--- expect ok
+--- expect plan
+load route: pipeline
+load validate edge_ri edge:Knows from Person: access probe
+load validate edge_ri edge:Knows to Person: access probe
+load validate edge_ri edge:Knows from Person: probe judged
+load validate edge_ri edge:Knows to Person: probe judged
+load executed: partitions 1 rows 2
+
+--- query
+query loaded() { match { $a: Person $a knows $b } return { count($b) as n } }
+--- expect unordered
+{"n": 2}
+--- expect shape
+n: I64

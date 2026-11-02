@@ -640,6 +640,30 @@ pub fn choose_validate_access(check: &ValidateCheck, inputs: ValidateCostInputs)
     }
 }
 
+/// The access of a committed lookup when the write keeps the consulted table
+/// (append, merge): `Probe` only under full BTREE coverage, where the index
+/// answers the key list and no fragment reads a filter. Lance hands an
+/// unindexed or partly covered table one copy of the whole key list per
+/// uncovered fragment, and its probe reads the id column whole anyway, so
+/// every other coverage scans. Cardinality and retained-edge checks only
+/// implement `Probe`.
+pub fn coverage_validate_access(
+    check: &ValidateCheck,
+    coverage: ValidateIndexCoverage,
+) -> ValidateAccess {
+    if matches!(
+        check,
+        ValidateCheck::RetainedEdges { .. }
+            | ValidateCheck::Cardinality { .. }
+            | ValidateCheck::SourceCardinality { .. }
+    ) || coverage == ValidateIndexCoverage::Full
+    {
+        ValidateAccess::Probe
+    } else {
+        ValidateAccess::Scan
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -714,6 +738,43 @@ mod tests {
         };
         assert_eq!(
             choose_validate_access(&unique, empty),
+            ValidateAccess::Probe
+        );
+    }
+
+    #[test]
+    fn kept_table_lookups_probe_only_under_full_coverage() {
+        use omnigraph_compiler::ir::{Endpoint, UniqueRole};
+        let endpoint = ValidateCheck::EdgeRi {
+            endpoint: Endpoint::To,
+            node_type: "Person".into(),
+        };
+        let unique = ValidateCheck::Unique {
+            role: UniqueRole::Unique,
+            columns: vec!["email".into()],
+        };
+        let cardinality = ValidateCheck::Cardinality {
+            endpoint: Endpoint::From,
+            node_type: "Person".into(),
+            min: 0,
+            max: Some(2),
+        };
+        for check in [&endpoint, &unique] {
+            assert_eq!(
+                coverage_validate_access(check, ValidateIndexCoverage::Full),
+                ValidateAccess::Probe
+            );
+            assert_eq!(
+                coverage_validate_access(check, ValidateIndexCoverage::Partial),
+                ValidateAccess::Scan
+            );
+            assert_eq!(
+                coverage_validate_access(check, ValidateIndexCoverage::Absent),
+                ValidateAccess::Scan
+            );
+        }
+        assert_eq!(
+            coverage_validate_access(&cardinality, ValidateIndexCoverage::Absent),
             ValidateAccess::Probe
         );
     }
