@@ -2607,6 +2607,101 @@ fn merge_history_cost_rows(replay: &str) -> String {
     rows
 }
 
+/// The cost of a one-row update after `commits` one-row inserts, each on a
+/// reopened handle, before and after `optimize`. Every insert lands as its
+/// own fragment; the update's key filter reads every fragment until
+/// compaction folds them (autoresearch branch-ops, 2026-11-02).
+#[test]
+#[ignore = "instrument: prints a one-row update's storage calls over per-commit fragments, before and after optimize"]
+#[serial]
+fn instrument_filtered_update_cost_over_per_commit_fragments() {
+    struct FragmentedUpdate {
+        commits: i64,
+    }
+
+    impl FragmentedUpdate {
+        async fn reopen(db: Session, resources: &omnigraph_dst::memory::MemoryStorage) -> Session {
+            let detached = db.detach();
+            detached.attach(Arc::new(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap(),
+            ))
+        }
+
+        async fn set_age(db: &Session, age: i64) {
+            db.mutate(
+                "main",
+                MUTATION_QUERIES,
+                "set_age",
+                &mixed_params(&[("$name", "Alice")], &[("$age", age)]),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for FragmentedUpdate {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_setup");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+            for commit in 0..self.commits {
+                db.mutate(
+                    "main",
+                    MUTATION_QUERIES,
+                    "insert_person",
+                    &mixed_params(&[("$name", &format!("h{commit:05}"))], &[("$age", commit)]),
+                )
+                .await
+                .unwrap();
+            }
+            let db = Self::reopen(db, resources).await;
+            omnigraph_dst::cost::set_label("UpdateColdBeforeOptimize");
+            Self::set_age(&db, 40).await;
+            omnigraph_dst::cost::set_label("UpdateWarmBeforeOptimize");
+            Self::set_age(&db, 41).await;
+            omnigraph_dst::cost::set_label("_optimize");
+            db.optimize().await.unwrap();
+            let db = Self::reopen(db, resources).await;
+            omnigraph_dst::cost::set_label("UpdateColdAfterOptimize");
+            Self::set_age(&db, 42).await;
+            omnigraph_dst::cost::set_label("UpdateWarmAfterOptimize");
+            Self::set_age(&db, 43).await;
+            omnigraph_dst::cost::set_label("_verify");
+        }
+    }
+
+    for commits in [32, 256] {
+        let rows = labeled_cost_rows_of(
+            format!("shared-memory://dst-fragmented-update-{commits}"),
+            &FragmentedUpdate { commits },
+            &[
+                "UpdateColdBeforeOptimize",
+                "UpdateWarmBeforeOptimize",
+                "UpdateColdAfterOptimize",
+                "UpdateWarmAfterOptimize",
+            ],
+        );
+        println!("commits={commits}\n{rows}");
+    }
+}
+
 fn labeled_cost_rows<S>(root: String, scenario: &S, label: &str) -> String
 where
     S: omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage, Output = ()>,
