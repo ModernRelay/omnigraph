@@ -14,8 +14,16 @@ grouping, rank profiles).
 **Outcome:** the [GQ 3 grammar RFC](../2026-10-28-gq-3-grammar.md), which
 cites this document as its evidence, and the
 [GQ 3 programme RFC](../2026-10-31-gq-3-programme.md), which turns §10.7 and
-§11 into the sequence and the slot ownership; §12 to §14 were added after the
-grammar RFC was drafted and are folded into both.
+§11.6 into the sequence and the slot ownership; §12 to §14 were added after
+the grammar RFC was drafted and are folded into it (§12 is the TypeDB
+comparison, which the programme RFC does not carry). The grammar RFC is the
+decision on the language: its freeze list, rewriter table and compatibility
+list win wherever §9 or §11 differs, and the passages below that once
+differed (the arrow spelling, a `contract` declaration, an `F64?` score
+column, a swap-fix refusal of an incoming triple, an HTTP contract bump)
+have been brought into line or marked as the first draft's choice. The
+programme RFC is the decision on the order; §11.1 to §11.5 record the
+additive-first order the project did not take, and §11.6 the order it took.
 
 ---
 
@@ -2836,7 +2844,7 @@ canonical result.
 | `query` for reads and writes alike | `query` for reads, `mutation` for writes, `view` for derived relations, `batch` for several under one snapshot | agents trained on GraphQL write `mutation { }` (the skill's documented trap); lint classifies by keyword, not body |
 | `$p worksAt $c`, direction from the schema | `$p -worksAt-> $c`, `$c <-worksAt- $p`, `$a -knows- $b` undirected, `-$e:worksAt->` bound, `-(knows|likes){1,3}->` | direction visible to the reviewer and the model; `T5` becomes a reading error, not a schema lookup. **Withdrawn 2026-10-30 (§13.3): the triple stays; the arrowhead carries nothing position and schema do not** |
 | Ranking functions as the leading `order` key | a `retrieve { }` clause that binds typed score columns; `order` sorts any expression | 2.10; Vespa; Bruch; thresholds, weights, more arms and rerank become expressions |
-| `rrf(a, b)` only | `rrf(...)`, `norm(...)`, weighted sums, `rerank(model, text) k` as a stage, `where $a.vec.distance < 0.4` | Bruch (+2–3 nDCG), BEIR (+11% rerank), LanceDB `distance_range` |
+| `rrf(a, b)` only | `rrf(...)`, `norm(...)`, weighted sums, `rerank(model, text, k: n)` as a stage, `having { $a.vec < 0.4 }` | Bruch (+2–3 nDCG), BEIR (+11% rerank), LanceDB `distance_range` |
 | Blocks as predicates only, constant right side | blocks as values (`count { } as n`), any expression on the right | #1050, Cypher `COUNT {}`, Soufflé |
 | No optional | `optional { }` with pattern-bound filters and nullable bindings | #658, GQL `OPTIONAL MATCH` |
 | No post-group filter, no collection | `having { }`, `collect($x)` / `collect($x { a, b })` | R3 Rosetta row; Datomic pull; one nesting level |
@@ -2889,7 +2897,7 @@ edge Supersedes: Assertion -> Assertion @card(0..1)
 view Contested($since: DateTime) @description("Assertions attacked since a date") {
   match {
     $a: Assertion
-    $r: Assertion -supports-> $a        // reuse: a 'Reason' would be its own type in a real schema
+    $r: Assertion  $r supports $a       // reuse: a 'Reason' would be its own type in a real schema
     $r.confidence < 0.3  $r.asserted_at >= $since
   }
   return { $a as assertion, count($r) as attacks }
@@ -2897,24 +2905,24 @@ view Contested($since: DateTime) @description("Assertions attacked since a date"
 
 // ---- a read: scope by graph, retrieve, fuse, filter on scores, project compactly
 query evidence($slug: String, $q: String, $k: I64 = 10, $at: Commit?)
-  @approximate(recall: 0.9) @budget(rows: 200000, ms: 2000) {
+  @approximate(recall = 0.9) @budget(rows = 200000, ms = 2000) {
   match {
     $c: Customer { slug: $slug }
-    $a: Assertion -about-> $c
-    not { $a -supersedes-> $_ }                       // only current claims
+    $a: Assertion  $a about $c
+    not { $a supersedes $_ }                          // only current claims
     optional { $x: Contested(datetime("2026-01-01")) { assertion: $a } }
   }
   retrieve {
-    $a.vec: nearest($a.embedding, $q) k 200
+    $a.vec: nearest($a.embedding, $q, k: 200)
     $a.lex: bm25($a.statement, $q)
   }
   return {
     $a { slug, statement, asserted_at },
     $x.attacks,
-    count { $s -supports-> $a } as support,
+    count { $s supports $a } as support,
     0.7 * norm($a.vec) + 0.3 * norm($a.lex) as score
   }
-  having { $a.vec.distance < 0.6 or $a.lex is not null }
+  having { $a.vec < 0.6 or $a.lex is not null }
   order { score desc }
   limit $k
 }
@@ -2923,20 +2931,28 @@ query evidence($slug: String, $q: String, $k: I64 = 10, $at: Commit?)
 mutation retract($slug: String, $why: String, $head: Commit) @if_commit($head) {
   update $a: Assertion where { $a: Assertion { slug: $slug } }
     set { retracted_at: now(), note: $why }
-  invalidate $e where { $a: Assertion { slug: $slug } -$e:supports-> $_ }
+  invalidate $e where { $a: Assertion { slug: $slug }  $a $e:supports $_ }
   returning { $a.@id, count($e) as detached }
 }
 
 // ---- speculation: the same statements as today, plus a batch under one snapshot
 batch explore @brief("which assertion types mention pricing") @phase(explore) {
   query types() { match { $t: @Type } return { $t.name, $t.instruction } }
-  query hits($q: String) @satisfice(ms: 300) {
+  query hits($q: String) @satisfice(ms = 300) {
     match { $a: Assertion }
     retrieve { $a.lex: bm25($a.statement, $q) }
-    return { $a.slug, $a.lex.score as s } order { s desc } limit 20
+    return { $a.slug, $a.lex as s } order { s desc } limit 20
   }
 }
 ```
+
+(The traversals are the triple the RFC kept; the first draft of this file
+wrote them with arrows. Annotation arguments use `=`, the `.pg` spelling the
+RFC fixed; call options use `:`. A score is the arm's column itself,
+`$a.vec`, not a field of it. Several forms here are later productions, not
+edition-3 text: arithmetic, the partial object `$a { … }`, `invalidate`, the
+pattern-scoped `update`, `norm`, `k:` on an arm, and the `bm25` arm over
+`@Type` in `types()` would be a slot refusal until the catalogue amendment.)
 
 Reading the file against the requirements: R1 is the schema with `@example`
 and `@instruction` served through `@Type`; R2 is the diagnostic, `why_not` and
@@ -2953,21 +2969,26 @@ line; R10 is the one file.
 
 ### 9.5 The retrieval clause, precisely
 
-`retrieve { $b.name: fn(args) [k N] … }` declares one or more *arms*, each
-over one binding's indexed property, each binding a typed score column
-(`$a.vec.distance: F64?`, `$a.lex.score: F64?`, null when the row is outside
-that arm's window). Semantics, unchanged in substance from today's contracts:
+`retrieve { $b.name: fn(args [, k: n]) … }` declares one or more *arms*, each
+over one binding's indexed property, each binding a typed score column. The
+column is the one the ranked scan appends today, with today's type: `F32`,
+non-null (`F64` for `rrf`), the squared L2 distance for `nearest` and the
+BM25 score for `bm25`; a row outside an arm's window is absent, not null (the
+first draft wrote `F64?` with nulls, which the RFC corrected to what the
+engine publishes). Semantics, unchanged in substance from today's contracts:
 the `match` block's filters and traversals are applied before any arm scores
 (prefilter); a `nearest` arm is a top-`k` window over the eligible rows with
 the declared recall, a `bm25` arm is the full matching population; the
 retrieved population is the union of the arms' rows; `return`, `having` and
 `order` may use the score columns as ordinary values, so `norm`, `rrf`, a
-weighted sum and a threshold are expressions, not grammar; `rerank(model,
-$a.statement, k 50)` is a stage declared after the arms, run over the fused
+weighted sum and a threshold are expressions, not grammar; `having` over a
+score means the top `limit` rows of the population passing the predicate,
+which is what the overfetch ladder already computes; `rerank(model,
+$a.statement, k: 50)` is a stage declared after the arms, run over the fused
 top-k with a provider named in `cluster.yaml` the way embedders are; a
 retrieval forces a `limit`. The envelope reports per arm the recall contract
 and, under filters, the recall achieved, and per row the arm contributions
-behind a fused score. A ranking that scopes by traversal (`$a -about-> $c`
+behind a fused score. A ranking that scopes by traversal (`$a about $c`
 above) ranks only the reached rows, as today.
 
 ### 9.6 Writes, precisely
@@ -2990,7 +3011,9 @@ for literals and parameters, `as commit`, `as unattached branch`.
 ### 9.7 The envelope, precisely
 
 Beside `columns`, `rows` and `graph_commit_id`: `retrievals` and `metrics`
-(today's descriptors, plus `recall_achieved` per filtered arm);
+(today's descriptors, plus `recall_achieved` per filtered arm, a field the
+RFC does not reserve, since a new envelope field is additive and the
+retrieval RFC that measures recall owns it);
 `notifications` (`N…` codes with the same four fields as refusals: a cross
 join, a destination-ranked scan of a whole type, a wildcard without a budget,
 a `bm25` arm without a cap); `why_not`, present when zero rows were returned
@@ -3072,15 +3095,18 @@ envelope that costs nothing now and is expensive to retrofit.
 Most of §9.3 is additive and already in §4.3 and §7.7: blocks as values,
 `optional`, `having`, `collect`, views, the function registry, interface
 bindings, annotations, catalogue types, paging, `returning`, pattern-scoped
-writes, notifications, `why_not`, editions. Only four items are incompatible
-with stored text and are the reason to ask the question at all: the arrow
-spelling for traversals (withdrawn on 2026-10-30, §13.3), `mutation` as a keyword, `retrieve` replacing ranking
-functions in `order`, and `@valid`/`invalidate` as schema and verb. Under an
-edition line all four ship as GQ 3 beside a GQ 2 the compiler keeps compiling
-for one release, with `queries validate` printing the rewrite; the rewrite from
-`$p worksAt $c` to `$p -worksAt-> $c` and from `order { nearest(…) }` to a
-`retrieve` arm is mechanical, which is what the `suggestion` field with
-`machine_applicable` edits was built for.
+writes, notifications, `why_not`, editions. Only three items are incompatible
+with stored text and are the reason to ask the question at all: `mutation` as
+a keyword, `retrieve` replacing ranking functions in `order`, and the call
+form for the infix string operators and the positional `k` (a fourth, the
+arrow spelling for traversals, was withdrawn on 2026-10-30, §13.3; `@valid`
+and `invalidate` are additive). Under an edition line the three ship as GQ 3
+beside a GQ 2 the compiler keeps compiling for one release, with `queries
+migrate` printing the rewrite; the rewrite from `order { nearest(…) }` to a
+`retrieve` arm, from `query` to `mutation` and from `x contains y` to
+`contains(x, y)` is mechanical, which is what the `suggestion` field with
+`machine_applicable` edits was built for, and the RFC proves each rewrite by
+typed-IR equality.
 
 ---
 
@@ -3485,10 +3511,10 @@ one pay. Sizes are relative (S, M, L), not dates.
                        ├──► N  envelope side channel (notifications, why_not, estimate) ────┤             │
                        ├──► P  paging (limit $k, continuation token) ────────────────────────┤             ▼
                        │                                                                    ├──► X  edition-3 spelling flip
-                       ├──► C  closure (blocks as values, having, collect, optional, views) ─┤       (arrows, mutation, retrieve
-                       │              │                                                      │        default, deprecations run
-                       │              └──► A  permissions (contracts as declarations         │        out: search/fuzzy/match_text,
-                       │                      over views; actor views first scope) ──────────┤        infix contains, rrf positional k)
+                       ├──► C  closure (blocks as values, having, collect, optional, views) ─┤       (mutation, retrieve default,
+                       │              │                                                      │        deprecations run out:
+                       │              └──► A  permissions (views as the unit of              │        infix contains, rrf positional k;
+                       │                      authority; actor views first scope) ───────────┤        the first draft also listed arrows)
                        ├──► L  lexical (@analyzed, terms, match_terms, bm25_v1) ─────────────┤
                        ├──► W1 writes (pattern-scoped, returning, @valid/invalidate) ────────┤
                        │                                                                    │
@@ -3521,13 +3547,13 @@ bounded union §7.6 wants. **A** waits for views (contracts bind to them).
 | **P Paging** (S) | `limit $k` (I64 parameter, non-null); continuation token in the envelope derived from the total order over the pinned snapshot; `--after <token>` on CLI, `after` on HTTP | total order (exists) | no | token round trip across a write (snapshot pinned, no skip, no repeat); two-key tie cases | stable pages without hand-written keyset predicates |
 | **F Function registry** (M) | generic `name(args, opt: v)` call rule; registry with signature, nullability rule, `can_fail`, `volatile`, pushdown mapping; the existing aggregates and search calls become rows; `contains()`/`starts_with()` land as the operator amendment specifies (infix kept, deprecated); first scalar library (`lower`, `upper`, `trim`, `length`, `coalesce`, date extraction, `case`); arithmetic with typed overflow refusal and the `can_fail` pushdown rule | E (for the infix deprecation) | no (infix stays one release) | `@Function` rows equal the compiler's registry (a test, not a doc); pushdown refuses to lift a fallible conjunct past its guard; GQT per function | derived values filter and order server-side; the end of client-side arithmetic |
 | **C Closure** (L) | blocks as values (`count { } as n`, `exists { } as b`), any expression on a block's right side; `having { }`; `collect($x)` / `collect($x { a, b })`; `optional { }` with pattern-bound filters and nullable bindings (`LeftExpand`); `view` declarations inlined at compile time, bindable as `$x: View(args)`, registered and validated with stored queries, listed in `@View`; interface *bindings* `$x: Named` as a union scan with the common projection (from the polymorphism RFC, no storage change); the Felleisen test applied to each as an acceptance criterion in the RFC | S (for `@View`), registry infrastructure | no | GQT per form; plan acceptance updated for `LeftExpand` and the projected block; a view invalidation case under `cluster plan`; the node-page task in M0 goes from N requests to 1 | the largest round-trip reduction in the plan; derived relations agents can author on a branch |
-| **L Lexical** (M–L) | `@analyzed` profiles in SchemaIR; `terms()`, `match_terms`; exact scan as oracle; `bm25_v1`; `search`/`fuzzy`/`match_text` compile to `match_terms` with a deprecation under E | E; F (named options) | no (deprecation window) | the RFC's oracle fixtures and the three Lance guards; #747/#748/#749 cases green at every index state | text answers that do not depend on index state |
+| **L Lexical** (M–L) | `@analyzed` profiles in SchemaIR; `terms()`, `match_terms`; exact scan as oracle; `bm25_v1`; `search`/`fuzzy`/`match_text` stay as registry rows and `queries fmt` canonicalises them to `match_terms` (the RFC's rule that a registry row is never removed; this file's first draft had them removed) | E | no | the RFC's oracle fixtures and its four Lance guards, re-qualified on the pinned Lance; #747/#748/#749 cases green at every index state | text answers that do not depend on index state |
 | **R Retrieve** (L) | `retrieve { }` clause binding typed score columns; arms with `k`; `norm()`, `rrf()` with n arms and weights, `rerank(model, text, k)` as a provider-backed stage; score columns usable in `having`/`order`/`return`; `@approximate(recall)` declaration; achieved recall in the envelope; 0048's laws, `exact: true`, `Vector(n, distance=…)` and recipes; rankings in `order` keep compiling for one release and lint prints the rewrite | E, F, 0047 (shipped) | no until X | the fusion and vector oracles 0048 names; GQT for windows, weights, thresholds, rerank, n arms; the discovery task in M0 answered by `rrf` over interface arms | hybrid search with weights, thresholds and a reranker; the end of two-query hybrids |
 | **W1 Writes** (M) | pattern-scoped `update $a … where { }` and `delete $e where { }` with one target type; `returning { }`; `@valid(from, to)` schema role and `invalidate`; `set { x: null }` in assignment position; bounded pattern-scoped `insert` | read planner under the write door (the shared expression RFC's "later RFC") | no | staging protocol unchanged (D2); GQT per form; affected receipts | invalidation as a verb; one round trip per write instead of read-then-write |
 | **W2 Computed writes** (S) | `set { visits: visits + 1 }` under `@if_commit` or a key equality; the read-set rule | F (arithmetic), W1 | no | contention case under DST; retry idempotence | the increment without a round trip |
-| **X Edition 3** (M) | `mutation` keyword; arrow traversal spelling (`-e->`, `<-e-`, `-e-`; withdrawn 2026-10-30, §13.3); `retrieve` as the only ranking position; removal of `search`/`fuzzy`/`match_text`, infix `contains`/`starts_with`, positional `rrf` `k`; the GQ 2 compiler kept for one more release; `queries validate` prints every rewrite as a machine-applicable suggestion | every deprecation above having lived one release | **yes, under the edition** | every stored query in the fleet rewritten by the suggestion tool and re-validated; the 45-task instrument re-run on the new spelling | one spelling per operation; direction visible; the novelty tax paid once |
+| **X Edition 3** (M) | `mutation` keyword; `retrieve` as the only ranking position; removal of infix `contains`/`starts_with` and positional `rrf` `k`; the GQ 2 compiler kept for one more release; `queries migrate` prints every rewrite as a machine-applicable suggestion (the first draft also flipped the traversal to arrows and removed `search`/`fuzzy`/`match_text`; both withdrawn, §13.3 and the RFC's registry rule) | every deprecation above having lived one release | **yes, under the edition** | every stored query in the fleet rewritten by the suggestion tool and re-validated; the 45-task instrument re-run on the new spelling | one spelling per operation; the novelty tax paid once |
 | **I + Poly** (L, own clock) | integer identity storage upgrade; polymorphic endpoints; unions `A \| B`; type tests; `@type_id`; interface-wide mutations; `rrf` over member arms as the interim cross-member search | storage upgrade RFC pair; C (interface bindings already shipped) | no (schema feature; old binaries refuse) | the RFC's prototype findings as regressions; upgrade journey tests | edge families collapse; discovery across types |
-| **A Permissions** (L) | actor views first scope (type and column visibility, per-row placement, reads); `contract` declarations in GQ bound to views and stored queries; Cedar grants on named capabilities; the fragment = kernel minus retrieval | C (views), S, both RFCs amended per §10.5 | no | #951's differential oracle for the first scope; #1197's adversarial matrix | query-only agents; shared graphs with audiences |
+| **A Permissions** (L) | actor views first scope (type and column visibility, per-row placement, reads); a permissions declaration in GQ bound to views and stored queries (the first draft called it `contract`; the RFC reserves no permissions declaration, since a file-level keyword is additive whenever the model is accepted); Cedar grants on named capabilities; the fragment #1197 defines (one concrete binding, scalar filters, projections, optional group, count, order and a literal limit) | C (views), S, both RFCs amended per §10.5 | no | #951's differential oracle for the first scope; #1197's adversarial matrix | query-only agents; shared graphs with audiences |
 | **Fed Federation** (L, later) | graph qualifier in type references; per-graph commit pins in the envelope; views over a foreign graph; change-feed-as-load for shares | E/S reservation; C (views); Poly (one-corpus search) | no | nothing until designed | cross-graph reads; shares kept current |
 
 ### 11.3 Three parallel tracks
@@ -3616,20 +3642,20 @@ not on it is additive forever after, by construction.
 
 | Frozen in the break | Decision | Semantics at break time |
 |---|---|---|
-| Declaration kinds | `query`, `mutation`, `view`, `contract`, `batch`, plus the schema kinds `node`, `edge`, `interface` in the same grammar; one file type, `.pg` accepted as the same grammar | `view`, `contract`, `batch` parse and are refused with a stable code ("reserved; not yet served") until their stage |
-| Clause set and order | `match` → `retrieve`? → `return` → `having`? → `order`? → `limit`? → `returning`? (mutations: statements → `returning`?) | `retrieve` carries exactly today's power (`nearest`, `bm25`, two-arm `rrf`); `having` works immediately (one `Filter` over `Aggregate`); `returning` parses, refused until W1 |
+| Declaration kinds | `query`, `mutation`, `view`, `batch`, plus the schema kinds `node`, `edge`, `interface` in the same grammar; one file type, `.pg` accepted as the same grammar (the first draft also reserved `contract`; the RFC removed it on 2026-10-29) | `view` and `batch` parse and are refused with a stable code ("reserved; not yet served") until their stage |
+| Clause set and order | `match` → `retrieve`? → `return` → `having`? → `order`? → `limit`? (mutations: statements → `returning`?) | `retrieve` carries exactly today's power (`nearest`, `bm25`, two-arm `rrf`) with today's `F32` columns; `having` works immediately over aggregates, group keys and score columns, a score threshold meaning the top `limit` passing rows; `returning` parses, refused until W1 |
 | Block kinds in `match` | `not`, `exists`, `count`/`sum`/… blocks, `optional` | `optional` parses, refused until C |
 | Traversal spelling | the triple stays (`$a e $b`, `<e>`); the first draft's arrow forms were withdrawn on 2026-10-30 (§13.3) | today's semantics |
-| Call syntax | `name(args, opt: v)`, generic, resolved against a registry; `contains()`, `starts_with()`, `terms()` reserved as names; no function in the grammar | today's functions become registry rows; `terms()` refused until L |
+| Call syntax | `name(args, opt: v)`, generic, resolved against a registry; `contains()`, `starts_with()` registry rows; no function in the grammar; a registry row is never removed | today's functions become registry rows (`search`, `fuzzy`, `match_text` included, for good); `terms()` and `match_terms()` are rows L adds, no slot needed |
 | Reserved words | the logic set only: `and`, `or`, `not`, `is`, `null`, `in`; every clause and declaration keyword contextual (word-bounded, position-based, as today) | closed; the amendment's rule becomes a grammar test |
 | Null | no literal in reads; `null` legal in assignment position only | today's rules plus the assignment case |
-| Parameters | `limit $k`; `$branch: Branch`, `$at: Commit` typed parameter kinds; defaults `($k: I64 = 10)` | `limit $k` works; `Branch`/`Commit` kinds parse and bind |
-| Annotations | `@ident(args)` on any declaration, retained as metadata; engine-known names typed (`@budget`, `@approximate`, `@satisfice`, `@if_commit`, `@example`, `@description`, `@instruction`) | known ones that are stubs refuse with a code |
-| Meta-fields and catalogue names | `@id`, `@src`, `@dst`, `@type`, `@type_id`, `@distance`, `@score` reserved; `@Type`, `@Property`, `@Edge`, `@Interface`, `@Index`, `@Function`, `@View` names reserved | `@distance`/`@score` are the `retrieve` columns; the catalogue types ship in S |
+| Parameters | `limit $k`; `$branch: Branch`, `$at: Commit` typed parameter kinds; defaults `($k: I64 = 10)` | `limit $k` works; `Branch`/`Commit` kinds parse and are slots for the branch-statements RFC |
+| Annotations | `@ident(args)` on any declaration, retained as metadata; arguments positional or `name = value`; `@description` and `@instruction` typed; `@budget`, `@approximate`, `@satisfice`, `@if_commit`, `@example`, `@brief`, `@phase` reserved | the reserved ones refuse with a code naming their owner |
+| Meta-fields and catalogue names | `@id`, `@src`, `@dst`, `@type`, `@type_id` reserved (the first draft also had `@distance` and `@score`; the arm's column is the score, so they were dropped); `@Type`, `@Property`, `@Edge`, `@Interface`, `@Index`, `@Function`, `@View` names and the `@`-prefixed catalogue edge reserved | the catalogue types ship in S; a `retrieve` over them waits for the catalogue amendment |
 | Type references | `[graph@]ns::Type` admitted by the grammar | the graph segment refused ("federation reserved") |
 | Edition line | `gq 3;` optional first line | the compiler is edition 3; edition 2 parses for one release through the rewriter |
 | Schema roles | `@valid(from, to)`, `Vector(n, distance=…)`, `@analyzed(...)`, `@embed` recipe arguments | `@valid` and `@analyzed` are SchemaIR features whose enforcement arrives with W1 and L; distance ships |
-| Envelope | `graph_commit_id` as a map keyed by graph (one entry today), `notifications`, `why_not`, `complete`, `continuation`, `retrievals.recall_achieved`, `estimate` reserved | present and empty until their stage; HTTP contract 0.14 → 0.15, explain and bound-plan versions bumped once |
+| Envelope | `graph_commits` as a map keyed by graph (one entry today) beside `graph_commit_id`, `notifications`, `why_not`, `complete`, `incomplete_reason`, `continuation`, `estimate` reserved (`recall_achieved`, in the first draft, is left to the retrieval RFC as an additive field) | present where their stage has shipped, absent otherwise; no HTTP contract bump (the first draft wrote 0.14 → 0.15); explain and bound-plan versions bumped once |
 
 Two things are deliberately *not* on the list, because they are additive by
 nature: new registry rows (functions, catalogue types, annotations) and new
@@ -3660,9 +3686,10 @@ and repair turns on the frozen grammar) rather than on taste.
 deliverables: the grammar and type rules of the freeze list; a **rewriter**
 (`omnigraph queries migrate`, the machine-applicable `suggestion` machinery
 turned into a tool) that rewrites every edition-2 source mechanically
-(`$p worksAt $c` → `$p -worksAt-> $c`, `order { nearest(…) }` → a `retrieve`
-arm, `query` writes → `mutation`, infix `contains` → `contains()`); the GQT
-corpus rewritten by that tool and re-run as the proof that the rewrite is
+(`order { nearest(…) }` → a `retrieve` arm, `query` writes → `mutation`,
+infix `contains` → `contains()`, positional `k` → `k:`; the traversal is
+untouched); the GQT corpus rewritten by that tool and re-run, with typed-IR
+equality per declaration, as the proof that the rewrite is
 semantics-preserving; and the fleet's stored queries rewritten under `cluster
 plan` with the same tool. Edition 2 keeps parsing for that one release so a
 stored query that escaped the sweep is rewritten at boot with a warning rather
@@ -4012,20 +4039,25 @@ one-spelling test of §14 reversed that on 2026-10-30. Four rules remain.
    `$a -subsidiaryOf-> $b`. It is a decoration on the one spelling, and its
    two justifications did not survive: `$p worksAt $c` reads in
    source-to-target order as a sentence does, and the only in-context
-   measurement GQ has is on the triple (RFC 0047: 45 of 45, 37 first tries
-   valid, no direction error) while CypherBench shows the arrow form does not
-   prevent reversals. Dropping it also removes the break's largest rewrite,
-   since every stored query has a traversal, and the arithmetic-minus rule.
-   The arrow forms stay in the grammar as a recognizer only: `$p -worksAt->
-   $c`, `$c <-worksAt- $p` and `$a -knows- $b` are parse errors whose fix
-   prints the triple with the ends in schema order.
-2. **A triple written against the schema is a typed error with a
-   machine-applicable swap**, never an empty result and never a silent
-   rewrite. `$c: Company worksAt $p` is `T5` with `fix` = `$p worksAt $c`.
-   This is LangChain's corrector moved into the compiler, where it belongs,
-   with the two differences the evidence asks for: it is loud (the agent
-   learns in one turn, which Olausson's result in §8.3 says is worth more
-   than the edit) and it never guesses when both orientations fit.
+   measurement GQ has is on the triple (RFC 0047: 45 of 45 correct, 8 of 45
+   first attempts refused, all for a missing `()`; it reports no direction
+   result) while CypherBench shows the arrow form does not prevent reversals
+   (9 of 55 gpt-4o error marks). Dropping it also removes the break's
+   largest rewrite, since every stored query has a traversal, and the
+   arithmetic-minus rule. The arrow forms stay in the grammar as a recognizer
+   only: `$p -worksAt-> $c`, `$c <-worksAt- $p` and `$a -knows- $b` are parse
+   errors whose fix prints the triple in the written order.
+2. **Both written orders of a directed triple stay legal, and the formatter
+   writes the schema's.** `$c: Company worksAt $p` typechecks today as the
+   incoming orientation, and the corpus writes it (issue 659's cases). The
+   first draft of this section made it `T5` with a swap as the fix,
+   LangChain's corrector moved into the compiler; the RFC's review found that
+   a break the compatibility list had hidden, and that the type checker
+   already resolves the orientation, so no correction is needed: `queries
+   fmt` rewrites the clause to schema order and lint names it, and `T5` keeps
+   today's meaning (an edge whose declared endpoints fit neither order).
+   Loud and never guessing, which Olausson's result in §8.3 says matters,
+   are properties the resolved triple has for free.
 3. **Same-type edges are where direction is meaning, and position carries
    it.** `$a subsidiaryOf $b` means `$a` is the subsidiary. No rule can check
    that against the schema; what GQ can do is make the schema say which end
@@ -4035,7 +4067,7 @@ one-spelling test of §14 reversed that on 2026-10-30. Four rules remain.
 4. **`<e>` means "whichever orientation the endpoint types admit".** For a
    same-type edge that is both orientations, deduplicated, as today. For an
    alternation or wildcard over edges of differing orientation
-   (`$p: Person <owns | ownedBy> $d: Doc`, the issue 659 case, which the
+   (`$p: Person  $d: Doc  $p <owns | ownedBy> $d`, the issue 659 case, which the
    directed triple resolves per member today) it is each member's declared
    orientation. The only refusal left is the genuinely ambiguous one: an
    asymmetric edge whose endpoints are not typed well enough to fix the
@@ -4092,7 +4124,8 @@ Every pair of forms in GQ 3 that could mean the same thing, and the ruling.
 
 | Pair | Same meaning? | Ruling |
 |---|---|---|
-| `$a knows $b` and a reversed arrow `$b <-knows- $a` | Yes, exactly | Grammar: the triple only, source on the left; every arrow form is a parse error with the swapped triple as its fix (§13.3) |
+| `$a knows $b` and a reversed arrow `$b <-knows- $a` | Yes, exactly | Grammar: the triple only; every arrow form is a parse error with the triple as its fix (§13.3) |
+| `$p worksAt $c` and `$c worksAt $p` under `Person -> Company` | Yes: the schema fixes the orientation, and the type checker resolves both | Both parse and typecheck, as in edition 2; `queries fmt` writes the schema's order and lint names it. Refusing one order was the first draft's `T5` swap, a hidden break |
 | `$a knows $b` (triple) and `$a -knows-> $b` | Yes, and the arrowhead adds nothing | Grammar: triple only, decided 2026-10-30 (§13.3); the first draft had chosen the arrow |
 | `x contains y` and `contains(x, y)` | Yes | Grammar: the call only; already in the RFC |
 | `rrf(a, b, 60)` and `rrf(a, b, k: 60)` | Yes | Grammar: named option only; already in the RFC |

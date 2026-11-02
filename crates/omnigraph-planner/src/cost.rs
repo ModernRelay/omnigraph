@@ -622,11 +622,15 @@ impl ValidateCostInputs {
 }
 
 /// Pick the cheaper supported access. Ties and unknown statistics retain
-/// Probe; cardinality and retained-edge checks only implement Probe.
+/// Probe; cardinality and retained-edge checks only implement Probe, apart
+/// from an overwrite's cardinality scan under a minimum, which the optimizer
+/// chooses before costing.
 pub fn choose_validate_access(check: &ValidateCheck, inputs: ValidateCostInputs) -> ValidateAccess {
     if matches!(
         check,
-        ValidateCheck::RetainedEdges { .. } | ValidateCheck::Cardinality { .. }
+        ValidateCheck::RetainedEdges { .. }
+            | ValidateCheck::Cardinality { .. }
+            | ValidateCheck::SourceCardinality { .. }
     ) {
         return ValidateAccess::Probe;
     }

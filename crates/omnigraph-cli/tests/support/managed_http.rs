@@ -97,6 +97,24 @@ impl IntentApiFixture {
         Self::start(replies, Some(session), Duration::ZERO, false)
     }
 
+    /// Hold the first scripted reply while the session lookup answers at once.
+    pub fn with_session_and_first_reply_delay(
+        replies: Vec<IntentReply>,
+        session: Value,
+        delay: Duration,
+    ) -> Self {
+        assert!(delay <= Duration::from_secs(32), "fixture delay bound");
+        Self::start_with_origin(
+            |_| replies,
+            Some(session),
+            Duration::ZERO,
+            false,
+            None,
+            None,
+            Some((0, delay)),
+        )
+    }
+
     /// Graph data fixtures answer public discovery without consuming a scripted
     /// reply. Control-plane and OAuth fixtures retain their separate protocol.
     pub fn graph(replies: Vec<IntentReply>) -> Self {

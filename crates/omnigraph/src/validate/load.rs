@@ -17,8 +17,8 @@ use omnigraph_compiler::types::ScalarType;
 use omnigraph_planner::{EndpointProbe, ValidateAccess, ValidateRemoval, ValidateSpec};
 
 use super::kernels::{
-    CardPlan, FinalKeys, Position, SharedFirstHolders, UniqueImage, UniquePartial, card_affected,
-    card_violations, merge_unique_image, orphan_violation, orphans_retained, unique_coalesced_dups,
+    CardPlan, FinalKeys, Position, SharedFirstHolders, UniqueImage, UniquePartial,
+    merge_unique_image, orphan_violation, orphans_retained, unique_coalesced_dups,
     unique_committed_collisions, unique_probe_keys,
 };
 use super::key_set::{IntKeySet, IntKeySetLayout, canonical_i64, key_bytes};
@@ -247,31 +247,53 @@ pub(crate) async fn judge_load_swept(
                 if edge_type.cardinality.is_default() {
                     continue;
                 }
+                // An overwrite's committed view is empty, but a source of the
+                // replaced image the delta leaves without an edge is below the
+                // minimum; only the plan's scan of those sources finds it.
+                if overwrite
+                    && edge_type.cardinality.min > 0
+                    && spec.access != Some(ValidateAccess::Scan)
+                {
+                    return Err(OmniError::manifest_internal(format!(
+                        "Validate: the plan reads the replaced sources of {table} under {:?}, \
+                         not a scan, so a source the overwrite empties would go uncounted",
+                        spec.access
+                    )));
+                }
                 let delta_by_id = std::mem::take(&mut extracted.card);
                 let plan = CardPlan {
                     changed_ids: delta_by_id.keys().cloned().collect(),
                     delta_by_id,
                     removed_ids: Vec::new(),
                 };
-                let moved_from = committed
-                    .committed_edges(table, system_columns.id, &plan.changed_ids, system_columns)
-                    .await?;
-                let affected = card_affected(&plan, &[], &moved_from, &HashSet::new());
-                if affected.is_empty() {
-                    continue;
-                }
-                let affected_ids: Vec<String> = affected.iter().cloned().collect();
-                let committed_for_affected = committed
-                    .committed_edges(table, system_columns.src, &affected_ids, system_columns)
-                    .await?;
-                card_violations(
+                super::evaluate_cardinality(
                     table,
                     edge_type,
                     &plan,
-                    &affected,
-                    &committed_for_affected,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                    &committed,
+                    system_columns,
                     &mut first.sink(),
-                )?;
+                )
+                .await?;
+                first.refuse_pending()?;
+            }
+            ValidateCheck::SourceCardinality { edge_table, .. } => {
+                // A node load adds and removes no edge, so the evaluator's rule
+                // counts each written node's committed edges; a new one has none.
+                let edge_type = edge_type_of(catalog, edge_table)?;
+                super::evaluate_cardinality(
+                    edge_table,
+                    edge_type,
+                    &CardPlan::default(),
+                    &extracted.ids,
+                    &HashSet::new(),
+                    &committed,
+                    system_columns,
+                    &mut first.sink(),
+                )
+                .await?;
                 first.refuse_pending()?;
             }
             ValidateCheck::RetainedEdges { edge_table, .. } => {
@@ -386,8 +408,10 @@ impl SweepPlan {
             needs_value: checks
                 .iter()
                 .any(|spec| matches!(spec.check, ValidateCheck::Value { .. })),
-            needs_ids: checks.iter().any(|spec| {
-                matches!(spec.check, ValidateCheck::Unique { .. }) && spec.consults.is_some()
+            needs_ids: checks.iter().any(|spec| match spec.check {
+                ValidateCheck::Unique { .. } => spec.consults.is_some(),
+                ValidateCheck::SourceCardinality { .. } => true,
+                _ => false,
             }),
             needs_card: checks
                 .iter()
@@ -671,7 +695,8 @@ pub(crate) struct Extracted {
     /// The first value violation: the first constraint in declaration order
     /// with a violating row anywhere in the delta, at its earliest row.
     value: Option<Violation>,
-    /// Every non-null id of the delta.
+    /// Every non-null id of the delta, when a consulted uniqueness or a
+    /// source cardinality check reads it.
     ids: HashSet<String>,
     /// Per uniqueness check (by list index): its image and the first key
     /// repeated anywhere in the input.

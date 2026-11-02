@@ -57,7 +57,12 @@ fn literal_to_typed_array(
             })?;
             Arc::new(Int32Array::from(vec![value; num_rows]))
         }
-        (Literal::Integer(n), DataType::Int64) => Arc::new(Int64Array::from(vec![*n; num_rows])),
+        (Literal::Integer(n), DataType::Int64) => {
+            let value = i64::try_from(*n).map_err(|_| {
+                OmniError::manifest(format!("integer value {n} exceeds Int64 range"))
+            })?;
+            Arc::new(Int64Array::from(vec![value; num_rows]))
+        }
         (Literal::Integer(n), DataType::UInt32) => {
             let value = u32::try_from(*n).map_err(|_| {
                 OmniError::manifest(format!("integer value {n} exceeds UInt32 range"))
@@ -220,7 +225,15 @@ fn typed_list_literal_to_array(
             for _ in 0..num_rows {
                 for item in items {
                     match item {
-                        Literal::Integer(value) => builder.values().append_value(*value),
+                        Literal::Integer(value) => {
+                            let value = i64::try_from(*value).map_err(|_| {
+                                OmniError::manifest(format!(
+                                    "list value {} exceeds Int64 range",
+                                    value
+                                ))
+                            })?;
+                            builder.values().append_value(value);
+                        }
                         _ => builder.values().append_null(),
                     }
                 }
@@ -2082,21 +2095,19 @@ mod literal_narrowing_tests {
 
     #[test]
     fn scalar_narrowing_accepts_boundaries_and_rejects_wraparound() {
-        assert!(
-            literal_to_typed_array(&Literal::Integer(i32::MAX as i64), &DataType::Int32, 1).is_ok()
-        );
-        assert!(
-            literal_to_typed_array(&Literal::Integer(i32::MAX as i64 + 1), &DataType::Int32, 1,)
-                .is_err()
-        );
-        assert!(
-            literal_to_typed_array(&Literal::Integer(u32::MAX as i64), &DataType::UInt32, 1)
-                .is_ok()
-        );
-        assert!(
-            literal_to_typed_array(&Literal::Integer(u32::MAX as i64 + 1), &DataType::UInt32, 1,)
-                .is_err()
-        );
+        let int = |value: i128| Literal::Integer(value);
+        let int32_max = int(i32::MAX as i128);
+        let int32_over = int(i32::MAX as i128 + 1);
+        let uint32_max = int(u32::MAX as i128);
+        let uint32_over = int(u32::MAX as i128 + 1);
+        let uint64_max = int(u64::MAX as i128);
+        let uint64_over = int(u64::MAX as i128 + 1);
+        assert!(literal_to_typed_array(&int32_max, &DataType::Int32, 1).is_ok());
+        assert!(literal_to_typed_array(&int32_over, &DataType::Int32, 1).is_err());
+        assert!(literal_to_typed_array(&uint32_max, &DataType::UInt32, 1).is_ok());
+        assert!(literal_to_typed_array(&uint32_over, &DataType::UInt32, 1).is_err());
+        assert!(literal_to_typed_array(&uint64_max, &DataType::UInt64, 1).is_ok());
+        assert!(literal_to_typed_array(&uint64_over, &DataType::UInt64, 1).is_err());
         assert!(literal_to_typed_array(&Literal::Integer(-1), &DataType::UInt32, 1).is_err());
         assert!(literal_to_typed_array(&Literal::Integer(-1), &DataType::UInt64, 1).is_err());
     }

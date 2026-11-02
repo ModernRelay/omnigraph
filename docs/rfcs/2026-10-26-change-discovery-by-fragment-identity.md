@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - Ragnor Comerford
 created: 2026-10-26
-updated: 2026-10-29
+updated: 2026-10-31
 discussion: https://github.com/ModernRelay/omnigraph/pull/1171
 supersedes: []
 superseded_by: []
@@ -45,8 +45,8 @@ One Lance 13 fact bounds the rule: the stamp a commit writes is its read
 manifest's version plus one, not the detached version the commit receives, so
 two sibling first commits after a fork stamp a row they both update alike. Stamp
 equality therefore proves two copies to be one unchanged row only where the
-`from` side lies on the `to` side's first-parent chain, which the diff decides
-from lineage the `to`
+`from` side lies on the `to` side's first-parent chain with no merge commit
+after it, which the diff decides from lineage the `to`
 branch's coordinator already holds. A diff of two diverged heads takes the exact
 merge.
 
@@ -198,7 +198,8 @@ adds one rung:
    transaction is read and the existing `Upserts` or `Deletes` plan is built,
    as today.
 3. No adjacency proof, `change_lineage` not `off`, and `from` on `to`'s
-   first-parent chain: the row-identity plan below.
+   first-parent chain with no merge commit after it: the row-identity plan
+   below.
 4. Otherwise the exact ordered merge.
 
 ### The discovery rule
@@ -254,29 +255,61 @@ The completeness argument needs one lineage. Across a fork it fails: two
 sibling branches that each update one row in their first commit after the fork
 both stamp it with the fork's version plus one, so the pair looks shared and
 the update is lost (`changes::cross_branch_diff_detects_same_length_blob_update_between_sibling_branches`
-found this on the first implementation). The rule therefore applies only when
-`from` lies on `to`'s first-parent chain:
+found this on the first implementation).
+
+A first-parent chain is not one lineage either when it crosses a merge commit.
+A merge can take the merged branch's pin for a type whose target pin is still
+the merge base's (`classify_adopt`'s pointer switch), which in a fast forward
+is every type the merged branch changed; that pin's history read the target's
+pin only when the merged branch descends from it through first parents, and a
+merged branch that merged its target since the fork does not. Two sibling first
+commits that each inserted a row gave both rows one `_rowid` and one stamp,
+and the merged branch's catch-up merge re-inserted the target's row under a
+new `_rowid`, so pairing the target's version before the fast forward with the
+version after it paired the two inserts as one unchanged row and reported the
+target's own row as inserted
+(`graph_diff_across_a_fast_forward.gqt`,
+`changes::commit_changes_feed_and_diff_across_a_fast_forward_report_the_source_rows`).
+Every other commit stages its tables on its first parent's pins, so the rule
+applies only when `from` lies on `to`'s first-parent chain with no merge
+commit after it:
 
 - the branch form when its merge base is on the source head's first-parent
-  chain. A source that merged its target holds the base as the merge commit's
-  second parent, off that chain; two sibling first commits after the fork that
-  each inserted a row gave both rows one `_rowid` and one stamp, so the review
-  takes the exact merge there
-  (`issue_969_branch_review_after_a_merge_from_target.gqt`);
-- a two-point diff whose `to` names a branch whose chain holds `from`;
-- a commit page and a feed commit always, since their window is parent to
-  child.
+  chain with no merge commit above it. A source that merged its target holds
+  the base as the merge commit's second parent, off that chain; two sibling
+  first commits after the fork that each inserted a row gave both rows one
+  `_rowid` and one stamp, so the review takes the exact merge there
+  (`issue_969_branch_review_after_a_merge_from_target.gqt`), as it does when
+  a fast forward above the base gave the source a branch that merged it
+  (`branch_review_across_a_fast_forward_on_the_source.gqt`);
+- a two-point diff whose `to` names a branch whose chain holds `from` with no
+  merge commit after it;
+- a commit page and a feed commit unless the commit is a merge commit, since
+  their window is parent to child.
 
-Both diff forms decide it from lineage already held, with no commit listing.
-The branch form walks the source's captured commit graph, which computing the
-merge base loaded. The two-point form (`Omnigraph::diff_from_is_ancestor`)
-takes `to` resolved to `from` itself as an ancestor; otherwise the `to`
-branch's `GraphCoordinator` answers `first_parent_chain_holds`, from its head
-and buffered commits with no read, then a first-parent page walk down to
-`from`'s generation. The coordinator is the handle's own when `to` is its
-branch and the merge-authority cache's otherwise. A `to` spelled as a commit
-id, a `from` of unknown generation, or a commit of the chain below the
-buffered commits that `__history` no longer holds answers `false` and takes
+A type that an interval reaches through one recorded transaction keeps the
+adjacency path, whatever commit wrote it; only the pairing is restricted. A
+merge commit's other types, a three-way merge's chain of chunks among them,
+take the exact merge, which is what they took before this rule. Proving such a
+type's own lineage (its pin's `read_version` chain back to `from`'s pin) would
+restore the pairing there and is left to a later change.
+
+Both diff forms decide it from lineage already held, with no commit listing,
+and every page decides it for the two commits it opens: the first page for
+what its sides resolve to, a later page for what its token names. A later page
+never asks the sides' heads or merge base now, which may have moved past the
+token's commits: once the target fast-forwards to the source, the merge base
+now is the source head, while the token's window still crosses the source's
+merge commit. The walk starts at `to` and goes down first parents to `from`'s
+generation, stopping at the first merge commit; held and buffered commits cost
+no read. The branch form walks the source's captured commit graph, which
+computing the merge base loaded, and reads a token's `from` there when it is
+no longer the merge base. The two-point form
+(`Omnigraph::diff_descends_linearly`) takes `to` equal to `from` as an empty
+window; otherwise it walks in the `to` branch's `GraphCoordinator`, the
+handle's own when `to` is its branch and the merge-authority cache's
+otherwise. A `to` spelled as a commit id, a `from` of unknown generation, or a
+commit of the chain that `__history` no longer holds answers `false` and takes
 the exact merge, which needs no lineage.
 
 Drop the restriction at the Lance bump whose stamp is the commit's own version;
@@ -527,3 +560,14 @@ Follow-ups, each its own change:
   the `branch diff` statement read `change_lineage` from the process default
   and the request session; a chain commit `__history` no longer holds answers
   `false`; `off` skips the ancestry answer.
+- 2026-10-31: the restriction also excludes a window that crosses a merge
+  commit, and a merge commit's own page and feed block: a fast forward gave
+  the target the merged branch's pins, whose history never read the target's,
+  and the pairing reported the target's own row as inserted in place of the
+  merged branch's. A merge commit's types without an adjacency proof take the
+  exact merge until their lineage is proven per type.
+- 2026-11-01: a diff continuation decides the pairing for the commits its
+  token names, walked from the token's `to`, not from the sides' heads or
+  merge base now: a branch review's second page after the target
+  fast-forwarded to the source had found the source head as the merge base
+  and paired rows across the source's merge commit.
