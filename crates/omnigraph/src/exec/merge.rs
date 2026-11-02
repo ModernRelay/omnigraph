@@ -1538,18 +1538,18 @@ async fn compute_adopt_delta(
     let plan = match lineage {
         MergeLineage::Off => None,
         MergeLineage::On | MergeLineage::Verify => {
-            plan_lineage_merge(
+            Box::pin(plan_lineage_merge(
                 catalog,
                 base_snapshot,
                 source_snapshot,
                 base_snapshot,
                 table_key,
-            )
+            ))
             .await?
         }
     };
     let Some(plan) = plan else {
-        return compute_adopt_delta_with(
+        return Box::pin(compute_adopt_delta_with(
             target_db,
             table_key,
             catalog,
@@ -1560,11 +1560,11 @@ async fn compute_adopt_delta(
             external_preflight,
             write_budget,
             None,
-        )
+        ))
         .await;
     };
     if lineage == MergeLineage::On {
-        return compute_adopt_delta_with(
+        return Box::pin(compute_adopt_delta_with(
             target_db,
             table_key,
             catalog,
@@ -1575,11 +1575,11 @@ async fn compute_adopt_delta(
             external_preflight,
             write_budget,
             None,
-        )
+        ))
         .await;
     }
     let mut walk_log = Vec::new();
-    let walk = compute_adopt_delta_with(
+    let walk = Box::pin(compute_adopt_delta_with(
         target_db,
         table_key,
         catalog,
@@ -1590,10 +1590,10 @@ async fn compute_adopt_delta(
         external_preflight,
         write_budget,
         Some(&mut walk_log),
-    )
+    ))
     .await?;
     let mut lineage_log = Vec::new();
-    let _ = compute_adopt_delta_with(
+    let _ = Box::pin(compute_adopt_delta_with(
         target_db,
         table_key,
         catalog,
@@ -1604,7 +1604,7 @@ async fn compute_adopt_delta(
         external_preflight,
         write_budget,
         Some(&mut lineage_log),
-    )
+    ))
     .await?;
     if walk_log != lineage_log {
         let first_difference = walk_log
@@ -1772,9 +1772,7 @@ async fn compute_adopt_delta_with(
                 id_col,
             )
             .await?;
-            state
-                .classify(base, source, &materializer, external_preflight)
-                .await?;
+            Box::pin(state.classify(base, source, &materializer, external_preflight)).await?;
         }
         Some(plan) => {
             let base_fragments =
@@ -1801,9 +1799,7 @@ async fn compute_adopt_delta_with(
                     id_col,
                 )
                 .await?;
-                state
-                    .classify(base, source, &materializer, external_preflight)
-                    .await?;
+                Box::pin(state.classify(base, source, &materializer, external_preflight)).await?;
             }
         }
     }
