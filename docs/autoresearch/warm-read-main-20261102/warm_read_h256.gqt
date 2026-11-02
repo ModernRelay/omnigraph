@@ -1,0 +1,107 @@
+# issue: none
+# notes: warm read on main autoresearch instrument: 256 small update commits after seed.
+--- runner
+timeout_ms: 600000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person { name: String @key age: I32? }
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"p0","age":0}}
+{"type":"Person","data":{"name":"p1","age":1}}
+{"type":"Person","data":{"name":"p2","age":2}}
+{"type":"Person","data":{"name":"p3","age":3}}
+{"type":"Person","data":{"name":"p4","age":4}}
+{"type":"Person","data":{"name":"p5","age":5}}
+{"type":"Person","data":{"name":"p6","age":6}}
+{"type":"Person","data":{"name":"p7","age":7}}
+{"type":"Person","data":{"name":"p8","age":8}}
+{"type":"Person","data":{"name":"p9","age":9}}
+{"type":"Person","data":{"name":"p10","age":10}}
+{"type":"Person","data":{"name":"p11","age":11}}
+{"type":"Person","data":{"name":"p12","age":12}}
+{"type":"Person","data":{"name":"p13","age":13}}
+{"type":"Person","data":{"name":"p14","age":14}}
+{"type":"Person","data":{"name":"p15","age":15}}
+{"edge":"Knows","from":"p0","to":"p1","data":{}}
+{"edge":"Knows","from":"p1","to":"p2","data":{}}
+{"edge":"Knows","from":"p2","to":"p3","data":{}}
+{"edge":"Knows","from":"p3","to":"p4","data":{}}
+{"edge":"Knows","from":"p4","to":"p5","data":{}}
+{"edge":"Knows","from":"p5","to":"p6","data":{}}
+{"edge":"Knows","from":"p6","to":"p7","data":{}}
+{"edge":"Knows","from":"p7","to":"p8","data":{}}
+{"edge":"Knows","from":"p8","to":"p9","data":{}}
+{"edge":"Knows","from":"p9","to":"p10","data":{}}
+{"edge":"Knows","from":"p10","to":"p11","data":{}}
+{"edge":"Knows","from":"p11","to":"p12","data":{}}
+{"edge":"Knows","from":"p12","to":"p13","data":{}}
+{"edge":"Knows","from":"p13","to":"p14","data":{}}
+{"edge":"Knows","from":"p14","to":"p15","data":{}}
+{"edge":"Knows","from":"p15","to":"p0","data":{}}
+
+--- loop $cycle 0 128
+--- mutate
+query set_one() { update Person set { age: 1 } where name = "p9" }
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query set_zero() { update Person set { age: 0 } where name = "p9" }
+--- expect affected: nodes=1 edges=0
+
+--- endloop
+--- restart
+
+--- query
+query lookup() { match { $p: Person { name: "p3" } } return { $p.name, $p.age } }
+--- expect unordered
+{"p.name":"p3","p.age":3}
+--- expect shape
+p.name: String
+p.age: I32?
+
+--- query
+query hop1() { match { $p: Person { name: "p3" } $p knows $q } return { $q.name } }
+--- expect unordered
+{"q.name":"p4"}
+--- expect shape
+q.name: String
+
+--- query
+query lookup() { match { $p: Person { name: "p3" } } return { $p.name, $p.age } }
+--- expect unordered
+{"p.name":"p3","p.age":3}
+--- expect shape
+p.name: String
+p.age: I32?
+
+--- query
+query hop1() { match { $p: Person { name: "p3" } $p knows $q } return { $q.name } }
+--- expect unordered
+{"q.name":"p4"}
+--- expect shape
+q.name: String
+
+--- mutate
+query bump() { update Person set { age: 7 } where name = "p9" }
+--- expect affected: nodes=1 edges=0
+
+--- query
+query lookup() { match { $p: Person { name: "p3" } } return { $p.name, $p.age } }
+--- expect unordered
+{"p.name":"p3","p.age":3}
+--- expect shape
+p.name: String
+p.age: I32?
+
+--- query
+query hop1() { match { $p: Person { name: "p3" } $p knows $q } return { $q.name } }
+--- expect unordered
+{"q.name":"p4"}
+--- expect shape
+q.name: String
