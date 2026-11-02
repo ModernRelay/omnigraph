@@ -57,7 +57,7 @@ use lance_file::{version::LanceFileVersion, writer::FileWriterOptions};
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
 use lance_index::{IndexType, is_system_index};
 use lance_linalg::distance::MetricType;
-use lance_select::mask::RowAddrTreeMap;
+use lance_select::mask::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 use omnigraph_compiler::SystemColumns;
@@ -3328,6 +3328,70 @@ impl TableStore {
         Ok(Some(StagedWrite::with_commit_metadata(
             uncommitted.transaction,
             StagedCommitMetadata::affected_rows(uncommitted.affected_rows),
+            new_fragments,
+            removed_fragment_ids,
+        )))
+    }
+
+    /// Stage the delete of exactly the rows at `row_addrs`, captured by the
+    /// caller's own filtered scan of `ds` at this same version, without
+    /// scanning again. This is Lance's `DeleteBuilder` after its scan:
+    /// each fragment holding an address extends its deletion vector
+    /// (`FileFragment::extend_deletions`, which drops a fragment it empties),
+    /// and the result is the same uncommitted `Operation::Delete`, with the
+    /// addresses as its `affected_rows`. `predicate` is only the transaction's
+    /// recorded predicate text, as `DeleteBuilder` records it. An empty
+    /// address set is a no-op (`None`); an address outside `ds`'s fragments
+    /// fails closed.
+    pub async fn stage_delete_rows(
+        &self,
+        ds: &Dataset,
+        predicate: &Expr,
+        row_addrs: &RowAddrTreeMap,
+    ) -> Result<Option<StagedWrite>> {
+        let num_deleted_rows = row_addrs.len().unwrap_or(0);
+        if num_deleted_rows == 0 {
+            return Ok(None);
+        }
+        let mut updated_fragments = Vec::new();
+        let mut deleted_fragment_ids = Vec::new();
+        for (fragment_id, _) in row_addrs.iter() {
+            let bitmap = row_addrs.get_fragment_bitmap(*fragment_id).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "stage_delete_rows: fragment {fragment_id} carries no row offsets"
+                ))
+            })?;
+            let fragment = ds.get_fragment(*fragment_id as usize).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "stage_delete_rows: fragment {fragment_id} is not in version {}",
+                    ds.version().version
+                ))
+                .unpublished()
+            })?;
+            match fragment
+                .extend_deletions(bitmap.iter())
+                .await
+                .map_err(|error| OmniError::storage(error).unpublished())?
+            {
+                Some(updated) => updated_fragments.push(updated.metadata().clone()),
+                None => deleted_fragment_ids.push(u64::from(*fragment_id)),
+            }
+        }
+        let mut removed_fragment_ids = deleted_fragment_ids.clone();
+        removed_fragment_ids.extend(updated_fragments.iter().map(|f| f.id));
+        let new_fragments = updated_fragments.clone();
+        let transaction = Transaction::new(
+            ds.manifest.version,
+            Operation::Delete {
+                updated_fragments,
+                deleted_fragment_ids,
+                predicate: predicate.to_string(),
+            },
+            None,
+        );
+        Ok(Some(StagedWrite::with_commit_metadata(
+            transaction,
+            StagedCommitMetadata::affected_rows(Some(row_addrs.clone())),
             new_fragments,
             removed_fragment_ids,
         )))

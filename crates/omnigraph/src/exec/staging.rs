@@ -130,6 +130,12 @@ pub(crate) struct MutationStaging {
     /// rows: validation recounts the srcs a delete empties, and the staged
     /// delete records them on its transaction as the commit's change set.
     pub(crate) deleted_ids: HashMap<String, Vec<String>>,
+    /// Row addresses removed per table, captured by the same scans as
+    /// `deleted_ids`, at the table's pinned version: the staged delete
+    /// writes their deletion vectors without scanning the table again.
+    /// Every recorded delete predicate records its addresses, so their
+    /// union is exactly the rows the combined predicate selects.
+    pub(crate) deleted_row_addrs: HashMap<String, (u64, lance_select::mask::RowAddrTreeMap)>,
     pub(crate) deleted_id_budget: DeletedIdBudget,
     /// Strictest [`MutationOpKind`] seen per table within this query. Drives
     /// the op-kind-aware drift check in [`StagedMutation::commit_all`]: for
@@ -367,6 +373,30 @@ impl MutationStaging {
             .extend(ids);
     }
 
+    /// Record the row addresses, at table version `version`, of the rows a
+    /// delete op on `table_key` removes; see `deleted_row_addrs`. A second
+    /// version for one table is an internal contract failure (one pin per
+    /// table per query).
+    pub(crate) fn record_deleted_row_addrs(
+        &mut self,
+        table_key: &str,
+        version: u64,
+        addrs: lance_select::mask::RowAddrTreeMap,
+    ) -> Result<()> {
+        let entry = self
+            .deleted_row_addrs
+            .entry(table_key.to_string())
+            .or_insert_with(|| (version, lance_select::mask::RowAddrTreeMap::new()));
+        if entry.0 != version {
+            return Err(OmniError::manifest_internal(format!(
+                "delete row addresses for '{table_key}' captured at versions {} and {version}",
+                entry.0
+            )));
+        }
+        entry.1 |= addrs;
+        Ok(())
+    }
+
     /// Delete predicates already recorded for `table_key` by earlier delete
     /// statements in this query. Read before recording the current statement's
     /// predicate so its `affected_*` count can exclude rows a prior statement
@@ -493,6 +523,7 @@ impl MutationStaging {
             write_budget,
             delete_predicates,
             deleted_ids,
+            mut deleted_row_addrs,
             deleted_id_budget: _,
             op_kinds: _,
             overwrite_writers,
@@ -676,8 +707,17 @@ impl MutationStaging {
                 continue;
             };
             let removed_ids = deleted_ids.get(&table_key).cloned().unwrap_or_default();
-            if let Some(entry) =
-                stage_delete_table(db, table_key, combined, path, expected, removed_ids).await?
+            let row_addrs = deleted_row_addrs.remove(&table_key);
+            if let Some(entry) = stage_delete_table(
+                db,
+                table_key,
+                combined,
+                path,
+                expected,
+                removed_ids,
+                row_addrs,
+            )
+            .await?
             {
                 staged_entries.push(entry);
             }
@@ -967,11 +1007,24 @@ async fn stage_delete_table(
     path: StagedTablePath,
     expected: u64,
     deleted_ids: Vec<String>,
+    row_addrs: Option<(u64, lance_select::mask::RowAddrTreeMap)>,
 ) -> Result<Option<StagedTableEntry>> {
     let ds = db
         .open_pinned_for_write(&path.full_path, &path.entry)
         .await?;
-    match db.storage().stage_delete(&ds, predicate).await? {
+    // The delete ops captured the matched rows' addresses at the pin; stage
+    // their deletion vectors directly. Addresses from another version than
+    // the one reopened here would name other rows, so that case (and a
+    // predicate recorded without addresses) takes Lance's scanning delete.
+    let staged = match row_addrs {
+        Some((version, addrs)) if version == ds.version() => {
+            db.storage()
+                .stage_delete_rows(&ds, &predicate, &addrs)
+                .await?
+        }
+        _ => db.storage().stage_delete(&ds, predicate).await?,
+    };
+    match staged {
         Some(mut staged) => {
             staged
                 .record_deleted_ids(ds.dataset(), &deleted_ids)
