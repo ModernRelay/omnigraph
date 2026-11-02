@@ -288,11 +288,15 @@ gates for single-writer ownership.
   an exclusive pass on any handle of the process (schema apply, the
   system-column upgrade, open, refresh, settle, reload, `sync_branch`,
   branch create), and, because the gate is write-preferring, from the
-  moment one is queued. It also takes its
-  handle's coordinator lock, which a publish on that handle's bound branch
-  holds for the manifest compare-and-swap: a read and a write sharing one
-  handle and branch (for example, the server's requests on `main`) still
-  wait for each other there.
+  moment one is queued. It takes no lock on its handle's coordinator: the
+  installed state is an immutable value a read loads with one atomic
+  pointer read, and a publish or refresh on that handle's bound branch does
+  its storage round trips on a clone and installs the result with one
+  pointer swap, refused when the installed state already supersedes it
+  (`Omnigraph::install_coordinator`). A read and a write sharing one handle
+  and branch (for example, the server's requests on `main`) no longer wait
+  for each other; a read that starts while a publish is in flight binds the
+  installed state and sees the publish once it is installed.
 - Write preparation may overlap. Durable effects are ordered by the shared
   schema, branch, and sorted-table gates, then fenced again by persisted
   authority and Lance transaction identity.

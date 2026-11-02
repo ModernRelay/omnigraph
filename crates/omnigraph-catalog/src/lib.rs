@@ -907,6 +907,20 @@ pub struct ManifestIncarnation {
 }
 
 impl ManifestIncarnation {
+    /// Whether this incarnation and `other` belong to one branch lifetime.
+    pub fn same_lifetime(&self, other: &Self) -> bool {
+        self.branch_identifier == other.branch_identifier
+    }
+
+    /// Whether installing this incarnation over `installed` never moves the
+    /// handle backwards within one lifetime: a version at least as new (an
+    /// equal version may carry another image, the root replaced underneath
+    /// the handle). Lifetimes have no order; `Omnigraph::install_coordinator`
+    /// decides a lifetime change by the provenance of the clone instead.
+    pub fn supersedes(&self, installed: &Self) -> bool {
+        self.same_lifetime(installed) && self.version >= installed.version
+    }
+
     pub fn matches(&self, held: &Self) -> bool {
         if self.version != held.version || self.branch_identifier != held.branch_identifier {
             return false;
