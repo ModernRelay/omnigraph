@@ -132,6 +132,19 @@ usable ID index is absent. A proof or budget miss falls back to the ordered
 walk. `off` uses that walk directly; `verify` executes both classifiers and
 compares their results.
 
+The same setting selects how an adopt (a table the target left at the base
+while the source changed it, so a fast forward too) computes the validation
+delta a proven pure-insert history does not discharge. At `on` the plan's
+base-to-source candidates are read from the base and the source by the same
+`id IN (...)` filter, each end scanned only over its scope
+(`LineageSideScope`): the fragments that end lacks, rewrote or deleted rows
+from relative to the other. A row outside the scope is live at the same
+position on both ends, and the exact-id primary key makes a live id unique
+within a version, so every candidate's live rows lie inside the scope. The
+delta then costs the changed fragments, not the table. `off` and a gate miss
+walk both ends in full; `verify` runs both and fails the merge on any
+difference in the ids it deletes, inserts or updates.
+
 The fallback is an ordered three-way cursor merge. Each cursor streams one
 snapshot's rows in `id` order in two phases so no payload column ever reaches
 a SortExec input. The change feed and export's `id` order walk tables through
@@ -170,7 +183,7 @@ versions, and `C` the bounded publish chunks.
 |---|---|---|
 | Pointer adoption | Metadata-only when no validation delta is needed; otherwise the delta may require base/source ordered scans | Manifest-pointer change; no table fork or row copy |
 | Proven insertion replay | Walk `K <= 1,024` transaction records and scan only the certified source interval | `C <= 1,024` join-free fenced inserts; no target ID preflight or MergeInsert join |
-| Adopt with delta | At least two full ordered scans, base and source | New rows use preflighted fenced inserts; changed rows use update-only `KnownPresentUpdate`; deletes are chunked |
+| Adopt with delta | Lineage candidate discovery and reads scoped to the changed fragments when proven; otherwise at least two full ordered scans, base and source | New rows use preflighted fenced inserts; changed rows use update-only `KnownPresentUpdate`; deletes are chunked |
 | General three-way | Lineage candidate discovery and filtered reads when proven; otherwise at least three full ordered scans | New rows use preflighted fenced inserts; existing rows use `KnownPresentUpdate`; deletes are chunked |
 
 Strict insertion keeps Lance's index-disabled, filter-bearing path so the
@@ -258,7 +271,7 @@ below correspond to
 | Route | Ordered cursors | Fenced inserts | Known-present updates | MergeInsert upserts | Strict-insert preflights |
 |---|---:|---:|---:|---:|---:|
 | Proven insertion replay | `0` | `C` | `0` | `0` | `0` |
-| Adopt with delta | at least `2` | insert chunks | changed-row chunks | `0` | insert chunks |
+| Adopt with delta | `0` for lineage candidates; at least `2` for ordered fallback | insert chunks | changed-row chunks | `0` | insert chunks |
 | General three-way | `0` for lineage candidates; at least `3` for ordered fallback | insert chunks | updated-row chunks | `0` | insert chunks |
 
 Blob descriptor selection can add cursor passes, so the fallback counts are
