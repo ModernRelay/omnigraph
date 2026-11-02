@@ -242,6 +242,10 @@ latency on S3, but I have not measured it.
   about schema design, Blob values and cluster operations, which don't bear
   on engine read cost. For engine work, the repository's invariants, Lance
   and testing guides were what mattered.
+- **Where to push.** The brief says to push the branch, but
+  `ModernRelay/omnigraph` has a `fork-only` ruleset that refuses every branch
+  creation, with no bypass. The branch is on Ragnor's fork,
+  `ragnorc/omnigraph`. Name the fork in the brief.
 - **Determinism.** The counts were deterministic run to run: two baseline
   runs of each instrument were identical, and the golden's built-in replay
   check passed.
