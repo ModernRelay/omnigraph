@@ -2053,11 +2053,14 @@ impl ManifestCoordinator {
     }
 
     /// Install the latest version of the branch's `__manifest`: its table
-    /// state and its head commit's record, from one scan of that version.
-    /// Every fallible read completes before a field is replaced, so a failure
-    /// leaves the previous view coherent. The scan leaves the schema contract
-    /// content unread, except for a branch recreated since the held version:
-    /// that is a new lifetime, captured with its contract as an open captures it.
+    /// state, its head commit's record and its schema contract, from one
+    /// scan of that version, the scan an open takes. Every fallible read
+    /// completes before a field is replaced, so a failure leaves the previous
+    /// view coherent. The contract is captured with the rows because the
+    /// read that follows a refresh validates it: without it, that read opened
+    /// and scanned the same version a second time. A contract content error
+    /// stays deferred to [`Self::read_schema_contract`], as on open.
+    /// A branch recreated since the held version is a new lifetime.
     /// A root replaced at the held version is one too, and it resets the history
     /// cache in place, for every handle and coordinator sharing it: no commit
     /// or `__history` object held from the replaced root describes the new one.
@@ -2096,10 +2099,7 @@ impl ManifestCoordinator {
             );
             replaced_root = true;
         }
-        let rows = match recreated || replaced_root {
-            true => state::read_manifest_rows_with_contract(&dataset).await?.0,
-            false => state::read_manifest_rows_projected(&dataset).await?,
-        };
+        let rows = state::read_manifest_rows_with_contract(&dataset).await?.0;
         let known_state = rows.state(dataset.version().version, native_branch.as_deref())?;
         fail(&READ_REFRESH_POST_STATE_PRE_LINEAGE)?;
         self.dataset = dataset;
