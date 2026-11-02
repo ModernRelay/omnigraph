@@ -16,19 +16,35 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
 
+/// One logged call: (label, verb, object path).
+pub type LoggedCall = (String, &'static str, String);
+
 pub struct CostLedger {
     label: Mutex<String>,
     /// (label, verb) -> (calls, bytes).
     #[allow(clippy::type_complexity)]
     rows: Mutex<BTreeMap<(String, &'static str), (u64, u64)>>,
+    /// (label, verb, object path) per call, kept only by [`arm_with_paths`]:
+    /// an instrument's attribution of each call to its dataset and
+    /// directory. Never part of the golden.
+    paths: Option<Mutex<Vec<LoggedCall>>>,
 }
 
 impl CostLedger {
-    fn new() -> Arc<Self> {
+    fn new(paths: bool) -> Arc<Self> {
         Arc::new(Self {
             label: Mutex::new("_setup".to_string()),
             rows: Mutex::new(BTreeMap::new()),
+            paths: paths.then(|| Mutex::new(Vec::new())),
         })
+    }
+    /// Every call's (label, verb, path), in call order; empty unless the
+    /// ledger was armed by [`arm_with_paths`].
+    pub fn path_log(&self) -> Vec<LoggedCall> {
+        self.paths
+            .as_ref()
+            .map(|paths| paths.lock().unwrap().clone())
+            .unwrap_or_default()
     }
     /// The GOLDEN surface: call counts only — measured to be exactly
     /// deterministic. Byte totals are excluded because Lance-internal
@@ -62,7 +78,14 @@ static LEDGER: RwLock<Option<Arc<CostLedger>>> = RwLock::new(None);
 
 /// Arm a fresh ledger (the instrument holds the Arc; disarm when done).
 pub fn arm() -> Arc<CostLedger> {
-    let ledger = CostLedger::new();
+    let ledger = CostLedger::new(false);
+    *LEDGER.write().unwrap() = Some(ledger.clone());
+    ledger
+}
+
+/// [`arm`], also keeping each call's object path ([`CostLedger::path_log`]).
+pub fn arm_with_paths() -> Arc<CostLedger> {
+    let ledger = CostLedger::new(true);
     *LEDGER.write().unwrap() = Some(ledger.clone());
     ledger
 }
@@ -97,10 +120,16 @@ pub fn debug_head<T: std::fmt::Debug>(v: &T) -> String {
     head.to_string()
 }
 
-/// Tally one storage action under the current label.
-pub(crate) fn tally(verb: &'static str, bytes: u64) {
+/// Tally one storage action on the object at `path` under the current label.
+pub(crate) fn tally_at(verb: &'static str, bytes: u64, path: &str) {
     if let Some(ledger) = LEDGER.read().unwrap().as_ref() {
         let label = ledger.label.lock().unwrap().clone();
+        if let Some(paths) = &ledger.paths {
+            paths
+                .lock()
+                .unwrap()
+                .push((label.clone(), verb, path.to_string()));
+        }
         let mut rows = ledger.rows.lock().unwrap();
         let entry = rows.entry((label, verb)).or_insert((0, 0));
         entry.0 += 1;
@@ -138,18 +167,23 @@ impl CostStorage {
 impl omnigraph::storage::StorageAdapter for CostStorage {
     async fn read_text(&self, uri: &str) -> omnigraph::error::Result<String> {
         let out = self.inner.read_text(uri).await;
-        tally("a.get", out.as_ref().map(|s| s.len() as u64).unwrap_or(0));
+        tally_at(
+            "a.get",
+            out.as_ref().map(|s| s.len() as u64).unwrap_or(0),
+            uri,
+        );
         out
     }
     async fn read_text_if_exists(&self, uri: &str) -> omnigraph::error::Result<Option<String>> {
         let out = self.inner.read_text_if_exists(uri).await;
-        tally(
+        tally_at(
             "a.get",
             out.as_ref()
                 .ok()
                 .and_then(|o| o.as_ref())
                 .map(|s| s.len() as u64)
                 .unwrap_or(0),
+            uri,
         );
         out
     }
@@ -159,13 +193,14 @@ impl omnigraph::storage::StorageAdapter for CostStorage {
         max_bytes: u64,
     ) -> omnigraph::error::Result<Option<String>> {
         let out = self.inner.read_text_if_exists_bounded(uri, max_bytes).await;
-        tally(
+        tally_at(
             "a.get",
             out.as_ref()
                 .ok()
                 .and_then(|o| o.as_ref())
                 .map(|s| s.len() as u64)
                 .unwrap_or(0),
+            uri,
         );
         out
     }
@@ -178,22 +213,23 @@ impl omnigraph::storage::StorageAdapter for CostStorage {
             .inner
             .read_bytes_if_exists_bounded(uri, max_bytes)
             .await;
-        tally(
+        tally_at(
             "a.get",
             out.as_ref()
                 .ok()
                 .and_then(|o| o.as_ref())
                 .map(|b| b.len() as u64)
                 .unwrap_or(0),
+            uri,
         );
         out
     }
     async fn write_text(&self, uri: &str, contents: &str) -> omnigraph::error::Result<()> {
-        tally("a.put", contents.len() as u64);
+        tally_at("a.put", contents.len() as u64, uri);
         self.inner.write_text(uri, contents).await
     }
     async fn write_bytes(&self, uri: &str, contents: &[u8]) -> omnigraph::error::Result<()> {
-        tally("a.put", contents.len() as u64);
+        tally_at("a.put", contents.len() as u64, uri);
         self.inner.write_bytes(uri, contents).await
     }
     async fn write_text_if_absent(
@@ -201,23 +237,23 @@ impl omnigraph::storage::StorageAdapter for CostStorage {
         uri: &str,
         contents: &str,
     ) -> omnigraph::error::Result<bool> {
-        tally("a.put_if_absent", contents.len() as u64);
+        tally_at("a.put_if_absent", contents.len() as u64, uri);
         self.inner.write_text_if_absent(uri, contents).await
     }
     async fn exists(&self, uri: &str) -> omnigraph::error::Result<bool> {
-        tally("a.exists", 0);
+        tally_at("a.exists", 0, uri);
         self.inner.exists(uri).await
     }
     async fn rename_text(&self, from_uri: &str, to_uri: &str) -> omnigraph::error::Result<()> {
-        tally("a.rename", 0);
+        tally_at("a.rename", 0, from_uri);
         self.inner.rename_text(from_uri, to_uri).await
     }
     async fn delete(&self, uri: &str) -> omnigraph::error::Result<()> {
-        tally("a.delete", 0);
+        tally_at("a.delete", 0, uri);
         self.inner.delete(uri).await
     }
     async fn list_dir(&self, dir_uri: &str) -> omnigraph::error::Result<Vec<String>> {
-        tally("a.list", 0);
+        tally_at("a.list", 0, dir_uri);
         self.inner.list_dir(dir_uri).await
     }
     async fn list_dir_bounded(
@@ -226,16 +262,17 @@ impl omnigraph::storage::StorageAdapter for CostStorage {
         matching_suffix: &str,
         bounds: omnigraph::storage::ListDirBounds,
     ) -> omnigraph::error::Result<Vec<String>> {
-        tally("a.list", 0);
+        tally_at("a.list", 0, dir_uri);
         self.inner
             .list_dir_bounded(dir_uri, matching_suffix, bounds)
             .await
     }
     async fn read_text_versioned(&self, uri: &str) -> omnigraph::error::Result<(String, String)> {
         let out = self.inner.read_text_versioned(uri).await;
-        tally(
+        tally_at(
             "a.get",
             out.as_ref().map(|(s, _)| s.len() as u64).unwrap_or(0),
+            uri,
         );
         out
     }
@@ -245,13 +282,13 @@ impl omnigraph::storage::StorageAdapter for CostStorage {
         contents: &str,
         expected_version: &str,
     ) -> omnigraph::error::Result<Option<String>> {
-        tally("a.cas", contents.len() as u64);
+        tally_at("a.cas", contents.len() as u64, uri);
         self.inner
             .write_text_if_match(uri, contents, expected_version)
             .await
     }
     async fn delete_prefix(&self, prefix_uri: &str) -> omnigraph::error::Result<()> {
-        tally("a.delete_prefix", 0);
+        tally_at("a.delete_prefix", 0, prefix_uri);
         self.inner.delete_prefix(prefix_uri).await
     }
 }
