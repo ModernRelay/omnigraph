@@ -923,8 +923,8 @@ pub enum PipelineShape {
 }
 
 /// Whether a validation judges every row as it passes, so its operator
-/// streams: a value, unique or cardinality check reads only what the sweep
-/// extracted, a swept endpoint check probes each row against sets built before
+/// streams: a value, unique, cardinality or source cardinality check reads
+/// only what the sweep extracted, a swept endpoint check probes each row against sets built before
 /// the drain. A judged endpoint check, a retained-edge check or a removal scan
 /// reads the whole delta after the drain and makes the operator a breaker.
 pub fn validate_streams(checks: &[ValidateSpec], removal: ValidateRemoval) -> bool {
@@ -933,7 +933,8 @@ pub fn validate_streams(checks: &[ValidateSpec], removal: ValidateRemoval) -> bo
         && checks.iter().all(|spec| match &spec.check {
             ValidateCheck::Value { .. }
             | ValidateCheck::Unique { .. }
-            | ValidateCheck::Cardinality { .. } => true,
+            | ValidateCheck::Cardinality { .. }
+            | ValidateCheck::SourceCardinality { .. } => true,
             ValidateCheck::EdgeRi { .. } => spec.probe == Some(crate::cost::EndpointProbe::Swept),
             ValidateCheck::RetainedEdges { .. } => false,
         })

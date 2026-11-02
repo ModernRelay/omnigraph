@@ -432,7 +432,7 @@ pub struct AppState {
     bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
     data_token_trust: Option<Arc<data_tokens::DataTokenTrust>>,
     oidc_identity_trust: Option<Arc<oidc_identity::OidcIdentityTrust>>,
-    /// MCP boot settings: which opt-in tools `/mcp` lists and admits.
+    /// MCP boot settings: the extra `Host` values `/mcp` admits.
     mcp: Arc<McpSettings>,
     /// Bounded process-wide ownership for queued served-export bytes. The
     /// response body and detached producer jointly retain each reservation.

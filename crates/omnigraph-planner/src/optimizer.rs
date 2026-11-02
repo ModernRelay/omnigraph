@@ -3847,10 +3847,17 @@ impl Lowering<'_> {
             consulted_rows: node.as_ref().and_then(|node| node.row_count),
             index_coverage,
         };
-        let access = if overwrite {
-            choose_validate_access(&spec.check, inputs)
-        } else {
-            ValidateAccess::Probe
+        let access = match &spec.check {
+            // An overwrite replaces the table, so each source of its prior
+            // image keeps only its delta edges: under a minimum the check
+            // scans those sources for one the delta leaves without an edge.
+            omnigraph_compiler::ir::ValidateCheck::Cardinality { min, .. }
+                if overwrite && *min > 0 =>
+            {
+                ValidateAccess::Scan
+            }
+            _ if overwrite => choose_validate_access(&spec.check, inputs),
+            _ => ValidateAccess::Probe,
         };
         let costs = inputs.costs(&spec.check);
         self.access_path = true;

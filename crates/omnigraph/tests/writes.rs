@@ -3502,8 +3502,8 @@ query cascade_then_explicit($name: String, $other: String) {
 /// route through `enforce_cardinality_bounds` which checks both bounds.
 ///
 /// Build a custom schema with `Knows: Person -> Person @card(2..*)`.
-/// Inserting a single Knows edge violates min=2. The mutation path must
-/// reject.
+/// A new person inserted with a single Knows edge violates min=2. The
+/// mutation path must reject.
 #[tokio::test]
 async fn mutation_insert_edge_enforces_min_cardinality() {
     use omnigraph::loader::LoadMode;
@@ -3515,8 +3515,9 @@ node Person {
 edge Knows: Person -> Person @card(2..)
 "#;
     const MIN_CARD_QUERY: &str = r#"
-query add_friend($from: String, $to: String) {
-    insert Knows { from: $from, to: $to }
+query add_person($name: String, $friend: String) {
+    insert Person { name: $name }
+    insert Knows { from: $name, to: $friend }
 }
 "#;
 
@@ -3526,16 +3527,23 @@ query add_friend($from: String, $to: String) {
 
     let seed = r#"{"type": "Person", "data": {"name": "Alice"}}
 {"type": "Person", "data": {"name": "Bob"}}
+{"type": "Person", "data": {"name": "Carol"}}
+{"edge": "Knows", "from": "Alice", "to": "Bob", "data": {}}
+{"edge": "Knows", "from": "Alice", "to": "Carol", "data": {}}
+{"edge": "Knows", "from": "Bob", "to": "Alice", "data": {}}
+{"edge": "Knows", "from": "Bob", "to": "Carol", "data": {}}
+{"edge": "Knows", "from": "Carol", "to": "Alice", "data": {}}
+{"edge": "Knows", "from": "Carol", "to": "Bob", "data": {}}
 "#;
     db.load_jsonl(seed, LoadMode::Overwrite).await.unwrap();
 
-    // Single insert: count=1 < min=2 → reject with clear message.
+    // Dave with a single edge: count=1 < min=2 → reject with clear message.
     let err = db
         .mutate(
             "main",
             MIN_CARD_QUERY,
-            "add_friend",
-            &params(&[("$from", "Alice"), ("$to", "Bob")]),
+            "add_person",
+            &params(&[("$name", "Dave"), ("$friend", "Alice")]),
         )
         .await
         .expect_err("min cardinality must reject the engine path");

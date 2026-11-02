@@ -20,9 +20,7 @@ use omnigraph_planner::{
 
 use crate::fixture_bounds::BOUNDS;
 
-fn operation(target: LoadTarget, mode: LoadStmtMode, source_bytes: u64) -> Operation {
-    let schema = parse_schema(
-        r#"
+const PERSON_KNOWS: &str = r#"
 node Person {
     id: String @key
     email: String @unique
@@ -30,9 +28,19 @@ node Person {
 edge Knows: Person -> Person {
     w: I64
 }
-"#,
-    )
-    .expect("schema parses");
+"#;
+
+fn operation(target: LoadTarget, mode: LoadStmtMode, source_bytes: u64) -> Operation {
+    operation_with(PERSON_KNOWS, target, mode, source_bytes)
+}
+
+fn operation_with(
+    schema: &str,
+    target: LoadTarget,
+    mode: LoadStmtMode,
+    source_bytes: u64,
+) -> Operation {
+    let schema = parse_schema(schema).expect("schema parses");
     let catalog = build_catalog(&schema).expect("catalog builds");
     let stmt = LoadStmt {
         source: "s3://bucket/people.csv".to_string(),
@@ -429,6 +437,52 @@ fn source_partitions_are_the_slices_capped_by_the_load_workers() {
             "{source_bytes} bytes"
         );
     }
+}
+
+/// Under a non-zero `@card` minimum an edge overwrite's cardinality check
+/// declares a scan: the replaced table's sources are read for one the new
+/// edges leave without an edge, and the judge refuses a plan without it.
+/// A maximum alone keeps the probe. A node load of the edge's source type
+/// carries `source_cardinality`, a probe of the committed edge table.
+#[test]
+fn card_minimum_declares_the_replaced_source_scan_and_the_source_count() {
+    let plan_of = |schema: &str, target: LoadTarget| {
+        let op = operation_with(schema, target, LoadStmtMode::Overwrite, 4096);
+        let Decision::Engine { plan, .. } = route(&op, &source(), RouteOverride::Registry, &BOUNDS)
+        else {
+            panic!("an overwrite load routes to the engine");
+        };
+        accesses(&plan)
+    };
+    let minimum = PERSON_KNOWS.replace(
+        "edge Knows: Person -> Person {",
+        "edge Knows: Person -> Person @card(1..) {",
+    );
+    let maximum = PERSON_KNOWS.replace(
+        "edge Knows: Person -> Person {",
+        "edge Knows: Person -> Person @card(0..2) {",
+    );
+
+    let edge = plan_of(&minimum, LoadTarget::Edge("Knows".into()));
+    assert!(
+        edge.contains(&("cardinality".to_string(), ValidateAccess::Scan)),
+        "{edge:?}"
+    );
+    let edge = plan_of(&maximum, LoadTarget::Edge("Knows".into()));
+    assert!(
+        edge.contains(&("cardinality".to_string(), ValidateAccess::Probe)),
+        "{edge:?}"
+    );
+    let node = plan_of(&minimum, LoadTarget::Node("Person".into()));
+    assert!(
+        node.contains(&("source_cardinality".to_string(), ValidateAccess::Probe)),
+        "{node:?}"
+    );
+    let node = plan_of(&maximum, LoadTarget::Node("Person".into()));
+    assert!(
+        !node.iter().any(|(check, _)| check == "source_cardinality"),
+        "{node:?}"
+    );
 }
 
 #[test]

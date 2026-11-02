@@ -24,8 +24,9 @@ use super::promotion::{open_at, table_location};
 
 decide_seam! {
     /// Inside the collector's read of one live branch's `__manifest`, after
-    /// its version history and before its registration rows; both come from
-    /// one open, so a publication landing here is invisible to both.
+    /// its version listing and before the commit times and registration rows
+    /// it reads; all come from one open, so a publication landing here is
+    /// invisible to every one of them.
     pub static CLEANUP_COLLECTOR_MID_BRANCH_READ = ("cleanup.collector_mid_branch_read", Unreachable, [Fail]);
 }
 
@@ -70,6 +71,11 @@ pub struct CollectorCost {
     /// `__manifest` reads: one per live branch at HEAD plus one per retained
     /// version below HEAD.
     pub manifest_snapshots: u64,
+    /// `__manifest` versions read for their commit time: under a cutoff,
+    /// each live branch's versions the newest-N / HEAD / base rule does not
+    /// already retain; none without one. The version numbers come from the
+    /// `_versions/` listing, which reads no manifest.
+    pub manifest_time_reads: u64,
     /// HEAD reads that prove the captured branch snapshots coexisted.
     pub manifest_rechecks: u64,
     /// Listings: per table location its `_versions/` once, then its objects
@@ -711,41 +717,66 @@ fn incarnation_key(identifier: &lance::dataset::refs::BranchIdentifier) -> Resul
     })
 }
 
-/// The `__manifest` versions `keep` and `cutoff` retain: the newest-N /
-/// newer-than rule of Lance's `cleanup_old_versions`, applied to graph commits
-/// (`__manifest` versions) per branch rather than to a table's Lance versions.
-/// HEAD is always among them and, with
-/// `keep_base` (a graph branch, deleting), its oldest: the fork-point merge base.
-fn retained_versions(
-    versions: &[lance::dataset::Version],
+/// The `__manifest` versions of one live branch that `keep` and `cutoff`
+/// retain, and the ones they prune, both ascending: the newest-N /
+/// newer-than rule of Lance's `cleanup_old_versions`, applied to graph
+/// commits (`__manifest` versions) per branch rather than to a table's Lance
+/// versions. HEAD is always among them and, with `keep_base` (a graph branch,
+/// deleting), its oldest: the fork-point merge base.
+///
+/// Every policy takes the version numbers from the `_versions/` listing,
+/// which reads no manifest (Lance's `retain_n_versions` does the same,
+/// lance#9019). A commit time is read only where it decides: for the
+/// versions the newest-N / HEAD / base rule leaves undecided, and only under
+/// a cutoff. Manifest times are not monotonic in the version (each writer
+/// stamps its own clock), so every undecided version is read, as many at
+/// once as the store's I/O parallelism allows.
+async fn retained_versions(
+    opened: &CollectorBranch,
     keep: Option<u32>,
     cutoff: Option<chrono::DateTime<chrono::Utc>>,
     keep_base: bool,
-) -> (Vec<u64>, Vec<u64>) {
-    let mut sorted: Vec<&lance::dataset::Version> = versions.iter().collect();
-    sorted.sort_by_key(|version| version.version);
-    let Some(head) = sorted.last().map(|version| version.version) else {
-        return (Vec::new(), Vec::new());
+    cost: &mut CollectorCost,
+) -> Result<(Vec<u64>, Vec<u64>)> {
+    let versions = opened.version_numbers().await?;
+    fail(&CLEANUP_COLLECTOR_MID_BRANCH_READ)?;
+    let (mut retained, undecided) = retained_by_position(&versions, keep, keep_base);
+    let Some(cutoff) = cutoff else {
+        return Ok((retained, undecided));
     };
-    let base = sorted.first().map(|version| version.version);
-    let floor = keep.map(|keep| {
-        let retain = (keep as usize).max(1);
-        sorted[sorted.len().saturating_sub(retain)].version
-    });
-    let mut retained = Vec::new();
+    cost.manifest_time_reads += undecided.len() as u64;
     let mut would_prune = Vec::new();
-    for version in sorted {
-        let kept = version.version == head
-            || (keep_base && Some(version.version) == base)
-            || floor.is_some_and(|floor| version.version >= floor)
-            || cutoff.is_some_and(|cutoff| version.timestamp >= cutoff);
-        if kept {
-            retained.push(version.version);
+    let read = opened.read_versions(&undecided).await?;
+    for (listed, manifest) in undecided.into_iter().zip(read) {
+        if manifest.timestamp >= cutoff {
+            retained.push(listed);
         } else {
-            would_prune.push(version.version);
+            would_prune.push(listed);
         }
     }
-    (retained, would_prune)
+    retained.sort_unstable();
+    Ok((retained, would_prune))
+}
+
+/// The part of the retention rule that version numbers decide: HEAD, the
+/// newest `keep` and, with `keep_base`, the oldest are retained; the rest,
+/// ascending, are left to the cutoff, and pruned without one.
+fn retained_by_position(
+    versions: &[u64],
+    keep: Option<u32>,
+    keep_base: bool,
+) -> (Vec<u64>, Vec<u64>) {
+    let mut sorted = versions.to_vec();
+    sorted.sort_unstable();
+    let (Some(&base), Some(&head)) = (sorted.first(), sorted.last()) else {
+        return (Vec::new(), Vec::new());
+    };
+    let floor = keep.map(|keep| sorted[sorted.len().saturating_sub((keep as usize).max(1))]);
+    sorted.into_iter().partition(|&version| {
+        version == head
+            || (keep_base && version == base)
+            || floor.is_some_and(|floor| version >= floor)
+    })
 }
 
 /// Per table location, the staged pins as `(staged version, linear twin)`
@@ -1018,10 +1049,14 @@ pub(crate) async fn plan_collection(
                 .insert(incarnation.to_string());
         }
         let head_version = opened.head_version();
-        let versions = opened.versions().await?;
-        fail(&CLEANUP_COLLECTOR_MID_BRANCH_READ)?;
-        let (retained, would_prune) =
-            retained_versions(&versions, options.keep_versions, cutoff, branch.is_some());
+        let (retained, would_prune) = retained_versions(
+            &opened,
+            options.keep_versions,
+            cutoff,
+            branch.is_some(),
+            &mut report.cost,
+        )
+        .await?;
         for entry in opened.rows().await? {
             let full_path = format!("{}/{}", db.root_uri(), entry.dataset_path);
             let location = table_location(&full_path, entry.native_dataset_branch.as_deref());
@@ -3203,5 +3238,47 @@ mod unattached_release_order_tests {
         let cyclic = vec![record("c_x", "x", "y", "c"), record("c_y", "y", "x", "c")];
         assert_eq!(unattached_release_order(&cyclic, &[]).len(), 2);
         assert!(unattached_release_order(&cyclic, &[record("c_kept", "z", "x", "c")]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::retained_by_position;
+
+    /// HEAD always; the newest `keep` (at least one); the oldest only for a
+    /// graph branch; everything else is left to the cutoff, ascending, and
+    /// the listing's order does not matter.
+    #[test]
+    fn version_numbers_decide_head_newest_and_base() {
+        let listed = [4, 1, 5, 2, 3];
+        assert_eq!(
+            retained_by_position(&[], Some(2), true),
+            (Vec::new(), Vec::new())
+        );
+        assert_eq!(
+            retained_by_position(&listed, None, false),
+            (vec![5], vec![1, 2, 3, 4])
+        );
+        assert_eq!(
+            retained_by_position(&listed, Some(2), false),
+            (vec![4, 5], vec![1, 2, 3])
+        );
+        assert_eq!(
+            retained_by_position(&listed, Some(0), false),
+            (vec![5], vec![1, 2, 3, 4]),
+            "a zero keep still keeps HEAD"
+        );
+        assert_eq!(
+            retained_by_position(&listed, Some(9), false),
+            (vec![1, 2, 3, 4, 5], Vec::new())
+        );
+        assert_eq!(
+            retained_by_position(&listed, Some(2), true),
+            (vec![1, 4, 5], vec![2, 3])
+        );
+        assert_eq!(
+            retained_by_position(&[7], None, true),
+            (vec![7], Vec::new())
+        );
     }
 }

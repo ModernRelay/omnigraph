@@ -816,10 +816,11 @@ fn admit_validation(
 ) -> DfResult<()> {
     let sc = judge.catalog.system_columns;
     let replacement = judge.mode == LoadMode::Overwrite;
-    let needs_ids = judge
-        .checks
-        .iter()
-        .any(|spec| matches!(spec.check, ValidateCheck::Unique { .. }) && spec.consults.is_some());
+    let needs_ids = judge.checks.iter().any(|spec| match spec.check {
+        ValidateCheck::Unique { .. } => spec.consults.is_some(),
+        ValidateCheck::SourceCardinality { .. } => true,
+        _ => false,
+    });
     for batch in batches {
         let rows = batch.num_rows();
         let column = |name: &str| {
@@ -934,6 +935,20 @@ fn admit_validation(
                     .saturating_mul(2)
                     .saturating_add(src_bytes.saturating_mul(3)),
             )?;
+        }
+        if judge
+            .checks
+            .iter()
+            .any(|spec| matches!(spec.check, ValidateCheck::SourceCardinality { .. }))
+        {
+            // The affected set (a copy of the written ids), its sorted probe
+            // keys, one chunk of literals at most, and one committed count
+            // per written node: the probe streams the edges and keeps none.
+            memory.entries::<String>(rows)?;
+            memory.entries::<&String>(rows)?;
+            memory.entries::<Expr>(rows)?;
+            memory.entries::<(String, u32)>(rows)?;
+            memory.string(id_bytes.saturating_mul(3))?;
         }
     }
     Ok(())

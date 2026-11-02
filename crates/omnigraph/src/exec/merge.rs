@@ -3339,29 +3339,39 @@ fn proven_fast_forward_needs_no_validation(
 ) -> bool {
     !candidates.is_empty()
         && candidates.iter().all(|(table_key, candidate)| {
-            if !matches!(
+            matches!(
                 candidate,
                 CandidateTableState::AdoptPureInserts(_)
                     | CandidateTableState::AdoptSourceState {
                         validation_delta: Some(AdoptValidation::PureInserts(_))
                     }
-            ) {
-                return false;
-            }
-            let Some(type_name) = table_key.strip_prefix("node:") else {
-                return false;
-            };
-            let Some(node_type) = catalog.node_types.get(type_name) else {
-                return false;
-            };
-            node_type.range_constraints.is_empty()
-                && node_type.check_constraints.is_empty()
-                && node_type.unique_constraints.is_empty()
-                && node_type
-                    .properties
-                    .values()
-                    .all(|property| property.enum_values.is_none())
+            ) && table_key
+                .strip_prefix("node:")
+                .is_some_and(|type_name| node_inserts_need_no_validation(catalog, type_name))
         })
+}
+
+/// Whether new rows of `type_name` alone can break no constraint: no value,
+/// enum or non-key uniqueness constraint, and no edge type with a non-zero
+/// `@card` minimum from it. A source node inserted with no edge of such a type
+/// is below the minimum; a branch written by this binary cannot hold one, but
+/// a branch written before the minimum counted inserted nodes can, so the
+/// evaluator counts them.
+fn node_inserts_need_no_validation(catalog: &Catalog, type_name: &str) -> bool {
+    let Some(node_type) = catalog.node_types.get(type_name) else {
+        return false;
+    };
+    node_type.range_constraints.is_empty()
+        && node_type.check_constraints.is_empty()
+        && node_type.unique_constraints.is_empty()
+        && node_type
+            .properties
+            .values()
+            .all(|property| property.enum_values.is_none())
+        && !catalog
+            .edge_types
+            .values()
+            .any(|edge| edge.from_type == type_name && edge.cardinality.min > 0)
 }
 
 fn adopt_advances_head(
@@ -5878,5 +5888,47 @@ impl Omnigraph {
             },
             commit: Some(commit),
         })
+    }
+}
+
+#[cfg(test)]
+mod fast_forward_validation_tests {
+    use super::*;
+    use omnigraph_compiler::catalog::build_catalog;
+    use omnigraph_compiler::schema::parser::parse_schema;
+
+    /// Only types whose new rows can break nothing skip a fast forward's
+    /// evaluator: a value constraint keeps it, and so does a non-zero `@card`
+    /// minimum on an edge type the node is the source of. A maximum alone, or a
+    /// minimum the node only receives, cannot be broken by inserted nodes.
+    #[test]
+    fn node_inserts_skip_validation_only_when_they_can_break_nothing() {
+        let catalog = build_catalog(
+            &parse_schema(
+                "node Plain { name: String @key }\n\
+                 node Ranged { name: String @key\n age: I32\n @range(age, 0..200) }\n\
+                 node Employee { name: String @key }\n\
+                 node Company { name: String @key }\n\
+                 node Member { name: String @key }\n\
+                 edge WorksAt: Employee -> Company @card(1..)\n\
+                 edge Follows: Member -> Plain @card(0..2)\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for (type_name, skips) in [
+            ("Plain", true),
+            ("Ranged", false),
+            ("Employee", false),
+            ("Company", true),
+            ("Member", true),
+            ("Missing", false),
+        ] {
+            assert_eq!(
+                node_inserts_need_no_validation(&catalog, type_name),
+                skips,
+                "{type_name}"
+            );
+        }
     }
 }

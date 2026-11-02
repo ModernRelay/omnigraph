@@ -38,7 +38,7 @@ omnigraph lint --query queries/signals.gq --target ./graph.omni
 Lint returns:
 - `"status": "ok"` — all queries passed
 - `"errors": N` — count of type errors (exit 1 when nonzero)
-- `"warnings": N` — count of drift warnings
+- `"warnings": N` — count of `L201` warnings (a nullable property that no update query sets)
 
 Run lint after every `.gq` or `.pg` edit. Wire into precommit.
 
@@ -103,6 +103,13 @@ query friends_of_friends($name: String) {
     return { $fof.name }
 }
 ```
+
+For variable length, put finite bounds on the edge: `$p knows{1,3} $f`.
+Bounds must be finite (`{1,}` is `T15`), and a bound above one needs an edge
+with the same node type at both ends (`$p worksAt{1,2} $c` over
+`Person -> Company` is `T5`). `$a (knows | likes) $b` follows either edge type,
+and `$a *{1,3} $b` any compatible type (declare both endpoint types); both
+share the `traversal_work_limit` setting.
 
 Hop counts are shortest-path distances from the start node (`{2,2}` returns
 nodes exactly two hops away); a node is not re-reached through a cycle, and
@@ -203,6 +210,7 @@ Use `$p.@id` for a node's identity and `$w.@id`, `$w.@src`, `$w.@dst` for a
 bound edge's identity and endpoints. These meta-fields work in filters,
 projections, and ordering on both current and legacy graphs. `$p.id` always
 means a declared user property named `id`; it is not an identity shorthand.
+`$w.@type` is a bound edge's schema type name (read-only).
 
 `return { $p }` returns one column named `p` containing the node object:
 `{"@id":"alice","name":"Alice"}`. It includes declared properties except
@@ -211,9 +219,9 @@ Blob and Vector properties. Project `$p.@id` for just the identity or
 bindings cannot be projected.
 
 Each projection needs a distinct result column name (`T25`): use aliases when
-expressions would collide. Aliases can be used in `order`, but cannot be
-projected again in `return` (`T36`), and alias ordering cannot be combined with
-a `nearest` ordering (`T18`). Order an aggregate by its alias or by repeating
+expressions would collide. Aliases can be used in `order`, including after a
+leading `nearest`/`bm25`/`rrf` key (`order { nearest($d.embedding, $q), title }`),
+but cannot be projected again in `return` (`T36`). Order an aggregate by its alias or by repeating
 the returned expression (`order { count($f) desc }`); an order key that is not
 a property, a system field, the leading search key, a `return` item, or an
 alias is refused at type checking (`T42`).
@@ -236,7 +244,7 @@ range fails the read instead of printing.
 ```gq
 match {
     $d: Doc
-    search($d.title, $q)       // full-text on @index'd String
+    search($d.title, $q)       // full-text; needs @index or @key on the String (T27)
 }
 ```
 
@@ -271,10 +279,12 @@ null, and `rrf` returns the union of its arms' candidates. `nearest` and `rrf`
 require `limit N`; BM25 alone does not, though a limit is recommended for
 bounded output.
 
-`nearest(...)` and `bm25(...)` can also be projected as scores when the
-expression exactly repeats the leading `order` key; see
-[`search.md`](search.md#projecting-scores). `rrf(...)` and search predicates
-cannot be projected.
+`nearest(...)`, `bm25(...)` and `rrf(...)` can also be projected as scores
+when the expression exactly repeats the leading `order` key (`T33`); see
+[`search.md`](search.md#projecting-scores). Search predicates (`search`,
+`fuzzy`, `match_text`) cannot be projected (`T35`). A ranked read's JSON
+carries a `ranking` object; see
+[`search.md`](search.md#what-a-ranked-read-reports).
 
 ### Hybrid (reciprocal rank fusion)
 
@@ -305,6 +315,12 @@ query friend_counts() {
 ```
 
 Supported: `count`, `sum`, `avg`, `min`, `max`. Grouping is implicit on non-aggregated return fields.
+`count(distinct $f)` counts distinct nodes and `count(distinct $f.city)`
+distinct non-null values; `distinct` under another aggregate is refused
+(`T57`). `return distinct { … }` keeps one row per distinct projected tuple
+before `order`/`limit` (with aggregates: `T56`). A comparison in `return`
+needs an alias (`T43`): `$p.age > 30 as adult`, or over aggregates
+`count($f) > 0 as any`.
 Return-clause integer `sum` accumulates exactly in 128 bits and rounds the total
 once to `F64`; `avg` uses a floating-point accumulator.
 
@@ -320,7 +336,14 @@ once to `F64`; `avg` uses a floating-point accumulator.
 
 ## Filter Operators
 
-`starts_with`, `contains`, `in`, `>=`, `<=`, `!=`, `>`, `<`, `=`
+`starts_with`, `contains`, `in`, `>=`, `<=`, `!=`, `>`, `<`, `=`, `is null`, `is not null`
+
+Combine filters with `and`, `or`, `not` and parentheses (`or` binds loosest,
+then `and`, then `not`); comparisons do not chain. A comparison with a null
+operand is null and a filter keeps only true rows, so `not ($p.age > 30)`
+skips null ages; add `or $p.age is null` to keep them. GQ has no `null`
+literal: `$p.x = null` is a parse error. On a list property, `contains` tests
+membership (`$p.tags contains "rust"`).
 
 Both String predicates are exact and case-sensitive: `contains` matches a
 substring and `starts_with` matches a prefix. They remain correct without an
@@ -394,6 +417,10 @@ query retitle_signal($slug: String, $new_title: String) {
 }
 ```
 
+An `update` cannot assign a `@key` property (refused when it runs, not by
+`lint`): delete and re-insert instead. A null assigned to a non-nullable
+property is refused before any row is matched.
+
 ### Delete
 
 ```gq
@@ -427,7 +454,7 @@ Prefer ISO strings on both paths:
 | Path | Date | DateTime |
 |---|---|---|
 | `mutate --params` | ISO string `"2026-04-29"` | ISO string `"2026-04-29T10:00:00Z"` |
-| `load` JSONL | ISO string `"2026-04-29"` (integer epoch days also accepted) | ISO string `"2026-04-29T10:00:00Z"` |
+| `load` JSONL | ISO string `"2026-04-29"` (integer epoch days also accepted) | ISO string `"2026-04-29T10:00:00Z"` (integer epoch milliseconds also accepted) |
 
 Integer epoch days remain useful for generated Arrow-oriented input, but are
 not required for hand-authored JSONL. A `Date` string must name a calendar day;
@@ -440,25 +467,31 @@ type, and refuse counts outside the JSON writer's supported calendar range.
 
 ## Branch Statements
 
-A `.gq` source may instead hold exactly one branch statement, never beside a
-query declaration:
+A `.gq` source may instead hold exactly one statement, never beside a query
+declaration: a branch statement, `commit publish "<id>"`/`commit drop "<id>"`,
+`load csv …`, `show`, or `explain query …`:
 
 ```text
 branch create "review/add-benchmark" from main
 branch merge "review/add-benchmark" into main
 branch delete "review/abandoned"
 branch list
+branch diff "review/add-benchmark" into main
+branch merge-base "review/add-benchmark" into main
+branch merge "review/add-benchmark" into main dry run
 ```
 
 `from` and `into` default to `main`; `branch create "fix" from commit "<commit-id>"`
 starts the branch at a published commit. Quote a name that is not a bare
 identifier (a lowercase letter or `_`, then letters, digits, or `_`), such as
-one containing `/`, `-`, or `.`. Run the control writes with
-`omnigraph mutate -e '…'` (HTTP `POST /mutate`) and `branch list` with
-`omnigraph query -e 'branch list'` (`POST /query`); the wrong verb is refused.
-A statement takes no name, `--params`, `--branch`, `--snapshot`, or
-`--if-commit`, and has no `--delete-branch` form: follow a merge with
-`branch delete`. `lint` and stored-query registries reject statement files.
+one containing `/`, `-`, or `.`. Run the writes (`branch create|delete|merge`,
+`commit publish|drop`, `load csv`) with `omnigraph mutate -e '…'`
+(`POST /mutate`) and the reads (`branch list|diff|merge-base`,
+`merge … dry run`, `show`, `explain`) with `omnigraph query -e '…'`
+(`POST /query`); the wrong verb is refused. A branch or commit statement takes
+no name, `--params`, `--branch`, `--snapshot`, or `--if-commit` (`load csv`
+takes `--branch` as its target), and has no `--delete-branch` form: follow a
+merge with `branch delete`. `lint` and stored-query registries reject statement files.
 Outcome and receipt semantics differ from data mutations; see
 [`changes.md`](changes.md#branch-statements).
 
@@ -471,4 +504,4 @@ Outcome and receipt semantics differ from data mutations; see
 
 ## Aliases Over Raw Queries
 
-For anything an agent or script will call repeatedly, define an operator alias. See `references/aliases.md`.
+For anything an agent or script will call repeatedly, define an operator alias. See [`aliases.md`](aliases.md).

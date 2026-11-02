@@ -129,8 +129,7 @@ refusals stay the server's.
   call or resource URI naming another graph is refused with a JSON-RPC error, and
   `graphs` and `omnigraph://graphs` list only this graph. Run one bridge per
   graph.
-- **Two consents for writes.** The server lists write tools only with
-  `--mcp-allow-writes`. Without `--write`, the bridge lists and admits only the
+- **Writes need `--write`.** Without it, the bridge lists and admits only the
   tools the server annotates `readOnlyHint: true`, and refuses a call to any
   other before sending it. The applied policy still decides every call.
 - **Existing endpoints only.** A server or managed target must name its existing
@@ -176,14 +175,17 @@ including JSON-RPC tool errors, never expose a reflected resource credential.
 
 | Flag | Environment | Default | Effect |
 |---|---|---|---|
-| `--mcp-allow-adhoc` | `OMNIGRAPH_MCP_ALLOW_ADHOC=1` | off | Lists and admits the `read` tool |
-| `--mcp-allow-writes` | `OMNIGRAPH_MCP_ALLOW_WRITES=1` | off | Lists and admits the write tools |
 | `--mcp-allowed-host <host[:port]>`, repeatable | `OMNIGRAPH_MCP_ALLOWED_HOSTS=a,b` | none | Adds allowed `Host` values |
 
-Settings are read once at boot. They enable tools; they grant nothing. A tool
-that is off is absent from `tools/list`, and a call to it is refused as an
-unknown tool. The opt-ins stay off even when a policy is applied: turn them on
-for a deployment whose policy was written with an LLM caller in mind.
+Settings are read once at boot. `/mcp` lists every tool below, and each call
+runs under the same policy action as its HTTP route, so a caller can do over
+MCP exactly what its credential may do over HTTP. To restrict what an agent
+may do, narrow the policy for the agent's credential.
+
+The removed `--mcp-allow-adhoc` and `--mcp-allow-writes` flags make
+`omnigraph-server` refuse to start; leftover `OMNIGRAPH_MCP_ALLOW_*` variables
+are ignored, so such a deployment lists every tool. A token with no applied
+policy still only reads: `query` answers, and a write tool returns 403.
 
 ## Tools
 
@@ -195,8 +197,7 @@ for a deployment whose policy was written with an LLM caller in mind.
 | `graphs` | none | `GET /graphs/discovery` for an identity credential; otherwise `GET /graphs`, narrowed to ids and names | identity, or `graph_list` |
 | `schema` | `graph` | `GET /graphs/{graph_id}/schema` | `read` |
 | `queries` | `graph` | `GET /graphs/{graph_id}/queries` | `read` |
-| `query` | `graph`, `name`, optional `params`, `branch` | `POST /graphs/{graph_id}/queries/{query_name}` as a read | `invoke_query`, then `read` |
-| `read` (opt-in) | `graph`, `query`, optional `name`, `params`, `branch`, `snapshot` | `POST /graphs/{graph_id}/query` | `read`; `change` for `explain load csv` |
+| `query` | `graph`, `query` (source) or `name` (stored), optional `params`, `branch`, `snapshot` | source: `POST /graphs/{graph_id}/query`; name: `POST /graphs/{graph_id}/queries/{query_name}` as a read | source: `read`, and `change` for `explain load csv`; name: `invoke_query`, then `read` |
 | `snapshot` | `graph`, optional `branch` | `GET /graphs/{graph_id}/snapshot` | `read` |
 | `access` | `graph`, optional `branch`, `target_branch` | `GET /graphs/{graph_id}/access` | none |
 | `branches_list` | `graph`, optional `detailed` | `GET /graphs/{graph_id}/branches` | `read`; with `detailed`, details only for branches the caller may `read` |
@@ -215,14 +216,13 @@ token, `graphs` returns 403 until the cluster policy permits `graph_list`; the
 other tools still work with a graph id the user supplies.
 
 The server's `initialize` instructions tell a model to call `graphs`, then
-`schema`, then a stored read with `query` or, when enabled, its own GQ read with
-`read`.
+`schema`, then `query` with a stored read's `name` or its own GQ source.
 
 - `queries` lists every stored query with its typed parameters (`name`,
   `kind`, `nullable`, plus `item_kind` for lists and `vector_dim` for
   vectors). An entry with `mutation: true` is a stored mutation, which
-  `mutate` runs when write tools are enabled.
-- `query` refuses stored mutations.
+  `mutate` runs.
+- `query` refuses stored mutations; `mutate` runs them.
 - `commits_list` takes `listing`: `history` (the default), `unpublished` for
   proposals written `as commit` that await `commits_publish`, or `unattached`
   for snapshots written `as unattached branch`. Only `history` pages.
@@ -234,15 +234,16 @@ The server's `initialize` instructions tell a model to call `graphs`, then
   `omnigraph blob stat --json` prints: the `selector`, `kind` (`managed`, with
   `size` and `etag`, or `external`, with `uri`) and the resolved `target`. It
   reads no payload byte. The route's conditional headers are not arguments.
-- `read` takes GQ source with typed parameter declarations, the same body as
-  `POST /query`. It also answers `branch list`, `branch diff`,
+- `query` with `query` takes GQ source with typed parameter declarations, the
+  same body as `POST /query`; `name` alongside source picks one declared query.
+  Source also answers `branch list`, `branch diff`,
   `branch merge-base`, `branch merge … dry run` and `explain query …`.
   `explain load csv …` requires `change` on its target branch before probing
   source metadata; it reads no payload byte and publishes nothing. It accepts
   `branch`, while refusing `snapshot`, `name` and `params`.
   The tool refuses `insert`, `update`, `delete` and branch writes with the route's 400.
 
-### Write tools (opt-in)
+### Write tools
 
 | Tool | Arguments | Runs | Policy action |
 |---|---|---|---|
@@ -277,7 +278,7 @@ Write tools follow one contract:
   completion the server cannot confirm, returns `isError` with
   `code: outcome_unknown`. A write the client cancelled, timed out or lost the
   connection for returns nothing, and means the same. Before replaying it, read
-  the target with `read` or `snapshot` and compare `graph_commit_id`, or list the
+  the target with `query` or `snapshot` and compare `graph_commit_id`, or list the
   branch with `commits_list`; replay a `mutate` with `if_graph_commit`, so a write
   that did land fails with 412 instead of applying twice. The 30 second wait is
   below the MCP TypeScript SDK's default 60 second request timeout; a client with

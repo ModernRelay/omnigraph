@@ -98,6 +98,17 @@ pub const OG_MF_104: DiagnosticCode = DiagnosticCode {
     short: "tighten nullable to non-nullable",
 };
 
+/// Add an edge type with a non-zero `@card` minimum whose source node type
+/// already exists. Existing source nodes have none of the new edges, so
+/// every one of them would sit below the minimum.
+pub const OG_MF_107: DiagnosticCode = DiagnosticCode {
+    code: "OG-MF-107",
+    family: Family::MF,
+    tier: SafetyTier::Validated,
+    default_severity: Severity::Error,
+    short: "add edge type with a @card minimum from populated node type",
+};
+
 /// Narrow a scalar (e.g. I64 → I32, F64 → F32). Lossy cast that may
 /// truncate or overflow. Today emitted on any `prop_type` change since
 /// the v1 planner doesn't yet distinguish widening from narrowing.
@@ -113,6 +124,7 @@ pub const OG_MF_106: DiagnosticCode = DiagnosticCode {
 /// (uniqueness, family coverage).
 pub const ALL_CODES: &[DiagnosticCode] = &[
     OG_DS_101, OG_DS_102, OG_DS_103, OG_DS_104, OG_DS_105, OG_MF_103, OG_MF_104, OG_MF_106,
+    OG_MF_107,
 ];
 
 /// Codes actually emitted by the planner in v0 (i.e. not reserved).
@@ -122,6 +134,7 @@ pub const EMITTED_IN_V0: &[&str] = &[
     "OG-DS-104",
     "OG-MF-103",
     "OG-MF-106",
+    "OG-MF-107",
 ];
 
 /// Look up a code by its string identifier.

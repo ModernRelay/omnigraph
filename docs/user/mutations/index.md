@@ -92,7 +92,7 @@ visible on the target in one atomic step. See
   values (an upsert), and an unkeyed edge by delete and re-insert.
 
 All declared value, uniqueness, endpoint, and cardinality constraints are
-checked before publication.
+checked before publication; a node a `@card` minimum needs edges for arrives with them in one query or load ([edge cardinality](../schema/index.md#edge-cardinality)).
 
 ## Bulk loading
 

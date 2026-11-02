@@ -35,8 +35,10 @@ const ROW_IDENTITY_ROWS_MAX: usize = 8 * 1024 * 1024;
 /// sibling first commits after one fork stamp a row they both change with
 /// the same value: equality proves a shared row only when one side's lineage
 /// passed through the other, which the caller decides (`pair_rows_by_identity`
-/// is `false` for a diff of diverged heads). The lineage facts this rule
-/// rests on are pinned by `lance_surface_guards::row_identity_discovery_*`.
+/// is `false` for a diff of diverged heads and for a window that crosses a
+/// merge commit, whose pins can come from the merged branch). The lineage
+/// facts this rule rests on are pinned by
+/// `lance_surface_guards::row_identity_discovery_*`.
 pub(crate) async fn row_identity_plan(
     from_dataset: &Dataset,
     to_dataset: &Dataset,
