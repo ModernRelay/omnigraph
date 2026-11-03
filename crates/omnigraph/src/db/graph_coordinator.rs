@@ -682,13 +682,13 @@ impl GraphCoordinator {
         snapshot_id: &SnapshotId,
     ) -> Result<CommitState> {
         let root_uri = self.root_uri();
-        let retired = admit_commit(
+        let retired = Box::pin(admit_commit(
             root_uri,
             control_session,
             &record.commit,
             Retention::LiveBranches(self),
             snapshot_id.as_str(),
-        )
+        ))
         .await?;
         let mut snapshot = Snapshot::wrap(record.snapshot(root_uri, control_session)?);
         if retired {
@@ -736,13 +736,13 @@ impl GraphCoordinator {
         if self.exact_graph_head().as_deref() == Some(id) {
             // The captured head is retention only while this branch is still
             // that incarnation; a retired writer goes through the one door.
-            let retired = admit_commit(
+            let retired = Box::pin(admit_commit(
                 self.root_uri(),
                 &session,
                 self.manifest.head(),
                 Retention::LiveBranches(self),
                 id,
-            )
+            ))
             .await?;
             let mut snapshot = self.snapshot();
             if retired {
@@ -766,8 +766,7 @@ impl GraphCoordinator {
         };
         match record {
             Some(record) => {
-                self.settled_commit_state(&session, record, snapshot_id)
-                    .await
+                Box::pin(self.settled_commit_state(&session, record, snapshot_id)).await
             }
             None => {
                 if let Some(candidate) = self.unpublished_commit(id).await? {

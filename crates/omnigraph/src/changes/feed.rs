@@ -514,7 +514,7 @@ impl<'a> PollSnapshots<'a> {
             // One door: a retired incarnation opens by its exact commit while
             // the polled branch, still the incarnation this cut captured,
             // reaches it.
-            let retired = crate::db::graph_coordinator::admit_commit(
+            let retired = Box::pin(crate::db::graph_coordinator::admit_commit(
                 self.root_uri,
                 &self.cut.control_session,
                 &commit,
@@ -523,7 +523,7 @@ impl<'a> PollSnapshots<'a> {
                     witness: &self.cut.witness,
                 },
                 commit_id,
-            )
+            ))
             .await?;
             if retired {
                 self.retired.insert(native.clone());
