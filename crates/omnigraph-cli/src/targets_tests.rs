@@ -297,9 +297,13 @@ async fn server_targets_capture_one_credential_and_never_fall_back() {
     // A long-lived client reads the rotated source again for its endpoint
     // only, and the invocation's own credential is unchanged.
     let route = first.owner.route().to_owned();
+    let renewed = first.reacquire(&route).await.unwrap().unwrap();
     assert_eq!(
-        first.reacquire(&route).await.unwrap().as_deref(),
-        Some("rotated-token")
+        renewed
+            .bearer_for(renewed.request(), time::OffsetDateTime::now_utc())
+            .unwrap()
+            .expose(),
+        "rotated-token"
     );
     assert!(
         first

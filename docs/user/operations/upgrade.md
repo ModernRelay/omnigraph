@@ -149,7 +149,7 @@ analyzer proofs still fail closed. For a graph that normal open accepts
 new indexes:
 
 ```bash
-omnigraph rebuild-full-text-indexes --target ./graph.omni --branch main --as operator --json
+omnigraph index rebuild --kind full-text --target ./graph.omni --branch main --as operator --json
 ```
 
 Follow the [full-text maintenance procedure](maintenance.md#rebuild-full-text-indexes)

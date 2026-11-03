@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
 use arrow_array::RecordBatch;
@@ -20,7 +20,9 @@ use datafusion::physical_plan::{
 use omnigraph_compiler::catalog::Catalog;
 
 use super::external;
-use super::shape::{Source, work};
+use super::load_budget::ShareClass;
+use super::memory::{WorkMemory, batch_bytes};
+use super::shape::Source;
 use crate::error::OmniError;
 use crate::loader::LoadSliceExecuted;
 use crate::loader::csv::{
@@ -43,6 +45,11 @@ pub(crate) struct CsvSourceExec {
     metrics: ExecutionPlanMetricsSet,
 }
 
+/// What a batch's validation facts cost, charged on `facts` by the producer
+/// in its sweeper's stead; the `usize` is the partition's rows probed so far.
+pub(crate) type FactsAdmission =
+    Box<dyn Fn(&WorkMemory, &RecordBatch, &mut usize) -> DfResult<()> + Send + Sync>;
+
 /// What every partition of one execution shares: the statement, the probed
 /// source, the header resolved once, each partition's range bounds and what
 /// each slice measured.
@@ -56,9 +63,14 @@ struct Parse {
     stop: AtomicBool,
     refused: Arc<AtomicBool>,
     started: OnceLock<Instant>,
-    /// The rows of the first slice any partition parsed, set before that
-    /// slice's batches leave the partition: the row estimate's sample.
+    /// The rows of partition 0's first slice, set before that slice's
+    /// batches leave the partition: the row estimate's sample, the seed's.
     first_slice_rows: OnceLock<u64>,
+    /// The consumer's facts admission, installed before any partition runs,
+    /// and the charges made ahead by slice key and batch ordinal, for the
+    /// sweeper to take and keep to the judgment.
+    admit_facts: OnceLock<FactsAdmission>,
+    facts_admissions: Mutex<HashMap<(usize, usize), WorkMemory>>,
     slices: Mutex<Vec<LoadSliceExecuted>>,
     failed: Mutex<Vec<FailedSlice>>,
     bounds: Mutex<Vec<Option<(u64, u64)>>>,
@@ -206,6 +218,8 @@ impl CsvSourceExec {
                 refused,
                 started: OnceLock::new(),
                 first_slice_rows: OnceLock::new(),
+                admit_facts: OnceLock::new(),
+                facts_admissions: Mutex::new(HashMap::new()),
                 slices: Mutex::new(Vec::new()),
                 failed: Mutex::new(Vec::new()),
                 bounds: Mutex::new(vec![None; partitions]),
@@ -220,6 +234,40 @@ impl CsvSourceExec {
 
     pub(crate) fn partitions(&self) -> usize {
         self.partitions
+    }
+
+    /// The source bytes one partition holds before it can cut a slice: its
+    /// admission and one slice of pieces; the floor its load share must
+    /// reach at admission.
+    pub(crate) fn admission_floor(&self) -> usize {
+        let slice = (self.parse.slice_bytes as u64).min(self.parse.bytes.size());
+        self.parse
+            .source_admission()
+            .saturating_add(usize::try_from(slice).unwrap_or(usize::MAX))
+    }
+
+    /// Mark a run of more than one partition refused by its sweep, so the
+    /// loader reruns it single-partitioned as it does for a parse refusal.
+    pub(crate) fn mark_refused(&self) {
+        if self.partitions > 1 {
+            self.parse.refused.store(true, Ordering::Release);
+        }
+    }
+
+    /// Install what a batch's validation facts cost, charged by the producer
+    /// before the batch leaves its partition; the first install holds.
+    pub(crate) fn admit_facts_ahead(&self, admit: FactsAdmission) {
+        let _ = self.parse.admit_facts.set(admit);
+    }
+
+    /// The facts charge the producer made ahead for the batch at `ordinal`
+    /// of `slice`, the sweeper's to keep to the judgment.
+    pub(crate) fn take_facts_admission(&self, slice: usize, ordinal: usize) -> Option<WorkMemory> {
+        self.parse
+            .facts_admissions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&(slice, ordinal))
     }
 
     /// Whether a run of more than one partition refused, marking the rerun.
@@ -325,7 +373,9 @@ impl ExecutionPlan for CsvSourceExec {
             "CsvSourceExec has {} partitions, partition {partition} executed",
             self.partitions
         );
-        let memory = work(ctx, "CsvSourceExec", &self.metrics)?;
+        let mut memory = WorkMemory::new(ctx, "CsvSourceExec")?;
+        memory.set_metrics(self.metrics.clone());
+        let memory = Arc::new(memory.in_share(ShareClass::Partition(partition)));
         memory.metric(CSV_SOURCE_ROWS, 0);
         let parse = Arc::clone(&self.parse);
         let source_bytes = memory.child("CSV source bytes")?;
@@ -359,6 +409,7 @@ impl ExecutionPlan for CsvSourceExec {
                 let mut first_record = 1_usize;
                 let mut index = 0_usize;
                 let mut partition_rows = 0_u64;
+                let mut probed_rows = 0_usize;
                 loop {
                     if parse.stop.load(Ordering::Acquire) {
                         break;
@@ -417,13 +468,33 @@ impl ExecutionPlan for CsvSourceExec {
                     }
                     let elapsed_compute_ns = elapsed_ns(computing);
                     for batch in &batches {
-                        memory.hold(batch)?;
+                        memory
+                            .hold(batch)
+                            .map_err(|error| parse.fail(memory.error(error)))?;
                     }
                     drop(decoding);
+                    for (ordinal, batch) in batches.iter().enumerate() {
+                        let sink_copy = batch_bytes(batch);
+                        memory
+                            .grow(sink_copy)
+                            .map_err(|error| parse.fail(memory.error(error)))?;
+                        if let Some(admit) = parse.admit_facts.get() {
+                            let facts = memory.child("load validation facts")?;
+                            admit(&facts, batch, &mut probed_rows)
+                                .map_err(|error| parse.fail(facts.error(error)))?;
+                            parse
+                                .facts_admissions
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .insert((key, ordinal), facts);
+                        }
+                    }
                     let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
                     memory.metric(CSV_SOURCE_ROWS, rows);
                     partition_rows = partition_rows.saturating_add(rows as u64);
-                    let _ = parse.first_slice_rows.set(rows as u64);
+                    if partition == 0 {
+                        let _ = parse.first_slice_rows.set(rows as u64);
+                    }
                     for batch in batches {
                         sender
                             .send(tag_slice(batch, key)?, Arc::clone(&memory))

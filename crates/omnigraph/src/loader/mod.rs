@@ -1280,9 +1280,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
             mode,
             &changeset,
         );
-        let access = crate::validate::AccessPaths::probe_everywhere();
-        crate::validate::validate_changeset_with_access(&changeset, &committed, &catalog, &access)
-            .await?;
+        crate::validate::validate_changeset(&changeset, &committed, &catalog).await?;
     }
     drop(validation);
     executed.rows = loaded_rows as u64;
@@ -1499,58 +1497,56 @@ pub(crate) async fn plan_load(
         SideId::Child,
         csv::target_arrow_schema(catalog, &request.target)?,
     );
-    if request.mode == LoadMode::Overwrite {
-        for side in &tables {
-            let key = &side.table.type_key;
-            let endpoint = ir.checks.iter().any(|check| {
-                matches!(
-                    check.check,
-                    omnigraph_compiler::ir::ValidateCheck::EdgeRi { .. }
-                ) && check.consults.as_ref() == Some(key)
-            });
-            if !endpoint && *key != table_key {
-                continue;
-            }
-            let Some(name) = key.strip_prefix("node:") else {
-                continue;
-            };
-            let Some(node) = catalog.node_types.get(name) else {
-                continue;
-            };
-            let Some(entry) = snapshot.dataset(key) else {
-                continue;
-            };
-            source = source
-                .with_node_type(
-                    name,
-                    NodeTypeSpec {
-                        table: side.table.clone(),
-                        version: Some(side.version),
-                        columns: catalog.system_columns,
-                        schema: node.arrow_schema.clone(),
-                        key: node.key.clone().unwrap_or_default(),
-                        object_columns: node
-                            .node_object_fields()
-                            .map(|field| field.name().clone())
-                            .collect(),
-                        object_fields: node
-                            .node_object_members()
-                            .map(|(member, field)| {
-                                arrow_schema::Field::new(
-                                    member,
-                                    field.data_type().clone(),
-                                    field.is_nullable(),
-                                )
-                            })
-                            .collect(),
-                        row_count: Some(entry.entity_count),
-                    },
-                )
-                .with_index_facts(
-                    key,
-                    crate::engine::plan_source::load_index_facts(snapshot, key).await?,
-                );
+    for side in &tables {
+        let key = &side.table.type_key;
+        let endpoint = ir.checks.iter().any(|check| {
+            matches!(
+                check.check,
+                omnigraph_compiler::ir::ValidateCheck::EdgeRi { .. }
+            ) && check.consults.as_ref() == Some(key)
+        });
+        if !endpoint && *key != table_key {
+            continue;
         }
+        let Some(name) = key.strip_prefix("node:") else {
+            continue;
+        };
+        let Some(node) = catalog.node_types.get(name) else {
+            continue;
+        };
+        let Some(entry) = snapshot.dataset(key) else {
+            continue;
+        };
+        source = source
+            .with_node_type(
+                name,
+                NodeTypeSpec {
+                    table: side.table.clone(),
+                    version: Some(side.version),
+                    columns: catalog.system_columns,
+                    schema: node.arrow_schema.clone(),
+                    key: node.key.clone().unwrap_or_default(),
+                    object_columns: node
+                        .node_object_fields()
+                        .map(|field| field.name().clone())
+                        .collect(),
+                    object_fields: node
+                        .node_object_members()
+                        .map(|(member, field)| {
+                            arrow_schema::Field::new(
+                                member,
+                                field.data_type().clone(),
+                                field.is_nullable(),
+                            )
+                        })
+                        .collect(),
+                    row_count: Some(entry.entity_count),
+                },
+            )
+            .with_index_facts(
+                key,
+                crate::engine::plan_source::load_index_facts(snapshot, key).await?,
+            );
     }
     let operation = Operation::Load {
         ir: Box::new(ir),

@@ -20,6 +20,21 @@ brew tap ModernRelay/tap
 brew install ModernRelay/tap/omnigraph
 ```
 
+## Nix
+
+The repository's flake builds the three release programs from source with the
+pinned Rust toolchain, the same packages and features as the release archives,
+on Linux x86_64 and arm64 and macOS arm64:
+
+```bash
+nix build github:ModernRelay/omnigraph
+nix run github:ModernRelay/omnigraph -- version
+```
+
+Pin a commit or a release tag that carries the flake with
+`github:ModernRelay/omnigraph/<ref>`. A build of a clean
+checkout reports its commit; it reports no release channel.
+
 ## Windows
 
 ```powershell

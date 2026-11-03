@@ -355,7 +355,119 @@ fn automation(origin: &str, token: Option<String>, api: Option<String>) -> Resul
 
 enum Source {
     Human(renewal::Identity),
-    Automation(crate::credential_sources::AcquiredCredential),
+    Automation {
+        credential: Box<tokio::sync::Mutex<crate::credential_sources::AcquiredCredential>>,
+        identity: VerifiedIdentity,
+    },
+}
+
+/// Complete verified metadata; continuity checks follow the selected provider.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VerifiedIdentity {
+    account_id: String,
+    principal_id: String,
+    kind: Option<String>,
+    subject: Option<String>,
+    provider_client_id: Option<String>,
+    assurance: Option<String>,
+}
+
+impl VerifiedIdentity {
+    // Existing external providers pin organization and principal; OAuth also
+    // pins its verified client identity. Keep the original metadata intact.
+    fn matches_profile(
+        &self,
+        other: &Self,
+        profile: Option<&crate::operator_schema::AuthProfile>,
+    ) -> bool {
+        self.account_id == other.account_id
+            && self.principal_id == other.principal_id
+            && (!matches!(
+                profile,
+                Some(crate::operator_schema::AuthProfile::OauthClientCredentials { .. })
+            ) || self == other)
+    }
+}
+
+async fn verify_external(
+    origin: &str,
+    organization: Option<&str>,
+    credential: crate::credential_sources::AcquiredCredential,
+) -> Result<(
+    VerifiedIdentity,
+    crate::credential_sources::AcquiredCredential,
+)> {
+    let token = acquired_bearer(&credential, origin)?.to_owned();
+    let body = Api::with_credential(origin.into(), credential.clone())?
+        .request(Method::GET, "/v1/auth/session", None, None)
+        .await
+        .map_err(|failure| scrub(failure, &token))?;
+    let data = &body["data"];
+    let account = bounded_string(data, "account_id", 128)?;
+    check_account(organization, account)?;
+    let optional = |value: &Value, field, max| -> Result<Option<String>> {
+        if value.get(field).is_none_or(Value::is_null) {
+            Ok(None)
+        } else {
+            bounded_string(value, field, max).map(|s| Some(s.into()))
+        }
+    };
+    let identity = VerifiedIdentity {
+        account_id: account.into(),
+        principal_id: bounded_string(data, "principal_id", 1024)?.into(),
+        kind: optional(data, "kind", 64)?,
+        subject: optional(data, "subject", 4096)?,
+        provider_client_id: optional(data, "provider_client_id", 512)?,
+        assurance: optional(&body["meta"], "assurance", 64)?,
+    };
+    let auth = crate::operator_routing::AUTH
+        .try_with(Clone::clone)
+        .ok()
+        .flatten();
+    if let Some(auth) = &auth {
+        if let crate::operator_schema::AuthProfile::OauthClientCredentials { client_id, .. } =
+            &auth.profile
+        {
+            if identity.kind.as_deref() != Some("automation")
+                || identity.assurance.as_deref() != Some("verified_workload")
+                || identity.provider_client_id.as_ref() != Some(client_id)
+                || identity.subject.is_none()
+                || data.get("expires_at").and_then(Value::as_str).is_none()
+            {
+                return Err(Failure::refused(
+                    "workload_identity_mismatch",
+                    "the verified session does not match the selected workload client",
+                ));
+            }
+        }
+    }
+    let credential = if data
+        .get("expires_at")
+        .is_some_and(|expiry| !expiry.is_null())
+    {
+        let expiry = OffsetDateTime::parse(bounded_string(data, "expires_at", 64)?, &Rfc3339)
+            .map_err(|_| Failure::protocol())?;
+        let bounded = credential.bound_expiry(expiry);
+        acquired_bearer(&bounded, origin)?;
+        bounded
+    } else {
+        credential
+    };
+    if let Some(auth) = auth {
+        let pinned = auth
+            .verified_managed_identity
+            .get_or_init(|| async { identity.clone() })
+            .await;
+        if !pinned.matches_profile(&identity, Some(&auth.profile)) {
+            return Err(Failure::refused(
+                "session_identity_mismatch",
+                "the verified identity changed during this invocation",
+            ));
+        }
+        auth.retain_verified_expiry(&credential)
+            .map_err(|_| Failure::protocol())?;
+    }
+    Ok((identity, credential))
 }
 
 pub(super) fn acquired_bearer<'a>(
@@ -426,16 +538,16 @@ async fn select_with(
             )
         })?;
         let credential = credential.ok_or_else(Failure::protocol)?;
-        let body = Api::with_credential(origin.into(), credential.clone())?
-            .request(Method::GET, "/v1/auth/session", None, None)
+        let (identity, credential) = verify_external(origin, organization, credential)
             .await
             .map_err(|failure| scrub(failure, &token))?;
-        let account = bounded_string(&body["data"], "account_id", 128)?;
-        check_account(organization, account)?;
         return Ok(Some(Selection {
-            account_id: account.into(),
-            principal_id: bounded_string(&body["data"], "principal_id", 1024)?.into(),
-            source: Source::Automation(credential),
+            account_id: identity.account_id.clone(),
+            principal_id: identity.principal_id.clone(),
+            source: Source::Automation {
+                credential: Box::new(tokio::sync::Mutex::new(credential)),
+                identity,
+            },
         }));
     }
     Ok(
@@ -539,14 +651,86 @@ async fn select_human_with(
 impl Selection {
     pub(super) async fn credential(&self, origin: &str) -> Result<String> {
         match &self.source {
-            Source::Automation(credential) => {
-                acquired_bearer(credential, origin).map(str::to_owned)
+            Source::Automation {
+                credential,
+                identity,
+            } => {
+                let authentication = crate::operator_routing::AUTH
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten();
+                if let Some(auth) = &authentication {
+                    auth.ensure_current().map_err(|_| {
+                        Failure::refused(
+                            "credential_generation_changed",
+                            "the selected credential owner changed; start a fresh invocation",
+                        )
+                    })?;
+                }
+                let mut credential = credential.lock().await;
+                if matches!(
+                    credential.bearer_for(credential.request(), OffsetDateTime::now_utc()),
+                    Err(crate::credential_sources::CredentialError::Expired)
+                ) {
+                    let fresh = configured_token(origin)
+                        .await?
+                        .ok_or_else(Failure::protocol)?;
+                    let (verified, fresh) =
+                        verify_external(origin, Some(&self.account_id), fresh).await?;
+                    if !identity.matches_profile(
+                        &verified,
+                        authentication.as_ref().map(|auth| &auth.profile),
+                    ) {
+                        return Err(Failure::refused(
+                            "session_identity_mismatch",
+                            "the renewed credential names another identity",
+                        ));
+                    }
+                    *credential = fresh;
+                }
+                acquired_bearer(&credential, origin).map(str::to_owned)
             }
             Source::Human(identity) => {
                 let _lock = coordination::lock(origin).await?;
                 renewal::credential(&AUTHKIT_STORE, origin, identity).await
             }
         }
+    }
+
+    pub(super) async fn renew_before_issuance(&self, origin: &str) -> Result<bool> {
+        let Source::Automation {
+            credential,
+            identity,
+        } = &self.source
+        else {
+            return Ok(false);
+        };
+        let Some(auth) = crate::operator_routing::AUTH
+            .try_with(Clone::clone)
+            .ok()
+            .flatten()
+        else {
+            return Ok(false);
+        };
+        if !auth.renewable() {
+            return Ok(false);
+        }
+        let mut current = credential.lock().await;
+        let fresh = auth.renew_control_credential(&current).await.map_err(|_| {
+            Failure::refused(
+                "credential_unavailable",
+                "the selected provider could not renew; no fallback was attempted",
+            )
+        })?;
+        let (verified, fresh) = verify_external(origin, Some(&self.account_id), fresh).await?;
+        if !identity.matches_profile(&verified, Some(&auth.profile)) {
+            return Err(Failure::refused(
+                "session_identity_mismatch",
+                "the renewed credential names another identity",
+            ));
+        }
+        *current = fresh;
+        Ok(true)
     }
 }
 

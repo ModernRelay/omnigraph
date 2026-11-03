@@ -3937,7 +3937,7 @@
           "branches"
         ],
         "summary": "List all branches.",
-        "description": "Returns branch names sorted by name in byte order. Read-only. The GQ statement\n`branch list` on `POST /query` runs the same body.",
+        "description": "Returns branch names sorted by name in byte order. Read-only. The GQ statement\n`branch list` on `POST /query` runs the same body.\n\n`detailed=true` adds `details`: for each branch the caller may `read`, its\nhead commit, the branch and commit it started from, when it was created,\nand when it last moved. Each listed branch costs a read of its latest\nversion, and of the version it was created from once it has written a\ncommit; no commit history is read.",
         "operationId": "branchList",
         "parameters": [
           {
@@ -3947,6 +3947,15 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "detailed",
+            "in": "query",
+            "description": "`true` adds `details`: each branch's head, the branch and commit it\nstarted from, when it was created, and when it last moved. Defaults\nto `false`. Reads each listed branch's latest version, and the version\nit was created from once it has written a commit, never its commit\nhistory; the names alone read neither.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           },
           {
@@ -3994,7 +4003,7 @@
             }
           },
           "400": {
-            "description": "api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "description": "Invalid `detailed`; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -12917,6 +12926,13 @@
             ],
             "description": "The branch asked about, when one was."
           },
+          "client_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The OAuth client the credential was issued to, when it is a verified\nOIDC access token. The actor stays the person's principal across\nclients. Opaque text the client chose: render it escaped."
+          },
           "graph_id": {
             "type": "string"
           },
@@ -13144,6 +13160,53 @@
           }
         }
       },
+      "BranchDetailOutput": {
+        "type": "object",
+        "description": "One live branch as `GET /branches?detailed=true` reports it. `from` and\n`from_commit_id` say where the branch started, as its `POST /branches`\nreceipt did. A branch deleted and created again under the same name is a\nnew lifetime: its start and creation time are the later creation's. The\noptional fields are absent on `main`.",
+        "required": [
+          "name",
+          "head",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the branch was created, as Unix epoch microseconds recorded to\nthe second.",
+            "example": 1714000000000000
+          },
+          "from": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The branch this one started from, as that branch was named then; it\nmay since have been deleted or recreated."
+          },
+          "from_commit_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The commit the branch started at. A later merge does not move it;\n`GET /branches/merge-base` answers where two branches last met."
+          },
+          "head": {
+            "$ref": "#/components/schemas/CommitOutput",
+            "description": "The commit a read of the branch sees: its newest commit, or the commit\nit started at while it has written none."
+          },
+          "name": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the head last moved, as Unix epoch microseconds: the time of the\nbranch's newest commit, or `created_at` while it has written none.",
+            "example": 1714000000000000
+          }
+        }
+      },
       "BranchListOutput": {
         "type": "object",
         "required": [
@@ -13154,7 +13217,18 @@
             "type": "array",
             "items": {
               "type": "string"
-            }
+            },
+            "description": "Every live branch, sorted by name in byte order."
+          },
+          "details": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/BranchDetailOutput"
+            },
+            "description": "Present only with `detailed=true`: one entry per branch the caller\nmay `read`, in the order of `branches`. A branch the caller may not\nread is listed in `branches` alone."
           }
         }
       },
@@ -14241,10 +14315,11 @@
       },
       "ErrorCode": {
         "type": "string",
-        "description": "The registry of error codes. A server sends each code under the HTTP statuses named with it; a code without one never appears in an HTTP response.\n\n- `unauthorized` (401): The request carries no credential the server accepts: a bearer token is missing, unknown or expired. Supply one the server is configured to verify.\n- `forbidden` (403): The credential's actor may not do this: policy denies the action, or the action needs a policy permit the server has not been given.\n- `bad_request` (400): The request is malformed or invalid: a body, query string, path parameter or header that does not decode, a query the compiler refuses (see `diagnostic`), or a value refused before any effect.\n- `api_contract_mismatch` (400): The request lacks exactly one `Omnigraph-Http-Api` header naming the contract this server speaks. Authentication and this check precede graph access and effects.\n- `actor_mismatch` (412): The request's `Omnigraph-If-Actor` header names another actor than its credential resolves to. Nothing ran.\n- `outcome_unknown` (500): A write whose completion the server could not settle: it may or may not have published. Read the target before writing again; never replay the write blindly. An MCP write call that was cancelled or passed its deadline answers it too.\n- `precondition_failed` (412): A request precondition no longer holds: the branch head moved past `Omnigraph-If-Graph-Commit` (see `precondition_failure`), or a Blob's `If-Match` names a value the cell no longer holds (a write's `blob_precondition_failure` names the current one). Nothing was written.\n- `recovery_required` (503): An overlapping durable recovery intent must be resolved first; see `recovery_required`.\n- `external_blob_source` (424): An admitted external Blob source could not be probed or read; see `external_blob_source`.\n- `change_feed_gap` (410): Retained history can no longer reconstruct a change continuation; see `change_feed_gap`. Resume from a new baseline.\n- `not_found` (404): The graph, branch, commit, query, entity or route the request names does not exist, or the caller may not learn that it does.\n- `method_not_allowed` (405): The request path is served, but not with the request's method.\n- `request_timeout` (408): The request body did not arrive before its deadline; nothing was admitted.\n- `conflict` (409): The request conflicts with the graph's current state: a concurrent change, an existing id, a merge conflict, an index that must be built first, or a commit that cannot be diffed. The details say which.\n- `branch_start_refusal` (409, 410): `branch create` could not start the branch at the commit `from_commit` named, and nothing was created; see `branch_start_refusal`, whose `not_retained` reason answers 410.\n- `unattached_cannot_publish` (409): The commit is an unattached snapshot, a kind that never publishes. Distinct from `conflict`, the authority-moved refusal of a publishable proposal.\n- `payload_too_large` (413): The request body, or the work it asks for, exceeds a bounded limit; `resource_limit` names the limit when it is the operation's. Split or reduce the request.\n- `unsupported_media_type` (415): The request body's content type is not one the route accepts.\n- `range_not_satisfiable` (416): The requested Blob byte range lies outside the value; see `blob_range`.\n- `too_many_requests` (429): Admission capacity is exhausted: an actor's, the server's, or the MCP endpoint's concurrent tool calls. Nothing started; retry after `Retry-After`.\n- `service_unavailable` (503): Operation admission is closed, or a deployment observation raced an owner change. Nothing started; retry after `Retry-After`, reconciling any earlier write first.\n- `graph_unavailable` (503): A known graph is not being served. The request did not start, so it may be retried once the graph is served again.\n- `internal` (500): The server failed. An error before any write took no effect; see the server log.\n- `cancelled` (no HTTP status): MCP only: the client cancelled a read tool call. A cancelled write answers `outcome_unknown`.\n- `deadline_exceeded` (no HTTP status): MCP only: a read tool call passed its deadline. A write that does answers `outcome_unknown`.\n- `result_too_large` (no HTTP status): MCP only: a tool result exceeds the result limit. Narrow the read.",
+        "description": "The registry of error codes. A server sends each code under the HTTP statuses named with it; a code without one never appears in an HTTP response.\n\n- `unauthorized` (401): The request carries no credential the server accepts: a bearer token is missing, unknown or expired. Supply one the server is configured to verify.\n- `forbidden` (403): The credential's actor may not do this: policy denies the action, or the action needs a policy permit the server has not been given.\n- `not_admitted` (403): The OIDC access token is valid, but the server admits no principal for its subject. Signing in again issues a token for the same subject and cannot help; the server's operator must admit the identity.\n- `bad_request` (400): The request is malformed or invalid: a body, query string, path parameter or header that does not decode, a query the compiler refuses (see `diagnostic`), or a value refused before any effect.\n- `api_contract_mismatch` (400): The request lacks exactly one `Omnigraph-Http-Api` header naming the contract this server speaks. Authentication and this check precede graph access and effects.\n- `actor_mismatch` (412): The request's `Omnigraph-If-Actor` header names another actor than its credential resolves to. Nothing ran.\n- `outcome_unknown` (500): A write whose completion the server could not settle: it may or may not have published. Read the target before writing again; never replay the write blindly. An MCP write call that was cancelled or passed its deadline answers it too.\n- `precondition_failed` (412): A request precondition no longer holds: the branch head moved past `Omnigraph-If-Graph-Commit` (see `precondition_failure`), or a Blob's `If-Match` names a value the cell no longer holds (a write's `blob_precondition_failure` names the current one). Nothing was written.\n- `recovery_required` (503): An overlapping durable recovery intent must be resolved first; see `recovery_required`.\n- `external_blob_source` (424): An admitted external Blob source could not be probed or read; see `external_blob_source`.\n- `change_feed_gap` (410): Retained history can no longer reconstruct a change continuation; see `change_feed_gap`. Resume from a new baseline.\n- `not_found` (404): The graph, branch, commit, query, entity or route the request names does not exist, or the caller may not learn that it does.\n- `method_not_allowed` (405): The request path is served, but not with the request's method.\n- `request_timeout` (408): The request body did not arrive before its deadline; nothing was admitted.\n- `conflict` (409): The request conflicts with the graph's current state: a concurrent change, an existing id, a merge conflict, an index that must be built first, or a commit that cannot be diffed. The details say which.\n- `branch_start_refusal` (409, 410): `branch create` could not start the branch at the commit `from_commit` named, and nothing was created; see `branch_start_refusal`, whose `not_retained` reason answers 410.\n- `unattached_cannot_publish` (409): The commit is an unattached snapshot, a kind that never publishes. Distinct from `conflict`, the authority-moved refusal of a publishable proposal.\n- `payload_too_large` (413): The request body, or the work it asks for, exceeds a bounded limit; `resource_limit` names the limit when it is the operation's. Split or reduce the request.\n- `unsupported_media_type` (415): The request body's content type is not one the route accepts.\n- `range_not_satisfiable` (416): The requested Blob byte range lies outside the value; see `blob_range`.\n- `too_many_requests` (429): Admission capacity is exhausted: an actor's, the server's, or the MCP endpoint's concurrent tool calls. Nothing started; retry after `Retry-After`.\n- `service_unavailable` (503): Operation admission is closed, or a deployment observation raced an owner change. Nothing started; retry after `Retry-After`, reconciling any earlier write first.\n- `graph_unavailable` (503): A known graph is not being served. The request did not start, so it may be retried once the graph is served again.\n- `internal` (500): The server failed. An error before any write took no effect; see the server log.\n- `cancelled` (no HTTP status): MCP only: the client cancelled a read tool call. A cancelled write answers `outcome_unknown`.\n- `deadline_exceeded` (no HTTP status): MCP only: a read tool call passed its deadline. A write that does answers `outcome_unknown`.\n- `result_too_large` (no HTTP status): MCP only: a tool result exceeds the result limit. Narrow the read.",
         "enum": [
           "unauthorized",
           "forbidden",
+          "not_admitted",
           "bad_request",
           "api_contract_mismatch",
           "actor_mismatch",
@@ -14520,7 +14595,7 @@
       },
       "FullTextIndexRequiredOutput": {
         "type": "object",
-        "description": "A full-text call read a declared full-text index that has no segment at\nthe query's snapshot (HTTP 409), so no segment carries its analyzer. This\nis not a retryable conflict: an operator builds the branch's index\n(`omnigraph optimize` on main, `omnigraph rebuild-full-text-indexes\n--branch` elsewhere). Historical snapshots stay unchanged.",
+        "description": "A full-text call read a declared full-text index that has no segment at\nthe query's snapshot (HTTP 409), so no segment carries its analyzer. This\nis not a retryable conflict: an operator builds the branch's index\n(`omnigraph index build --branch <branch>`). Historical snapshots stay\nunchanged.",
         "required": [
           "index"
         ],
@@ -15440,6 +15515,45 @@
         },
         "additionalProperties": false
       },
+      "RankOrder": {
+        "type": "string",
+        "description": "The direction a ranking's score orders rows.",
+        "enum": [
+          "ascending",
+          "descending"
+        ]
+      },
+      "RankingOutput": {
+        "type": "object",
+        "description": "The ranking a read ordered its rows by.",
+        "required": [
+          "by",
+          "order",
+          "exhaustive",
+          "score_columns"
+        ],
+        "properties": {
+          "by": {
+            "$ref": "#/components/schemas/SearchFunction",
+            "description": "The search function the leading `order` key names."
+          },
+          "exhaustive": {
+            "type": "boolean",
+            "description": "Whether no row the search admitted and did not return outranks a\nreturned one. `bm25` scores every match, so it is always exhaustive.\n`nearest` is exhaustive when the run searched every partition of the\nvector index, scored every row flat or returned every row it\nadmitted, and `false` when a probe cap left partitions unsearched, so\na nearer row may exist. `rrf` is exhaustive when its `nearest` arms\nare."
+          },
+          "order": {
+            "$ref": "#/components/schemas/RankOrder",
+            "description": "`ascending` for a `nearest` distance (smaller is nearer),\n`descending` for a `bm25` or `rrf` score (larger is more relevant)."
+          },
+          "score_columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The returned columns that hold the ranking's own score, in return\norder; empty when the read returns none. A column computed from the\nscore is not one."
+          }
+        }
+      },
       "ReadOutput": {
         "type": "object",
         "required": [
@@ -15475,6 +15589,17 @@
           },
           "query_name": {
             "type": "string"
+          },
+          "ranking": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RankingOutput",
+                "description": "How the read ordered its rows when its order is a search: the\nsearch function, the direction its score ranks, whether the run's\nsearch was exhaustive, and the returned columns holding the score.\nAbsent when the order is no search."
+              }
+            ]
           },
           "row_count": {
             "type": "integer",
@@ -15692,6 +15817,15 @@
           }
         }
       },
+      "SearchFunction": {
+        "type": "string",
+        "description": "The search function a ranked read orders by.",
+        "enum": [
+          "nearest",
+          "bm25",
+          "rrf"
+        ]
+      },
       "SettingsRequest": {
         "type": "object",
         "description": "The `settings` field of a request: one optional value per `request`-scope\nsetting of the definition, applied to the request's session before the\nsource's own `set` lines, so a `set` line in the request's text overrides\nthe field. An absent field is empty. A `process` setting has no field\nhere, so `{\"stage_write_concurrency\": 64}` is refused as an unknown field.",
@@ -15700,6 +15834,15 @@
             "type": "integer",
             "description": "the partition cap per index delta of a `nearest` scan; `0` is no cap",
             "minimum": 0
+          },
+          "change_lineage": {
+            "type": "string",
+            "description": "how a graph diff or commit page finds the entities it compares across a window with no adjacent transaction: the exact ordered merge of both versions, the entities paired by stable identity, or both compared",
+            "enum": [
+              "off",
+              "on",
+              "verify"
+            ]
           },
           "engine": {
             "type": "string",

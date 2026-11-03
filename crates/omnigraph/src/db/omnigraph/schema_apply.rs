@@ -150,7 +150,7 @@ async fn plan_schema_for_apply_from_accepted(
     desired_schema_source: &str,
     accepted_ir: &SchemaIR,
 ) -> Result<PlannedSchemaApply> {
-    let branches = db.coordinator.read().await.all_branches().await?;
+    let branches = db.coordinator.load_full().all_branches().await?;
     let blocking_branches = branches
         .into_iter()
         .filter(|branch| branch != "main")
@@ -275,8 +275,7 @@ where
     if let Some(commit_id) = prepared.graph_commit_id()
         && db
             .coordinator
-            .read()
-            .await
+            .load_full()
             .captured_commit(commit_id)?
             .is_some()
     {
@@ -592,7 +591,7 @@ where
     // physical-only manifest movement requires a fresh preparation.
     db.refresh_coordinator_only().await?;
     let (current_branch_identifier, current_graph_head) = {
-        let coordinator = db.coordinator.read().await;
+        let coordinator = db.coordinator.load_full();
         (
             coordinator.branch_identifier().await?,
             coordinator.exact_graph_head(),
@@ -624,7 +623,7 @@ where
             current_graph_head,
         ));
     }
-    let current_snapshot = db.coordinator.read().await.snapshot();
+    let current_snapshot = db.coordinator.load_full().snapshot();
     if current_snapshot.graph_manifest_version() != snapshot.graph_manifest_version() {
         return Err(OmniError::manifest_read_set_changed(
             "prepared_schema_manifest_version",
@@ -1036,17 +1035,17 @@ where
             ),
             version: snapshot.graph_manifest_version(),
         };
-        let published = db
-            .coordinator
-            .write()
-            .await
+        let (installed, mut next) = db.installed_coordinator_copy();
+        let outcome = next
             .commit_changes_with_intent_and_expected(
                 &manifest_changes,
                 &expected_versions,
                 lineage_intent,
                 &precondition,
             )
-            .await?;
+            .await;
+        db.install_coordinator(next, &installed);
+        let published = outcome?;
         published_commit = Some(published.commit.graph_commit_id.clone());
 
         db.store_schema_view(

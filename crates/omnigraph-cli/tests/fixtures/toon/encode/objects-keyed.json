@@ -1,0 +1,160 @@
+{
+  "version": "4.0",
+  "category": "encode",
+  "description": "Keyed tabular encoding – objects whose values are uniform objects collapse into keyed headers with entry rows",
+  "tests": [
+    {
+      "name": "encodes objects of uniform objects in keyed tabular form",
+      "input": {
+        "servers": {
+          "alpha": { "host": "a.example.com", "port": 8080 },
+          "beta": { "host": "b.example.com", "port": 9090 }
+        }
+      },
+      "expected": "servers[2:]{host,port}:\n  alpha: a.example.com,8080\n  beta: b.example.com,9090",
+      "specSection": "9.5"
+    },
+    {
+      "name": "encodes an eligible root object with a keyless keyed header",
+      "input": {
+        "alice": { "age": 30, "city": "Berlin" },
+        "bob": { "age": 25, "city": "Oslo" }
+      },
+      "expected": "[2:]{age,city}:\n  alice: 30,Berlin\n  bob: 25,Oslo",
+      "specSection": "9.5",
+      "note": "The keyless keyed header is valid only at the root (§5)"
+    },
+    {
+      "name": "collapses uniform nested object columns inside keyed headers",
+      "input": {
+        "regions": {
+          "eu": { "name": "Europe", "geo": { "lat": 50, "lon": 10 } },
+          "us": { "name": "America", "geo": { "lat": 40, "lon": -100 } }
+        }
+      },
+      "expected": "regions[2:]{name,geo{lat,lon}}:\n  eu: Europe,50,10\n  us: America,40,-100",
+      "specSection": "9.5"
+    },
+    {
+      "name": "orders fields by the first entry value's encounter order",
+      "input": {
+        "m": {
+          "a": { "x": 1, "y": 2 },
+          "b": { "y": 4, "x": 3 }
+        }
+      },
+      "expected": "m[2:]{x,y}:\n  a: 1,2\n  b: 3,4",
+      "specSection": "9.5"
+    },
+    {
+      "name": "uses the active delimiter in keyed headers and entry-row cells",
+      "input": {
+        "servers": {
+          "alpha": { "host": "a.example.com", "port": 8080, "note": "x|y" },
+          "beta": { "host": "b.example.com", "port": 9090, "note": "p,q" }
+        }
+      },
+      "options": { "delimiter": "|" },
+      "expected": "servers[2:|]{host|port|note}:\n  alpha: a.example.com|8080|\"x|y\"\n  beta: b.example.com|9090|p,q",
+      "specSection": "9.5",
+      "minSpecVersion": "4.2",
+      "note": "The keyed marker precedes the delimiter symbol: [2:|]"
+    },
+    {
+      "name": "quotes entry keys per key encoding",
+      "input": {
+        "ids": { "42": { "v": 1 }, "my key": { "v": 2 } }
+      },
+      "expected": "ids[2:]{v}:\n  \"42\": 1\n  \"my key\": 2",
+      "specSection": "9.5"
+    },
+    {
+      "name": "quotes entry-row cells containing the active delimiter",
+      "input": {
+        "notes": {
+          "n1": { "text": "a,b" },
+          "n2": { "text": "c" }
+        }
+      },
+      "expected": "notes[2:]{text}:\n  n1: \"a,b\"\n  n2: c",
+      "specSection": "9.5"
+    },
+    {
+      "name": "keeps single-entry objects in nested form",
+      "input": {
+        "config": {
+          "only": { "a": 1, "b": 2 }
+        }
+      },
+      "expected": "config:\n  only:\n    a: 1\n    b: 2",
+      "specSection": "9.5",
+      "note": "Keyed tabular detection requires at least two entries"
+    },
+    {
+      "name": "keeps objects in nested form when entry values have differing key sets",
+      "input": {
+        "envs": {
+          "dev": { "host": "x" },
+          "prod": { "host": "y", "port": 1 }
+        }
+      },
+      "expected": "envs:\n  dev:\n    host: x\n  prod:\n    host: y\n    port: 1",
+      "specSection": "9.5"
+    },
+    {
+      "name": "keeps objects in nested form when a value is primitive",
+      "input": {
+        "m": {
+          "a": { "x": 1 },
+          "b": 2
+        }
+      },
+      "expected": "m:\n  a:\n    x: 1\n  b: 2",
+      "specSection": "9.5"
+    },
+    {
+      "name": "keeps objects in nested form when an entry value contains an array",
+      "input": {
+        "m": {
+          "a": { "tags": ["x"] },
+          "b": { "tags": ["y"] }
+        }
+      },
+      "expected": "m:\n  a:\n    tags[1]: x\n  b:\n    tags[1]: y",
+      "specSection": "9.5",
+      "note": "Entry-row cells must be primitive leaves; an array value disqualifies the column"
+    },
+    {
+      "name": "emits a keyed header on the hyphen line when it is the first field of a list item",
+      "input": {
+        "items": [
+          { "config": { "a": { "x": 1 }, "b": { "x": 2 } }, "status": "ok" },
+          { "status": "down" }
+        ]
+      },
+      "expected": "items[2]:\n  - config[2:]{x}:\n      a: 1\n      b: 2\n    status: ok\n  - status: down",
+      "specSection": "10",
+      "note": "Entry rows at depth +2, sibling fields at depth +1, mirroring tabular arrays on hyphen lines"
+    },
+    {
+      "name": "never encodes an anonymous array element in keyed tabular form",
+      "input": {
+        "items": [
+          { "a": { "x": 1 }, "b": { "x": 2 } },
+          5
+        ]
+      },
+      "expected": "items[2]:\n  - a:\n      x: 1\n    b:\n      x: 2\n  - 5",
+      "specSection": "9.5",
+      "note": "The element object is keyed-eligible but has no key; the keyless form is root-only, so it encodes per §10"
+    },
+    {
+      "name": "keeps an object of empty objects out of keyed tabular form",
+      "input": {
+        "m": { "a": {}, "b": {} }
+      },
+      "expected": "m:\n  a:\n  b:",
+      "specSection": "9.5"
+    }
+  ]
+}

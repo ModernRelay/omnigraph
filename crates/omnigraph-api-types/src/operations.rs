@@ -4,7 +4,7 @@
 //! restricted binding names its reason; adding a tool or command does not
 //! silently turn it into another operation. The HTTP rows include distinct
 //! conditional and payload variants because they have distinct wire contracts.
-//! Runtime dispatch, authentication, schemas and MCP boot gates keep their
+//! Runtime dispatch, authentication, schemas and MCP tool definitions keep their
 //! existing owners. In particular, the engine-free MCP crate does not depend on
 //! this module: the server compares its real tool list with this inventory.
 
@@ -521,7 +521,10 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         "/graphs/{graph_id}/query",
         Capability::Read,
         None,
-        Surface::bound(&["read"]),
+        Surface::restricted(
+            &["query"],
+            "query with source selects this route; with only a name it invokes a stored read.",
+        ),
         Surface::restricted(
             &["query"],
             "Ad-hoc source selects this route; a stored name selects query invoke.",
@@ -622,7 +625,8 @@ pub const CLI_ONLY_OPERATIONS: &[CliOnlyOperation] = &[
     cli_only("init", STORAGE),
     cli_only("upgrade", STORAGE),
     cli_only("optimize", STORAGE),
-    cli_only("rebuild-full-text-indexes", STORAGE),
+    cli_only("index build", STORAGE),
+    cli_only("index rebuild", STORAGE),
     cli_only("repair", STORAGE),
     cli_only("cleanup", STORAGE),
     cli_only("lint", LOCAL),
@@ -646,7 +650,7 @@ pub const CLI_ONLY_OPERATIONS: &[CliOnlyOperation] = &[
     cli_only("cluster history", MANAGED),
     cli_only("cluster cancel", MANAGED),
     cli_only("organization members list", MANAGED),
-    cli_only("organization members apply", MANAGED),
+    cli_only("organization members set", MANAGED),
     cli_only("organization members offboard", MANAGED),
     cli_only("organization invitations list", MANAGED),
     cli_only("organization invitations send", MANAGED),

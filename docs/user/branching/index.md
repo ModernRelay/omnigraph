@@ -28,6 +28,19 @@ omnigraph branch list --target ./graph.omni
 omnigraph branch delete review/abandoned --target ./graph.omni
 ```
 
+`branch list --detailed` (served: `GET /branches?detailed=true`; MCP:
+`branches_list` with `detailed`) adds a `details` array. Per branch it reports
+`head`, the commit a read sees; `from` and `from_commit_id`, the branch and
+commit it started from, as its create receipt named them (a later merge moves
+the merge base, not these); `created_at`, recorded to the second; and
+`updated_at`, the newest commit's time, or `created_at` while the branch has
+written none. Times are Unix microseconds. `main` omits `from`,
+`from_commit_id` and `created_at`. A branch deleted and created again reports
+its new creation. Each branch costs a read of its own manifest, two once it has
+written a commit, whatever its history, and the branches are not read as one
+cut. The served listing needs the `read` that `GET /branches` needs, and has
+details only for branches the caller may `read`.
+
 Creating a branch defaults to `main` when `--from` is omitted. To start a
 branch at a past commit instead of a branch head, use `--from-commit`; see
 [start a branch at a commit](#start-a-branch-at-a-commit). A load can create a

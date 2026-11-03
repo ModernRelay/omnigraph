@@ -17,8 +17,8 @@ use omnigraph_compiler::types::ScalarType;
 use omnigraph_planner::{EndpointProbe, ValidateAccess, ValidateRemoval, ValidateSpec};
 
 use super::kernels::{
-    CardPlan, FinalKeys, Position, SharedFirstHolders, UniqueImage, UniquePartial, card_affected,
-    card_violations, merge_unique_image, orphan_violation, orphans_retained, unique_coalesced_dups,
+    CardPlan, FinalKeys, Position, SharedFirstHolders, UniqueImage, UniquePartial,
+    merge_unique_image, orphan_violation, orphans_retained, unique_coalesced_dups,
     unique_committed_collisions, unique_probe_keys,
 };
 use super::key_set::{IntKeySet, IntKeySetLayout, canonical_i64, key_bytes};
@@ -89,6 +89,7 @@ pub(crate) async fn judge_load(
         base,
         mode,
         batches,
+        batches.iter().map(RecordBatch::num_rows).sum(),
         extracted,
         admission,
     )
@@ -101,6 +102,7 @@ pub(crate) async fn judge_load(
 /// the plan's word on the ids an overwrite removes: under `Scan` they are
 /// found before the checks run, under `None` the plan carries no check that
 /// reads them, which the committed table's row count must bear out.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn judge_load_swept(
     table: &str,
     checks: &[ValidateSpec],
@@ -109,6 +111,7 @@ pub(crate) async fn judge_load_swept(
     base: &Snapshot,
     mode: LoadMode,
     batches: &[RecordBatch],
+    delta_rows: usize,
     mut extracted: Extracted,
     admission: &mut LoadAdmission<'_>,
 ) -> Result<()> {
@@ -157,6 +160,7 @@ pub(crate) async fn judge_load_swept(
             committed: Some(cached_base.as_ref().unwrap_or(base)),
             overwritten: overwrite.then(|| table.to_string()).into_iter().collect(),
             live: None,
+            opened: Default::default(),
         };
         match &spec.check {
             ValidateCheck::Value { .. } => first.refuse(extracted.value.take())?,
@@ -186,7 +190,7 @@ pub(crate) async fn judge_load_swept(
                 }
             }
             ValidateCheck::EdgeRi { .. } => {
-                if edge_ri_judged || batches.iter().all(|batch| batch.num_rows() == 0) {
+                if edge_ri_judged || delta_rows == 0 {
                     continue;
                 }
                 edge_ri_judged = true;
@@ -244,31 +248,53 @@ pub(crate) async fn judge_load_swept(
                 if edge_type.cardinality.is_default() {
                     continue;
                 }
+                // An overwrite's committed view is empty, but a source of the
+                // replaced image the delta leaves without an edge is below the
+                // minimum; only the plan's scan of those sources finds it.
+                if overwrite
+                    && edge_type.cardinality.min > 0
+                    && spec.access != Some(ValidateAccess::Scan)
+                {
+                    return Err(OmniError::manifest_internal(format!(
+                        "Validate: the plan reads the replaced sources of {table} under {:?}, \
+                         not a scan, so a source the overwrite empties would go uncounted",
+                        spec.access
+                    )));
+                }
                 let delta_by_id = std::mem::take(&mut extracted.card);
                 let plan = CardPlan {
                     changed_ids: delta_by_id.keys().cloned().collect(),
                     delta_by_id,
                     removed_ids: Vec::new(),
                 };
-                let moved_from = committed
-                    .committed_edges(table, system_columns.id, &plan.changed_ids, system_columns)
-                    .await?;
-                let affected = card_affected(&plan, &[], &moved_from, &HashSet::new());
-                if affected.is_empty() {
-                    continue;
-                }
-                let affected_ids: Vec<String> = affected.iter().cloned().collect();
-                let committed_for_affected = committed
-                    .committed_edges(table, system_columns.src, &affected_ids, system_columns)
-                    .await?;
-                card_violations(
+                super::evaluate_cardinality(
                     table,
                     edge_type,
                     &plan,
-                    &affected,
-                    &committed_for_affected,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                    &committed,
+                    system_columns,
                     &mut first.sink(),
-                )?;
+                )
+                .await?;
+                first.refuse_pending()?;
+            }
+            ValidateCheck::SourceCardinality { edge_table, .. } => {
+                // A node load adds and removes no edge, so the evaluator's rule
+                // counts each written node's committed edges; a new one has none.
+                let edge_type = edge_type_of(catalog, edge_table)?;
+                super::evaluate_cardinality(
+                    edge_table,
+                    edge_type,
+                    &CardPlan::default(),
+                    &extracted.ids,
+                    &HashSet::new(),
+                    &committed,
+                    system_columns,
+                    &mut first.sink(),
+                )
+                .await?;
                 first.refuse_pending()?;
             }
             ValidateCheck::RetainedEdges { edge_table, .. } => {
@@ -383,8 +409,10 @@ impl SweepPlan {
             needs_value: checks
                 .iter()
                 .any(|spec| matches!(spec.check, ValidateCheck::Value { .. })),
-            needs_ids: checks.iter().any(|spec| {
-                matches!(spec.check, ValidateCheck::Unique { .. }) && spec.consults.is_some()
+            needs_ids: checks.iter().any(|spec| match spec.check {
+                ValidateCheck::Unique { .. } => spec.consults.is_some(),
+                ValidateCheck::SourceCardinality { .. } => true,
+                _ => false,
             }),
             needs_card: checks
                 .iter()
@@ -402,6 +430,11 @@ impl SweepPlan {
     /// Whether the partitions probe the endpoint checks as they sweep.
     pub(crate) fn sweeps_endpoints(&self) -> bool {
         !self.endpoints.is_empty()
+    }
+
+    /// Whether a uniqueness check's holders are sized and shared.
+    pub(crate) fn has_unique_holders(&self) -> bool {
+        !self.unique_holders.is_empty()
     }
 
     /// Every uniqueness check's holders sized for `rows` once, the first time
@@ -469,6 +502,7 @@ pub(crate) async fn admit_swept_sets(
         committed: Some(base),
         overwritten: overwrite.then(|| table.to_string()).into_iter().collect(),
         live: None,
+        opened: Default::default(),
     };
     let mut admitted = AdmittedSets {
         tables: Vec::new(),
@@ -514,7 +548,7 @@ impl AdmittedSets {
         for (node_type, ds, bound) in self.tables {
             let mut keys = Vec::with_capacity(bound);
             if let Some(ds) = ds.filter(|_| bound > 0) {
-                scan_int_ids(&ds, system_columns.id, &mut keys, bound).await?;
+                scan_int_ids(&ds, system_columns.id, &mut keys, bound, &|_| true).await?;
             }
             let layout = IntKeySetLayout::new(keys.len())
                 .ok_or_else(|| integer_capacity_error(keys.len()))?;
@@ -663,7 +697,8 @@ pub(crate) struct Extracted {
     /// The first value violation: the first constraint in declaration order
     /// with a violating row anywhere in the delta, at its earliest row.
     value: Option<Violation>,
-    /// Every non-null id of the delta.
+    /// Every non-null id of the delta, when a consulted uniqueness or a
+    /// source cardinality check reads it.
     ids: HashSet<String>,
     /// Per uniqueness check (by list index): its image and the first key
     /// repeated anywhere in the input.
@@ -1435,6 +1470,7 @@ mod tests {
             &snapshot,
             LoadMode::Overwrite,
             &batches,
+            3,
             Extracted::sweep("node:Person", &checks, &catalog, &batches, sc, true).unwrap(),
             &mut LoadAdmission {
                 phase: None,
@@ -1466,6 +1502,7 @@ mod tests {
             &snapshot,
             LoadMode::Overwrite,
             &batches,
+            3,
             Extracted::sweep("node:Person", &pruned, &catalog, &batches, sc, true).unwrap(),
             &mut LoadAdmission {
                 phase: None,

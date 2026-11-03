@@ -110,6 +110,20 @@ pub(crate) struct GraphCoordinator {
     bound_branch: Option<String>,
 }
 
+/// An operation-local copy of the exact immutable view: table state and head
+/// copied (O(tables)), history cache and Lance session shared; a publish or
+/// refresh runs on the copy and installs it (`Omnigraph::install_coordinator`).
+impl Clone for GraphCoordinator {
+    fn clone(&self) -> Self {
+        Self {
+            root_uri: self.root_uri.clone(),
+            storage: Arc::clone(&self.storage),
+            manifest: self.manifest.capture(),
+            bound_branch: self.bound_branch.clone(),
+        }
+    }
+}
+
 /// What a merge reads of one captured branch beside its write transaction: the
 /// captured head's record, the buffer of the `__manifest` version that holds
 /// it, and the commit graph that can load that exact head's lineage if needed.
@@ -328,12 +342,7 @@ impl GraphCoordinator {
     /// state and the head are copied; the history cache and the Lance session
     /// are shared. Callers must first probe the complete manifest incarnation.
     pub(crate) fn capture_for_branch_control(&self) -> Self {
-        Self {
-            root_uri: self.root_uri.clone(),
-            storage: Arc::clone(&self.storage),
-            manifest: self.manifest.capture(),
-            bound_branch: self.bound_branch.clone(),
-        }
+        self.clone()
     }
 
     pub fn root_uri(&self) -> &str {
@@ -478,6 +487,25 @@ impl GraphCoordinator {
     /// commits are the first-parent run that ends at the head.
     pub(crate) fn holds_commit(&self, commit_id: &str) -> bool {
         self.manifest.held_commit(commit_id).is_some()
+    }
+
+    /// Whether `descendant`, a commit of this coordinator's branch, descends
+    /// from `commit_id` through first parents with no merge commit after it:
+    /// the head and the buffered commits answer with no read,
+    /// [`descends_linearly_from_in`] walks the chain below them.
+    pub(crate) async fn descends_linearly_from(
+        &self,
+        descendant: &str,
+        commit_id: &str,
+        generation: u64,
+    ) -> Result<bool> {
+        descends_linearly_from_in(
+            &self.manifest.commit_graph(),
+            descendant,
+            commit_id,
+            Some(generation),
+        )
+        .await
     }
 
     pub async fn branch_list(&self) -> Result<Vec<String>> {
@@ -1082,6 +1110,22 @@ impl GraphCoordinator {
     }
 }
 
+/// Whether `descendant` descends from `commit_id` through first parents with
+/// no merge commit after it, walked in `graph`
+/// ([`CommitGraph::descends_linearly_from`]) a page of
+/// [`FIRST_PARENT_WALK_COMMITS`] at a time; a commit `__history` no longer
+/// holds answers `false`, and the caller takes the exact merge.
+pub(crate) async fn descends_linearly_from_in(
+    graph: &CommitGraph,
+    descendant: &str,
+    commit_id: &str,
+    generation: Option<u64>,
+) -> Result<bool> {
+    graph
+        .descends_linearly_from(descendant, commit_id, generation, FIRST_PARENT_WALK_COMMITS)
+        .await
+}
+
 /// Commits one step of a whole-chain walk reads before the next.
 const FIRST_PARENT_WALK_COMMITS: usize = 1024;
 
@@ -1181,7 +1225,7 @@ mod tests {
                             assert_eq!(error.kind, crate::error::ManifestErrorKind::Internal);
                             assert_eq!(error.message, CAPTURE_ERROR);
                             assert!(error.details.is_none());
-                            assert!(!error.publication_in_doubt);
+                            assert!(error.publication_in_doubt.is_none());
                         }
                         error => panic!("unexpected capture error: {error:?}"),
                     }
@@ -1416,6 +1460,6 @@ mod tests {
             error.message
         );
         assert!(error.details.is_none());
-        assert!(!error.publication_in_doubt);
+        assert!(error.publication_in_doubt.is_none());
     }
 }

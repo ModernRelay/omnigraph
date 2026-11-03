@@ -214,7 +214,7 @@ and the [managed command reference](reference.md#managed-cluster-commands).
 
 For `query` and `alias`, output selection follows `--json`, then `--format`,
 then operator `defaults.output`, then `table`. Aliases have no format field.
-Structured execution errors use the selected JSON or JSONL format. Mutations
+Structured execution errors use the selected JSON, JSONL, or TOON format. Mutations
 require explicit `--json` for structured errors. Target diagnostics go to
 stderr and cannot be suppressed by a quiet flag.
 
@@ -237,7 +237,7 @@ omnigraph skill export ~/.claude/skills/omnigraph --force --json
 omnigraph skill show references/queries.md
 ```
 
-The binary carries the agent skill matching its commands and HTTP contract.
+Running `omnigraph` or `omnigraph help` says to call that skill before a first schema or query. The binary carries the agent skill matching its commands and HTTP contract.
 Export refuses existing files unless `--force`; a later forced export removes
 obsolete recorded files only while their bytes remain unchanged. Neither
 command reads operator configuration or contacts a server.

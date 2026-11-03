@@ -48,14 +48,21 @@ pub(super) fn texts(names: [&str; 2], batches: &[&[(&str, &str)]]) -> Arc<dyn Ex
 /// batch.
 pub(super) fn context(limit: usize, size: usize) -> (Arc<dyn MemoryPool>, Arc<TaskContext>) {
     let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
-    let resources = Arc::new(QueryResources::new(Arc::clone(&pool), limit as u64));
+    (Arc::clone(&pool), context_over(pool, limit, size))
+}
+
+/// A task context over `pool`, whose query limit is `limit` bytes, `size`
+/// rows a batch.
+pub(super) fn context_over(
+    pool: Arc<dyn MemoryPool>,
+    limit: usize,
+    size: usize,
+) -> Arc<TaskContext> {
+    let resources = Arc::new(QueryResources::new(pool, limit as u64));
     let config = SessionConfig::new()
         .with_batch_size(size)
         .with_extension(resources);
-    (
-        pool,
-        Arc::new(TaskContext::default().with_session_config(config)),
-    )
+    Arc::new(TaskContext::default().with_session_config(config))
 }
 
 /// The `(m.mid, p.pid)` pairs of each of `batches`.

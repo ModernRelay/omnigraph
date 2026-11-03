@@ -70,6 +70,9 @@ pub fn admit_served(case: &Case) -> Result<(), String> {
     if case.csv_slice_bytes.is_some() {
         refused.push("the `# csv_slice_bytes:` pin".to_string());
     }
+    if case.overwrite_chunk_rows.is_some() {
+        refused.push("the `# overwrite_chunk_rows:` pin".to_string());
+    }
     if case.needs_indices {
         refused.push("queries that need indices (search, fuzzy, nearest, rrf)".to_string());
     }

@@ -751,12 +751,82 @@ impl CommitGraph {
         start: &str,
         limit: usize,
     ) -> Result<Option<FirstParentPage>> {
+        let (commits, end) = self.read_first_parents(start, limit).await?;
+        match end {
+            ChainEnd::Missing(_) if commits.is_empty() => Ok(None),
+            ChainEnd::Missing(id) => Err(missing_parent(&id)),
+            ChainEnd::Root => Ok(Some(FirstParentPage {
+                commits,
+                next: None,
+            })),
+            ChainEnd::Next(next) => Ok(Some(FirstParentPage {
+                commits,
+                next: Some(next),
+            })),
+        }
+    }
+
+    /// Whether `descendant` descends from `commit_id` through first parents
+    /// with no merge commit after it: `commit_id` is on the first-parent chain
+    /// from `descendant`, read as [`Self::first_parent_page`] reads it, `limit`
+    /// commits at a time, and no commit above it on that chain names a merged
+    /// parent. The walk stops at the commit, at the first merge commit above
+    /// it, or at the first commit below the commit's own generation, so the
+    /// reads follow the distance between the two. `generation` is that
+    /// generation when the caller knows it; otherwise the commit is read
+    /// first. A commit neither the held commits nor `__history` hold, either
+    /// end or one the chain names, ends the walk with `false`: the caller's
+    /// fallback needs no lineage.
+    pub async fn descends_linearly_from(
+        &self,
+        descendant: &str,
+        commit_id: &str,
+        generation: Option<u64>,
+        limit: usize,
+    ) -> Result<bool> {
+        if descendant == commit_id {
+            return Ok(true);
+        }
+        let generation = match generation {
+            Some(generation) => generation,
+            None => match self.read_first_parents(commit_id, 1).await?.0.first() {
+                Some(commit) => commit.generation,
+                None => return Ok(false),
+            },
+        };
+        let mut start = descendant.to_string();
+        loop {
+            let (commits, end) = self.read_first_parents(&start, limit).await?;
+            for commit in &commits {
+                if commit.graph_commit_id == commit_id {
+                    return Ok(true);
+                }
+                if commit.merged_parent_commit_id.is_some() || commit.generation < generation {
+                    return Ok(false);
+                }
+            }
+            match end {
+                ChainEnd::Next(next) => start = next,
+                ChainEnd::Root | ChainEnd::Missing(_) => return Ok(false),
+            }
+        }
+    }
+
+    /// Up to `limit` commits of the first-parent chain from `start`, newest
+    /// first, and how the run ended.
+    async fn read_first_parents(
+        &self,
+        start: &str,
+        limit: usize,
+    ) -> Result<(Vec<GraphCommit>, ChainEnd)> {
         let settled = self.history.held();
         let mut read: HashMap<String, GraphCommit> = HashMap::new();
         let mut commits: Vec<GraphCommit> = Vec::with_capacity(limit.min(PAGE_PREALLOCATED));
         let mut next = Some(start.to_string());
         while commits.len() < limit {
-            let Some(id) = next.take() else { break };
+            let Some(id) = next.take() else {
+                return Ok((commits, ChainEnd::Root));
+            };
             let held = self
                 .held
                 .get(&id)
@@ -781,8 +851,7 @@ impl CommitGraph {
                     );
                     match read.get(&id) {
                         Some(commit) => commit.clone(),
-                        None if commits.is_empty() => return Ok(None),
-                        None => return Err(missing_parent(&id)),
+                        None => return Ok((commits, ChainEnd::Missing(id))),
                     }
                 }
             };
@@ -800,8 +869,22 @@ impl CommitGraph {
             next = commit.parent_commit_id.clone();
             commits.push(commit);
         }
-        Ok(Some(FirstParentPage { commits, next }))
+        Ok((
+            commits,
+            match next {
+                Some(next) => ChainEnd::Next(next),
+                None => ChainEnd::Root,
+            },
+        ))
     }
+}
+
+/// How a run of first parents ended: at the root, at the commit the next run
+/// starts from, or at a commit neither the held commits nor `__history` hold.
+enum ChainEnd {
+    Root,
+    Next(String),
+    Missing(String),
 }
 
 /// Commits a page reserves room for before it learns how long its chain is.

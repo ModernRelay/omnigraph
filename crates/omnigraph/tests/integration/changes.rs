@@ -164,6 +164,97 @@ async fn write_receipts_identify_exact_commits_and_mutation_noops() {
     );
 }
 
+/// A chain commit `__history` no longer holds answers the ancestry question
+/// `false`: a two-point diff whose walk from the head meets the missing block
+/// before `from`'s generation takes the exact merge instead of refusing.
+#[tokio::test]
+async fn graph_diff_takes_the_exact_merge_below_a_missing_history_block() {
+    use crate::helpers::cost::measure;
+    use omnigraph::changes::{GraphDiffRequest, GraphDiffSides};
+    use omnigraph_core::graph_commit_id::parse_history_block_id;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(root, "node Person {\n    name: String @key\n}\n")
+        .await
+        .unwrap();
+    let db = with_setting(&helpers::session(db), "history_release_bytes", "2048");
+    let block_of = |id: &str| parse_history_block_id(id).unwrap().unwrap().block;
+    let mut published: Vec<String> = Vec::new();
+    let mut blocks = Vec::new();
+    for load in 0..256 {
+        let line = format!(r#"{{"type":"Person","data":{{"name":"p{load:03}"}}}}"#);
+        let receipt = db
+            .load_with_receipt("main", &line, LoadMode::Append)
+            .await
+            .unwrap();
+        published.push(receipt.commit.graph_commit_id);
+        blocks = published.iter().map(|id| block_of(id)).collect();
+        blocks.dedup();
+        if blocks.len() == 4 {
+            break;
+        }
+    }
+    assert_eq!(
+        blocks.len(),
+        4,
+        "256 loads under 2048 bytes opened fewer than four blocks, and a block reaches \
+         `__history` once the block after it has closed: {published:?}"
+    );
+    let released = dir
+        .path()
+        .join("__history")
+        .join("blocks")
+        .join(blocks[1].to_string());
+    let extents: Vec<_> = std::fs::read_dir(&released)
+        .map(|entries| entries.map(|entry| entry.unwrap().file_name()).collect())
+        .unwrap_or_default();
+    fn files_under(path: &std::path::Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
+            if entry.path().is_dir() {
+                files_under(&entry.path(), out);
+            } else {
+                out.push(entry.path().display().to_string());
+            }
+        }
+    }
+    let mut history = Vec::new();
+    files_under(&dir.path().join("__history"), &mut history);
+    assert!(
+        !extents.is_empty(),
+        "the second block was released to `__history`: {released:?}; blocks {blocks:?}; \
+         history holds {history:#?}"
+    );
+    std::fs::remove_dir_all(&released).unwrap();
+
+    let request = GraphDiffRequest {
+        sides: GraphDiffSides::Between {
+            from: published[0].clone(),
+            to: "main".to_string(),
+        },
+        scope: ChangeFeedScope::default(),
+        page_token: None,
+        max_changes: None,
+        max_bytes: None,
+    };
+    let (page, io) = measure(db.diff_page(&request)).await;
+    let page = page.unwrap();
+    assert_eq!(page.changes.len(), published.len() - 1);
+    assert!(
+        page.changes
+            .iter()
+            .all(|change| change.op == ChangeOpKind::Insert)
+    );
+    assert_eq!(
+        (
+            io.change_intervals_row_identity,
+            io.change_intervals_exact_merge
+        ),
+        (0, 1),
+        "the missing page answers `false` and the exact merge runs"
+    );
+}
+
 #[tokio::test]
 async fn diff_empty_when_nothing_changed() {
     let dir = tempfile::tempdir().unwrap();
@@ -3299,6 +3390,181 @@ async fn change_feed_merge_commit_is_first_parent_relative_with_merged_parent_on
         )],
         "only main's own divergence is main's change since the base"
     );
+}
+
+/// A fast-forward merge commit takes the source's table pins, whose history
+/// never read the target's. Main and feature each insert one person in their
+/// first commit after the fork, which Lance gives one row id and one version
+/// stamp; feature merges main in, re-inserting main's person under a new row
+/// id, and main fast-forwards to feature. The fast forward's commit page, the
+/// feed across it and the two-point diff from its parent report feature's
+/// person alone, under every `change_lineage`.
+#[tokio::test]
+async fn commit_changes_feed_and_diff_across_a_fast_forward_report_the_source_rows() {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedStart};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    let main_after_eve = write_on(&db, "main", "insert_person", &person("Eve", 22)).await;
+    write_on(&db, "feature", "insert_person", &person("Frank", 60)).await;
+    let caught_up = db.branch_merge("main", "feature").await.unwrap();
+    assert_eq!(caught_up.outcome, MergeOutcome::Merged);
+    let fast_forward = db.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(fast_forward.outcome, MergeOutcome::FastForward);
+    let fast_forward = fast_forward
+        .commit
+        .expect("a fast forward publishes one commit");
+    assert_eq!(
+        fast_forward.parent_commit_id.as_deref(),
+        Some(main_after_eve.graph_commit_id.as_str()),
+        "the fast forward's first parent is main's head"
+    );
+
+    let expected = vec![(
+        "Person".to_string(),
+        "Frank".to_string(),
+        ChangeOpKind::Insert,
+    )];
+    for value in ["off", "on", "verify"] {
+        let session = with_setting(&db, "change_lineage", value);
+        let page = session
+            .commit_changes_page(
+                &fast_forward.graph_commit_id,
+                &ChangeFeedScope::default(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            diff_ops(&page.block.changes),
+            expected,
+            "commit page, change_lineage = {value}"
+        );
+
+        let feed = session
+            .poll_change_feed(feed_request(
+                None,
+                ChangeFeedPosition::Start(ChangeFeedStart::AfterCommit(
+                    main_after_eve.graph_commit_id.clone(),
+                )),
+            ))
+            .await
+            .unwrap();
+        let blocks: Vec<(&str, _)> = feed
+            .blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.cause.graph_commit_id.as_str(),
+                    diff_ops(&block.changes),
+                )
+            })
+            .collect();
+        assert_eq!(
+            blocks,
+            vec![(fast_forward.graph_commit_id.as_str(), expected.clone())],
+            "feed, change_lineage = {value}"
+        );
+
+        let diff = session
+            .diff_page(&diff_request(
+                between(&main_after_eve.graph_commit_id, "main"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            diff_ops(&diff.changes),
+            expected,
+            "two-point diff, change_lineage = {value}"
+        );
+    }
+}
+
+/// A branch review's later page decides row pairing from the commits its
+/// token names, not from the merge base now. Feature and main each insert one
+/// person in their first commit after the fork, which Lance gives one row id
+/// and one version stamp, feature inserts another and merges main in. The
+/// review's first page takes the exact merge, since the source merged its
+/// target. Main then fast-forwards to feature, which makes the source head
+/// the merge base now, while the token's window still crosses feature's merge
+/// commit. The next page must report feature's first person under every
+/// `change_lineage`, not main's.
+#[tokio::test]
+async fn branch_diff_continuation_after_a_fast_forward_reports_the_source_rows() {
+    use omnigraph::changes::GraphDiffSides;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    write_on(&db, "feature", "insert_person", &person("Yara", 30)).await;
+    let main_after_xena = write_on(&db, "main", "insert_person", &person("Xena", 40)).await;
+    write_on(&db, "feature", "insert_person", &person("Abe", 50)).await;
+    assert_eq!(
+        db.branch_merge("main", "feature").await.unwrap().outcome,
+        MergeOutcome::Merged
+    );
+
+    let request = diff_request(
+        GraphDiffSides::Branch {
+            source: "feature".to_string(),
+            target: "main".to_string(),
+        },
+        Some(1),
+    );
+    let mut first_pages = Vec::new();
+    for value in ["off", "on", "verify"] {
+        let session = with_setting(&db, "change_lineage", value);
+        let first = session.diff_page(&request).await.unwrap();
+        assert_eq!(
+            first.from_commit_id, main_after_xena.graph_commit_id,
+            "feature merged main in, so the base is main's head"
+        );
+        first_pages.push((value, session, first));
+    }
+
+    assert_eq!(
+        db.branch_merge("feature", "main").await.unwrap().outcome,
+        MergeOutcome::FastForward
+    );
+    let base = db.merge_base("feature", "main").await.unwrap();
+    assert_eq!(
+        base.merge_base.graph_commit_id, base.source_commit_id,
+        "after the fast forward the source head is the merge base"
+    );
+
+    for (value, session, first) in first_pages {
+        let mut changes = diff_ops(&first.changes);
+        let mut token = first.next_page_token.clone();
+        let mut request = request.clone();
+        while let Some(next) = token {
+            request.page_token = Some(next);
+            let page = session.diff_page(&request).await.unwrap();
+            assert_eq!(page.from_commit_id, first.from_commit_id);
+            assert_eq!(page.to_commit_id, first.to_commit_id);
+            changes.extend(diff_ops(&page.changes));
+            token = page.next_page_token;
+        }
+        assert_eq!(
+            changes,
+            vec![
+                (
+                    "Person".to_string(),
+                    "Abe".to_string(),
+                    ChangeOpKind::Insert
+                ),
+                (
+                    "Person".to_string(),
+                    "Yara".to_string(),
+                    ChangeOpKind::Insert
+                ),
+            ],
+            "branch review across a later fast forward, change_lineage = {value}"
+        );
+    }
 }
 
 #[tokio::test]

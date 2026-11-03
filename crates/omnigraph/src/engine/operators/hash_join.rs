@@ -256,7 +256,7 @@ struct Probe {
 /// How the probe reaches the destination rows, once the build was tried.
 enum Side {
     Pending,
-    Hashed(Built),
+    Hashed(Box<Built>),
     Lookup(Lookup),
     /// The build held no row: nothing joins, the probe stops.
     Empty,
@@ -275,7 +275,7 @@ impl Probe {
                 if built.batch.num_rows() == 0 {
                     Side::Empty
                 } else {
-                    Side::Hashed(built)
+                    Side::Hashed(Box::new(built))
                 }
             }
             Err(error) if self.fallback.is_some() && OmniError::is_query_memory_failure(&error) => {

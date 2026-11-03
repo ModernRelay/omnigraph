@@ -379,6 +379,7 @@ pub(super) async fn execute_node_scan(
     };
     scan_report.probes.clear();
     scan_report.ann_metrics.clear();
+    scan_report.exact = false;
     let mut last_rung: Option<(usize, u64)> = None;
     let mut final_summary: Option<(Option<u64>, Option<u64>)> = None;
     let (batches, attempt_memory) = loop {
@@ -386,6 +387,7 @@ pub(super) async fn execute_node_scan(
             .child("v2 scan attempt")
             .map_err(|error| memory.error(error))?;
         if scan_proven_empty {
+            scan_report.exact = true;
             break (Vec::new(), attempt_memory);
         }
         let scan_stats: Arc<
@@ -467,6 +469,23 @@ pub(super) async fn execute_node_scan(
             flat: !use_index,
             rows,
         });
+        let unreached = batches_hold_infinite_distance(&batches);
+        // Every vector index the engine builds is IVF_FLAT, which scores
+        // every row of a partition it searches exactly, so an attempt that
+        // searched every partition ranked exactly; Lance reports neither
+        // partition counter when no index covers the column and it scores
+        // every row flat. A row the prefilter admitted and the search did
+        // not reach comes back at `+inf`, out of its place.
+        let every_partition = match summary {
+            Some((None, None)) => true,
+            Some((Some(searched), Some(ranked))) => searched >= ranked,
+            _ => false,
+        };
+        scan_report.exact = !use_index
+            || (!unreached
+                && (every_partition
+                    || known_matches.is_some_and(|matches| rows >= matches)
+                    || rows as u64 >= type_rows));
         if !use_index {
             break (batches, attempt_memory);
         }
@@ -479,7 +498,7 @@ pub(super) async fn execute_node_scan(
             *k,
             known_matches,
             dataset_rows,
-            batches_hold_infinite_distance(&batches),
+            unreached,
             summary,
             probe_budget,
             last_rung,

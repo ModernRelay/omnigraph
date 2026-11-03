@@ -24,7 +24,9 @@ the time spent on each storage request. A re-issue that creates the version
 publishes the commit once. A version that already exists is read
 back: it holds either this commit, and the write succeeds, or another commit,
 and the write meets an ordinary conflict. Re-issuing the same conditional
-request never publishes a duplicate.
+request never publishes a duplicate. When a re-issue meets a version already
+held and the read-back then finds it missing, the outcome stays unknown rather
+than failed: on S3 that conflict can answer the first request, still landing.
 
 ## Unknown publications
 
@@ -94,13 +96,16 @@ restart on failure (Railway `ON_FAILURE`, Kubernetes `restartPolicy: Always`).
 - The lock's owner renews the lease with heartbeat objects under
   `__cluster/lease/` every third of a lease. Heartbeats retry on their own, and
   one whose answer was lost counts once a retry finds it. When no heartbeat
-  is answered for two thirds of a lease, or a successor claims the lock, the
-  owner stops every storage write at once and exits 2 without releasing. A
-  server whose first heartbeat is not answered within that time does not
-  start serving.
+  is answered for two thirds of a lease, the owner stops every storage write,
+  even after a pause of its whole process, and exits 2 without releasing. It stops the same way at its next
+  heartbeat, at most a third of a lease later, when a successor has claimed
+  the lock or `lock.json` no longer names it (after a takeover or a
+  `cluster force-unlock` of its ID). A server whose first heartbeat is not
+  answered within that time does not start serving.
 - A restarted server that finds the lock held watches those heartbeats. It
   refuses with `state_lock_held` while they continue, and takes the lock over
-  once they have been silent for a lease and a half.
+  once they have been silent for a lease and a half. A takeover leaves the
+  previous owner's lease directory, its claim and last heartbeats, in place.
 - The lease is 30 seconds by default, so a restart after a crash waits about
   45 seconds. `OMNIGRAPH_CLUSTER_LEASE_SECONDS` sets it between 2 and 600
   seconds; a successor waits on the value the owner recorded.
@@ -127,7 +132,9 @@ paths; each records the failure's class.
 
 - `engine failure without definite completion evidence`: the failure's class,
   the status its response sends, and whether its uncertainty is scoped to its
-  storage keys.
+  storage keys. When the failure is a publication whose outcome is unknown, its
+  `publication` field names the graph commit, so you can look the commit up
+  later and see whether it landed.
 - `owned write ended without a definite outcome`: the status its response
   sends, 500 for `outcome_unknown`, and whether it contained the process.
 - `manifest request outcome unknown; re-issuing the identical conditional
@@ -141,3 +148,17 @@ paths; each records the failure's class.
 - `took over a silent owner's cluster lock` when a restarted server takes over
   its predecessor's lock, and an error when an owner's lease lapses or another
   server claims it.
+
+## Rust error API
+
+Rust embedders updating from 0.14.0 must pass the publication's graph commit ID
+before the diagnostic message to
+`OmniError::manifest_publish_in_doubt(graph_commit_id, message)`. The ID must
+name the attempted publication; do not substitute a storage path or invent an
+ID when the outcome is unknown.
+
+`ManifestError.publication_in_doubt` changes from `bool` to
+`Option<Box<String>>`: `Some` carries that commit ID, and `None` means this is
+not an in-doubt publication. Prefer the constructor over struct literals, and
+use `is_manifest_publish_in_doubt()` or `publication_id()` to inspect an
+`OmniError`. HTTP error responses and CLI syntax are unchanged.

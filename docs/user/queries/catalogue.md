@@ -157,6 +157,7 @@ binary's rows.
 | name | kind | default | scope |
 |---|---|---|---|
 | ann_nprobes | integer(0..) | 20 | request |
+| change_lineage | enum(off, on, verify) | on | request |
 | engine | enum(v2) | v2 | request |
 | explain_dump_dir | text |  | process |
 | history_release_bytes | integer(1024..=262144) | 262144 | request |

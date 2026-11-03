@@ -1,0 +1,167 @@
+# issue: 969
+# red_on: none on main, where every step took the exact merge (the fix is a cost change, gated in changes_cost.rs); the sibling-heads step went red on the row-identity rule before its ancestry guard, which dropped erin's update.
+# notes: A graph diff whose window spans several commits pairs the two versions' live rows by
+# notes: stable row id and compares their version stamps (`change_lineage`); the exact merge of
+# notes: both versions checks every answer in a debug build. The window folds two updates of one
+# notes: row, a delete, a delete and reinsert, an insert and an edge insert; `change_lineage = off`,
+# notes: set in the diff's own request so the served runner carries it, answers the same rows. Two sibling branches that update one row with equal-length values
+# notes: stamp it alike, so the diff of their heads takes the exact merge, and a window from a
+# notes: commit before the fork into a sibling pairs rows across the fork.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+edge Knows: Person -> Person {
+    since: I32? @key(@src, @dst)
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Person","data":{"name":"bob","age":40}}
+{"type":"Person","data":{"name":"carol","age":20}}
+{"type":"Person","data":{"name":"dave","age":50}}
+{"edge":"Knows","from":"alice","to":"bob"}
+
+--- mutate
+query mark() {
+    insert Person { name: "start", age: 0 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $start
+
+--- mutate
+query alice_ages() {
+    update Person set { age: 31 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query alice_ages_again() {
+    update Person set { age: 32 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query erin_arrives() {
+    insert Person { name: "erin", age: 25 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query dave_leaves() {
+    delete Person where name = "dave"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query carol_leaves() {
+    delete Person where name = "carol"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query carol_returns_older() {
+    insert Person { name: "carol", age: 21 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query carol_knows_erin() {
+    insert Knows { from: "carol", to: "erin", since: 2024 }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- query
+branch diff "${start}" to main
+
+--- expect ordered
+{"after":{"properties":{"age":32,"name":"alice"}},"before":{"properties":{"age":30,"name":"alice"}},"id":"alice","kind":"node","op":"update","type":"Person"}
+{"after":{"properties":{"age":21,"name":"carol"}},"before":{"properties":{"age":20,"name":"carol"}},"id":"carol","kind":"node","op":"update","type":"Person"}
+{"before":{"properties":{"age":50,"name":"dave"}},"id":"dave","kind":"node","op":"delete","type":"Person"}
+{"after":{"properties":{"age":25,"name":"erin"}},"id":"erin","kind":"node","op":"insert","type":"Person"}
+{"after":{"endpoints":{"from":"carol","to":"erin"},"properties":{"since":2024}},"id":"[\"carol\",\"erin\"]","kind":"edge","op":"insert","type":"Knows"}
+
+--- query
+set change_lineage = off;
+branch diff "${start}" to main
+
+--- expect ordered
+{"after":{"properties":{"age":32,"name":"alice"}},"before":{"properties":{"age":30,"name":"alice"}},"id":"alice","kind":"node","op":"update","type":"Person"}
+{"after":{"properties":{"age":21,"name":"carol"}},"before":{"properties":{"age":20,"name":"carol"}},"id":"carol","kind":"node","op":"update","type":"Person"}
+{"before":{"properties":{"age":50,"name":"dave"}},"id":"dave","kind":"node","op":"delete","type":"Person"}
+{"after":{"properties":{"age":25,"name":"erin"}},"id":"erin","kind":"node","op":"insert","type":"Person"}
+{"after":{"endpoints":{"from":"carol","to":"erin"},"properties":{"since":2024}},"id":"[\"carol\",\"erin\"]","kind":"edge","op":"insert","type":"Knows"}
+
+--- mutate
+branch create sibling_a
+
+--- expect ok
+
+--- mutate
+branch create sibling_b
+
+--- expect ok
+
+--- mutate branch: sibling_a
+query erin_ages_on_a() {
+    update Person set { age: 26 } where name = "erin"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $on_a
+
+--- mutate branch: sibling_b
+query erin_ages_on_b() {
+    update Person set { age: 27 } where name = "erin"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $on_b
+
+--- query
+reset change_lineage;
+branch diff "${on_a}" to "${on_b}"
+
+--- expect ordered
+{"kind":"node","type":"Person","id":"erin","op":"update","before":{"properties":{"name":"erin","age":26}},"after":{"properties":{"name":"erin","age":27}}}
+
+--- query
+branch diff "${start}" to sibling_a
+
+--- expect ordered
+{"after":{"properties":{"age":32,"name":"alice"}},"before":{"properties":{"age":30,"name":"alice"}},"id":"alice","kind":"node","op":"update","type":"Person"}
+{"after":{"properties":{"age":21,"name":"carol"}},"before":{"properties":{"age":20,"name":"carol"}},"id":"carol","kind":"node","op":"update","type":"Person"}
+{"before":{"properties":{"age":50,"name":"dave"}},"id":"dave","kind":"node","op":"delete","type":"Person"}
+{"after":{"properties":{"age":26,"name":"erin"}},"id":"erin","kind":"node","op":"insert","type":"Person"}
+{"after":{"endpoints":{"from":"carol","to":"erin"},"properties":{"since":2024}},"id":"[\"carol\",\"erin\"]","kind":"edge","op":"insert","type":"Knows"}
+
+--- query
+branch diff sibling_a into main
+
+--- expect ordered
+{"kind":"node","type":"Person","id":"erin","op":"update","before":{"properties":{"name":"erin","age":25}},"after":{"properties":{"name":"erin","age":26}}}

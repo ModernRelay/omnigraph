@@ -271,6 +271,7 @@ impl std::error::Error for ApiContractError {}
 
 /// The explicit server root owns discovery, including any proxy path prefix.
 /// Never derive it from a graph URL: a proxy prefix may itself contain `graphs`.
+#[derive(Clone)]
 pub(crate) struct GraphHttpClient {
     operator_transport: Option<crate::operator_transport::CapturedTransport>,
     client: reqwest::Client,
@@ -460,6 +461,27 @@ impl GraphHttpClient {
 
     pub(crate) async fn send(&self, request: RequestBuilder) -> Result<Response> {
         let request = self.discovered(request).await?;
+        let bearer = self.validate_credential(&request)?;
+        crate::command_outcome::dispatched(request.method());
+        let mut response = self.client.execute(request).await?;
+        crate::command_outcome::response(response.status(), response.headers(), bearer.as_deref());
+        if !has_contract(&response) {
+            return Err(ApiContractError::response(response.status()).into());
+        }
+        if response.status() == StatusCode::UNAUTHORIZED
+            && bearer.is_none()
+            && let Some(missing) = &self.missing_credential
+        {
+            response
+                .extensions_mut()
+                .insert(MissingCredential::clone(missing));
+        }
+        Ok(response)
+    }
+
+    /// Discovery can outlive a credential. Check its exact bearer and
+    /// destination immediately before dispatch on both HTTP protocols.
+    fn validate_credential(&self, request: &reqwest::Request) -> Result<Option<String>> {
         let bearer = request
             .headers()
             .get(reqwest::header::AUTHORIZATION)
@@ -479,21 +501,7 @@ impl GraphHttpClient {
                 return Err(crate::credential_sources::CredentialError::BindingMismatch.into());
             }
         }
-        crate::command_outcome::dispatched(request.method());
-        let mut response = self.client.execute(request).await?;
-        crate::command_outcome::response(response.status(), response.headers(), bearer.as_deref());
-        if !has_contract(&response) {
-            return Err(ApiContractError::response(response.status()).into());
-        }
-        if response.status() == StatusCode::UNAUTHORIZED
-            && bearer.is_none()
-            && let Some(missing) = &self.missing_credential
-        {
-            response
-                .extensions_mut()
-                .insert(MissingCredential::clone(missing));
-        }
-        Ok(response)
+        Ok(bearer)
     }
 
     /// [`Self::send`] for `/mcp`, which follows the MCP transport instead of
@@ -503,6 +511,7 @@ impl GraphHttpClient {
     /// a 401 included, is the caller's to read.
     pub(crate) async fn send_mcp(&self, request: RequestBuilder) -> Result<Response> {
         let request = self.discovered(request).await?;
+        self.validate_credential(&request)?;
         Ok(self.client.execute(request).await?)
     }
 

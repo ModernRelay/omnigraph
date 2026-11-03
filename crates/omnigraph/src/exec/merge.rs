@@ -11,7 +11,8 @@ use crate::storage_layer::{
     KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, ProvenInsertChunk,
 };
 use crate::table_store::{
-    MATERIALIZED_BLOB_PAYLOAD_BYTES, certified_insert_absence_rows, is_full_text_declaration,
+    MATERIALIZED_BLOB_PAYLOAD_BYTES, certified_insert_absence_rows, deletion_file_identical,
+    fragment_data_identical, fragment_deletion_vector, is_index_only_commit,
 };
 use futures::StreamExt;
 use omnigraph_compiler::settings::MergeLineage;
@@ -994,9 +995,9 @@ fn opened_at_pin(dataset: &Dataset, entry: &crate::db::DatasetEntry) -> bool {
 }
 
 /// Walk the source's chain of commits by `read_version` links down to either
-/// base pin, certifying each as an exact-id fenced insert or a full-text
-/// declaration (which moves no row); the new fragments are the source's
-/// fragments the base lacks, and the rows are the chain's.
+/// base pin, certifying each as an exact-id fenced insert or an index-only
+/// commit (which moves no row); the new fragments are the source's fragments
+/// the base lacks, and the rows are the chain's.
 async fn proven_chain_fragments(
     source: &Dataset,
     base: &Dataset,
@@ -1010,7 +1011,7 @@ async fn proven_chain_fragments(
         let identity = crate::table_store::StagedTransactionIdentity::recorded_by(&dataset)?;
         crate::instrumentation::record_proven_insert_history_read();
         let transaction = dataset.read_transaction().await.ok()??;
-        let rows = if is_full_text_declaration(&transaction, identity.read_version) {
+        let rows = if is_index_only_commit(&transaction, identity.read_version) {
             0
         } else {
             certified_insert_absence_rows(
@@ -1891,125 +1892,6 @@ struct LineageMergePlan {
     source: Option<Dataset>,
     target: Option<Dataset>,
     candidate_chunks: DeleteIdChunks,
-}
-
-/// Resolve one data file to its physical identity: (owning root, relative
-/// path), with `base_id` resolved through the manifest's base paths. `None`
-/// when the referenced base path is missing — callers treat that fragment as
-/// changed (superset-safe).
-fn resolved_data_file_key<'a>(
-    dataset: &'a Dataset,
-    base_id: Option<u32>,
-    path: &'a str,
-) -> Option<(&'a str, &'a str)> {
-    let root = match base_id {
-        None => dataset.uri(),
-        Some(base_id) => dataset
-            .manifest
-            .base_paths
-            .get(&base_id)
-            .map(|base_path| base_path.path.as_str())?,
-    };
-    // The same local root appears both as `file:///abs/path` (dataset URIs)
-    // and bare `/abs/path` (stored base paths); strip the scheme so the two
-    // spellings of one root compare equal. Non-file schemes are untouched.
-    let root = root.strip_prefix("file://").unwrap_or(root);
-    Some((root.trim_end_matches('/'), path))
-}
-
-/// Whether two fragment incarnations hold byte-identical row data: same
-/// resolved data files (base-path indirection resolved on each side) and the
-/// same overlay list. Deletion state is compared separately — a deletion-file
-/// mismatch is self-correcting through the deletion-vector content diff.
-fn fragment_data_identical(
-    base_dataset: &Dataset,
-    base_meta: &lance_table::format::Fragment,
-    side_dataset: &Dataset,
-    side_meta: &lance_table::format::Fragment,
-) -> bool {
-    if base_meta.files.len() != side_meta.files.len()
-        || base_meta.overlays.len() != side_meta.overlays.len()
-    {
-        return false;
-    }
-    // Overlay data files carry `base_id` indirection exactly like fragment
-    // data files, and the same `base_id` number can resolve to different
-    // roots in the two manifests — so overlays must compare through resolved
-    // physical identity too, never raw struct equality. A false "identical"
-    // here is the one direction that breaks the candidate superset.
-    let overlays_identical = base_meta
-        .overlays
-        .iter()
-        .zip(side_meta.overlays.iter())
-        .all(|(base_overlay, side_overlay)| {
-            base_overlay.coverage == side_overlay.coverage
-                && base_overlay.committed_version == side_overlay.committed_version
-                && data_file_identical(
-                    base_dataset,
-                    &base_overlay.data_file,
-                    side_dataset,
-                    &side_overlay.data_file,
-                )
-        });
-    if !overlays_identical {
-        return false;
-    }
-    base_meta
-        .files
-        .iter()
-        .zip(side_meta.files.iter())
-        .all(|(base_file, side_file)| {
-            data_file_identical(base_dataset, base_file, side_dataset, side_file)
-        })
-}
-
-/// Whether two data-file references name the same physical file with the same
-/// column layout, `base_id` indirection resolved on each side.
-fn data_file_identical(
-    base_dataset: &Dataset,
-    base_file: &lance_table::format::DataFile,
-    side_dataset: &Dataset,
-    side_file: &lance_table::format::DataFile,
-) -> bool {
-    base_file.fields == side_file.fields
-        && base_file.column_indices == side_file.column_indices
-        && match (
-            resolved_data_file_key(base_dataset, base_file.base_id, &base_file.path),
-            resolved_data_file_key(side_dataset, side_file.base_id, &side_file.path),
-        ) {
-            (Some(base_key), Some(side_key)) => base_key == side_key,
-            _ => false,
-        }
-}
-
-/// Whether two deletion-file references name the same physical deletion file.
-/// `(read_version, id, file_type, base_id)` pins the uniquely-named file; a
-/// false negative only costs two deletion-vector reads whose content diff
-/// comes back empty (superset-safe).
-fn deletion_file_identical(
-    base_meta: &lance_table::format::Fragment,
-    side_meta: &lance_table::format::Fragment,
-) -> bool {
-    match (&base_meta.deletion_file, &side_meta.deletion_file) {
-        (None, None) => true,
-        (Some(base_file), Some(side_file)) => {
-            base_file.read_version == side_file.read_version
-                && base_file.id == side_file.id
-                && base_file.file_type == side_file.file_type
-                && base_file.base_id == side_file.base_id
-        }
-        _ => false,
-    }
-}
-
-async fn fragment_deletion_vector(
-    fragment: &lance::dataset::fragment::FileFragment,
-) -> Result<Arc<lance_core::utils::deletion::DeletionVector>> {
-    Ok(fragment
-        .get_deletion_vector()
-        .await
-        .map_err(OmniError::storage)?
-        .unwrap_or_default())
 }
 
 /// Check the owned-key estimate before copying a decoded key into the set.
@@ -3457,29 +3339,39 @@ fn proven_fast_forward_needs_no_validation(
 ) -> bool {
     !candidates.is_empty()
         && candidates.iter().all(|(table_key, candidate)| {
-            if !matches!(
+            matches!(
                 candidate,
                 CandidateTableState::AdoptPureInserts(_)
                     | CandidateTableState::AdoptSourceState {
                         validation_delta: Some(AdoptValidation::PureInserts(_))
                     }
-            ) {
-                return false;
-            }
-            let Some(type_name) = table_key.strip_prefix("node:") else {
-                return false;
-            };
-            let Some(node_type) = catalog.node_types.get(type_name) else {
-                return false;
-            };
-            node_type.range_constraints.is_empty()
-                && node_type.check_constraints.is_empty()
-                && node_type.unique_constraints.is_empty()
-                && node_type
-                    .properties
-                    .values()
-                    .all(|property| property.enum_values.is_none())
+            ) && table_key
+                .strip_prefix("node:")
+                .is_some_and(|type_name| node_inserts_need_no_validation(catalog, type_name))
         })
+}
+
+/// Whether new rows of `type_name` alone can break no constraint: no value,
+/// enum or non-key uniqueness constraint, and no edge type with a non-zero
+/// `@card` minimum from it. A source node inserted with no edge of such a type
+/// is below the minimum; a branch written by this binary cannot hold one, but
+/// a branch written before the minimum counted inserted nodes can, so the
+/// evaluator counts them.
+fn node_inserts_need_no_validation(catalog: &Catalog, type_name: &str) -> bool {
+    let Some(node_type) = catalog.node_types.get(type_name) else {
+        return false;
+    };
+    node_type.range_constraints.is_empty()
+        && node_type.check_constraints.is_empty()
+        && node_type.unique_constraints.is_empty()
+        && node_type
+            .properties
+            .values()
+            .all(|property| property.enum_values.is_none())
+        && !catalog
+            .edge_types
+            .values()
+            .any(|edge| edge.from_type == type_name && edge.cardinality.min > 0)
 }
 
 fn adopt_advances_head(
@@ -5996,5 +5888,47 @@ impl Omnigraph {
             },
             commit: Some(commit),
         })
+    }
+}
+
+#[cfg(test)]
+mod fast_forward_validation_tests {
+    use super::*;
+    use omnigraph_compiler::catalog::build_catalog;
+    use omnigraph_compiler::schema::parser::parse_schema;
+
+    /// Only types whose new rows can break nothing skip a fast forward's
+    /// evaluator: a value constraint keeps it, and so does a non-zero `@card`
+    /// minimum on an edge type the node is the source of. A maximum alone, or a
+    /// minimum the node only receives, cannot be broken by inserted nodes.
+    #[test]
+    fn node_inserts_skip_validation_only_when_they_can_break_nothing() {
+        let catalog = build_catalog(
+            &parse_schema(
+                "node Plain { name: String @key }\n\
+                 node Ranged { name: String @key\n age: I32\n @range(age, 0..200) }\n\
+                 node Employee { name: String @key }\n\
+                 node Company { name: String @key }\n\
+                 node Member { name: String @key }\n\
+                 edge WorksAt: Employee -> Company @card(1..)\n\
+                 edge Follows: Member -> Plain @card(0..2)\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for (type_name, skips) in [
+            ("Plain", true),
+            ("Ranged", false),
+            ("Employee", false),
+            ("Company", true),
+            ("Member", true),
+            ("Missing", false),
+        ] {
+            assert_eq!(
+                node_inserts_need_no_validation(&catalog, type_name),
+                skips,
+                "{type_name}"
+            );
+        }
     }
 }

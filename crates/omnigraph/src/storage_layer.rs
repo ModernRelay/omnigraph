@@ -56,8 +56,8 @@ use omnigraph_compiler::SystemColumns;
 use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::table_store::{
-    ExternalBlobPreflight, ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, StagedTransactionIdentity,
-    StagedWrite, TableState, TableStore,
+    ExternalBlobPreflight, ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, OverwriteChunk, RefreshedIndex,
+    StagedTransactionIdentity, StagedWrite, TableState, TableStore,
 };
 
 /// One fenced merge chunk is bounded in both rows and materialized Arrow
@@ -244,6 +244,16 @@ pub enum IndexBuildSpec {
     Vector {
         column: String,
     },
+}
+
+/// A staged index reconciliation
+/// ([`TableStorage::stage_index_reconciliation`]): the batch to commit
+/// detached, if any index had work, the lagging indexes it rebuilds whole,
+/// and the vector columns whose index could not be trained, with the reason.
+pub struct IndexReconciliation {
+    pub staged: Option<StagedHandle>,
+    pub refreshed: Vec<RefreshedIndex>,
+    pub skipped: Vec<(String, String)>,
 }
 
 /// Logical semantics for an RFC-023 keyed write.
@@ -651,6 +661,15 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         snapshot: &SnapshotHandle,
     ) -> Result<(Option<StagedHandle>, Vec<(String, String)>)>;
 
+    /// Stage, as one detached-ready `CreateIndex`, the declared indexes the
+    /// table lacks (`specs`) and the whole rebuild of every lagging foldable
+    /// index; `staged` is `None` when neither has work.
+    async fn stage_index_reconciliation(
+        &self,
+        snapshot: &SnapshotHandle,
+        specs: &[IndexBuildSpec],
+    ) -> Result<IndexReconciliation>;
+
     /// Atomically create version 1 from a staged read-version-0 transaction.
     /// Lance conflict retries are disabled so a concurrently-created dataset
     /// is rejected rather than overwritten.
@@ -837,6 +856,18 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         snapshot: &SnapshotHandle,
         batches: Vec<RecordBatch>,
+        write_budget: WriteBudget,
+        writers: usize,
+    ) -> Result<StagedHandle>;
+
+    /// Stage an overwrite from chunks as a producer cuts them, each written
+    /// as it arrives, the fragments joined in source order at the end; a
+    /// refusal deletes what was written. See `TableStore::stage_overwrite_stream`.
+    async fn stage_overwrite_stream(
+        &self,
+        snapshot: &SnapshotHandle,
+        chunks: futures::stream::BoxStream<'_, Result<OverwriteChunk>>,
+        schema: Option<SchemaRef>,
         write_budget: WriteBudget,
         writers: usize,
     ) -> Result<StagedHandle>;
@@ -1169,6 +1200,19 @@ impl TableStorage for TableStore {
         Ok((fold.staged.map(StagedHandle::new), fold.skipped))
     }
 
+    async fn stage_index_reconciliation(
+        &self,
+        snapshot: &SnapshotHandle,
+        specs: &[IndexBuildSpec],
+    ) -> Result<IndexReconciliation> {
+        let work = TableStore::stage_index_reconciliation(self, snapshot.dataset(), specs).await?;
+        Ok(IndexReconciliation {
+            staged: work.staged.map(StagedHandle::new),
+            refreshed: work.refreshed,
+            skipped: work.skipped,
+        })
+    }
+
     async fn commit_staged_create_exact(
         &self,
         dataset_uri: &str,
@@ -1418,6 +1462,26 @@ impl TableStorage for TableStore {
             self,
             snapshot.dataset(),
             batches,
+            write_budget,
+            writers,
+        )
+        .await
+        .map(StagedHandle::new)
+    }
+
+    async fn stage_overwrite_stream(
+        &self,
+        snapshot: &SnapshotHandle,
+        chunks: futures::stream::BoxStream<'_, Result<OverwriteChunk>>,
+        schema: Option<SchemaRef>,
+        write_budget: WriteBudget,
+        writers: usize,
+    ) -> Result<StagedHandle> {
+        TableStore::stage_overwrite_stream(
+            self,
+            snapshot.dataset(),
+            chunks,
+            schema,
             write_budget,
             writers,
         )

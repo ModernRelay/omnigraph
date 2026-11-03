@@ -20,9 +20,7 @@ use omnigraph_planner::{
 
 use crate::fixture_bounds::BOUNDS;
 
-fn operation(target: LoadTarget, mode: LoadStmtMode, source_bytes: u64) -> Operation {
-    let schema = parse_schema(
-        r#"
+const PERSON_KNOWS: &str = r#"
 node Person {
     id: String @key
     email: String @unique
@@ -30,9 +28,19 @@ node Person {
 edge Knows: Person -> Person {
     w: I64
 }
-"#,
-    )
-    .expect("schema parses");
+"#;
+
+fn operation(target: LoadTarget, mode: LoadStmtMode, source_bytes: u64) -> Operation {
+    operation_with(PERSON_KNOWS, target, mode, source_bytes)
+}
+
+fn operation_with(
+    schema: &str,
+    target: LoadTarget,
+    mode: LoadStmtMode,
+    source_bytes: u64,
+) -> Operation {
+    let schema = parse_schema(schema).expect("schema parses");
     let catalog = build_catalog(&schema).expect("catalog builds");
     let stmt = LoadStmt {
         source: "s3://bucket/people.csv".to_string(),
@@ -219,6 +227,78 @@ fn node_overwrite_resolves_to_source_validate_chain_and_write() {
     assert_eq!(pipelines[1]["depends_on"], serde_json::json!([0]));
 }
 
+/// A node target with an integer key and no incoming edge type carries only
+/// checks judged as the rows pass and no removal scan: its validation streams
+/// and the load is one pipeline; the whole-input validation above stays two.
+#[test]
+fn per_row_checks_plan_one_pipeline_through_the_write() {
+    use omnigraph_planner::{PipelineShape, validate_streams};
+
+    let schema = parse_schema(
+        r#"
+node Item {
+    id: I64 @key
+    note: String
+}
+"#,
+    )
+    .expect("schema parses");
+    let catalog = build_catalog(&schema).expect("catalog builds");
+    let stmt = LoadStmt {
+        source: "s3://bucket/items.csv".to_string(),
+        target: LoadTarget::Node("Item".into()),
+        mode: LoadStmtMode::Overwrite,
+        delimiter: b',',
+        header: true,
+        columns: None,
+    };
+    let op = Operation::Load {
+        ir: Box::new(lower_load(&catalog, &stmt)),
+        tables: vec![side("node:Item", 7)],
+        source_bytes: 3 * SOURCE_PARTITION_BYTES,
+    };
+    let Decision::Engine { plan, explain, .. } =
+        route(&op, &source(), RouteOverride::Registry, &BOUNDS)
+    else {
+        panic!("an overwrite load routes to the engine");
+    };
+    let validations: Vec<&PhysicalNode> = chain(&plan)
+        .into_iter()
+        .filter(|node| matches!(node, PhysicalNode::Validate { .. }))
+        .collect();
+    let [validation] = &validations[..] else {
+        panic!("one validation per load plan, found {}", validations.len());
+    };
+    let PhysicalNode::Validate {
+        checks, removal, ..
+    } = validation
+    else {
+        unreachable!();
+    };
+    assert!(validate_streams(checks, *removal), "{checks:?} {removal:?}");
+    assert_eq!(validation.shape(), PipelineShape::Streaming);
+    let document = explain.to_value();
+    let pipelines = document["pipelines"]
+        .as_array()
+        .expect("a load plan has pipelines");
+    assert_eq!(
+        pipelines.len(),
+        1,
+        "a validation judged per row cuts nothing: {pipelines:?}"
+    );
+    assert_eq!(pipelines[0]["source"]["node"], "CsvSource");
+    assert_eq!(pipelines[0]["partitions"], 3);
+    let operators: Vec<&str> = pipelines[0]["operators"]
+        .as_array()
+        .expect("operators")
+        .iter()
+        .map(|operator| operator["name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(operators, ["Validate", "FragmentWrite"]);
+    assert_eq!(pipelines[0]["sink"]["name"], "consumer");
+    assert_eq!(pipelines[0]["depends_on"], serde_json::json!([]));
+}
+
 /// A node target whose manifest count is zero removes nothing, so pass 9 plans
 /// neither the removal scan nor the retained-edge checks; a populated or
 /// uncounted target keeps both; an edge overwrite never scans.
@@ -359,8 +439,57 @@ fn source_partitions_are_the_slices_capped_by_the_load_workers() {
     }
 }
 
+/// Under a non-zero `@card` minimum an edge overwrite's cardinality check
+/// declares a scan: the replaced table's sources are read for one the new
+/// edges leave without an edge, and the judge refuses a plan without it.
+/// A maximum alone keeps the probe. A node load of the edge's source type
+/// carries `source_cardinality`, a probe of the committed edge table.
 #[test]
-fn endpoint_checks_keep_probe_without_consulted_statistics() {
+fn card_minimum_declares_the_replaced_source_scan_and_the_source_count() {
+    let plan_of = |schema: &str, target: LoadTarget| {
+        let op = operation_with(schema, target, LoadStmtMode::Overwrite, 4096);
+        let Decision::Engine { plan, .. } = route(&op, &source(), RouteOverride::Registry, &BOUNDS)
+        else {
+            panic!("an overwrite load routes to the engine");
+        };
+        accesses(&plan)
+    };
+    let minimum = PERSON_KNOWS.replace(
+        "edge Knows: Person -> Person {",
+        "edge Knows: Person -> Person @card(1..) {",
+    );
+    let maximum = PERSON_KNOWS.replace(
+        "edge Knows: Person -> Person {",
+        "edge Knows: Person -> Person @card(0..2) {",
+    );
+
+    let edge = plan_of(&minimum, LoadTarget::Edge("Knows".into()));
+    assert!(
+        edge.contains(&("cardinality".to_string(), ValidateAccess::Scan)),
+        "{edge:?}"
+    );
+    let edge = plan_of(&maximum, LoadTarget::Edge("Knows".into()));
+    assert!(
+        edge.contains(&("cardinality".to_string(), ValidateAccess::Probe)),
+        "{edge:?}"
+    );
+    let node = plan_of(&minimum, LoadTarget::Node("Person".into()));
+    assert!(
+        node.contains(&("source_cardinality".to_string(), ValidateAccess::Probe)),
+        "{node:?}"
+    );
+    let node = plan_of(&maximum, LoadTarget::Node("Person".into()));
+    assert!(
+        !node.iter().any(|(check, _)| check == "source_cardinality"),
+        "{node:?}"
+    );
+}
+
+/// Without consulted statistics an overwrite's endpoint checks keep the
+/// probe at any input size; append and merge keep the endpoint table, so
+/// without index coverage they scan it.
+#[test]
+fn endpoint_checks_without_consulted_statistics_probe_only_for_an_overwrite() {
     let mapped_columns = ["from", "to", "w"].len() as u64;
     let narrowest_row = 2 * mapped_columns;
     let within = PROBE_CHUNK_KEYS * narrowest_row;
@@ -368,8 +497,8 @@ fn endpoint_checks_keep_probe_without_consulted_statistics() {
     for (mode, source_bytes, expected) in [
         (LoadStmtMode::Overwrite, within, ValidateAccess::Probe),
         (LoadStmtMode::Overwrite, past, ValidateAccess::Probe),
-        (LoadStmtMode::Append, past, ValidateAccess::Probe),
-        (LoadStmtMode::Merge, past, ValidateAccess::Probe),
+        (LoadStmtMode::Append, past, ValidateAccess::Scan),
+        (LoadStmtMode::Merge, past, ValidateAccess::Scan),
     ] {
         let op = operation(LoadTarget::Edge("Knows".into()), mode, source_bytes);
         let decision = route(&op, &source(), RouteOverride::Registry, &BOUNDS);

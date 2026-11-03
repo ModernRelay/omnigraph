@@ -909,6 +909,10 @@ async fn issue_567_unfiltered_nearest_climbs_the_ladder_to_the_whole_corpus() {
         Some(ranked),
         "the last rung read every ranked partition: rungs {rungs:?}"
     );
+    assert!(
+        result.ranking().unwrap().exhaustive,
+        "the last attempt searched every partition of the IVF_FLAT index"
+    );
     assert_eq!(
         probes
             .ann_overfetches
@@ -949,6 +953,10 @@ async fn issue_567_unfiltered_nearest_keeps_the_probe_cap() {
         result_slugs(&result),
         (0..10).map(|row| format!("n{row:05}")).collect::<Vec<_>>(),
         "the ten nearest docs, from the one partition nearest the query"
+    );
+    assert!(
+        !result.ranking().unwrap().exhaustive,
+        "three partitions went unsearched, so a nearer row may exist"
     );
     assert_eq!(
         probes
@@ -1015,6 +1023,10 @@ async fn issue_567_ladder_stops_when_the_prefilter_admits_fewer_rows_than_k() {
             .map(|row| format!("n{row:05}"))
             .collect::<Vec<_>>(),
         "every edge-bearing doc, nothing else, in distance order"
+    );
+    assert!(
+        result.ranking().unwrap().exhaustive,
+        "the flat scan scored every admitted row"
     );
     assert_eq!(
         probes

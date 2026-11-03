@@ -390,6 +390,21 @@ fn result_rejects_a_different_request_and_expiry_at_the_boundary() {
             .is_ok()
     );
     assert!(!format!("{captured:?}").contains("test-only"));
+    assert_eq!(
+        captured
+            .clone()
+            .bound_expiry(now + time::Duration::seconds(60))
+            .expires_at(),
+        Some(now),
+        "verified session metadata cannot extend provider expiry"
+    );
+    assert_eq!(
+        captured
+            .bound_expiry(now - time::Duration::seconds(60))
+            .expires_at(),
+        Some(now - time::Duration::seconds(60)),
+        "the shorter verified expiry wins"
+    );
 }
 
 #[test]

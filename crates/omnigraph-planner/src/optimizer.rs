@@ -18,7 +18,8 @@ use crate::cost::{
     ExpandPolicy, HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, HYDRATE_ROW_RATIO, IndexCoverage,
     ValidateAccess, ValidateCostInputs, ValidateIndexCoverage, ValidateRemoval, chain_rows,
     choose_access_path, choose_anti_join_strategy, choose_expand_mode, choose_validate_access,
-    direction_probe_factor, estimate_rows, executed_hops, hydrate_chunk_bytes, scan_row_estimate,
+    coverage_validate_access, direction_probe_factor, estimate_rows, executed_hops,
+    hydrate_chunk_bytes, scan_row_estimate,
 };
 use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
 use crate::key_set::{KeySetTree, key_set_tree};
@@ -3796,7 +3797,8 @@ impl Lowering<'_> {
     }
 
     /// Pass 9 costs the committed lookup from the accepted node count and
-    /// index metadata. Append and merge retain their executor's Probe path.
+    /// index metadata when an overwrite replaces the table; append and merge
+    /// keep it, so their lookups probe only under full index coverage.
     fn validate_access(
         &mut self,
         spec: &ValidateSpec,
@@ -3847,10 +3849,17 @@ impl Lowering<'_> {
             consulted_rows: node.as_ref().and_then(|node| node.row_count),
             index_coverage,
         };
-        let access = if overwrite {
-            choose_validate_access(&spec.check, inputs)
-        } else {
-            ValidateAccess::Probe
+        let access = match &spec.check {
+            // An overwrite replaces the table, so each source of its prior
+            // image keeps only its delta edges: under a minimum the check
+            // scans those sources for one the delta leaves without an edge.
+            omnigraph_compiler::ir::ValidateCheck::Cardinality { min, .. }
+                if overwrite && *min > 0 =>
+            {
+                ValidateAccess::Scan
+            }
+            _ if overwrite => choose_validate_access(&spec.check, inputs),
+            _ => coverage_validate_access(&spec.check, index_coverage),
         };
         let costs = inputs.costs(&spec.check);
         self.access_path = true;

@@ -4785,6 +4785,7 @@ async fn unattached_child_checks_expected_versions_against_its_base() {
     crate::unattached::release_unattached_tag_confirmed(
         &main,
         &unattached_tag_name(&root.graph_commit_id, &root.graph_commit_id),
+        &root.graph_commit_id,
     )
     .await
     .unwrap();
@@ -15207,7 +15208,8 @@ async fn manifest_create_without_a_definite_answer_stays_in_doubt_issue_1067() {
 }
 
 /// A manifest create no re-issue settled may still land, and its manifest
-/// names the attempt's transaction file. Lance reads the version back after
+/// names the attempt's transaction file. The in-doubt error names the graph
+/// commit that may land, which is the one that does. Lance reads the version back after
 /// the last re-issue; the missing version must not count as proof of
 /// absence there, or Lance deletes that file and the late manifest names a
 /// file that is gone. Here no storage scope backs the protocol, as on an
@@ -15228,6 +15230,19 @@ async fn unresolved_manifest_create_keeps_its_transaction_file_issue_1067() {
         landed.version().version,
         before + 1,
         "the late create landed"
+    );
+    // The error named, as its own field, the graph commit that landed.
+    assert_eq!(
+        error.publication_id(),
+        Some(
+            read_manifest_rows(&landed)
+                .await
+                .unwrap()
+                .head
+                .graph_commit_id
+                .as_str()
+        ),
+        "{error:?}"
     );
     let transaction = landed
         .manifest()
@@ -15481,5 +15496,43 @@ async fn candidate_tag_reappearing_after_rollback_stays_uncertain_issue_1067() {
             ),
         ],
         "deleting the acknowledged tag does not prove the candidate stayed unreachable"
+    );
+}
+
+#[test]
+fn manifest_incarnation_supersedes_newer_equal_and_other_lifetimes_but_not_older() {
+    let main = lance::dataset::refs::BranchIdentifier::main();
+    let recreated = lance::dataset::refs::BranchIdentifier::new(&main, 1);
+    let at = |version: u64,
+              branch_identifier: &lance::dataset::refs::BranchIdentifier,
+              e_tag: &str| ManifestIncarnation {
+        version,
+        e_tag: Some(e_tag.to_string()),
+        timestamp_nanos: None,
+        branch_identifier: branch_identifier.clone(),
+    };
+    let installed = at(5, &main, "a");
+    assert!(at(6, &main, "b").supersedes(&installed), "a later version");
+    assert!(
+        at(5, &main, "b").supersedes(&installed),
+        "another image at the same version"
+    );
+    assert!(at(5, &main, "a").supersedes(&installed), "the same image");
+    assert!(
+        !at(4, &main, "c").supersedes(&installed),
+        "an older version"
+    );
+    assert!(
+        !at(1, &recreated, "d").supersedes(&installed),
+        "another branch lifetime is never ordered by version"
+    );
+    assert!(
+        !at(9, &recreated, "e").supersedes(&installed),
+        "another branch lifetime at a later version is not ordered either"
+    );
+    assert!(
+        !at(9, &recreated, "e").same_lifetime(&installed)
+            && at(6, &main, "b").same_lifetime(&installed),
+        "same_lifetime compares the branch identifier alone"
     );
 }

@@ -14,6 +14,7 @@ pub(crate) use omnigraph_core::{
     branch_control, branch_names, dataset_index, error, handle_cache, instrumentation,
     lance_access, lance_clone, manifest_request, metadata, seams, staging, storage,
 };
+pub mod branch_detail;
 pub mod commit_graph;
 
 mod commit;
@@ -63,6 +64,7 @@ pub mod retention;
 pub mod state;
 pub mod unattached;
 pub mod unpublished;
+pub use branch_detail::{GraphBranchDetail, GraphBranchListing, list_graph_branches_detailed};
 pub use branch_names::is_merge_input_tag;
 pub use migrations::{
     UNATTACHED_BRANCHES_STAMP, UNPUBLISHED_COMMITS_STAMP, require_unattached_branches,
@@ -905,6 +907,20 @@ pub struct ManifestIncarnation {
 }
 
 impl ManifestIncarnation {
+    /// Whether this incarnation and `other` belong to one branch lifetime.
+    pub fn same_lifetime(&self, other: &Self) -> bool {
+        self.branch_identifier == other.branch_identifier
+    }
+
+    /// Whether installing this incarnation over `installed` never moves the
+    /// handle backwards within one lifetime: a version at least as new (an
+    /// equal version may carry another image, the root replaced underneath
+    /// the handle). Lifetimes have no order; `Omnigraph::install_coordinator`
+    /// decides a lifetime change by the provenance of the clone instead.
+    pub fn supersedes(&self, installed: &Self) -> bool {
+        self.same_lifetime(installed) && self.version >= installed.version
+    }
+
     pub fn matches(&self, held: &Self) -> bool {
         if self.version != held.version || self.branch_identifier != held.branch_identifier {
             return false;
@@ -1179,18 +1195,59 @@ impl CollectorBranch {
         .with_registry(Arc::new(rows.registry), &self.dataset))
     }
 
-    /// The version history up to the opened version; a version published
-    /// after the open is listed by the store and dropped here.
-    pub async fn versions(&self) -> Result<Vec<lance::dataset::Version>> {
+    /// The attached version numbers up to the opened version, ascending, from
+    /// the `_versions/` listing alone: `Dataset::version_refs` reads no
+    /// manifest (`Dataset::versions` reads and decodes every one, one after
+    /// another). A version published after the open is listed by the store
+    /// and dropped here.
+    pub async fn version_numbers(&self) -> Result<Vec<u64>> {
         let head = self.head_version();
         Ok(self
             .dataset
-            .versions()
+            .version_refs()
             .await
             .map_err(OmniError::storage)?
             .into_iter()
-            .filter(|version| version.version <= head)
+            .map(|version| version.version)
+            .filter(|version| *version <= head)
             .collect())
+    }
+
+    /// The listed `versions`' manifests, read through the opened branch in
+    /// the order given, as many at once as the store's I/O parallelism allows
+    /// (Lance's own bound: 8 on a local store, 64 on object storage). Each
+    /// read resolves the version's manifest path with a HEAD (V2, else V1),
+    /// then reads the manifest. A manifest whose body names another version
+    /// than the listed path it was read from is refused: `checkout_version`
+    /// does not compare them, and a caller keyed by the body's number would
+    /// lose the listed version.
+    pub async fn read_versions(&self, versions: &[u64]) -> Result<Vec<lance::dataset::Version>> {
+        use futures::{StreamExt, TryStreamExt};
+        let concurrency = self
+            .dataset
+            .object_store(None)
+            .await
+            .map_err(OmniError::storage)?
+            .io_parallelism();
+        futures::stream::iter(versions.iter().copied())
+            .map(|version| async move {
+                let read = self
+                    .dataset
+                    .checkout_version(version)
+                    .await
+                    .map_err(OmniError::storage)?
+                    .version();
+                if read.version != version {
+                    return Err(OmniError::manifest_internal(format!(
+                        "__manifest version {version} holds a manifest of version {}",
+                        read.version
+                    )));
+                }
+                Ok(read)
+            })
+            .buffered(concurrency.max(1))
+            .try_collect()
+            .await
     }
 
     /// Every pin the branch has held up to the opened version.
@@ -1996,11 +2053,14 @@ impl ManifestCoordinator {
     }
 
     /// Install the latest version of the branch's `__manifest`: its table
-    /// state and its head commit's record, from one scan of that version.
-    /// Every fallible read completes before a field is replaced, so a failure
-    /// leaves the previous view coherent. The scan leaves the schema contract
-    /// content unread, except for a branch recreated since the held version:
-    /// that is a new lifetime, captured with its contract as an open captures it.
+    /// state, its head commit's record and its schema contract, from one
+    /// scan of that version, the scan an open takes. Every fallible read
+    /// completes before a field is replaced, so a failure leaves the previous
+    /// view coherent. The contract is captured with the rows because the
+    /// read that follows a refresh validates it: without it, that read opened
+    /// and scanned the same version a second time. A contract content error
+    /// stays deferred to [`Self::read_schema_contract`], as on open.
+    /// A branch recreated since the held version is a new lifetime.
     /// A root replaced at the held version is one too, and it resets the history
     /// cache in place, for every handle and coordinator sharing it: no commit
     /// or `__history` object held from the replaced root describes the new one.
@@ -2039,10 +2099,7 @@ impl ManifestCoordinator {
             );
             replaced_root = true;
         }
-        let rows = match recreated || replaced_root {
-            true => state::read_manifest_rows_with_contract(&dataset).await?.0,
-            false => state::read_manifest_rows_projected(&dataset).await?,
-        };
+        let rows = state::read_manifest_rows_with_contract(&dataset).await?.0;
         let known_state = rows.state(dataset.version().version, native_branch.as_deref())?;
         fail(&READ_REFRESH_POST_STATE_PRE_LINEAGE)?;
         self.dataset = dataset;
@@ -2668,23 +2725,10 @@ impl ManifestCoordinator {
     /// Logical graph branches, `main` first. Each live native ref maps to
     /// exactly one logical name; a duplicate incarnation fails loudly.
     pub async fn list_graph_branches(&self) -> Result<Vec<String>> {
-        let branches = list_live_manifest_branch_contents(&self.dataset).await?;
-        let mut names = Vec::with_capacity(branches.len());
-        let mut seen = HashSet::with_capacity(branches.len());
-        for native in branches.keys().filter(|name| *name != "main") {
-            let logical = crate::branch_names::logical_branch_name(native).to_string();
-            if !seen.insert(logical.clone()) {
-                return Err(OmniError::manifest_conflict(format!(
-                    "branch '{logical}' has more than one live native incarnation; run cleanup \
-                     before using it"
-                )));
-            }
-            names.push(logical);
-        }
-        names.sort();
-        let mut all = vec!["main".to_string()];
-        all.extend(names);
-        Ok(all)
+        let named = branch_detail::live_named_branches(&self.dataset).await?;
+        Ok(std::iter::once("main".to_string())
+            .chain(named.into_iter().map(|branch| branch.name))
+            .collect())
     }
 }
 

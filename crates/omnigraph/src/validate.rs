@@ -36,14 +36,15 @@ use futures::TryStreamExt;
 use lance::Dataset;
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::{Catalog, EdgeType};
+use omnigraph_core::dataset_index::{IndexCoverage, key_column_index_coverage};
 
 use crate::db::{Omnigraph, Snapshot};
 use crate::error::{MergeConflict, MergeConflictKind, OmniError, Result};
 use crate::loader::{validate_enum_constraints, validate_value_constraints};
 use crate::table_store::{ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, TableStore};
 use kernels::{
-    HoldersByKey, card_affected, card_plan, card_violations, deleted_endpoints, edge_ri_delta,
-    match_unique_holders, orphans_in_delta, orphans_retained, partition_endpoints,
+    CardPlan, HoldersByKey, card_affected, card_plan, card_violations, deleted_endpoints,
+    edge_ri_delta, match_unique_holders, orphans_in_delta, orphans_retained, partition_endpoints,
     unique_coalesced_dups, unique_committed_collisions, unique_image, unique_probe_keys,
 };
 use key_set::{IntKeySet, IntKeySetLayout, canonical_i64, key_bytes};
@@ -215,7 +216,6 @@ pub(crate) enum AccessPath {
     /// Filtered scans carrying the delta's keys, served by the scalar index.
     Probe,
     /// One projected scan of the committed table, matched in memory.
-    #[allow(dead_code)]
     Scan,
 }
 
@@ -241,7 +241,6 @@ impl Constraint {
     /// The access paths this constraint's committed lookup can take. Empty
     /// when it has no committed lookup: `Value`, and a `@key` group, whose
     /// committed holder of a key value is the same row.
-    #[allow(dead_code)]
     pub(crate) fn access_paths(&self) -> &'static [AccessPath] {
         match self {
             Constraint::Value | Constraint::Unique { is_key: true, .. } => &[],
@@ -265,11 +264,61 @@ impl AccessPaths {
         Self::default()
     }
 
+    /// The choice for a committed view the write keeps (merge, mutation,
+    /// append and merge loads): an endpoint or non-key `@unique` lookup
+    /// probes only while every column it looks up has full BTREE coverage on
+    /// the consulted table, where the index answers the key list; otherwise
+    /// it scans. Lance hands an unindexed or partly covered table one copy of
+    /// the whole key list per uncovered fragment (#1225), and such a probe
+    /// reads the id column whole anyway, so the scan is never more IO.
+    /// Δ-scoped like the evaluator: a constraint whose table `changeset` adds
+    /// no rows to makes no committed lookup and gets no choice.
+    ///
+    /// # Errors
+    /// A consulted table's index metadata cannot be read.
+    pub(crate) async fn for_committed(
+        committed: &CommittedState<'_>,
+        constraints: &[Constraint],
+        changeset: &ChangeSet,
+        system_columns: SystemColumns,
+    ) -> Result<Self> {
+        let mut access = Self::probe_everywhere();
+        let adds_rows = |table_key: &str| {
+            changeset
+                .get(table_key)
+                .is_some_and(|change| change.added.iter().any(|batch| batch.num_rows() > 0))
+        };
+        for constraint in constraints {
+            let lookups: Vec<(String, Vec<&str>)> = match constraint {
+                Constraint::EdgeRi {
+                    table_key,
+                    from_type,
+                    to_type,
+                } if adds_rows(table_key) => vec![
+                    (format!("node:{from_type}"), vec![system_columns.id]),
+                    (format!("node:{to_type}"), vec![system_columns.id]),
+                ],
+                Constraint::Unique {
+                    table_key,
+                    columns,
+                    is_key: false,
+                } if adds_rows(table_key) => vec![(
+                    table_key.clone(),
+                    columns.iter().map(String::as_str).collect(),
+                )],
+                _ => continue,
+            };
+            if !committed.fully_indexed(&lookups).await? {
+                access.choose(constraint, AccessPath::Scan)?;
+            }
+        }
+        Ok(access)
+    }
+
     /// Record `path` for `constraint`.
     ///
     /// # Errors
     /// `path` is not among [`Constraint::access_paths`].
-    #[allow(dead_code)]
     pub(crate) fn choose(&mut self, constraint: &Constraint, path: AccessPath) -> Result<()> {
         let Some(key) = constraint
             .key()
@@ -370,10 +419,10 @@ pub(crate) fn constraints_for(catalog: &Catalog) -> Vec<Constraint> {
     out
 }
 
-/// Keys per batched committed-uniqueness scan. Bounds the pushed-down filter
-/// size on the merge path (whose deltas are not row-capped); Mutation/Load
-/// deltas are already capped at this many rows, so they probe in one chunk.
-const UNIQUE_PROBE_CHUNK_KEYS: usize = 8_192;
+/// Keys per batched committed probe: uniqueness holders and `@card` edges.
+/// Bounds the pushed-down filter size, since a merge delta is not row-capped
+/// and a load holds many keyed batches of `KEYED_WRITE_MAX_ROWS` rows.
+const PROBE_CHUNK_KEYS: usize = 8_192;
 
 /// Index-backed view of committed target state for the merge delta's lookups.
 /// Every method reads the (indexed) target table via a structured `filter_expr`
@@ -397,6 +446,9 @@ pub(crate) struct CommittedState<'a> {
     /// committed graph view, not a raw Lance HEAD that may be unpublished or
     /// belong to an inherited source ref. `None` on merge/load.
     live: Option<(&'a Omnigraph, Option<&'a str>)>,
+    /// The committed datasets this validation has opened, one open per
+    /// table: the access choice and the lookups share the handle.
+    opened: std::sync::Mutex<HashMap<String, Dataset>>,
 }
 
 impl<'a> CommittedState<'a> {
@@ -406,6 +458,7 @@ impl<'a> CommittedState<'a> {
             committed: Some(target),
             overwritten: HashSet::new(),
             live: None,
+            opened: Default::default(),
         }
     }
 
@@ -421,6 +474,7 @@ impl<'a> CommittedState<'a> {
             committed: Some(committed),
             overwritten: HashSet::new(),
             live: Some((db, branch)),
+            opened: Default::default(),
         }
     }
 
@@ -444,6 +498,7 @@ impl<'a> CommittedState<'a> {
             committed: Some(base),
             overwritten,
             live: None,
+            opened: Default::default(),
         }
     }
 
@@ -454,10 +509,21 @@ impl<'a> CommittedState<'a> {
         let Some(committed) = self.committed else {
             return Ok(None);
         };
-        match committed.dataset(table_key) {
-            Some(_) => Ok(Some(committed.open_lance_dataset(table_key).await?)),
-            None => Ok(None),
+        if committed.dataset(table_key).is_none() {
+            return Ok(None);
         }
+        if let Some(ds) = self.opened().get(table_key) {
+            return Ok(Some(ds.clone()));
+        }
+        let ds = committed.open_lance_dataset(table_key).await?;
+        self.opened().insert(table_key.to_string(), ds.clone());
+        Ok(Some(ds))
+    }
+
+    fn opened(&self) -> std::sync::MutexGuard<'_, HashMap<String, Dataset>> {
+        self.opened
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Open an edge table for cardinality counting: the current manifest-visible
@@ -491,6 +557,23 @@ impl<'a> CommittedState<'a> {
             }
             None => Ok(Some(committed.open_lance_dataset(table_key).await?)),
         }
+    }
+
+    /// Whether every column of every `(table, columns)` lookup has full BTREE
+    /// coverage; a table this view holds no rows for is looked up in nothing
+    /// and counts as covered.
+    async fn fully_indexed(&self, lookups: &[(String, Vec<&str>)]) -> Result<bool> {
+        for (table_key, columns) in lookups {
+            let Some(ds) = self.open(table_key).await? else {
+                continue;
+            };
+            for column in columns {
+                if key_column_index_coverage(&ds, column).await? != IndexCoverage::Indexed {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// Which of `ids` exist as committed rows in `table_key` (by `id`): one
@@ -540,8 +623,9 @@ impl<'a> CommittedState<'a> {
         Ok(present)
     }
 
-    /// The committed `id`s of `table_key` that spell canonical integers, as one
-    /// probeable key set: `Probe` filters by `wanted`, `Scan` reads every id.
+    /// The committed `id`s of `table_key` among `wanted` that spell canonical
+    /// integers, as one probeable key set: `Probe` filters the read by `wanted`,
+    /// `Scan` reads the id column once and keeps only the wanted ids.
     async fn existing_int_keys(
         &self,
         table_key: &str,
@@ -554,10 +638,7 @@ impl<'a> CommittedState<'a> {
         let bound = match &ds {
             Some(ds) => {
                 let rows = ds.count_rows(None).await.map_err(OmniError::storage)?;
-                match access {
-                    AccessPath::Probe => rows.min(wanted.len()),
-                    AccessPath::Scan => rows,
-                }
+                rows.min(wanted.len())
             }
             None => 0,
         };
@@ -569,10 +650,17 @@ impl<'a> CommittedState<'a> {
                     let expr = col(system_columns.id)
                         .in_list(wanted.iter().map(|k| lit(k.clone())).collect(), false);
                     for batch in &scan_filtered(&ds, &[system_columns.id], expr).await? {
-                        push_int_ids(batch, system_columns.id, &mut keys, bound)?;
+                        push_int_ids(batch, system_columns.id, &mut keys, bound, &|_| true)?;
                     }
                 }
-                AccessPath::Scan => scan_int_ids(&ds, system_columns.id, &mut keys, bound).await?,
+                AccessPath::Scan => {
+                    let wanted: HashSet<i64> =
+                        wanted.iter().filter_map(|key| canonical_i64(key)).collect();
+                    scan_int_ids(&ds, system_columns.id, &mut keys, bound, &|key| {
+                        wanted.contains(&key)
+                    })
+                    .await?
+                }
             }
         }
         let layout =
@@ -583,7 +671,7 @@ impl<'a> CommittedState<'a> {
     }
 
     /// Committed holders of the `columns` tuples in `table_key`, holder lists in
-    /// scan order: `Probe` filters per [`UNIQUE_PROBE_CHUNK_KEYS`] chunk, `Scan`
+    /// scan order: `Probe` filters per [`PROBE_CHUNK_KEYS`] chunk, `Scan`
     /// reads the id and group columns once; both match exact tuples in Rust.
     async fn unique_holders(
         &self,
@@ -605,7 +693,7 @@ impl<'a> CommittedState<'a> {
             .collect();
         match access {
             AccessPath::Probe => {
-                for chunk in keys.chunks(UNIQUE_PROBE_CHUNK_KEYS) {
+                for chunk in keys.chunks(PROBE_CHUNK_KEYS) {
                     let wanted: HashSet<&Vec<String>> =
                         chunk.iter().map(|(canonical, _)| canonical).collect();
                     let batches =
@@ -642,32 +730,127 @@ impl<'a> CommittedState<'a> {
         Ok(holders)
     }
 
-    /// Committed edges `(id, src)` in `edge_table` matching `keys` on `key_col`
-    /// (id or src). Index-backed.
-    async fn committed_edges(
+    /// Committed edges `(id, src)` in `edge_table` whose id is one of `ids`,
+    /// probed in filtered scans of at most [`PROBE_CHUNK_KEYS`] ids each. An id
+    /// names at most one edge, so the result is bounded by `ids`.
+    async fn committed_edges_by_id(
         &self,
         edge_table: &str,
-        key_col: &str,
-        keys: &[String],
+        ids: &[String],
         system_columns: SystemColumns,
     ) -> Result<Vec<(String, String)>> {
+        // No keys, no open: on the write path an open refreshes the branch
+        // snapshot.
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let Some(ds) = self.open_cardinality(edge_table).await? else {
             return Ok(Vec::new());
         };
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        let expr = col(key_col).in_list(keys.iter().map(|k| lit(k.clone())).collect(), false);
-        let batches = scan_filtered(&ds, &[system_columns.id, system_columns.src], expr).await?;
         let mut out = Vec::new();
-        for batch in &batches {
-            let ids = string_col(batch, system_columns.id)?;
-            let srcs = string_col(batch, system_columns.src)?;
-            for i in 0..batch.num_rows() {
-                out.push((ids.value(i).to_string(), srcs.value(i).to_string()));
+        for chunk in ids.chunks(PROBE_CHUNK_KEYS) {
+            let expr = col(system_columns.id)
+                .in_list(chunk.iter().map(|id| lit(id.clone())).collect(), false);
+            let batches =
+                scan_filtered(&ds, &[system_columns.id, system_columns.src], expr).await?;
+            for batch in &batches {
+                let ids = string_col(batch, system_columns.id)?;
+                let srcs = string_col(batch, system_columns.src)?;
+                for i in 0..batch.num_rows() {
+                    out.push((ids.value(i).to_string(), srcs.value(i).to_string()));
+                }
             }
         }
         Ok(out)
+    }
+
+    /// Committed edges of `edge_table` per source among `srcs`, an edge whose
+    /// id `excluded` names (removed or re-placed by the change) left out.
+    /// The sources are probed in sorted filtered scans of at most
+    /// [`PROBE_CHUNK_KEYS`] each and the edges stream past batch by batch, so
+    /// memory holds one count per source, never the edges themselves.
+    async fn committed_source_counts(
+        &self,
+        edge_table: &str,
+        srcs: &HashSet<String>,
+        system_columns: SystemColumns,
+        excluded: impl Fn(&str) -> bool,
+    ) -> Result<HashMap<String, u32>> {
+        let mut counts = HashMap::new();
+        if srcs.is_empty() {
+            return Ok(counts);
+        }
+        let Some(ds) = self.open_cardinality(edge_table).await? else {
+            return Ok(counts);
+        };
+        let mut sorted: Vec<&String> = srcs.iter().collect();
+        sorted.sort();
+        for chunk in sorted.chunks(PROBE_CHUNK_KEYS) {
+            let expr = col(system_columns.src)
+                .in_list(chunk.iter().map(|src| lit((*src).clone())).collect(), false);
+            let projection = [system_columns.id, system_columns.src];
+            let mut stream = TableStore::scan_stream_with(
+                &ds,
+                Some(&projection),
+                None,
+                None,
+                false,
+                move |scanner| {
+                    scanner.filter_expr(expr);
+                    Ok(())
+                },
+            )
+            .await?;
+            while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+                let ids = string_col(&batch, system_columns.id)?;
+                let batch_srcs = string_col(&batch, system_columns.src)?;
+                for i in 0..batch.num_rows() {
+                    if excluded(ids.value(i)) {
+                        continue;
+                    }
+                    let count = counts
+                        .entry(batch_srcs.value(i).to_string())
+                        .or_insert(0u32);
+                    *count = count.checked_add(1).ok_or_else(|| {
+                        OmniError::manifest_internal("@card edge count overflows u32")
+                    })?;
+                }
+            }
+        }
+        Ok(counts)
+    }
+
+    /// The smallest source in `edge_table`'s image before this write that
+    /// `reject` names, read by one bounded scan of the src column: the
+    /// replaced image of an overwritten table, which its committed view hides.
+    async fn first_replaced_source(
+        &self,
+        edge_table: &str,
+        system_columns: SystemColumns,
+        reject: impl Fn(&str) -> bool,
+    ) -> Result<Option<String>> {
+        let Some(committed) = self.committed else {
+            return Ok(None);
+        };
+        if committed.dataset(edge_table).is_none() {
+            return Ok(None);
+        }
+        let ds = committed.open_lance_dataset(edge_table).await?;
+        let mut stream = scan_bounded(&ds, &[system_columns.src]).await?;
+        let mut first: Option<String> = None;
+        while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+            let srcs = string_col(&batch, system_columns.src)?;
+            for row in 0..srcs.len() {
+                if srcs.is_null(row) {
+                    continue;
+                }
+                let src = srcs.value(row);
+                if reject(src) && first.as_deref().is_none_or(|smallest| src < smallest) {
+                    first = Some(src.to_string());
+                }
+            }
+        }
+        Ok(first)
     }
 
     /// The first committed edge a single-table node overwrite would strand.
@@ -890,23 +1073,36 @@ fn integer_capacity_error(keys: usize) -> OmniError {
     )
 }
 
-/// Every committed id of `ds` that spells a canonical integer, at most `bound`.
-async fn scan_int_ids(ds: &Dataset, id: &str, keys: &mut Vec<i64>, bound: usize) -> Result<()> {
+/// Every committed id of `ds` that spells a canonical integer and passes
+/// `keep`, at most `bound`.
+async fn scan_int_ids(
+    ds: &Dataset,
+    id: &str,
+    keys: &mut Vec<i64>,
+    bound: usize,
+    keep: &(dyn Fn(i64) -> bool + Sync),
+) -> Result<()> {
     let mut stream = scan_bounded(ds, &[id]).await?;
     while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
-        push_int_ids(&batch, id, keys, bound)?;
+        push_int_ids(&batch, id, keys, bound, keep)?;
     }
     Ok(())
 }
 
-/// Every non-null canonical-integer value of `batch`'s `name` column, appended
-/// to `keys`; a value that is not a canonical integer is no id of an
-/// integer-keyed table and is skipped.
-fn push_int_ids(batch: &RecordBatch, name: &str, keys: &mut Vec<i64>, bound: usize) -> Result<()> {
+/// Every non-null canonical-integer value of `batch`'s `name` column that
+/// passes `keep`, appended to `keys`; a value that is not a canonical integer
+/// is no id of an integer-keyed table and is skipped.
+fn push_int_ids(
+    batch: &RecordBatch,
+    name: &str,
+    keys: &mut Vec<i64>,
+    bound: usize,
+    keep: &(dyn Fn(i64) -> bool + Sync),
+) -> Result<()> {
     let column = string_col(batch, name)?;
     for row in 0..column.len() {
         if !column.is_null(row) {
-            if let Some(key) = canonical_i64(column.value(row)) {
+            if let Some(key) = canonical_i64(column.value(row)).filter(|key| keep(*key)) {
                 if keys.len() == bound {
                     return Err(OmniError::manifest_internal(
                         "integer endpoint scan exceeded its admitted row bound",
@@ -954,29 +1150,8 @@ pub(crate) async fn validate_changeset(
     if changeset.is_empty() {
         return Ok(());
     }
-    validate_changeset_with_access(
-        changeset,
-        committed,
-        catalog,
-        &AccessPaths::probe_everywhere(),
-    )
-    .await
-}
-
-/// [`validate_changeset`] with the committed lookups taking the access path
-/// `access` records per constraint (an accepted load plan's choices).
-pub(crate) async fn validate_changeset_with_access(
-    changeset: &ChangeSet,
-    committed: &CommittedState<'_>,
-    catalog: &Catalog,
-    access: &AccessPaths,
-) -> Result<()> {
-    if changeset.is_empty() {
-        return Ok(());
-    }
     let constraints = constraints_for(catalog);
-    let violations =
-        evaluate_with_access(&constraints, changeset, committed, catalog, access).await?;
+    let violations = evaluate(&constraints, changeset, committed, catalog).await?;
     match violations.into_iter().next() {
         Some(violation) => Err(violation.into_omni_error()),
         None => Ok(()),
@@ -984,22 +1159,19 @@ pub(crate) async fn validate_changeset_with_access(
 }
 
 /// Run the declared constraints over the merge delta against committed state,
-/// probing committed state everywhere. Δ-scoped: only tables present in
-/// `changeset` do any work.
+/// the committed lookups taking the access path [`AccessPaths::for_committed`]
+/// derives from the consulted tables' index coverage. Δ-scoped: only tables
+/// present in `changeset` do any work.
 pub(crate) async fn evaluate(
     constraints: &[Constraint],
     changeset: &ChangeSet,
     committed: &CommittedState<'_>,
     catalog: &Catalog,
 ) -> Result<Vec<Violation>> {
-    evaluate_with_access(
-        constraints,
-        changeset,
-        committed,
-        catalog,
-        &AccessPaths::probe_everywhere(),
-    )
-    .await
+    let access =
+        AccessPaths::for_committed(committed, constraints, changeset, catalog.system_columns)
+            .await?;
+    evaluate_with_access(constraints, changeset, committed, catalog, &access).await
 }
 
 /// [`evaluate`] with the committed lookups taking the access path `access`
@@ -1028,9 +1200,10 @@ pub(crate) async fn evaluate_with_access(
 }
 
 /// Run the declared constraints while emitting each violation as soon as it is
-/// produced, probing committed state everywhere. Constraint order,
-/// per-constraint ordering, and messages are identical to [`evaluate`]; unlike
-/// that compatibility wrapper, this entry point does not retain a graph-wide
+/// produced, the committed lookups taking the access path
+/// [`AccessPaths::for_committed`] derives. Constraint order, per-constraint
+/// ordering, and messages are identical to [`evaluate`]; unlike that
+/// compatibility wrapper, this entry point does not retain a graph-wide
 /// violation vector.
 ///
 /// A fallible sink may observe a successful prefix before either it or a later
@@ -1047,15 +1220,10 @@ pub(crate) async fn evaluate_with_sink<F>(
 where
     F: FnMut(Violation) -> Result<()>,
 {
-    evaluate_with_access_and_sink(
-        constraints,
-        changeset,
-        committed,
-        catalog,
-        &AccessPaths::probe_everywhere(),
-        sink,
-    )
-    .await
+    let access =
+        AccessPaths::for_committed(committed, constraints, changeset, catalog.system_columns)
+            .await?;
+    evaluate_with_access_and_sink(constraints, changeset, committed, catalog, &access, sink).await
 }
 
 /// [`evaluate_with_sink`] with the committed lookups taking the access path
@@ -1138,22 +1306,45 @@ where
                     }
                 }
                 Constraint::Cardinality { table_key } => {
-                    if let Some(change) = changeset.get(table_key) {
-                        let Some(type_name) = table_key.strip_prefix("edge:") else {
-                            continue;
+                    let Some(edge_type) = table_key
+                        .strip_prefix("edge:")
+                        .and_then(|type_name| catalog.edge_types.get(type_name))
+                    else {
+                        continue;
+                    };
+                    // Run when the edge table has a delta OR, under a non-zero
+                    // minimum, when the write inserts or updates a source node:
+                    // a source node written with no edge of the type is below
+                    // the minimum although no edge of the type moved.
+                    let change = changeset.get(table_key);
+                    let written_sources = changeset
+                        .get(&format!("node:{}", edge_type.from_type))
+                        .filter(|_| edge_type.cardinality.min > 0)
+                        .filter(|change| change.value_batches().next().is_some());
+                    if change.is_some() || written_sources.is_some() {
+                        let plan = match change {
+                            Some(change) => card_plan(change, system_columns)?,
+                            None => CardPlan::default(),
                         };
-                        if let Some(edge_type) = catalog.edge_types.get(type_name) {
-                            evaluate_cardinality(
-                                table_key,
-                                edge_type,
-                                change,
-                                changeset,
-                                committed,
-                                system_columns,
-                                &mut emit,
-                            )
-                            .await?;
-                        }
+                        let written = match written_sources {
+                            Some(change) => delta_id_set(change, system_columns)?,
+                            None => HashSet::new(),
+                        };
+                        let deleted_src_nodes: HashSet<String> = changeset
+                            .get(&format!("node:{}", edge_type.from_type))
+                            .map(|change| change.deleted_ids.iter().cloned().collect())
+                            .unwrap_or_default();
+                        evaluate_cardinality(
+                            table_key,
+                            edge_type,
+                            &plan,
+                            &written,
+                            &deleted_src_nodes,
+                            committed,
+                            system_columns,
+                            &mut emit,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -1316,18 +1507,25 @@ async fn merged_node_existence(
     Ok(exist)
 }
 
-/// `@card` for an edge type, scoped to the srcs the delta affects. The delta is
-/// coalesced by edge id (last-wins, as commit does); the merged edge set per src
-/// = (committed edges with that src, minus those deleted or re-placed by the
-/// delta) ∪ (coalesced delta edges with that src). The affected set includes the
-/// new src of each delta edge AND the old committed src of each changed/deleted
-/// edge id, so moving an edge off a src recounts the vacated src. A src that is
-/// itself a deleted node is skipped.
+/// `@card` for an edge type, scoped to the srcs the change affects: the one
+/// rule every write route counts by, the evaluator's and the `load csv`
+/// judge's alike. `plan` is the edge delta coalesced by edge id (last-wins, as
+/// commit does); the merged edge count per src = (committed edges with that
+/// src, minus those deleted or re-placed by the delta) + (coalesced delta edges
+/// with that src). The affected set includes the new src of each delta edge
+/// AND the old committed src of each changed/deleted edge id, so moving an edge
+/// off a src recounts the vacated src. Under a non-zero minimum it also
+/// includes every source node the write inserts or updates (`written`), so a
+/// node written without its edges is counted, and an overwritten edge table
+/// takes [`evaluate_replaced_cardinality`]. A src in `deleted_src_nodes` is
+/// skipped.
+#[allow(clippy::too_many_arguments)]
 async fn evaluate_cardinality<F>(
     edge_table: &str,
     edge_type: &EdgeType,
-    change: &TableChange,
-    changeset: &ChangeSet,
+    plan: &CardPlan,
+    written: &HashSet<String>,
+    deleted_src_nodes: &HashSet<String>,
     committed: &CommittedState<'_>,
     system_columns: SystemColumns,
     sink: &mut F,
@@ -1337,10 +1535,22 @@ where
 {
     let card = &edge_type.cardinality;
     // Default unbounded cardinality can never be violated — skip the lookups.
-    if card.min == 0 && card.max.is_none() {
+    if card.is_default() {
         return Ok(());
     }
-    let plan = card_plan(change, system_columns)?;
+    if card.min > 0 && committed.overwritten.contains(edge_table) {
+        return evaluate_replaced_cardinality(
+            edge_table,
+            edge_type,
+            plan,
+            written,
+            deleted_src_nodes,
+            committed,
+            system_columns,
+            sink,
+        )
+        .await;
+    }
 
     // Committed srcs of the edges this delta touches. `removed_edges` are the
     // deleted ids (direct deletes; a node-delete cascade already lands those ids
@@ -1348,46 +1558,75 @@ where
     // upsert that moves an edge's src vacates its old src, which must be
     // recounted or a drop below @card min is missed.
     let removed_edges = committed
-        .committed_edges(
-            edge_table,
-            system_columns.id,
-            &plan.removed_ids,
-            system_columns,
-        )
+        .committed_edges_by_id(edge_table, &plan.removed_ids, system_columns)
         .await?;
     let moved_from = committed
-        .committed_edges(
-            edge_table,
-            system_columns.id,
-            &plan.changed_ids,
-            system_columns,
-        )
+        .committed_edges_by_id(edge_table, &plan.changed_ids, system_columns)
         .await?;
-
-    let deleted_src_nodes: HashSet<String> = changeset
-        .get(&format!("node:{}", edge_type.from_type))
-        .map(|change| change.deleted_ids.iter().cloned().collect())
-        .unwrap_or_default();
-    let affected = card_affected(&plan, &removed_edges, &moved_from, &deleted_src_nodes);
+    let affected = card_affected(
+        plan,
+        &removed_edges,
+        &moved_from,
+        written,
+        deleted_src_nodes,
+    );
     if affected.is_empty() {
         return Ok(());
     }
 
-    let affected_vec: Vec<String> = affected.iter().cloned().collect();
-    let committed_for_affected = committed
-        .committed_edges(
-            edge_table,
-            system_columns.src,
-            &affected_vec,
-            system_columns,
-        )
+    let removed: HashSet<&str> = plan.removed_ids.iter().map(String::as_str).collect();
+    let committed_counts = committed
+        .committed_source_counts(edge_table, &affected, system_columns, |id| {
+            removed.contains(id) || plan.delta_by_id.contains_key(id)
+        })
         .await?;
     card_violations(
         edge_table,
         edge_type,
-        &plan,
+        plan,
         &affected,
-        &committed_for_affected,
+        &committed_counts,
+        sink,
+    )
+}
+
+/// `@card` under a non-zero minimum for an edge table the write replaces (an
+/// `overwrite` load). Every source of the replaced image or the delta then
+/// holds exactly its coalesced delta edges, so a source the overwrite empties
+/// is below the minimum although no delta row names it. The replaced image's
+/// sources stream past once in bounded batches and only the smallest source
+/// the delta leaves without an edge is kept, so memory stays with the delta.
+/// The first violation in source order is always among those reported, which
+/// is the one a load refuses on. A src that is itself a deleted node is
+/// skipped.
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_replaced_cardinality<F>(
+    edge_table: &str,
+    edge_type: &EdgeType,
+    plan: &CardPlan,
+    written: &HashSet<String>,
+    deleted_src_nodes: &HashSet<String>,
+    committed: &CommittedState<'_>,
+    system_columns: SystemColumns,
+    sink: &mut F,
+) -> Result<()>
+where
+    F: FnMut(Violation) -> Result<()>,
+{
+    let delta_sources: HashSet<&str> = plan.delta_by_id.values().map(String::as_str).collect();
+    let emptied = committed
+        .first_replaced_source(edge_table, system_columns, |src| {
+            !delta_sources.contains(src) && !deleted_src_nodes.contains(src)
+        })
+        .await?;
+    let mut affected = card_affected(plan, &[], &[], written, deleted_src_nodes);
+    affected.extend(emptied);
+    card_violations(
+        edge_table,
+        edge_type,
+        plan,
+        &affected,
+        &HashMap::new(),
         sink,
     )
 }
@@ -1512,6 +1751,7 @@ mod tests {
             committed: None,
             overwritten: HashSet::new(),
             live: None,
+            opened: Default::default(),
         };
 
         let collected = evaluate(&constraints, &changeset, &committed, &catalog)
@@ -1717,6 +1957,77 @@ mod tests {
         );
     }
 
+    /// A kept committed view is scanned until its `@key` BTREE covers every
+    /// fragment: `optimize` builds the node id index, so the endpoint lookup
+    /// turns to the probe while the unindexed `@unique` column keeps scanning.
+    #[tokio::test]
+    async fn committed_lookups_scan_until_the_key_index_covers_the_table_issue_1225() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = committed_people(&dir).await;
+        let catalog = db.catalog();
+        let constraints = constraints_for(&catalog);
+        let knows = constraints
+            .iter()
+            .find(|constraint| matches!(constraint, Constraint::EdgeRi { .. }))
+            .unwrap();
+        let email = constraints
+            .iter()
+            .find(|constraint| matches!(constraint, Constraint::Unique { is_key: false, .. }))
+            .unwrap();
+
+        let sc = catalog.system_columns;
+        let mut people = TableChange::default();
+        people.added.push(person_batch(sc, &[("Eve", "eve@x")]));
+        let mut knows_change = TableChange::default();
+        knows_change
+            .added
+            .push(knows_batch(sc, &[("e1", "Alice", "Bob")]));
+        let mut changeset = ChangeSet::new();
+        changeset.insert("node:Person".to_string(), people);
+        changeset.insert("edge:Knows".to_string(), knows_change);
+        let mut knows_only = TableChange::default();
+        knows_only
+            .added
+            .push(knows_batch(sc, &[("e1", "Alice", "Bob")]));
+        let mut edges_only = ChangeSet::new();
+        edges_only.insert("edge:Knows".to_string(), knows_only);
+
+        let snapshot = db.snapshot().await;
+        let unindexed = AccessPaths::for_committed(
+            &CommittedState::merge(&snapshot),
+            &constraints,
+            &changeset,
+            sc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(unindexed.path_for(knows), AccessPath::Scan);
+        assert_eq!(unindexed.path_for(email), AccessPath::Scan);
+        let untouched = AccessPaths::for_committed(
+            &CommittedState::merge(&snapshot),
+            &constraints,
+            &edges_only,
+            sc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(untouched.path_for(knows), AccessPath::Scan);
+        assert_eq!(untouched.path_for(email), AccessPath::Probe);
+
+        db.db().optimize().await.unwrap();
+        let snapshot = db.snapshot().await;
+        let indexed = AccessPaths::for_committed(
+            &CommittedState::merge(&snapshot),
+            &constraints,
+            &changeset,
+            sc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(indexed.path_for(knows), AccessPath::Probe);
+        assert_eq!(indexed.path_for(email), AccessPath::Scan);
+    }
+
     #[test]
     fn access_paths_refuse_a_path_the_constraint_does_not_offer() {
         let catalog = catalog(GRAPH_SCHEMA);
@@ -1763,6 +2074,7 @@ mod tests {
             committed: None,
             overwritten: HashSet::new(),
             live: None,
+            opened: Default::default(),
         };
         let mut observed = Vec::new();
 
