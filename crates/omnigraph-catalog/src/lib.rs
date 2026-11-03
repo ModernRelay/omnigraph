@@ -231,11 +231,15 @@ pub async fn read_supported_internal_schema_version(root_uri: &str) -> Result<u3
     migrations::guard_stamp(&dataset)
 }
 
-/// Whether the selected graph-manifest dataset depends on files outside its
-/// own dataset root.
+/// Whether the selected graph-manifest dataset depends on files outside the
+/// graph root.
 ///
-/// A directory copy is self-contained only when both this manifest dataset
-/// and every user dataset have no Lance `base_paths`. Keep the paths private:
+/// A whole-root copy is self-contained when neither this manifest dataset nor
+/// any user dataset carries a base that is not a graph-internal branch base
+/// (`branch_base::has_external_bases`, the relocated graph roots RFC). A
+/// branch base inside the root follows the root the copy is opened at, and the
+/// open door refuses any other base, so an openable graph answers `false`.
+/// Keep the paths private:
 /// callers need a relocation eligibility bit, not access to storage
 /// locations that may contain credentials or deployment details.
 /// Test-only: production reads pass the reading handle's control session.
@@ -258,7 +262,7 @@ pub async fn manifest_has_external_base_paths_with_session(
     session: &Arc<lance::session::Session>,
 ) -> Result<bool> {
     let dataset = open_manifest_dataset_with_session(root_uri, branch, session).await?;
-    Ok(!dataset.manifest().base_paths.is_empty())
+    Ok(crate::branch_base::has_external_bases(&dataset))
 }
 
 /// Where the text of a snapshot's schema contract is read.
@@ -527,13 +531,15 @@ impl SnapshotDataset {
         self.dataset.manifest().index_section.is_some()
     }
 
-    /// Whether this pinned table version depends on files outside its dataset
-    /// root through Lance's `base_paths` relocation mechanism.
+    /// Whether this pinned table version carries a Lance base that is not a
+    /// graph-internal branch base (`branch_base::has_external_bases`). A
+    /// pre-v11 fork's bases lie inside the graph root and follow a whole-root
+    /// copy; the open door refuses any other base.
     ///
     /// The actual paths remain private so this read-only metadata surface
     /// cannot disclose source locations or expose a writable Lance handle.
     pub fn has_external_base_paths(&self) -> bool {
-        !self.dataset.manifest().base_paths.is_empty()
+        crate::branch_base::has_external_bases(&self.dataset)
     }
 
     /// Whether `column` has complete usable BTREE coverage.

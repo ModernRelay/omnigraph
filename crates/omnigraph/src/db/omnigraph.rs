@@ -838,10 +838,10 @@ impl Omnigraph {
     }
 
     /// Whether the selected graph-manifest dataset references files outside
-    /// its own root through Lance `base_paths`.
+    /// the graph root: a Lance base that is not a graph-internal branch base.
     ///
-    /// This is relocation audit evidence. A copied graph is self-contained
-    /// only when this returns false and every pinned user dataset reports
+    /// This is relocation audit evidence. A whole-root copy is self-contained
+    /// when this returns false and every pinned user dataset reports
     /// [`SnapshotDataset::has_external_base_paths`](crate::db::SnapshotDataset::has_external_base_paths)
     /// as false.
     pub async fn manifest_has_external_base_paths(&self, branch: Option<&str>) -> Result<bool> {

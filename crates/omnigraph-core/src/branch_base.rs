@@ -5,7 +5,7 @@
 //! source branch's absolute URI as a dataset-root `BasePath` named for that
 //! branch (`Operation::Clone.ref_path`, then `Manifest::shallow_clone`), sets
 //! `base_id` on every inherited data, deletion and index file, and copies the
-//! source's own bases forward. Lance resolves a `base_id` file only through
+//! source's own bases forward. Lance resolves a `base_id` file through
 //! `Dataset::manifest.base_paths`, so a root copied to a new location would
 //! read inherited files at the location each branch was created at.
 //!
@@ -15,43 +15,72 @@
 //! location: `find_branch(name)` of the dataset's main location.
 //! [`follow_opened_root`] replaces each such base in the handle's in-memory
 //! manifest with that location and refuses a handle carrying any other base.
-//! Persisted bytes are never rewritten.
+//! Persisted bytes are never rewritten. A table pin's `manifest_path`, the
+//! other absolute location a graph records, is Omnigraph's own and is rebuilt
+//! from the opened root by `metadata::full_manifest_object_store_path`; this
+//! module owns only Lance bases.
 //!
 //! A base is graph-internal when it is a dataset root and its recorded path
 //! ends with the suffix its own name selects: `/<dir>` for main (no name, or
 //! `main`) and `/<dir>/tree/<name>` for a branch, `<dir>` being the last
 //! segment of the dataset's main location (`__manifest` or a table's
-//! directory). A rebound file missing under the opened root fails there;
-//! nothing falls back to the recorded path.
+//! directory). A recorded path loses its query and trailing `/` first, and
+//! on Windows `\` reads as `/`. A rebound file missing under the opened root
+//! fails there, naming that path; nothing falls back to the recorded path.
 //!
 //! Every open of a graph dataset passes through this module: the
 //! instrumented opener applies [`follow_opened_root`], and [`checkout`] /
-//! [`checkout_native_branch`] are the only checkouts (`forbidden_apis.rs` refuses a
-//! bare `checkout_branch`, `checkout_version`, `checkout_latest` or
-//! `checkout_tag` elsewhere).
+//! [`checkout_native_branch`] are the only checkouts (`forbidden_apis.rs`
+//! refuses a bare `checkout_branch`, `checkout_version`, `checkout_latest` or
+//! `checkout_tag` elsewhere, an assignment to `Dataset::manifest` outside this
+//! module, and a read of `base_paths` outside it).
+//!
+//! **The base-store cache.** A base file's path is computed from
+//! `manifest.base_paths` on every call, but its store is built from the base's
+//! URI on first use and kept in Lance's `base_object_stores`, which clones
+//! share and which only Lance's private `set_manifest` clears. Replacing the
+//! public manifest `Arc` would leave a store opened at the recorded URI in
+//! place, and a handle would read the rebound path through it (on S3 or Azure,
+//! another bucket or container). So the rebound map is installed on a fresh
+//! clone with an empty cache (`Dataset::with_object_store` of the handle's own
+//! primary store), never on the handle that came in. A handle whose bases
+//! already name the opened root is returned as it is: its cache can hold only
+//! stores opened at those URIs, because this module is the only writer of the
+//! map.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use lance::Dataset;
 use lance::dataset::refs::Ref;
 use lance_core::{Error, Result};
 use lance_table::format::BasePath;
+use object_store::path::Path;
 
 const MAIN_BRANCH: &str = "main";
 const BRANCH_DIR: &str = "tree";
 
 /// Rebind every graph-internal branch base of `dataset` to the opened root and
-/// refuse any other base. A dataset without bases is returned unchanged.
-pub fn follow_opened_root(mut dataset: Dataset) -> Result<Dataset> {
-    rebind_internal_bases(&mut dataset)?;
-    Ok(dataset)
+/// refuse any other base. A dataset without bases, or whose bases already name
+/// the opened root, is returned unchanged; otherwise the result is a fresh
+/// handle with an empty base-store cache.
+pub async fn follow_opened_root(dataset: Dataset) -> Result<Dataset> {
+    let Some(base_paths) = rebound_bases(&dataset)? else {
+        return Ok(dataset);
+    };
+    let primary = dataset.object_store(None).await?;
+    let mut fresh = dataset.with_object_store(primary, None);
+    let mut manifest = fresh.manifest.as_ref().clone();
+    manifest.base_paths = base_paths;
+    fresh.manifest = Arc::new(manifest);
+    Ok(fresh)
 }
 
-/// [`follow_opened_root`] in place. Idempotent: a handle whose bases already
-/// name the opened root keeps its manifest `Arc`.
-pub fn rebind_internal_bases(dataset: &mut Dataset) -> Result<()> {
+/// The rebound map, `None` when every base already names the opened root, or
+/// the refusal of a base that is not graph-internal.
+fn rebound_bases(dataset: &Dataset) -> Result<Option<HashMap<u32, BasePath>>> {
     if dataset.manifest.base_paths.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let main = dataset.branch_location().find_main()?;
     let dir = dataset_dir(&main.uri);
@@ -70,27 +99,66 @@ pub fn rebind_internal_bases(dataset: &mut Dataset) -> Result<()> {
             .get_or_insert_with(|| dataset.manifest.base_paths.clone())
             .insert(*id, rebound);
     }
-    if let Some(base_paths) = rebased {
-        let mut manifest = dataset.manifest.as_ref().clone();
-        manifest.base_paths = base_paths;
-        dataset.manifest = Arc::new(manifest);
-    }
-    Ok(())
+    Ok(rebased)
 }
 
 /// Check out `target` of `dataset`, then [`follow_opened_root`]. The one
 /// checkout of a graph dataset.
 pub async fn checkout(dataset: &Dataset, target: impl Into<Ref>) -> Result<Dataset> {
-    dataset
-        .checkout_version(target)
-        .await
-        .and_then(follow_opened_root)
+    let checked_out = dataset.checkout_version(target).await?;
+    follow_opened_root(checked_out).await
 }
 
 /// The latest version of native `branch`, through [`checkout`]; Lance's
 /// `checkout_branch` is the same reference.
 pub async fn checkout_native_branch(dataset: &Dataset, branch: &str) -> Result<Dataset> {
     checkout(dataset, Ref::Version(Some(branch.to_string()), None)).await
+}
+
+/// Whether `dataset` carries any Lance base at all, whatever its location.
+/// Callers that bound I/O to the primary store ask this.
+pub fn has_bases(dataset: &Dataset) -> bool {
+    !dataset.manifest.base_paths.is_empty()
+}
+
+/// Whether `dataset` carries a base that is not a graph-internal branch base:
+/// the relocation bit. A copy of the whole root serves every other base from
+/// the root it is opened at, and the open door refuses a dataset with such a
+/// base, so an opened graph dataset answers `false`.
+pub fn has_external_bases(dataset: &Dataset) -> bool {
+    rebound_bases(dataset).is_err()
+}
+
+/// One base of a handle that came through the door: its URI and whether it is
+/// a dataset root. `None` for an id the manifest does not name.
+pub fn base(dataset: &Dataset, id: u32) -> Option<(&str, bool)> {
+    dataset
+        .manifest
+        .base_paths
+        .get(&id)
+        .map(|base| (base.path.as_str(), base.is_dataset_root))
+}
+
+/// Every base of a handle that came through the door, as [`base`] returns it.
+pub fn bases(dataset: &Dataset) -> impl Iterator<Item = (&str, bool)> {
+    dataset
+        .manifest
+        .base_paths
+        .values()
+        .map(|base| (base.path.as_str(), base.is_dataset_root))
+}
+
+/// The object path of base `id` under the dataset's store registry and whether
+/// it is a dataset root. The collector and the full-text certificate resolve
+/// base files through this. It classifies nothing: the door already refused a
+/// handle with a base that is not graph-internal and rebound every other one,
+/// so the map it reads names locations under the opened root.
+pub fn base_object_path(dataset: &Dataset, id: u32) -> Result<Option<(Path, bool)>> {
+    let Some(base) = dataset.manifest.base_paths.get(&id) else {
+        return Ok(None);
+    };
+    let path = base.extract_path(dataset.session().store_registry())?;
+    Ok(Some((path, base.is_dataset_root)))
 }
 
 /// The branch `base` is graph-internal for (`None` for main), or the refusal
@@ -210,7 +278,7 @@ mod tests {
             ],
         )
         .await;
-        let rebound = follow_opened_root(dataset).unwrap();
+        let rebound = follow_opened_root(dataset).await.unwrap();
         let paths = paths(&rebound);
         assert_eq!(paths[&1], manifest);
         assert_eq!(paths[&2], manifest);
@@ -218,7 +286,7 @@ mod tests {
         assert_eq!(paths[&4], format!("{manifest}/tree/team/review.01K"));
 
         // Idempotent: a rebound handle is returned as it is.
-        let again = follow_opened_root(rebound.clone()).unwrap();
+        let again = follow_opened_root(rebound.clone()).await.unwrap();
         assert!(Arc::ptr_eq(&again.manifest, &rebound.manifest));
     }
 
@@ -241,7 +309,7 @@ mod tests {
             ],
         )
         .await;
-        let paths = paths(&follow_opened_root(dataset).unwrap());
+        let paths = paths(&follow_opened_root(dataset).await.unwrap());
         assert_eq!(paths[&1], table);
         assert_eq!(paths[&2], format!("{table}/tree/legacy"));
     }
@@ -272,7 +340,7 @@ mod tests {
             let described = format!("{refused:?}");
             let root = opened.join(format!("case-{case}"));
             let dataset = with_bases(&root, "__manifest", vec![refused]).await;
-            let error = follow_opened_root(dataset).expect_err(&described);
+            let error = follow_opened_root(dataset).await.expect_err(&described);
             assert!(
                 matches!(error, Error::Internal { .. })
                     && error.to_string().contains("so the dataset is refused")
@@ -301,6 +369,66 @@ mod tests {
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].path, opened.uri());
         assert_eq!(branch.count_rows(None).await.unwrap(), 2);
+    }
+
+    /// A handle that already resolved a base's store at the recorded URI must
+    /// not read the rebound path through it: across buckets that store would
+    /// read the wrong bucket. `shared-memory://<authority>` buckets are
+    /// isolated, like S3 buckets.
+    #[tokio::test]
+    async fn a_base_store_resolved_before_the_rebind_is_not_read_through() {
+        use futures::TryStreamExt;
+        use object_store::ObjectStoreExt;
+
+        let run = ulid::Ulid::new().to_string().to_lowercase();
+        let source = format!("shared-memory://source-{run}/root/__manifest");
+        let copy = format!("shared-memory://copy-{run}/root/__manifest");
+        let mut dataset = fresh_dataset(&source).await;
+        let version = dataset.version().version;
+        dataset
+            .create_branch("feature", version, None)
+            .await
+            .unwrap();
+
+        // Copy every object to the other bucket, then empty the source bucket.
+        let (from, from_root) = lance::io::ObjectStore::from_uri(&source).await.unwrap();
+        let (to, to_root) = lance::io::ObjectStore::from_uri(&copy).await.unwrap();
+        let objects: Vec<_> = from
+            .read_dir_all(&from_root, None)
+            .try_collect()
+            .await
+            .unwrap();
+        for object in &objects {
+            let relative: Vec<_> = object.location.prefix_match(&from_root).unwrap().collect();
+            let target: Path = to_root.parts().chain(relative).collect();
+            let bytes = from
+                .inner
+                .get(&object.location)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            to.put(&target, &bytes).await.unwrap();
+            from.inner.delete(&object.location).await.unwrap();
+        }
+
+        // A stock handle on the copy resolves its base store at the recorded
+        // (source-bucket) URI before any rebind.
+        // forbidden-api-allow: test-only stock open that bypasses the door, the handle under test
+        let stale = lance::dataset::builder::DatasetBuilder::from_uri(&copy)
+            .with_branch("feature", None)
+            .load()
+            .await
+            .unwrap();
+        let id = *stale.manifest.base_paths.keys().next().unwrap();
+        assert_eq!(stale.manifest.base_paths[&id].path, source);
+        stale.object_store(Some(id)).await.unwrap();
+
+        let rebound = follow_opened_root(stale.clone()).await.unwrap();
+        assert_eq!(rebound.manifest.base_paths[&id].path, copy);
+        let rows = rebound.scan().try_into_batch().await.unwrap();
+        assert_eq!(rows.num_rows(), 2, "reads the copy's bucket");
     }
 
     async fn fresh_open(uri: &str) -> Dataset {

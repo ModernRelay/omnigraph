@@ -517,18 +517,17 @@ fn probe_directory(
             base.clone().join(directory)
         });
     };
-    let base = dataset.manifest().base_paths.get(&base_id).ok_or_else(|| {
-        OmniError::manifest(format!("retained root has unknown base path {base_id}"))
-    })?;
-    if directory.is_empty() && !base.is_dataset_root {
+    let (path, is_dataset_root) = omnigraph_core::branch_base::base_object_path(dataset, base_id)
+        .map_err(OmniError::storage)?
+        .ok_or_else(|| {
+            OmniError::manifest(format!("retained root has unknown base path {base_id}"))
+        })?;
+    if directory.is_empty() && !is_dataset_root {
         return Err(OmniError::manifest(format!(
             "deletion base {base_id} is not a dataset root"
         )));
     }
-    let path = base
-        .extract_path(dataset.session().store_registry())
-        .map_err(OmniError::storage)?;
-    Ok(if base.is_dataset_root && !directory.is_empty() {
+    Ok(if is_dataset_root && !directory.is_empty() {
         path.join(directory)
     } else {
         path
@@ -1737,13 +1736,14 @@ async fn borrowed_origins(
     ids.extend(indices.iter().filter_map(|index| index.base_id));
     ids.into_iter()
         .map(|id| {
-            let base = manifest.base_paths.get(&id).ok_or_else(|| {
-                OmniError::manifest_conflict(format!("retained snapshot lacks borrowed base {id}"))
-            })?;
-            Ok(base
-                .extract_path(dataset.session().store_registry())
+            let (path, _) = omnigraph_core::branch_base::base_object_path(dataset, id)
                 .map_err(OmniError::storage)?
-                .to_string())
+                .ok_or_else(|| {
+                    OmniError::manifest_conflict(format!(
+                        "retained snapshot lacks borrowed base {id}"
+                    ))
+                })?;
+            Ok(path.to_string())
         })
         .collect()
 }
