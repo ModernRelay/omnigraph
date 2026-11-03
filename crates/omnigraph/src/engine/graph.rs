@@ -606,10 +606,7 @@ where
                         Some((
                             vec![(
                                 *edge_ds,
-                                endpoint_probes(
-                                    named.member.direction,
-                                    env.catalog.system_columns,
-                                ),
+                                endpoint_probes(named.member.direction, env.catalog.system_columns),
                             )],
                             Some(pushdown),
                         )),
@@ -796,9 +793,9 @@ pub(super) async fn decide_expand_start(
     let pushdown = match &coverage {
         Some(Ok(crate::table_store::IndexCoverage::Indexed)) => true,
         Some(_) => false,
-        None => corrected.as_ref().is_none_or(|inputs| {
-            inputs.coverage == omnigraph_planner::IndexCoverage::Indexed
-        }),
+        None => corrected
+            .as_ref()
+            .is_none_or(|inputs| inputs.coverage == omnigraph_planner::IndexCoverage::Indexed),
     };
     let hop_policy = match corrected {
         Some(inputs) => HopPolicy::Full(inputs),
@@ -956,16 +953,15 @@ where
         let scan_memory = memory
             .child("bound edge scan")
             .map_err(|error| memory.error(error))?;
-        let mut stream =
-            scan_edges_stream(
-                &dataset,
-                orientation,
-                &attach_columns,
-                &keys,
-                None,
-                &scan_memory,
-            )
-            .await?;
+        let mut stream = scan_edges_stream(
+            &dataset,
+            orientation,
+            &attach_columns,
+            &keys,
+            None,
+            &scan_memory,
+        )
+        .await?;
         while let Some(batch) = stream.next().await {
             let batch = batch.map_err(|error| memory.error(error))?;
             let input_memory = scan_memory
@@ -1199,7 +1195,7 @@ pub(super) async fn execute_expand_bfs<F>(
     graph_index: &GraphIndexHandle,
     catalog: &Catalog,
     step: &ExpandStep,
-    start_indexed: Option<(Vec<(Dataset, Vec<EndpointColumns>)>, Option<bool>)>,
+    start_indexed: Option<IndexedStart>,
     hop_policy: HopPolicy,
     side: &Gauge,
     memory: &WorkMemory,
@@ -1644,6 +1640,10 @@ pub(super) enum ActiveExpandSource<'g> {
     Csr(CsrSource<'g>),
 }
 
+/// An indexed walk's edge datasets with their probes, and the pushdown
+/// verdict the start decision reached (`None`: each scan probes).
+pub(super) type IndexedStart = (Vec<(Dataset, Vec<EndpointColumns>)>, Option<bool>);
+
 pub(super) struct IndexedExpandSource {
     pub(super) datasets: Vec<(Dataset, Vec<EndpointColumns>)>,
     /// The known coverage verdict for the pushed key list, when the start
@@ -1763,6 +1763,13 @@ fn physical_scan_rows<E: std::fmt::Display>(
     })
 }
 
+/// The longest key list an unindexed edge scan still pushes into Lance; see
+/// the pushdown rule in [`scan_edges_stream`]. The indexed expand path's
+/// frontier ceiling (`OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER`, 1,024 by
+/// default) is this size: a frontier the plan sends to per-hop scans stays
+/// pushed, a bound edge over a larger source set is sieved.
+const PUSHDOWN_KEYS_MAX: usize = 1024;
+
 async fn scan_edges_stream(
     ds: &Dataset,
     orientation: EndpointColumns,
@@ -1798,13 +1805,18 @@ async fn scan_edges_stream(
             .copied()
             .filter(|column| *column != key_col && *column != opposite_col),
     );
-    // A `key IN (keys)` filter reaches Lance only where a BTREE on the key
-    // column turns it into index lookups. Elsewhere Lance scans every fragment
-    // anyway and re-plans the pushed list for each one (a clone and a hash
-    // set of every key per fragment), so the engine sieves the batches
-    // itself through one set of the keys.
+    // A `key IN (keys)` filter reaches Lance where a BTREE on the key column
+    // turns it into index lookups, and where the list is small: Lance 13
+    // re-plans a pushed list for every fragment (a clone and a hash set of
+    // every key per fragment), but a pushed filter also lets it read a
+    // fragment's other columns only for the rows the key column admits, one
+    // read fewer per fragment no key is in. Up to `PUSHDOWN_KEYS_MAX` keys
+    // the per-fragment replan is cheaper than that read; past it the engine
+    // sieves the batches itself through one set of the keys.
     let pushdown = match pushdown {
-        Some(known) => known,
+        Some(true) => true,
+        _ if keys.len() <= PUSHDOWN_KEYS_MAX => true,
+        Some(false) => false,
         None => matches!(
             omnigraph_core::dataset_index::key_column_index_coverage(ds, key_col).await,
             Ok(omnigraph_core::dataset_index::IndexCoverage::Indexed)

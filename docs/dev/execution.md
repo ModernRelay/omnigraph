@@ -75,7 +75,14 @@ not force a graph-wide scan and a lazy branch may reuse an identical inherited
 table view.
 
 An explicitly bound edge must scan its edge table because topology alone does
-not contain edge properties. It preserves incoming row/rank order and carries a
+not contain edge properties. Every edge probe (`graph.rs::scan_edges_stream`:
+the bound-edge producer, an indexed hop) pushes its `key IN (keys)` list into
+Lance when the key column has usable BTREE coverage, which turns it into
+index lookups, or when the list holds at most 1,024 keys; a longer list over
+an unindexed column is not pushed, because Lance 13 clones and plans the
+list again for every fragment, so that scan reads unfiltered and the engine
+keeps the rows whose key is in one set of the keys (one more column read per
+fragment no key is in, which only a long list pays for). It preserves incoming row/rank order and carries a
 deterministic edge tie-break. A correlated block (`not { ... }`,
 `exists { ... }`, `count { ... } > 2`, `sum($d.size) { ... } > 100`) is one
 anti-join over its typed inner pipeline, keeping each outer row by a

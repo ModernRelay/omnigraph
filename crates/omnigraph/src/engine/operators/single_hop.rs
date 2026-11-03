@@ -280,7 +280,9 @@ impl Streamed for SingleHop {
 /// One batch's neighbour source: CSR slices borrowed from the index, or the
 /// edge dataset a batch-local scan reads.
 enum Source<'g> {
-    Csr { csr: CsrSource<'g> },
+    Csr {
+        csr: CsrSource<'g>,
+    },
     Indexed {
         edge_ds: &'g lance::Dataset,
         pushdown: bool,
