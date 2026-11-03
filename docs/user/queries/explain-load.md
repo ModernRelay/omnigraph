@@ -85,8 +85,58 @@ The `plan` rows are the query explain's, with these values for a load:
 |---|---|
 | `datafusion` | `unavailable`: a load's operators are lowered at execution, under the statement's transaction |
 | `route` | `engine` for overwrite, which runs the plan; `executor` for append and merge, which the plan describes while the keyed adapters run them (`reason` then says `mode_on_executor`) |
-| `explain_version` | the shared counter, `7` since every route prints `pipelines` |
+| `explain_version` | the shared counter, `8` since a write's plan has the `DeltaSource` leaf |
 | `operation` | `kind` (`load`), `mode`, and `tables`: the target and each consulted committed table with its `type_key` and `version` |
+
+## A staged write's document
+
+Every other write the engine validates is planned the same way, one plan
+per table it stages: a JSONL load (`POST /load`, `omnigraph load`), a
+`load csv` append or merge (whose one plan is the statement's own, above),
+a GQ `insert`, `update` or `delete`, a Blob cell write and a `branch
+merge`. The write's receipt carries one document per table it validated,
+and the engine's judge executes exactly the `Validate` node each document
+shows while the keyed adapters write. Such a document has two nodes:
+
+| `node` | `detail` fields |
+|---|---|
+| `Validate` | as above: `table`, `checks` with each check's `access`, `removal` |
+| `DeltaSource` | `table`, `version` (the committed version the write pins, or `null` for a table new in the base), `rows` (the staged rows, exact), `delta` and `deletes` |
+
+`delta` is what the write does to the table's rows: `insert` (a strict
+insert, an append), `upsert` (a keyed upsert, a merge load, a staged
+mutation, a branch merge's effects), `replace` (an overwrite's whole new
+image) or `removal` (no rows: the write only removes ids). `deletes` says
+whether the write removes ids from the table (a `delete`, a branch merge's
+deletions); a removed node may strand committed edges, so a node table with
+`deletes` carries the `retained_edges` checks an overwrite carries, and an
+edge table with `deletes` under a non-zero `@card` minimum carries the
+`cardinality` recount of the sources it empties.
+
+The `plan` rows differ from a `load csv` statement's in two values:
+
+| `node` | `detail` |
+|---|---|
+| `route` | `executor`, always; `reason` says `write_on_executor` with the write's kind |
+| `operation` | `kind` (`write`), `write` (`load`, `mutation`, `blob_cell` or `branch_merge`), `committed` and `tables` |
+
+`committed` is the committed image the checks read: `base`, the
+transaction's pinned base (a load); `live`, the base for existence and
+uniqueness with `@card` counted on the live branch (a mutation and a Blob
+cell write); `merge_target`, the merge target's pinned base (a branch
+merge). The access rule is the one above: a kept table's `edge_ri` and
+non-key `@unique` lookups `probe` only under full BTREE coverage of the
+consulted table and `scan` otherwise, so a mutation inserting edges into a
+Person table whose key index does not cover every fragment scans the
+table's id column once, and probes it again once the table is optimized.
+An `edge_ri` check's `probe` follows the same rule as a load's: under
+`swept` the judge loads the committed key sets, one per endpoint node type,
+before it sweeps the staged rows, and under `judged` it looks the endpoints
+up after the sweep. A load and a mutation refuse on the first missing
+endpoint; a branch merge lists every one among its conflicts.
+A GQT case pins these documents with `--- expect plan` after a mutate
+step's expect or a `branch merge` step's expect, in the `load validate …`
+lines of a load plan.
 
 An executed load's receipt carries the same document and an `executed`
 object with `partitions` (the widest operator's), `rows`, `source_bytes` and

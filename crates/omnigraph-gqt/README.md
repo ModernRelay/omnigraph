@@ -192,6 +192,11 @@ load csv "person.csv" into node:Person mode append delimiter "|" header
 A `--- expect plan` section directly after a `load csv` step's `--- expect ok`
 pins the load's planner document and executed report, read from the load's
 receipt ([explaining a load statement](../../docs/user/queries/explain-load.md)).
+The same section after a mutate step's `--- expect ok|affected` or a
+`branch merge` step's expect pins the write's `Validate` nodes, one planner
+document per table the write validated, read from the mutation's or the
+merge's receipt; a fact holds when any of those documents holds it, and the
+`executed` forms have no document to hold them.
 Each line is one fact; a fact the section does not mention is unchecked, as
 for a query plan. The forms: `load route: <plan|pipeline>` (the document's
 `engine` or `executor` route); `load scan: partitions <n> fallback
@@ -691,6 +696,12 @@ A `load csv` step may carry an `--- expect plan` section directly after its
 `--- expect ok`.
 Its lines are checked against the planner document in the executed load's
 receipt ([Explaining a load statement](../../docs/user/queries/explain-load.md)).
+A mutate step's `--- expect ok|affected` and a `branch merge` step's expect
+may carry the same section: its lines are checked against the write's
+`Validate` documents, one per table the write validated (a JSONL load, a
+mutation, a blob cell or a branch merge plans each table it stages), and a
+line holds when any of them holds it; the `load executed` forms claim a
+report only a `load csv` receipt carries.
 Each line is one fact claim, and a fact no line mentions is unchecked:
 
 ```text

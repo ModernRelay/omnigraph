@@ -734,6 +734,7 @@ fn outcome_takes_the_three_merge_words() {
             into,
             as_commit: _,
             expect: MergeExpect::Outcome(got),
+            plan: _,
         } = &step.write
         else {
             panic!(
@@ -3371,7 +3372,7 @@ async fn traversal_pin_preserves_the_hosts_query_io_probes() {
 }
 
 #[test]
-fn a_load_plan_section_follows_a_load_steps_expect_ok_only() {
+fn a_plan_section_follows_a_load_or_mutate_steps_expect_only() {
     const CSV: &str = "--- csv people.csv\nname\ncarol\n";
     const LOAD: &str =
         "--- mutate\nload csv \"people.csv\" into node:Person mode overwrite header\n";
@@ -3397,5 +3398,11 @@ fn a_load_plan_section_follows_a_load_steps_expect_ok_only() {
     let malformed = text.replace("load route: plan", "load route: express");
     assert!(parse_case("load_plan", &malformed).is_err());
     let on_a_mutation = format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{EXPECT_OK}{PLAN}");
-    assert!(parse_case("load_plan", &on_a_mutation).is_err());
+    let case = parse_case("load_plan", &on_a_mutation).unwrap();
+    let [Item::Step(Step::Mutate(step))] = case.items.as_slice() else {
+        panic!("expected one mutate step carrying a plan expect");
+    };
+    assert_eq!(step.plan.as_ref().map(|plan| plan.lines.len()), Some(2));
+    let before_the_expect = format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{PLAN}{EXPECT_OK}");
+    assert!(parse_case("load_plan", &before_the_expect).is_err());
 }

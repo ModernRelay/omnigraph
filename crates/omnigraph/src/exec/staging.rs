@@ -419,37 +419,6 @@ impl MutationStaging {
             .unwrap_or(&[])
     }
 
-    /// Build the validation [`ChangeSet`](crate::validate::ChangeSet) for this
-    /// staging: every touched table's accumulated rows as the `changed` delta
-    /// (record-batch clone is Arc-cheap — no data copy). Shared by the mutation
-    /// and loader write paths so their validation input cannot drift.
-    pub(crate) fn to_changeset(&self) -> crate::validate::ChangeSet {
-        let mut changeset = crate::validate::ChangeSet::new();
-        let mut __dst_pk: Vec<_> = self.pending.keys().collect();
-        __dst_pk.sort();
-        for table_key in __dst_pk {
-            let batches = self.pending_batches(table_key);
-            if batches.is_empty() {
-                continue;
-            }
-            let mut change = crate::validate::TableChange::default();
-            change.changed.extend(batches.iter().cloned());
-            changeset.insert(table_key.clone(), change);
-        }
-        // Deletes (disjoint from `pending` by D₂) carry their removed ids so the
-        // evaluator recounts the srcs a delete empties (`@card`) and sees removed
-        // rows for RI — the faithful change-set the merge path also builds.
-        let mut __dst_di: Vec<_> = self.deleted_ids.iter().collect();
-        __dst_di.sort_by(|a, b| a.0.cmp(b.0));
-        for (table_key, ids) in __dst_di {
-            if ids.is_empty() {
-                continue;
-            }
-            changeset.entry(table_key.clone()).or_default().deleted_ids = ids.clone();
-        }
-        changeset
-    }
-
     /// Schema of the accumulated batches for `table_key`, or `None` if no
     /// op has touched the table. Used by `scan_with_pending` to construct
     /// the in-memory `MemTable`.
