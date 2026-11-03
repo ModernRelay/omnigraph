@@ -5342,3 +5342,239 @@ async fn branch_merge_reports_divergent_insert_for_keyed_edge() {
         other => panic!("expected merge conflicts, got {other:?}"),
     }
 }
+
+/// Copy a whole graph root, every file, as a backup tool would.
+fn copy_root(from: &std::path::Path, to: &std::path::Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_root(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// The `.lance` data files directly under `dir`.
+fn lance_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "lance"))
+        .collect()
+}
+
+/// Every `data/` directory of the `__manifest` dataset: main's and each
+/// native branch tree's.
+fn manifest_data_dirs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let manifest = root.join("__manifest");
+    let mut dirs = vec![manifest.join("data")];
+    let tree = manifest.join("tree");
+    if tree.exists() {
+        for entry in fs::read_dir(tree).unwrap() {
+            let data = entry.unwrap().path().join("data");
+            if data.exists() {
+                dirs.push(data);
+            }
+        }
+    }
+    dirs
+}
+
+/// `node:Person` rows on `target` of the graph at `root`, opened fresh.
+async fn person_rows_at(root: &std::path::Path, target: ReadTarget) -> Result<usize, OmniError> {
+    let db = Omnigraph::open(root.to_str().unwrap()).await?;
+    let snapshot = db.snapshot_of(target).await?;
+    let dataset = snapshot.open_dataset("node:Person").await?;
+    dataset.count_rows(None).await
+}
+
+/// A whole-root copy serves every retained branch from its own bytes: the
+/// `__manifest` base a native branch inherits through Lance's shallow clone
+/// follows the opened root, never the path the branch was created at.
+#[tokio::test]
+async fn relocated_root_serves_retained_branches_from_its_own_files_issue_1233() {
+    let work = tempfile::tempdir().unwrap();
+    let original = work.path().join("original.omni");
+    let db = init_and_load_at(original.to_str().unwrap(), TEST_SCHEMA).await;
+
+    // An unwritten retained branch, a written branch and an unwritten child of
+    // the written branch: the child's base is the written branch's tree.
+    db.branch_create("retained").await.unwrap();
+    db.branch_create("written").await.unwrap();
+    mutate_branch(
+        &db,
+        "written",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+    db.branch_create_from(ReadTarget::branch("written"), "child")
+        .await
+        .unwrap();
+    // A commit only `written` holds; resolving it reads every branch manifest,
+    // the unwritten siblings included.
+    let written_head = newest_commit(&db, "written").await.graph_commit_id;
+    drop(db);
+
+    let reads = |root: std::path::PathBuf| {
+        let written_head = written_head.clone();
+        async move {
+            assert_eq!(
+                person_rows_at(&root, ReadTarget::branch("main"))
+                    .await
+                    .unwrap(),
+                4
+            );
+            assert_eq!(
+                person_rows_at(&root, ReadTarget::branch("retained"))
+                    .await
+                    .unwrap(),
+                4,
+                "unwritten retained branch at {root:?}"
+            );
+            assert_eq!(
+                person_rows_at(&root, ReadTarget::branch("written"))
+                    .await
+                    .unwrap(),
+                5
+            );
+            assert_eq!(
+                person_rows_at(&root, ReadTarget::branch("child"))
+                    .await
+                    .unwrap(),
+                5,
+                "child of a written branch at {root:?}"
+            );
+            assert_eq!(
+                person_rows_at(
+                    &root,
+                    ReadTarget::snapshot(SnapshotId::new(written_head.clone()))
+                )
+                .await
+                .unwrap(),
+                5,
+                "branch-only snapshot lookup with unwritten siblings at {root:?}"
+            );
+        }
+    };
+
+    let backup = work.path().join("backup.omni");
+    copy_root(&original, &backup);
+    let relocated = work.path().join("relocated.omni");
+    copy_root(&original, &relocated);
+
+    // No fallback: a copy missing an inherited file fails, though the
+    // original path still holds that file.
+    let missing = work.path().join("missing.omni");
+    copy_root(&original, &missing);
+    let inherited = lance_files(&missing.join("__manifest").join("data"));
+    {
+        // Main moves on, so only the retained branches still need the files
+        // main held when they were created.
+        let db = helpers::session(Omnigraph::open(missing.to_str().unwrap()).await.unwrap());
+        mutate_main(
+            &db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Mia")], &[("$age", 30)]),
+        )
+        .await
+        .unwrap();
+    }
+    let main_head = open_dataset_head(missing.join("__manifest").to_str().unwrap(), None).await;
+    let main_files: std::collections::BTreeSet<String> = main_head
+        .manifest()
+        .fragments
+        .iter()
+        .flat_map(|fragment| fragment.files.iter().map(|file| file.path.clone()))
+        .collect();
+    let mut removed = 0;
+    for file in inherited {
+        let name = file.file_name().unwrap().to_str().unwrap().to_string();
+        if !main_files.contains(&name) {
+            fs::remove_file(file).unwrap();
+            removed += 1;
+        }
+    }
+    assert!(
+        removed > 0,
+        "main's head must have replaced an inherited file"
+    );
+    assert_eq!(
+        person_rows_at(&missing, ReadTarget::branch("main"))
+            .await
+            .unwrap(),
+        5
+    );
+    let error = person_rows_at(&missing, ReadTarget::branch("retained"))
+        .await
+        .expect_err("a read must not fall back to the create-time path");
+    let message = error.to_string();
+    assert!(
+        message.contains("missing.omni") && !message.contains("original.omni"),
+        "the failed read names the opened root, not the original: {message}"
+    );
+
+    // A still-present but divergent original: it advanced, and it no longer
+    // holds the files the copy's branches inherit. The copy reads its own.
+    {
+        let db = helpers::session(Omnigraph::open(original.to_str().unwrap()).await.unwrap());
+        mutate_main(
+            &db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Zed")], &[("$age", 99)]),
+        )
+        .await
+        .unwrap();
+    }
+    for dir in manifest_data_dirs(&original) {
+        for file in lance_files(&dir) {
+            fs::remove_file(file).unwrap();
+        }
+    }
+    reads(relocated.clone()).await;
+
+    // The original path is gone: the copy still reads.
+    fs::remove_dir_all(&original).unwrap();
+    reads(relocated.clone()).await;
+
+    // The copy writes and branches on a rebound branch: the publish and the
+    // new shallow clone start from the copy's own files.
+    {
+        let db = helpers::session(Omnigraph::open(relocated.to_str().unwrap()).await.unwrap());
+        mutate_branch(
+            &db,
+            "retained",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Ray")], &[("$age", 41)]),
+        )
+        .await
+        .unwrap();
+        db.branch_create_from(ReadTarget::branch("child"), "grandchild")
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        person_rows_at(&relocated, ReadTarget::branch("retained"))
+            .await
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        person_rows_at(&relocated, ReadTarget::branch("grandchild"))
+            .await
+            .unwrap(),
+        5
+    );
+
+    // Same-path restore of the whole-root backup.
+    copy_root(&backup, &original);
+    reads(original.clone()).await;
+}

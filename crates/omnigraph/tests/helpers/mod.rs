@@ -901,3 +901,125 @@ pub fn resign_change_token(token: &str, edit: impl FnOnce(&mut serde_json::Value
     encoded.extend_from_slice(&checksum);
     engine.encode(encoded)
 }
+
+/// Copy every object under the graph root `from` to the same relative path
+/// under `to`, on any backend Lance opens (a whole-root backup restored at a
+/// new location, or into another bucket or container). Returns the count.
+pub async fn copy_graph_root_objects(from: &str, to: &str) -> usize {
+    use object_store::ObjectStoreExt;
+    let (source, source_root) = lance::io::ObjectStore::from_uri(from).await.unwrap();
+    let (target, target_root) = lance::io::ObjectStore::from_uri(to).await.unwrap();
+    let objects: Vec<_> = source
+        .read_dir_all(&source_root, None)
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(!objects.is_empty(), "nothing to copy under {from}");
+    for object in &objects {
+        let relative: Vec<_> = object
+            .location
+            .prefix_match(&source_root)
+            .unwrap_or_else(|| panic!("{} is outside {from}", object.location))
+            .collect();
+        let destination: object_store::path::Path = target_root.parts().chain(relative).collect();
+        let bytes = source
+            .inner
+            .get(&object.location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        target.put(&destination, &bytes).await.unwrap();
+    }
+    objects.len()
+}
+
+/// Delete every object under the graph root `uri`.
+pub async fn delete_graph_root_objects(uri: &str) {
+    use object_store::ObjectStoreExt;
+    let (store, root) = lance::io::ObjectStore::from_uri(uri).await.unwrap();
+    let objects: Vec<_> = store.read_dir_all(&root, None).try_collect().await.unwrap();
+    for object in objects {
+        store.inner.delete(&object.location).await.unwrap();
+    }
+}
+
+/// The relocation journey every backend runs (the relocated graph roots RFC,
+/// issue 1233): build a graph at `source` with an unwritten retained branch,
+/// a written branch and an unwritten child of it, copy the whole root to each
+/// of `copies` in turn, remove the previous location, and read and write
+/// every branch at the copy, then clean up there.
+pub async fn assert_relocated_root_serves_every_branch(source: &str, copies: &[String]) {
+    let person = |name: &str, age: i64| mixed_params(&[("$name", name)], &[("$age", age)]);
+    let db = init_and_load_at(source, TEST_SCHEMA).await;
+    db.branch_create("retained").await.unwrap();
+    db.branch_create("written").await.unwrap();
+    mutate_branch(
+        &db,
+        "written",
+        MUTATION_QUERIES,
+        "insert_person",
+        &person("Eve", 22),
+    )
+    .await
+    .unwrap();
+    db.branch_create_from(ReadTarget::branch("written"), "child")
+        .await
+        .unwrap();
+    let written_head = db
+        .list_commits(Some("written"))
+        .await
+        .unwrap()
+        .remove(0)
+        .graph_commit_id;
+    drop(db);
+
+    let rows = |uri: String, target: ReadTarget| async move {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        let snapshot = db.snapshot_of(target).await.unwrap();
+        let dataset = snapshot.open_dataset("node:Person").await.unwrap();
+        dataset.count_rows(None).await.unwrap()
+    };
+    let mut previous = source.to_string();
+    let mut retained = 4;
+    for copy in copies {
+        copy_graph_root_objects(&previous, copy).await;
+        delete_graph_root_objects(&previous).await;
+        let at = |target: ReadTarget| rows(copy.clone(), target);
+        assert_eq!(at(ReadTarget::branch("main")).await, 4, "{copy}");
+        assert_eq!(at(ReadTarget::branch("retained")).await, retained, "{copy}");
+        assert_eq!(at(ReadTarget::branch("written")).await, 5, "{copy}");
+        assert_eq!(at(ReadTarget::branch("child")).await, 5, "{copy}");
+        assert_eq!(
+            at(ReadTarget::snapshot(SnapshotId::new(written_head.clone()))).await,
+            5,
+            "{copy}"
+        );
+
+        let db = session(Omnigraph::open(copy).await.unwrap());
+        retained += 1;
+        mutate_branch(
+            &db,
+            "retained",
+            MUTATION_QUERIES,
+            "insert_person",
+            &person(&format!("Moved-{retained}"), 30),
+        )
+        .await
+        .unwrap();
+        let cleaned = db
+            .cleanup(omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            })
+            .await
+            .unwrap();
+        assert!(cleaned.iter().all(|row| row.error.is_none()), "{cleaned:?}");
+        drop(db);
+        assert_eq!(at(ReadTarget::branch("retained")).await, retained, "{copy}");
+        assert_eq!(at(ReadTarget::branch("child")).await, 5, "{copy}");
+        previous = copy.clone();
+    }
+    delete_graph_root_objects(&previous).await;
+}

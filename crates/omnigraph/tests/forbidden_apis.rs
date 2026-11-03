@@ -4232,6 +4232,66 @@ fn lance_batched_blob_read_call_counts_are_pinned() {
     );
 }
 
+/// Every checkout of a graph dataset goes through `branch_base::checkout`,
+/// which rebinds graph-internal branch bases to the opened root and refuses
+/// any other base (the relocated graph roots RFC, issue 1233); the catalog's
+/// `layout::checkout_manifest` is that door for `__manifest`. No writer adds a
+/// Lance base except the one shallow clone `lance_clone::create_branch` makes,
+/// so a base never names a location outside the graph. A bare checkout here
+/// would read inherited files at the location a branch was created at.
+#[test]
+fn graph_dataset_checkouts_and_bases_have_one_door_issue_1233() {
+    let src = engine_src_root();
+    let mut sites = Vec::new();
+    let mut fields = Vec::new();
+    for (relative, file) in labeled_scan_files(&src, true) {
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        let ast = parse_rust_source(&contents, &relative);
+        let inventory = call_inventory(&ast);
+        for method in [
+            "checkout_branch",
+            "checkout_version",
+            "checkout_latest",
+            "checkout_tag",
+            "add_bases",
+            "shallow_clone",
+        ] {
+            let count = inventory.counts.get(method).copied().unwrap_or(0);
+            if count > 0 {
+                sites.push((method, relative.clone(), count));
+            }
+        }
+        for (number, line) in contents.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            for field in [
+                "initial_bases",
+                "target_bases",
+                "target_base_names_or_paths",
+            ] {
+                if code.contains(field) && !code.contains(&format!("{field}: None")) {
+                    fields.push(format!("{relative}:{}: {}", number + 1, line.trim()));
+                }
+            }
+        }
+    }
+    sites.sort();
+    assert_eq!(
+        sites,
+        vec![(
+            "checkout_version",
+            "omnigraph-core/branch_base.rs".to_string(),
+            1
+        )],
+        "a graph dataset is checked out only through branch_base::checkout \
+         (layout::checkout_manifest for __manifest), and no writer adds a base"
+    );
+    assert!(
+        fields.is_empty(),
+        "a write may not name Lance bases; the shallow clone is the only source: {fields:#?}"
+    );
+}
+
 /// Pins the vector index the engine builds to IVF_FLAT, which scores every
 /// row of a partition it searches exactly. A read reports its `nearest`
 /// search exhaustive when it searched every partition; a quantized or graph
