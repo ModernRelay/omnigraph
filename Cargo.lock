@@ -5902,6 +5902,7 @@ dependencies = [
  "omnigraph-compiler",
  "serde",
  "serde_json",
+ "syn",
  "tempfile",
  "thiserror",
 ]

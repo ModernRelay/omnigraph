@@ -612,7 +612,22 @@ node's `NodeId`, its fields and its already lowered inputs. The trait has one
 method per `PhysicalNode` variant and no default body, and the walk's match
 has no catch-all arm, so a new variant does not compile until the walk and
 every `impl Lower` handle it. `Lower::Op` is an associated type; the planner
-crate does not depend on DataFusion. Two calls are not one per node:
+crate does not depend on DataFusion.
+
+A new variant is one line of the `physical_nodes!` declaration
+(`crates/omnigraph-planner/src/physical.rs`): its fields, its explain name,
+its child fields, and four classification tokens, `shape:` (its
+`PipelineShape` over the streamed input), `sides:` (the inputs its operator
+drains whole), `cut:` (the most rows it keeps) and `order:` (the order its
+output leaves in, `order_of(input)` for an order-preserving operator). The
+macro generates `shape`, `collected_sides`, `row_cut` and `order` as matches
+with one arm per kind, so a line without a token does not compile, at that
+line, and a constant per kind is never an arm elsewhere. The matches that read
+fields stay hand-written and are named in
+`crates/omnigraph-planner/tests/physical_node_matches.rs`, which parses the
+crate and refuses a default arm beside named kinds and a match over kinds at
+any other site; the `Lower` walk, the engine's lowering and the catalogue
+golden (`@Operator`) then report the behaviour the new kind still owes. Two calls are not one per node:
 `anti_join_outer` runs between the outer and the inner tree of an `AntiJoin`,
 and `finish` runs once with the lowered root. A `RankFuse` has two input
 subtrees, one per arm, and the walk lowers each once; a subtree reached

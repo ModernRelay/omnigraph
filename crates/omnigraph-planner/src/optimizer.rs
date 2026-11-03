@@ -4301,70 +4301,13 @@ fn variable_offset_width(data_type: &DataType) -> u64 {
 pub(crate) const RRF_NEAREST_ARM_K: usize = 100;
 
 /// The order a node's output leaves in, from the operator's definition and
-/// its inputs' orders (`input`): a ranking scan leaves in score order
-/// (`nearest` ascending `_distance`, `bm25` descending `_score`), an
-/// id-ordered scan or a key merge in its key's order, a sort in exactly its
-/// comparator (its keys, then its identity keys), and an order-preserving
-/// operator (a dependent scan, a hash join's probe, a filter, a projection, a
-/// limit, a page, a hydration, a row compare) in its input's order; every
-/// other operator declares none. A fusion declares none: it appends the
-/// fused score as a column, and the `Sort` above it orders by that score.
+/// its inputs' orders (`input`): each kind's `order:` token in the
+/// `physical_nodes!` declaration ([`PhysicalNode::order`]).
 pub fn node_order(
     node: &PhysicalNode,
     input: impl Fn(NodeId) -> Option<Vec<OrderKey>>,
 ) -> Option<Vec<OrderKey>> {
-    match node {
-        PhysicalNode::Scan {
-            source: ScanInput::Dependent { input: probe, .. },
-            ..
-        } => input(*probe),
-        PhysicalNode::Scan {
-            source: ScanInput::Table,
-            spec,
-            ranked: Some(ranked),
-            ..
-        } => Some(vec![OrderKey::of(
-            &ranked.ordering(spec.binding.as_deref()?),
-        )]),
-        PhysicalNode::Scan {
-            source: ScanInput::Table,
-            ordered,
-            ..
-        } => ordered.then(|| vec![OrderKey::Column(LOGICAL_ID.to_string())]),
-        PhysicalNode::SortMergeJoin { on, .. } => Some(vec![OrderKey::Column(on.clone())]),
-        PhysicalNode::ClassifyThreeWay { .. } => {
-            Some(vec![OrderKey::Column(LOGICAL_ID.to_string())])
-        }
-        PhysicalNode::HashJoin { probe, .. } => input(*probe),
-        PhysicalNode::HydrateByAddress { input: from, .. }
-        | PhysicalNode::HydrateColumns { input: from, .. }
-        | PhysicalNode::RowCompare { input: from }
-        | PhysicalNode::Page { input: from, .. }
-        | PhysicalNode::Limit { input: from, .. }
-        | PhysicalNode::Filter { input: from, .. }
-        | PhysicalNode::Projection { input: from, .. } => input(*from),
-        PhysicalNode::Sort {
-            order_by, tiebreak, ..
-        } => Some(
-            order_by
-                .iter()
-                .map(OrderKey::of)
-                .chain(tiebreak.iter().cloned().map(OrderKey::Identity))
-                .collect(),
-        ),
-        PhysicalNode::Validate { input: from, .. } => input(*from),
-        PhysicalNode::MetadataCount { .. }
-        | PhysicalNode::CrossJoin { .. }
-        | PhysicalNode::ContainsJoin { .. }
-        | PhysicalNode::OuterReference { .. }
-        | PhysicalNode::Expand { .. }
-        | PhysicalNode::AntiJoin { .. }
-        | PhysicalNode::RankFuse { .. }
-        | PhysicalNode::Aggregate { .. }
-        | PhysicalNode::CsvSource { .. }
-        | PhysicalNode::DeltaSource { .. }
-        | PhysicalNode::FragmentWrite { .. } => None,
-    }
+    node.order(input)
 }
 
 /// [`node_order`] of `id`, recomputed from the operators of its subtree and
