@@ -202,9 +202,7 @@ impl SingleHop {
             })?;
         let hop_memory = memory.child("expand hop")?;
         hop_memory.entries::<usize>(batch.num_rows())?;
-        let row_bytes = (0..batch.num_rows())
-            .map(|row| memory.slice_bytes(&batch, row, 1))
-            .collect::<Result<Vec<_>>>()?;
+        let row_bytes = memory.row_bytes(&batch)?;
         let source = match &started.mode {
             Mode::Csr => {
                 let gi = env

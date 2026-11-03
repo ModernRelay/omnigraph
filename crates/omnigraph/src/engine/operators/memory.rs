@@ -867,6 +867,19 @@ impl WorkMemory {
         })
     }
 
+    /// `slice_bytes(batch, row, 1)` for every row of `batch` in one pass per
+    /// column: the same numbers, read off each column's layout (a constant per
+    /// row for fixed-width columns, the offset deltas for variable-width ones,
+    /// children summed for structs) instead of one `ArrayData` slice per row
+    /// per column.
+    pub(in crate::engine) fn row_bytes(&self, batch: &RecordBatch) -> DfResult<Vec<usize>> {
+        let mut rows = vec![0usize; batch.num_rows()];
+        for column in batch.columns() {
+            add_row_bytes(&column.to_data(), &mut rows)?;
+        }
+        Ok(rows)
+    }
+
     pub(in crate::engine) fn take(
         &self,
         batch: &RecordBatch,
@@ -1169,6 +1182,66 @@ fn take_scratch_size(data: &ArrayData, rows: usize) -> usize {
 /// Bytes copied from an Arrow range, including nested child ranges. Arrow's
 /// ArrayData slice keeps list child buffers whole, so recursing through its
 /// get_slice_memory_size would count the entire vector column per picked row.
+/// Add each row's `slice_memory_size(data, row, 1)` to `rows`, one pass over
+/// the column; a layout with no shortcut falls back to the per-row slice.
+fn add_row_bytes(data: &ArrayData, rows: &mut [usize]) -> DfResult<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let validity = usize::from(data.nulls().is_some());
+    match data.data_type() {
+        DataType::Utf8 | DataType::Binary => {
+            let offsets = &data.buffers()[0].typed_data::<i32>()[data.offset()..];
+            for (row, bytes) in rows.iter_mut().enumerate() {
+                let value = (offsets[row + 1] - offsets[row]) as usize;
+                *bytes = bytes.saturating_add(4 + value + validity);
+            }
+        }
+        DataType::LargeUtf8 | DataType::LargeBinary => {
+            let offsets = &data.buffers()[0].typed_data::<i64>()[data.offset()..];
+            for (row, bytes) in rows.iter_mut().enumerate() {
+                let value = (offsets[row + 1] - offsets[row]) as usize;
+                *bytes = bytes.saturating_add(8 + value + validity);
+            }
+        }
+        DataType::Struct(_) => {
+            for child in data.child_data() {
+                add_row_bytes(&child.slice(data.offset(), rows.len()), rows)?;
+            }
+            for bytes in rows.iter_mut() {
+                *bytes = bytes.saturating_add(validity);
+            }
+        }
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::Map(_, _)
+        | DataType::FixedSizeList(_, _) => {
+            for (row, bytes) in rows.iter_mut().enumerate() {
+                *bytes = bytes.saturating_add(slice_memory_size(data, row, 1)?);
+            }
+        }
+        _ => {
+            if data.data_type().is_primitive()
+                || matches!(
+                    data.data_type(),
+                    DataType::Boolean | DataType::FixedSizeBinary(_) | DataType::Null
+                )
+            {
+                // Fixed-width layouts cost the same for every row.
+                let each = slice_memory_size(data, 0, 1)?;
+                for bytes in rows.iter_mut() {
+                    *bytes = bytes.saturating_add(each);
+                }
+            } else {
+                for (row, bytes) in rows.iter_mut().enumerate() {
+                    *bytes = bytes.saturating_add(slice_memory_size(data, row, 1)?);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn slice_memory_size(data: &ArrayData, offset: usize, len: usize) -> DfResult<usize> {
     let data = data.slice(offset, len);
     let validity = if data.nulls().is_some() {
@@ -1734,5 +1807,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pool.reserved(), 0);
+    }
+}
+
+#[cfg(test)]
+mod row_bytes_tests {
+    use super::*;
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder, StringBuilder};
+    use arrow_array::{ArrayRef, BooleanArray, Int64Array, StringArray, StructArray};
+    use arrow_schema::{Field, Fields};
+    use datafusion::execution::context::SessionConfig;
+    use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+    /// One pass per column gives every row the bytes a one-row slice gives.
+    #[test]
+    fn row_bytes_equals_the_per_row_slice_for_every_layout() {
+        let limit = 1 << 20;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+        let resources = Arc::new(QueryResources::new(pool, limit as u64));
+        let ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_extension(resources)),
+        );
+        let memory = WorkMemory::new(ctx, "row bytes").unwrap();
+        let ints: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(3), Some(4)]));
+        let flags: ArrayRef = Arc::new(BooleanArray::from(vec![true, false, true, true]));
+        let names: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("a"),
+            Some("longer value"),
+            None,
+            Some(""),
+        ]));
+        let mut vectors = FixedSizeListBuilder::new(Float32Builder::new(), 3);
+        for row in 0..4 {
+            vectors.values().append_slice(&[row as f32; 3]);
+            vectors.append(row != 1);
+        }
+        let vectors: ArrayRef = Arc::new(vectors.finish());
+        let mut lists = ListBuilder::new(StringBuilder::new());
+        lists.values().append_value("x");
+        lists.values().append_value("yy");
+        lists.append(true);
+        lists.append(false);
+        lists.append(true);
+        lists.values().append_value("zzz");
+        lists.append(true);
+        let lists: ArrayRef = Arc::new(lists.finish());
+        let nested: ArrayRef = Arc::new(StructArray::new(
+            Fields::from(vec![
+                Field::new("n", DataType::Int64, true),
+                Field::new("s", DataType::Utf8, true),
+            ]),
+            vec![Arc::clone(&ints), Arc::clone(&names)],
+            None,
+        ));
+        let batch = RecordBatch::try_from_iter([
+            ("ints", ints),
+            ("flags", flags),
+            ("names", names),
+            ("vectors", vectors),
+            ("lists", lists),
+            ("nested", nested),
+        ])
+        .unwrap();
+        let sliced = batch.slice(1, 3);
+        for batch in [batch, sliced] {
+            let expected: Vec<usize> = (0..batch.num_rows())
+                .map(|row| memory.slice_bytes(&batch, row, 1).unwrap())
+                .collect();
+            assert_eq!(memory.row_bytes(&batch).unwrap(), expected);
+            assert!(expected.iter().all(|bytes| *bytes > 0));
+        }
     }
 }
