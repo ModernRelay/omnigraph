@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - Ragnor Comerford
 created: 2026-11-01
-updated: 2026-11-01
+updated: 2026-11-03
 discussion: https://github.com/ModernRelay/omnigraph/pull/1224
 supersedes: []
 superseded_by: []
@@ -46,11 +46,13 @@ reaches Cedar and never narrows anything.
 
 So every client a person connects acts with that person's full applied
 permissions. The MCP surface (RFC 0003) makes this concrete: `/mcp`
-authenticates through the same bearer path, and when a server enables
-`--mcp-allow-writes`, the `mutate`, `load`, `branches_*` and `commits_*`
-tools reach the same `_as` entry points as HTTP writes. A person who connects
-an agent to read a graph also lets it change, merge, publish and drop commits
-wherever that person can. RFC 0003 names the intended remedy: "An operator
+authenticates through the same bearer path, every tool is listed, and each
+tool runs under the policy action of the HTTP route it projects; the
+`--mcp-allow-writes` and `--mcp-allow-adhoc` settings that once hid tools
+were removed on 2026-10-29. A person who connects an agent to read a graph
+also lets it change, merge, publish and drop commits wherever that person
+can, and no server setting keeps the agent narrower. RFC 0003 names the
+intended remedy: "An operator
 who wants an agent narrower than a person grants the agent's credential
 less." Today there is no way to grant a credential less than its actor.
 
@@ -90,8 +92,9 @@ the issued token says what was granted. The pieces are already in place:
   `insufficient_scope` error with a `scope` parameter) that clients already
   understand.
 - The Intent API already parses and intersects a `scope` claim for M2M
-  tokens, with exact bounds (256 entries, 128 bytes, the RFC 6749 scope-token
-  alphabet). This RFC reuses those bounds unchanged.
+  tokens. The entry bounds this RFC fixes for the server (256 entries, 128
+  bytes, the RFC 6749 scope-token alphabet) are the same numbers, so the two
+  components refuse the same inputs.
 
 ### What this RFC is not
 
@@ -110,6 +113,13 @@ It is not membership, roles, agents or delegation.
   ([#1173](https://github.com/ModernRelay/omnigraph/issues/1173)).
 - It does not make WorkOS a second permission source. A scope can only remove
   an action the policy would have allowed; it can never add one.
+- It does not separate stored-query invocation from ordinary reads. Invoking a
+  stored query still requires `read` on the branch or snapshot it runs
+  against, checked by the runner's inner gate, so a scope that named
+  `invoke_query` alone could run nothing; `invoke_query` therefore sits inside
+  `graph.read`. A client limited to deployed queries is the query-contract
+  design of [#1197](https://github.com/ModernRelay/omnigraph/issues/1197),
+  not a scope.
 
 ## Vocabulary
 
@@ -146,19 +156,24 @@ table covers every one of the thirteen current policy actions.
 
 `graph.write.unprotected` is the ceiling for an agent that may work on
 branches but not land on the ones that matter. The branch it is judged by is
-the branch policy already judges the action by: the written branch for
-`change` and `branch_delete`, the new branch for `branch_create`, and the
-destination for `branch_merge`, `commit_publish` and `commit_drop` (policy's
-`target_branch_scope`). A merge from `main` into a feature branch is inside
-the ceiling; a merge into `main` is not. Schema apply targets `main` only and
-is not a write action here, so this scope never covers it; a client that
-applies schema holds `graph.schema`. Which branches are protected is decided
-by the applied bundle's `protected_branches`, the same list that gives
-`branch_scope: protected` its meaning, so a deployment has one definition of
-a protected branch and changes it in one place. A bundle that names no
-protected branches protects nothing, for policy and for this scope alike;
-preview reports a graph whose bundle lists none when the trust document
-declares a prefix.
+the slot of the policy request that the action already uses: the `branch`
+slot for `change`, which policy judges by `branch_scope`, and the
+`target_branch` slot for every other write action, which policy judges by
+`target_branch_scope`: the deleted branch for `branch_delete`, the new branch
+for `branch_create`, and the destination for `branch_merge`, `commit_publish`
+and `commit_drop`. The access report classifies the actions the same way
+(`access_slot` in `omnigraph-api-types`), so the ceiling adds no third list.
+A merge from `main` into a feature branch is inside the ceiling; a merge into
+`main` is not, and neither is deleting `main`. Schema apply targets `main`
+only and is not a write action here, so this scope never covers it; a client
+that applies schema holds `graph.schema`. Which branches are protected is
+decided by the applied bundle's `protected_branches`, the same list that
+gives `branch_scope: protected` its meaning, so a deployment has one
+definition of a protected branch and changes it in one place. A bundle that
+names no protected branches protects nothing, for policy and for this scope
+alike. A server whose trust document declares a prefix names every graph
+whose applied bundle lists none in its boot log, and again whenever such a
+bundle is applied, so the gap is visible where an operator reads.
 
 This follows the shape GitHub uses for the same problem. Its credentials say
 `contents: write` for a repository and never name a branch; rulesets on the
@@ -190,9 +205,11 @@ reaches a graph its user cannot. Narrowing a client to one of the user's
 graphs is a different question, answered in OAuth by the resource indicator
 (RFC 8707) rather than by the scope; see the unresolved questions.
 
-Graph discovery (`GET /graphs` and the `graphs` tool for an identity
-credential) names graphs by ID and display name and checks no policy action
-today; a ceiling does not change it.
+Graph discovery for an identity credential (`GET /graphs/discovery`, and
+the identity path of the `graphs` tool) names graphs by ID and display name
+and checks no policy action today; a ceiling does not change it. `GET
+/graphs`, which every other credential uses, checks `graph_list` and so sits
+under `cluster.list`.
 
 ### Trust document
 
@@ -228,8 +245,7 @@ claim:
 
 - Absent `scope`, or an empty string, means the token was granted no scopes:
   the ceiling is empty. The token is still admitted; every policy action is
-  then refused with `insufficient_scope` (below). This matches WorkOS, which
-  "omits scope when no scopes were granted".
+  then refused with `insufficient_scope` (below).
 - `scope` must be a string. It is split on single spaces into at most 256
   entries, each 1 to 128 bytes of the scope-token alphabet, with no
   duplicates. Anything else refuses the token with 401 `invalid_token`.
@@ -247,19 +263,40 @@ principals to `principal:<id>`, and `client_id` is still kept beside it.
 ### Evaluation
 
 Every authorization decision over HTTP and MCP already passes through one
-function, `handlers::authorize`, which holds the full `AuthenticatedActor`.
-The ceiling is checked there, after the policy decision:
+function, `handlers::authorize`, which holds the full `AuthenticatedActor`
+and today returns one of two outcomes, `Allowed` or `Denied`. It gains a
+third, outside the ceiling, and the ceiling is checked there after the
+policy decision:
 
-1. Applied policy decides as today. A denial is 403 `forbidden`, unchanged.
+1. Applied policy decides as today. A denial is `Denied`, answered 403
+   `forbidden` or hidden as 404 exactly where it is today.
 2. If policy allows and the actor's token has a ceiling, the requested policy
    action must be in it. A write action covered only by
-   `graph.write.unprotected` is in the ceiling only when the branch the
-   request is judged by is not protected in the applied bundle. Otherwise
-   the request is refused with 403 `insufficient_scope`.
+   `graph.write.unprotected` is in the ceiling only when the branch in the
+   slot the request is judged by is not protected in the applied bundle. A
+   miss is the third outcome, answered 403 `insufficient_scope`.
 
 The second step sees the same `PolicyRequest` the first did, branch and target
-branch included, and the same applied bundle; it reads nothing the policy
-decision did not.
+branch included, and asks the same `PolicyEngine` whether the judged branch
+is protected, through one new predicate beside `uses_target_branch_scope`; it
+reads nothing the policy decision did not. The step also runs where
+`authorize` allows without an engine: a server in default-deny mode (bearer
+tokens configured, no applied bundle) permits `read` alone, and a ceilinged
+token without `graph.read` is refused there too. An open server
+(`--unauthenticated`) resolves no actor and so has no ceiling.
+
+The third outcome exists because the routes that hide a policy denial as 404
+must not hide a ceiling miss. Invoking a stored query, changing an
+unattached branch from its base commit, creating a branch from a snapshot and
+reading a commit's changes all answer `Denied` with "not found", so an actor
+without the grant cannot learn whether the query or commit exists. A ceiling
+miss is reached only after policy confirmed that the actor holds the grant,
+so on every one of those routes it is answered 403 `insufficient_scope`: the
+client learns only that its own user may act there, which that user reads
+from `/access` anyway. Where a route folds a per-branch `Denied` into a
+listing (the branch listing and the readable change diff omit branches the
+actor cannot read), a ceiling miss is not a per-branch fact and refuses the
+whole listing with 403 rather than emptying it.
 
 Policy goes first so `insufficient_scope` is only ever returned for an action
 the person could perform with a wider scope. A client that receives it may ask
@@ -268,19 +305,46 @@ the user for that scope and will then succeed; a client that receives
 response reveals to the client only that its own user holds a permission,
 which the user can read from `/access` anyway.
 
-The engine's second gate (`Omnigraph::enforce`, the `PolicyChecker` trait) and
-the cluster path (`AppliedPolicies::check_cluster` / `check_graph`) see only an
-actor string and stay as they are. A ceiling is a property of the credential,
-and the credential exists only at the HTTP layer; it is checked once, where it
-exists, before any handler runs. The two routes that build an
-`IdentityAuthorization` from an OIDC actor (`POST /cluster/plan` and
-`POST /cluster/deployments`) check the ceiling for `config_manage` through the
-same function before constructing it.
+The engine's second gate (`Omnigraph::enforce`, the `PolicyChecker` trait)
+sees only an actor string and stays as it is: it runs after `authorize` on
+the same request, and a request outside the ceiling never reaches it. The
+cluster path is different and is covered next.
 
 A request that performs several actions (a `mutate` with branch statements, a
 `load` with `from`, a stored mutation's `invoke_query` then `change`) checks
 each action as it does today; the first action outside the ceiling refuses
 the request before any effect, exactly where a policy denial would.
+
+### Deployment routes
+
+The deployment routes are the one place where a policy action is checked
+without passing through `handlers::authorize`. `POST /cluster/plan` and
+`POST /cluster/deployments` check `config_manage` through
+`authorize_request`, then hand the cluster crate an `IdentityAuthorization`
+that carries only the actor string. The crate itself checks `read` on `main`
+and `schema_apply` on `main` for every graph the deployment touches
+(`AppliedPolicies::check_graph`, in the preview and again during apply when a
+graph's schema digest changes), and `schema_apply` is checked nowhere else.
+A ceiling applied only in `authorize` would cover `config_manage` and leave
+`graph.schema` meaningless: a token holding only `cluster.config` could
+still apply schema.
+
+So the ceiling travels with the identity. `IdentityAuthorization` gains the
+same optional ceiling the actor holds, set by the server when it constructs
+the deployment caller, and `check_cluster` and `check_graph` apply it after
+their policy check, in the same order as the HTTP layer: `config_manage`
+under `cluster.config`, `read` under `graph.read`, `schema_apply` under
+`graph.schema`. A miss is a refusal diagnostic with code `insufficient_scope`
+that the server answers as the 403 below. Every one of these checks runs
+before the deployment is accepted. The ledger records the actor, as today,
+and never the ceiling; a settlement resumed after acceptance (a severed
+caller, a restarted server) is an accepted operation that carries no token,
+so no ceiling applies to it.
+
+`GET /cluster/deployments/{id}` (`lookup`) builds its identity the same way
+but without the `config_manage` check, so that a receipt can be read back by
+its original identity. It carries the ceiling the same way; what it checks
+is not changed by this RFC.
 
 ### Refusal shape
 
@@ -291,6 +355,7 @@ HTTP conventions RFC requires:
 {
   "error": "the credential's scope does not cover change",
   "code": "insufficient_scope",
+  "disposition": {"effects": "none", "action": "fix"},
   "scope": "omnigraph:graph.write"
 }
 ```
@@ -298,19 +363,24 @@ HTTP conventions RFC requires:
 `scope` is the typed detail: the one prefixed scope that would have covered
 the refused action. A write to a protected branch under
 `graph.write.unprotected` names `graph.write`, the scope that would have
-covered it. The response also carries
+covered it. `ErrorOutput` gains the optional field, and so does
+`ChangeErrorOutput`, which the change routes serialize instead. The response
+also carries
 
 ```
 WWW-Authenticate: Bearer error="insufficient_scope", scope="omnigraph:graph.write", resource_metadata="<url>"
 ```
 
-as RFC 6750 §3.1 specifies for this error. RFC 0003 currently says a 403
-carries no challenge; this RFC amends that for `insufficient_scope` only.
-`forbidden` and `not_admitted` keep no challenge, so a client still cannot be
-driven to re-authenticate for a permission its user lacks.
+as RFC 6750 §3.1 specifies for this error. The `challenge` middleware sets
+`WWW-Authenticate` only on a 401 and stays that way; the `insufficient_scope`
+error carries its own header, built from the same protected-resource metadata
+URL the 401 challenge names. RFC 0003 currently says a 403 carries no
+challenge; this RFC amends that for `insufficient_scope` only. `forbidden`
+and `not_admitted` keep no challenge, so a client still cannot be driven to
+re-authenticate for a permission its user lacks.
 
-MCP tool refusals carry the same `error`, `code` and `scope` in their
-structured content, as every handler refusal does.
+MCP tool refusals carry the same `error`, `code`, `disposition` and `scope`
+in their structured content, as every handler refusal does.
 
 ### Discovery
 
@@ -353,8 +423,10 @@ credential has a ceiling:
 ```
 
 `graph_wide` and `actions` list what this credential can do here: policy
-permits intersected with the ceiling. An empty `scopes` array is a token
-granted no ceiling scopes; an absent field is a token without a ceiling.
+permits intersected with the ceiling, a policy denial and a ceiling miss both
+reading as absent. An empty `scopes` array is a token granted no ceiling
+scopes, and its report lists no action while still naming the scopes; an
+absent field is a token without a ceiling.
 
 Under `graph.write.unprotected` the report takes the shape policy already
 produces for a rule with `branch_scope: unprotected`: the write actions leave
@@ -394,16 +466,24 @@ write actions are limited to unprotected branches (true when
 `graph.write.unprotected` is present and `graph.write` is not).
 `AuthenticatedActor` exposes `ceiling() -> Option<&Ceiling>`: `None` for
 static tokens, native signed tokens and OIDC tokens at a trust document
-without a prefix; `Some` for the rest, including `Some(empty)`.
+without a prefix; `Some` for the rest, including `Some(empty)`. The
+deployment routes copy that value onto the `IdentityAuthorization` they hand
+the cluster crate, which is the only other place it lives.
 
 ### Where it is checked
 
-`handlers::authorize(actor, policy, request)` gains the second step described
-above. It is the only place; no handler, MCP tool, resource or route checks a
+`handlers::authorize(actor, policy, request)` gains the third outcome and the
+second step described above, and `AppliedPolicies::check_cluster` and
+`check_graph` apply the ceiling that `IdentityAuthorization` carries. Those
+are the only two places; no handler, MCP tool, resource or route checks a
 scope on its own. This preserves RFC 0003's invariant that the MCP layer adds
-no authorization path. The branch test for `graph.write.unprotected` asks the
-applied bundle the question policy already answers for `branch_scope`, through
-the same protected-branch lookup, so the two cannot disagree.
+no authorization path. The branch test for `graph.write.unprotected` is one
+predicate on `PolicyEngine`: given a `PolicyRequest`, whether the branch in
+the slot the action is judged by (`target_branch` for the actions
+`uses_target_branch_scope` names, `branch` otherwise) is in
+`protected_branches`. The server keeps no list of actions or slots of its own,
+so the ceiling and policy cannot disagree about which branch an action
+touches.
 
 ### Vocabulary as code
 
@@ -423,11 +503,11 @@ the RFC that decided it.
 |---|---|
 | `scope_prefix` | 1–64 bytes, scope-token alphabet |
 | `scope` claim entries | ≤ 256, each 1–128 bytes, distinct |
-| Admitted token lifetime | unchanged, `exp - iat` ≤ 300 s, no leeway |
+| Admitted token lifetime | unchanged: `exp - iat` ≤ 300 s, zero validation leeway, `iat` at most 30 s in the future |
 | Vocabulary size | 7 names; the whole prefixed list fits in 512 bytes of metadata |
 
-The entry bounds equal the Intent API's `validate_scopes`, so the two
-components refuse the same inputs.
+The entry bounds are this server's contract. They coincide with the Intent
+API's `validate_scopes`, so the two components refuse the same inputs.
 
 ## Invariants
 
@@ -438,7 +518,11 @@ components refuse the same inputs.
 - The actor is unchanged by a ceiling. Commits, policy logs and `/access`
   attribute to the same `principal:<id>` with or without one.
 - `insufficient_scope` is only ever returned where policy would have allowed
-  the action.
+  the action, and a ceiling miss is never hidden as 404: the existence it
+  could disclose is already the user's to read.
+- The cluster crate applies the ceiling it is handed before acceptance and
+  records none of it; a settlement resumed after acceptance has no ceiling
+  to apply.
 - The vocabulary is owned by the server, is versioned with it, and is not
   configurable. A deployment chooses a prefix, never a mapping.
 - A branch is protected for the ceiling exactly when applied policy's
@@ -448,8 +532,10 @@ components refuse the same inputs.
 ## Compatibility and reversibility
 
 Trust documents without `scope_prefix` are unaffected, and existing documents
-have none. Native signed credentials, static tokens, the policy crate, the
-engine gate and the cluster authorization path are unchanged. The
+have none. Native signed credentials, static tokens and the engine gate are
+unchanged. The policy crate gains one predicate and the cluster authorization
+path gains an optional ceiling on `IdentityAuthorization`; with no ceiling
+both behave as today. The
 `AccessOutput` and metadata additions are optional fields that older clients
 ignore; the new error code follows the conventions RFC's rule that a client
 treats an unknown code by its HTTP status.
@@ -478,6 +564,12 @@ touched.
   is never the check.
 - **Per-tool or per-route allow lists.** Unstable as tools change; policy
   actions are the stable authorization vocabulary.
+- **A separate scope for `invoke_query`**, so an agent could run deployed
+  queries without ad-hoc reads. Not possible yet: the stored-query runner
+  checks `read` on the branch or snapshot under its inner gate, so a token
+  without `graph.read` could invoke nothing. The split is #1197's query
+  contracts, where a deployed query's own contract authorizes its reads;
+  once that lands, a scope for it is one table row.
 - **A separate `graph.export` scope.** Rejected: `read` already permits
   arbitrary queries, so the data is visible either way; the split would
   withhold a transport, not information, while adding a scope every read
@@ -517,22 +609,37 @@ touched.
   `insufficient_scope` only when policy allows.
 - The vocabulary test covers every `PolicyAction`.
 - `graph.write.unprotected`: each write action on a protected and an
-  unprotected branch, judged by the written branch for `change` and
-  `branch_delete`, the new branch for `branch_create` and the destination for
-  `branch_merge`, `commit_publish` and `commit_drop`; a merge from a protected
-  source into an unprotected target succeeds and the reverse refuses with
-  `scope: "<prefix>graph.write"`; `schema_apply` refuses; a bundle with no
-  `protected_branches` permits every branch and preview reports it; a token
-  holding both write scopes behaves as `graph.write`; `/access` matches the
-  shape of a `branch_scope: unprotected` rule.
+  unprotected branch, judged by the `branch` slot for `change` and the
+  `target_branch` slot for `branch_create`, `branch_delete`, `branch_merge`,
+  `commit_publish` and `commit_drop`; deleting a protected branch refuses; a
+  merge from a protected source into an unprotected target succeeds and the
+  reverse refuses with `scope: "<prefix>graph.write"`; `schema_apply`
+  refuses; a bundle with no `protected_branches` permits every branch and the
+  boot log names the graph; a token holding both write scopes behaves as
+  `graph.write`; `/access` matches the shape of a `branch_scope: unprotected`
+  rule.
+- Hidden-404 routes: on stored-query invoke, change from a base commit,
+  branch create from a snapshot and commit changes, a policy denial keeps its
+  404 and a ceiling miss answers 403 `insufficient_scope`; the branch listing
+  and readable change diff refuse under a ceiling without `graph.read` rather
+  than returning empty.
+- Default-deny mode (tokens, no bundle): `read` is refused for a ceiling
+  without `graph.read` and allowed with it.
 - MCP: every write tool refuses under `graph.read` with the structured
   `insufficient_scope`; every read tool succeeds; `access` reports the
   intersection and `scopes`.
-- Challenge: `insufficient_scope` carries `WWW-Authenticate` with `scope`;
-  `forbidden` and `not_admitted` carry none.
+- Challenge: `insufficient_scope` carries `WWW-Authenticate` with `scope`,
+  set by the error rather than the 401 middleware, and a body with
+  `disposition` and `scope` on both `ErrorOutput` and `ChangeErrorOutput`;
+  `forbidden` and `not_admitted` carry no challenge.
 - Multi-action requests refuse before any effect when a later action is
   outside the ceiling.
-- Cluster routes refuse plan and deployment without `cluster.config`.
+- Deployment routes: plan and apply refuse without `cluster.config`; with
+  `cluster.config` alone, a deployment that changes a graph's schema refuses
+  in preview and in apply with `insufficient_scope` naming `graph.schema`,
+  and one that reads a graph refuses naming `graph.read`; the ledger of an
+  accepted deployment holds no scope, and a settlement resumed after
+  acceptance completes without a token.
 - Attribution: a scoped write records the same `actor_id` as an unscoped one.
 - No regression: a trust document without a prefix produces byte-identical
   responses on the existing OIDC fixtures.
@@ -555,8 +662,9 @@ touched.
   this RFC adds the optional ceiling that RFC called useful and left out;
   admission, actor identity and the refusal of `act` are unchanged.
 - [MCP server surface](0003-mcp-server-surface.md): the check sits in the
-  one shared `authorize`; the 403 challenge rule is amended for
-  `insufficient_scope` only.
+  one shared `authorize`, and since every tool is listed and runs under its
+  HTTP action the ceiling reaches MCP without a second path; the 403
+  challenge rule is amended for `insufficient_scope` only.
 - [HTTP API conventions](2026-10-19-http-api-conventions.md): error shape.
 - [Graph access and cross-process writes](2026-10-16-graph-access-serving-and-cross-process-writes.md):
   describes `/access` (its field list predates `actor_id` and `client_id`)
@@ -567,8 +675,9 @@ touched.
 - #978 (delegated, branch-scoped credentials; `graph.write.unprotected`
   gives OAuth clients the protected-branch half of that ask without a
   delegated identity), #1173 (client beside actor; step 1 landed in #1196;
-  a client selector in policy would be its continuation), #1025 (OAuth for
-  standard clients), #991 (one MCP surface).
+  a client selector in policy would be its continuation), #1197 (query
+  contracts; the stored-query-only client this RFC cannot express), #1025
+  (OAuth for standard clients), #991 (one MCP surface).
 - Closed #1218 bundled a version of this with provider-role membership and
   WorkOS Agent Auth; the membership half is #1223, and Agent Auth is out of
   scope here.
@@ -590,10 +699,14 @@ touched.
   limit covers the common case (an agent may merge and publish on its own
   branches but not onto `main`) without that split.
 - Whether a scope-enabled deployment with a bundle that lists no
-  `protected_branches` should be a preview warning only, as proposed, or a
+  `protected_branches` should be a boot-log report only, as proposed, or a
   validation failure for that bundle.
-- Whether identity-credential graph discovery should require `cluster.list`
+- Whether identity-credential graph discovery (`GET /graphs/discovery` and
+  the identity path of the `graphs` tool) should require `cluster.list`
   under a ceiling, or stay free as now.
+- Whether `GET /cluster/deployments/{id}` should check `config_manage` as
+  the other deployment routes do. It does not today, and this RFC leaves
+  that as it is.
 - Whether a native signed credential should carry an equivalent field so a
   CLI can mint a narrowed credential for a local agent without an
   authorization server; today that is #978's territory.
@@ -607,3 +720,14 @@ touched.
 - 2026-11-01: added `graph.write.unprotected`, judged by policy's own
   `protected_branches`, after the question of how a client is kept off
   `main`; the GitHub ruleset model is recorded as the policy-side complement.
+- 2026-11-03: revised after the review on #1224, verified against main
+  36d3ea08. Write actions are judged by the request slot the action already
+  uses, so `branch_delete` is judged by the deleted branch; the ceiling
+  travels on `IdentityAuthorization` so the cluster crate's `read` and
+  `schema_apply` checks honor `graph.read` and `graph.schema`; `authorize`
+  gains a third outcome so a ceiling miss is never hidden as 404 and the 403
+  carries its own challenge and `disposition`; the removed
+  `--mcp-allow-writes` is no longer cited and discovery names
+  `GET /graphs/discovery`; `invoke_query` stays in `graph.read` as a stated
+  non-goal pending #1197; the empty `protected_branches` report moves to the
+  boot log.
