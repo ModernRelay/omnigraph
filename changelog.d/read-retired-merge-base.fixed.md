@@ -1,1 +1,1 @@
-- `branch diff`, two-point diff, `commit changes`, `query --snapshot` and the change feed read a commit written by a deleted branch while a live branch still retains it. After a stacked branch's parent was fast-forward merged and deleted, these calls failed with `not_found` on the merge base while `branch merge` succeeded. A commit no live branch retains still answers not found, naming the caller's spelling.
+- Diff, `commit changes`, `query --snapshot` and the change feed read a commit of a deleted branch while a live branch retains it, such as a stacked branch's merge base.
