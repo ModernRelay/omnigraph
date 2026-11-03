@@ -466,7 +466,16 @@ materialized row and payload accounts are checked again before staging.
 
 Delete mutations, cascades and Overwrite's removed-ID detection stream matches
 under one `write_max_bytes` removed-ID allowance per operation, charging each
-ID's UTF-8 length plus one 24-byte `String` slot before copying it. Overwrite
+ID's UTF-8 length plus one 24-byte `String` slot before copying it. A delete's
+id scan also returns each matched row's address at the table's pin, and
+`stage_all` writes the deletion vectors for exactly those rows
+(`TableStore::stage_delete_rows`, Lance's `DeleteBuilder` after its scan), so
+a deleted table is scanned once; addresses from another version than the
+reopened pin take Lance's scanning delete. A node delete whose predicate has
+a `<key> = v` conjunct on the type's single String `@key` also filters on the
+derived id when the pinned table has an id BTREE, as the read planner's key
+narrowing does. Mutation validation reads the write's pinned base through the
+shared session and the held-handle cache keyed by each exact pin. Overwrite
 runs that detection only when its plan's `removal` is `scan`, a populated node
 target an edge type references; under `none` it detects and charges nothing.
 Overwrite's bulk input is not subject to the keyed aggregate row/batch limits.
