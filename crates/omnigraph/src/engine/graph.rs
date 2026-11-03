@@ -1539,9 +1539,9 @@ pub(super) fn bulk_anti_join_mask(
         return Ok(None);
     };
     memory
-        .entries::<bool>(outer_ids.len())
+        .entries::<u64>(outer_ids.len())
         .map_err(|error| memory.error(error))?;
-    let mut keep_mask = Vec::with_capacity(outer_ids.len());
+    let mut counts = Vec::with_capacity(outer_ids.len());
     let mut targets = Vec::new();
     for i in 0..outer_ids.len() {
         memory.check().map_err(|error| memory.error(error))?;
@@ -1559,9 +1559,12 @@ pub(super) fn bulk_anti_join_mask(
             }
             None => 0,
         };
-        keep_mask.push(row_count.holds(matches)?);
+        counts.push(matches);
     }
-    Ok(Some(BooleanArray::from(keep_mask)))
+    memory
+        .entries::<(i64, bool)>(counts.len())
+        .map_err(|error| memory.error(error))?;
+    Ok(Some(row_count.holds_all(&counts)?))
 }
 
 /// Where the shared BFS core reads each hop's neighbors from. The two sources

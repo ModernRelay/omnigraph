@@ -6,7 +6,8 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Decimal128Array, Float64Array, RecordBatch, UInt32Array,
+    Array, ArrayRef, BooleanArray, Decimal128Array, Float64Array, Int64Array, RecordBatch,
+    UInt32Array,
 };
 use arrow_schema::DataType;
 use datafusion::common::ScalarValue;
@@ -158,12 +159,35 @@ impl BoundComparison {
         })
     }
 
-    fn holds(&self, value: ScalarValue) -> Result<bool> {
-        let value = value.to_array_of_size(1).map_err(OmniError::datafusion)?;
-        let value = cast_left(&self.left, &value)?;
-        let mask = compare_arrays(&value, self.op, &self.right)?;
-        Ok(mask.is_valid(0) && mask.value(0))
+    /// Whether the predicate holds for each of `values`, the block
+    /// aggregate's results in the leaf's declared type: one cast chain and
+    /// one comparison over the whole column, a null verdict reading `false`.
+    fn holds_all(&self, values: &ArrayRef) -> Result<BooleanArray> {
+        let value = cast_left(&self.left, values)?;
+        let right = arrow_select::take::take(
+            self.right.as_ref(),
+            &UInt32Array::from(vec![0u32; value.len()]),
+            None,
+        )
+        .map_err(OmniError::arrow_internal)?;
+        let mask = compare_arrays(&value, self.op, &right)?;
+        Ok(if mask.null_count() == 0 {
+            mask
+        } else {
+            arrow_select::filter::prep_null_mask_filter(&mask)
+        })
     }
+}
+
+/// `counts` as the `I64` column a block's row count is compared in.
+fn count_values(counts: &[u64]) -> Result<ArrayRef> {
+    let counts = counts
+        .iter()
+        .map(|&count| {
+            i64::try_from(count).map_err(|_| OmniError::manifest("block count exceeds the I64 range"))
+        })
+        .collect::<Result<Vec<i64>>>()?;
+    Ok(Arc::new(Int64Array::from(counts)))
 }
 
 fn cast_left(expr: &BlockAggregateExpr, value: &ArrayRef) -> Result<ArrayRef> {
@@ -220,8 +244,14 @@ impl RowCountPredicate {
         self.existence_only
     }
 
+    /// The verdict of every outer row from its neighbour count.
+    pub(crate) fn holds_all(&self, counts: &[u64]) -> Result<BooleanArray> {
+        self.comparison.holds_all(&count_values(counts)?)
+    }
+
+    #[cfg(test)]
     pub(crate) fn holds(&self, count: u64) -> Result<bool> {
-        self.comparison.holds(count_value(count)?)
+        Ok(self.holds_all(&[count])?.value(0))
     }
 }
 
@@ -395,11 +425,28 @@ impl SubqueryAggregate {
         Ok(value)
     }
 
+    /// Every outer row's verdict: the row counts as one `I64` column when
+    /// the block counts rows, else each row's finalized aggregate gathered
+    /// into one column, then one comparison.
     pub(crate) fn keep_mask(&self) -> Result<BooleanArray> {
-        (0..self.counts.len())
-            .map(|row| self.comparison.holds(self.aggregate(row)?))
-            .collect::<Result<Vec<_>>>()
-            .map(BooleanArray::from)
+        let leaf = self.comparison.left.leaf();
+        let values = match (leaf, &self.values) {
+            (BlockAggregateExpr::CountRows { .. }, None)
+            | (
+                BlockAggregateExpr::Aggregate {
+                    func: AggFunc::Count,
+                    ..
+                },
+                None,
+            ) => count_values(&self.counts)?,
+            _ => {
+                let values = (0..self.counts.len())
+                    .map(|row| self.aggregate(row))
+                    .collect::<Result<Vec<_>>>()?;
+                ScalarValue::iter_to_array(values).map_err(OmniError::datafusion)?
+            }
+        };
+        self.comparison.holds_all(&values)
     }
 }
 
