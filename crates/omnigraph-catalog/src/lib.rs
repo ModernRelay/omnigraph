@@ -11,7 +11,7 @@
 
 pub(crate) use omnigraph_core::dst_ids;
 pub(crate) use omnigraph_core::{
-    branch_control, branch_names, dataset_index, error, handle_cache, instrumentation,
+    branch_base, branch_control, branch_names, dataset_index, error, handle_cache, instrumentation,
     lance_access, lance_clone, lance_commit, manifest_request, metadata, seams, staging, storage,
 };
 pub mod branch_detail;
@@ -1054,8 +1054,7 @@ async fn probe_dataset_latest_incarnation(
         Err(error) => return Err(error),
     }
     let native = resolve_native_manifest_branch(dataset, branch).await?;
-    let replacement = dataset
-        .checkout_branch(&native)
+    let replacement = crate::layout::checkout_manifest_branch(dataset, &native)
         .await
         .map_err(|error| branch_ref_error(error, branch))?;
     let branch_identifier = crate::branch_control::dataset_branch_identifier(&replacement)
@@ -1231,9 +1230,7 @@ impl CollectorBranch {
             .io_parallelism();
         futures::stream::iter(versions.iter().copied())
             .map(|version| async move {
-                let read = self
-                    .dataset
-                    .checkout_version(version)
+                let read = crate::layout::checkout_manifest(&self.dataset, version)
                     .await
                     .map_err(OmniError::storage)?
                     .version();
@@ -1667,8 +1664,7 @@ impl ManifestCoordinator {
             &snapshot.session,
         )
         .await?;
-        dataset
-            .checkout_version(snapshot.graph_manifest_version())
+        crate::layout::checkout_manifest(&dataset, snapshot.graph_manifest_version())
             .await
             .map_err(OmniError::storage)
     }
@@ -1687,8 +1683,7 @@ impl ManifestCoordinator {
             &control_session,
         )
         .await?;
-        let dataset = dataset
-            .checkout_version(version)
+        let dataset = crate::layout::checkout_manifest(&dataset, version)
             .await
             .map_err(OmniError::storage)?;
         let state = read_manifest_state(&dataset).await?;
@@ -2444,11 +2439,13 @@ impl ManifestCoordinator {
         for native in natives {
             let branch = match &native {
                 None => main.clone(),
-                Some(native) => match main.checkout_branch(native).await {
-                    Ok(branch) => branch,
-                    Err(lance::Error::RefNotFound { .. }) => continue,
-                    Err(error) => return Err(OmniError::storage(error)),
-                },
+                Some(native) => {
+                    match crate::layout::checkout_manifest_branch(&main, native).await {
+                        Ok(branch) => branch,
+                        Err(lance::Error::RefNotFound { .. }) => continue,
+                        Err(error) => return Err(OmniError::storage(error)),
+                    }
+                }
             };
             let rows = state::read_manifest_rows_projected(&branch).await?;
             if let Some(record) = rows.record(graph_commit_id) {
@@ -2640,8 +2637,7 @@ impl ManifestCoordinator {
         let dataset = if version == self.version() {
             self.dataset.clone()
         } else {
-            self.dataset
-                .checkout_version(version)
+            crate::layout::checkout_manifest(&self.dataset, version)
                 .await
                 .map_err(|error| OmniError::storage(error).before_effect())?
         };
@@ -2711,8 +2707,7 @@ impl ManifestCoordinator {
         let records = match self.native_branch.as_deref() == Some(native) {
             true => self.branch_records(),
             false => {
-                let branch = control
-                    .checkout_branch(native)
+                let branch = crate::layout::checkout_manifest_branch(control, native)
                     .await
                     .map_err(|error| branch_ref_error(error, logical))?;
                 state::read_manifest_rows_projected(&branch)

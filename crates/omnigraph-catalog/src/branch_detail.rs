@@ -175,8 +175,7 @@ async fn read_branch(
     native: &str,
     contents: &BranchContents,
 ) -> Result<(GraphLineageRow, bool, String)> {
-    let branch = main
-        .checkout_branch(native)
+    let branch = crate::layout::checkout_manifest_branch(main, native)
         .await
         .map_err(OmniError::storage)?;
     let head = read_manifest_rows_projected(&branch).await?.head;
@@ -184,8 +183,7 @@ async fn read_branch(
         let started_at = head.graph_commit_id.clone();
         return Ok((head, false, started_at));
     }
-    let created = branch
-        .checkout_version(contents.parent_version)
+    let created = crate::layout::checkout_manifest(&branch, contents.parent_version)
         .await
         .map_err(OmniError::storage)?;
     let started_at =

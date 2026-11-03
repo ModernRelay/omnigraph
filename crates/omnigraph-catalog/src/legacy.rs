@@ -1540,8 +1540,7 @@ pub mod write {
                     )));
                 }
             }
-            let forked = dataset
-                .checkout_branch(native)
+            let forked = crate::layout::checkout_manifest_branch(&dataset, native)
                 .await
                 .map_err(OmniError::storage)?;
             self.heads.insert(Some(native.to_string()), forked);

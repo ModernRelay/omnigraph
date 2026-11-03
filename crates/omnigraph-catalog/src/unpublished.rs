@@ -516,11 +516,13 @@ pub(crate) async fn resolve_recorded_target(
         (None, None) => Ok(Some(main.clone())),
         (Some(logical), Some(native)) => {
             match crate::branch_control::resolve_live_native_branch(main, logical).await? {
-                Some(live) if live == native => match main.checkout_branch(native).await {
-                    Ok(dataset) => Ok(Some(dataset)),
-                    Err(lance::Error::RefNotFound { .. }) => Ok(None),
-                    Err(error) => Err(OmniError::storage(error)),
-                },
+                Some(live) if live == native => {
+                    match crate::layout::checkout_manifest_branch(main, native).await {
+                        Ok(dataset) => Ok(Some(dataset)),
+                        Err(lance::Error::RefNotFound { .. }) => Ok(None),
+                        Err(error) => Err(OmniError::storage(error)),
+                    }
+                }
                 _ => Ok(None),
             }
         }
@@ -644,10 +646,12 @@ impl ManifestCoordinator {
         let expected_id = unpublished_tag_commit_id(name)?.ok_or_else(|| {
             OmniError::manifest_internal(format!("native tag '{name}' is not a proposal tag"))
         })?;
-        let detached = main
-            .checkout_version(Ref::Version(tag.branch.clone(), Some(tag.version)))
-            .await
-            .map_err(OmniError::storage)?;
+        let detached = crate::layout::checkout_manifest(
+            main,
+            Ref::Version(tag.branch.clone(), Some(tag.version)),
+        )
+        .await
+        .map_err(OmniError::storage)?;
         let stamp = read_stamp(&detached).ok_or_else(|| {
             OmniError::manifest_internal(format!("the version tag '{name}' names carries no stamp"))
         })?;
@@ -793,14 +797,15 @@ impl ManifestCoordinator {
     /// The source records a merge candidate publishes as its merged parent,
     /// read from the held source version.
     async fn held_merge_records(&self, merge: &UnpublishedMergeInputs) -> Result<BranchRecords> {
-        let source = self
-            .dataset
-            .checkout_version(Ref::Version(
+        let source = crate::layout::checkout_manifest(
+            &self.dataset,
+            Ref::Version(
                 merge.source_native.clone(),
                 Some(merge.source_manifest_version),
-            ))
-            .await
-            .map_err(OmniError::storage)?;
+            ),
+        )
+        .await
+        .map_err(OmniError::storage)?;
         let rows = read_manifest_rows_projected(&source).await?;
         if rows.head.graph_commit_id != merge.source_head_commit_id {
             return Err(OmniError::manifest_internal(format!(

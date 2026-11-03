@@ -2173,7 +2173,9 @@ impl TableStore {
         .await?;
         match branch {
             Some(branch) if branch != "main" => {
-                ds.checkout_branch(branch).await.map_err(OmniError::storage)
+                omnigraph_core::branch_base::checkout_native_branch(&ds, branch)
+                    .await
+                    .map_err(OmniError::storage)
             }
             _ => Ok(ds),
         }

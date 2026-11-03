@@ -213,6 +213,8 @@ pub async fn create_branch(
             source.create_branch(branch, source_version, store_params),
         )
         .await
+        // Lance builds the branch manifest from the source's persisted bases.
+        .and_then(crate::branch_base::follow_opened_root)
 }
 
 impl ManifestLocationCommitHandler {

@@ -1084,8 +1084,7 @@ async fn proven_chain_fragments(
             })?;
             return (fragment_rows == proven_rows).then_some((fragments, proven_rows));
         }
-        dataset = dataset
-            .checkout_version(transaction.read_version)
+        dataset = omnigraph_core::branch_base::checkout(&dataset, transaction.read_version)
             .await
             .ok()?;
     }
