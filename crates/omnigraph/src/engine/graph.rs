@@ -578,7 +578,7 @@ where
                 .iter()
                 .map(|edge| (edge.dataset.clone(), edge.probes.clone()))
                 .collect();
-            (Some(datasets), HopPolicy::Off)
+            (Some((datasets, None)), HopPolicy::Off)
         }
         ExpandExecution::Named(named) => {
             let start = decide_expand_start(
@@ -599,13 +599,20 @@ where
                 ExpandStart::Indexed {
                     edge_ds,
                     hop_policy,
+                    pushdown,
                 } => {
                     Switch::IndexedScan.record(switch);
                     (
-                        Some(vec![(
-                            *edge_ds,
-                            endpoint_probes(named.member.direction, env.catalog.system_columns),
-                        )]),
+                        Some((
+                            vec![(
+                                *edge_ds,
+                                endpoint_probes(
+                                    named.member.direction,
+                                    env.catalog.system_columns,
+                                ),
+                            )],
+                            Some(pushdown),
+                        )),
                         hop_policy,
                     )
                 }
@@ -631,6 +638,10 @@ pub(super) enum ExpandStart {
     Indexed {
         edge_ds: Box<Dataset>,
         hop_policy: HopPolicy,
+        /// Whether the key column's BTREE coverage, as the plan's pinned
+        /// index facts or the runtime probe judged it, makes a pushed
+        /// `key IN (keys)` list index lookups (`scan_edges_stream`).
+        pushdown: bool,
     },
 }
 
@@ -782,6 +793,13 @@ pub(super) async fn decide_expand_start(
     if let Some(coverage) = &coverage {
         warn_on_degraded_coverage(coverage, key_col, edge_type);
     }
+    let pushdown = match &coverage {
+        Some(Ok(crate::table_store::IndexCoverage::Indexed)) => true,
+        Some(_) => false,
+        None => corrected.as_ref().is_none_or(|inputs| {
+            inputs.coverage == omnigraph_planner::IndexCoverage::Indexed
+        }),
+    };
     let hop_policy = match corrected {
         Some(inputs) => HopPolicy::Full(inputs),
         None if matches!(named.origin, ModeOrigin::Pinned) => HopPolicy::Off,
@@ -794,6 +812,7 @@ pub(super) async fn decide_expand_start(
     Ok(ExpandStart::Indexed {
         edge_ds: Box::new(edge_ds),
         hop_policy,
+        pushdown,
     })
 }
 
@@ -938,7 +957,15 @@ where
             .child("bound edge scan")
             .map_err(|error| memory.error(error))?;
         let mut stream =
-            scan_edges_stream(&dataset, orientation, &attach_columns, &keys, &scan_memory).await?;
+            scan_edges_stream(
+                &dataset,
+                orientation,
+                &attach_columns,
+                &keys,
+                None,
+                &scan_memory,
+            )
+            .await?;
         while let Some(batch) = stream.next().await {
             let batch = batch.map_err(|error| memory.error(error))?;
             let input_memory = scan_memory
@@ -1172,7 +1199,7 @@ pub(super) async fn execute_expand_bfs<F>(
     graph_index: &GraphIndexHandle,
     catalog: &Catalog,
     step: &ExpandStep,
-    start_indexed: Option<Vec<(Dataset, Vec<EndpointColumns>)>>,
+    start_indexed: Option<(Vec<(Dataset, Vec<EndpointColumns>)>, Option<bool>)>,
     hop_policy: HopPolicy,
     side: &Gauge,
     memory: &WorkMemory,
@@ -1216,8 +1243,9 @@ where
     let max = step.max_hops;
 
     let mut active = match start_indexed {
-        Some(datasets) => ActiveExpandSource::Indexed(Box::new(IndexedExpandSource {
+        Some((datasets, pushdown)) => ActiveExpandSource::Indexed(Box::new(IndexedExpandSource {
             datasets,
+            pushdown,
             interner: crate::graph_index::TypeIndex::new(),
             neighbor_map: HashMap::new(),
         })),
@@ -1415,6 +1443,7 @@ where
                     dataset,
                     probes,
                     &union_keys,
+                    src.pushdown,
                     &mut src.interner,
                     &mut src.neighbor_map,
                     &hop_memory,
@@ -1617,6 +1646,9 @@ pub(super) enum ActiveExpandSource<'g> {
 
 pub(super) struct IndexedExpandSource {
     pub(super) datasets: Vec<(Dataset, Vec<EndpointColumns>)>,
+    /// The known coverage verdict for the pushed key list, when the start
+    /// decision judged it; `None` lets each scan probe.
+    pub(super) pushdown: Option<bool>,
     pub(super) interner: crate::graph_index::TypeIndex,
     /// This hop's dense key -> dense neighbors (scan order; duplicates
     /// preserved, like CSR multi-edges). Rebuilt per hop.
@@ -1634,10 +1666,12 @@ pub(super) enum HopPolicy {
 /// One `key IN (keys)` scan per probe, every row's endpoints interned into
 /// `interner` and the opposite appended to `neighbor_map[key]` in scan order
 /// (probe 0's rows, then probe 1's; parallel edges kept, like the CSR).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn scan_neighbor_map(
     edge_ds: &Dataset,
     probes: &[EndpointColumns],
     keys: &[String],
+    pushdown: Option<bool>,
     interner: &mut crate::graph_index::TypeIndex,
     neighbor_map: &mut HashMap<u32, Vec<u32>>,
     hop_memory: &WorkMemory,
@@ -1648,7 +1682,7 @@ pub(super) async fn scan_neighbor_map(
             key: key_col,
             opposite: opp_col,
         } = orientation;
-        let batches = scan_edges(edge_ds, orientation, &[], keys, hop_memory).await?;
+        let batches = scan_edges(edge_ds, orientation, &[], keys, pushdown, hop_memory).await?;
         for batch in &batches {
             let keys = utf8_column(batch, key_col)?;
             let opposites = utf8_column(batch, opp_col)?;
@@ -1696,12 +1730,13 @@ async fn scan_edges(
     orientation: EndpointColumns,
     extras: &[&str],
     keys: &[String],
+    pushdown: Option<bool>,
     memory: &WorkMemory,
 ) -> Result<Vec<RecordBatch>> {
     if keys.is_empty() {
         return Ok(Vec::new());
     }
-    let stream = scan_edges_stream(ds, orientation, extras, keys, memory).await?;
+    let stream = scan_edges_stream(ds, orientation, extras, keys, pushdown, memory).await?;
     memory
         .collect(stream)
         .await
@@ -1733,6 +1768,7 @@ async fn scan_edges_stream(
     orientation: EndpointColumns,
     extras: &[&str],
     keys: &[String],
+    pushdown: Option<bool>,
     memory: &WorkMemory,
 ) -> Result<SendableRecordBatchStream> {
     if memory.traversal_limited() {
@@ -1767,10 +1803,13 @@ async fn scan_edges_stream(
     // anyway and re-plans the pushed list for each one (a clone and a hash
     // set of every key per fragment), so the engine sieves the batches
     // itself through one set of the keys.
-    let pushdown = matches!(
-        omnigraph_core::dataset_index::key_column_index_coverage(ds, key_col).await,
-        Ok(omnigraph_core::dataset_index::IndexCoverage::Indexed)
-    );
+    let pushdown = match pushdown {
+        Some(known) => known,
+        None => matches!(
+            omnigraph_core::dataset_index::key_column_index_coverage(ds, key_col).await,
+            Ok(omnigraph_core::dataset_index::IndexCoverage::Indexed)
+        ),
+    };
     let filter = pushdown.then(|| id_in_list_expr(keys, key_col));
     let plan = crate::table_store::TableStore::scan_plan_with(
         ds,
