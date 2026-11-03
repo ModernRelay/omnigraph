@@ -493,17 +493,53 @@ fn source_node_key(source: usize, node: u32) -> u64 {
 /// The destination column of one chunk: `dense` resolved through `ids`, the
 /// dictionary of the walk's destination space, charged to `memory` first.
 fn destination_column(dense: &[u32], ids: &[String], memory: &WorkMemory) -> Result<ArrayRef> {
-    let bytes = dense
+    let strings = dense
         .iter()
-        .map(|&d| ids[d as usize].len())
+        .map(|&d| {
+            ids.get(d as usize).map(String::as_str).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "dense destination id {d} is outside its dictionary of {} ids",
+                    ids.len()
+                ))
+            })
+        })
+        .collect::<Result<Vec<&str>>>()?;
+    let bytes = strings
+        .iter()
+        .map(|id| id.len())
         .fold(0usize, usize::saturating_add);
     memory.string(bytes).map_err(|error| memory.error(error))?;
     memory
         .grow((dense.len() + 1).saturating_mul(std::mem::size_of::<i32>()))
         .map_err(|error| memory.error(error))?;
-    Ok(Arc::new(StringArray::from_iter_values(
-        dense.iter().map(|&d| ids[d as usize].as_str()),
-    )))
+    Ok(Arc::new(StringArray::from_iter_values(strings)))
+}
+
+/// The pending chunk as pairs ready to emit: its destinations resolved
+/// through `ids`, the dictionary of the source that found them, the buffers
+/// and the emission charge swapped for fresh ones.
+fn take_pending_pairs(
+    emitted_src: &mut Vec<u32>,
+    emitted_dst: &mut Vec<u32>,
+    emission_memory: &mut WorkMemory,
+    ids: &[String],
+    memory: &WorkMemory,
+    chunk_rows: usize,
+) -> Result<ExpandedPairs> {
+    let next_emission = memory
+        .child("expand emissions")
+        .map_err(|error| memory.error(error))?;
+    next_emission
+        .entries::<(u32, u32)>(chunk_rows)
+        .map_err(|error| memory.error(error))?;
+    memory.metric("expand_pairs", emitted_src.len());
+    let destination = destination_column(emitted_dst, ids, emission_memory)?;
+    emitted_dst.clear();
+    Ok(ExpandedPairs {
+        source_rows: std::mem::replace(emitted_src, Vec::with_capacity(chunk_rows)),
+        destination,
+        _memory: std::mem::replace(emission_memory, next_emission),
+    })
 }
 
 pub(super) struct PreparedEdge {
@@ -1355,6 +1391,23 @@ where
                 let gi = graph_index.get().await?.ok_or_else(|| {
                     OmniError::manifest("graph index required for CSR traversal".to_string())
                 })?;
+                // The pending chunk's destinations are dense ids of the
+                // interner: they leave now, as strings, before the
+                // dictionaries change. A `Utf8` column has no id space.
+                if !emitted_src.is_empty() {
+                    let ActiveExpandSource::Indexed(src) = &active else {
+                        unreachable!("switch only fires while the Indexed source is active");
+                    };
+                    let pairs = take_pending_pairs(
+                        &mut emitted_src,
+                        &mut emitted_dst,
+                        &mut emission_memory,
+                        src.interner.ids(),
+                        memory,
+                        chunk_rows,
+                    )?;
+                    emit(pairs).await?;
+                }
                 let csr_source = ActiveExpandSource::Csr(resolve_csr(
                     gi,
                     edge_def,
@@ -1479,41 +1532,40 @@ where
                             .map_err(|error| memory.error(error))?;
                     }
                     let is_self = same_type && hop == 1 && neighbor == node;
-                    if !is_self && same_type && !visited.insert(source_node_key(i, neighbor)) {
-                        continue;
+                    if !is_self && same_type {
+                        if !visited.insert(source_node_key(i, neighbor)) {
+                            continue;
+                        }
+                        added = added.saturating_add(WorkMemory::entry_bytes::<u64>());
                     }
                     if !is_self {
                         next.push(neighbor);
+                        added = added.saturating_add(WorkMemory::entry_bytes::<u32>());
                     }
                     if hop >= min_hops
                         && (neighbor as usize) < ids.len()
                         && seen_dst.insert(source_node_key(i, neighbor))
                     {
+                        added = added.saturating_add(
+                            WorkMemory::entry_bytes::<u64>()
+                                .saturating_add(WorkMemory::entry_bytes::<(u32, u32)>()),
+                        );
                         emitted_src.push(i as u32);
                         emitted_dst.push(neighbor);
                         if emitted_src.len() >= chunk_rows {
-                            let next_emission = memory
-                                .child("expand emissions")
-                                .map_err(|error| memory.error(error))?;
-                            next_emission
-                                .entries::<(u32, u32)>(chunk_rows)
-                                .map_err(|error| memory.error(error))?;
-                            memory.metric("expand_pairs", emitted_src.len());
-                            let destination =
-                                destination_column(&emitted_dst, ids, &emission_memory)?;
-                            emitted_dst.clear();
-                            emit(ExpandedPairs {
-                                source_rows: std::mem::replace(
-                                    &mut emitted_src,
-                                    Vec::with_capacity(chunk_rows),
-                                ),
-                                destination,
-                                _memory: std::mem::replace(&mut emission_memory, next_emission),
-                            })
-                            .await?;
+                            let pairs = take_pending_pairs(
+                                &mut emitted_src,
+                                &mut emitted_dst,
+                                &mut emission_memory,
+                                ids,
+                                memory,
+                                chunk_rows,
+                            )?;
+                            emit(pairs).await?;
                         }
                     }
                 }
+                memory.shrink_to(before.saturating_add(added));
                 memory.check().map_err(|error| memory.error(error))?;
             }
             *frontier = next;
