@@ -15,7 +15,6 @@ use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::SchemaRef;
 use datafusion::common::hash_utils::{RandomState, create_hashes};
 use datafusion::common::{DataFusionError, Result as DfResult};
-use hashbrown::HashTable;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::metrics::{
     Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricsSet,
@@ -24,6 +23,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use futures::future::BoxFuture;
+use hashbrown::HashTable;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::ir::{IRExpr, ParamMap};
 use omnigraph_planner::AccessPath;

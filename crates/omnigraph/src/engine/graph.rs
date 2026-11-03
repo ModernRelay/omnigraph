@@ -497,9 +497,7 @@ fn destination_column(dense: &[u32], ids: &[String], memory: &WorkMemory) -> Res
         .iter()
         .map(|&d| ids[d as usize].len())
         .fold(0usize, usize::saturating_add);
-    memory
-        .string(bytes)
-        .map_err(|error| memory.error(error))?;
+    memory.string(bytes).map_err(|error| memory.error(error))?;
     memory
         .grow((dense.len() + 1).saturating_mul(std::mem::size_of::<i32>()))
         .map_err(|error| memory.error(error))?;
@@ -1851,7 +1849,9 @@ async fn scan_edges_stream(
             .column_by_name(&key_col)
             .and_then(|column| column.as_any().downcast_ref::<StringArray>())
             .ok_or_else(|| {
-                datafusion::common::DataFusionError::Internal(format!("edge batch has no Utf8 '{key_col}'"))
+                datafusion::common::DataFusionError::Internal(format!(
+                    "edge batch has no Utf8 '{key_col}'"
+                ))
             })?;
         let mask = arrow_array::BooleanArray::from_iter(
             keys.iter()

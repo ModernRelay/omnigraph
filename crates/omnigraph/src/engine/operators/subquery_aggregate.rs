@@ -184,7 +184,8 @@ fn count_values(counts: &[u64]) -> Result<ArrayRef> {
     let counts = counts
         .iter()
         .map(|&count| {
-            i64::try_from(count).map_err(|_| OmniError::manifest("block count exceeds the I64 range"))
+            i64::try_from(count)
+                .map_err(|_| OmniError::manifest("block count exceeds the I64 range"))
         })
         .collect::<Result<Vec<i64>>>()?;
     Ok(Arc::new(Int64Array::from(counts)))
