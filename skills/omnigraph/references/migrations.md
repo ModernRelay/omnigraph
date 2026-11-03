@@ -73,7 +73,9 @@ standalone v8, v9 or v13 graph straight to 16 in place and keeps branches,
 commit ids and commit history; no table row is rewritten. `--to-format`
 accepts 16 only. The upgrade is offline and cannot verify that itself: stop
 every server, reader, writer and maintenance process, take and verify a
-backup of the whole graph root (rollback is restoring that backup), then
+backup of the whole graph root (rollback is restoring that backup at the
+graph's own path; a whole-root copy also opens at a new path on the same kind
+of storage), then
 with the current binary:
 
 ```bash

@@ -41,6 +41,27 @@ which can make earlier commits unreadable. Review the retention policy and
 backups before confirming it, and quiesce long-lived historical or Blob readers
 first. An unconfirmed cleanup echoes the policy but does not inspect candidates.
 
+## Copying a graph root
+
+A whole copy of a graph root is a backup. You can restore it at its own
+location, or open it at a new location on the same kind of storage: another
+local directory, another S3 prefix or bucket, or another Azure prefix or
+container. The copy serves every branch, tag and retained snapshot, and it
+reads and writes only objects under the root you opened.
+
+- Copy every object under the root while no process writes the graph.
+- If the copy is missing an object, the read that needs it fails and names the
+  root you opened. It never reads that object from the original location.
+- A graph whose storage names a location outside its root is refused when it
+  is opened. Omnigraph never writes such a graph.
+- To move a graph between kinds of storage (local, S3, Azure), export it and
+  load it into a new graph instead.
+- Restore a graph that a cluster manages at the location its cluster
+  declares; a cluster does not adopt a root at a new location.
+- External Blob URIs still point where they pointed before the copy.
+- Omnigraph 0.14.0 and earlier read some branch files at the location the
+  branch was created at. Open a copy at a new location with a later release.
+
 ## Local filesystem requirement
 
 Local read-write graphs require filesystem hard-link support. Read-only access
