@@ -673,6 +673,92 @@ impl GraphCoordinator {
         }
     }
 
+    /// The state of a settled commit, from the `table` rows of its record.
+    ///
+    /// A commit of the live incarnation of its branch is read directly. A
+    /// commit whose writing incarnation is gone (its branch deleted, or
+    /// deleted and recreated) is read only while a live branch still retains
+    /// it, and only when the retired native ref matching that exact commit
+    /// still opens; otherwise it is the not-found of the spelling the caller
+    /// used, never of the deleted branch's name. A manifest reclaimed since
+    /// is the retention gap of that open.
+    async fn settled_commit_state(
+        &self,
+        control_session: &Arc<lance::session::Session>,
+        record: HistoryRecord,
+        snapshot_id: &SnapshotId,
+    ) -> Result<CommitState> {
+        let root_uri = self.root_uri();
+        let mut retired = false;
+        if !ManifestCoordinator::incarnation_is_live(root_uri, control_session, &record.commit)
+            .await?
+        {
+            retired = true;
+            if !self
+                .retained_by_live_branch(&record.commit.graph_commit_id)
+                .await?
+            {
+                // The refusal the gate always gave: a deleted name is the
+                // caller's not-found, a recreated one the witness error.
+                let refusal = ManifestCoordinator::ensure_incarnation_live(
+                    root_uri,
+                    control_session,
+                    &record.commit,
+                )
+                .await;
+                return Err(match refusal {
+                    Err(OmniError::BranchNotFound { .. }) | Ok(()) => {
+                        OmniError::ReadTargetNotFound {
+                            target: snapshot_id.as_str().to_string(),
+                        }
+                    }
+                    Err(error) => error,
+                });
+            }
+            ManifestCoordinator::ensure_retired_incarnation_opens(
+                root_uri,
+                control_session,
+                &record.commit,
+            )
+            .await?;
+        }
+        let mut snapshot = Snapshot::wrap(record.snapshot(root_uri, control_session)?);
+        if retired {
+            snapshot = snapshot.retired_incarnation();
+        }
+        Ok(CommitState {
+            commit: graph_commit_from_manifest_row(record.commit),
+            snapshot,
+        })
+    }
+
+    /// Whether the history of a live branch (main first) reaches `commit_id`
+    /// through parents and merged parents. Read only when a commit's writing
+    /// incarnation is gone, so the live-branch read pays nothing for it.
+    async fn retained_by_live_branch(&self, commit_id: &str) -> Result<bool> {
+        let mut branches = vec![None];
+        branches.extend(self.all_branches().await?.into_iter().map(Some));
+        for branch in branches {
+            let other = self.open_sibling(branch.as_deref()).await?;
+            let lineage = other.lineage().await?;
+            let mut seen = std::collections::HashSet::new();
+            let mut pending = vec![lineage.head().graph_commit_id.clone()];
+            while let Some(id) = pending.pop() {
+                if id == commit_id {
+                    return Ok(true);
+                }
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                if let Some(commit) = lineage.get_commit(&id) {
+                    pending.extend(commit.parent_commit_id.clone());
+                    pending.extend(commit.merged_parent_commit_id.clone());
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// The commit `snapshot_id` names and the graph as of it, from its record:
     /// held by this coordinator, else in `__history`, else in a live branch.
     /// Refused once the branch incarnation that wrote it is not live.
@@ -703,7 +789,10 @@ impl GraphCoordinator {
             },
         };
         match record {
-            Some(record) => settled_commit_state(self.root_uri(), &session, record).await,
+            Some(record) => {
+                self.settled_commit_state(&session, record, snapshot_id)
+                    .await
+            }
             None => {
                 if let Some(candidate) = self.unpublished_commit(id).await? {
                     candidate.require_readable()?;
@@ -1128,20 +1217,6 @@ pub(crate) async fn descends_linearly_from_in(
 
 /// Commits one step of a whole-chain walk reads before the next.
 const FIRST_PARENT_WALK_COMMITS: usize = 1024;
-
-/// The state of a settled commit, from the `table` rows of its record.
-async fn settled_commit_state(
-    root_uri: &str,
-    control_session: &Arc<lance::session::Session>,
-    record: HistoryRecord,
-) -> Result<CommitState> {
-    ManifestCoordinator::ensure_incarnation_live(root_uri, control_session, &record.commit).await?;
-    let snapshot = Snapshot::wrap(record.snapshot(root_uri, control_session)?);
-    Ok(CommitState {
-        commit: graph_commit_from_manifest_row(record.commit),
-        snapshot,
-    })
-}
 
 pub(crate) fn commit_not_found(snapshot_id: &SnapshotId) -> OmniError {
     OmniError::manifest_not_found(format!("commit '{}' not found", snapshot_id))
