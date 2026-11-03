@@ -124,13 +124,49 @@ pub struct HistoryCache {
     /// by data file: written once and named by every later version, where
     /// fragment ids repeat across Lance branches and file names do not.
     cold: Arc<Mutex<HashMap<String, Arc<LineageRegistry>>>>,
+    /// The `__manifest` branch where a lookup last found a buffered commit of
+    /// each history block: its native name, or `None` for main. One native
+    /// branch writes a block, so its other commits are buffered there too
+    /// until they are released or merged. A hint for where to look first,
+    /// never an answer: a branch that no longer holds the commit drops it.
+    homes: Arc<Mutex<HashMap<Ulid, Option<String>>>>,
 }
 
 /// Cold registry files held per handle before the ones a read did not name
 /// are dropped: a few branches' worth of logarithmic fragment counts.
 const COLD_REGISTRY_FILES: usize = 64;
 
+/// Block homes held per handle before all are dropped and found again.
+const BLOCK_HOMES: usize = 4096;
+
 impl HistoryCache {
+    /// Where a lookup last found a buffered commit of `block`.
+    pub(crate) fn block_home(&self, block: Ulid) -> Option<Option<String>> {
+        self.homes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&block)
+            .cloned()
+    }
+
+    /// Remember that the branch `native` (`None` for main) buffered a commit
+    /// of `block` when a lookup read it.
+    pub(crate) fn remember_block_home(&self, block: Ulid, native: Option<String>) {
+        let mut homes = self.homes.lock().unwrap_or_else(PoisonError::into_inner);
+        if homes.len() >= BLOCK_HOMES && !homes.contains_key(&block) {
+            homes.clear();
+        }
+        homes.insert(block, native);
+    }
+
+    /// Forget where `block` was found: that branch no longer holds it.
+    pub(crate) fn forget_block_home(&self, block: Ulid) {
+        self.homes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&block);
+    }
+
     /// The registry rows of the cold fragments of `dataset`'s version,
     /// cached by data-file path while retained in this handle.
     pub(crate) async fn cold_registry(&self, dataset: &Dataset) -> Result<LineageRegistry> {
