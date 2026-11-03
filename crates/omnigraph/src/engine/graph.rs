@@ -493,26 +493,25 @@ fn source_node_key(source: usize, node: u32) -> u64 {
 /// The destination column of one chunk: `dense` resolved through `ids`, the
 /// dictionary of the walk's destination space, charged to `memory` first.
 fn destination_column(dense: &[u32], ids: &[String], memory: &WorkMemory) -> Result<ArrayRef> {
-    let strings = dense
-        .iter()
-        .map(|&d| {
-            ids.get(d as usize).map(String::as_str).ok_or_else(|| {
-                OmniError::manifest_internal(format!(
-                    "dense destination id {d} is outside its dictionary of {} ids",
-                    ids.len()
-                ))
-            })
-        })
-        .collect::<Result<Vec<&str>>>()?;
-    let bytes = strings
-        .iter()
-        .map(|id| id.len())
-        .fold(0usize, usize::saturating_add);
+    // One pass checks every id against the dictionary and sums the bytes;
+    // the column is then built straight from the dictionary.
+    let mut bytes = 0usize;
+    for &d in dense {
+        let id = ids.get(d as usize).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "dense destination id {d} is outside its dictionary of {} ids",
+                ids.len()
+            ))
+        })?;
+        bytes = bytes.saturating_add(id.len());
+    }
     memory.string(bytes).map_err(|error| memory.error(error))?;
     memory
         .grow((dense.len() + 1).saturating_mul(std::mem::size_of::<i32>()))
         .map_err(|error| memory.error(error))?;
-    Ok(Arc::new(StringArray::from_iter_values(strings)))
+    Ok(Arc::new(StringArray::from_iter_values(
+        dense.iter().map(|&d| ids[d as usize].as_str()),
+    )))
 }
 
 /// The pending chunk as pairs ready to emit: its destinations resolved
