@@ -145,12 +145,32 @@ struct Built {
 impl Built {
     /// The first build row holding `id`, hashed as `hash`.
     fn row_of(&self, hash: u64, id: &str) -> Option<u32> {
-        self.rows
-            .find(hash, |&(entry_hash, row)| {
-                entry_hash == hash && self.ids.value(row as usize) == id
-            })
-            .map(|&(_, row)| row)
+        find_row(&self.rows, &self.ids, hash, id)
     }
+}
+
+/// The build table over `ids` hashed as `hashes`: one `(hash, row)` entry
+/// per distinct non-null id, the first row of a duplicate kept; two ids
+/// with one hash keep separate entries, told apart by their strings.
+fn index_rows(ids: &StringArray, hashes: &[u64]) -> HashTable<(u64, u32)> {
+    let mut rows: HashTable<(u64, u32)> = HashTable::with_capacity(ids.len());
+    for (row, &hash) in hashes.iter().enumerate() {
+        if ids.is_null(row) {
+            continue;
+        }
+        if find_row(&rows, ids, hash, ids.value(row)).is_none() {
+            rows.insert_unique(hash, (hash, row as u32), |&(entry_hash, _)| entry_hash);
+        }
+    }
+    rows
+}
+
+/// The build row of `id`, hashed as `hash`, in `rows` over `ids`.
+fn find_row(rows: &HashTable<(u64, u32)>, ids: &StringArray, hash: u64, id: &str) -> Option<u32> {
+    rows.find(hash, |&(entry_hash, row)| {
+        entry_hash == hash && ids.value(row as usize) == id
+    })
+    .map(|&(_, row)| row)
 }
 
 /// `hashes` filled with the hash of every value of `ids` (nulls included,
@@ -183,28 +203,19 @@ async fn build_side(
             "destination scan exceeds row index range",
         ))
     })?;
-    // The table's entries plus the hash buffer, one `u64` per row.
+    // The table's entries plus the hash buffer, one `u64` per row; the
+    // buffer's share is released once the table is built.
+    let before = work.charged();
+    let table_bytes = WorkMemory::entry_bytes::<(u64, u32)>().saturating_mul(ids.len());
     work.entries::<(u64, u32)>(ids.len())?;
     work.entries::<u64>(ids.len())?;
     let state = RandomState::with_seed(HASH_SEED);
     let id_array: ArrayRef = Arc::new(ids.clone());
     let mut hashes = Vec::new();
     hash_ids(&id_array, &state, &mut hashes)?;
-    let mut rows: HashTable<(u64, u32)> = HashTable::with_capacity(ids.len());
-    for (row, &hash) in hashes.iter().enumerate() {
-        if ids.is_null(row) {
-            continue;
-        }
-        let id = ids.value(row);
-        let occupied = rows
-            .find(hash, |&(entry_hash, entry_row)| {
-                entry_hash == hash && ids.value(entry_row as usize) == id
-            })
-            .is_some();
-        if !occupied {
-            rows.insert_unique(hash, (hash, row as u32), |&(entry_hash, _)| entry_hash);
-        }
-    }
+    let rows = index_rows(ids, &hashes);
+    drop(hashes);
+    work.shrink_to(before.saturating_add(table_bytes));
     let ids = ids.clone();
     Ok(Built {
         batch,
@@ -427,5 +438,26 @@ impl Streamed for Probe {
                 )),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The build table keeps the first row of a duplicate id, tells two ids
+    /// with one hash apart by their strings, and never indexes a null.
+    #[test]
+    fn build_table_keeps_the_first_row_and_resolves_a_collision() {
+        let ids = StringArray::from(vec![Some("a"), Some("b"), Some("a"), None, Some("c")]);
+        // `a` and `b` collide; the null shares `c`'s hash and must stay out.
+        let hashes = [7, 7, 7, 9, 9];
+        let rows = index_rows(&ids, &hashes);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(find_row(&rows, &ids, 7, "a"), Some(0));
+        assert_eq!(find_row(&rows, &ids, 7, "b"), Some(1));
+        assert_eq!(find_row(&rows, &ids, 9, "c"), Some(4));
+        assert_eq!(find_row(&rows, &ids, 7, "c"), None);
+        assert_eq!(find_row(&rows, &ids, 9, "a"), None);
     }
 }

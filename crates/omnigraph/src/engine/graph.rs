@@ -1336,7 +1336,10 @@ where
     let mut emitted_dst: Vec<u32> = Vec::with_capacity(chunk_rows);
     let mut prev_union_len: usize = 0;
     // What one examined neighbour may add: a visited entry, a frontier
-    // entry, an emitted-set entry and a pair; charged per node, not per edge.
+    // entry, an emitted-set entry and a pair. A node admits that bound for
+    // all its neighbours before its slice is walked and settles to what the
+    // walk added once it is done: two pool calls per node, none per edge,
+    // and the held charge is the live state.
     let per_neighbour_bytes = WorkMemory::entry_bytes::<u64>()
         .saturating_mul(2)
         .saturating_add(WorkMemory::entry_bytes::<u32>())
@@ -1522,9 +1525,11 @@ where
                     ActiveExpandSource::Csr(CsrSource { dst_idx, .. }) => dst_idx.ids(),
                 };
                 // Admit what this node's neighbours can add before the walk.
+                let before = memory.charged();
                 memory
                     .grow((fwd.len() + rev.len()).saturating_mul(per_neighbour_bytes))
                     .map_err(|error| memory.error(error))?;
+                let mut added = 0usize;
                 for &neighbor in fwd.iter().chain(rev) {
                     if budgeted {
                         memory
@@ -1814,7 +1819,7 @@ fn physical_scan_rows<E: std::fmt::Display>(
 }
 
 /// The longest key list an unindexed edge scan still pushes into Lance; see
-/// the pushdown rule in [`scan_edges_stream`]. The indexed expand path's
+/// the pushdown rule in `scan_edges_stream`. The indexed expand path's
 /// frontier ceiling (`OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER`, 1,024 by
 /// default) is this size: a frontier the plan sends to per-hop scans stays
 /// pushed, a bound edge over a larger source set is sieved.
@@ -1857,12 +1862,13 @@ async fn scan_edges_stream(
     );
     // A `key IN (keys)` filter reaches Lance where a BTREE on the key column
     // turns it into index lookups, and where the list is small: Lance 13
-    // re-plans a pushed list for every fragment (a clone and a hash set of
-    // every key per fragment), but a pushed filter also lets it read a
-    // fragment's other columns only for the rows the key column admits, one
-    // read fewer per fragment no key is in. Up to `PUSHDOWN_KEYS_MAX` keys
-    // the per-fragment replan is cheaper than that read; past it the engine
-    // sieves the batches itself through one set of the keys.
+    // clones a pushed list for every fragment it reads (`filtered_read.rs`
+    // clones `full_filter` per fragment; the physical expression is built
+    // once per distinct expression), but a pushed filter also lets it read
+    // a fragment's other columns only for the rows the key column admits,
+    // one read fewer per fragment no key is in. Up to `PUSHDOWN_KEYS_MAX`
+    // keys the per-fragment clone is cheaper than that read; past it the
+    // engine sieves the batches itself through one set of the keys.
     let pushdown = match pushdown {
         Some(true) => true,
         _ if keys.len() <= PUSHDOWN_KEYS_MAX => true,

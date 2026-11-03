@@ -732,6 +732,11 @@ impl WorkMemory {
 
     /// Lower this work's charge to `bytes` once its peak has passed; a charge
     /// already at or under `bytes`, or freed meanwhile, stays as it is.
+    /// This work's current scratch charge, the number `shrink_to` lowers.
+    pub(in crate::engine) fn charged(&self) -> usize {
+        self.scratch.size()
+    }
+
     pub(in crate::engine) fn shrink_to(&self, bytes: usize) {
         let excess = self.scratch.size().saturating_sub(bytes);
         if self.scratch.try_shrink(excess).is_ok() {
