@@ -63,11 +63,20 @@ root as the unit of authority (invariants 3 and 12).
 Users need this to work. The upgrade guide makes a whole-root backup the
 rollback unit, and the maintenance guide makes it the recovery unit after an
 external cleanup. A backup that must stand alone, at another path or on
-another machine, does not serve a graph's branches today. Lance's own
-[table layout](https://lance.org/format/table/layout/) page ("Dataset
-Portability") says a copied dataset root "will function immediately at the
-new location". A branch under `tree/` is inside the root, and it breaks that
-promise.
+another machine, does not serve a graph's branches today.
+
+Lance's [table layout](https://lance.org/format/table/layout/) page, under
+"Dataset Portability", already draws this line:
+
+- A dataset whose files resolve through relative paths works at a new
+  location with no manifest update.
+- A dataset with several bases, "such as in shallow clones", keeps the
+  original base locations when only its root is copied. To port it, copy the
+  bases and "update the manifest's base_paths array".
+
+A branch is that shallow clone. Its base is a branch of the same dataset,
+inside the copied root. This rule is the port step the page names, done in
+the handle's memory rather than written back.
 
 An issue-sized fix is not enough here. The fix decides when Omnigraph may
 override a persisted substrate field. That is a compatibility rule every
@@ -144,13 +153,28 @@ This section describes Lance 13.0.0 (`lance`, `lance-table`, `lance-io`):
   `base_paths` and adds `BasePath::new(id, ref_path, ref_name, true)`. The
   name is the source branch (`None` or `main` for main), and
   `is_dataset_root` is true.
-- Every `base_id` read resolves through `Dataset::manifest.base_paths` only:
-  `data_file_dir_for_base`, `dataset_dir_for_deletion`, `indice_files_dir`,
-  and `object_store(Some(id))`. A local store opens the resulting absolute
-  path directly (`LocalObjectReader`). An object-store wrapper therefore
-  cannot redirect the read.
-- `checkout_by_ref` always builds a new handle from the persisted manifest.
-  `Dataset::manifest` is a public `Arc<Manifest>`.
+- A `base_id` file's path comes from `Dataset::manifest.base_paths`, read
+  on every call: `data_file_dir_for_base`, `dataset_dir_for_deletion`, and
+  `indice_files_dir`. A local store opens the resulting absolute path
+  directly (`LocalObjectReader`), so an object-store wrapper cannot redirect
+  the read.
+- **The store for a base is not re-read.** `object_store(Some(id))` builds it
+  from the base's URI on first use and keeps it in `base_object_stores`, a
+  `pub(crate)` cache that clones share. Only the private `set_manifest`
+  clears it, and only when `base_paths` change. Replacing the public
+  `Dataset::manifest` `Arc` does not clear it. A store opened at the old URI
+  therefore survives a later rewrite of the map. A handle would then compute
+  each path from the new map and read it through the old store, which on S3
+  or Azure is another bucket or container.
+- `checkout_by_ref` builds a new handle, with an empty cache, from the
+  persisted manifest. The exception is a checkout of the version the handle
+  already holds (`already_checked_out`): it returns `self.clone()`, which
+  shares the cache. `Dataset::with_object_store` is the public clone that
+  starts an empty cache.
+- A commit uses the handle's in-memory map only when the handle holds the
+  transaction's `read_version` (`commit_transaction`). Otherwise Lance checks
+  out `read_version` from disk, and the new version carries the recorded
+  bases.
 - `BranchLocation::find_main` and `find_branch(name)` derive every branch
   location of a dataset from the opened location.
 - No Lance API renames a branch. Bases are added by `Operation::Clone`, by
@@ -164,8 +188,12 @@ clone of a branch of the same dataset, called through
 `lance_clone::create_branch`.
 
 - Current binaries clone only `__manifest`, from
-  `branch_control::create_branch_recoverably`. The storage upgrade converts
-  branches through the same call.
+  `branch_control::create_branch_recoverably`.
+- The storage upgrade does not clone. `publish_conversion` checks out each
+  existing branch and overwrites it, and `Manifest::new_from_previous` copies
+  the predecessor's `base_paths`. An upgraded graph therefore carries the
+  old binary's clone bases. The genuine predecessor journeys in `blocked_on`
+  are the evidence that those bases have the shape below.
 - Binaries before storage format v11 also created table forks this way.
 - The production source has exactly one `.create_branch(` call into Lance.
   `forbidden_apis.rs` already pins that count. No Omnigraph writer uses
@@ -191,16 +219,36 @@ After every open and every checkout, Omnigraph does the following for a
 graph dataset:
 
 1. It replaces `b.path` with `M.find_branch(b.name).uri` for every
-   graph-internal branch base. It does this in a clone of the handle's
-   manifest, and leaves the session's cached manifest alone. Equal paths are
-   left as they are, so applying the rule twice changes nothing.
+   graph-internal branch base. It writes a clone of the manifest, so the
+   session's cached manifest is untouched. It installs the new map on a
+   handle with an empty base-store cache (`Dataset::with_object_store` of the
+   handle's own primary store), before any base on that handle resolves. No
+   other handle shares that cache, so no store opened at a recorded URI can
+   serve it. A handle whose bases already name the opened root is returned
+   as it is, so applying the rule twice changes nothing. Its cache can hold
+   only stores opened at those same URIs, because the door is the only code
+   that replaces the map.
 2. It refuses the handle when any other base is present (a `Permanent`
    storage failure). This includes a base whose name selects a different
    tree from the one its path records, a base that is not a dataset root,
    and any path outside the shape above.
 
+Before the comparison, a recorded path loses its query string and any
+trailing `/`. On Windows, `\` is also read as `/`, because Lance's
+`get_root_path` accepts both separators.
+
+One residual is accepted. A base Omnigraph did not write, whose name selects
+main and whose path still ends in `/<D>`, is rebound rather than refused.
+The writer inventory says no such base occurs, and even then the read stays
+under the opened root.
+
 A rebound base points under the opened root, so its files are read through
-the opened root's store and binding. A file missing there fails there.
+the opened root's store and binding. A file missing there fails there. The
+failure keeps today's class: a `NotFound` storage failure, reported as
+`internal` with the `refresh` action. That action is wrong for a missing
+copied object, which a retry does not bring back; this RFC does not change
+it. The message names the path under the opened root, never the recorded
+path.
 
 ### One door
 
@@ -215,6 +263,29 @@ in two places:
 The catalog exposes that checkout as its function for every `__manifest`
 checkout. A `forbidden_apis.rs` rule refuses a bare checkout, and every
 Lance base-adding API, in engine, core, and catalog production sources.
+
+### Two path rules, one owner each
+
+Omnigraph holds two kinds of absolute location for a graph dataset. Each has
+one owner:
+
+- **A table pin's `manifest_path`.** Omnigraph writes it into a catalog row.
+  `full_manifest_object_store_path` (`omnigraph-core` `metadata.rs`) rebuilds
+  it from the opened root and the table's relative path when it is read.
+  This RFC does not change it.
+- **A Lance `BasePath`.** Lance writes it into a manifest. `branch_base`
+  rebinds it at the open door. `branch_base` is the only code that classifies
+  bases. That covers the refusal, the collector's borrowed origins, and the
+  relocation bit.
+
+The relocation bit (`manifest_has_external_base_paths`,
+`SnapshotDataset::has_external_base_paths`, and the benchmark's
+`relocation_self_contained`) is true today whenever `base_paths` is
+non-empty, so every branched graph counts as not relocatable. Under this
+contract it asks `branch_base` instead: a dataset has an external base only
+if one of its bases is not graph-internal. Such a dataset is refused at open,
+so an openable graph is self-contained. No third path rule may be added; a
+new location fact names one of these two owners.
 
 ### Mismatched names fail closed
 
@@ -260,12 +331,20 @@ their parent chain, not bases, so it needs no change.
 
 ### What new manifests persist
 
-Nothing new is persisted. A publish from a rebound handle records the opened
-root's absolute URI, because `Manifest::new_from_previous` copies the
-in-memory map. That is what Lance writes on any fresh clone at that
-location. A branch created on a relocated root records the opened URI for
-its direct source, and it copies its ancestors' recorded URIs from the
-reloaded source manifest. The rule covers both.
+Nothing new is persisted. What a new version records depends on how it is
+written:
+
+- **A publish whose handle holds the read version.** It records the opened
+  root's absolute URI for every base, ancestors included, because
+  `Manifest::new_from_previous` copies the handle's in-memory map. That is
+  what Lance writes for any clone made at that location.
+- **A publish whose handle does not hold the read version.** Lance checks out
+  `read_version` from disk, and the new version keeps the recorded bases.
+- **A branch created on a relocated root.** `create_branch` always reloads
+  the source manifest, so the new branch records the opened URI for its
+  direct source and keeps its ancestors' recorded URIs.
+
+The rule covers all three.
 
 Existing manifests and clone transaction files are never rewritten, so local
 e-tags and branch identity do not change.
@@ -289,11 +368,15 @@ The implementation adds this row to the fence table in
 
 > **Branch bases.** Lance 13 `create_branch` records the source branch's
 > absolute URI as a dataset-root `BasePath` named for that branch, and
-> `shallow_clone` copies the source's bases forward. Every `base_id` file
-> resolves through `Dataset::manifest.base_paths`. After each open and
-> checkout, Omnigraph rebinds every base whose recorded path ends in the
-> suffix its name selects to `find_branch(name)` of the opened location, in
-> memory (`branch_base`), and refuses every other base. Drop the in-memory
+> `shallow_clone` copies the source's bases forward. A `base_id` file's path
+> comes from `Dataset::manifest.base_paths`, read on every call. Its store
+> comes from the `base_object_stores` cache, built from the base's URI on
+> first use and shared by clones. Replacing the public map does not clear
+> it. After each open and checkout, Omnigraph rebinds every base whose
+> recorded path ends in the suffix its name selects to `find_branch(name)`
+> of the opened location. It does this in memory (`branch_base`), on a
+> handle with a fresh cache, before any base resolves, and refuses every
+> other base. Drop the in-memory
 > rebinding for new bytes at the bump whose clone records a location
 > relative to the dataset. Keep it for existing bytes.
 
@@ -335,10 +418,13 @@ The change is read-side only:
 
 - **Persisted bytes.** None change. The storage format and graph stamp are
   unchanged.
-- **Older binaries.** They read new bytes as before. A root relocated and
-  then written by a new binary records absolute URIs at its new location, so
-  an older binary can read those versions there. It still fails on inherited
-  ancestor bases, as it does today.
+- **Older binaries.** They read new bytes as before. On a root relocated and
+  then written by a new binary:
+  - a version from a same-version publish records the new location for every
+    base, so an older binary reads it there;
+  - a new branch, a publish from a stale handle, and every version not
+    rewritten keep recorded ancestor bases, and an older binary still fails
+    on them, as it does today.
 - **Reverting.** Reverting restores the current behavior for every graph,
   with nothing to migrate.
 - **Possible break.** The one possible break is the fail-closed refusal. A
@@ -356,10 +442,10 @@ The change is read-side only:
 | A `relocate` command that rewrites `base_paths` with new manifest versions | Historical versions keep the old bases, so the reader rule is still needed. It also adds a commit per branch and per fork after every move. Rejected. |
 | Persist a root-relative `BasePath.path` | Lance specifies an absolute path, and `uri_to_url` would resolve a relative one against the working directory. That needs a format stamp and a Lance change, and still a reader rule for existing bytes. Rejected. |
 | An object-store wrapper or a registry `extract_path` rewrite | Local reads bypass the wrapper. The registry is process-wide, so two copies of one backup open in one process would need opposite rewrites. Rejected. |
-| `DatasetBuilder::with_serialized_manifest` | It reopens the handle and loses the resolved `ManifestLocation` (e-tag, size) that freshness and identity checks compare. Rejected. |
+| `DatasetBuilder::with_serialized_manifest` | It opens the dataset again, with I/O: `load_by_uri` still calls `resolve_version_location`, which HEADs an attached version's manifest. The in-memory door adds no I/O, and that holds only when it runs before any base read. Rejected. |
 | Rebind graph-internal bases but keep the recorded path for any other base | It keeps a cross-tree read for exactly the shapes that cannot be explained. Rejected in favor of refusal. |
 | Refuse relocation while pre-v11 forks exist | It costs the same detection and serves less. See [Design](#pre-v11-table-forks-the-rule-extends-to-tables-and-the-collector). |
-| Wait for a Lance release | It fixes neither existing bytes nor current graphs. The upstream issue is filed as well. |
+| Wait for a Lance release | It fixes neither existing bytes nor current graphs. The upstream issue is [lance#10661](https://github.com/lance-format/lance/issues/10661). |
 
 ## Evidence and tests
 
@@ -387,8 +473,14 @@ Required by the implementation, all extending existing owners:
 - **RustFS**: a copy into another prefix and into another bucket, in the
   `s3_storage` owner. **Azurite**: another prefix and another container, run
   by the Azurite job.
-- **Guards**: the `forbidden_apis.rs` guards and the
+- **Guards**: the `forbidden_apis.rs` guards (one checkout door, one base
+  classifier, no other writer of `Dataset::manifest`) and the
   `lance_surface_guards.rs` stock-behavior guard.
+- **The cache rule**: a handle that resolved a base store at the recorded
+  URI before the rebind does not read through that store afterwards. Across
+  buckets on RustFS, that stale store would read the wrong bucket.
+- **The relocation bit**: it is reported self-contained for a branched graph
+  whose bases are all graph-internal.
 - **The genuine predecessor journeys**, unchanged and green.
 
 Upstream surfaces reviewed: Lance 13.0.0 `dataset.rs` (`create_branch`,
@@ -410,15 +502,17 @@ base resolution, `add_bases`), `dataset/branch_location.rs`,
      `> **Relocated graph roots disposition:** [Relocated graph roots](2026-11-03-relocated-graph-roots.md) supplies the test this RFC asks for, for a whole-root copy on the same kind of backend: such a copy is supported, and a base outside the root or a missing copied object refuses. Moving a root between backend kinds stays unsupported, and the export and import workflow below stays the route.`
    - Under [RFC 0064](0064-explicit-storage-upgrades.md):
      `> **Relocated graph roots disposition:** an upgrade still assumes no root copy or rename. A whole-root backup may be restored at its own location or at a new one on the same kind of backend, under [Relocated graph roots](2026-11-03-relocated-graph-roots.md).`
-2. **The implementation pull request** carries the rule, the door and its
-   guards, the fork and collector extension, the object-store evidence, the
-   fence row, the user documentation, and a changelog note.
+2. **The implementation pull request**, draft
+   [#1235](https://github.com/ModernRelay/omnigraph/pull/1235), carries the
+   rule, the door and its guards, the fork and collector extension, the
+   relocation bit, the object-store evidence, the fence row, the user
+   documentation, and a changelog note.
    `implementation` moves to `in-progress` when it is opened against an
    accepted RFC, and to `complete` when it merges with its evidence green.
-3. **The upstream Lance issue** links the layout page's portability promise
-   to `create_branch`'s absolute `ref_path`. When Lance records a relative
-   same-dataset location, the fence row's drop condition applies to new
-   bytes only.
+3. **Upstream.** [lance#10661](https://github.com/lance-format/lance/issues/10661)
+   links the layout page's portability text to `create_branch`'s absolute
+   `ref_path`. When Lance records a relative same-dataset location, the fence
+   row's drop condition applies to new bytes only.
 
 ## Unresolved questions
 
@@ -438,3 +532,17 @@ None block acceptance. The two evidence gates are in `blocked_on`.
   rule to pre-v11 table forks and the collector, and on support for copies
   within one backend kind (another prefix, bucket, or container) but not
   across kinds.
+- 2026-11-03: Revised after review. It now states:
+  - the base-store cache limit, and that the door installs the rebound map
+    on a fresh, unshared cache before any base resolves;
+  - that the storage upgrade overwrites (`publish_conversion`) rather than
+    clones;
+  - what a same-version publish, a stale-handle publish, and a new branch
+    persist;
+  - the layout page's shallow-clone port step;
+  - one owner each for pin paths and `BasePath`s, the relocation bit
+    included;
+  - the builder's I/O as the reason to reject it, the `NotFound` class and
+    message path, separator normalization, and the main-name residual.
+
+  Linked the filed upstream issue (lance#10661) and draft #1235.
