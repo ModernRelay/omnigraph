@@ -8,13 +8,14 @@
 //! the node declares that fallback. An empty build stops the probe after its
 //! first batch.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use arrow_array::{Array, RecordBatch, StringArray, UInt32Array};
+use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::SchemaRef;
+use datafusion::common::hash_utils::{RandomState, create_hashes};
 use datafusion::common::{DataFusionError, Result as DfResult};
+use hashbrown::HashTable;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::metrics::{
     Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricsSet,
@@ -124,12 +125,41 @@ impl DisplayAs for HashJoinExec {
     }
 }
 
-/// The drained build side: its rows and the row of every id, held under
-/// `memory` for as long as the probe runs.
+/// The seed of the join's hash function: fixed, so a build hashes the same
+/// way on every run.
+const HASH_SEED: u64 = 0x6f6d_6e69_6a6f_696e;
+
+/// The drained build side: its rows and, per distinct non-null id, the first
+/// row holding it, as `(hash, row)` entries in a table that borrows nothing
+/// (an entry compares through the id column of `batch`), held under
+/// `memory` for as long as the probe runs. The ids are hashed in bulk with
+/// DataFusion's `create_hashes`; no id is copied out of the Arrow column.
 struct Built {
     batch: RecordBatch,
-    row_by_id: HashMap<String, u32>,
+    ids: StringArray,
+    rows: HashTable<(u64, u32)>,
+    state: RandomState,
     _memory: WorkMemory,
+}
+
+impl Built {
+    /// The first build row holding `id`, hashed as `hash`.
+    fn row_of(&self, hash: u64, id: &str) -> Option<u32> {
+        self.rows
+            .find(hash, |&(entry_hash, row)| {
+                entry_hash == hash && self.ids.value(row as usize) == id
+            })
+            .map(|&(_, row)| row)
+    }
+}
+
+/// `hashes` filled with the hash of every value of `ids` (nulls included,
+/// which the callers skip) under `state`.
+fn hash_ids(ids: &ArrayRef, state: &RandomState, hashes: &mut Vec<u64>) -> DfResult<()> {
+    hashes.clear();
+    hashes.resize(ids.len(), 0);
+    create_hashes([ids], state, hashes)?;
+    Ok(())
 }
 
 async fn build_side(
@@ -148,22 +178,39 @@ async fn build_side(
                 "destination scan must return Utf8 '{id_column}'"
             )))
         })?;
-    work.entries::<(String, u32)>(ids.len())?;
-    work.string(ids.iter().flatten().map(str::len).sum())?;
-    let mut row_by_id = HashMap::with_capacity(ids.len());
-    for (row, id) in ids.iter().enumerate() {
-        if let Some(id) = id {
-            let row = u32::try_from(row).map_err(|_| {
-                external(OmniError::manifest_internal(
-                    "destination scan exceeds row index range",
-                ))
-            })?;
-            row_by_id.entry(id.to_string()).or_insert(row);
+    u32::try_from(ids.len()).map_err(|_| {
+        external(OmniError::manifest_internal(
+            "destination scan exceeds row index range",
+        ))
+    })?;
+    // The table's entries plus the hash buffer, one `u64` per row.
+    work.entries::<(u64, u32)>(ids.len())?;
+    work.entries::<u64>(ids.len())?;
+    let state = RandomState::with_seed(HASH_SEED);
+    let id_array: ArrayRef = Arc::new(ids.clone());
+    let mut hashes = Vec::new();
+    hash_ids(&id_array, &state, &mut hashes)?;
+    let mut rows: HashTable<(u64, u32)> = HashTable::with_capacity(ids.len());
+    for (row, &hash) in hashes.iter().enumerate() {
+        if ids.is_null(row) {
+            continue;
+        }
+        let id = ids.value(row);
+        let occupied = rows
+            .find(hash, |&(entry_hash, entry_row)| {
+                entry_hash == hash && ids.value(entry_row as usize) == id
+            })
+            .is_some();
+        if !occupied {
+            rows.insert_unique(hash, (hash, row as u32), |&(entry_hash, _)| entry_hash);
         }
     }
+    let ids = ids.clone();
     Ok(Built {
         batch,
-        row_by_id,
+        ids,
+        rows,
+        state,
         _memory: work,
     })
 }
@@ -315,16 +362,23 @@ impl Probe {
             })?;
         let work = Arc::new(memory.child(OUTPUT)?);
         work.entries::<u32>(ids.len().saturating_mul(2))?;
+        work.entries::<u64>(ids.len())?;
+        u32::try_from(ids.len()).map_err(|_| {
+            external(OmniError::manifest_internal(
+                "traversal batch exceeds row index range",
+            ))
+        })?;
+        let mut hashes = Vec::new();
+        hash_ids(batch.column(id_index), &built.state, &mut hashes)?;
         let mut probe_rows = Vec::with_capacity(ids.len());
         let mut build_rows = Vec::with_capacity(ids.len());
-        for (row, id) in ids.iter().enumerate() {
-            if let Some(build_row) = id.and_then(|id| built.row_by_id.get(id)) {
-                probe_rows.push(u32::try_from(row).map_err(|_| {
-                    external(OmniError::manifest_internal(
-                        "traversal batch exceeds row index range",
-                    ))
-                })?);
-                build_rows.push(*build_row);
+        for (row, &hash) in hashes.iter().enumerate() {
+            if ids.is_null(row) {
+                continue;
+            }
+            if let Some(build_row) = built.row_of(hash, ids.value(row)) {
+                probe_rows.push(row as u32);
+                build_rows.push(build_row);
             }
         }
         if probe_rows.is_empty() {
