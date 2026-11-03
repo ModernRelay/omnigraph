@@ -48,6 +48,7 @@ query operators() {
 {"o.name":"CsvSource","o.inputs":[0]}
 {"o.name":"Validate","o.inputs":[1]}
 {"o.name":"FragmentWrite","o.inputs":[1]}
+{"o.name":"DeltaSource","o.inputs":[0]}
 
 --- expect shape
 o.name: String
@@ -96,6 +97,7 @@ query logical_kinds() {
 {"k.name":"Aggregate","k.coverage":"refused_by_name"}
 {"k.name":"AntiJoin","k.coverage":"refused_by_name"}
 {"k.name":"CsvSource","k.coverage":"refused_by_name"}
+{"k.name":"DeltaSource","k.coverage":"refused_by_name"}
 {"k.name":"Expand","k.coverage":"refused_by_name"}
 {"k.name":"Filter","k.coverage":"routable"}
 {"k.name":"FragmentWrite","k.coverage":"refused_by_name"}

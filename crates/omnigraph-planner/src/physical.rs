@@ -13,9 +13,9 @@ use crate::aggregate::AggregateSpec;
 use crate::cost::{AccessPath, AntiJoinStrategy, ExpandMode, ExpandPolicy, ValidateRemoval};
 use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
 use crate::logical::{
-    ColumnRef, CsvSourceSpec, FragmentWriteSpec, KeyJoinKind, ScanSpec, ValidateSpec,
-    csv_source_json, filters_json, fragment_write_json, metadata_count_json, ordering_text,
-    scan_json, tiebreak_text, validate_json,
+    ColumnRef, CsvSourceSpec, DeltaSourceSpec, FragmentWriteSpec, KeyJoinKind, ScanSpec,
+    ValidateSpec, csv_source_json, delta_source_json, filters_json, fragment_write_json,
+    metadata_count_json, ordering_text, scan_json, tiebreak_text, validate_json,
 };
 use crate::mirror::EdgeSelectionMirror;
 use crate::operation::TableRef;
@@ -907,6 +907,11 @@ physical_nodes! {
         max_input_bytes: u64,
         max_workers: u32,
     } => "FragmentWrite" [input: NodeId];
+    /// A write's staged delta of one table, in memory on the executor: the
+    /// leaf of a write plan, whose `Validate` the executor's judge runs.
+    DeltaSource {
+        spec: Box<DeltaSourceSpec>,
+    } => "DeltaSource" [];
 }
 
 /// How a node's operator relates its output to its streamed input in time:
@@ -988,6 +993,7 @@ impl PhysicalNode {
             | Self::Limit { .. }
             | Self::Filter { .. }
             | Self::Projection { .. }
+            | Self::DeltaSource { .. }
             | Self::FragmentWrite { .. } => PipelineShape::Streaming,
         }
     }
@@ -1023,6 +1029,7 @@ impl PhysicalNode {
             | Self::Aggregate { .. }
             | Self::Sort { .. }
             | Self::Validate { .. }
+            | Self::DeltaSource { .. }
             | Self::FragmentWrite { .. } => Vec::new(),
         }
     }
@@ -1090,6 +1097,7 @@ impl PhysicalNode {
             | Self::Aggregate { .. }
             | Self::CsvSource { .. }
             | Self::Validate { .. }
+            | Self::DeltaSource { .. }
             | Self::FragmentWrite { .. } => None,
         }
     }
@@ -1538,6 +1546,7 @@ impl PhysicalPlan {
                 "typed_residual": crate::typed::exprs(residual),
                 "typed_conjunct": crate::typed::expr(conjunct),
             }),
+            PhysicalNode::DeltaSource { spec } => delta_source_json(spec),
             PhysicalNode::CsvSource {
                 spec,
                 max_partitions,
@@ -1689,6 +1698,10 @@ impl PhysicalPlan {
                     Some(PhysicalNode::CsvSource { spec, .. }) => json!({
                         "node": "CsvSource",
                         "source": spec.source,
+                    }),
+                    Some(PhysicalNode::DeltaSource { spec }) => json!({
+                        "node": "DeltaSource",
+                        "table": spec.table,
                     }),
                     Some(PhysicalNode::OuterReference { outer_var }) => json!({
                         "node": "OuterReference",

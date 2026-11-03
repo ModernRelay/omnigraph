@@ -277,6 +277,10 @@ pub struct MutateStep {
     /// Whether the header spelled `branch:`; an omitted branch lets a child
     /// write inherit its base's target.
     branch_spelled: bool,
+    /// `--- expect plan` after the step's `--- expect ok|affected`: facts of
+    /// the planner documents the mutation's receipt carries, one per table
+    /// the write validated.
+    plan: Option<LoadPlanExpect>,
 }
 
 /// A `--- mutate` step holding a control write. The expect lives inside
@@ -311,6 +315,9 @@ pub enum ControlWrite {
         /// `as commit`: the merge result is an unpublished commit.
         as_commit: bool,
         expect: MergeExpect,
+        /// `--- expect plan` after the step's expect: facts of the planner
+        /// documents the merge's receipt carries, one per validated table.
+        plan: Option<LoadPlanExpect>,
     },
     /// `commit publish "<id>"`.
     Publish {
@@ -1798,6 +1805,7 @@ fn complete_control_step(
             into,
             as_commit,
             expect: complete_merge_expect(mode, section)?,
+            plan: None,
         },
         ControlSource::Commit(CommitWrite::Publish { graph_commit_id }) => ControlWrite::Publish {
             graph_commit_id,
@@ -1902,6 +1910,7 @@ fn complete_decl_step(
                     bind: None,
                     base_binding: step.base_binding,
                     branch_spelled: step.branch_spelled,
+                    plan: None,
                 })
             } else {
                 Step::Query(QueryStep {
@@ -1933,6 +1942,7 @@ fn complete_decl_step(
                 bind: None,
                 base_binding: step.base_binding,
                 branch_spelled: step.branch_spelled,
+                plan: None,
             }))
         }
         (ExpectHeader::Affected { nodes, edges }, true) => {
@@ -1952,6 +1962,7 @@ fn complete_decl_step(
                 bind: None,
                 base_binding: step.base_binding,
                 branch_spelled: step.branch_spelled,
+                plan: None,
             }))
         }
     }
@@ -2637,7 +2648,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     let Some(mut step) = awaiting_plan.take() else {
                         if !awaiting_load_plan {
                             return Err(format!(
-                                "line {}: `--- expect plan` must directly follow a query step's `--- expect shape` or a `load csv` step's `--- expect ok`",
+                                "line {}: `--- expect plan` must directly follow a query step's `--- expect shape`, or the `--- expect` of a `load csv`, `branch merge` or mutate step that succeeds",
                                 section.header_line + 1
                             ));
                         }
@@ -2651,17 +2662,21 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                                 _ => None,
                             },
                         };
-                        let Some(Step::Control(ControlStep {
-                            write: ControlWrite::Load { plan, .. },
-                            ..
-                        })) = last
-                        else {
-                            return Err(format!(
-                                "line {}: internal: the step awaiting a load plan is not a `load csv` step",
-                                section.header_line + 1
-                            ));
+                        let slot = match last {
+                            Some(Step::Control(ControlStep {
+                                write:
+                                    ControlWrite::Load { plan, .. } | ControlWrite::Merge { plan, .. },
+                                ..
+                            })) => plan,
+                            Some(Step::Mutate(MutateStep { plan, .. })) => plan,
+                            _ => {
+                                return Err(format!(
+                                    "line {}: internal: the step awaiting a write plan is not a `load csv`, `branch merge` or mutate step",
+                                    section.header_line + 1
+                                ));
+                            }
                         };
-                        *plan = Some(LoadPlanExpect { lines });
+                        *slot = Some(LoadPlanExpect { lines });
                         continue;
                     };
                     let lines = parse_plan_body(&section.body)
@@ -2762,16 +2777,25 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         ));
                     }
                 };
-                awaiting_load_plan = matches!(
-                    &completed,
+                awaiting_load_plan = match &completed {
                     Step::Control(ControlStep {
-                        write: ControlWrite::Load {
-                            expect: WriteExpect::Ok,
-                            ..
-                        },
+                        write:
+                            ControlWrite::Load {
+                                expect: WriteExpect::Ok,
+                                ..
+                            },
                         ..
-                    })
-                );
+                    }) => true,
+                    Step::Control(ControlStep {
+                        write: ControlWrite::Merge { expect, .. },
+                        ..
+                    }) => !matches!(expect, MergeExpect::Write(WriteExpect::Error { .. })),
+                    Step::Mutate(MutateStep {
+                        expect: MutateExpect::Ok | MutateExpect::Affected { .. },
+                        ..
+                    }) => true,
+                    _ => false,
+                };
                 if matches!(completed.read_expect(), Some(QueryExpect::Rows { .. })) {
                     substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
                     awaiting_shape = Some(completed);
@@ -4107,6 +4131,7 @@ async fn run_control_step(
             into,
             as_commit,
             expect,
+            plan,
         } => {
             let target = into.as_deref().unwrap_or(MAIN_BRANCH);
             let outcome = operation(
@@ -4123,26 +4148,59 @@ async fn run_control_step(
                     commit.graph_commit_id.clone()
                 })
             });
+            let plans: Vec<Value> = outcome
+                .as_ref()
+                .ok()
+                .map(|result| result.plans.iter().map(|plan| plan.to_value()).collect())
+                .unwrap_or_default();
             let outcome = outcome.map(|result| result.outcome);
             host.observe(|| format!("actual merge: {outcome:?}"));
             match expect {
                 MergeExpect::Write(expect) => {
                     host.observe(|| format!("actual control: {outcome:?}"));
-                    check_write_expect(host, name, expect, outcome)
-                        .map(|()| commit)
-                        .map_err(fail)
+                    check_write_expect(host, name, expect, outcome).map_err(&fail)?;
                 }
                 MergeExpect::Outcome(want) => match outcome {
-                    Ok(got) if got == *want => Ok(commit),
-                    Ok(got) => Err(fail(format!(
-                        "merge outcome mismatch: expected `{}`, got `{}`",
-                        merge_outcome_word(*want),
-                        merge_outcome_word(got)
-                    ))),
-                    Err(e) => Err(fail(format!("`{name}` failed: {e}"))),
+                    Ok(got) if got == *want => {}
+                    Ok(got) => {
+                        return Err(fail(format!(
+                            "merge outcome mismatch: expected `{}`, got `{}`",
+                            merge_outcome_word(*want),
+                            merge_outcome_word(got)
+                        )));
+                    }
+                    Err(e) => return Err(fail(format!("`{name}` failed: {e}"))),
                 },
             }
+            if let Some(expect) = plan {
+                check_write_plans(host, expect, &plans, "merge").map_err(fail)?;
+            }
+            Ok(commit)
         }
+    }
+}
+
+/// The `--- expect plan` of a mutate or `branch merge` step against the
+/// planner documents its receipt carries: a fact holds when any validated
+/// table's document holds it.
+fn check_write_plans(
+    host: &impl ExecutionHost,
+    expect: &LoadPlanExpect,
+    documents: &[Value],
+    what: &str,
+) -> Result<(), String> {
+    if documents.is_empty() {
+        return Err(format!(
+            "`--- expect plan` on a {what} whose receipt carries no plan: the write validated no table"
+        ));
+    }
+    host.observe(|| {
+        let facts: Vec<String> = load_plan::write_plan_facts(documents);
+        format!("actual {what} plans: {facts:?}")
+    });
+    match load_plan::write_plan_mismatch(&expect.lines, documents) {
+        Some(message) => Err(message),
+        None => Ok(()),
     }
 }
 
@@ -4223,34 +4281,33 @@ async fn run_mutate_step(
     if let Some(violation) = check_pin(mode, &counts, false) {
         return Err(fail(violation));
     }
-    let commit_id = |receipt: &MutationReceipt| {
-        receipt
-            .commit
-            .as_ref()
-            .map(|commit| commit.graph_commit_id.clone())
-    };
-    match &step.expect {
-        MutateExpect::Ok => outcome
-            .map(|receipt| commit_id(&receipt))
-            .map_err(|e| fail(format!("mutation failed: {e}"))),
+    let receipt = match &step.expect {
+        MutateExpect::Ok => outcome.map_err(|e| fail(format!("mutation failed: {e}")))?,
         MutateExpect::Affected { nodes, edges } => {
             let receipt = outcome.map_err(|e| fail(format!("mutation failed: {e}")))?;
             let result = &receipt.result;
-            if result.affected_nodes == *nodes && result.affected_edges == *edges {
-                Ok(commit_id(&receipt))
-            } else {
-                Err(fail(format!(
+            if result.affected_nodes != *nodes || result.affected_edges != *edges {
+                return Err(fail(format!(
                     "affected counts mismatch: expected nodes={nodes} edges={edges}, got nodes={} edges={}",
                     result.affected_nodes, result.affected_edges
-                )))
+                )));
             }
+            receipt
         }
         MutateExpect::Error { needle } => {
-            check_error_expect(host, needle, outcome, "the mutation succeeded")
+            return check_error_expect(host, needle, outcome, "the mutation succeeded")
                 .map(|()| None)
-                .map_err(fail)
+                .map_err(fail);
         }
+    };
+    if let Some(expect) = &step.plan {
+        let plans: Vec<Value> = receipt.plans.iter().map(|plan| plan.to_value()).collect();
+        check_write_plans(host, expect, &plans, "mutation").map_err(fail)?;
     }
+    Ok(receipt
+        .commit
+        .as_ref()
+        .map(|commit| commit.graph_commit_id.clone()))
 }
 
 /// One session of a block: the statement on its branch through the case
@@ -4593,15 +4650,26 @@ fn expectation_evidence(step: &Step) -> Value {
             evidence
         }
         Step::List(l) => read_expect_evidence(&l.expect),
-        Step::Mutate(m) => match &m.expect {
-            MutateExpect::Ok => serde_json::json!({"kind": "ok"}),
-            MutateExpect::Affected { nodes, edges } => {
-                serde_json::json!({"kind": "affected", "nodes": nodes, "edges": edges})
+        Step::Mutate(m) => {
+            let mut evidence = match &m.expect {
+                MutateExpect::Ok => serde_json::json!({"kind": "ok"}),
+                MutateExpect::Affected { nodes, edges } => {
+                    serde_json::json!({"kind": "affected", "nodes": nodes, "edges": edges})
+                }
+                MutateExpect::Error { needle } => {
+                    serde_json::json!({"kind": "error", "contains": needle})
+                }
+            };
+            if let Some(plan) = &m.plan {
+                evidence["plan"] = serde_json::json!(
+                    plan.lines
+                        .iter()
+                        .map(load_plan::LoadFact::spell)
+                        .collect::<Vec<_>>()
+                );
             }
-            MutateExpect::Error { needle } => {
-                serde_json::json!({"kind": "error", "contains": needle})
-            }
-        },
+            evidence
+        }
         Step::Load(step) => {
             serde_json::json!({"kind": "load", "expectation": format!("{:?}", step.expect)})
         }

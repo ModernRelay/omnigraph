@@ -5,9 +5,11 @@ pub mod load;
 pub(crate) mod lower;
 pub mod untyped;
 pub(crate) mod validate;
+pub mod write;
 
-pub use load::{Endpoint, LoadCheck, LoadIR, UniqueRole, ValidateCheck, lower_load};
+pub use load::{Endpoint, LoadCheck, LoadIR, UniqueRole, ValidateCheck, checks_for, lower_load};
 pub use lower::is_fresh_variable;
+pub use write::{DeltaClass, WriteKind, WriteTableIR, lower_write_table};
 
 use std::collections::HashMap;
 

@@ -498,6 +498,7 @@ fn estimate_rows_over(
         LogicalNode::OuterReference { .. } => outer_rows,
         LogicalNode::MergeClassify { .. } => None,
         LogicalNode::CsvSource { spec } => Some(spec.estimated_rows),
+        LogicalNode::DeltaSource { spec } => Some(spec.rows),
         LogicalNode::Validate { input, .. } => estimate_rows(plan, *input, source),
         LogicalNode::FragmentWrite { .. } => Some(1),
     }
