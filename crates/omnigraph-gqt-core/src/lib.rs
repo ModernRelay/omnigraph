@@ -262,6 +262,9 @@ pub struct MutateStep {
     name: String,
     /// The `branch: <name>` header argument, as `QueryStep::branch`.
     branch: String,
+    /// `as commit` on the declaration: the write is an unpublished commit
+    /// and advances no head.
+    as_commit: bool,
     ast_params: Vec<Param>,
     params_raw: Option<ParamsInput>,
     expect: MutateExpect,
@@ -976,6 +979,13 @@ pub fn read_target(step: &QueryStep, bindings: &Bindings) -> Result<ReadTarget, 
         Some(id) => ReadTarget::snapshot(SnapshotId::new(id)),
         None => ReadTarget::branch(&step.branch),
     })
+}
+
+/// The `commit` record a write that produced a graph commit hands the host:
+/// whether the commit advanced its branch head (`published`) or is an
+/// unpublished `as commit` proposal.
+pub fn commit_evidence(published: bool) -> serde_json::Value {
+    serde_json::json!({"published": published})
 }
 
 /// Record the commit a bound write published; a bound write that published
@@ -1885,6 +1895,7 @@ fn complete_decl_step(
                     source: step.source,
                     name: step.name,
                     branch: step.branch,
+                    as_commit: step.decl.write_mode == MutationWriteMode::AsCommit,
                     ast_params: step.decl.params,
                     params_raw: step.params_raw,
                     expect: MutateExpect::Error { needle },
@@ -1915,6 +1926,7 @@ fn complete_decl_step(
                 source: step.source,
                 name: step.name,
                 branch: step.branch,
+                as_commit: step.decl.write_mode == MutationWriteMode::AsCommit,
                 ast_params: step.decl.params,
                 params_raw: step.params_raw,
                 expect: MutateExpect::Ok,
@@ -1930,6 +1942,7 @@ fn complete_decl_step(
                 source: step.source,
                 name: step.name,
                 branch: step.branch,
+                as_commit: step.decl.write_mode == MutationWriteMode::AsCommit,
                 ast_params: step.decl.params,
                 params_raw: step.params_raw,
                 expect: MutateExpect::Affected {
@@ -4105,10 +4118,10 @@ async fn run_control_step(
             .map_err(&fail)?
             .inspect_err(|error| host.observe_fault(error));
             let commit = outcome.as_ref().ok().and_then(|result| {
-                result
-                    .commit
-                    .as_ref()
-                    .map(|commit| commit.graph_commit_id.clone())
+                result.commit.as_ref().map(|commit| {
+                    host.record("commit", || commit_evidence(commit.published));
+                    commit.graph_commit_id.clone()
+                })
             });
             let outcome = outcome.map(|result| result.outcome);
             host.observe(|| format!("actual merge: {outcome:?}"));
@@ -4193,6 +4206,13 @@ async fn run_mutate_step(
         }
         Err(error) => serde_json::json!({"error": error.to_string()}),
     });
+    if let Ok(MutationReceipt {
+        commit: Some(commit),
+        ..
+    }) = &outcome
+    {
+        host.record("commit", || commit_evidence(commit.published));
+    }
     host.observe(|| match &outcome {
         Ok(receipt) => format!(
             "actual affected: nodes={} edges={}",
@@ -4755,6 +4775,47 @@ impl Case {
 }
 
 impl Step {
+    /// The step writes an unpublished commit: a mutation declared `as
+    /// commit` or a `branch merge … as commit`. Such a write advances no
+    /// head, so a graph nobody else writes to is unchanged by it.
+    pub fn as_commit(&self) -> bool {
+        match self {
+            Self::Mutate(step) => step.as_commit,
+            Self::Control(step) => {
+                matches!(
+                    step.write,
+                    ControlWrite::Merge {
+                        as_commit: true,
+                        ..
+                    }
+                )
+            }
+            Self::Query(_)
+            | Self::Load(_)
+            | Self::List(_)
+            | Self::Settings(_)
+            | Self::Show(_)
+            | Self::BranchRead(_)
+            | Self::Restart { .. }
+            | Self::Concurrent(_) => false,
+        }
+    }
+
+    /// `commit drop "${name}"`: the dropped commit is one this case bound,
+    /// never a literal id the case did not create.
+    pub fn drops_bound_commit(&self) -> bool {
+        match self {
+            Self::Control(ControlStep {
+                write:
+                    ControlWrite::Drop {
+                        graph_commit_id, ..
+                    },
+                ..
+            }) => bound_operand(graph_commit_id).is_some(),
+            _ => false,
+        }
+    }
+
     pub fn operation_kind(&self) -> StepKind {
         match self {
             Self::Query(_) => StepKind::Query,
