@@ -986,6 +986,27 @@ pub async fn assert_relocated_root_serves_every_branch(source: &str, copies: &[S
     for copy in copies {
         copy_graph_root_objects(&previous, copy).await;
         delete_graph_root_objects(&previous).await;
+        // A stock handle on the never-written `child`, every row inherited,
+        // that resolved its base stores at the recorded URIs
+        // before the rebind still reads the copy (in another bucket, that
+        // store would read the emptied previous one).
+        let manifest = format!("{}/__manifest", copy.trim_end_matches('/'));
+        let native = graph_native_ref(copy, "child").await;
+        let stale = lance::dataset::builder::DatasetBuilder::from_uri(&manifest)
+            .with_branch(&native, None)
+            .load()
+            .await
+            .unwrap();
+        for id in stale.manifest.base_paths.keys() {
+            stale.object_store(Some(*id)).await.unwrap();
+        }
+        let rebound = omnigraph_core::branch_base::follow_opened_root(stale)
+            .await
+            .unwrap();
+        assert!(
+            rebound.scan().try_into_batch().await.unwrap().num_rows() > 0,
+            "{copy}"
+        );
         let at = |target: ReadTarget| rows(copy.clone(), target);
         assert_eq!(at(ReadTarget::branch("main")).await, 4, "{copy}");
         assert_eq!(at(ReadTarget::branch("retained")).await, retained, "{copy}");

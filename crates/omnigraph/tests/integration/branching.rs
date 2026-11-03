@@ -5544,6 +5544,19 @@ async fn relocated_root_serves_retained_branches_from_its_own_files_issue_1233()
     fs::remove_dir_all(&original).unwrap();
     reads(relocated.clone()).await;
 
+    // The relocation bit agrees: every base is a branch base inside the root.
+    {
+        let db = Omnigraph::open(relocated.to_str().unwrap()).await.unwrap();
+        for branch in ["main", "retained", "written", "child"] {
+            assert!(
+                !db.manifest_has_external_base_paths(Some(branch))
+                    .await
+                    .unwrap(),
+                "{branch} is relocation self-contained"
+            );
+        }
+    }
+
     // The copy writes and branches on a rebound branch: the publish and the
     // new shallow clone start from the copy's own files.
     {
