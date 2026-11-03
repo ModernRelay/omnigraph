@@ -1729,14 +1729,25 @@ async fn scan_edges_stream(
             .copied()
             .filter(|column| *column != key_col && *column != opposite_col),
     );
-    let filter = id_in_list_expr(keys, key_col);
+    // A `key IN (keys)` filter reaches Lance only where a BTREE on the key
+    // column turns it into index lookups. Elsewhere Lance scans every fragment
+    // anyway and re-plans the pushed list for each one (a clone and a hash
+    // set of every key per fragment), so the engine sieves the batches
+    // itself through one set of the keys.
+    let pushdown = matches!(
+        omnigraph_core::dataset_index::key_column_index_coverage(ds, key_col).await,
+        Ok(omnigraph_core::dataset_index::IndexCoverage::Indexed)
+    );
+    let filter = pushdown.then(|| id_in_list_expr(keys, key_col));
     let plan = crate::table_store::TableStore::scan_plan_with(
         ds,
         Some(&projection),
         None,
         false,
         |scanner| {
-            scanner.filter_expr(filter);
+            if let Some(filter) = filter {
+                scanner.filter_expr(filter);
+            }
             scanner.batch_size(memory.batch_rows());
             scanner.batch_size_bytes(memory.batch_bytes() as u64);
             Ok(())
@@ -1744,7 +1755,29 @@ async fn scan_edges_stream(
     )
     .await?;
     let (_, stream) = memory.stream(plan).map_err(|error| memory.error(error))?;
-    Ok(stream)
+    if pushdown {
+        return Ok(stream);
+    }
+    let wanted: hashbrown::HashSet<String> = keys.iter().cloned().collect();
+    let schema = stream.schema();
+    let key_col = key_col.to_string();
+    let sieved = stream.map(move |batch| {
+        let batch = batch?;
+        let keys = batch
+            .column_by_name(&key_col)
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| {
+                datafusion::common::DataFusionError::Internal(format!("edge batch has no Utf8 '{key_col}'"))
+            })?;
+        let mask = arrow_array::BooleanArray::from_iter(
+            keys.iter()
+                .map(|key| Some(key.is_some_and(|key| wanted.contains(key)))),
+        );
+        Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
+    });
+    Ok(Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, sieved),
+    ))
 }
 
 #[cfg(test)]
