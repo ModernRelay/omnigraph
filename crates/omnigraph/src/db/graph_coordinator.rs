@@ -1231,9 +1231,9 @@ pub(crate) async fn admit_commit(
     }
     let retained = match retention {
         Retention::LiveBranches(coordinator) => {
-            coordinator
-                .retained_by_live_branch(&commit.graph_commit_id)
-                .await?
+            // Boxed: the walk's future would otherwise deepen every caller's
+            // layout past the crate dependents' recursion limit.
+            Box::pin(coordinator.retained_by_live_branch(&commit.graph_commit_id)).await?
         }
         Retention::PolledBranch {
             branch: None,
