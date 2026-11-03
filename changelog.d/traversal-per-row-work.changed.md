@@ -1,1 +1,1 @@
-- Traversals allocate less per row: expand row sizing in one pass, bulk-hashed destination joins, one visited table per multi-hop walk, engine-side key sieving for long unindexed edge probes, and block predicates evaluated once over all outer rows. Results are unchanged.
+- Traversals allocate less per row: one-pass expand sizing, bulk-hashed joins, one visited table per walk, engine-side key sieving, block predicates run once. Results are unchanged.
