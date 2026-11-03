@@ -221,7 +221,7 @@ between graph roots. Copy a whole root instead; see
 
 | Error | Cause | Action |
 |---|---|---|
-| `storage: Not found` naming an object under the root you opened | The copy of the root is incomplete | Copy the whole root again from a verified backup while no process writes it |
+| `storage: Not found` naming an object under the root you opened | The copy of the root is incomplete | The error suggests a refresh, but a retry does not bring the object back: copy the whole root again from a verified backup while no process writes it |
 | `graph dataset … names base …, which …; Omnigraph reads only objects under the opened root, so the dataset is refused` | The graph's storage names a location outside its root, which Omnigraph never writes | Restore the root from a verified backup; do not write to its datasets with other tools |
 
 ## Cluster failures
