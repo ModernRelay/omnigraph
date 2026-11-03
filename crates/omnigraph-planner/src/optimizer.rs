@@ -24,9 +24,10 @@ use crate::cost::{
 use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
 use crate::key_set::{KeySetTree, key_set_tree};
 use crate::logical::{
-    ColumnRef, ConsultedImage, CsvSourceSpec, EDGE_TYPE_MEMBER, FragmentWriteSpec, GqFilter,
-    IDENTITY_MEMBER, KeyJoinKind, LOGICAL_ID, LogicalId, LogicalNode, LogicalPlan, Predicate,
-    RuntimeFilterKind, RuntimeFilterSpec, ScanSpec, SearchArm, ValidateSpec, tiebreak_text,
+    ColumnRef, ConsultedImage, CsvSourceSpec, DeltaSourceSpec, EDGE_TYPE_MEMBER, FragmentWriteSpec,
+    GqFilter, IDENTITY_MEMBER, KeyJoinKind, LOGICAL_ID, LogicalId, LogicalNode, LogicalPlan,
+    Predicate, RuntimeFilterKind, RuntimeFilterSpec, ScanSpec, SearchArm, ValidateSpec,
+    tiebreak_text,
 };
 use crate::lower::ContainsJoinFields;
 use crate::operation::{Operation, Side};
@@ -172,8 +173,72 @@ pub fn resolve(op: &Operation, source: &dyn PlanSource) -> Result<LogicalPlan, P
             tables,
             source_bytes,
         } => resolve_load(&mut plan, ir, tables, *source_bytes, source)?,
+        Operation::Write { ir, tables, .. } => resolve_write(&mut plan, ir, tables, source)?,
     }
     Ok(plan)
+}
+
+/// The IR's checks as logical specs: the consulted image at the version
+/// `tables` pins, no access yet.
+fn validate_specs(
+    checks: &[omnigraph_compiler::ir::LoadCheck],
+    tables: &[Side],
+) -> Vec<ValidateSpec> {
+    checks
+        .iter()
+        .map(|check| ValidateSpec {
+            check: check.check.clone(),
+            consults: check.consults.as_ref().map(|table| ConsultedImage {
+                table: table.clone(),
+                version: side_version(tables, table),
+            }),
+            access: None,
+            probe: None,
+        })
+        .collect()
+}
+
+fn side_version(tables: &[Side], type_key: &str) -> Option<u64> {
+    tables
+        .iter()
+        .find(|side| side.table.type_key == type_key)
+        .map(|side| side.version)
+}
+
+/// Stage 1, pass 1 for a write's table: the staged delta as the leaf and one
+/// `Validate` carrying the IR's checks in its order at the root; the
+/// executor writes, so no node follows.
+fn resolve_write(
+    plan: &mut LogicalPlan,
+    ir: &omnigraph_compiler::ir::WriteTableIR,
+    tables: &[Side],
+    source: &dyn PlanSource,
+) -> Result<(), PlanError> {
+    let target = ir.target.table_key();
+    let schema = source.schema(SideId::Child)?;
+    let delta = plan.add(
+        LogicalNode::DeltaSource {
+            spec: Box::new(DeltaSourceSpec {
+                table: target.clone(),
+                version: side_version(tables, &target),
+                rows: ir.rows,
+                delta: ir.delta,
+                deletes: ir.deletes,
+            }),
+        },
+        schema.clone(),
+    );
+    let validated = plan.add(
+        LogicalNode::Validate {
+            input: delta,
+            table: target,
+            checks: validate_specs(&ir.checks, tables),
+            replaced: ir.delta.replaces(),
+        },
+        schema,
+    );
+    plan.set_root(validated);
+    Ok(())
 }
 
 /// Stage 1, pass 1 for a load: the source leaf, one `Validate` carrying the
@@ -187,12 +252,6 @@ fn resolve_load(
     source: &dyn PlanSource,
 ) -> Result<(), PlanError> {
     let target = ir.target.table_key();
-    let version_of = |type_key: &str| {
-        tables
-            .iter()
-            .find(|side| side.table.type_key == type_key)
-            .map(|side| side.version)
-    };
     let schema = source.schema(SideId::Child)?;
     let source_node = plan.add(
         LogicalNode::CsvSource {
@@ -204,29 +263,17 @@ fn resolve_load(
                 header: ir.header,
                 columns: ir.columns.clone(),
                 table: target.clone(),
-                version: version_of(&target),
+                version: side_version(tables, &target),
             }),
         },
         schema.clone(),
     );
-    let checks = ir
-        .checks
-        .iter()
-        .map(|check| ValidateSpec {
-            check: check.check.clone(),
-            consults: check.consults.as_ref().map(|table| ConsultedImage {
-                table: table.clone(),
-                version: version_of(table),
-            }),
-            access: None,
-            probe: None,
-        })
-        .collect();
     let validated = plan.add(
         LogicalNode::Validate {
             input: source_node,
             table: target.clone(),
-            checks,
+            checks: validate_specs(&ir.checks, tables),
+            replaced: ir.mode == LoadStmtMode::Overwrite,
         },
         schema,
     );
@@ -235,7 +282,7 @@ fn resolve_load(
             input: validated,
             spec: Box::new(FragmentWriteSpec {
                 table: target.clone(),
-                version: version_of(&target),
+                version: side_version(tables, &target),
                 mode: ir.mode,
             }),
         },
@@ -2383,10 +2430,12 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             target: _,
         }
         | LogicalNode::CsvSource { spec: _ }
+        | LogicalNode::DeltaSource { spec: _ }
         | LogicalNode::Validate {
             input: _,
             table: _,
             checks: _,
+            replaced: _,
         }
         | LogicalNode::FragmentWrite { input: _, spec: _ } => {}
     }
@@ -3652,14 +3701,18 @@ impl Lowering<'_> {
                     max_workers,
                 }))
             }
+            LogicalNode::DeltaSource { spec } => Ok(self
+                .physical
+                .add(PhysicalNode::DeltaSource { spec: spec.clone() })),
             LogicalNode::Validate {
                 input,
                 table,
                 checks,
+                replaced,
             } => {
                 let estimated_rows = estimate_rows(self.logical, *input, self.source);
                 let lowered = self.lower(*input)?;
-                let overwrite = self.load_overwrites();
+                let overwrite = *replaced;
                 let target_rows = table
                     .strip_prefix("node:")
                     .and_then(|name| self.source.node_type(name).ok())
@@ -3787,13 +3840,6 @@ impl Lowering<'_> {
             .to_string(),
         });
         Some(probe)
-    }
-
-    /// Whether the load plan's write replaces its table.
-    fn load_overwrites(&self) -> bool {
-        self.logical
-            .live()
-            .any(|(_, node)| matches!(node, LogicalNode::FragmentWrite { spec, .. } if spec.mode == LoadStmtMode::Overwrite))
     }
 
     /// Pass 9 costs the committed lookup from the accepted node count and
@@ -4316,6 +4362,7 @@ pub fn node_order(
         | PhysicalNode::RankFuse { .. }
         | PhysicalNode::Aggregate { .. }
         | PhysicalNode::CsvSource { .. }
+        | PhysicalNode::DeltaSource { .. }
         | PhysicalNode::FragmentWrite { .. } => None,
     }
 }
@@ -4676,6 +4723,23 @@ fn derive_properties(
                     origin: format!(
                         "source_bytes {} over the narrowest row, an upper bound",
                         spec.source_bytes
+                    ),
+                }],
+            },
+            PhysicalNode::DeltaSource { spec } => Properties {
+                schema: source.schema(SideId::Child)?,
+                ordering: None,
+                rows: Estimate::Known(spec.rows),
+                work_bytes: Estimate::Unknown,
+                retained_limit: None,
+                sources: vec![StatisticSource {
+                    statistic: "estimated_rows".to_string(),
+                    value: spec.rows.to_string(),
+                    origin: format!(
+                        "the staged {} delta of {}, exact{}",
+                        spec.delta.as_str(),
+                        spec.table,
+                        if spec.deletes { ", with deletes" } else { "" }
                     ),
                 }],
             },

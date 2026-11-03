@@ -166,12 +166,15 @@ fn branch_start_not_retained(commit_id: &str, entry: &crate::db::DatasetEntry) -
 }
 
 /// A merge's disposition and the graph commit published by that invocation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct MergeResult {
     pub outcome: MergeOutcome,
     /// `None` only when the merge was already up to date. This receipt is
     /// captured at publication, so later writers cannot replace its identity.
     pub commit: Option<GraphCommit>,
+    /// The planner's document per candidate table the merge validated, in
+    /// table order; empty when nothing needed validation.
+    pub plans: Vec<omnigraph_planner::explain::Explain>,
 }
 
 #[derive(Debug, Clone)]

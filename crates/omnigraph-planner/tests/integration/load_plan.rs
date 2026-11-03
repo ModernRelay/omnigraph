@@ -175,7 +175,7 @@ fn node_overwrite_resolves_to_source_validate_chain_and_write() {
         ]
     );
     let document = explain.to_value();
-    assert_eq!(document["explain_version"], 7);
+    assert_eq!(document["explain_version"], 8);
     assert!(document["logical_plan_initial"].is_object());
     assert_eq!(document["route"], "engine");
     assert_eq!(document["operation"]["kind"], "load");
@@ -512,8 +512,13 @@ fn endpoint_checks_without_consulted_statistics_probe_only_for_an_overwrite() {
                     reason,
                     explain,
                     logical,
+                    physical,
                 },
             ) => {
+                assert!(
+                    physical.is_some(),
+                    "an append or merge load hands the executor its physical plan"
+                );
                 assert_eq!(
                     reason,
                     Unrouted::ModeOnExecutor {

@@ -68,6 +68,9 @@ pub struct MutationReceipt {
     /// unattached write the recorded target its base inherits (`"main"` for
     /// main).
     pub branch: String,
+    /// The planner's document per table the write validated, in table order;
+    /// empty when the mutation staged nothing.
+    pub plans: Vec<omnigraph_planner::explain::Explain>,
 }
 
 // DST seam: registry access for the harness's Lance-realm fault injector.

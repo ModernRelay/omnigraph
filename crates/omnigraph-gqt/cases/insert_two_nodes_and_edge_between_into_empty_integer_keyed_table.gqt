@@ -1,0 +1,41 @@
+# issue: none
+# notes: One mutation inserts two integer-keyed Person rows and an edge between them into a Person
+# notes: table that holds no rows yet, so the committed key set the endpoint checks sweep is empty;
+# notes: both endpoints are found among the same write's rows and the write lands.
+
+# traversal: auto
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    id: I64 @key
+    code: I64 @unique @index
+}
+node Tag {
+    id: String @key
+}
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Tag","data":{"id":"t0"}}
+
+--- mutate
+query w() {
+    insert Person { id: 500, code: 900 }
+    insert Person { id: 501, code: 901 }
+    insert Knows { from: "500", to: "501" }
+}
+--- expect ok
+
+--- query
+query n_knows() { match { $a: Person $a knows $b } return { count($b) as n } }
+--- expect unordered
+{"n":1}
+
+--- expect shape
+n: I64

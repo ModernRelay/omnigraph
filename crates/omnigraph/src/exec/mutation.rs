@@ -565,6 +565,8 @@ use super::staging::{MutationStaging, PendingMode};
 pub(super) struct CommittedStagedMutation {
     pub(super) committed: super::staging::CommittedMutation,
     lineage_intent: crate::db::manifest::LineageIntent,
+    /// The planner's document per validated table, for the receipt.
+    pub(super) plans: Vec<omnigraph_planner::Explain>,
 }
 
 /// Where a declaration's write lands, resolved from the parsed declaration
@@ -1054,24 +1056,46 @@ impl Session {
 }
 
 impl Omnigraph {
-    /// End-of-query validation for a constructive mutation: build the change-set
-    /// from the accumulated staging and run the unified evaluator (value/enum,
-    /// uniqueness incl. cross-version, edge-RI, cardinality) against committed
-    /// state. Read-your-writes is inherent — every same-query insert is already
-    /// in the change-set. Destructive queries (D2) stage no constructive batches,
-    /// so the change-set is empty and this is a no-op (deletes cascade).
+    /// End-of-query validation of a mutation: every staged table planned as an
+    /// upsert and every deleted-from table as a removal, judged against the
+    /// pinned base and, for `@card` (#298), the live branch; documents for the receipt.
     async fn validate_staged_mutation(
         &self,
         staging: &MutationStaging,
         txn: &crate::db::WriteTxn,
-    ) -> Result<()> {
-        // RI/uniqueness read the write's already-validated pinned base (`txn.base`),
-        // NOT a fresh `snapshot_for_branch` — per-table resolution must not add a
-        // schema-contract validation beyond capture + the pre-effect gate.
-        // Cardinality reads a fresh manifest-visible branch snapshot (the #298
-        // stale-handle fix) via `CommittedState::write`; it never follows an
-        // unpublished raw Lance HEAD or a not-yet-created first-touch ref.
-        //
+    ) -> Result<Vec<omnigraph_planner::Explain>> {
+        use crate::validate::load::{JudgedSide, RepeatRule, Report, WriteJudge};
+        use crate::validate::plan::{WriteTable, judgment_rank, plan_write};
+        use omnigraph_compiler::ir::{DeltaClass, WriteKind};
+        use omnigraph_planner::CommittedSide;
+
+        let mut tables: Vec<WriteTable> = staging
+            .pending
+            .iter()
+            .filter(|(_, pending)| !pending.batches.is_empty())
+            .map(|(table, pending)| WriteTable {
+                table: table.clone(),
+                delta: DeltaClass::Upsert,
+                rows: pending.batches.iter().map(|b| b.num_rows() as u64).sum(),
+                deleted_ids: Vec::new(),
+            })
+            .chain(
+                staging
+                    .deleted_ids
+                    .iter()
+                    .filter(|(_, ids)| !ids.is_empty())
+                    .map(|(table, ids)| WriteTable {
+                        table: table.clone(),
+                        delta: DeltaClass::Removal,
+                        rows: 0,
+                        deleted_ids: ids.clone(),
+                    }),
+            )
+            .collect();
+        if tables.is_empty() {
+            return Ok(Vec::new());
+        }
+        tables.sort_by(|a, b| judgment_rank(&a.table).cmp(&judgment_rank(&b.table)));
         // The base pins exact table versions, which this write's own opens
         // (`open_pinned_for_write`) already read through the shared session
         // and the held-handle cache keyed by that pin; validation reads the
@@ -1085,12 +1109,50 @@ impl Omnigraph {
             handles: self.read_caches().handles.clone(),
             table_wrapper: None,
         });
-        let committed = crate::validate::CommittedState::write(&base, self, txn.branch.as_deref());
-        // `to_changeset` carries both constructive batches and the ids the delete
-        // ops captured from their own scans (`deleted_ids`), so the evaluator
-        // recounts the srcs a delete empties (`@card`) and sees removed rows for
-        // RI — the faithful change-set the merge path also builds.
-        crate::validate::validate_changeset(&staging.to_changeset(), &committed, &txn.catalog).await
+        let write_budget = staging.write_budget();
+        let batches: Vec<Vec<RecordBatch>> = tables
+            .iter()
+            .map(|table| staging.pending_batches(&table.table).to_vec())
+            .collect();
+        let (judged, plans): (Vec<_>, Vec<_>) = plan_write(
+            &base,
+            &txn.catalog,
+            WriteKind::Mutation,
+            CommittedSide::Live,
+            tables,
+            write_budget.bytes(),
+        )
+        .await?
+        .into_iter()
+        .unzip();
+        let judge = WriteJudge {
+            tables: judged,
+            committed: JudgedSide::Live {
+                base,
+                branch: txn.branch.clone(),
+            },
+            write_budget,
+            catalog: Arc::clone(&txn.catalog),
+            report: Report::First,
+            repeat: RepeatRule::for_write(WriteKind::Mutation),
+        };
+        let mut deleted = DeletedIdBudget::new(write_budget);
+        let mut admit_removed = |id: &str| deleted.retain(id);
+        let mut admit_retained = |_: &RecordBatch| Ok(());
+        judge
+            .judge_batches(
+                self,
+                batches,
+                &mut crate::validate::load::LoadAdmission {
+                    phase: None,
+                    bytes: None,
+                    reuse: None,
+                    removed: &mut admit_removed,
+                    retained: &mut admit_retained,
+                },
+            )
+            .await?;
+        Ok(plans)
     }
 
     async fn mutate_with_current_actor(
@@ -1265,10 +1327,11 @@ impl Omnigraph {
                     result: total,
                     commit: None,
                     branch: addressed,
+                    plans: Vec::new(),
                 })
             }
             Ok(total) => {
-                let committed = self
+                let mut committed = self
                     .commit_staged_mutation(
                         staging,
                         &txn,
@@ -1277,6 +1340,7 @@ impl Omnigraph {
                         history_release_bytes,
                     )
                     .await?;
+                let plans = std::mem::take(&mut committed.plans);
                 let publication = route.publication(&txn).map_err(OmniError::unpublished)?;
                 let commit = self
                     .publish_committed_mutation(committed, &txn, actor_id, publication)
@@ -1285,6 +1349,7 @@ impl Omnigraph {
                     result: total,
                     commit: Some(commit),
                     branch: addressed,
+                    plans,
                 })
             }
         }
@@ -1304,7 +1369,7 @@ impl Omnigraph {
         history_release_bytes: HistoryReleaseBytes,
     ) -> Result<CommittedStagedMutation> {
         let requested = txn.branch.as_deref();
-        self.validate_staged_mutation(&staging, txn).await?;
+        let plans = self.validate_staged_mutation(&staging, txn).await?;
         // From the first staged file to the publisher call, every durable
         // effect is a fresh file or a detached version no manifest names: a
         // failure here is definite (`Unpublished`), whatever its cause, and a
@@ -1325,6 +1390,7 @@ impl Omnigraph {
         Ok(CommittedStagedMutation {
             committed,
             lineage_intent,
+            plans,
         })
     }
 
@@ -1346,6 +1412,7 @@ impl Omnigraph {
                     gates: _held_gates,
                 },
             lineage_intent,
+            plans: _,
         } = committed;
         // `_held_gates` holds the shared schema permit, branch effect gate,
         // and sorted table gates acquired by `commit_all`. They remain held

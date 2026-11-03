@@ -1,0 +1,39 @@
+# issue: none
+# notes: One mutation inserts a Person whose @unique code a committed row holds and an edge to an
+# notes: absent Person; the node table is judged before the edge table, so the refusal names the
+# notes: @unique collision, not the orphan edge, on integer keys.
+
+# traversal: auto
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    id: I64 @key
+    code: I64 @unique @index
+}
+node Tag {
+    id: String @key
+}
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 8
+    commits: 4
+    columns:
+      id: {kind: ordinal, start: 0, step: 1}
+      code: {kind: ordinal, start: 100, step: 1}
+
+--- mutate
+query w() {
+    insert Person { id: 500, code: 103 }
+    insert Knows { from: "0", to: "79" }
+}
+--- expect error: @unique violation on Person.code: value '103' held by '3' and '500'
