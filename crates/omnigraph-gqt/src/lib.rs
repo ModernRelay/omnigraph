@@ -226,18 +226,27 @@ async fn execute_case_with_storage(
     uri: &str,
     storage: Arc<dyn StorageAdapter>,
     engine: Engine,
+    prepared: Option<&str>,
 ) -> Result<(), String> {
-    let fixture = case
-        .fixture
-        .as_ref()
-        .ok_or("invalid_case: DST requires schema and seed")?;
-    let db =
-        Omnigraph::init_with_storage(uri, &fixture.schema, storage.clone(), Default::default())
-            .await
-            .map_err(|e| format!("init failed: {e}"))?;
+    let db = match (prepared, case.fixture.as_ref()) {
+        (Some(restored), _) => {
+            GqtHost.observe(|| restored.to_string());
+            Omnigraph::open_with_storage(uri, storage.clone())
+                .await
+                .map_err(|e| format!("open failed: {e}"))?
+        }
+        (None, Some(fixture)) => {
+            Omnigraph::init_with_storage(uri, &fixture.schema, storage.clone(), Default::default())
+                .await
+                .map_err(|e| format!("init failed: {e}"))?
+        }
+        (None, None) => return Err("invalid_case: DST requires schema and seed, or --store".into()),
+    };
     let db = with_case_external_blob_policy(db, case)?;
     let session = case_session(db, case, engine)?;
-    seed_case(&session, &fixture.seed, case.needs_indices).await?;
+    if let (None, Some(fixture)) = (prepared, case.fixture.as_ref()) {
+        seed_case(&session, &fixture.seed, case.needs_indices).await?;
+    }
     omnigraph_gqt_core::execute_steps(case, path, false, session, uri, Some(storage), &GqtHost)
         .await
         .map(|_| ())

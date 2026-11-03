@@ -2210,6 +2210,16 @@ impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for G
             crate::measure::prepare(model)
         });
         crate::concurrent::install(measure);
+        let prepared = match self.input.store.as_deref() {
+            Some(uri) => {
+                let restored = resources.restore_from_uri(uri).await?;
+                Some(format!(
+                    "prepared store: {} restored below the ledger, {} objects, {} bytes",
+                    restored.uri, restored.objects, restored.bytes
+                ))
+            }
+            None => None,
+        };
         let base: std::sync::Arc<dyn StorageAdapter> =
             crate::measure::wrap_adapter(resources.adapter.clone(), crate::concurrent::touch);
         let decoration =
@@ -2230,6 +2240,7 @@ impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for G
                         &resources.root,
                         storage,
                         self.input.engine,
+                        prepared.as_deref(),
                     ),
                 ),
             )
