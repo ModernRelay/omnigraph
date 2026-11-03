@@ -488,7 +488,22 @@ with its wall times and the count of requests made outside any session are
 in the report's measurements, not the cost table. Under `--measure` each
 session is its own row, labeled by its session label, and the block's own
 row holds the requests made outside any session, so a read's virtual time
-beside a write is a number. Once a block is starved its sessions drain, and
+beside a write is a number. So is its wait: every in-process lock the engine
+takes is a gate whose acquisition crosses the seams `gate.<gate>.acquire`,
+`gate.<gate>.hold` and `gate.<gate>.release`, plus `gate.coordinator_cas.refused`
+for an install that ends without a hold (`table`, `branch`,
+`schema_shared`, `schema_exclusive`, `export`, `coordinator_cas`; the
+engine's `write_queue` module doc §Gates), and a session's `acquire`-to-`hold`
+spans on the virtual clock are summed per gate into `wait.<gate>` ticks, in
+its row's `waiting` column and in the TSV. The clock rule: the virtual clock
+moves only while a request sleeps its cost or the block drives it for a
+session waiting on the script, so a wait no request fills reads 0 and a 0 says
+the clock stood still, not that the gate was free; a wait at the front door
+(a read parked at the schema gate before its first request) is in the row
+all the same, since the span starts at the crossing, not at a request. A gate
+seam is a wait event, not a phase: the session's phase stays the last other
+seam it crossed. Outside a block one statement runs on the handle at a time,
+so no `wait.<gate>` row is written there. Once a block is starved its sessions drain, and
 the requests they make from then on are in phase `after_abort`: a starved
 block's rows are the drain, not the interleaving the script named. Store
 requests are the only points an entry can name in this version; seams and
@@ -922,6 +937,14 @@ control realm's limits below are the exceptions). Per group it reports:
   share one unit under every model, and the printout shows the parallelism
   achieved (requests per makespan tick) beside the parallelism available
   (requests per span tick);
+- its gate waits, for a concurrent block's session: the engine's six
+  in-process gates cross `gate.<gate>.acquire` and `gate.<gate>.hold`
+  (§Concurrent block), and the session's spans between the two are summed
+  per gate into ticks, printed after `waiting` as `<gate> <ticks>` when
+  above 0 and carried in the TSV as `wait.<gate>` for every gate the session
+  crossed, 0 included (0 means no request moved the clock while it waited,
+  not that it did not wait); schedule-derived like makespan, so in the
+  measurements, never in the `io` evidence row;
 - `sim ms`, the group's virtual time under the latency model, and `u$`, its
   requests at S3 list prices in microdollars (PUT, COPY and LIST 5.0, GET and
   HEAD 0.4, DELETE free).

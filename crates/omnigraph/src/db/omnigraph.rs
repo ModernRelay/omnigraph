@@ -22,6 +22,7 @@ use crate::db::graph_coordinator::{
     CapturedLineage, GraphCoordinator, PublishedSnapshot, commit_not_found,
     descends_linearly_from_in,
 };
+use crate::db::write_queue::observed;
 use crate::error::{BranchStartRefusal, ManifestErrorKind, OmniError, Result, dataset_subject};
 use crate::runtime_cache::RuntimeCache;
 use crate::seams::{decide_seam, fail};
@@ -512,6 +513,25 @@ decide_seam! {
     pub static OPEN_BEFORE_SCHEMA_CONTRACT_READ = ("open.before_schema_contract_read", Unreachable, [Fail]);
 }
 
+decide_seam! {
+    /// `install_coordinator` starts a compare-and-swap round on the handle's
+    /// coordinator pointer; a round past the first is one lost to another
+    /// install, a wait of the CAS kind (`write_queue` §Gates).
+    pub static GATE_COORDINATOR_CAS_ACQUIRE = ("gate.coordinator_cas.acquire", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    /// `install_coordinator`'s swap won: the coordinator pointer is `next`.
+    pub static GATE_COORDINATOR_CAS_HOLD = ("gate.coordinator_cas.hold", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    /// `install_coordinator` refused the install (the binding moved to another
+    /// branch, or `derived_from` was replaced and `next` does not supersede the
+    /// installed state): the round's `acquire` ends with no `hold`.
+    pub static GATE_COORDINATOR_CAS_REFUSED = ("gate.coordinator_cas.refused", Unreachable, [Fail]);
+}
+
 impl Omnigraph {
     /// Create a new graph at `uri` from schema source.
     ///
@@ -724,7 +744,7 @@ impl Omnigraph {
             // sessions reuse the process-wide object-store registry.
             table_store: TableStore::new(&root, session),
             runtime_cache: RuntimeCache::default(),
-            feed_cut_cache: tokio::sync::RwLock::new(None),
+            feed_cut_cache: tokio::sync::RwLock::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
             read_caches,
             schema_view: Arc::new(ArcSwap::from_pointee(HandleSchemaView {
                 catalog,
@@ -733,7 +753,7 @@ impl Omnigraph {
                 schema_identity_domain,
             })),
             write_queue,
-            merge_authority_cache: tokio::sync::Mutex::new(None),
+            merge_authority_cache: tokio::sync::Mutex::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
             embedding_config: None,
@@ -917,7 +937,7 @@ impl Omnigraph {
             // sessions reuse the process-wide object-store registry.
             table_store: TableStore::new(&root, session),
             runtime_cache: RuntimeCache::default(),
-            feed_cut_cache: tokio::sync::RwLock::new(None),
+            feed_cut_cache: tokio::sync::RwLock::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
             read_caches,
             schema_view: Arc::new(ArcSwap::from_pointee(HandleSchemaView {
                 catalog,
@@ -926,7 +946,7 @@ impl Omnigraph {
                 schema_identity_domain,
             })),
             write_queue,
-            merge_authority_cache: tokio::sync::Mutex::new(None),
+            merge_authority_cache: tokio::sync::Mutex::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
             embedding_config: None,
@@ -1078,11 +1098,11 @@ impl Omnigraph {
             coordinator: Arc::clone(&self.coordinator),
             table_store,
             runtime_cache: RuntimeCache::default(),
-            feed_cut_cache: tokio::sync::RwLock::new(None),
+            feed_cut_cache: tokio::sync::RwLock::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
             read_caches: Arc::clone(&self.read_caches),
             schema_view: Arc::clone(&self.schema_view),
             write_queue: Arc::clone(&self.write_queue),
-            merge_authority_cache: tokio::sync::Mutex::new(None),
+            merge_authority_cache: tokio::sync::Mutex::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
             history: self.history.clone(),
             policy,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
@@ -2320,17 +2340,20 @@ impl Omnigraph {
         let next = Arc::new(next);
         let mut installed = self.coordinator.load();
         loop {
+            observed(&GATE_COORDINATOR_CAS_ACQUIRE);
             let ordered = Arc::ptr_eq(&installed, derived_from)
                 || next
                     .manifest_incarnation()
                     .supersedes(&installed.manifest_incarnation());
             if installed.current_branch() != next.current_branch() || !ordered {
+                observed(&GATE_COORDINATOR_CAS_REFUSED);
                 return false;
             }
             let previous = self
                 .coordinator
                 .compare_and_swap(&*installed, Arc::clone(&next));
             if Arc::ptr_eq(&previous, &installed) {
+                observed(&GATE_COORDINATOR_CAS_HOLD);
                 return true;
             }
             installed = previous;
@@ -6463,6 +6486,41 @@ edge WorksAt: Person -> Company
         );
         let result = db.apply_schema(&desired).await.unwrap();
         assert!(result.applied, "schema apply should have applied");
+    }
+
+    /// The coordinator CAS is a gate: a winning install crosses `acquire` once
+    /// per round, here one, then `hold`; a refused install (a clone bound to a
+    /// branch the handle has since left) crosses `acquire`, then `refused`.
+    #[cfg(feature = "failpoints")]
+    #[tokio::test]
+    async fn a_winning_coordinator_install_crosses_acquire_then_hold() {
+        let _scenario = crate::seams::FailScenario::setup();
+        let crossings: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let note = |name: &'static str| {
+            let crossings = Arc::clone(&crossings);
+            move || crossings.lock().unwrap().push(name)
+        };
+        let _acquire = GATE_COORDINATOR_CAS_ACQUIRE.observe(note("acquire"));
+        let _hold = GATE_COORDINATOR_CAS_HOLD.observe(note("hold"));
+        let _refused = GATE_COORDINATOR_CAS_REFUSED.observe(note("refused"));
+        let dir = tempfile::tempdir().unwrap();
+        let db = Omnigraph::init(dir.path().to_str().unwrap(), TEST_SCHEMA)
+            .await
+            .unwrap();
+        crossings.lock().unwrap().clear();
+
+        let (installed, mut next) = db.installed_coordinator_copy();
+        next.refresh().await.unwrap();
+        assert!(db.install_coordinator(next, &installed));
+        assert_eq!(*crossings.lock().unwrap(), ["acquire", "hold"]);
+
+        db.branch_create("feature").await.unwrap();
+        db.sync_branch("feature").await.unwrap();
+        let (feature_pointer, feature_clone) = db.installed_coordinator_copy();
+        db.sync_branch("main").await.unwrap();
+        crossings.lock().unwrap().clear();
+        assert!(!db.install_coordinator(feature_clone, &feature_pointer));
+        assert_eq!(*crossings.lock().unwrap(), ["acquire", "refused"]);
     }
 
     /// A clone of an installed pointer that another install has since replaced
