@@ -161,8 +161,9 @@ slot for `change`, which policy judges by `branch_scope`, and the
 `target_branch` slot for every other write action, which policy judges by
 `target_branch_scope`: the deleted branch for `branch_delete`, the new branch
 for `branch_create`, and the destination for `branch_merge`, `commit_publish`
-and `commit_drop`. The access report classifies the actions the same way
-(`access_slot` in `omnigraph-api-types`), so the ceiling adds no third list.
+and `commit_drop`. That split is the policy crate's own
+`uses_target_branch_scope`, and policy validation refuses a `branch_scope`
+rule on any of those five actions, so the ceiling adds no list of its own.
 A merge from `main` into a feature branch is inside the ceiling; a merge into
 `main` is not, and neither is deleting `main`. Schema apply targets `main`
 only and is not a write action here, so this scope never covers it; a client
@@ -244,8 +245,10 @@ At a trust document **with** `scope_prefix`, admission reads the `scope`
 claim:
 
 - Absent `scope`, or an empty string, means the token was granted no scopes:
-  the ceiling is empty. The token is still admitted; every policy action is
-  then refused with `insufficient_scope` (below).
+  the ceiling is empty. The token is still admitted, and no policy action
+  passes the ceiling; where policy allows one, the answer is
+  `insufficient_scope` (below), and where policy denies, the policy answer
+  stands.
 - `scope` must be a string. It is split on single spaces into at most 256
   entries, each 1 to 128 bytes of the scope-token alphabet, with no
   duplicates. Anything else refuses the token with 401 `invalid_token`.
@@ -279,24 +282,34 @@ policy decision:
 The second step sees the same `PolicyRequest` the first did, branch and target
 branch included, and asks the same `PolicyEngine` whether the judged branch
 is protected, through one new predicate beside `uses_target_branch_scope`; it
-reads nothing the policy decision did not. The step also runs where
-`authorize` allows without an engine: a server in default-deny mode (bearer
-tokens configured, no applied bundle) permits `read` alone, and a ceilinged
-token without `graph.read` is refused there too. An open server
-(`--unauthenticated`) resolves no actor and so has no ceiling.
+reads nothing the policy decision did not. The step also sits on the path
+where `authorize` allows without an engine, but only a static token reaches
+it: a server in default-deny mode (bearer tokens configured, no applied
+bundle) permits `read` alone, and before that it denies every action for a
+signed-data credential. An OIDC token is signed data, and a ceiling exists
+only on an OIDC token, so with no bundle a ceilinged token is denied for
+every action before the ceiling is consulted, with or without `graph.read`.
+An open server (`--unauthenticated`) resolves no actor and so has no
+ceiling.
 
 The third outcome exists because the routes that hide a policy denial as 404
-must not hide a ceiling miss. Invoking a stored query, changing an
-unattached branch from its base commit, creating a branch from a snapshot and
-reading a commit's changes all answer `Denied` with "not found", so an actor
-without the grant cannot learn whether the query or commit exists. A ceiling
-miss is reached only after policy confirmed that the actor holds the grant,
-so on every one of those routes it is answered 403 `insufficient_scope`: the
+must not hide a ceiling miss. These answer `Denied` with "not found" today:
+invoking a stored query, both at the handler and in the ingress classifier
+that runs before it; changing an unattached branch from its base commit;
+creating a branch from a snapshot; reading a commit's changes; and
+publishing or dropping a commit (`commit_control_body`, with the commit's
+recorded branch in the target slot). The engine's own commit-control gate
+maps a policy error to the same "not found", so the HTTP check answers the
+ceiling miss before that call. The hiding exists so that an actor without
+the grant cannot learn whether the query or commit exists. A ceiling miss is
+reached only after policy confirmed that the actor holds the grant, so on
+every one of those routes it is answered 403 `insufficient_scope`: the
 client learns only that its own user may act there, which that user reads
-from `/access` anyway. Where a route folds a per-branch `Denied` into a
-listing (the branch listing and the readable change diff omit branches the
-actor cannot read), a ceiling miss is not a per-branch fact and refuses the
-whole listing with 403 rather than emptying it.
+from `/access` anyway. Two read paths fold a per-branch decision into their
+result: the readable diff answers "not found" for a side the caller cannot
+read, and the detailed branch list omits such a branch. A ceiling miss is
+not a per-branch fact, so both refuse the whole request with 403 before
+that mapping.
 
 Policy goes first so `insufficient_scope` is only ever returned for an action
 the person could perform with a wider scope. A client that receives it may ask
@@ -335,11 +348,18 @@ the deployment caller, and `check_cluster` and `check_graph` apply it after
 their policy check, in the same order as the HTTP layer: `config_manage`
 under `cluster.config`, `read` under `graph.read`, `schema_apply` under
 `graph.schema`. A miss is a refusal diagnostic with code `insufficient_scope`
-that the server answers as the 403 below. Every one of these checks runs
-before the deployment is accepted. The ledger records the actor, as today,
-and never the ceiling; a settlement resumed after acceptance (a severed
-caller, a restarted server) is an accepted operation that carries no token,
-so no ceiling applies to it.
+that the server answers as a 403 with the body below; the server's
+deployment `refusal` mapper, which sends four diagnostic codes to 403 and
+every other to 409 with a flat `[code] message` string, gains this code on
+its 403 arm and builds `disposition` and `scope` from the diagnostic. Every
+one of these checks runs before the deployment is accepted. The ledger
+records the actor, as today, and never the ceiling. A settlement resumed
+after acceptance (a severed caller, a restarted server) still re-checks
+`read` and `schema_apply` for an authenticated identity, as it does today;
+that caller carries no token and so no ceiling value, which is an absent
+ceiling, not an empty one. The graph-deletion path makes the same two checks
+and takes the caller's ceiling the same way: the request's on apply, none on
+a tokenless resume.
 
 `GET /cluster/deployments/{id}` (`lookup`) builds its identity the same way
 but without the `config_manage` check, so that a receipt can be read back by
@@ -428,10 +448,15 @@ reading as absent. An empty `scopes` array is a token granted no ceiling
 scopes, and its report lists no action while still naming the scopes; an
 absent field is a token without a ceiling.
 
-Under `graph.write.unprotected` the report takes the shape policy already
-produces for a rule with `branch_scope: unprotected`: the write actions leave
-`graph_wide`, and `actions` lists them for an unprotected `branch` and omits
-them for a protected one. No new field is needed.
+Under `graph.write.unprotected` the report takes the two shapes policy
+already produces, because the route builds it from the same per-action
+slots. `change` follows `branch`, as a `branch_scope: unprotected` rule
+would. The target-scoped actions follow the `branch` query parameter placed
+in the target slot, as a `target_branch_scope: unprotected` rule would;
+`branch_create` and `branch_merge` appear only when `target_branch` is set,
+and only that target is tested. The write actions leave `graph_wide`, and
+`actions` lists them for an unprotected branch and omits them for a
+protected one. No new field is needed.
 
 ### What a deployment must know about its authorization server
 
@@ -521,8 +546,8 @@ API's `validate_scopes`, so the two components refuse the same inputs.
   the action, and a ceiling miss is never hidden as 404: the existence it
   could disclose is already the user's to read.
 - The cluster crate applies the ceiling it is handed before acceptance and
-  records none of it; a settlement resumed after acceptance has no ceiling
-  to apply.
+  records none of it; a settlement resumed after acceptance keeps its policy
+  checks and carries no ceiling.
 - The vocabulary is owned by the server, is versioned with it, and is not
   configurable. A deployment chooses a prefix, never a mapping.
 - A branch is protected for the ceiling exactly when applied policy's
@@ -537,8 +562,8 @@ unchanged. The policy crate gains one predicate and the cluster authorization
 path gains an optional ceiling on `IdentityAuthorization`; with no ceiling
 both behave as today. The
 `AccessOutput` and metadata additions are optional fields that older clients
-ignore; the new error code follows the conventions RFC's rule that a client
-treats an unknown code by its HTTP status.
+ignore; the new error code carries `disposition.action: fix`, which the
+conventions RFC makes the one thing a client obeys.
 
 Removing the feature means refusing `scope_prefix` again; no stored state is
 touched.
@@ -616,15 +641,19 @@ touched.
   reverse refuses with `scope: "<prefix>graph.write"`; `schema_apply`
   refuses; a bundle with no `protected_branches` permits every branch and the
   boot log names the graph; a token holding both write scopes behaves as
-  `graph.write`; `/access` matches the shape of a `branch_scope: unprotected`
-  rule.
-- Hidden-404 routes: on stored-query invoke, change from a base commit,
-  branch create from a snapshot and commit changes, a policy denial keeps its
-  404 and a ceiling miss answers 403 `insufficient_scope`; the branch listing
-  and readable change diff refuse under a ceiling without `graph.read` rather
-  than returning empty.
-- Default-deny mode (tokens, no bundle): `read` is refused for a ceiling
-  without `graph.read` and allowed with it.
+  `graph.write`; `/access` follows `branch` for `change` and the target slot
+  for the other five, and names `branch_create` and `branch_merge` only when
+  `target_branch` is set.
+- Hidden-404 routes: on stored-query invoke (handler and ingress
+  classifier), change from a base commit, branch create from a snapshot,
+  commit changes, commit publish and commit drop, a policy denial keeps its
+  404 and a ceiling miss answers 403 `insufficient_scope` before the engine's
+  own not-found mapping; the readable diff and the detailed branch list
+  refuse under a ceiling without `graph.read` rather than hiding a side or
+  omitting a branch.
+- Default-deny mode (tokens, no bundle): an OIDC token is denied every
+  action, with or without `graph.read`, by the signed-data rule that
+  precedes the ceiling; a static token's `read` is unchanged.
 - MCP: every write tool refuses under `graph.read` with the structured
   `insufficient_scope`; every read tool succeeds; `access` reports the
   intersection and `scopes`.
@@ -637,9 +666,10 @@ touched.
 - Deployment routes: plan and apply refuse without `cluster.config`; with
   `cluster.config` alone, a deployment that changes a graph's schema refuses
   in preview and in apply with `insufficient_scope` naming `graph.schema`,
-  and one that reads a graph refuses naming `graph.read`; the ledger of an
-  accepted deployment holds no scope, and a settlement resumed after
-  acceptance completes without a token.
+  and one that reads a graph refuses naming `graph.read`, as a 403 whose
+  body carries `disposition` and `scope`; the ledger of an accepted
+  deployment holds no scope, and a settlement resumed after acceptance still
+  passes its policy checks and completes without a token.
 - Attribution: a scoped write records the same `actor_id` as an unscoped one.
 - No regression: a trust document without a prefix produces byte-identical
   responses on the existing OIDC fixtures.
@@ -731,3 +761,11 @@ touched.
   `GET /graphs/discovery`; `invoke_query` stays in `graph.read` as a stated
   non-goal pending #1197; the empty `protected_branches` report moves to the
   boot log.
+- 2026-11-03: second revision after the review on 902ea979. The slot rule
+  is owned by `uses_target_branch_scope` alone and `access_slot` is no
+  longer cited; `/access` is described as the two shapes the route builds;
+  commit publish, commit drop and the ingress classifier join the hidden-404
+  list and the readable diff is a whole-request refusal; a ceilinged token
+  with no bundle is denied by the signed-data rule before any ceiling; the
+  deployment `refusal` mapper and the tokenless resume are described as they
+  are; the misattributed conventions sentence is removed.
