@@ -216,10 +216,12 @@ filter applies only to the resumed feed. Baselines require the `export`
 policy action; commit changes, diffs and feed polling require `read`. A diff
 needs `read` on the branch each side resolves to; a side the actor cannot read
 answers `404` exactly as a side that names nothing, whatever the other side
-names. A commit whose branch was deleted is still readable while a live
+names. The engine reads a commit whose branch was deleted while a live
 branch retains it (a stacked branch's merge base after its parent was merged
 and deleted): diffs, commit changes, reads at the commit and the feed open the
-retired incarnation by its exact commit. A commit that no live branch retains,
+retired incarnation by its exact commit. The HTTP `commit changes` route still
+needs `read` on the branch that wrote the commit, so a policy that does not
+grant the deleted name answers `404` there. A commit that no live branch retains,
 or whose recorded incarnation was reclaimed, answers the same `404` as a
 commit that names nothing; the error names the spelling the caller used, never
 the deleted branch. Branch creation from such a commit still refuses with

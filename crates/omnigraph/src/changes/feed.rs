@@ -27,7 +27,7 @@ use super::token::{
 };
 use crate::db::Snapshot;
 use crate::db::commit_graph::Lineage;
-use crate::db::manifest::{CommitBuffer, HistoryRecord, ManifestCoordinator, history};
+use crate::db::manifest::{CommitBuffer, HistoryRecord, history};
 use crate::error::{OmniError, Result};
 use crate::table_store::TableStore;
 
@@ -509,28 +509,23 @@ impl<'a> PollSnapshots<'a> {
         };
         if let Some(native) = &commit.native_branch
             && !self.live.contains(native)
+            && !self.retired.contains(native)
         {
-            // A retired incarnation opens by its exact commit, but only while
-            // the polled branch, which reaches it, is itself still live.
-            if !ManifestCoordinator::incarnation_is_live(
+            // One door: a retired incarnation opens by its exact commit while
+            // the polled branch, still the incarnation this cut captured,
+            // reaches it.
+            let retired = crate::db::graph_coordinator::admit_commit(
                 self.root_uri,
                 &self.cut.control_session,
                 &commit,
+                crate::db::graph_coordinator::Retention::PolledBranch {
+                    branch: self.cut.branch.as_deref(),
+                    witness: &self.cut.witness,
+                },
+                commit_id,
             )
-            .await?
-            {
-                ManifestCoordinator::ensure_incarnation_live(
-                    self.root_uri,
-                    &self.cut.control_session,
-                    &self.cut.head_record.commit,
-                )
-                .await?;
-                ManifestCoordinator::ensure_retired_incarnation_opens(
-                    self.root_uri,
-                    &self.cut.control_session,
-                    &commit,
-                )
-                .await?;
+            .await?;
+            if retired {
                 self.retired.insert(native.clone());
             } else {
                 self.live.insert(native.clone());

@@ -2511,6 +2511,21 @@ impl ManifestCoordinator {
         }
     }
 
+    /// The Lance identifier of the live native ref of `branch` now. A fresh
+    /// read, unlike [`Self::branch_identifier`]: it changes when the branch is
+    /// deleted and recreated, and a deleted branch is `BranchNotFound`.
+    pub async fn live_branch_identifier(
+        root_uri: &str,
+        control_session: &Arc<lance::session::Session>,
+        branch: &str,
+    ) -> Result<lance::dataset::refs::BranchIdentifier> {
+        let main = open_manifest_dataset_with_session(root_uri, None, control_session).await?;
+        let native = resolve_native_manifest_branch(&main, branch).await?;
+        crate::branch_control::get_branch_identifier(&main, &native)
+            .await
+            .map_err(|error| layout::branch_ref_error(error, branch))
+    }
+
     /// The exact manifest a commit of a retired incarnation names, opened
     /// through its live or retired native ref
     /// ([`Self::pinned_graph_commit_with_session`]); a reclaimed manifest or

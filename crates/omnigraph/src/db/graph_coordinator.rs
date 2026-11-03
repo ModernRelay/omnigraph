@@ -673,15 +673,8 @@ impl GraphCoordinator {
         }
     }
 
-    /// The state of a settled commit, from the `table` rows of its record.
-    ///
-    /// A commit of the live incarnation of its branch is read directly. A
-    /// commit whose writing incarnation is gone (its branch deleted, or
-    /// deleted and recreated) is read only while a live branch still retains
-    /// it, and only when the retired native ref matching that exact commit
-    /// still opens; otherwise it is the not-found of the spelling the caller
-    /// used, never of the deleted branch's name. A manifest reclaimed since
-    /// is the retention gap of that open.
+    /// The state of a settled commit, from the `table` rows of its record,
+    /// admitted by [`admit_commit`] against every live branch.
     async fn settled_commit_state(
         &self,
         control_session: &Arc<lance::session::Session>,
@@ -689,39 +682,14 @@ impl GraphCoordinator {
         snapshot_id: &SnapshotId,
     ) -> Result<CommitState> {
         let root_uri = self.root_uri();
-        let mut retired = false;
-        if !ManifestCoordinator::incarnation_is_live(root_uri, control_session, &record.commit)
-            .await?
-        {
-            retired = true;
-            if !self
-                .retained_by_live_branch(&record.commit.graph_commit_id)
-                .await?
-            {
-                // The refusal the gate always gave: a deleted name is the
-                // caller's not-found, a recreated one the witness error.
-                let refusal = ManifestCoordinator::ensure_incarnation_live(
-                    root_uri,
-                    control_session,
-                    &record.commit,
-                )
-                .await;
-                return Err(match refusal {
-                    Err(OmniError::BranchNotFound { .. }) | Ok(()) => {
-                        OmniError::ReadTargetNotFound {
-                            target: snapshot_id.as_str().to_string(),
-                        }
-                    }
-                    Err(error) => error,
-                });
-            }
-            ManifestCoordinator::ensure_retired_incarnation_opens(
-                root_uri,
-                control_session,
-                &record.commit,
-            )
-            .await?;
-        }
+        let retired = admit_commit(
+            root_uri,
+            control_session,
+            &record.commit,
+            Retention::LiveBranches(self),
+            snapshot_id.as_str(),
+        )
+        .await?;
         let mut snapshot = Snapshot::wrap(record.snapshot(root_uri, control_session)?);
         if retired {
             snapshot = snapshot.retired_incarnation();
@@ -761,20 +729,28 @@ impl GraphCoordinator {
 
     /// The commit `snapshot_id` names and the graph as of it, from its record:
     /// held by this coordinator, else in `__history`, else in a live branch.
-    /// Refused once the branch incarnation that wrote it is not live.
+    /// A retired writer incarnation is read only through [`admit_commit`].
     async fn commit_state(&self, snapshot_id: &SnapshotId) -> Result<CommitState> {
         let session = self.manifest.control_session();
         let id = snapshot_id.as_str();
         if self.exact_graph_head().as_deref() == Some(id) {
-            ManifestCoordinator::ensure_incarnation_live(
+            // The captured head is retention only while this branch is still
+            // that incarnation; a retired writer goes through the one door.
+            let retired = admit_commit(
                 self.root_uri(),
                 &session,
                 self.manifest.head(),
+                Retention::LiveBranches(self),
+                id,
             )
             .await?;
+            let mut snapshot = self.snapshot();
+            if retired {
+                snapshot = snapshot.retired_incarnation();
+            }
             return Ok(CommitState {
                 commit: self.head_commit(),
-                snapshot: self.snapshot(),
+                snapshot,
             });
         }
         let record = match self.manifest.held_record(id) {
@@ -951,16 +927,8 @@ impl GraphCoordinator {
         // fences cursor ABA. This is the identifier captured with the head and
         // lineage above, never a fresh ref read that could name a replacement.
         let witness = match self.current_branch() {
-            None => crate::changes::token::hashed_identity("branch:main"),
-            Some(_) => {
-                let identifier = self.branch_identifier().await?;
-                let encoded = serde_json::to_string(&identifier).map_err(|error| {
-                    OmniError::manifest_internal(format!(
-                        "failed to encode Lance branch identifier: {error}"
-                    ))
-                })?;
-                crate::changes::token::hashed_identity(&encoded)
-            }
+            None => branch_witness(None)?,
+            Some(_) => branch_witness(Some(&self.branch_identifier().await?))?,
         };
         // One walk finds genesis AND builds the forward first-parent child
         // index (chain member → its unique on-chain child), so a poll can walk
@@ -1217,6 +1185,89 @@ pub(crate) async fn descends_linearly_from_in(
 
 /// Commits one step of a whole-chain walk reads before the next.
 const FIRST_PARENT_WALK_COMMITS: usize = 1024;
+
+/// The change-feed witness of a branch: a hash of its Lance identifier
+/// (`None`: main, which cannot be deleted or recreated).
+pub(crate) fn branch_witness(
+    identifier: Option<&lance::dataset::refs::BranchIdentifier>,
+) -> Result<String> {
+    let Some(identifier) = identifier else {
+        return Ok(crate::changes::token::hashed_identity("branch:main"));
+    };
+    let encoded = serde_json::to_string(identifier).map_err(|error| {
+        OmniError::manifest_internal(format!("failed to encode Lance branch identifier: {error}"))
+    })?;
+    Ok(crate::changes::token::hashed_identity(&encoded))
+}
+
+/// What retains a commit whose writing incarnation is gone.
+pub(crate) enum Retention<'a> {
+    /// Any live branch whose parents or merged parents reach it.
+    LiveBranches(&'a GraphCoordinator),
+    /// The polled branch (`None`: main), while it is still the incarnation
+    /// `witness` names.
+    PolledBranch {
+        branch: Option<&'a str>,
+        witness: &'a str,
+    },
+}
+
+/// The one decision for reading a settled commit. `Ok(false)`: its writing
+/// incarnation is live, the existing path. `Ok(true)`: the writer is retired,
+/// something in `retention` still reaches the commit, and the retired native
+/// ref matching that exact commit opens (a reclaimed manifest is that open's
+/// loud gap); the caller marks its snapshot retired. Otherwise the commit is
+/// the not-found of `spelling`, the id the caller used and never the deleted
+/// branch, or the incarnation-witness refusal of a recreated name.
+pub(crate) async fn admit_commit(
+    root_uri: &str,
+    control_session: &Arc<lance::session::Session>,
+    commit: &omnigraph_catalog::GraphLineageRow,
+    retention: Retention<'_>,
+    spelling: &str,
+) -> Result<bool> {
+    if ManifestCoordinator::incarnation_is_live(root_uri, control_session, commit).await? {
+        return Ok(false);
+    }
+    let retained = match retention {
+        Retention::LiveBranches(coordinator) => {
+            coordinator
+                .retained_by_live_branch(&commit.graph_commit_id)
+                .await?
+        }
+        Retention::PolledBranch {
+            branch: None,
+            witness: _,
+        } => true,
+        Retention::PolledBranch {
+            branch: Some(branch),
+            witness,
+        } => {
+            let fresh =
+                ManifestCoordinator::live_branch_identifier(root_uri, control_session, branch)
+                    .await;
+            match fresh {
+                Ok(identifier) => branch_witness(Some(&identifier))? == witness,
+                Err(OmniError::BranchNotFound { .. }) => false,
+                Err(error) => return Err(error),
+            }
+        }
+    };
+    if !retained {
+        return match ManifestCoordinator::ensure_incarnation_live(root_uri, control_session, commit)
+            .await
+        {
+            Ok(()) => Ok(false),
+            Err(OmniError::BranchNotFound { .. }) => Err(OmniError::ReadTargetNotFound {
+                target: spelling.to_string(),
+            }),
+            Err(error) => Err(error),
+        };
+    }
+    ManifestCoordinator::ensure_retired_incarnation_opens(root_uri, control_session, commit)
+        .await?;
+    Ok(true)
+}
 
 pub(crate) fn commit_not_found(snapshot_id: &SnapshotId) -> OmniError {
     OmniError::manifest_not_found(format!("commit '{}' not found", snapshot_id))

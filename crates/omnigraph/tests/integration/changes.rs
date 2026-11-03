@@ -5024,6 +5024,12 @@ async fn stacked_branch_reads_survive_its_parents_delete_issue_1236() {
     let a1 = write_on(&db, "a", "insert_person", &person("Una", 5)).await;
     db.branch_create_from("a", "b").await.unwrap();
     let b1 = write_on(&db, "b", "insert_person", &person("Bea", 7)).await;
+    // A child with no commit of its own: its head row still names `a`.
+    db.branch_create_from("a", "kid").await.unwrap();
+    // A handle bound to `a` before the delete captured a1 as its head.
+    let uri = dir.path().to_str().unwrap();
+    let stale = helpers::session(Omnigraph::open(uri).await.unwrap());
+    stale.sync_branch("a").await.unwrap();
     let merged = db.branch_merge("a", "main").await.unwrap();
     assert_eq!(
         merged.outcome,
@@ -5070,6 +5076,41 @@ async fn stacked_branch_reads_survive_its_parents_delete_issue_1236() {
     .await
     .unwrap();
 
+    // The feed of the live child that wrote nothing: its head is a1.
+    let page = db
+        .poll_change_feed(feed_request(
+            Some("kid"),
+            ChangeFeedPosition::Start(ChangeFeedStart::Beginning),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        page.blocks
+            .iter()
+            .any(|block| diff_ops(&block.changes).contains(&(
+                "Person".to_string(),
+                "Una".to_string(),
+                Insert
+            ))),
+        "the feed of a child with no commit of its own reports the parent's commit"
+    );
+
+    // The handle that captured a1 as its head before the delete.
+    stale
+        .snapshot_of(ReadTarget::snapshot(omnigraph::db::SnapshotId::new(
+            a1.graph_commit_id.clone(),
+        )))
+        .await
+        .unwrap();
+    let page = stale
+        .commit_changes_page(&a1.graph_commit_id, &scope, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        diff_ops(&page.block.changes),
+        vec![("Person".to_string(), "Una".to_string(), Insert)]
+    );
+
     // A reclaimed name cannot stand in for the retired incarnation: the exact
     // commit still opens after `a` is recreated.
     db.branch_create("a").await.unwrap();
@@ -5086,17 +5127,10 @@ async fn stacked_branch_reads_survive_its_parents_delete_issue_1236() {
         .commit_changes_page(&on_gone.graph_commit_id, &scope, None, None, None)
         .await
         .unwrap_err();
-    assert!(
-        !error.to_string().contains("'gone'"),
-        "the error names the caller's spelling, not the deleted branch: {error}"
-    );
-    assert!(
-        matches!(
-            error,
-            OmniError::Manifest(_)
-                | OmniError::BranchNotFound { .. }
-                | OmniError::ReadTargetNotFound { .. }
-        ),
-        "{error:?}"
-    );
+    match error {
+        OmniError::ReadTargetNotFound { target } => {
+            assert_eq!(target, on_gone.graph_commit_id, "the caller's spelling")
+        }
+        other => panic!("expected ReadTargetNotFound of the commit id, got {other:?}"),
+    }
 }

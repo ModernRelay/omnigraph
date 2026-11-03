@@ -612,6 +612,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
+        "live_branch_identifier",
+    ),
+    (
+        "omnigraph-catalog/lib.rs",
+        "ManifestCoordinator",
         "ensure_retired_incarnation_opens",
     ),
     (
