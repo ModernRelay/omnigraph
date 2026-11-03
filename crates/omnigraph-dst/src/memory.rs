@@ -8,7 +8,8 @@ use futures::{StreamExt, TryStreamExt};
 use lance_io::object_store::providers::shared_memory::SharedMemoryStoreProvider;
 use lance_io::object_store::{ObjectStoreParams, ObjectStoreProvider};
 use object_store::path::Path;
-use omnigraph::storage::ObjectStorageAdapter;
+use object_store::{ObjectStoreExt, PutPayload};
+use omnigraph::storage::{ObjectStorageAdapter, StorageAdapter};
 use url::Url;
 
 use crate::environment::{UniverseEnvironment, UniverseProcess};
@@ -40,6 +41,136 @@ pub struct MemoryStorage {
     lance: Arc<dyn object_store::ObjectStore>,
     prefix: Path,
     _lease: AuthorityLease,
+}
+
+/// What a prepared store's restore put into the environment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Restored {
+    pub uri: String,
+    pub objects: usize,
+    pub bytes: u64,
+}
+
+/// The directory a `file://` prepared-store URI names, when it exists.
+pub fn prepared_root(uri: &str) -> Result<std::path::PathBuf, String> {
+    let root = uri
+        .strip_prefix("file://")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| format!("a prepared store is a file:// root, got {uri}"))?;
+    if !root.is_dir() {
+        return Err(format!(
+            "prepared store root is not a directory: {}",
+            root.display()
+        ));
+    }
+    Ok(root)
+}
+
+enum Realm {
+    Lance,
+    Adapter,
+}
+
+/// The realm that reads an object of the prepared store, by the write
+/// census taxonomy; an unknown kind refuses the restore.
+fn realm_of(key: &str) -> Result<Realm, String> {
+    Ok(match crate::write_census::classify(key) {
+        "manifest"
+        | "lance-transaction"
+        | "lance-version-manifest"
+        | "lance-index"
+        | "lance-deletion"
+        | "lance-data-file"
+        | "branch-ref" => Realm::Lance,
+        "recovery-sidecar"
+        | "graph-index-artifact"
+        | "history-file-untriaged"
+        | "init-claim"
+        | "capability-probe" => Realm::Adapter,
+        kind => {
+            return Err(format!(
+                "prepared store holds an object of kind {kind}: {key}; the write census taxonomy names every kind the engine writes"
+            ));
+        }
+    })
+}
+
+fn collect_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    keys: &mut Vec<String>,
+) -> Result<(), String> {
+    let mut entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("list {}: {e}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("list {}: {e}", dir.display()))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "prepared store holds a symlink: {}; the root is restored from plain files and directories only",
+                path.display()
+            ));
+        }
+        if file_type.is_dir() {
+            collect_files(root, &path, keys)?;
+        } else {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            keys.push(
+                relative
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            );
+        }
+    }
+    Ok(())
+}
+
+impl MemoryStorage {
+    /// Fill the empty environment from a `file://` graph root: every object
+    /// under it goes to the realm that reads it, below every harness
+    /// wrapper, so the copy counts as no request; the root is never
+    /// written.
+    pub async fn restore_from_uri(&self, uri: &str) -> Result<Restored, String> {
+        let root = prepared_root(uri)?;
+        let mut keys = Vec::new();
+        collect_files(&root, &root, &mut keys)?;
+        let mut bytes = 0u64;
+        for key in &keys {
+            let realm = realm_of(key)?;
+            let contents = std::fs::read(root.join(key)).map_err(|e| format!("read {key}: {e}"))?;
+            bytes += contents.len() as u64;
+            match realm {
+                Realm::Lance => {
+                    let path = Path::parse(format!("{}/{key}", self.prefix))
+                        .map_err(|e| format!("{key}: {e}"))?;
+                    self.lance
+                        .put(&path, PutPayload::from(contents))
+                        .await
+                        .map_err(|e| format!("restore {key}: {e}"))?;
+                }
+                Realm::Adapter => {
+                    self.adapter
+                        .write_bytes(&format!("{}/{key}", self.root), &contents)
+                        .await
+                        .map_err(|e| format!("restore {key}: {e}"))?;
+                }
+            }
+        }
+        Ok(Restored {
+            uri: uri.to_string(),
+            objects: keys.len(),
+            bytes,
+        })
+    }
 }
 
 #[derive(Debug)]

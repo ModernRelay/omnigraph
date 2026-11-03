@@ -55,10 +55,21 @@ for each environment. These two target/storage combinations are implemented.
 With `--store`, direct engine execution opens an existing `file://`, `s3://`
 or `az://` root matching the declared `local-filesystem`, `s3-compatible` or
 `azure-blob-storage` backend. It skips initialization, seed loading and
-automatic index building; ordinary steps may change the supplied store.
-`--store` refuses files with schema and seed, DST and server targets, seams,
-and concurrent blocks. Direct-engine memory storage and cloud fixture
-initialization fail admission explicitly.
+automatic index building; ordinary steps may change the supplied store, and
+seams and concurrent blocks are refused there. An `omnigraph-engine-dst`
+environment takes `--store` with a `file://` root instead: before the steps,
+every object under the root is restored into the in-memory environment below
+the measure ledger and the seams (Lance dataset files to the Lance store, the
+engine's control objects to the adapter), the graph is opened there, and the
+case's steps, seams and concurrent blocks run on that copy. A symlink under the
+root, or an object of a kind the engine never writes (a stray dotfile, say),
+refuses the run by name. The root is never
+written, each run of the replay pair restores it again, and the report's
+observations name the root with its object and byte counts; a saved report of
+such a run still does not replay, since the root is not frozen by the report.
+`--store` refuses files with schema and seed and server targets everywhere.
+Direct-engine memory storage and cloud fixture initialization fail admission
+explicitly.
 
 With `--server <URL> --graph <ID>` (plus `--token <TOKEN>` on a
 token-protected deployment), the declared `omnigraph-server` environments run
