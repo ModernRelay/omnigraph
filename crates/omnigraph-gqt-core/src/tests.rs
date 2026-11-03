@@ -882,6 +882,37 @@ fn bind_commit_names_a_write_and_its_consumers_resolve_it() {
     );
 }
 
+/// A step says whether its write stays unpublished and whether a drop names
+/// a commit the case bound; the benchmark's served admission reads both.
+#[test]
+fn as_commit_and_bound_drop_are_visible_per_step() {
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{PROPOSE}{BIND}--- mutate\ncommit drop \"${{c}}\"\n{EXPECT_OK}--- mutate\nquery publish_bob() {{\n    insert Person {{ name: \"carol\" }}\n}}\n{EXPECT_OK}--- mutate\nbranch merge b0 as commit\n--- expect outcome: merged\n--- mutate\nbranch merge b0\n--- expect outcome: merged\n--- mutate\ncommit drop \"hb1-literal\"\n{EXPECT_OK}{QUERY}{EXPECT}"
+    );
+    let case = parse_case("x", &text).unwrap();
+    let want = [
+        ("the `as commit` mutation", true, false),
+        ("drop of the bound commit", false, true),
+        ("a published mutation", false, false),
+        ("the `as commit` merge", true, false),
+        ("a published merge", false, false),
+        ("drop of a literal id", false, false),
+        ("a read", false, false),
+    ];
+    assert_eq!(case.items.len(), want.len());
+    for (item, (label, as_commit, drops_bound)) in case.items.iter().zip(want) {
+        let Item::Step(step) = item else {
+            panic!("{label}: no loop in this case");
+        };
+        assert_eq!(step.as_commit(), as_commit, "{label}: as_commit");
+        assert_eq!(
+            step.drops_bound_commit(),
+            drops_bound,
+            "{label}: drops_bound_commit"
+        );
+    }
+}
+
 /// Every misplacement of a binding is refused with the rule it broke.
 #[test]
 fn bind_commit_refusals() {

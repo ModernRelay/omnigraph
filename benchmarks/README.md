@@ -515,8 +515,11 @@ prefix as state-neutral `unpublished_run` recovery evidence. Resolve any `possib
 identity with `archive reconcile` before minting a replacement invocation. A
 later controlled-cloud adapter binds declared S3 facts, applies budget and lifecycle
 controls, executes the same typed plans, and uploads the same record format.
-S3 reset, served writes, comparison/noise-floor reports, and proved operating-system page-cache eviction remain outside this
-slice.
+S3 reset, served writes that advance a head, comparison/noise-floor reports, and proved operating-system page-cache eviction remain outside this
+slice. A served write is admitted only as an unpublished commit (`as commit`),
+verified at its snapshot and dropped; `branch-merge-d50-as-commit-served` and
+`tiny-mutate-as-commit-served` are the served twins of their engine points and
+share one workload file with them.
 
 ## Add a scenario
 
