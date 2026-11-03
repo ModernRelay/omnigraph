@@ -274,9 +274,10 @@ one owner:
   it from the opened root and the table's relative path when it is read.
   This RFC does not change it.
 - **A Lance `BasePath`.** Lance writes it into a manifest. `branch_base`
-  rebinds it at the open door. `branch_base` is the only code that classifies
-  bases. That covers the refusal, the collector's borrowed origins, and the
-  relocation bit.
+  rebinds it at the open door. `branch_base` is the only code that reads
+  bases. The refusal and the relocation bit classify them. The collector's
+  borrowed origins and the other path resolvers read the map the door
+  rebound.
 
 The relocation bit (`manifest_has_external_base_paths`,
 `SnapshotDataset::has_external_base_paths`, and the benchmark's
