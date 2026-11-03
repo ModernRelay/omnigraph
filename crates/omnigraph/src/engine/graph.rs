@@ -474,11 +474,38 @@ pub(super) fn endpoint_probes(
     probes
 }
 
-/// At most `batch_size` emitted ID pairs, charged to `_memory`.
+/// At most `batch_size` emitted pairs, charged to `_memory`: the source row
+/// ordinals and the destination ids as one `Utf8` column built from the
+/// walk's dictionary.
 pub(super) struct ExpandedPairs {
     pub(super) source_rows: Vec<u32>,
-    pub(super) destination_ids: Vec<String>,
+    pub(super) destination: ArrayRef,
     _memory: WorkMemory,
+}
+
+/// A per-source set member as one key: the source row in the high half, the
+/// dense node in the low half, so every source's visited and emitted sets
+/// share one table instead of one allocation per source row.
+fn source_node_key(source: usize, node: u32) -> u64 {
+    ((source as u64) << 32) | u64::from(node)
+}
+
+/// The destination column of one chunk: `dense` resolved through `ids`, the
+/// dictionary of the walk's destination space, charged to `memory` first.
+fn destination_column(dense: &[u32], ids: &[String], memory: &WorkMemory) -> Result<ArrayRef> {
+    let bytes = dense
+        .iter()
+        .map(|&d| ids[d as usize].len())
+        .fold(0usize, usize::saturating_add);
+    memory
+        .string(bytes)
+        .map_err(|error| memory.error(error))?;
+    memory
+        .grow((dense.len() + 1).saturating_mul(std::mem::size_of::<i32>()))
+        .map_err(|error| memory.error(error))?;
+    Ok(Arc::new(StringArray::from_iter_values(
+        dense.iter().map(|&d| ids[d as usize].as_str()),
+    )))
 }
 
 pub(super) struct PreparedEdge {
@@ -1212,11 +1239,13 @@ where
 
     let n = src_ids.len();
     memory
-        .entries::<(Vec<u32>, HashSet<u32>, HashSet<u32>, u32)>(n)
+        .entries::<(Vec<u32>, u64, u32)>(n)
         .map_err(|error| memory.error(error))?;
     let mut frontiers: Vec<Vec<u32>> = Vec::with_capacity(n);
-    let mut visited: Vec<HashSet<u32>> = Vec::with_capacity(n);
-    let mut seen_dst: Vec<HashSet<u32>> = Vec::with_capacity(n);
+    // One table per set over every source row (`source_node_key`): the nodes
+    // a source reached and the destinations it emitted.
+    let mut visited: HashSet<u64, ahash::RandomState> = HashSet::default();
+    let mut seen_dst: HashSet<u64, ahash::RandomState> = HashSet::default();
     for i in 0..n {
         let seed = match &mut active {
             ActiveExpandSource::Indexed(src) => {
@@ -1226,15 +1255,12 @@ where
                 src_idx.to_dense(src_ids.value(i))
             }
         };
-        let mut v = HashSet::new();
         if same_type {
             if let Some(s) = seed {
-                v.insert(s);
+                visited.insert(source_node_key(i, s));
             }
         }
         frontiers.push(seed.map(|s| vec![s]).unwrap_or_default());
-        visited.push(v);
-        seen_dst.push(HashSet::new());
     }
 
     memory.checkpoint().map_err(|error| memory.error(error))?;
@@ -1245,9 +1271,18 @@ where
     let mut frontier_memory = memory
         .child("expand frontier")
         .map_err(|error| memory.error(error))?;
+    emission_memory
+        .entries::<(u32, u32)>(chunk_rows)
+        .map_err(|error| memory.error(error))?;
     let mut emitted_src: Vec<u32> = Vec::with_capacity(chunk_rows);
-    let mut emitted_dst: Vec<String> = Vec::with_capacity(chunk_rows);
+    let mut emitted_dst: Vec<u32> = Vec::with_capacity(chunk_rows);
     let mut prev_union_len: usize = 0;
+    // What one examined neighbour may add: a visited entry, a frontier
+    // entry, an emitted-set entry and a pair; charged per node, not per edge.
+    let per_neighbour_bytes = WorkMemory::entry_bytes::<u64>()
+        .saturating_mul(2)
+        .saturating_add(WorkMemory::entry_bytes::<u32>())
+        .saturating_add(WorkMemory::entry_bytes::<(u32, u32)>());
 
     for hop in 1..=max {
         memory.check().map_err(|error| memory.error(error))?;
@@ -1316,26 +1351,33 @@ where
                     unreachable!("active source was just replaced with Csr");
                 };
                 hop_memory
-                    .entries::<u32>(
+                    .entries::<u64>(
                         frontiers.iter().map(Vec::len).sum::<usize>()
-                            + visited.iter().map(HashSet::len).sum::<usize>()
-                            + seen_dst.iter().map(HashSet::len).sum::<usize>(),
+                            + visited.len()
+                            + seen_dst.len(),
                     )
                     .map_err(|error| memory.error(error))?;
-                let translate_set =
-                    |set: &HashSet<u32>, idx: &crate::graph_index::TypeIndex| -> HashSet<u32> {
-                        set.iter()
-                            .filter_map(|&d| interner.to_id(d).and_then(|id| idx.to_dense(id)))
-                            .collect()
-                    };
-                for i in 0..n {
-                    frontiers[i] = frontiers[i]
+                let translate_set = |set: &HashSet<u64, ahash::RandomState>,
+                                     idx: &crate::graph_index::TypeIndex|
+                 -> HashSet<u64, ahash::RandomState> {
+                    set.iter()
+                        .filter_map(|&key| {
+                            let (source, dense) = ((key >> 32) as usize, key as u32);
+                            interner
+                                .to_id(dense)
+                                .and_then(|id| idx.to_dense(id))
+                                .map(|dense| source_node_key(source, dense))
+                        })
+                        .collect()
+                };
+                for frontier in frontiers.iter_mut() {
+                    *frontier = frontier
                         .iter()
                         .filter_map(|&d| interner.to_id(d).and_then(|id| src_idx.to_dense(id)))
                         .collect();
-                    visited[i] = translate_set(&visited[i], src_idx);
-                    seen_dst[i] = translate_set(&seen_dst[i], dst_idx);
                 }
+                visited = translate_set(&visited, src_idx);
+                seen_dst = translate_set(&seen_dst, dst_idx);
                 tracing::debug!(
                     target: "omnigraph::traverse",
                     edge = %member.edge_type,
@@ -1399,75 +1441,57 @@ where
                         adj_rev.map(|a| a.neighbors(node)).unwrap_or(&[]),
                     ),
                 };
+                let ids: &[String] = match &active {
+                    ActiveExpandSource::Indexed(src) => src.interner.ids(),
+                    ActiveExpandSource::Csr(CsrSource { dst_idx, .. }) => dst_idx.ids(),
+                };
+                // Admit what this node's neighbours can add before the walk.
+                memory
+                    .grow((fwd.len() + rev.len()).saturating_mul(per_neighbour_bytes))
+                    .map_err(|error| memory.error(error))?;
                 for &neighbor in fwd.iter().chain(rev) {
                     if budgeted {
                         memory
                             .charge_traversal(1)
                             .map_err(|error| memory.error(error))?;
-                    } else {
-                        memory.check().map_err(|error| memory.error(error))?;
                     }
                     let is_self = same_type && hop == 1 && neighbor == node;
-                    if !is_self && same_type {
-                        if visited[i].contains(&neighbor) {
-                            continue;
-                        }
-                        memory
-                            .entries::<u32>(1)
-                            .map_err(|error| memory.error(error))?;
-                        visited[i].insert(neighbor);
+                    if !is_self && same_type && !visited.insert(source_node_key(i, neighbor)) {
+                        continue;
                     }
                     if !is_self {
-                        next_memory
-                            .entries::<u32>(1)
-                            .map_err(|error| memory.error(error))?;
                         next.push(neighbor);
                     }
-                    if hop >= min_hops && !seen_dst[i].contains(&neighbor) {
-                        memory
-                            .entries::<u32>(1)
-                            .map_err(|error| memory.error(error))?;
-                        seen_dst[i].insert(neighbor);
-                        let dst_id = match &active {
-                            ActiveExpandSource::Indexed(src) => Some(
-                                src.interner
-                                    .to_id(neighbor)
-                                    .expect("interned dst id must resolve"),
-                            ),
-                            ActiveExpandSource::Csr(CsrSource { dst_idx, .. }) => {
-                                dst_idx.to_id(neighbor)
-                            }
-                        };
-                        if let Some(dst_id) = dst_id {
-                            emission_memory
-                                .entries::<(u32, String)>(1)
+                    if hop >= min_hops
+                        && (neighbor as usize) < ids.len()
+                        && seen_dst.insert(source_node_key(i, neighbor))
+                    {
+                        emitted_src.push(i as u32);
+                        emitted_dst.push(neighbor);
+                        if emitted_src.len() >= chunk_rows {
+                            let next_emission = memory
+                                .child("expand emissions")
                                 .map_err(|error| memory.error(error))?;
-                            emission_memory
-                                .string(dst_id.len())
+                            next_emission
+                                .entries::<(u32, u32)>(chunk_rows)
                                 .map_err(|error| memory.error(error))?;
-                            emitted_src.push(i as u32);
-                            emitted_dst.push(dst_id.to_string());
-                            if emitted_src.len() >= chunk_rows {
-                                let next = memory
-                                    .child("expand emissions")
-                                    .map_err(|error| memory.error(error))?;
-                                memory.metric("expand_pairs", emitted_src.len());
-                                emit(ExpandedPairs {
-                                    source_rows: std::mem::replace(
-                                        &mut emitted_src,
-                                        Vec::with_capacity(chunk_rows),
-                                    ),
-                                    destination_ids: std::mem::replace(
-                                        &mut emitted_dst,
-                                        Vec::with_capacity(chunk_rows),
-                                    ),
-                                    _memory: std::mem::replace(&mut emission_memory, next),
-                                })
-                                .await?;
-                            }
+                            memory.metric("expand_pairs", emitted_src.len());
+                            let destination =
+                                destination_column(&emitted_dst, ids, &emission_memory)?;
+                            emitted_dst.clear();
+                            emit(ExpandedPairs {
+                                source_rows: std::mem::replace(
+                                    &mut emitted_src,
+                                    Vec::with_capacity(chunk_rows),
+                                ),
+                                destination,
+                                _memory: std::mem::replace(&mut emission_memory, next_emission),
+                            })
+                            .await?;
                         }
                     }
                 }
+                memory.check().map_err(|error| memory.error(error))?;
             }
             frontiers[i] = next;
         }
@@ -1476,6 +1500,15 @@ where
             src.neighbor_map = HashMap::new();
         }
     }
+    let destination = if emitted_src.is_empty() {
+        None
+    } else {
+        let ids: &[String] = match &active {
+            ActiveExpandSource::Indexed(src) => src.interner.ids(),
+            ActiveExpandSource::Csr(CsrSource { dst_idx, .. }) => dst_idx.ids(),
+        };
+        Some(destination_column(&emitted_dst, ids, &emission_memory)?)
+    };
     drop(active);
     drop(frontiers);
     drop(visited);
@@ -1483,13 +1516,13 @@ where
     drop(frontier_memory);
     memory.release_work();
 
-    if emitted_src.is_empty() {
+    let Some(destination) = destination else {
         return Ok(());
-    }
+    };
     memory.metric("expand_pairs", emitted_src.len());
     emit(ExpandedPairs {
         source_rows: emitted_src,
-        destination_ids: emitted_dst,
+        destination,
         _memory: emission_memory,
     })
     .await
