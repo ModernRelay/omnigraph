@@ -27,7 +27,7 @@ use super::token::{
 };
 use crate::db::Snapshot;
 use crate::db::commit_graph::Lineage;
-use crate::db::manifest::{CommitBuffer, HistoryRecord, ManifestCoordinator, history};
+use crate::db::manifest::{CommitBuffer, HistoryRecord, history};
 use crate::error::{OmniError, Result};
 use crate::table_store::TableStore;
 
@@ -454,6 +454,8 @@ struct PollSnapshots<'a> {
     settled: HashMap<String, HistoryRecord>,
     /// The native refs this poll has proven live.
     live: HashSet<String>,
+    /// The retired native refs this poll opened by exact commit.
+    retired: HashSet<String>,
 }
 
 impl<'a> PollSnapshots<'a> {
@@ -473,12 +475,13 @@ impl<'a> PollSnapshots<'a> {
             cut,
             settled,
             live: HashSet::new(),
+            retired: HashSet::new(),
         })
     }
 
     /// The graph as of `commit_id`: the cut's snapshot for its head, else the
     /// `table` rows of the commit's record, from the cut's buffer or from
-    /// `__history`. Refused once the incarnation that wrote it is not live.
+    /// `__history`. A retired incarnation opens by its exact commit.
     async fn of(&mut self, commit_id: &str) -> Result<Snapshot> {
         let (commit, snapshot) = if commit_id == self.cut.head {
             (
@@ -506,14 +509,34 @@ impl<'a> PollSnapshots<'a> {
         };
         if let Some(native) = &commit.native_branch
             && !self.live.contains(native)
+            && !self.retired.contains(native)
         {
-            ManifestCoordinator::ensure_incarnation_live(
+            // One door: a retired incarnation opens by its exact commit while
+            // the polled branch, still the incarnation this cut captured,
+            // reaches it.
+            let retired = Box::pin(crate::db::graph_coordinator::admit_commit(
                 self.root_uri,
                 &self.cut.control_session,
                 &commit,
-            )
+                crate::db::graph_coordinator::Retention::PolledBranch {
+                    branch: self.cut.branch.as_deref(),
+                    witness: &self.cut.witness,
+                },
+                commit_id,
+            ))
             .await?;
-            self.live.insert(native.clone());
+            if retired {
+                self.retired.insert(native.clone());
+            } else {
+                self.live.insert(native.clone());
+            }
+        }
+        if commit
+            .native_branch
+            .as_ref()
+            .is_some_and(|native| self.retired.contains(native))
+        {
+            return Ok(snapshot.retired_incarnation());
         }
         Ok(snapshot)
     }
