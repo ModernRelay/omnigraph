@@ -16,7 +16,7 @@ use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::refs::{BranchContents, Ref};
 use lance::dataset::transaction::{Operation, Transaction, UpdateMap};
-use lance::dataset::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
+use lance::dataset::{InsertBuilder, WriteMode, WriteParams};
 use lance::session::Session;
 use lance_file::version::LanceFileVersion;
 use serde::Serialize;
@@ -1893,7 +1893,7 @@ async fn stamp_live_refs(
 /// else, never retried: the version number is the CAS.
 async fn publish_stamp(dataset: Dataset, target: u32) -> Result<Dataset> {
     let transaction = Transaction::new(dataset.version().version, stamp_operation(target), None);
-    CommitBuilder::new(Arc::new(dataset))
+    crate::lance_commit::commit_builder(Arc::new(dataset))
         .with_max_retries(0)
         .with_skip_auto_cleanup(true)
         .execute(transaction)
@@ -1907,7 +1907,7 @@ async fn publish_fence(dataset: Dataset, intent: String, target: u32) -> Result<
         fence_operation(intent, target),
         None,
     );
-    CommitBuilder::new(Arc::new(dataset))
+    crate::lance_commit::commit_builder(Arc::new(dataset))
         .with_max_retries(0)
         .with_skip_auto_cleanup(true)
         .execute(transaction)
@@ -1926,7 +1926,7 @@ async fn publish_activation(dataset: Dataset) -> Result<Dataset> {
         }),
     };
     let transaction = Transaction::new(dataset.version().version, operation, None);
-    CommitBuilder::new(Arc::new(dataset))
+    crate::lance_commit::commit_builder(Arc::new(dataset))
         .with_max_retries(0)
         .with_skip_auto_cleanup(true)
         .execute(transaction)
@@ -1985,7 +1985,7 @@ async fn publish_conversion(
         .await
         .map_err(OmniError::storage)?;
     fail(&UPGRADE_AFTER_STAGE)?;
-    let target = CommitBuilder::new(destination)
+    let target = crate::lance_commit::commit_builder(destination)
         .with_max_retries(0)
         .with_skip_auto_cleanup(true)
         .execute(transaction)

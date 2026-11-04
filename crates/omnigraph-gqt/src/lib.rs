@@ -266,6 +266,7 @@ async fn run_concurrent_step(
     }
     let line = case.source_lines.get(&step.ordinal).map(|l| *l as u64);
     let run = concurrent::Run::begin(step, concurrent::starve_budget(case.runner.timeout_ms));
+    let _stop = run.stop_guard();
     let sessions = step.sessions.iter().enumerate().map(|(index, op)| {
         let ctx = measure::SessionCtx::new(
             index,
@@ -282,11 +283,7 @@ async fn run_concurrent_step(
             (outcome, script)
         })
     });
-    let results = tokio::select! {
-        biased;
-        results = futures::future::join_all(sessions) => results,
-        () = run.drive_clock() => unreachable!("the clock driver never returns"),
-    };
+    let results = futures::future::join_all(sessions).await;
     let block = run.end();
     let sessions_evidence: Vec<Value> = step
         .sessions
