@@ -5766,6 +5766,7 @@ dependencies = [
 name = "omnigraph-engine"
 version = "0.14.1"
 dependencies = [
+ "ahash",
  "aho-corasick",
  "arc-swap",
  "arrow-array",
@@ -5781,6 +5782,7 @@ dependencies = [
  "csv-core",
  "datafusion",
  "futures",
+ "hashbrown 0.17.1",
  "lance",
  "lance-core",
  "lance-datafusion",
