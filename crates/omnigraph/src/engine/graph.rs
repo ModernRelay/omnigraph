@@ -1061,11 +1061,9 @@ where
                 columns,
             )
             .map_err(OmniError::arrow_internal)?;
-            let data: Vec<_> = attach
-                .columns()
-                .iter()
-                .map(|column| column.to_data())
-                .collect();
+            let attach_bytes = memory
+                .row_bytes(&attach)
+                .map_err(|error| memory.error(error))?;
             let mut source_rows = Vec::new();
             let mut edge_rows = Vec::new();
             let mut chunk_bytes = 0usize;
@@ -1074,7 +1072,7 @@ where
                     .child("bound edge pairs")
                     .map_err(|error| memory.error(error))?,
             );
-            for row in 0..batch.num_rows() {
+            for (row, attached_bytes) in attach_bytes.into_iter().enumerate() {
                 memory
                     .charge_traversal(1)
                     .map_err(|error| memory.error(error))?;
@@ -1087,15 +1085,7 @@ where
                 let edge_row = u32::try_from(row).map_err(|_| {
                     OmniError::manifest_internal("edge batch ordinal exceeds UInt32")
                 })?;
-                let row_bytes = data
-                    .iter()
-                    .try_fold(4usize, |size, column| {
-                        column
-                            .slice(row, 1)
-                            .get_slice_memory_size()
-                            .map(|bytes| size.saturating_add(bytes))
-                    })
-                    .map_err(OmniError::arrow_internal)?;
+                let row_bytes = attached_bytes.saturating_add(4);
                 for &source_row in wide_rows {
                     memory
                         .charge_traversal(1)
