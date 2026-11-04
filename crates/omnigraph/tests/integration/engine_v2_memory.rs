@@ -2112,13 +2112,13 @@ async fn bound_expand_returns_list_edge_properties_under_a_fixed_pool_issue_1251
     let db = session(
         Omnigraph::init(
             dir.path().to_str().unwrap(),
-            "node Person { name: String @key } edge Knows: Person -> Person { tags: [String] }",
+            "node Person { name: String @key } edge Knows: Person -> Person { labels: [String] }",
         )
         .await
         .unwrap(),
     );
     let leaves = 4_096;
-    let tags = |leaf: usize| -> Vec<String> {
+    let labels = |leaf: usize| -> Vec<String> {
         (0..4)
             .map(|tag| format!("{leaf:05}-{tag}-{}", "x".repeat(56)))
             .collect()
@@ -2133,7 +2133,7 @@ async fn bound_expand_returns_list_edge_properties_under_a_fixed_pool_issue_1251
     for leaf in 0..leaves {
         lines.push(
             serde_json::json!({"edge":"Knows","from":"hub","to":format!("leaf{leaf:05}"),
-                "data":{"tags":tags(leaf)}})
+                "data":{"labels":labels(leaf)}})
             .to_string(),
         );
     }
@@ -2143,7 +2143,7 @@ async fn bound_expand_returns_list_edge_properties_under_a_fixed_pool_issue_1251
     let v2 = with_setting(&db, "engine", "v2");
     let query = r#"query tagged() {
         match { $a: Person { name: "hub" } $a $t:knows $b }
-        return { $b.name, $t.tags }
+        return { $b.name, $t.labels }
     }"#;
     let limit = 8 * MIB;
     let probes = QueryMemoryProbes::default();
@@ -2161,7 +2161,7 @@ async fn bound_expand_returns_list_edge_properties_under_a_fixed_pool_issue_1251
         .downcast_ref::<StringArray>()
         .unwrap();
     let lists = batch
-        .column_by_name("t.tags")
+        .column_by_name("t.labels")
         .unwrap()
         .as_any()
         .downcast_ref::<arrow_array::ListArray>()
@@ -2178,7 +2178,7 @@ async fn bound_expand_returns_list_edge_properties_under_a_fixed_pool_issue_1251
         .collect();
     rows.sort();
     let expected: Vec<(String, Vec<String>)> = (0..leaves)
-        .map(|leaf| (format!("leaf{leaf:05}"), tags(leaf)))
+        .map(|leaf| (format!("leaf{leaf:05}"), labels(leaf)))
         .collect();
     assert_eq!(rows, expected);
     assert_released(&probes);

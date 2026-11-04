@@ -467,7 +467,7 @@ async fn selected_bound_sort_spills_and_refuses_its_scratch_quota_issue_659() {
 #[tokio::test]
 async fn bound_pairs_size_a_list_property_by_its_own_elements_issue_1251() {
     const EDGES: usize = 256;
-    let tags = |edge: usize| -> Vec<String> {
+    let labels = |edge: usize| -> Vec<String> {
         (0..4)
             .map(|tag| format!("{edge:03}-{tag}-{}", "x".repeat(250)))
             .collect()
@@ -476,11 +476,11 @@ async fn bound_pairs_size_a_list_property_by_its_own_elements_issue_1251() {
     for edge in 0..EDGES {
         seed.push(
             serde_json::json!({"edge":"Tagged","id":format!("t{edge:03}"),
-            "from":"a","to":"b","data":{"tags":tags(edge)}}),
+            "from":"a","to":"b","data":{"labels":labels(edge)}}),
         );
     }
     let (_dir, env) = graph_environment_for(
-        "node Person { name: String @key }\nedge Tagged: Person -> Person { tags: [String] }",
+        "node Person { name: String @key }\nedge Tagged: Person -> Person { labels: [String] }",
         seed,
     )
     .await;
@@ -528,7 +528,7 @@ async fn bound_pairs_size_a_list_property_by_its_own_elements_issue_1251() {
             .downcast_ref::<StringArray>()
             .unwrap();
         let lists = chunk
-            .column_by_name("tags")
+            .column_by_name("labels")
             .unwrap()
             .as_any()
             .downcast_ref::<arrow_array::ListArray>()
@@ -544,7 +544,7 @@ async fn bound_pairs_size_a_list_property_by_its_own_elements_issue_1251() {
     }
     pairs.sort();
     let expected: Vec<(String, Vec<String>)> = (0..EDGES)
-        .map(|edge| (format!("t{edge:03}"), tags(edge)))
+        .map(|edge| (format!("t{edge:03}"), labels(edge)))
         .collect();
     assert_eq!(pairs, expected);
     // 256 rows of about 1 KiB each fit one 1 MiB chunk.
