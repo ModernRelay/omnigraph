@@ -2467,19 +2467,79 @@ impl ManifestCoordinator {
         control_session: &Arc<lance::session::Session>,
         commit: &GraphLineageRow,
     ) -> Result<()> {
-        let (Some(native), Some(branch)) = (&commit.native_branch, &commit.graph_branch) else {
+        if Self::incarnation_is_live(root_uri, control_session, commit).await? {
             return Ok(());
-        };
-        let main = open_manifest_dataset_with_session(root_uri, None, control_session).await?;
-        let live = resolve_native_manifest_branch(&main, branch).await?;
-        if &live != native {
-            return Err(OmniError::manifest(format!(
-                "commit '{}' has no persisted native-branch incarnation witness: branch \
-                 '{branch}' was deleted and recreated after the commit was written",
-                commit.graph_commit_id
-            )));
         }
-        Ok(())
+        let branch = commit.graph_branch.clone().unwrap_or_default();
+        let main = open_manifest_dataset_with_session(root_uri, None, control_session).await?;
+        // A deleted name is `BranchNotFound`; a recreated one is a mismatch.
+        resolve_native_manifest_branch(&main, &branch).await?;
+        Err(OmniError::manifest(format!(
+            "commit '{}' has no persisted native-branch incarnation witness: branch \
+             '{branch}' was deleted and recreated after the commit was written",
+            commit.graph_commit_id
+        )))
+    }
+
+    /// Whether the incarnation that wrote `commit` is the live one of its
+    /// branch. A commit of main, or one with no recorded incarnation, is.
+    pub async fn incarnation_is_live(
+        root_uri: &str,
+        control_session: &Arc<lance::session::Session>,
+        commit: &GraphLineageRow,
+    ) -> Result<bool> {
+        let (Some(native), Some(branch)) = (&commit.native_branch, &commit.graph_branch) else {
+            return Ok(true);
+        };
+        Self::native_incarnation_is_live(root_uri, control_session, branch, native).await
+    }
+
+    /// Whether `native` is the live native ref of the logical `branch`. A
+    /// native ref name carries its incarnation, so a retired one never names
+    /// a recreated branch's history.
+    pub async fn native_incarnation_is_live(
+        root_uri: &str,
+        control_session: &Arc<lance::session::Session>,
+        branch: &str,
+        native: &str,
+    ) -> Result<bool> {
+        let main = open_manifest_dataset_with_session(root_uri, None, control_session).await?;
+        match resolve_native_manifest_branch(&main, branch).await {
+            Ok(live) => Ok(live == native),
+            Err(OmniError::BranchNotFound { .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The Lance identifier of the live native ref of `branch` now. A fresh
+    /// read, unlike [`Self::branch_identifier`]: it changes when the branch is
+    /// deleted and recreated, and a deleted branch is `BranchNotFound`.
+    pub async fn live_branch_identifier(
+        root_uri: &str,
+        control_session: &Arc<lance::session::Session>,
+        branch: &str,
+    ) -> Result<lance::dataset::refs::BranchIdentifier> {
+        let main = open_manifest_dataset_with_session(root_uri, None, control_session).await?;
+        let native = resolve_native_manifest_branch(&main, branch).await?;
+        crate::branch_control::get_branch_identifier(&main, &native)
+            .await
+            .map_err(|error| layout::branch_ref_error(error, branch))
+    }
+
+    /// The exact manifest a commit of a retired incarnation names, opened
+    /// through its live or retired native ref
+    /// ([`Self::pinned_graph_commit_with_session`]); a reclaimed manifest or
+    /// table pin is the loud gap that open reports. The caller has already
+    /// established that a live branch retains the commit.
+    pub async fn ensure_retired_incarnation_opens(
+        root_uri: &str,
+        control_session: &Arc<lance::session::Session>,
+        commit: &GraphLineageRow,
+    ) -> Result<()> {
+        let commit = commit_graph::graph_commit_from_manifest_row(commit.clone());
+        Self::pinned_graph_commit_with_session(root_uri, &commit, control_session)
+            .await
+            .map(drop)
     }
 
     /// Current graph-manifest version.
