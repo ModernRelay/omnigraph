@@ -117,6 +117,7 @@ binary's rows.
 | ContainsJoin | [2] |
 | CrossJoin | [2] |
 | CsvSource | [0] |
+| DeltaSource | [0] |
 | Expand | [1] |
 | Filter | [1] |
 | FragmentWrite | [1] |
@@ -176,6 +177,7 @@ binary's rows.
 | Aggregate | refused_by_name |
 | AntiJoin | refused_by_name |
 | CsvSource | refused_by_name |
+| DeltaSource | refused_by_name |
 | Expand | refused_by_name |
 | Filter | routable |
 | FragmentWrite | refused_by_name |

@@ -621,6 +621,40 @@ fn node_facts(node: &Value, facts: &mut Vec<LoadFact>) {
     }
 }
 
+/// Every fact of a staged write's planner documents, one document per
+/// validated table, in document order and deduplicated: the mutate and
+/// `branch merge` receipts carry no executed report, so the executed facts
+/// are the default's and a section never claims them.
+pub(crate) fn write_plan_facts(documents: &[Value]) -> Vec<String> {
+    let executed = LoadExecuted::default();
+    let mut facts: Vec<String> = Vec::new();
+    for document in documents {
+        for fact in plan_facts(document, &executed) {
+            let line = fact.spell();
+            if !facts.contains(&line) {
+                facts.push(line);
+            }
+        }
+    }
+    facts
+}
+
+/// The first expected fact no document of a staged write holds, with every
+/// fact the documents do hold, or `None` when all hold.
+pub(crate) fn write_plan_mismatch(expected: &[LoadFact], documents: &[Value]) -> Option<String> {
+    let actual = write_plan_facts(documents);
+    let missing = expected
+        .iter()
+        .map(LoadFact::spell)
+        .find(|line| !actual.contains(line))?;
+    let mut message = format!("write plan does not hold `{missing}`; the validated tables' facts:");
+    for line in &actual {
+        message.push_str("\n  ");
+        message.push_str(line);
+    }
+    Some(message)
+}
+
 /// The first expected fact the executed plan does not hold, with every fact
 /// the plan does hold, or `None` when all hold.
 pub(crate) fn load_plan_mismatch(

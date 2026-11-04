@@ -614,7 +614,15 @@ fn external_store_admission_refuses_before_workers() {
                 "target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]",
             ),
             Some(uri.as_str()),
-            "--store requires direct engine",
+            "--store root is not a directory",
+        ),
+        (
+            text.replace(
+                "target: omnigraph-engine\n    storage: local-filesystem",
+                "target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]",
+            ),
+            Some("s3://bucket/untouched"),
+            "--store takes a file:// root",
         ),
         (
             text.clone(),
@@ -905,7 +913,7 @@ fn external_store_missing_root_is_not_initialized() {
 }
 
 #[test]
-fn external_store_selects_direct_execution_from_a_mixed_case() {
+fn external_store_runs_every_selected_environment_of_a_mixed_case() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("graph");
     let uri = format!("file://{}", root.display());
@@ -928,20 +936,190 @@ fn external_store_selects_direct_execution_from_a_mixed_case() {
         }
         let output = command.output().unwrap();
         let (_, summary) = report(&output);
-        assert_eq!(
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !selected && !cfg!(tokio_unstable) {
+            assert!(!output.status.success());
+            assert!(
+                stderr.contains("DST runner is unavailable in this build"),
+                "{stderr}"
+            );
+            continue;
+        }
+        assert!(output.status.success(), "{stderr}");
+        let attempts = summary["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), if selected { 1 } else { 3 }, "{summary}");
+        assert_eq!(summary["scope"], if selected { "partial" } else { "full" });
+        assert!(
+            attempts
+                .iter()
+                .all(|attempt| attempt["input"]["store"] == uri),
+            "{summary}"
+        );
+    }
+}
+
+#[cfg(tokio_unstable)]
+#[test]
+fn prepared_store_under_dst_runs_a_concurrent_block_and_leaves_the_root_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("file://{}/graph", dir.path().display());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let db = omnigraph::db::Omnigraph::init(&uri, "node Person { name: String @key }")
+            .await
+            .unwrap();
+        omnigraph::Session::from_defaults(std::sync::Arc::new(db), Default::default())
+            .load_jsonl(
+                "{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}",
+                omnigraph::loader::LoadMode::Overwrite,
+            )
+            .await
+            .unwrap();
+    });
+    let path = dir.path().join("prepared.gqt");
+    std::fs::write(
+        &path,
+        "# issue: none\n--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n\n--- concurrent\nw1: query add_bob() { insert Person { name: \"bob\" } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1 park put __manifest/_versions/, r1 start, w1 put __manifest/_versions/, w1, r1\n--- expect\nw1: ok\nr1: ok\n\n--- query\nquery all() { match { $p: Person } return { $p.name } }\n--- expect unordered\n{\"p.name\":\"alice\"}\n{\"p.name\":\"bob\"}\n--- expect shape\np.name: String\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(&path)
+        .args(["--store", &uri, "--measure"])
+        .arg("--artifacts")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (_, summary) = report(&output);
+    assert_eq!(summary["attempts"][0]["input"]["store"], uri);
+    let observations = summary["attempts"][0]["outcome"]["Ok"]["observations"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        observations.iter().any(|event| {
+            event.as_str().is_some_and(|text| {
+                text.starts_with("prepared store: ") && text.contains("objects")
+            })
+        }),
+        "{observations:?}"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("GQT measure:"));
+    runtime.block_on(async {
+        let db = omnigraph::db::Omnigraph::open(&uri).await.unwrap();
+        let session =
+            omnigraph::Session::from_defaults(std::sync::Arc::new(db), Default::default());
+        let rows = session
+            .query(
+                omnigraph::db::ReadTarget::branch("main"),
+                "query all() { match { $p: Person } return { $p.name } }",
+                "all",
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.num_rows(), 1, "the prepared root must not change");
+    });
+}
+
+#[cfg(tokio_unstable)]
+#[test]
+fn prepared_store_under_dst_runs_seams_on_the_copy_and_refuses_foreign_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("graph");
+    let uri = format!("file://{}", root.display());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let db = omnigraph::db::Omnigraph::init(&uri, "node Person { name: String @key }")
+            .await
+            .unwrap();
+        omnigraph::Session::from_defaults(std::sync::Arc::new(db), Default::default())
+            .load_jsonl(
+                "{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}",
+                omnigraph::loader::LoadMode::Overwrite,
+            )
+            .await
+            .unwrap();
+    });
+    let header = "# issue: none\n--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n\n";
+    let retried = format!(
+        "{header}--- seam\nat: publish.load_state\noccurrence: 1\naction: contention\nscope: next_step\n\n--- mutate\nquery add_bob() {{ insert Person {{ name: \"bob\" }} }}\n--- expect affected: nodes=1 edges=0\n\n--- query\nquery all() {{ match {{ $p: Person }} return {{ $p.name }} }}\n--- expect unordered\n{{\"p.name\":\"alice\"}}\n{{\"p.name\":\"bob\"}}\n--- expect shape\np.name: String\n"
+    );
+    let windowed = format!(
+        "{header}--- seam\nat: mutation.post_table_commit\noccurrence: 1\naction: fail\nscope: next_step\n\n--- mutate\nquery add_bob() {{ insert Person {{ name: \"bob\" }} }}\n--- expect error: injected failpoint triggered: mutation.post_table_commit\n\n--- query\nquery all() {{ match {{ $p: Person }} return {{ $p.name }} }}\n--- expect unordered\n{{\"p.name\":\"alice\"}}\n--- expect shape\np.name: String\n"
+    );
+    let run = |name: &str, text: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, text).unwrap();
+        Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+            .arg(&path)
+            .args(["--store", &uri])
+            .arg("--artifacts")
+            .arg(dir.path())
+            .output()
+            .unwrap()
+    };
+    for (name, text) in [
+        ("copy_retried.gqt", &retried),
+        ("copy_windowed.gqt", &windowed),
+    ] {
+        let output = run(name, text);
+        assert!(
             output.status.success(),
-            selected,
-            "{}",
+            "{name}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(
-            summary["attempts"].as_array().unwrap().len(),
-            usize::from(selected)
+        let (_, summary) = report(&output);
+        let observations = summary["attempts"][0]["outcome"]["Ok"]["observations"].clone();
+        assert!(
+            observations.as_array().unwrap().iter().any(|event| event
+                .as_str()
+                .is_some_and(|t| t.starts_with("prepared store: "))),
+            "{name}: {observations:?}"
         );
-        if selected {
-            assert_eq!(summary["scope"], "partial");
-        }
     }
+    std::fs::write(root.join(".stray"), b"not an engine object").unwrap();
+    let output = run("copy_windowed.gqt", &windowed);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success());
+    assert!(
+        text.contains("prepared store holds an object of kind UNKNOWN: .stray"),
+        "{text}"
+    );
+    std::fs::remove_file(root.join(".stray")).unwrap();
+    std::os::unix::fs::symlink(".", root.join("loop")).unwrap();
+    let output = run("copy_windowed.gqt", &windowed);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success());
+    assert!(text.contains("prepared store holds a symlink"), "{text}");
+    std::fs::remove_file(root.join("loop")).unwrap();
+    runtime.block_on(async {
+        let db = omnigraph::db::Omnigraph::open(&uri).await.unwrap();
+        let session =
+            omnigraph::Session::from_defaults(std::sync::Arc::new(db), Default::default());
+        let rows = session
+            .query(
+                omnigraph::db::ReadTarget::branch("main"),
+                "query all() { match { $p: Person } return { $p.name } }",
+                "all",
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.num_rows(), 1, "the prepared root must not change");
+    });
 }
 
 #[test]

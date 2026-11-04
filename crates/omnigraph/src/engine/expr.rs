@@ -49,6 +49,7 @@ impl ProjectionContext {
                 | PhysicalNode::Aggregate { .. }
                 | PhysicalNode::Sort { .. }
                 | PhysicalNode::CsvSource { .. }
+                | PhysicalNode::DeltaSource { .. }
                 | PhysicalNode::Validate { .. }
                 | PhysicalNode::FragmentWrite { .. } => {}
             }

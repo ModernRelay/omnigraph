@@ -17,9 +17,6 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
-use omnigraph_compiler::catalog::Catalog;
-use omnigraph_planner::{ValidateRemoval, ValidateSpec};
-
 use futures::StreamExt;
 use tokio::sync::watch;
 
@@ -28,14 +25,14 @@ use super::external;
 use super::load_budget::ShareClass;
 use super::memory::WorkMemory;
 use super::shape::{BatchSender, Breaker, Streaming, work};
-use crate::db::{Omnigraph, Snapshot};
+use crate::db::Omnigraph;
 use crate::error::OmniError;
-use crate::loader::LoadMode;
 use crate::loader::read_reuse::LoadReadReuse;
-use crate::storage_layer::{DeletedIdBudget, WriteBudget};
+use crate::storage_layer::DeletedIdBudget;
 use crate::validate::load::{
     AdmittedSets, Extracted, LoadAdmission, LoadPhase, SweepPartial, SweepPlan, SweptSets,
-    admit_swept_sets, int_keyed, judge_load_swept, parse_scratch_bytes, position,
+    TableDelta, WriteJudge, admit_swept_sets, int_keyed, judge_write_swept, parse_scratch_bytes,
+    position,
 };
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::ir::ValidateCheck;
@@ -46,19 +43,6 @@ type PublishedSets = watch::Receiver<Option<Arc<SweptSets>>>;
 
 /// The `validated_rows` metric: the delta rows the operator judged.
 pub(crate) const VALIDATED_ROWS: &str = "validated_rows";
-
-/// What one validation judges against: the plan's checks, the statement's
-/// mode, and the committed image the transaction pins.
-pub(crate) struct LoadJudge {
-    pub(crate) db: Arc<Omnigraph>,
-    pub(crate) table: String,
-    pub(crate) checks: Vec<ValidateSpec>,
-    pub(crate) removal: ValidateRemoval,
-    pub(crate) mode: LoadMode,
-    pub(crate) write_budget: WriteBudget,
-    pub(crate) snapshot: Snapshot,
-    pub(crate) catalog: Arc<Catalog>,
-}
 
 /// The shape the plan's cut declares for the validation, the same fact the
 /// planner's `validate_streams` reads off the node.
@@ -91,18 +75,27 @@ type Forward = Option<Arc<tokio::sync::Mutex<BatchSender>>>;
 
 pub(crate) struct ValidateExec {
     input: Arc<dyn ExecutionPlan>,
-    judge: Arc<LoadJudge>,
+    judge: Arc<WriteJudge>,
+    db: Arc<Omnigraph>,
     shape: ValidateShape,
     metrics: ExecutionPlanMetricsSet,
 }
 
 impl ValidateExec {
-    /// `streams` is the planner's `validate_streams` for the node's checks.
-    pub(crate) fn new(input: Arc<dyn ExecutionPlan>, judge: LoadJudge, streams: bool) -> Self {
+    /// `streams` is the planner's `validate_streams` for the node's checks;
+    /// `judge` carries the plan's one table, judged against `db`.
+    pub(crate) fn new(
+        input: Arc<dyn ExecutionPlan>,
+        judge: WriteJudge,
+        db: Arc<Omnigraph>,
+        streams: bool,
+    ) -> Self {
+        assert_eq!(judge.tables.len(), 1, "ValidateExec judges one table");
         let schema = input.schema();
         Self {
             input,
             judge: Arc::new(judge),
+            db,
             shape: ValidateShape::new(schema, streams),
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -112,8 +105,8 @@ impl ValidateExec {
 impl fmt::Debug for ValidateExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ValidateExec")
-            .field("table", &self.judge.table)
-            .field("checks", &self.judge.checks.len())
+            .field("table", &self.judge.only().table)
+            .field("checks", &self.judge.only().checks.len())
             .finish_non_exhaustive()
     }
 }
@@ -122,6 +115,7 @@ impl DisplayAs for ValidateExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let checks: Vec<&str> = self
             .judge
+            .only()
             .checks
             .iter()
             .map(|spec| spec.check.name())
@@ -129,7 +123,7 @@ impl DisplayAs for ValidateExec {
         write!(
             f,
             "ValidateExec: {} [{}]",
-            self.judge.table,
+            self.judge.only().table,
             checks.join(", ")
         )
     }
@@ -163,6 +157,7 @@ impl ExecutionPlan for ValidateExec {
             shape: ValidateShape::new(input.schema(), streams),
             input,
             judge: Arc::clone(&self.judge),
+            db: Arc::clone(&self.db),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
     }
@@ -184,12 +179,8 @@ impl ExecutionPlan for ValidateExec {
         memory.metric("input_rows", 0);
         memory.metric(VALIDATED_ROWS, 0);
         let judge = Arc::clone(&self.judge);
-        let plan = Arc::new(SweepPlan::new(
-            &judge.table,
-            &judge.checks,
-            judge.mode == LoadMode::Overwrite,
-            partitions,
-        ));
+        let db = Arc::clone(&self.db);
+        let plan = Arc::new(judge.sweep_plan(0, partitions));
         if let Some(csv) = self.input.downcast_ref::<CsvSourceExec>() {
             let judge = Arc::clone(&judge);
             let plan = Arc::clone(&plan);
@@ -211,6 +202,7 @@ impl ExecutionPlan for ValidateExec {
                     judge_after_drain(
                         &memory,
                         &judge,
+                        &db,
                         &plan,
                         &batches,
                         drained.rows,
@@ -227,21 +219,29 @@ impl ExecutionPlan for ValidateExec {
                     Ok(())
                 },
             )),
-            ValidateShape::Streaming(streaming) => Ok(streaming.drive(
-                memory,
-                &self.metrics,
-                move |memory, sender| async move {
-                    let forward = Some(Arc::new(tokio::sync::Mutex::new(sender)));
-                    let drained = drain(
-                        partitions, ctx, &memory, &source, &schema, &plan, &judge, forward,
-                    )
-                    .await?;
-                    judge_after_drain(&memory, &judge, &plan, &[], drained.rows, drained.partials)
+            ValidateShape::Streaming(streaming) => {
+                Ok(
+                    streaming.drive(memory, &self.metrics, move |memory, sender| async move {
+                        let forward = Some(Arc::new(tokio::sync::Mutex::new(sender)));
+                        let drained = drain(
+                            partitions, ctx, &memory, &source, &schema, &plan, &judge, forward,
+                        )
                         .await?;
-                    drop(drained.facts);
-                    Ok(())
-                },
-            )),
+                        judge_after_drain(
+                            &memory,
+                            &judge,
+                            &db,
+                            &plan,
+                            &[],
+                            drained.rows,
+                            drained.partials,
+                        )
+                        .await?;
+                        drop(drained.facts);
+                        Ok(())
+                    }),
+                )
+            }
         }
     }
 }
@@ -267,7 +267,7 @@ async fn drain(
     source: &Arc<dyn ExecutionPlan>,
     schema: &arrow_schema::SchemaRef,
     plan: &Arc<SweepPlan>,
-    judge: &Arc<LoadJudge>,
+    judge: &Arc<WriteJudge>,
     forward: Forward,
 ) -> DfResult<Drained> {
     let admitted = admit_sets(memory, judge, plan).await?;
@@ -298,9 +298,11 @@ async fn drain(
 
 /// The checks judged over what the sweep extracted and, for the breaker,
 /// the held batches; the unique holders freed after the verdict.
+#[allow(clippy::too_many_arguments)]
 async fn judge_after_drain(
     memory: &Arc<WorkMemory>,
-    judge: &Arc<LoadJudge>,
+    judge: &Arc<WriteJudge>,
+    db: &Omnigraph,
     plan: &Arc<SweepPlan>,
     batches: &[RecordBatch],
     rows: usize,
@@ -331,7 +333,7 @@ async fn judge_after_drain(
         let mut admit_reuse = || {
             memory
                 .admit_read_reuse()
-                .and_then(|admitted| LoadReadReuse::new(&judge.db, &judge.snapshot, admitted))
+                .and_then(|admitted| LoadReadReuse::new(db, judge.snapshot(), admitted))
         };
         let mut deleted = DeletedIdBudget::new(judge.write_budget);
         let mut admit_removed = |id: &str| {
@@ -352,16 +354,14 @@ async fn judge_after_drain(
             };
             reserve().map_err(|error| charged.error(error))
         };
-        judge_load_swept(
-            &judge.table,
-            &judge.checks,
-            judge.removal,
-            &judge.catalog,
-            &judge.snapshot,
-            judge.mode,
-            batches,
-            rows,
-            extracted,
+        judge_write_swept(
+            judge,
+            db,
+            vec![TableDelta {
+                batches: batches.to_vec(),
+                rows,
+                extracted,
+            }],
             &mut LoadAdmission {
                 phase: Some(&mut admit_phase),
                 bytes: Some(&mut admit_bytes),
@@ -388,7 +388,7 @@ async fn drain_and_sweep(
     source: &Arc<dyn ExecutionPlan>,
     schema: &arrow_schema::SchemaRef,
     plan: &Arc<SweepPlan>,
-    judge: &Arc<LoadJudge>,
+    judge: &Arc<WriteJudge>,
     published: PublishedSets,
     forward: Forward,
 ) -> DfResult<Drained> {
@@ -475,7 +475,7 @@ async fn drain_and_sweep(
 /// parse and a refused set precedes them all.
 async fn admit_sets(
     memory: &Arc<WorkMemory>,
-    judge: &Arc<LoadJudge>,
+    judge: &Arc<WriteJudge>,
     plan: &SweepPlan,
 ) -> DfResult<Option<AdmittedSets>> {
     if !plan.sweeps_endpoints() {
@@ -493,16 +493,10 @@ async fn admit_sets(
                     .map_err(|error| memory.error(error))?;
                 Ok(Box::new(allocation))
             };
-            admit_swept_sets(
-                &judge.table,
-                &judge.checks,
-                &judge.snapshot,
-                judge.mode == LoadMode::Overwrite,
-                &mut admit,
-            )
-            .await
-            .map(Some)
-            .map_err(external)
+            admit_swept_sets(&judge, &mut admit)
+                .await
+                .map(Some)
+                .map_err(external)
         })
         .await
 }
@@ -512,7 +506,7 @@ async fn admit_sets(
 /// ones the caller releases after the drain. A failed read drops the sender.
 async fn load_sets(
     memory: Arc<WorkMemory>,
-    judge: Arc<LoadJudge>,
+    judge: Arc<WriteJudge>,
     admitted: Option<AdmittedSets>,
     publish: watch::Sender<Option<Arc<SweptSets>>>,
 ) -> DfResult<(Vec<Box<dyn Send>>, Vec<Box<dyn Send>>)> {
@@ -546,7 +540,7 @@ async fn sweep_partition(
     memory: Arc<WorkMemory>,
     source: Arc<dyn ExecutionPlan>,
     plan: Arc<SweepPlan>,
-    judge: Arc<LoadJudge>,
+    judge: Arc<WriteJudge>,
     mut published: PublishedSets,
     forward: Forward,
 ) -> DfResult<Swept> {
@@ -685,7 +679,7 @@ async fn sweep_partition(
 /// sweeps endpoints, and the entry of a batch a `holding` drain keeps.
 fn admit_facts(
     facts: &WorkMemory,
-    judge: &LoadJudge,
+    judge: &WriteJudge,
     plan: &SweepPlan,
     holding: bool,
     batch: &RecordBatch,
@@ -790,7 +784,7 @@ fn probe_batch(
     sets: &SweptSets,
 ) -> DfResult<()> {
     partial
-        .probe_endpoints(plan, batch, system_columns, base, sets)
+        .probe_endpoints(plan, batch, system_columns, base, sets, None)
         .map_err(external)
 }
 
@@ -811,16 +805,13 @@ async fn release_holders(memory: &Arc<WorkMemory>, plan: &SweepPlan) -> DfResult
 
 fn admit_validation(
     memory: &WorkMemory,
-    judge: &LoadJudge,
+    judge: &WriteJudge,
     batches: &[RecordBatch],
 ) -> DfResult<()> {
     let sc = judge.catalog.system_columns;
-    let replacement = judge.mode == LoadMode::Overwrite;
-    let needs_ids = judge.checks.iter().any(|spec| match spec.check {
-        ValidateCheck::Unique { .. } => spec.consults.is_some(),
-        ValidateCheck::SourceCardinality { .. } => true,
-        _ => false,
-    });
+    let table = judge.only();
+    let replacement = table.delta.replaces();
+    let needs_ids = judge.needs_ids(0);
     for batch in batches {
         let rows = batch.num_rows();
         let column = |name: &str| {
@@ -835,7 +826,7 @@ fn admit_validation(
             memory.entries::<String>(rows)?;
             memory.string(id_bytes)?;
         }
-        for spec in &judge.checks {
+        for spec in &table.checks {
             if let ValidateCheck::Unique { columns, .. } = &spec.check {
                 memory.entries::<(Vec<String>, String)>(rows)?;
                 if replacement {
@@ -846,7 +837,7 @@ fn admit_validation(
                     memory.string(id_bytes)?;
                     let names = columns
                         .iter()
-                        .fold(judge.table.len().saturating_add(128), |sum, name| {
+                        .fold(table.table.len().saturating_add(128), |sum, name| {
                             sum.saturating_add(name.len().saturating_mul(2))
                         });
                     memory.string(
@@ -909,7 +900,7 @@ fn admit_validation(
                 }
             }
         }
-        if judge.checks.iter().any(|spec| {
+        if table.checks.iter().any(|spec| {
             matches!(&spec.check, ValidateCheck::EdgeRi { node_type, .. } if !int_keyed(&judge.catalog, node_type))
         }) {
             let src_bytes = string_payload_bytes(column(sc.src)?);
@@ -920,7 +911,7 @@ fn admit_validation(
             memory.string(id_bytes)?;
             memory.string(src_bytes.saturating_add(dst_bytes).saturating_mul(4))?;
         }
-        if judge
+        if table
             .checks
             .iter()
             .any(|spec| matches!(spec.check, ValidateCheck::Cardinality { .. }))
@@ -936,7 +927,7 @@ fn admit_validation(
                     .saturating_add(src_bytes.saturating_mul(3)),
             )?;
         }
-        if judge
+        if table
             .checks
             .iter()
             .any(|spec| matches!(spec.check, ValidateCheck::SourceCardinality { .. }))
@@ -997,21 +988,52 @@ mod tests {
     use datafusion::execution::memory_pool::{
         GreedyMemoryPool, MemoryConsumer, MemoryPool, MemoryReservation,
     };
-    use omnigraph_compiler::catalog::build_catalog;
-    use omnigraph_compiler::ir::lower_load;
+    use omnigraph_compiler::catalog::{Catalog, build_catalog};
+    use omnigraph_compiler::ir::{DeltaClass, lower_load};
     use omnigraph_compiler::query::ast::{LoadStmt, LoadStmtMode, LoadTarget};
     use omnigraph_compiler::schema::parser::parse_schema;
     use omnigraph_compiler::settings::SessionSettings;
-    use omnigraph_planner::{ConsultedImage, EndpointProbe, ValidateAccess, ValidateRemoval};
+    use omnigraph_planner::{
+        ConsultedImage, EndpointProbe, ValidateAccess, ValidateRemoval, ValidateSpec,
+    };
 
     use super::super::csv_source::CSV_SLICE_METADATA;
     use super::super::fixtures;
     use super::super::load_budget::LoadBudget;
     use super::*;
+    use crate::db::{Omnigraph, Snapshot};
+    use crate::loader::LoadMode;
     use crate::loader::csv::{
         CSV_READ_BATCH_ROWS, CsvBytes, CsvLoadRequest, NormalizeStep, RangeScanner, ResolvedCsv,
         target_arrow_schema,
     };
+    use crate::storage_layer::WriteBudget;
+    use crate::validate::load::{JudgedSide, JudgedTable, RepeatRule, Report};
+
+    /// A one-table overwrite judge, the `load csv` plan's shape.
+    fn overwrite_judge(
+        db: &crate::Session,
+        table: &str,
+        checks: Vec<ValidateSpec>,
+        removal: ValidateRemoval,
+        snapshot: Snapshot,
+        catalog: Arc<Catalog>,
+    ) -> WriteJudge {
+        WriteJudge {
+            tables: vec![JudgedTable {
+                table: table.to_string(),
+                checks,
+                removal,
+                delta: DeltaClass::Replace,
+                deleted_ids: Vec::new(),
+            }],
+            committed: JudgedSide::Base(snapshot),
+            write_budget: WriteBudget::from_settings(db.settings()),
+            catalog,
+            report: Report::First,
+            repeat: RepeatRule::AcrossInput,
+        }
+    }
 
     const PERSON: &str = "node Person {\n  key: I64 @key\n  score: F64\n}\n";
 
@@ -1135,22 +1157,24 @@ mod tests {
                 probe: None,
             })
             .collect();
-        let judge = LoadJudge {
-            db: Arc::clone(db.db()),
-            table: "node:Person".to_string(),
+        let judge = overwrite_judge(
+            &db,
+            "node:Person",
             checks,
-            removal: if streams {
+            if streams {
                 ValidateRemoval::None
             } else {
                 ValidateRemoval::Scan
             },
-            mode: LoadMode::Overwrite,
-            write_budget: WriteBudget::from_settings(db.settings()),
-            snapshot: db.snapshot().await,
+            db.snapshot().await,
             catalog,
-        };
-        let validate =
-            ValidateExec::new(Arc::clone(&exec) as Arc<dyn ExecutionPlan>, judge, streams);
+        );
+        let validate = ValidateExec::new(
+            Arc::clone(&exec) as Arc<dyn ExecutionPlan>,
+            judge,
+            Arc::clone(db.db()),
+            streams,
+        );
         let judged = validate
             .execute(0, ctx)
             .unwrap()
@@ -1587,17 +1611,19 @@ mod tests {
             .collect()
     }
 
-    fn knows_judge(db: &crate::Session, checks: &[ValidateSpec], snapshot: &Snapshot) -> LoadJudge {
-        LoadJudge {
-            db: Arc::clone(db.db()),
-            table: "edge:Knows".to_string(),
-            checks: checks.to_vec(),
-            removal: ValidateRemoval::None,
-            mode: LoadMode::Overwrite,
-            write_budget: WriteBudget::from_settings(db.settings()),
-            snapshot: snapshot.clone(),
-            catalog: db.catalog(),
-        }
+    fn knows_judge(
+        db: &crate::Session,
+        checks: &[ValidateSpec],
+        snapshot: &Snapshot,
+    ) -> WriteJudge {
+        overwrite_judge(
+            db,
+            "edge:Knows",
+            checks.to_vec(),
+            ValidateRemoval::None,
+            snapshot.clone(),
+            db.catalog(),
+        )
     }
 
     /// The sets arrive after both partitions hold every batch, then before
@@ -1611,18 +1637,15 @@ mod tests {
         let sc = catalog.system_columns;
         let checks = swept_checks(&catalog);
         let snapshot = db.snapshot().await;
-        let (sets, _retained, _transient) =
-            admit_swept_sets("edge:Knows", &checks, &snapshot, true, &mut |_| {
-                Ok(Box::new(()))
-            })
+        let judge = Arc::new(knows_judge(&db, &checks, &snapshot));
+        let (sets, _retained, _transient) = admit_swept_sets(&judge, &mut |_| Ok(Box::new(())))
             .await
             .unwrap()
             .load(sc)
             .await
             .unwrap();
         let sets = Arc::new(sets);
-        let judge = Arc::new(knows_judge(&db, &checks, &snapshot));
-        let plan = Arc::new(SweepPlan::new("edge:Knows", &checks, true, 2));
+        let plan = Arc::new(judge.sweep_plan(0, 2));
         assert!(plan.sweeps_endpoints());
         let later_slice_missing_dst_at_row_1 = vec![
             knows_batch(sc, 1, &[("e4", "3", "1"), ("e5", "2", "9")]),
@@ -1685,16 +1708,14 @@ mod tests {
             let b = b.unwrap();
             let extracted = Extracted::prepare(&plan, vec![a.partial, b.partial]);
             let held: Vec<RecordBatch> = b.held.into_iter().chain(a.held).collect();
-            let refused = judge_load_swept(
-                "edge:Knows",
-                &checks,
-                ValidateRemoval::None,
-                &catalog,
-                &snapshot,
-                LoadMode::Overwrite,
-                &held,
-                a.rows + b.rows,
-                extracted,
+            let refused = judge_write_swept(
+                &judge,
+                &db,
+                vec![TableDelta {
+                    rows: a.rows + b.rows,
+                    batches: held,
+                    extracted,
+                }],
                 &mut LoadAdmission {
                     phase: None,
                     bytes: None,
@@ -1723,7 +1744,7 @@ mod tests {
         let catalog = db.catalog();
         let checks = swept_checks(&catalog);
         let snapshot = db.snapshot().await;
-        let plan = Arc::new(SweepPlan::new("edge:Knows", &checks, true, 2));
+        let plan = Arc::new(knows_judge(&db, &checks, &snapshot).sweep_plan(0, 2));
         let three_keys_scan_input = 3 * 8;
         let three_keys_in_four_slots_retained = (4 + 1) * 8 + 3 * 8;
         let four_slots_build_scratch = 4 * 8;
@@ -1742,6 +1763,7 @@ mod tests {
         let validate = ValidateExec::new(
             Arc::clone(&exec) as Arc<dyn ExecutionPlan>,
             knows_judge(&db, &checks, &snapshot),
+            Arc::clone(db.db()),
             false,
         );
         let (_pool, ctx) = fixtures::context(whole_set - 1, CSV_READ_BATCH_ROWS);
@@ -1877,6 +1899,7 @@ mod tests {
         let validate = ValidateExec::new(
             Arc::clone(&exec) as Arc<dyn ExecutionPlan>,
             knows_judge(&db, &checks, &snapshot),
+            Arc::clone(db.db()),
             false,
         );
         let ledger = Arc::new(ChargeLedger::new(64 << 20));

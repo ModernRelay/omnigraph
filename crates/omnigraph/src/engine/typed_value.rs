@@ -782,6 +782,7 @@ pub(super) fn validate_plan_values(
                 | PhysicalNode::Expand { .. }
                 | PhysicalNode::OuterReference { .. }
                 | PhysicalNode::CsvSource { .. }
+                | PhysicalNode::DeltaSource { .. }
                 | PhysicalNode::Validate { .. }
                 | PhysicalNode::FragmentWrite { .. } => {}
             }
