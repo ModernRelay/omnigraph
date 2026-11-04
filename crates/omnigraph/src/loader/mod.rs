@@ -3160,17 +3160,11 @@ fn build_column_from_json(
     write_budget: WriteBudget,
 ) -> Result<ArrayRef> {
     let array: ArrayRef = match data_type {
-        DataType::Utf8 => {
-            let values: Vec<Option<String>> = rows
-                .iter()
-                .map(|row| {
-                    row.get(name)
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                })
-                .collect();
-            Arc::new(StringArray::from(values))
-        }
+        DataType::Utf8 => Arc::new(
+            rows.iter()
+                .map(|row| row.get(name).and_then(|v| v.as_str()))
+                .collect::<StringArray>(),
+        ),
         DataType::Int32 => {
             let mut values = Vec::with_capacity(rows.len());
             for row in rows {
