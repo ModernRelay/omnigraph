@@ -482,14 +482,22 @@ For replay, session observations and result evidence are grouped in declaration
 order. Each session's event order and values are preserved; completion timing
 does not determine report order.
 
-While a session waits on the script the block drives the paused clock
-itself (RFC 0045 §Concurrent block says why) up to ten virtual seconds past
-the last cursor move or request; past that the clock stands still and the
+Nothing drives the paused clock while a session waits on the script (RFC
+0045 §Concurrent block says why): the runtime idles and tokio moves the
+clock only to the earliest pending timer, never while a task of its own
+blocking pool runs, so a session's work on a foreign thread takes no
+virtual time; Lance's CPU pool is a second runtime the paused clock does
+not see, so a hop onto it that overlaps another session's modeled sleep
+wakes before or after that one jump, a one-tick window Lance owns. A
+timer farther than the block's work fires the moment a session parks with
+nothing nearer pending, so the engine's commits run without Lance's commit
+timeout under simulation (`lance_commit::commit_builder`) and any other
+far timer ends the block as its own timeout, visibly. The
 block fails as starved when neither an entry nor a request arrives for half
-the case's `timeout_ms` of wall time, at most ten seconds, or when a
-session finishes without a request entry of its own. A session blocked in
-the engine while no session waits on the script ends as the case's
-timeout. The example above is the read-during-publish case: on an engine
+the case's `timeout_ms` of wall time, at most ten seconds, read off the
+runtime by a guard thread, or when a session finishes without a request
+entry of its own. A session blocked in the engine while no session waits
+on the script ends as the case's timeout. The example above is the read-during-publish case: on an engine
 whose publish holds the schema gate and the handle's coordinator lock
 across the manifest commit, `r1` waits behind `w1` (at the schema gate,
 before it reaches the coordinator lock) and the block starves at entry 3;
@@ -512,9 +520,10 @@ for an install that ends without a hold (`table`, `branch`,
 engine's `write_queue` module doc §Gates), and a session's `acquire`-to-`hold`
 spans on the virtual clock are summed per gate into `wait.<gate>` ticks, in
 its row's `waiting` column and in the TSV. The clock rule: the virtual clock
-moves only while a request sleeps its cost or the block drives it for a
-session waiting on the script, so a wait no request fills reads 0 and a 0 says
-the clock stood still, not that the gate was free; a wait at the front door
+moves only while a request sleeps its cost (or an engine timer its distance),
+so a wait is the modeled cost of what the holder did meanwhile, the same on
+every run of a seed; a wait no request fills reads 0 and a 0 says the clock
+stood still, not that the gate was free; a wait at the front door
 (a read parked at the schema gate before its first request) is in the row
 all the same, since the span starts at the crossing, not at a request. A gate
 seam is a wait event, not a phase: the session's phase stays the last other

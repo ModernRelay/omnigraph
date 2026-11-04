@@ -36,8 +36,8 @@ use lance::dataset::write::merge_insert::{
     MergeStats, SourceDedupeBehavior, UncommittedMergeInsert,
 };
 use lance::dataset::{
-    CommitBuilder, DeleteBuilder, InsertBuilder, MergeInsertBuilder, ReadBlobsStream, WhenMatched,
-    WhenNotMatched, WriteMode, WriteParams,
+    DeleteBuilder, InsertBuilder, MergeInsertBuilder, ReadBlobsStream, WhenMatched, WhenNotMatched,
+    WriteMode, WriteParams,
 };
 use lance::datatypes::Schema as LanceSchema;
 use lance::index::DatasetIndexExt;
@@ -1010,7 +1010,7 @@ async fn commit_detached(
     transaction: Transaction,
     affected_rows: Option<RowAddrTreeMap>,
 ) -> Result<Dataset> {
-    let mut builder = CommitBuilder::new(ds)
+    let mut builder = crate::lance_commit::commit_builder(ds)
         .with_skip_auto_cleanup(true)
         .with_detached(true);
     if let Some(affected_rows) = affected_rows {
@@ -3245,7 +3245,7 @@ impl TableStore {
     ) -> Result<Dataset> {
         let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         match dataset {
-            Some(mut ds) => {
+            Some(ds) => {
                 let params = WriteParams {
                     mode: WriteMode::Append,
                     allow_external_blob_outside_bases: true,
@@ -3253,10 +3253,17 @@ impl TableStore {
                     skip_auto_cleanup: true,
                     ..Default::default()
                 };
-                ds.append(reader, Some(params))
+                let ds = Arc::new(ds);
+                let transaction = InsertBuilder::new(Arc::clone(&ds))
+                    .with_params(&params)
+                    .execute_uncommitted(vec![batch])
                     .await
                     .map_err(OmniError::storage)?;
-                Ok(ds)
+                crate::lance_commit::commit_builder(ds)
+                    .with_skip_auto_cleanup(true)
+                    .execute(transaction)
+                    .await
+                    .map_err(OmniError::storage)
             }
             None => {
                 let control_session = crate::lance_access::control_session();
@@ -4469,7 +4476,7 @@ impl TableStore {
         )
         .await
         .map_err(OmniError::storage)?;
-        let dataset = CommitBuilder::new(dataset_uri)
+        let dataset = crate::lance_commit::commit_builder(dataset_uri)
             .with_commit_handler(handler)
             .use_stable_row_ids(true)
             .with_storage_format(LanceFileVersion::V2_2)
@@ -4509,7 +4516,7 @@ impl TableStore {
         // upgraded graphs. Skipping here covers the staged write path (the main
         // data path) for new and legacy datasets alike, preventing Lance from
         // GC'ing versions the __manifest still pins for snapshots/time-travel.
-        let mut builder = CommitBuilder::new(ds).with_skip_auto_cleanup(true);
+        let mut builder = crate::lance_commit::commit_builder(ds).with_skip_auto_cleanup(true);
         if mode == StagedCommitMode::EffectFreeExact {
             builder = builder.with_max_retries(0);
         }

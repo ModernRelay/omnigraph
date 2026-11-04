@@ -36,6 +36,7 @@ pub mod graph_index;
 pub(crate) use omnigraph_core::handle_cache;
 pub mod instrumentation;
 pub(crate) use omnigraph_core::lance_access;
+pub(crate) use omnigraph_core::lance_commit;
 pub(crate) use omnigraph_core::{dataset_index, staging};
 pub mod loader;
 pub(crate) mod ordered_cursor;

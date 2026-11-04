@@ -137,6 +137,7 @@ pub fn run_universe<E: UniverseEnvironment, S: UniverseScenario<E::Resources>>(
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_time()
                     .start_paused(true)
+                    .max_blocking_threads(1)
                     .rng_seed(tokio::runtime::RngSeed::from_bytes(
                         &runtime_seed.to_le_bytes(),
                     ))
