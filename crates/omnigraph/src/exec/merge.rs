@@ -381,8 +381,9 @@ fn escaped_delete_literal_bytes(id: &str) -> Result<u64> {
 /// [#7185]: https://github.com/lance-format/lance/issues/7185
 #[derive(Debug)]
 struct AdoptDelta {
-    /// New-on-source rows → a streaming strict exact-`id` fenced merge. The
-    /// source stays batch-bounded while retaining `WhenMatched::Fail` semantics.
+    /// New-on-source rows → batch-bounded strict inserts: each chunk probes
+    /// the pinned target for its ids and stages one certified insert-only
+    /// `Update`.
     inserts: Option<StagedTable>,
     /// Changed-on-source rows → a fenced upsert bounded to the
     /// genuinely-changed set, not the whole delta).
@@ -4603,11 +4604,12 @@ async fn publish_adopted_delta(
         })?
         .into_parts();
 
-    // Phase 1a: strict-insert the NEW rows through RFC-023's streaming exact-id
-    // adapter. The ordered walk classified them as absent at the pinned base,
-    // but `WhenMatched::Fail` is still required: a concurrent same-key writer
-    // must conflict rather than letting this optimization bypass the fence.
-    // The adapter keeps wide vector/blob rows streaming and batch-bounded.
+    // Phase 1a: strict-insert the NEW rows through RFC-023's exact-id adapter.
+    // The ordered walk classified them as absent at the pinned base; each
+    // chunk still probes its pinned parent and returns `KeyConflict` for an
+    // existing id. Every chunk commits detached, which runs no Lance conflict
+    // pass; the `__manifest` publish CAS orders concurrent writers. The
+    // adapter keeps wide vector/blob rows streaming and batch-bounded.
     let mut chain = MergeChain::new(
         target_txn.authority.staging_witness()?,
         crate::db::omnigraph::table_ops::declared_full_text_columns(&target_txn.catalog, table_key),
