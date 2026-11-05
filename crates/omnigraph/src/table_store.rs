@@ -145,6 +145,44 @@ pub(crate) fn sort_input_batch_bytes(memory_limit: u64) -> usize {
     (memory_limit / 4).clamp(1, ORDERED_SCAN_MAX_INPUT_BATCH_BYTES) as usize
 }
 
+/// `plan` with a `HardCapBatchSizeExec` of `input_batch_bytes` under every
+/// `SortExec`, its partitions merged into one stream: in order when the plan
+/// declares an output ordering, otherwise as they arrive.
+///
+/// DataFusion cannot spill a first `SortExec` input batch larger than its
+/// memory pool; Lance applies the same hard cap below the sorts of MergeInsert.
+pub(crate) fn cap_sort_inputs_and_merge_partitions(
+    plan: Arc<dyn ExecutionPlan>,
+    input_batch_bytes: usize,
+) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+    let plan = plan
+        .transform_down(|node| {
+            if node.downcast_ref::<SortExec>().is_some() {
+                let children = node
+                    .children()
+                    .into_iter()
+                    .map(|child| {
+                        Arc::new(HardCapBatchSizeExec::new(
+                            Arc::clone(child),
+                            input_batch_bytes,
+                        )) as Arc<dyn ExecutionPlan>
+                    })
+                    .collect();
+                Ok(Transformed::yes(node.with_new_children(children)?))
+            } else {
+                Ok(Transformed::no(node))
+            }
+        })?
+        .data;
+    Ok(if plan.output_partitioning().partition_count() == 1 {
+        plan
+    } else if let Some(ordering) = plan.output_ordering() {
+        Arc::new(SortPreservingMergeExec::new(ordering.clone(), plan))
+    } else {
+        Arc::new(CoalescePartitionsExec::new(plan))
+    })
+}
+
 /// DataFusion's sort spill reservation under a pool of `memory_limit` bytes.
 pub(crate) fn sort_spill_reservation_bytes(memory_limit: u64) -> usize {
     (memory_limit / 3).min(40 * 1024 * 1024) as usize
@@ -2816,29 +2854,8 @@ impl TableStore {
 
         let input_batch_limit = sort_input_batch_bytes(memory_limit);
         let plan = scanner.create_plan().await.map_err(OmniError::storage)?;
-        // DataFusion cannot spill a first SortExec input batch that is larger
-        // than its memory pool. Lance applies this same hard-cap node below
-        // sorts in MergeInsert; ordered graph scans do so here as well.
-        let plan = plan
-            .transform_down(|node| {
-                if node.downcast_ref::<SortExec>().is_some() {
-                    let children = node
-                        .children()
-                        .into_iter()
-                        .map(|child| {
-                            Arc::new(HardCapBatchSizeExec::new(
-                                Arc::clone(child),
-                                input_batch_limit,
-                            )) as Arc<dyn ExecutionPlan>
-                        })
-                        .collect();
-                    Ok(Transformed::yes(node.with_new_children(children)?))
-                } else {
-                    Ok(Transformed::no(node))
-                }
-            })
-            .map_err(OmniError::datafusion_internal)?
-            .data;
+        let plan = cap_sort_inputs_and_merge_partitions(plan, input_batch_limit)
+            .map_err(OmniError::datafusion_internal)?;
 
         // Own one runtime context for this execution. Lance's general helper
         // caches contexts; after LRU eviction an active old context can coexist
@@ -2865,14 +2882,6 @@ impl TableStore {
         if let Some(batch_size) = options.batch_size {
             state.config_mut().options_mut().execution.batch_size = batch_size;
         }
-        let plan: Arc<dyn ExecutionPlan> = if plan.properties().partitioning.partition_count() == 1
-        {
-            plan
-        } else if let Some(ordering) = plan.output_ordering() {
-            Arc::new(SortPreservingMergeExec::new(ordering.clone(), plan))
-        } else {
-            Arc::new(CoalescePartitionsExec::new(plan))
-        };
         let stream = plan
             .execute(0, state.task_ctx())
             .map_err(OmniError::datafusion_internal)?;

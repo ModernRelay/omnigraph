@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use futures::StreamExt;
 use lance::index::DatasetIndexExt;
+use lance_table::io::commit::ManifestNamingScheme;
 
 use crate::db::commit_graph::{CommitGraph, GraphCommit, Lineage, MergeBaseResolver};
 use crate::db::manifest::retention::{ManifestTagInventory, incarnation_digest, merge_input_owner};
@@ -1299,11 +1300,15 @@ pub(crate) async fn plan_collection(
     Ok(report)
 }
 
+/// The version a detached manifest's file name carries. Lance's parser reads
+/// the number before the first dot and ignores the extension, so a staging
+/// name (`d{version}.manifest-{uuid}`) would parse too; only a `.manifest`
+/// name is a version.
 fn parse_detached_name(name: &str) -> Option<u64> {
-    name.strip_prefix('d')?
-        .strip_suffix(".manifest")?
-        .parse::<u64>()
-        .ok()
+    if !name.ends_with(".manifest") {
+        return None;
+    }
+    ManifestNamingScheme::parse_detached_version(name)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2256,6 +2261,24 @@ mod path_probe_tests {
             }
         }
         assert!(captured.missing_paths().await.unwrap().is_empty());
+    }
+
+    /// A detached manifest name parses back to the version Lance wrote it
+    /// for; a linear name, a staging name and the version hint do not.
+    #[test]
+    fn detached_manifest_names_parse_through_lance() {
+        let version = lance_table::format::DETACHED_VERSION_MASK | 7;
+        let base = object_store::path::Path::from("table.lance");
+        for naming in [ManifestNamingScheme::V1, ManifestNamingScheme::V2] {
+            let path = naming.manifest_path(&base, version);
+            let name = path.filename().unwrap();
+            assert_eq!(parse_detached_name(name), Some(version), "{name}");
+            let linear = naming.manifest_path(&base, 7);
+            assert_eq!(parse_detached_name(linear.filename().unwrap()), None);
+            let staging = format!("{name}-9c100374-3298-4537-afc6-f5ee7913666d");
+            assert_eq!(parse_detached_name(&staging), None);
+        }
+        assert_eq!(parse_detached_name("latest_version_hint.json"), None);
     }
 }
 
