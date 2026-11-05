@@ -1196,9 +1196,8 @@ impl StagedMutation {
         fail(&catalog::FORK_BEFORE_CLASSIFY)?;
 
         let witness = txn.authority.staging_witness()?;
-        let mut updates: Vec<DatasetUpdate> = Vec::with_capacity(staged.len());
-        let mut detached_tables = Vec::with_capacity(staged.len());
-        for entry in staged {
+        let witness = &witness;
+        let commits = staged.into_iter().map(|entry| async move {
             let StagedTableEntry {
                 table_key,
                 path,
@@ -1218,7 +1217,7 @@ impl StagedMutation {
             );
             let (detached, identity) = db
                 .storage()
-                .commit_staged_detached(dataset, staged_write, &witness, &declared_full_text)
+                .commit_staged_detached(dataset, staged_write, witness, &declared_full_text)
                 .await?;
             let state = db.storage().table_state(&path.full_path, &detached).await?;
             let target = expected_version + 1;
@@ -1227,16 +1226,24 @@ impl StagedMutation {
                 .with_table_fork_owner(table_fork_owner)
                 .with_staged(state.version, identity.uuid.clone())
                 .with_last_linear_version(path.entry.version_metadata.last_linear_version());
-            detached_tables.push((table_key.clone(), detached));
-            updates.push(DatasetUpdate {
+            let update = DatasetUpdate {
                 identity: path.identity,
-                type_key: table_key,
+                type_key: table_key.clone(),
                 published_dataset_version: target,
                 native_dataset_branch: path.table_branch,
                 entity_count: state.row_count,
                 version_metadata,
-            });
+            };
             fail(&MUTATION_POST_TABLE_COMMIT)?;
+            Ok::<_, OmniError>((table_key, detached, update))
+        });
+        let committed = futures::future::join_all(commits).await;
+        let mut updates: Vec<DatasetUpdate> = Vec::with_capacity(committed.len());
+        let mut detached_tables = Vec::with_capacity(committed.len());
+        for result in committed {
+            let (table_key, detached, update) = result?;
+            detached_tables.push((table_key, detached));
+            updates.push(update);
         }
 
         Ok(CommittedMutation {
