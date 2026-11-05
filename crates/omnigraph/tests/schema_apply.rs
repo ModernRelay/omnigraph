@@ -3762,3 +3762,233 @@ async fn prepared_schema_numeric_fence_rejects_metadata_interposed_after_effects
         }
     ));
 }
+
+// Issue #721: a nullable property that every row now fills can be promoted to
+// required and unique without rebuilding the graph. Promotion must refuse,
+// leaving the accepted schema in force, while a null or a duplicate remains.
+const ISSUE_721_V1: &str = "node Decision {\n    slug: String @key\n    ref: String?\n}\n";
+const ISSUE_721_V2: &str = "node Decision {\n    slug: String @key\n    ref: String @unique\n}\n";
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn issue_721_backfilled_nullable_property_promotes_to_required_unique() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
+    db.load_jsonl(
+        "{\"type\":\"Decision\",\"data\":{\"slug\":\"a\",\"ref\":\"D-1\"}}\n\
+         {\"type\":\"Decision\",\"data\":{\"slug\":\"b\",\"ref\":\"D-2\"}}",
+        LoadMode::Merge,
+    )
+    .await
+    .expect("backfilled rows load");
+
+    let result = db
+        .apply_schema(ISSUE_721_V2)
+        .await
+        .expect("promotion of a fully backfilled, distinct property must apply");
+    assert!(result.supported && result.applied);
+
+    db.load_jsonl(
+        r#"{"type":"Decision","data":{"slug":"c"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect_err("a missing required value must be rejected after promotion");
+    db.load_jsonl(
+        r#"{"type":"Decision","data":{"slug":"d","ref":"D-1"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect_err("a duplicate unique value must be rejected after promotion");
+    db.load_jsonl(
+        r#"{"type":"Decision","data":{"slug":"e","ref":"D-3"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("a distinct value is accepted");
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn issue_721_promotion_refuses_while_a_null_or_duplicate_remains() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
+    db.load_jsonl(
+        "{\"type\":\"Decision\",\"data\":{\"slug\":\"a\",\"ref\":\"D-1\"}}\n\
+         {\"type\":\"Decision\",\"data\":{\"slug\":\"b\"}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let error = db
+        .apply_schema(ISSUE_721_V2)
+        .await
+        .expect_err("a null remains");
+    assert!(
+        error.to_string().contains("Decision") && error.to_string().contains("'ref'"),
+        "{error}"
+    );
+
+    db.load_jsonl(
+        "{\"type\":\"Decision\",\"data\":{\"slug\":\"b\",\"ref\":\"D-1\"}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.apply_schema(ISSUE_721_V2)
+        .await
+        .expect_err("a duplicate remains");
+
+    // The previous schema stays usable: a null is still accepted.
+    db.load_jsonl(
+        r#"{"type":"Decision","data":{"slug":"z"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("failed validation leaves the accepted schema in force");
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn issue_721_promoted_table_still_evolves_and_reopens() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
+    db.load_jsonl(
+        r#"{"type":"Decision","data":{"slug":"a","ref":"D-1"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.apply_schema(ISSUE_721_V2)
+        .await
+        .expect("promotion applies");
+
+    // A later, unrelated change to the same table still plans and applies.
+    let v3 =
+        "node Decision {\n    slug: String @key\n    ref: String @unique\n    note: String?\n}\n";
+    db.apply_schema(v3)
+        .await
+        .expect("a later schema change applies");
+
+    // A fresh handle reads the promoted schema and keeps enforcing it.
+    let reopened = helpers::session(Omnigraph::open(uri).await.unwrap());
+    reopened
+        .load_jsonl(
+            r#"{"type":"Decision","data":{"slug":"c","note":"n"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .expect_err("a reopened graph still requires ref");
+    reopened
+        .load_jsonl(
+            r#"{"type":"Decision","data":{"slug":"d","ref":"D-9","note":"n"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .expect("a complete row loads");
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn issue_721_promotion_tightens_the_lance_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
+    db.load_jsonl(
+        r#"{"type":"Decision","data":{"slug":"a","ref":"D-1"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert!(
+        before
+            .open_dataset("node:Decision")
+            .await
+            .unwrap()
+            .schema()
+            .field("ref")
+            .unwrap()
+            .nullable
+    );
+
+    db.apply_schema(ISSUE_721_V2)
+        .await
+        .expect("promotion applies");
+
+    let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let dataset = after.open_dataset("node:Decision").await.unwrap();
+    assert!(
+        !dataset.schema().field("ref").unwrap().nullable,
+        "the Lance column is required after promotion"
+    );
+    assert_eq!(
+        after
+            .dataset("node:Decision")
+            .unwrap()
+            .published_dataset_version,
+        before
+            .dataset("node:Decision")
+            .unwrap()
+            .published_dataset_version
+            + 1,
+        "the tightening is one table commit"
+    );
+}
+
+// A deleted row keeps its null in the data file, so the null check counts it:
+// the promotion is refused until `optimize` rewrites the fragment, and then
+// applies. A later schema change and write also succeed.
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn issue_721_deleted_null_row_before_promotion() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
+    db.load_jsonl(
+        "{\"type\":\"Decision\",\"data\":{\"slug\":\"a\",\"ref\":\"D-1\"}}\n\
+         {\"type\":\"Decision\",\"data\":{\"slug\":\"gone\"}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    mutate_main(
+        &db,
+        "query rm($slug: String) { delete Decision where slug = $slug }",
+        "rm",
+        &params(&[("slug", "gone")]),
+    )
+    .await
+    .unwrap();
+    let error = db
+        .apply_schema(ISSUE_721_V2)
+        .await
+        .expect_err("a deleted row still holds the null");
+    assert!(
+        error.to_string().contains("deleted rows included"),
+        "{error}"
+    );
+    db.optimize()
+        .await
+        .expect("optimize purges the deleted row");
+    db.apply_schema(ISSUE_721_V2)
+        .await
+        .expect("promotion applies");
+    let v3 =
+        "node Decision {\n    slug: String @key\n    ref: String @unique\n    note: String?\n}\n";
+    db.apply_schema(v3)
+        .await
+        .expect("a later column addition applies");
+    db.optimize()
+        .await
+        .expect("compaction rewrites the fragment holding the deleted null");
+    db.load_jsonl(
+        r#"{"type":"Decision","data":{"slug":"d","ref":"D-2","note":"n"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("a write after the later change succeeds");
+}

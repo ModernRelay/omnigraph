@@ -347,6 +347,8 @@ where
     let mut dropped_tables = BTreeSet::new();
     let mut property_renames = HashMap::<String, HashMap<String, String>>::new();
     let mut changed_edge_tables = false;
+    let mut promotion_required = HashMap::<String, Vec<String>>::new();
+    let mut promotion_unique = HashMap::<String, Vec<Vec<String>>>::new();
 
     for step in &plan.steps {
         match step {
@@ -418,6 +420,30 @@ where
             // committed row is valid under the wider set, so no table data is
             // touched — the accepted catalog update alone makes the unified
             // validator accept the new variants on all three write surfaces.
+            SchemaMigrationStep::AddConstraint {
+                type_kind,
+                type_name,
+                constraint: omnigraph_compiler::schema::ast::Constraint::Unique(columns),
+            } => {
+                let table_key = schema_table_key(*type_kind, type_name);
+                promotion_unique
+                    .entry(table_key.clone())
+                    .or_default()
+                    .push(columns.clone());
+                evolved_tables.insert(table_key);
+            }
+            SchemaMigrationStep::RequireProperty {
+                type_kind,
+                type_name,
+                property_name,
+            } => {
+                let table_key = schema_table_key(*type_kind, type_name);
+                promotion_required
+                    .entry(table_key.clone())
+                    .or_default()
+                    .push(property_name.clone());
+                evolved_tables.insert(table_key);
+            }
             SchemaMigrationStep::AddConstraint { .. }
             | SchemaMigrationStep::ExtendEnum { .. }
             | SchemaMigrationStep::UpdateTypeMetadata { .. }
@@ -682,12 +708,29 @@ where
             })
             .unwrap_or_default();
         renames.sort();
-        let evolution = TableStore::plan_schema_evolution(source_ds.dataset(), &target, &renames)
+        let source_dataset = source_ds.dataset();
+        // #721: a promotion judges the committed rows under the gates held
+        // here, before any table moves; a violation leaves the graph as is.
+        let required = promotion_required
+            .get(table_key)
+            .cloned()
+            .unwrap_or_default();
+        let unique = promotion_unique.get(table_key).cloned().unwrap_or_default();
+        if !required.is_empty() || !unique.is_empty() {
+            if let Some(violation) =
+                TableStore::promotion_violation(source_dataset, &required, &unique).await?
+            {
+                return Err(OmniError::manifest(format!(
+                    "[promotion refused] {table_key}: {violation}"
+                )));
+            }
+        }
+        let evolution = TableStore::plan_schema_evolution(source_dataset, &target, &renames)
             .map_err(|error| {
-            OmniError::manifest(format!(
-                "schema apply cannot evolve table '{source_table_key}' in place: {error}"
-            ))
-        })?;
+                OmniError::manifest(format!(
+                    "schema apply cannot evolve table '{source_table_key}' in place: {error}"
+                ))
+            })?;
         evolutions.insert(table_key.clone(), evolution);
     }
 

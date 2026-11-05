@@ -931,7 +931,7 @@ gateway_surfaces! {
         "scan_proven_insert_delta_bounded", "include_proven_insert_blob_selection",
         "scan_stream", "scan_stream_bounded",
         "scan_stream_with", "scan_plan_with", "scan_plan_with_filter", "ordered_scan_error", "scan", "scan_with",
-        "count_rows",
+        "count_rows", "promotion_violation",
         "dataset_version", "table_state", "scan_with_staged", "scan_with_pending",
         "scan_with_pending_materialized_blobs", "count_rows_with_staged",
         "has_btree_index", "has_fts_index", "has_fts_postings",

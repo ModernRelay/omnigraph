@@ -203,7 +203,8 @@ omnigraph schema apply --schema next.pg --target ./graph.omni
 
 Supported changes include adding types, adding nullable properties, renaming
 nodes, edges, or properties with `@rename_from`, adding index declarations,
-widening an enum with new values, updating descriptions or instructions, and
+widening an enum with new values, making a nullable property required, adding
+`@unique` to a node type, updating descriptions or instructions, and
 dropping node, edge, or property declarations. Dropping a property also drops
 every constraint that names only dropped properties: its own `@index`,
 `@unique`, `@range` or `@check`, and a composite constraint whose members are
@@ -220,14 +221,27 @@ their values. They still grow with the table's metadata: its columns, its
 indexes and its fragments, of which a table written by many small commits has
 more until `omnigraph optimize` compacts them.
 
+Making a nullable property required and adding `@unique` to a node type read the
+stored rows first, under the locks the apply holds, and change nothing if a row
+breaks the rule. A property becomes required only when no row holds a null,
+deleted rows included; run `omnigraph optimize` to purge a deleted row that still
+holds one. `@unique` is added only when no two rows share the key, and the check
+refuses a table of more than 5,000,000 distinct keys. A refused apply leaves the
+accepted schema in force. A successful one keeps entity ids, relationships and
+retained commits, and later writes are checked against the new rule. To add a
+required or unique property to a populated type, add it nullable, load its
+values, then promote it. Promotion rewrites no data file; making a property
+required also makes its storage column non-nullable in one extra table commit.
+
 Applying changed schema text, including comments or formatting, records the new
 source in one graph commit even when no table changes are needed. Applying the
 same accepted source again leaves the graph unchanged.
 
-Changes such as adding a required property to existing entities, changing a property
-type (except enum widening), changing edge endpoints or cardinality, adding an
+Changes such as adding a required property to existing entities (add it nullable,
+then promote it), changing a property
+type (except enum widening and making a property required), changing edge endpoints or cardinality, adding an
 edge type with a non-zero `@card` minimum from an existing node type, changing a
-node's implemented interfaces, adding a constraint other than `@index`,
+node's implemented interfaces, adding a constraint other than `@index` and a node's `@unique`,
 removing a constraint from a property that stays, and adding, removing or
 changing an existing type's `@key` are rejected. A drop is rejected when it
 would remove a constraint that also names a field that stays, such as

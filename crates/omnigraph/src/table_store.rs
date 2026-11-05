@@ -952,6 +952,10 @@ pub struct SchemaEvolution {
     /// The `(field id, name)` columns, in order, of the dataset the next step
     /// must be staged against: the planned base, then each step's result.
     expected: Vec<(i32, String)>,
+    /// #721: a column goes from nullable to required, so the `Project` commit
+    /// must not preserve nullability. The caller has judged that no row holds
+    /// a null.
+    tightens: bool,
 }
 
 /// A schema's columns as `(field id, name)` in pre-order: the identity a
@@ -4838,6 +4842,84 @@ impl TableStore {
         Ok(StagedWrite::new(transaction, Vec::new(), Vec::new()))
     }
 
+    /// Most distinct keys one `@unique` promotion check holds in memory. A
+    /// larger table is refused rather than risking the process (#721).
+    pub(crate) const PROMOTION_UNIQUE_KEY_CAP: usize = 5_000_000;
+
+    /// #721: judge the rows of `ds` against the constraints a schema promotion
+    /// would add. Returns the first violation: a null in a column about to
+    /// become required, or a key held by two live rows of a group about to
+    /// become unique. Reads only the named columns. The null check includes
+    /// deleted rows, whose values stay in the data files, so the column can be
+    /// made non-nullable physically. The key check holds at most
+    /// `PROMOTION_UNIQUE_KEY_CAP` keys and refuses a larger table.
+    pub(crate) async fn promotion_violation(
+        ds: &Dataset,
+        required: &[String],
+        unique: &[Vec<String>],
+    ) -> Result<Option<String>> {
+        for column in required {
+            let mut scanner = ds.scan();
+            scanner
+                .project(&[column.as_str()])
+                .map_err(OmniError::storage)?;
+            scanner.with_row_id().include_deleted_rows();
+            let mut stream = scanner
+                .try_into_stream()
+                .await
+                .map_err(OmniError::storage)?;
+            let mut nulls = 0usize;
+            while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+                let values = batch.column_by_name(column).ok_or_else(|| {
+                    OmniError::manifest_internal(format!("scan lost column '{column}'"))
+                })?;
+                nulls += values.null_count();
+            }
+            if nulls > 0 {
+                return Ok(Some(format!(
+                    "{nulls} row(s), deleted rows included, hold a null in '{column}'; backfill them, or run optimize to purge deleted rows, before making it required"
+                )));
+            }
+        }
+        for group in unique {
+            let mut scanner = ds.scan();
+            scanner.project(group).map_err(OmniError::storage)?;
+            let mut stream = scanner
+                .try_into_stream()
+                .await
+                .map_err(OmniError::storage)?;
+            let mut seen = HashSet::<Vec<String>>::new();
+            while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+                let columns = group
+                    .iter()
+                    .map(|name| {
+                        batch.column_by_name(name).cloned().ok_or_else(|| {
+                            OmniError::manifest_internal(format!("scan lost column '{name}'"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for row in 0..batch.num_rows() {
+                    if let Some(key) = crate::loader::composite_unique_key(&columns, row)? {
+                        if !seen.insert(key.clone()) {
+                            return Ok(Some(format!(
+                                "value {key:?} of ({}) is held by more than one row; make the values distinct before adding @unique",
+                                group.join(", ")
+                            )));
+                        }
+                        if seen.len() > Self::PROMOTION_UNIQUE_KEY_CAP {
+                            return Err(OmniError::manifest(format!(
+                                "@unique({}) cannot be checked: the table holds more than {} distinct keys",
+                                group.join(", "),
+                                Self::PROMOTION_UNIQUE_KEY_CAP
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Plan the metadata-only commits that move a table from its dataset
     /// schema to `target`, the desired physical schema in catalog order, with
     /// `renames` naming each renamed column as `(from, to)`. Reads only the
@@ -4873,6 +4955,7 @@ impl TableStore {
         let mut consumed = HashSet::<&str>::new();
         let mut renamed = false;
         let mut added = false;
+        let mut tightens = false;
         for target_field in target.fields() {
             let name = target_field.name().as_str();
             let source = match source_of.get(name) {
@@ -4909,7 +4992,9 @@ impl TableStore {
                 .expect("the source column was found above");
             let desired = lance::datatypes::Field::try_from(target_field.as_ref())
                 .map_err(OmniError::lance_internal)?;
-            if existing.data_type() != desired.data_type() || existing.nullable != desired.nullable
+            let tightening = existing.nullable && !desired.nullable;
+            if existing.data_type() != desired.data_type()
+                || (existing.nullable != desired.nullable && !tightening)
             {
                 return Err(OmniError::manifest_internal(format!(
                     "column '{source}' cannot become '{name}' without a rewrite: {:?} (nullable {}) -> {:?} (nullable {})",
@@ -4920,6 +5005,10 @@ impl TableStore {
                 )));
             }
             let mut field = existing.clone();
+            if tightening {
+                field.nullable = false;
+                tightens = true;
+            }
             if source != name {
                 field.name = name.to_string();
                 renamed = true;
@@ -4981,6 +5070,7 @@ impl TableStore {
                 project,
                 merge: None,
                 expected,
+                tightens,
             });
         }
         let project = if renamed || dropped {
@@ -5001,6 +5091,7 @@ impl TableStore {
             project,
             merge: Some(evolved),
             expected,
+            tightens,
         })
     }
 
@@ -5032,7 +5123,7 @@ impl TableStore {
             evolution.expected = schema_columns(&schema);
             Operation::Project {
                 schema,
-                preserves_nullability: true,
+                preserves_nullability: !evolution.tightens,
             }
         } else if let Some(schema) = evolution.merge.take() {
             evolution.expected = schema_columns(&schema);
