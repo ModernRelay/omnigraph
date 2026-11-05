@@ -173,8 +173,12 @@ versions, and `C` the bounded publish chunks.
 | Adopt with delta | At least two full ordered scans, base and source | New rows use preflighted fenced inserts; changed rows use update-only `KnownPresentUpdate`; deletes are chunked |
 | General three-way | Lineage candidate discovery and filtered reads when proven; otherwise at least three full ordered scans | New rows use preflighted fenced inserts; existing rows use `KnownPresentUpdate`; deletes are chunked |
 
-Strict insertion keeps Lance's index-disabled, filter-bearing path so the
-transaction carries the exact-`id` conflict proof. `KnownPresentUpdate` can use an `id` index
+Strict insertion probes the pinned target for its ids, then stages a
+join-free, insert-only `Update` carrying the exact-`id` key filter. That
+filter backs Omnigraph's own insertion-absence certificate
+(`omnigraph.insert_absence`), not a Lance conflict check: a detached commit
+runs no Lance conflict pass, and the `__manifest` publish CAS orders
+concurrent writers. `KnownPresentUpdate` can use an `id` index
 when its coverage is safe, falls back to the full join otherwise, and never
 inserts.
 

@@ -3623,8 +3623,8 @@ impl TableStore {
             // completed statistics prove this execution inserted every row,
             // but an unfamiliar future transaction shape must disable the
             // history shortcut rather than fail an otherwise valid logical
-            // write. StrictInsert keeps the same check mandatory because its
-            // exact filter is part of the requested conflict semantics.
+            // write. StrictInsert returned above; its writer certifies every
+            // insertion unconditionally.
             tracing::debug!(
                 type_key,
                 error = %error,
@@ -4003,21 +4003,23 @@ impl TableStore {
         system_columns: SystemColumns,
         context: &'static str,
     ) -> Result<(StagedWrite, MergeStats)> {
+        // Strict insertion never reaches merge-insert: `stage_keyed_write`
+        // and `stage_proven_strict_insert` stage it through
+        // `stage_absence_proven_strict_insert`.
+        let when_not_matched = match semantics {
+            KeyedWriteSemantics::Upsert => WhenNotMatched::InsertAll,
+            KeyedWriteSemantics::KnownPresentUpdate => WhenNotMatched::DoNothing,
+            KeyedWriteSemantics::StrictInsert => {
+                return Err(OmniError::manifest_internal(format!(
+                    "{context}: strict insert must stage through the absence-proven insert writer"
+                )));
+            }
+        };
         let mut builder =
             MergeInsertBuilder::try_new(Arc::new(ds), vec![system_columns.id.to_string()])
                 .map_err(OmniError::lance_internal)?;
-        builder.when_matched(match semantics {
-            KeyedWriteSemantics::StrictInsert => WhenMatched::Fail,
-            KeyedWriteSemantics::Upsert | KeyedWriteSemantics::KnownPresentUpdate => {
-                WhenMatched::UpdateAll
-            }
-        });
-        builder.when_not_matched(match semantics {
-            KeyedWriteSemantics::KnownPresentUpdate => WhenNotMatched::DoNothing,
-            KeyedWriteSemantics::StrictInsert | KeyedWriteSemantics::Upsert => {
-                WhenNotMatched::InsertAll
-            }
-        });
+        builder.when_matched(WhenMatched::UpdateAll);
+        builder.when_not_matched(when_not_matched);
         if semantics != KeyedWriteSemantics::KnownPresentUpdate {
             // Lance's scalar-index v1 route omits the inserted-row key filter.
             // Every insertion-capable path therefore forces v2 and validates
@@ -4034,17 +4036,10 @@ impl TableStore {
             .await
             .map_err(OmniError::lance_stream)?;
 
-        match semantics {
-            KeyedWriteSemantics::StrictInsert => {
-                validate_exact_id_filter(&uncommitted, id_field_id, context)?;
-                validate_strict_insert_merge_stats(&uncommitted, merged_rows, context)?;
-            }
-            KeyedWriteSemantics::Upsert => {
-                validate_exact_id_filter(&uncommitted, id_field_id, context)?;
-            }
-            KeyedWriteSemantics::KnownPresentUpdate => {
-                validate_known_present_update(&uncommitted, id_field_id, merged_rows, context)?;
-            }
+        if semantics == KeyedWriteSemantics::KnownPresentUpdate {
+            validate_known_present_update(&uncommitted, id_field_id, merged_rows, context)?;
+        } else {
+            validate_exact_id_filter(&uncommitted, id_field_id, context)?;
         }
         let stats = uncommitted.stats.clone();
         if semantics == KeyedWriteSemantics::KnownPresentUpdate {
@@ -7018,7 +7013,8 @@ fn validate_keyed_write_batch_ids(
 
 /// Assert the exact RFC-023 substrate proof carried by pinned Lance's v2
 /// merge-insert route.  Checking both public copies makes a future Lance
-/// refactor that drops the transaction-level conflict filter fail closed.
+/// refactor that drops the transaction's inserted-row key filter fail closed;
+/// the insertion-absence certificate and the merge proof read that filter.
 fn validate_exact_id_filter(
     uncommitted: &UncommittedMergeInsert,
     id_field_id: i32,
@@ -7029,25 +7025,6 @@ fn validate_exact_id_filter(
     if uncommitted.inserted_rows_filter.as_ref() != Some(transaction_filter) {
         return Err(OmniError::manifest_internal(format!(
             "{context}: Lance uncommitted result and transaction disagree on the inserted-row key filter"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_strict_insert_merge_stats(
-    uncommitted: &UncommittedMergeInsert,
-    expected_rows: u64,
-    context: &'static str,
-) -> Result<()> {
-    let stats = &uncommitted.stats;
-    if !merge_stats_prove_pure_insert(stats, expected_rows) {
-        return Err(OmniError::manifest_internal(format!(
-            "{context}: strict insert merge stats were inserted={}, updated={}, deleted={}, skipped={}, attempts={}; expected inserted={expected_rows}, updated=0, deleted=0, skipped=0, attempts=1",
-            stats.num_inserted_rows,
-            stats.num_updated_rows,
-            stats.num_deleted_rows,
-            stats.num_skipped_duplicates,
-            stats.num_attempts,
         )));
     }
     Ok(())
