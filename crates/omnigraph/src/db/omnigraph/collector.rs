@@ -166,7 +166,9 @@ pub struct TableCollectionPlan {
     /// Physical object-store prefixes borrowed by retained native snapshots.
     pub(crate) borrowed_origins: BTreeSet<String>,
     pub(crate) object_base: String,
-    orphan_sizes: BTreeMap<String, u64>,
+    /// The sizes the location's listing gave for the paths the run deletes,
+    /// an orphan `_indices/<uuid>` directory as the sum of its files.
+    listed_sizes: BTreeMap<String, u64>,
     /// Linear versions above the last linear version (above the newest pin
     /// any registration names while none is recorded).
     pub foreign_versions: Vec<u64>,
@@ -317,7 +319,8 @@ pub(crate) async fn sweep_table(
     let naming = dataset.manifest_location().naming_scheme;
     let base = location_base(dataset);
     fail(&CLEANUP_SWEEP_PRE_FILE_DELETE)?;
-    stats.bytes_removed += delete_paths(&store, &base, &plan.sweep_paths).await?;
+    stats.bytes_removed +=
+        delete_paths(&store, &base, &plan.sweep_paths, &plan.listed_sizes).await?;
     fail(&CLEANUP_SWEEP_PRE_MANIFEST_DELETE)?;
     for (index, version) in plan.would_remove().iter().enumerate() {
         if index > 0 {
@@ -330,7 +333,8 @@ pub(crate) async fn sweep_table(
     }
     let dead = plan.dead_stagings();
     if !dead.is_empty() {
-        stats.bytes_removed += delete_paths(&store, &base, &plan.dead_paths).await?;
+        stats.bytes_removed +=
+            delete_paths(&store, &base, &plan.dead_paths, &plan.listed_sizes).await?;
         fail(&CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE)?;
     }
     for version in dead {
@@ -340,7 +344,8 @@ pub(crate) async fn sweep_table(
         stats.manifests_removed += 1;
         stats.unpublished_removed += 1;
     }
-    stats.bytes_removed += delete_paths(&store, &base, &plan.orphan_paths).await?;
+    stats.bytes_removed +=
+        delete_paths(&store, &base, &plan.orphan_paths, &plan.listed_sizes).await?;
     Ok(())
 }
 
@@ -353,8 +358,9 @@ fn location_base(dataset: &lance::Dataset) -> object_store::path::Path {
 }
 
 /// Delete the location-relative `paths` (never an inherited `base:` file),
-/// an `_indices/<uuid>` entry as a directory; returns the bytes freed,
-/// with a file an earlier pass already removed counting nothing. A pass
+/// an `_indices/<uuid>` entry as a directory; returns the bytes freed, a
+/// file at the size the plan's listing gave (`sizes`), with a file an
+/// earlier pass already removed counting nothing. A pass
 /// that stops between these files and their manifest plans the manifest
 /// again, so an absent index directory is already deleted, not an error
 /// (the local store reports one as `NotFound`; object stores list it empty).
@@ -362,6 +368,7 @@ async fn delete_paths(
     store: &lance::io::ObjectStore,
     base: &object_store::path::Path,
     paths: &BTreeSet<String>,
+    sizes: &BTreeMap<String, u64>,
 ) -> Result<u64> {
     let mut bytes = 0;
     for path in paths {
@@ -379,7 +386,7 @@ async fn delete_paths(
             }
             continue;
         }
-        bytes += delete_object(store, &full, None).await?;
+        bytes += delete_object(store, &full, sizes.get(path).copied()).await?;
     }
     Ok(bytes)
 }
@@ -1432,6 +1439,9 @@ async fn plan_orphans(
                 plan.dead_paths.insert(relative.clone());
             }
         }
+        if plan.sweep_paths.contains(&relative) || plan.dead_paths.contains(&relative) {
+            plan.listed_sizes.insert(relative.clone(), file.size);
+        }
         if plan.referenced_paths.contains(&key) {
             continue;
         }
@@ -1441,14 +1451,14 @@ async fn plan_orphans(
             slot.0 &= old;
             slot.1 += file.size;
         } else if old {
-            plan.orphan_sizes.insert(relative.clone(), file.size);
+            plan.listed_sizes.insert(relative.clone(), file.size);
             plan.orphan_paths.insert(relative);
             plan.orphan_bytes += file.size;
         }
     }
     for (dir, (all_old, bytes)) in index_dirs {
         if all_old {
-            plan.orphan_sizes.insert(dir.clone(), bytes);
+            plan.listed_sizes.insert(dir.clone(), bytes);
             plan.orphan_paths.insert(dir);
             plan.orphan_bytes += bytes;
         }
@@ -1859,7 +1869,7 @@ fn protect_borrowed_files(report: &mut CollectorReport) {
         plan.orphan_bytes = plan
             .orphan_paths
             .iter()
-            .filter_map(|path| plan.orphan_sizes.get(path))
+            .filter_map(|path| plan.listed_sizes.get(path))
             .sum();
     }
 }
