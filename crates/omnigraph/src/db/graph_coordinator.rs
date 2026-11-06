@@ -112,6 +112,20 @@ pub(crate) struct GraphCoordinator {
     bound_branch: Option<String>,
 }
 
+/// An operation-local copy of the exact immutable view: table state and head
+/// copied (O(tables)), history cache and Lance session shared; a publish or
+/// refresh runs on the copy and installs it (`Omnigraph::install_coordinator`).
+impl Clone for GraphCoordinator {
+    fn clone(&self) -> Self {
+        Self {
+            root_uri: self.root_uri.clone(),
+            storage: Arc::clone(&self.storage),
+            manifest: self.manifest.capture(),
+            bound_branch: self.bound_branch.clone(),
+        }
+    }
+}
+
 /// What a merge reads of one captured branch beside its write transaction: the
 /// captured head's record, the buffer of the `__manifest` version that holds
 /// it, and the commit graph that can load that exact head's lineage if needed.
@@ -330,12 +344,7 @@ impl GraphCoordinator {
     /// state and the head are copied; the history cache and the Lance session
     /// are shared. Callers must first probe the complete manifest incarnation.
     pub(crate) fn capture_for_branch_control(&self) -> Self {
-        Self {
-            root_uri: self.root_uri.clone(),
-            storage: Arc::clone(&self.storage),
-            manifest: self.manifest.capture(),
-            bound_branch: self.bound_branch.clone(),
-        }
+        self.clone()
     }
 
     pub fn root_uri(&self) -> &str {
@@ -482,18 +491,23 @@ impl GraphCoordinator {
         self.manifest.held_commit(commit_id).is_some()
     }
 
-    /// Whether `commit_id` is on the first-parent chain from the head this
-    /// coordinator holds: the head and the buffered commits answer with no
-    /// read, [`first_parent_chain_holds_in`] walks the chain below them.
-    pub(crate) async fn first_parent_chain_holds(
+    /// Whether `descendant`, a commit of this coordinator's branch, descends
+    /// from `commit_id` through first parents with no merge commit after it:
+    /// the head and the buffered commits answer with no read,
+    /// [`descends_linearly_from_in`] walks the chain below them.
+    pub(crate) async fn descends_linearly_from(
         &self,
+        descendant: &str,
         commit_id: &str,
         generation: u64,
     ) -> Result<bool> {
-        if self.holds_commit(commit_id) {
-            return Ok(true);
-        }
-        first_parent_chain_holds_in(&self.manifest.commit_graph(), commit_id, generation).await
+        descends_linearly_from_in(
+            &self.manifest.commit_graph(),
+            descendant,
+            commit_id,
+            Some(generation),
+        )
+        .await
     }
 
     pub async fn branch_list(&self) -> Result<Vec<String>> {
@@ -661,22 +675,84 @@ impl GraphCoordinator {
         }
     }
 
+    /// The state of a settled commit, from the `table` rows of its record,
+    /// admitted by [`admit_commit`] against every live branch.
+    async fn settled_commit_state(
+        &self,
+        control_session: &Arc<lance::session::Session>,
+        record: HistoryRecord,
+        snapshot_id: &SnapshotId,
+    ) -> Result<CommitState> {
+        let root_uri = self.root_uri();
+        let retired = Box::pin(admit_commit(
+            root_uri,
+            control_session,
+            &record.commit,
+            Retention::LiveBranches(self),
+            snapshot_id.as_str(),
+        ))
+        .await?;
+        let mut snapshot = Snapshot::wrap(record.snapshot(root_uri, control_session)?);
+        if retired {
+            snapshot = snapshot.retired_incarnation();
+        }
+        Ok(CommitState {
+            commit: graph_commit_from_manifest_row(record.commit),
+            snapshot,
+        })
+    }
+
+    /// Whether the history of a live branch (main first) reaches `commit_id`
+    /// through parents and merged parents. Read only when a commit's writing
+    /// incarnation is gone, so the live-branch read pays nothing for it.
+    async fn retained_by_live_branch(&self, commit_id: &str) -> Result<bool> {
+        let mut branches = vec![None];
+        branches.extend(self.all_branches().await?.into_iter().map(Some));
+        for branch in branches {
+            let other = self.open_sibling(branch.as_deref()).await?;
+            let lineage = other.lineage().await?;
+            let mut seen = std::collections::HashSet::new();
+            let mut pending = vec![lineage.head().graph_commit_id.clone()];
+            while let Some(id) = pending.pop() {
+                if id == commit_id {
+                    return Ok(true);
+                }
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                if let Some(commit) = lineage.get_commit(&id) {
+                    pending.extend(commit.parent_commit_id.clone());
+                    pending.extend(commit.merged_parent_commit_id.clone());
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// The commit `snapshot_id` names and the graph as of it, from its record:
     /// held by this coordinator, else in `__history`, else in a live branch.
-    /// Refused once the branch incarnation that wrote it is not live.
+    /// A retired writer incarnation is read only through [`admit_commit`].
     async fn commit_state(&self, snapshot_id: &SnapshotId) -> Result<CommitState> {
         let session = self.manifest.control_session();
         let id = snapshot_id.as_str();
         if self.exact_graph_head().as_deref() == Some(id) {
-            ManifestCoordinator::ensure_incarnation_live(
+            // The captured head is retention only while this branch is still
+            // that incarnation; a retired writer goes through the one door.
+            let retired = Box::pin(admit_commit(
                 self.root_uri(),
                 &session,
                 self.manifest.head(),
-            )
+                Retention::LiveBranches(self),
+                id,
+            ))
             .await?;
+            let mut snapshot = self.snapshot();
+            if retired {
+                snapshot = snapshot.retired_incarnation();
+            }
             return Ok(CommitState {
                 commit: self.head_commit(),
-                snapshot: self.snapshot(),
+                snapshot,
             });
         }
         let record = match self.manifest.held_record(id) {
@@ -691,7 +767,9 @@ impl GraphCoordinator {
             },
         };
         match record {
-            Some(record) => settled_commit_state(self.root_uri(), &session, record).await,
+            Some(record) => {
+                Box::pin(self.settled_commit_state(&session, record, snapshot_id)).await
+            }
             None => {
                 if let Some(candidate) = self.unpublished_commit(id).await? {
                     candidate.require_readable()?;
@@ -850,16 +928,8 @@ impl GraphCoordinator {
         // fences cursor ABA. This is the identifier captured with the head and
         // lineage above, never a fresh ref read that could name a replacement.
         let witness = match self.current_branch() {
-            None => crate::changes::token::hashed_identity("branch:main"),
-            Some(_) => {
-                let identifier = self.branch_identifier().await?;
-                let encoded = serde_json::to_string(&identifier).map_err(|error| {
-                    OmniError::manifest_internal(format!(
-                        "failed to encode Lance branch identifier: {error}"
-                    ))
-                })?;
-                crate::changes::token::hashed_identity(&encoded)
-            }
+            None => branch_witness(None)?,
+            Some(_) => branch_witness(Some(&self.branch_identifier().await?))?,
         };
         // One walk finds genesis AND builds the forward first-parent child
         // index (chain member → its unique on-chain child), so a poll can walk
@@ -1102,35 +1172,106 @@ impl GraphCoordinator {
     }
 }
 
-/// Whether `commit_id` is on the first-parent chain from `graph`'s head
-/// ([`CommitGraph::first_parent_chain_holds`]), a page of
+/// Whether `descendant` descends from `commit_id` through first parents with
+/// no merge commit after it, walked in `graph`
+/// ([`CommitGraph::descends_linearly_from`]) a page of
 /// [`FIRST_PARENT_WALK_COMMITS`] at a time; a commit `__history` no longer
 /// holds answers `false`, and the caller takes the exact merge.
-pub(crate) async fn first_parent_chain_holds_in(
+pub(crate) async fn descends_linearly_from_in(
     graph: &CommitGraph,
+    descendant: &str,
     commit_id: &str,
-    generation: u64,
+    generation: Option<u64>,
 ) -> Result<bool> {
     graph
-        .first_parent_chain_holds(commit_id, generation, FIRST_PARENT_WALK_COMMITS)
+        .descends_linearly_from(descendant, commit_id, generation, FIRST_PARENT_WALK_COMMITS)
         .await
 }
 
 /// Commits one step of a whole-chain walk reads before the next.
 const FIRST_PARENT_WALK_COMMITS: usize = 1024;
 
-/// The state of a settled commit, from the `table` rows of its record.
-async fn settled_commit_state(
+/// The change-feed witness of a branch: a hash of its Lance identifier
+/// (`None`: main, which cannot be deleted or recreated).
+pub(crate) fn branch_witness(
+    identifier: Option<&lance::dataset::refs::BranchIdentifier>,
+) -> Result<String> {
+    let Some(identifier) = identifier else {
+        return Ok(crate::changes::token::hashed_identity("branch:main"));
+    };
+    let encoded = serde_json::to_string(identifier).map_err(|error| {
+        OmniError::manifest_internal(format!("failed to encode Lance branch identifier: {error}"))
+    })?;
+    Ok(crate::changes::token::hashed_identity(&encoded))
+}
+
+/// What retains a commit whose writing incarnation is gone.
+pub(crate) enum Retention<'a> {
+    /// Any live branch whose parents or merged parents reach it.
+    LiveBranches(&'a GraphCoordinator),
+    /// The polled branch (`None`: main), while it is still the incarnation
+    /// `witness` names.
+    PolledBranch {
+        branch: Option<&'a str>,
+        witness: &'a str,
+    },
+}
+
+/// The one decision for reading a settled commit. `Ok(false)`: its writing
+/// incarnation is live, the existing path. `Ok(true)`: the writer is retired,
+/// something in `retention` still reaches the commit, and the retired native
+/// ref matching that exact commit opens (a reclaimed manifest is that open's
+/// loud gap); the caller marks its snapshot retired. Otherwise the commit is
+/// the not-found of `spelling`, the id the caller used and never the deleted
+/// branch, or the incarnation-witness refusal of a recreated name.
+pub(crate) async fn admit_commit(
     root_uri: &str,
     control_session: &Arc<lance::session::Session>,
-    record: HistoryRecord,
-) -> Result<CommitState> {
-    ManifestCoordinator::ensure_incarnation_live(root_uri, control_session, &record.commit).await?;
-    let snapshot = Snapshot::wrap(record.snapshot(root_uri, control_session)?);
-    Ok(CommitState {
-        commit: graph_commit_from_manifest_row(record.commit),
-        snapshot,
-    })
+    commit: &omnigraph_catalog::GraphLineageRow,
+    retention: Retention<'_>,
+    spelling: &str,
+) -> Result<bool> {
+    if ManifestCoordinator::incarnation_is_live(root_uri, control_session, commit).await? {
+        return Ok(false);
+    }
+    let retained = match retention {
+        Retention::LiveBranches(coordinator) => {
+            // Boxed: the walk's future would otherwise deepen every caller's
+            // layout past the crate dependents' recursion limit.
+            Box::pin(coordinator.retained_by_live_branch(&commit.graph_commit_id)).await?
+        }
+        Retention::PolledBranch {
+            branch: None,
+            witness: _,
+        } => true,
+        Retention::PolledBranch {
+            branch: Some(branch),
+            witness,
+        } => {
+            let fresh =
+                ManifestCoordinator::live_branch_identifier(root_uri, control_session, branch)
+                    .await;
+            match fresh {
+                Ok(identifier) => branch_witness(Some(&identifier))? == witness,
+                Err(OmniError::BranchNotFound { .. }) => false,
+                Err(error) => return Err(error),
+            }
+        }
+    };
+    if !retained {
+        return match ManifestCoordinator::ensure_incarnation_live(root_uri, control_session, commit)
+            .await
+        {
+            Ok(()) => Ok(false),
+            Err(OmniError::BranchNotFound { .. }) => Err(OmniError::ReadTargetNotFound {
+                target: spelling.to_string(),
+            }),
+            Err(error) => Err(error),
+        };
+    }
+    ManifestCoordinator::ensure_retired_incarnation_opens(root_uri, control_session, commit)
+        .await?;
+    Ok(true)
 }
 
 pub(crate) fn commit_not_found(snapshot_id: &SnapshotId) -> OmniError {

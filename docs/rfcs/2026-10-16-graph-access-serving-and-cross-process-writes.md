@@ -1596,15 +1596,6 @@ proposal.
   credentials" for that case only: the rule stays in force for self-hosted
   OIDC servers and every other client, and the launcher's refusal of a managed
   target (the target table and Opening Studio) is unchanged.
-
-- 2026-10-29: Pending amendment. [Remote optimize through the serving
-  owner](2026-10-29-remote-optimize-through-the-serving-owner.md), a draft, runs a served
-  cluster root's `optimize` in the process that holds the cluster lock,
-  through graph-scoped routes with a durable operation record. Once it is
-  accepted, `optimize` leaves the "Runs where the storage is" row of the
-  exception table for served cluster roots and stays there for direct
-  targets. The other commands in that row are unchanged. The table stands
-  unchanged until acceptance.
 - 2026-10-30: The server's `--mcp-allow-adhoc` and `--mcp-allow-writes` boot
   settings are removed ([RFC 0003](0003-mcp-server-surface.md), decision log
   2026-10-29): `/mcp` lists every tool and the applied policy is the write

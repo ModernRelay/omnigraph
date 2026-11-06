@@ -389,7 +389,7 @@ impl ManifestCoordinator {
             };
         }
         Err(OmniError::manifest_not_found(format!(
-            "merge base '{}' has no matching retained native manifest at version {}",
+            "commit '{}' has no matching retained native manifest at version {}",
             commit.graph_commit_id, commit.graph_manifest_version,
         )))
     }

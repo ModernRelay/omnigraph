@@ -609,7 +609,7 @@ impl object_store::ObjectStore for FaultInjectingOsStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
-        crate::cost::tally("l.put", payload.content_length() as u64);
+        crate::cost::tally_at("l.put", payload.content_length() as u64, location.as_ref());
         if let Some(rule) = publication_fault()
             && rule.take(location.as_ref(), &opts)
         {
@@ -650,7 +650,7 @@ impl object_store::ObjectStore for FaultInjectingOsStore {
         location: &OsPath,
         opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        crate::cost::tally("l.put_multipart", 0);
+        crate::cost::tally_at("l.put_multipart", 0, location.as_ref());
         let _turn = fault(false, "put_multipart", location.as_ref()).await?;
         assert!(
             kill_state().is_none(),
@@ -667,8 +667,19 @@ impl object_store::ObjectStore for FaultInjectingOsStore {
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
         let _turn = fault(true, "get", location.as_ref()).await?;
+        let head = options.head;
         let result = self.inner.get_opts(location, options).await?;
-        crate::cost::tally("l.get", result.meta.size);
+        // The golden counts a HEAD as `l.get`; only the instrument's path
+        // log tells the two apart, and carries the byte range read.
+        if head {
+            crate::cost::tally_at("l.get", result.meta.size, &format!("{location}#head"));
+        } else {
+            crate::cost::tally_at(
+                "l.get",
+                result.meta.size,
+                &format!("{location}#{:?}", result.range),
+            );
+        }
         // The violation-tier canary: flip one seeded byte in
         // the targeted response. Rebuild the GetResult around the mutated
         // payload (same meta/range/attributes — a LIE, not a truncation).
@@ -720,7 +731,7 @@ impl object_store::ObjectStore for FaultInjectingOsStore {
                 let inner = Arc::clone(&inner);
                 async move {
                     let path = path_res?;
-                    crate::cost::tally("l.delete", 0);
+                    crate::cost::tally_at("l.delete", 0, path.as_ref());
                     let _in_flight = kill_state().map(|k| k.enter_write());
                     let _turn = fault(false, "delete", path.as_ref()).await?;
                     inner.delete(&path).await?;
@@ -742,7 +753,7 @@ impl object_store::ObjectStore for FaultInjectingOsStore {
             let label = prefix.as_ref().map(|p| p.to_string()).unwrap_or_default();
             match fault(true, "list", &label).await {
                 Ok(_turn) => {
-                    crate::cost::tally("l.list", 0);
+                    crate::cost::tally_at("l.list", 0, &label);
                     inner.list(prefix.as_ref())
                 }
                 Err(e) => futures::stream::once(futures::future::ready(Err(e))).boxed(),
@@ -757,7 +768,7 @@ impl object_store::ObjectStore for FaultInjectingOsStore {
         prefix: Option<&OsPath>,
     ) -> object_store::Result<ListResult> {
         let label = prefix.map(|p| p.to_string()).unwrap_or_default();
-        crate::cost::tally("l.list", 0);
+        crate::cost::tally_at("l.list", 0, &label);
         let _turn = fault(true, "list_with_delimiter", &label).await?;
         self.inner.list_with_delimiter(prefix).await
     }
@@ -768,7 +779,7 @@ impl object_store::ObjectStore for FaultInjectingOsStore {
         to: &OsPath,
         options: CopyOptions,
     ) -> object_store::Result<()> {
-        crate::cost::tally("l.copy", 0);
+        crate::cost::tally_at("l.copy", 0, from.as_ref());
         let _in_flight = kill_state().map(|k| k.enter_write());
         let _turn = fault(false, "copy", from.as_ref()).await?;
         let out = self.inner.copy_opts(from, to, options).await;

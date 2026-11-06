@@ -53,6 +53,28 @@ Large results use `next_page_token`. The CLI normally follows every page;
 is not a feed cursor. Parentless commits and unsupported schema-boundary diffs return `409`;
 capture a baseline instead of treating them as empty changes.
 
+## Compare two points or review a branch
+
+```bash
+omnigraph diff --from <commit-id> --to main --target ./graph.omni --json
+omnigraph branch diff feature --into main --target ./graph.omni --json
+omnigraph branch merge-base feature --into main --target ./graph.omni --json
+```
+
+`diff` reports the net change from `from` to `to` (each a branch head or a
+commit id) in the `commit changes` shape, with `from_commit_id`/`to_commit_id`
+and no `cause`; an update later reverted, or a delete followed by an equal
+reinsert, produces nothing. Comparing two branch heads also shows what the
+target changed since they diverged, reversed, so review a branch with
+`branch diff`: what `feature` changed since its merge base with `--into`
+(default `main`), naming `base_commit_id`. `merge-base` prints that commit.
+Both diffs take `--limit`/`--page-token`. A schema change between the sides is
+`409` `schema_boundary`, a side with reclaimed history `410`
+`change_feed_gap`. HTTP: `GET /graphs/{graph_id}/diff?from=&to=`,
+`GET /graphs/{graph_id}/branches/diff?source=&target=` and
+`/branches/merge-base?source=&target=`. To see whether a merge would succeed,
+use `branch merge --dry-run`.
+
 ## Follow a branch
 
 ```bash
@@ -101,5 +123,5 @@ On POSIX, CLI `--out` syncs and atomically replaces the snapshot file before it
 prints the handshake to JSON stdout. Baselines require Cedar `export`; commit
 changes and feed polling require `read`.
 
-Canonical contracts: [change feeds](https://github.com/ModernRelay/omnigraph/blob/v0.12.0/docs/user/branching/changes.md)
-and [conditional mutations](https://github.com/ModernRelay/omnigraph/blob/v0.12.0/docs/user/mutations/index.md#conditional-mutations).
+Canonical contracts: [change feeds](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/branching/changes.md)
+and [conditional mutations](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/mutations/conditional.md).

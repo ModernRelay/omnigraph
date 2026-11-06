@@ -12,7 +12,7 @@
 pub(crate) use omnigraph_core::dst_ids;
 pub(crate) use omnigraph_core::{
     branch_control, branch_names, dataset_index, error, handle_cache, instrumentation,
-    lance_access, lance_clone, manifest_request, metadata, seams, staging, storage,
+    lance_access, lance_clone, lance_commit, manifest_request, metadata, seams, staging, storage,
 };
 pub mod branch_detail;
 pub mod commit_graph;
@@ -907,6 +907,20 @@ pub struct ManifestIncarnation {
 }
 
 impl ManifestIncarnation {
+    /// Whether this incarnation and `other` belong to one branch lifetime.
+    pub fn same_lifetime(&self, other: &Self) -> bool {
+        self.branch_identifier == other.branch_identifier
+    }
+
+    /// Whether installing this incarnation over `installed` never moves the
+    /// handle backwards within one lifetime: a version at least as new (an
+    /// equal version may carry another image, the root replaced underneath
+    /// the handle). Lifetimes have no order; `Omnigraph::install_coordinator`
+    /// decides a lifetime change by the provenance of the clone instead.
+    pub fn supersedes(&self, installed: &Self) -> bool {
+        self.same_lifetime(installed) && self.version >= installed.version
+    }
+
     pub fn matches(&self, held: &Self) -> bool {
         if self.version != held.version || self.branch_identifier != held.branch_identifier {
             return false;
@@ -2039,11 +2053,14 @@ impl ManifestCoordinator {
     }
 
     /// Install the latest version of the branch's `__manifest`: its table
-    /// state and its head commit's record, from one scan of that version.
-    /// Every fallible read completes before a field is replaced, so a failure
-    /// leaves the previous view coherent. The scan leaves the schema contract
-    /// content unread, except for a branch recreated since the held version:
-    /// that is a new lifetime, captured with its contract as an open captures it.
+    /// state, its head commit's record and its schema contract, from one
+    /// scan of that version, the scan an open takes. Every fallible read
+    /// completes before a field is replaced, so a failure leaves the previous
+    /// view coherent. The contract is captured with the rows because the
+    /// read that follows a refresh validates it: without it, that read opened
+    /// and scanned the same version a second time. A contract content error
+    /// stays deferred to [`Self::read_schema_contract`], as on open.
+    /// A branch recreated since the held version is a new lifetime.
     /// A root replaced at the held version is one too, and it resets the history
     /// cache in place, for every handle and coordinator sharing it: no commit
     /// or `__history` object held from the replaced root describes the new one.
@@ -2082,10 +2099,7 @@ impl ManifestCoordinator {
             );
             replaced_root = true;
         }
-        let rows = match recreated || replaced_root {
-            true => state::read_manifest_rows_with_contract(&dataset).await?.0,
-            false => state::read_manifest_rows_projected(&dataset).await?,
-        };
+        let rows = state::read_manifest_rows_with_contract(&dataset).await?.0;
         let known_state = rows.state(dataset.version().version, native_branch.as_deref())?;
         fail(&READ_REFRESH_POST_STATE_PRE_LINEAGE)?;
         self.dataset = dataset;
@@ -2453,19 +2467,79 @@ impl ManifestCoordinator {
         control_session: &Arc<lance::session::Session>,
         commit: &GraphLineageRow,
     ) -> Result<()> {
-        let (Some(native), Some(branch)) = (&commit.native_branch, &commit.graph_branch) else {
+        if Self::incarnation_is_live(root_uri, control_session, commit).await? {
             return Ok(());
-        };
-        let main = open_manifest_dataset_with_session(root_uri, None, control_session).await?;
-        let live = resolve_native_manifest_branch(&main, branch).await?;
-        if &live != native {
-            return Err(OmniError::manifest(format!(
-                "commit '{}' has no persisted native-branch incarnation witness: branch \
-                 '{branch}' was deleted and recreated after the commit was written",
-                commit.graph_commit_id
-            )));
         }
-        Ok(())
+        let branch = commit.graph_branch.clone().unwrap_or_default();
+        let main = open_manifest_dataset_with_session(root_uri, None, control_session).await?;
+        // A deleted name is `BranchNotFound`; a recreated one is a mismatch.
+        resolve_native_manifest_branch(&main, &branch).await?;
+        Err(OmniError::manifest(format!(
+            "commit '{}' has no persisted native-branch incarnation witness: branch \
+             '{branch}' was deleted and recreated after the commit was written",
+            commit.graph_commit_id
+        )))
+    }
+
+    /// Whether the incarnation that wrote `commit` is the live one of its
+    /// branch. A commit of main, or one with no recorded incarnation, is.
+    pub async fn incarnation_is_live(
+        root_uri: &str,
+        control_session: &Arc<lance::session::Session>,
+        commit: &GraphLineageRow,
+    ) -> Result<bool> {
+        let (Some(native), Some(branch)) = (&commit.native_branch, &commit.graph_branch) else {
+            return Ok(true);
+        };
+        Self::native_incarnation_is_live(root_uri, control_session, branch, native).await
+    }
+
+    /// Whether `native` is the live native ref of the logical `branch`. A
+    /// native ref name carries its incarnation, so a retired one never names
+    /// a recreated branch's history.
+    pub async fn native_incarnation_is_live(
+        root_uri: &str,
+        control_session: &Arc<lance::session::Session>,
+        branch: &str,
+        native: &str,
+    ) -> Result<bool> {
+        let main = open_manifest_dataset_with_session(root_uri, None, control_session).await?;
+        match resolve_native_manifest_branch(&main, branch).await {
+            Ok(live) => Ok(live == native),
+            Err(OmniError::BranchNotFound { .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The Lance identifier of the live native ref of `branch` now. A fresh
+    /// read, unlike [`Self::branch_identifier`]: it changes when the branch is
+    /// deleted and recreated, and a deleted branch is `BranchNotFound`.
+    pub async fn live_branch_identifier(
+        root_uri: &str,
+        control_session: &Arc<lance::session::Session>,
+        branch: &str,
+    ) -> Result<lance::dataset::refs::BranchIdentifier> {
+        let main = open_manifest_dataset_with_session(root_uri, None, control_session).await?;
+        let native = resolve_native_manifest_branch(&main, branch).await?;
+        crate::branch_control::get_branch_identifier(&main, &native)
+            .await
+            .map_err(|error| layout::branch_ref_error(error, branch))
+    }
+
+    /// The exact manifest a commit of a retired incarnation names, opened
+    /// through its live or retired native ref
+    /// ([`Self::pinned_graph_commit_with_session`]); a reclaimed manifest or
+    /// table pin is the loud gap that open reports. The caller has already
+    /// established that a live branch retains the commit.
+    pub async fn ensure_retired_incarnation_opens(
+        root_uri: &str,
+        control_session: &Arc<lance::session::Session>,
+        commit: &GraphLineageRow,
+    ) -> Result<()> {
+        let commit = commit_graph::graph_commit_from_manifest_row(commit.clone());
+        Self::pinned_graph_commit_with_session(root_uri, &commit, control_session)
+            .await
+            .map(drop)
     }
 
     /// Current graph-manifest version.

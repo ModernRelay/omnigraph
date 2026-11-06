@@ -255,4 +255,3 @@ then dated RFCs by date.
 | [2026-10-19](2026-10-19-storage-outcomes-and-restartable-ownership.md) | Storage outcomes per operation and restartable ownership | maintainer | accepted | in-progress |
 | [2026-10-20](2026-10-20-operator-connections-and-credential-providers.md) | Operator profiles and credential providers | maintainer | draft | in-progress |
 | [2026-10-26](2026-10-26-change-discovery-by-fragment-identity.md) | Change discovery by fragment and row identity | maintainer | draft | in-progress |
-| [2026-10-29](2026-10-29-remote-optimize-through-the-serving-owner.md) | Remote optimize through the serving owner | maintainer | draft | not-started |

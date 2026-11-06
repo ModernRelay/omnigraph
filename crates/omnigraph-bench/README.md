@@ -211,11 +211,19 @@ these declarations enter point identity and are never inferred from the client.
 Explicit `--dataset`/`--queries` pairs are embedded only and refuse `--server`.
 
 The entire schema-less query program must be read-only, including loop bodies
-and verification suffixes. Mutations, loads, restarts, index requirements and
+and verification suffixes, or write only unpublished commits: a mutation
+declared `as commit` or a `branch merge … as commit`, bound with `--- bind
+commit $name`, verified by reads at `snapshot: $name`, and released by `commit
+drop "${name}"`. Such a write advances no head, so the provisioned graph is the
+same for every repetition without a reset; its receipt records
+`published: false`, and a record whose write receipt lacks that flag is
+refused. Published writes, `commit publish`, drops of a commit the workload did
+not bind, loads, branch creates and deletes, restarts, index requirements and
 registered-fixture recipes are refused. Settings prefixes on read steps are
 refused for served acquisition. Acquisition does not seed, restore,
 restart or clean up the server. It creates a fresh client worker per repetition
-and sends only the admitted GQT reads. Timing uses the shared BenchHost boundary
+and sends only the admitted GQT steps; a dropped commit leaves its detached
+`__manifest` version and table staging to the server's collector. Timing uses the shared BenchHost boundary
 and includes the selected request and result materialization; warm-up and
 assertions stay outside. The server lifecycle is `long-running-server`, with
 `reset: none` and `attribution: off`. Zero warm-up means uncontrolled server

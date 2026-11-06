@@ -11469,3 +11469,156 @@ async fn planning_source_failures_keep_their_error_class() {
         .expect("the next read plans and runs");
     assert_eq!(rows.num_rows(), 1);
 }
+
+/// A publish parked on either side of its `__manifest` commit holds no
+/// coordinator lock: a read on the same handle completes beside it, binding
+/// the installed state, and reads the published row once the publish returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn read_on_the_handle_completes_while_its_publish_is_parked() {
+    for (seam, published_while_parked) in [
+        (&catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND, false),
+        (&catalog::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT, true),
+    ] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(init_and_load(&dir).await);
+        let lookup = params(&[("$name", "parked-publish")]);
+        let base_version = db
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .graph_manifest_version();
+
+        let rendezvous = helpers::failpoint::Rendezvous::park_first(seam);
+        let writer = {
+            let db = Arc::clone(&db);
+            tokio::spawn(async move { insert_person(&db, "main", "parked-publish").await })
+        };
+        rendezvous.wait_until_reached().await;
+
+        let snapshot = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            db.snapshot_of(ReadTarget::branch("main")),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{}: snapshot_of waits on the parked publish", seam.name()))
+        .unwrap();
+        let rows = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            db.query(
+                ReadTarget::branch("main"),
+                TEST_QUERIES,
+                "get_person",
+                &lookup,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{}: a query waits on the parked publish", seam.name()))
+        .unwrap();
+        assert_eq!(
+            snapshot.graph_manifest_version() > base_version,
+            published_while_parked,
+            "{}: the read binds the `__manifest` head as it stands",
+            seam.name()
+        );
+        assert_eq!(
+            rows.num_rows(),
+            usize::from(published_while_parked),
+            "{}",
+            seam.name()
+        );
+        assert!(
+            !writer.is_finished(),
+            "{}: the publish is still parked",
+            seam.name()
+        );
+
+        rendezvous.release();
+        writer.await.unwrap();
+        assert!(
+            !rendezvous.timed_out(),
+            "{}: released, not timed out",
+            seam.name()
+        );
+        let rows = db
+            .query(
+                ReadTarget::branch("main"),
+                TEST_QUERIES,
+                "get_person",
+                &lookup,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.num_rows(), 1, "{}", seam.name());
+    }
+}
+
+/// Two reads on one handle refresh a stale coordinator concurrently; the one
+/// that read the older `__manifest` version installs last and is refused by
+/// `supersedes`, so the installed state stays at the newest version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn concurrent_stale_refreshes_on_one_handle_keep_the_newest_installed() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let writer = init_and_load(&dir).await;
+    let reader = Arc::new(helpers::session(
+        Omnigraph::open(writer.uri()).await.unwrap(),
+    ));
+    reader
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    insert_person(&writer, "main", "first-refresh").await;
+    let older = writer
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .graph_manifest_version();
+
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(&catalog::READ_REFRESH_POST_STATE_PRE_LINEAGE);
+    let parked = {
+        let reader = Arc::clone(&reader);
+        tokio::spawn(async move { reader.snapshot_of(ReadTarget::branch("main")).await })
+    };
+    rendezvous.wait_until_reached().await;
+    insert_person(&writer, "main", "second-refresh").await;
+    let newest = writer
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .graph_manifest_version();
+    assert!(newest > older);
+    let racing = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reader.snapshot_of(ReadTarget::branch("main")),
+    )
+    .await
+    .expect("a second refresh waits on the parked one")
+    .unwrap();
+    assert_eq!(racing.graph_manifest_version(), newest);
+
+    rendezvous.release();
+    let late = parked.await.unwrap().unwrap();
+    assert!(!rendezvous.timed_out(), "released, not timed out");
+    assert_eq!(
+        late.graph_manifest_version(),
+        older,
+        "the parked refresh resolves the version it read"
+    );
+
+    for name in ["first-refresh", "second-refresh"] {
+        let rows = reader
+            .query(
+                ReadTarget::branch("main"),
+                TEST_QUERIES,
+                "get_person",
+                &params(&[("$name", name)]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.num_rows(), 1, "{name} after the newest install");
+    }
+}

@@ -1785,7 +1785,7 @@ async fn clear_manifest_auto_cleanup(db: &Omnigraph) -> ConfigurationClear {
         match clear_stale_auto_cleanup_config(&mut ds).await {
             Ok(false) => return ConfigurationClear::NothingToClear,
             Ok(true) => {
-                if let Err(error) = db.coordinator.write().await.refresh().await {
+                if let Err(error) = db.refresh_coordinator_only().await {
                     tracing::warn!(
                         target: "omnigraph::optimize",
                         error = %error,
@@ -2063,8 +2063,7 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
 pub(crate) async fn cleanup_graph_branches(db: &Omnigraph) -> Result<Vec<Option<String>>> {
     let mut branches = db
         .coordinator
-        .read()
-        .await
+        .load_full()
         .all_branches()
         .await?
         .into_iter()

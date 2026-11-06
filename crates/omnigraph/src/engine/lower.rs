@@ -22,16 +22,17 @@ use datafusion::physical_expr::expressions::{CastExpr, Column};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
 use datafusion::physical_plan::execution_plan::EmissionType;
-use omnigraph_compiler::ir::SubqueryPredicate;
+use omnigraph_compiler::ir::{DeltaClass, SubqueryPredicate};
 use omnigraph_compiler::query::ast::LoadStmtMode;
 use omnigraph_compiler::traversal::EDGE_TYPE_COLUMN;
 use omnigraph_planner::logical::{EDGE_TYPE_MEMBER, IDENTITY_MEMBER};
 use omnigraph_planner::{
     Accumulator, AggregateFields, AntiJoinStrategy, BoundPlan, ColumnRef, ContainsJoinFields,
-    CsvSourceFields, ExpandFields, FragmentWriteFields, HashJoinFields, HydratedBinding, Lower,
-    NodeId, PhysicalNode, PhysicalPlan, PlanError, Predicate, ROW_ADDRESS_PREFIX, RankArm,
-    RankFuseFields, RankKind, RankedAccess, RuntimeFilterKind, RuntimeFilterSpec, ScanInput,
-    ScanSpec, SideId, SortMergeJoinFields, ValidateFields, ValueTable,
+    CsvSourceFields, DeltaSourceFields, ExpandFields, FragmentWriteFields, HashJoinFields,
+    HydratedBinding, Lower, NodeId, PhysicalNode, PhysicalPlan, PlanError, Predicate,
+    ROW_ADDRESS_PREFIX, RankArm, RankFuseFields, RankKind, RankedAccess, RuntimeFilterKind,
+    RuntimeFilterSpec, ScanInput, ScanSpec, SideId, SortMergeJoinFields, ValidateFields,
+    ValueTable,
 };
 
 use super::adapters::{GqProjectionExpr, LoweringId, Projected};
@@ -39,12 +40,14 @@ use super::exact_aggregate::{EXACT_CARRIER, ExactIntegerUdaf};
 use super::operators::{
     AntiJoinMaskExec, ArmOrder, CatalogueExec, ContainsJoinExec, CrossJoinExec, CsvSourceExec,
     ExpandExec, ExpandExecution, ExpandStep, FilterExec, GraphEnv, HashJoinExec, HydrateExec,
-    LanceFragmentSink, LimitExec, LoadJudge, LookupSpec, MetadataCountExec, OuterReferenceExec,
-    OuterSlot, ProjectionExec, RankFuseExec, RuntimeFilterSlot, ScanExec, ScanSource, SortExec,
-    SortKey, ValidateExec, fresh_tag_column, tagged_schema,
+    LanceFragmentSink, LimitExec, LookupSpec, MetadataCountExec, OuterReferenceExec, OuterSlot,
+    ProjectionExec, RankFuseExec, RuntimeFilterSlot, ScanExec, ScanSource, SortExec, SortKey,
+    ValidateExec, fresh_tag_column, tagged_schema,
 };
 use super::*;
+use crate::loader::LoadMode;
 use crate::loader::csv::target_arrow_schema;
+use crate::validate::load::{JudgedSide, JudgedTable, RepeatRule, Report, WriteJudge};
 
 type Plan = Arc<dyn ExecutionPlan>;
 
@@ -1240,6 +1243,15 @@ impl Lower for Walk<'_, '_> {
         self.built(id, sort)
     }
 
+    fn delta_source(&mut self, _id: NodeId, fields: DeltaSourceFields<'_>) -> Lowers<Plan> {
+        Err(OmniError::manifest_internal(format!(
+            "`DeltaSource` of {} is the executor's staged delta; a write plan's `Validate` \
+             runs on the executor's judge, never through the engine",
+            fields.spec.table
+        ))
+        .into())
+    }
+
     fn csv_source(&mut self, id: NodeId, fields: CsvSourceFields<'_>) -> Lowers<Plan> {
         let load = self.lowering.load.ok_or_else(|| {
             OmniError::manifest_internal(format!(
@@ -1301,18 +1313,32 @@ impl Lower for Walk<'_, '_> {
                 "Validate {id}: the lowering carries no write transaction"
             ))
         })?;
-        let judge = LoadJudge {
-            db: Arc::clone(&write.db),
-            table,
-            checks: fields.checks.to_vec(),
-            removal: fields.removal,
-            mode: load.request.mode,
+        if load.request.mode != LoadMode::Overwrite {
+            return Err(OmniError::manifest_internal(format!(
+                "Validate {id}: a {} load runs its plan's node on the executor's judge",
+                load.request.mode.as_str()
+            ))
+            .into());
+        }
+        let judge = WriteJudge {
+            tables: vec![JudgedTable {
+                table,
+                checks: fields.checks.to_vec(),
+                removal: fields.removal,
+                delta: DeltaClass::Replace,
+                deleted_ids: Vec::new(),
+            }],
+            committed: JudgedSide::Base(self.lowering.snapshot("load validation")?.clone()),
             write_budget: write.write_budget,
-            snapshot: self.lowering.snapshot("load validation")?.clone(),
             catalog: Arc::clone(self.lowering.catalog),
+            report: Report::First,
+            repeat: RepeatRule::AcrossInput,
         };
         let streams = omnigraph_planner::validate_streams(fields.checks, fields.removal);
-        self.built(id, ValidateExec::new(input, judge, streams))
+        self.built(
+            id,
+            ValidateExec::new(input, judge, Arc::clone(&write.db), streams),
+        )
     }
 
     fn fragment_write(

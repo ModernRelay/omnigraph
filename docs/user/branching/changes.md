@@ -89,11 +89,14 @@ Lance's stable row id and reads only the rows whose version stamp differs or
 that exist on one side alone, so the cost follows the changed rows and the
 fragments that hold them, not the table's size, and stays flat across a
 compaction. That pairing applies when the `from` side is on the `to` side's
-history: a branch review whose merge base is on the source's first-parent
-history, and a two-point diff whose `to` names a branch whose first-parent
-chain holds `from`. A diff of two diverged heads compares every row of each changed
-type, and so does a review of a branch that has merged its target since the
-fork. The `change_lineage`
+history with no merge commit after it: a branch review whose merge base is on
+the source's first-parent history, and a two-point diff whose `to` names a
+branch whose first-parent chain holds `from`. A merge, a fast forward included,
+can give a type the merged branch's rows, whose history never passed through
+`from`. A diff of two diverged heads compares every row of each changed type,
+and so do a review of a branch that has merged its target since the fork, a
+window that crosses a merge commit, and a merge commit's own changes, except
+for a type the merge wrote in one step. The `change_lineage`
 [session setting](../queries/settings.md) selects the comparison for every
 change read: `on` (the default) pairs rows by id, `off` compares every row,
 and `verify` runs both and fails the page where they disagree, which a debug
@@ -213,7 +216,16 @@ filter applies only to the resumed feed. Baselines require the `export`
 policy action; commit changes, diffs and feed polling require `read`. A diff
 needs `read` on the branch each side resolves to; a side the actor cannot read
 answers `404` exactly as a side that names nothing, whatever the other side
-names. A commit whose branch was deleted answers the same `404`.
+names. The engine reads a commit whose branch was deleted while a live
+branch retains it (a stacked branch's merge base after its parent was merged
+and deleted): diffs, commit changes, reads at the commit and the feed open the
+retired incarnation by its exact commit. The HTTP `commit changes` route still
+needs `read` on the branch that wrote the commit, so a policy that does not
+grant the deleted name answers `404` there. A commit that no live branch retains,
+or whose recorded incarnation was reclaimed, answers the same `404` as a
+commit that names nothing; the error names the spelling the caller used, never
+the deleted branch. Branch creation from such a commit still refuses with
+`branch_deleted`.
 `branch diff` and `branch merge-base` need `read` on both branches, every
 page included, and answer `403` otherwise. On a later page, a commit the
 token names that its side no longer resolves to needs `read` on the branch

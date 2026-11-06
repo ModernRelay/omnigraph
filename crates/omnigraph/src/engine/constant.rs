@@ -87,14 +87,10 @@ fn literal_from_scalar(value: ScalarValue) -> Result<Literal> {
     Ok(match value {
         ScalarValue::Boolean(Some(value)) => Literal::Bool(value),
         ScalarValue::Utf8(Some(value)) => Literal::String(value),
-        ScalarValue::Int32(Some(value)) => Literal::Integer(i64::from(value)),
-        ScalarValue::Int64(Some(value)) => Literal::Integer(value),
-        ScalarValue::UInt32(Some(value)) => Literal::Integer(i64::from(value)),
-        ScalarValue::UInt64(Some(value)) => {
-            Literal::Integer(i64::try_from(value).map_err(|_| {
-                OmniError::manifest("constant U64 result exceeds the public literal range")
-            })?)
-        }
+        ScalarValue::Int32(Some(value)) => Literal::Integer(i128::from(value)),
+        ScalarValue::Int64(Some(value)) => Literal::Integer(i128::from(value)),
+        ScalarValue::UInt32(Some(value)) => Literal::Integer(i128::from(value)),
+        ScalarValue::UInt64(Some(value)) => Literal::Integer(i128::from(value)),
         ScalarValue::Float32(Some(value)) => Literal::Float(f64::from(value)),
         ScalarValue::Float64(Some(value)) => Literal::Float(value),
         ScalarValue::Date32(Some(value)) => {
@@ -273,7 +269,7 @@ mod tests {
             ty: exact.clone(),
         };
         let signed = cast(IRExpr::Literal(
-            Literal::Integer(i64::MAX),
+            Literal::Integer(i128::from(i64::MAX)),
             scalar(ScalarType::I64, false),
         ));
         let unsigned = cast(IRExpr::Param("wide".into(), scalar(ScalarType::U64, false)));
@@ -302,7 +298,7 @@ mod tests {
 
         let list = IRExpr::Cast {
             expr: Box::new(IRExpr::Literal(
-                Literal::List(vec![Literal::Integer(i64::MAX), Literal::Null]),
+                Literal::List(vec![Literal::Integer(i128::from(i64::MAX)), Literal::Null]),
                 ExprType::from_prop(&PropType::list_of(ScalarType::I64, false)),
             )),
             ty: ExprType::ExactInteger {

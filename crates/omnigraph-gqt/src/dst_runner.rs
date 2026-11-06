@@ -1240,7 +1240,7 @@ fn report_measurements(
         "step = one executing section of the case (a mutate, query, control or restart), numbered in file order; setup = the store, schema and seed before step 1; runner, after N = from step N's end to the next step's start (the runner's own checks)"
     );
     println!(
-        "requests = the work; repeats = reads of an object and range already read in the step; makespan = ticks the schedule took (one tick = 1 ms of virtual time); span = its critical path with the tables of each phase side by side; waiting = makespan - span; parallelism = requests per tick, achieved (makespan) / available (span); sim ms = virtual time under the model; u$ = microdollars at S3 list prices"
+        "requests = the work; repeats = reads of an object and range already read in the step; makespan = ticks the schedule took (one tick = 1 ms of virtual time); span = its critical path with the tables of each phase side by side; waiting = makespan - span, then each engine gate a block session waited at with its ticks (every gate a session crossed is a wait.<gate> row in the TSV, 0 when no request moved the clock while it waited); parallelism = requests per tick, achieved (makespan) / available (span); sim ms = virtual time under the model; u$ = microdollars at S3 list prices"
     );
     let cells = |requests: u64, makespan: Option<u64>, span: Option<u64>, tables: Option<u64>| {
         let waiting = match (makespan, span) {
@@ -1306,6 +1306,15 @@ fn report_measurements(
             row.n("span"),
         );
         let mut all = cells(requests, makespan, span, None);
+        for (gate, ticks) in row.detail["waits"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(_, ticks)| ticks.as_u64().is_some_and(|t| t > 0))
+        {
+            let separator = if all[3].is_empty() { "" } else { ", " };
+            all[3] = format!("{}{separator}{gate} {ticks}", all[3]);
+        }
         all.insert(1, row.n("repeat_reads").unwrap_or(0).to_string());
         step_row.extend(all);
         step_row.push(
@@ -1336,6 +1345,13 @@ fn report_measurements(
         }
         if let Some(classes) = row.counts["by_class"].as_object() {
             metrics.extend(classes.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        if let Some(waits) = row.detail["waits"].as_object() {
+            metrics.extend(
+                waits
+                    .iter()
+                    .map(|(gate, v)| (format!("wait.{gate}"), v.clone())),
+            );
         }
         for io in row.counts["phases"].as_array().into_iter().flatten() {
             let phase = io["phase"].as_str().unwrap_or("?");
@@ -2194,6 +2210,16 @@ impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for G
             crate::measure::prepare(model)
         });
         crate::concurrent::install(measure);
+        let prepared = match self.input.store.as_deref() {
+            Some(uri) => {
+                let restored = resources.restore_from_uri(uri).await?;
+                Some(format!(
+                    "prepared store: {} restored below the ledger, {} objects, {} bytes",
+                    restored.uri, restored.objects, restored.bytes
+                ))
+            }
+            None => None,
+        };
         let base: std::sync::Arc<dyn StorageAdapter> =
             crate::measure::wrap_adapter(resources.adapter.clone(), crate::concurrent::touch);
         let decoration =
@@ -2214,6 +2240,7 @@ impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for G
                         &resources.root,
                         storage,
                         self.input.engine,
+                        prepared.as_deref(),
                     ),
                 ),
             )

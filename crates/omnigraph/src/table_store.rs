@@ -36,8 +36,8 @@ use lance::dataset::write::merge_insert::{
     MergeStats, SourceDedupeBehavior, UncommittedMergeInsert,
 };
 use lance::dataset::{
-    CommitBuilder, DeleteBuilder, InsertBuilder, MergeInsertBuilder, ReadBlobsStream, WhenMatched,
-    WhenNotMatched, WriteMode, WriteParams,
+    DeleteBuilder, InsertBuilder, MergeInsertBuilder, ReadBlobsStream, WhenMatched, WhenNotMatched,
+    WriteMode, WriteParams,
 };
 use lance::datatypes::Schema as LanceSchema;
 use lance::index::DatasetIndexExt;
@@ -57,7 +57,7 @@ use lance_file::{version::LanceFileVersion, writer::FileWriterOptions};
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
 use lance_index::{IndexType, is_system_index};
 use lance_linalg::distance::MetricType;
-use lance_select::mask::RowAddrTreeMap;
+use lance_select::mask::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 use omnigraph_compiler::SystemColumns;
@@ -143,6 +143,44 @@ pub(crate) const ID_SCAN_BATCH_BYTES: u64 = 1024 * 1024;
 /// The byte cap of one batch entering a `SortExec` under a pool of `memory_limit` bytes.
 pub(crate) fn sort_input_batch_bytes(memory_limit: u64) -> usize {
     (memory_limit / 4).clamp(1, ORDERED_SCAN_MAX_INPUT_BATCH_BYTES) as usize
+}
+
+/// `plan` with a `HardCapBatchSizeExec` of `input_batch_bytes` under every
+/// `SortExec`, its partitions merged into one stream: in order when the plan
+/// declares an output ordering, otherwise as they arrive.
+///
+/// DataFusion cannot spill a first `SortExec` input batch larger than its
+/// memory pool; Lance applies the same hard cap below the sorts of MergeInsert.
+pub(crate) fn cap_sort_inputs_and_merge_partitions(
+    plan: Arc<dyn ExecutionPlan>,
+    input_batch_bytes: usize,
+) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+    let plan = plan
+        .transform_down(|node| {
+            if node.downcast_ref::<SortExec>().is_some() {
+                let children = node
+                    .children()
+                    .into_iter()
+                    .map(|child| {
+                        Arc::new(HardCapBatchSizeExec::new(
+                            Arc::clone(child),
+                            input_batch_bytes,
+                        )) as Arc<dyn ExecutionPlan>
+                    })
+                    .collect();
+                Ok(Transformed::yes(node.with_new_children(children)?))
+            } else {
+                Ok(Transformed::no(node))
+            }
+        })?
+        .data;
+    Ok(if plan.output_partitioning().partition_count() == 1 {
+        plan
+    } else if let Some(ordering) = plan.output_ordering() {
+        Arc::new(SortPreservingMergeExec::new(ordering.clone(), plan))
+    } else {
+        Arc::new(CoalescePartitionsExec::new(plan))
+    })
 }
 
 /// DataFusion's sort spill reservation under a pool of `memory_limit` bytes.
@@ -1010,7 +1048,7 @@ async fn commit_detached(
     transaction: Transaction,
     affected_rows: Option<RowAddrTreeMap>,
 ) -> Result<Dataset> {
-    let mut builder = CommitBuilder::new(ds)
+    let mut builder = crate::lance_commit::commit_builder(ds)
         .with_skip_auto_cleanup(true)
         .with_detached(true);
     if let Some(affected_rows) = affected_rows {
@@ -2816,29 +2854,8 @@ impl TableStore {
 
         let input_batch_limit = sort_input_batch_bytes(memory_limit);
         let plan = scanner.create_plan().await.map_err(OmniError::storage)?;
-        // DataFusion cannot spill a first SortExec input batch that is larger
-        // than its memory pool. Lance applies this same hard-cap node below
-        // sorts in MergeInsert; ordered graph scans do so here as well.
-        let plan = plan
-            .transform_down(|node| {
-                if node.downcast_ref::<SortExec>().is_some() {
-                    let children = node
-                        .children()
-                        .into_iter()
-                        .map(|child| {
-                            Arc::new(HardCapBatchSizeExec::new(
-                                Arc::clone(child),
-                                input_batch_limit,
-                            )) as Arc<dyn ExecutionPlan>
-                        })
-                        .collect();
-                    Ok(Transformed::yes(node.with_new_children(children)?))
-                } else {
-                    Ok(Transformed::no(node))
-                }
-            })
-            .map_err(OmniError::datafusion_internal)?
-            .data;
+        let plan = cap_sort_inputs_and_merge_partitions(plan, input_batch_limit)
+            .map_err(OmniError::datafusion_internal)?;
 
         // Own one runtime context for this execution. Lance's general helper
         // caches contexts; after LRU eviction an active old context can coexist
@@ -2865,14 +2882,6 @@ impl TableStore {
         if let Some(batch_size) = options.batch_size {
             state.config_mut().options_mut().execution.batch_size = batch_size;
         }
-        let plan: Arc<dyn ExecutionPlan> = if plan.properties().partitioning.partition_count() == 1
-        {
-            plan
-        } else if let Some(ordering) = plan.output_ordering() {
-            Arc::new(SortPreservingMergeExec::new(ordering.clone(), plan))
-        } else {
-            Arc::new(CoalescePartitionsExec::new(plan))
-        };
         let stream = plan
             .execute(0, state.task_ctx())
             .map_err(OmniError::datafusion_internal)?;
@@ -3245,7 +3254,7 @@ impl TableStore {
     ) -> Result<Dataset> {
         let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         match dataset {
-            Some(mut ds) => {
+            Some(ds) => {
                 let params = WriteParams {
                     mode: WriteMode::Append,
                     allow_external_blob_outside_bases: true,
@@ -3253,10 +3262,17 @@ impl TableStore {
                     skip_auto_cleanup: true,
                     ..Default::default()
                 };
-                ds.append(reader, Some(params))
+                let ds = Arc::new(ds);
+                let transaction = InsertBuilder::new(Arc::clone(&ds))
+                    .with_params(&params)
+                    .execute_uncommitted(vec![batch])
                     .await
                     .map_err(OmniError::storage)?;
-                Ok(ds)
+                crate::lance_commit::commit_builder(ds)
+                    .with_skip_auto_cleanup(true)
+                    .execute(transaction)
+                    .await
+                    .map_err(OmniError::storage)
             }
             None => {
                 let control_session = crate::lance_access::control_session();
@@ -3328,6 +3344,70 @@ impl TableStore {
         Ok(Some(StagedWrite::with_commit_metadata(
             uncommitted.transaction,
             StagedCommitMetadata::affected_rows(uncommitted.affected_rows),
+            new_fragments,
+            removed_fragment_ids,
+        )))
+    }
+
+    /// Stage the delete of exactly the rows at `row_addrs`, captured by the
+    /// caller's own filtered scan of `ds` at this same version, without
+    /// scanning again. This is Lance's `DeleteBuilder` after its scan:
+    /// each fragment holding an address extends its deletion vector
+    /// (`FileFragment::extend_deletions`, which drops a fragment it empties),
+    /// and the result is the same uncommitted `Operation::Delete`, with the
+    /// addresses as its `affected_rows`. `predicate` is only the transaction's
+    /// recorded predicate text, as `DeleteBuilder` records it. An empty
+    /// address set is a no-op (`None`); an address outside `ds`'s fragments
+    /// fails closed.
+    pub async fn stage_delete_rows(
+        &self,
+        ds: &Dataset,
+        predicate: &Expr,
+        row_addrs: &RowAddrTreeMap,
+    ) -> Result<Option<StagedWrite>> {
+        let num_deleted_rows = row_addrs.len().unwrap_or(0);
+        if num_deleted_rows == 0 {
+            return Ok(None);
+        }
+        let mut updated_fragments = Vec::new();
+        let mut deleted_fragment_ids = Vec::new();
+        for (fragment_id, _) in row_addrs.iter() {
+            let bitmap = row_addrs.get_fragment_bitmap(*fragment_id).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "stage_delete_rows: fragment {fragment_id} carries no row offsets"
+                ))
+            })?;
+            let fragment = ds.get_fragment(*fragment_id as usize).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "stage_delete_rows: fragment {fragment_id} is not in version {}",
+                    ds.version().version
+                ))
+                .unpublished()
+            })?;
+            match fragment
+                .extend_deletions(bitmap.iter())
+                .await
+                .map_err(|error| OmniError::storage(error).unpublished())?
+            {
+                Some(updated) => updated_fragments.push(updated.metadata().clone()),
+                None => deleted_fragment_ids.push(u64::from(*fragment_id)),
+            }
+        }
+        let mut removed_fragment_ids = deleted_fragment_ids.clone();
+        removed_fragment_ids.extend(updated_fragments.iter().map(|f| f.id));
+        let new_fragments = updated_fragments.clone();
+        let transaction = Transaction::new(
+            ds.manifest.version,
+            Operation::Delete {
+                updated_fragments,
+                deleted_fragment_ids,
+                predicate: predicate.to_string(),
+            },
+            None,
+        );
+        Ok(Some(StagedWrite::with_commit_metadata(
+            transaction,
+            StagedCommitMetadata::affected_rows(Some(row_addrs.clone())),
             new_fragments,
             removed_fragment_ids,
         )))
@@ -3552,8 +3632,8 @@ impl TableStore {
             // completed statistics prove this execution inserted every row,
             // but an unfamiliar future transaction shape must disable the
             // history shortcut rather than fail an otherwise valid logical
-            // write. StrictInsert keeps the same check mandatory because its
-            // exact filter is part of the requested conflict semantics.
+            // write. StrictInsert returned above; its writer certifies every
+            // insertion unconditionally.
             tracing::debug!(
                 type_key,
                 error = %error,
@@ -3932,21 +4012,23 @@ impl TableStore {
         system_columns: SystemColumns,
         context: &'static str,
     ) -> Result<(StagedWrite, MergeStats)> {
+        // Strict insertion never reaches merge-insert: `stage_keyed_write`
+        // and `stage_proven_strict_insert` stage it through
+        // `stage_absence_proven_strict_insert`.
+        let when_not_matched = match semantics {
+            KeyedWriteSemantics::Upsert => WhenNotMatched::InsertAll,
+            KeyedWriteSemantics::KnownPresentUpdate => WhenNotMatched::DoNothing,
+            KeyedWriteSemantics::StrictInsert => {
+                return Err(OmniError::manifest_internal(format!(
+                    "{context}: strict insert must stage through the absence-proven insert writer"
+                )));
+            }
+        };
         let mut builder =
             MergeInsertBuilder::try_new(Arc::new(ds), vec![system_columns.id.to_string()])
                 .map_err(OmniError::lance_internal)?;
-        builder.when_matched(match semantics {
-            KeyedWriteSemantics::StrictInsert => WhenMatched::Fail,
-            KeyedWriteSemantics::Upsert | KeyedWriteSemantics::KnownPresentUpdate => {
-                WhenMatched::UpdateAll
-            }
-        });
-        builder.when_not_matched(match semantics {
-            KeyedWriteSemantics::KnownPresentUpdate => WhenNotMatched::DoNothing,
-            KeyedWriteSemantics::StrictInsert | KeyedWriteSemantics::Upsert => {
-                WhenNotMatched::InsertAll
-            }
-        });
+        builder.when_matched(WhenMatched::UpdateAll);
+        builder.when_not_matched(when_not_matched);
         if semantics != KeyedWriteSemantics::KnownPresentUpdate {
             // Lance's scalar-index v1 route omits the inserted-row key filter.
             // Every insertion-capable path therefore forces v2 and validates
@@ -3963,17 +4045,10 @@ impl TableStore {
             .await
             .map_err(OmniError::lance_stream)?;
 
-        match semantics {
-            KeyedWriteSemantics::StrictInsert => {
-                validate_exact_id_filter(&uncommitted, id_field_id, context)?;
-                validate_strict_insert_merge_stats(&uncommitted, merged_rows, context)?;
-            }
-            KeyedWriteSemantics::Upsert => {
-                validate_exact_id_filter(&uncommitted, id_field_id, context)?;
-            }
-            KeyedWriteSemantics::KnownPresentUpdate => {
-                validate_known_present_update(&uncommitted, id_field_id, merged_rows, context)?;
-            }
+        if semantics == KeyedWriteSemantics::KnownPresentUpdate {
+            validate_known_present_update(&uncommitted, id_field_id, merged_rows, context)?;
+        } else {
+            validate_exact_id_filter(&uncommitted, id_field_id, context)?;
         }
         let stats = uncommitted.stats.clone();
         if semantics == KeyedWriteSemantics::KnownPresentUpdate {
@@ -4405,7 +4480,7 @@ impl TableStore {
         )
         .await
         .map_err(OmniError::storage)?;
-        let dataset = CommitBuilder::new(dataset_uri)
+        let dataset = crate::lance_commit::commit_builder(dataset_uri)
             .with_commit_handler(handler)
             .use_stable_row_ids(true)
             .with_storage_format(LanceFileVersion::V2_2)
@@ -4445,7 +4520,7 @@ impl TableStore {
         // upgraded graphs. Skipping here covers the staged write path (the main
         // data path) for new and legacy datasets alike, preventing Lance from
         // GC'ing versions the __manifest still pins for snapshots/time-travel.
-        let mut builder = CommitBuilder::new(ds).with_skip_auto_cleanup(true);
+        let mut builder = crate::lance_commit::commit_builder(ds).with_skip_auto_cleanup(true);
         if mode == StagedCommitMode::EffectFreeExact {
             builder = builder.with_max_retries(0);
         }
@@ -6983,7 +7058,8 @@ fn validate_keyed_write_batch_ids(
 
 /// Assert the exact RFC-023 substrate proof carried by pinned Lance's v2
 /// merge-insert route.  Checking both public copies makes a future Lance
-/// refactor that drops the transaction-level conflict filter fail closed.
+/// refactor that drops the transaction's inserted-row key filter fail closed;
+/// the insertion-absence certificate and the merge proof read that filter.
 fn validate_exact_id_filter(
     uncommitted: &UncommittedMergeInsert,
     id_field_id: i32,
@@ -6994,25 +7070,6 @@ fn validate_exact_id_filter(
     if uncommitted.inserted_rows_filter.as_ref() != Some(transaction_filter) {
         return Err(OmniError::manifest_internal(format!(
             "{context}: Lance uncommitted result and transaction disagree on the inserted-row key filter"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_strict_insert_merge_stats(
-    uncommitted: &UncommittedMergeInsert,
-    expected_rows: u64,
-    context: &'static str,
-) -> Result<()> {
-    let stats = &uncommitted.stats;
-    if !merge_stats_prove_pure_insert(stats, expected_rows) {
-        return Err(OmniError::manifest_internal(format!(
-            "{context}: strict insert merge stats were inserted={}, updated={}, deleted={}, skipped={}, attempts={}; expected inserted={expected_rows}, updated=0, deleted=0, skipped=0, attempts=1",
-            stats.num_inserted_rows,
-            stats.num_updated_rows,
-            stats.num_deleted_rows,
-            stats.num_skipped_duplicates,
-            stats.num_attempts,
         )));
     }
     Ok(())

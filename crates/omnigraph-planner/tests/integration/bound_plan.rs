@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
-use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR};
+use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, ParamMap, QueryIR};
 use omnigraph_compiler::query::ast::{CompOp, Literal};
 use omnigraph_compiler::result::SearchFunction;
 use omnigraph_compiler::{ExprType, PropType, SYSTEM_COLUMNS_V3, ScalarType};
@@ -198,6 +198,23 @@ fn saved_plan_version_refuses_both_legacy_and_future_readers() {
         values: serde_json::Value,
     }
     assert!(serde_json::from_value::<OldReader>(encoded).is_err());
+}
+
+#[test]
+fn a_wide_bound_value_reads_back_exactly_issue_918() {
+    let bound = BoundPlan {
+        plan: plan(prop("d", "slug")),
+        values: ValueTable {
+            params: Arc::new(ParamMap::from([
+                ("wide".to_string(), Literal::Integer(i128::from(u64::MAX))),
+                ("low".to_string(), Literal::Integer(i128::from(i64::MIN))),
+            ])),
+            vectors: BTreeMap::new(),
+        },
+    };
+    let text = serde_json::to_string(&bound).expect("the bound plan serializes");
+    assert!(text.contains("18446744073709551615"), "{text}");
+    assert_eq!(round_trip(&bound), bound);
 }
 
 #[test]

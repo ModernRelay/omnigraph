@@ -882,7 +882,8 @@ async fn named_write_capture_reuses_the_exact_local_publication() {
 }
 
 /// A deterministic cross-run I/O assertion; GQT --measure reports counts,
-/// but baseline differences do not fail a case.
+/// but baseline differences do not fail a case. A validation opens each
+/// committed table once under either pool, so the reuse shows in the reads.
 #[tokio::test]
 async fn load_csv_reuses_endpoint_reads_and_falls_back_under_a_small_pool() {
     use omnigraph::db::Omnigraph;
@@ -935,8 +936,8 @@ async fn load_csv_reuses_endpoint_reads_and_falls_back_under_a_small_pool() {
                 counts.push(io);
             }
             let [uncached, cached] = counts.as_slice() else { unreachable!() };
-            assert!(cached.data_open_count < uncached.data_open_count,
-                "{mode:?}: repeated endpoints must reuse a pinned table handle; uncached={uncached:?}, cached={cached:?}");
+            assert!(cached.data_open_count <= uncached.data_open_count,
+                "{mode:?}: reuse must not open more tables; uncached={uncached:?}, cached={cached:?}");
             assert!(cached.data_reads < uncached.data_reads,
                 "{mode:?}: reuse must reduce total data-table reads; uncached={uncached:?}, cached={cached:?}");
         }

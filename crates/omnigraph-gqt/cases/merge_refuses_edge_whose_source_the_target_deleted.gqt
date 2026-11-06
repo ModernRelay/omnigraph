@@ -1,0 +1,42 @@
+# issue: none
+# notes: A branch merge refuses an edge inserted on the branch when main deleted its source node
+# notes: meanwhile, reporting an orphan edge conflict on an unindexed text-keyed Person table.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    id: String @key
+}
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 8
+    commits: 4
+    columns:
+      id: {kind: key, prefix: p, width: 6}
+
+--- mutate
+branch create b
+--- expect ok
+
+--- mutate branch: b
+query ins_b() { insert Knows { from: "p000000", to: "p000001" } }
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query del_main() { delete Person where id = "p000000" }
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge b
+
+--- expect error: (orphan_edge): __src 'p000000' not found in Person
+

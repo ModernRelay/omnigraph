@@ -21,6 +21,8 @@ url = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Paused time for the scope's deadline tests.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

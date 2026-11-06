@@ -1,0 +1,41 @@
+# issue: none
+# traversal: auto
+# notes: Inserting an edge whose target key is absent is refused on an integer-keyed Person table
+# notes: whose key index covers only part of the rows, so the unindexed tail is checked too.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    id: I64 @key
+}
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 8
+    commits: 4
+    columns:
+      id: {kind: ordinal, start: 0, step: 1}
+
+--- load generate: v1 seed: 43 mode: append
+tables:
+  - kind: node
+    name: Person
+    rows: 1
+    commits: 1
+    columns:
+      id: {kind: ordinal, start: 1000, step: 1}
+--- expect ok
+
+--- mutate
+query ins() { insert Knows { from: "2", to: "99" } }
+
+--- expect error: __dst '99' not found in Person
+
