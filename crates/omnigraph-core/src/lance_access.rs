@@ -138,9 +138,10 @@ pub fn store_registry() -> Arc<ObjectStoreRegistry> {
 /// the installed decorator returns for the base store.
 #[cfg(feature = "dst")]
 pub mod object_store_seam {
+    use std::collections::HashMap;
     use std::fmt;
     use std::ops::Range;
-    use std::sync::Arc;
+    use std::sync::{Arc, LazyLock, RwLock};
 
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -153,7 +154,56 @@ pub mod object_store_seam {
         PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
     };
     use omnigraph_seams::{Behavior, Global, Op, Seam};
+    use omnigraph_storage::{FrozenDirectory, ReadThroughStore};
     use url::Url;
+
+    /// A frozen directory and the key prefix it is mounted at.
+    type Mount = (Arc<FrozenDirectory>, Path);
+
+    /// The mount each `shared-memory` authority reads through to, looked up
+    /// per call below the decorator.
+    static READ_THROUGH: LazyLock<RwLock<HashMap<String, Mount>>> = LazyLock::new(RwLock::default);
+
+    /// Mount `frozen` at `prefix` under every store of
+    /// `shared-memory://<authority>`; dropping the guard unmounts it. One
+    /// mount per authority.
+    pub fn mount_read_through(
+        authority: &str,
+        frozen: Arc<FrozenDirectory>,
+        prefix: Path,
+    ) -> Result<ReadThroughMount, String> {
+        let mut mounts = READ_THROUGH
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if mounts.contains_key(authority) {
+            return Err(format!(
+                "a read-through store is already mounted under shared-memory://{authority}"
+            ));
+        }
+        mounts.insert(authority.to_string(), (frozen, prefix));
+        Ok(ReadThroughMount(authority.to_string()))
+    }
+
+    /// The guard of one [`mount_read_through`].
+    #[derive(Debug)]
+    pub struct ReadThroughMount(String);
+
+    impl Drop for ReadThroughMount {
+        fn drop(&mut self) {
+            READ_THROUGH
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&self.0);
+        }
+    }
+
+    fn read_through_mount(authority: &str) -> Option<Mount> {
+        READ_THROUGH
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(authority)
+            .cloned()
+    }
 
     /// What the seam holds: a decorator over the base store Lance built. It
     /// is asked on every call, so it must be cheap and must not capture
@@ -198,9 +248,12 @@ pub mod object_store_seam {
             base_path: Url,
             params: &ObjectStoreParams,
         ) -> lance_core::Result<LanceObjectStore> {
+            let authority =
+                (base_path.scheme() == "shared-memory").then(|| base_path.authority().to_string());
             let mut store = self.inner.new_store(base_path, params).await?;
             store.inner = Arc::new(HookedStore {
                 base: Arc::clone(&store.inner),
+                authority,
             });
             Ok(store)
         }
@@ -219,17 +272,28 @@ pub mod object_store_seam {
         }
     }
 
-    /// Forwards every call through the seam (module doc).
+    /// Forwards every call through the seam (module doc); `authority` is the
+    /// `shared-memory` authority a read-through mount is looked up by.
     #[derive(Debug)]
     struct HookedStore {
         base: Arc<dyn ObjectStore>,
+        authority: Option<String>,
     }
 
     impl HookedStore {
         fn current(&self) -> Arc<dyn ObjectStore> {
+            let base: Arc<dyn ObjectStore> =
+                match self.authority.as_deref().and_then(read_through_mount) {
+                    Some((frozen, prefix)) => Arc::new(ReadThroughStore::new(
+                        Arc::clone(&self.base),
+                        frozen,
+                        prefix,
+                    )),
+                    None => Arc::clone(&self.base),
+                };
             OBJECT_STORE
-                .with(|decorator| decorator.wrap(Arc::clone(&self.base)))
-                .unwrap_or_else(|| Arc::clone(&self.base))
+                .with(|decorator| decorator.wrap(Arc::clone(&base)))
+                .unwrap_or(base)
         }
     }
 

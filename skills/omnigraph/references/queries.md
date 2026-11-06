@@ -447,6 +447,8 @@ or delete and reinsert an unkeyed edge.
 
 > **Insert/update-only OR delete-only (the D₂ rule).** A single mutation query may contain inserts and updates, **or** deletes — never both. Mixing a `delete` with an `insert`/`update` in the same query is refused when the mutation executes, before any effect — `lint` does not catch it. The split is deliberate: one mutation query is constructive XOR destructive. Split a delete-then-insert into two separate mutations.
 
+A mutation `where` may compare at most four properties more than once each with `=`, `!=` or `in` (for example `s in ["a"] or s in ["b"]` compares `s` twice). One that compares more is refused before any effect; split the condition across statements or simplify it.
+
 ### Date and DateTime values
 
 Prefer ISO strings on both paths:

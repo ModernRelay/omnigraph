@@ -1658,6 +1658,7 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         txn.authority.graph_head.clone(),
     );
 
+    let advances_head = matches!(publication, Publication::Publish);
     let installed = db.coordinator.load_full();
     let bound_view = if branch == installed.current_branch() {
         let captured_view_matches = installed
@@ -1741,7 +1742,44 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         *db.merge_authority_cache.lock().await = Some((cache_key.to_string(), coordinator));
         published
     };
+    if advances_head {
+        evict_superseded_handles(db, &txn.base, updates).await;
+    }
     Ok(published)
+}
+
+/// Drop the held handle of every pin this publication replaced on its
+/// branch. The branch now names the new pins, so the base versions left its
+/// working set; holding them kept one decoded manifest, which lists every
+/// fragment, per superseded version of a steadily written table (issue 859).
+/// Keys stay version-exact, so this is memory hygiene: another branch still
+/// at a base pin pays at most one reopen.
+async fn evict_superseded_handles(
+    db: &Omnigraph,
+    base: &crate::db::Snapshot,
+    updates: &[crate::db::DatasetUpdate],
+) {
+    let handles = &db.read_caches().handles;
+    for update in updates {
+        let Some(entry) = base.dataset(&update.type_key) else {
+            continue;
+        };
+        let replaced = entry.published_dataset_version != update.published_dataset_version
+            || entry.native_dataset_branch != update.native_dataset_branch
+            || entry.version_metadata.staged_version() != update.version_metadata.staged_version()
+            || entry.version_metadata.e_tag() != update.version_metadata.e_tag();
+        if replaced {
+            handles
+                .evict(&omnigraph_core::handle_cache::TableHandleKey::new(
+                    &entry.dataset_path,
+                    entry.native_dataset_branch.as_deref(),
+                    entry.published_dataset_version,
+                    entry.version_metadata.staged_version(),
+                    entry.version_metadata.e_tag(),
+                ))
+                .await;
+        }
+    }
 }
 
 pub(super) async fn invalidate_graph_index(db: &Omnigraph) {

@@ -600,7 +600,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-15, windows-latest]
     env:
       BUILD_TAG: ${{ needs.prepare_edge_release.outputs.build_tag }}
       SOURCE_SHA: ${{ needs.vocabulary_gate.outputs.source_sha }}

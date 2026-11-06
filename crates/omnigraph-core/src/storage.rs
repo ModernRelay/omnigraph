@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use crate::error::Result;
 
 pub use omnigraph_storage::{
-    CapturedStorageBinding, ListDirBounds, StorageDestination, StorageIoScope, StorageKind,
-    join_uri, redacted_storage_uri,
+    CapturedStorageBinding, FrozenDirectory, ListDirBounds, StorageDestination, StorageIoScope,
+    StorageKind, join_uri, redacted_storage_uri,
 };
 
 #[async_trait]
@@ -172,6 +172,19 @@ impl ObjectStorageAdapter {
     pub fn in_memory() -> Self {
         Self {
             inner: omnigraph_storage::ObjectStorageAdapter::in_memory(),
+            binding: None,
+        }
+    }
+
+    /// The in-memory backend over a frozen directory mounted at `prefix`:
+    /// a prepared store under DST, read through and never written.
+    #[cfg(feature = "dst")]
+    pub fn read_through(
+        frozen: std::sync::Arc<FrozenDirectory>,
+        prefix: object_store::path::Path,
+    ) -> Self {
+        Self {
+            inner: omnigraph_storage::ObjectStorageAdapter::read_through(frozen, prefix),
             binding: None,
         }
     }

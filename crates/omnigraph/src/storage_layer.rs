@@ -662,6 +662,15 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         options: &lance::dataset::optimize::CompactionOptions,
     ) -> Result<Option<(StagedHandle, lance::dataset::optimize::CompactionMetrics)>>;
 
+    /// #721: stage one detached-ready rewrite of exactly the named
+    /// fragments, deletions materialized, or `None` when none is named. See
+    /// `TableStore::stage_fragment_rewrite`.
+    async fn stage_fragment_rewrite(
+        &self,
+        snapshot: &SnapshotHandle,
+        fragment_ids: &[u64],
+    ) -> Result<Option<StagedHandle>>;
+
     /// RFC 0067: stage one detached-ready fold of every foldable index whose
     /// coverage lags the fragments, each rebuilt whole under its name; `None`
     /// when every index is current. The second value names the vector
@@ -1233,6 +1242,18 @@ impl TableStorage for TableStore {
             TableStore::stage_compaction(self, snapshot.dataset(), options)
                 .await?
                 .map(|compaction| (StagedHandle::new(compaction.staged), compaction.metrics)),
+        )
+    }
+
+    async fn stage_fragment_rewrite(
+        &self,
+        snapshot: &SnapshotHandle,
+        fragment_ids: &[u64],
+    ) -> Result<Option<StagedHandle>> {
+        Ok(
+            TableStore::stage_fragment_rewrite(self, snapshot.dataset(), fragment_ids)
+                .await?
+                .map(|compaction| StagedHandle::new(compaction.staged)),
         )
     }
 

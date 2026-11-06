@@ -2212,10 +2212,9 @@ impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for G
         crate::concurrent::install(measure);
         let prepared = match self.input.store.as_deref() {
             Some(uri) => {
-                let restored = resources.restore_from_uri(uri).await?;
+                resources.mount_prepared(uri).await?;
                 Some(format!(
-                    "prepared store: {} restored below the ledger, {} objects, {} bytes",
-                    restored.uri, restored.objects, restored.bytes
+                    "prepared store: {uri} read through below the ledger"
                 ))
             }
             None => None,
