@@ -168,9 +168,18 @@ remain rebuild territory. Value *order* never matters (values are normalized).
 
 Changing the key field is effectively a replace — it invalidates every external reference to the node. `schema plan` refuses adding, removing, or changing `@key` on an existing node or edge type; an identity change is an export/rebuild migration, not a casual field rename.
 
-### Constraints: only `@index` is added in place
+### Constraints: `@index` and a node's `@unique` are added in place
 
-Adding a constraint other than `@index` (`@key`, `@unique`, `@range`, `@check`)
+Adding `@index` is metadata only. Adding `@unique` to a node type, and making a
+nullable property required (`T?` → `T`, node or edge), first read the stored
+rows under the apply's locks: a live row holding a null (OG-MF-104) or two rows
+sharing a key (OG-MF-108) refuse the apply and change nothing. To add a required
+or unique property to a populated type, add it nullable, load its values, then
+promote it. Promotion may be combined with a `@rename_from` of the same property.
+A `@unique` naming a nullable property added in the same apply needs no row
+check: every stored row holds a null there, and a key with a null part is exempt.
+
+Adding another constraint (`@key`, `@range`, `@check`, an edge `@unique`)
 to an existing type, removing a constraint from a property that stays,
 changing edge cardinality or endpoints, and adding an edge type with a non-zero
 `@card` minimum from an existing node type (OG-MF-107) are refused as
@@ -178,8 +187,9 @@ unsupported. Dropping a
 property drops every constraint that names only dropped properties (its own
 `@index`, `@unique`, `@range` or `@check`); a drop that would remove a `@key`,
 or a constraint that also names a field that stays, is refused. In-place
-migrations are additions of nullable properties and types, `@index` additions,
-enum widening, renames, and drops; tightening a constraint means a rebuild.
+migrations are additions of nullable properties and types, `@index` and node
+`@unique` additions, nullable-to-required promotion, enum widening, renames,
+and drops; any other tightening means a rebuild.
 
 ### `schema apply` blocks writes while running
 

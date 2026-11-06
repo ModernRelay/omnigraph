@@ -77,6 +77,15 @@ pub enum SchemaMigrationStep {
         /// for the untouched prefix; display/debug aid).
         added_values: Vec<String>,
     },
+    /// Promote a nullable property to required (#721). Emitted only when the
+    /// desired type equals the accepted one except for nullability. Apply
+    /// refuses unless no committed row of the table holds a null in the
+    /// column; `property_name` is the DESIRED (post-rename) name.
+    RequireProperty {
+        type_kind: SchemaTypeKind,
+        type_name: String,
+        property_name: String,
+    },
     UpdateTypeMetadata {
         type_kind: SchemaTypeKind,
         name: String,
@@ -665,6 +674,12 @@ fn plan_properties(
                 property_name: property.name.clone(),
                 added_values,
             });
+        } else if nullability_tightening(&existing.prop_type, &property.prop_type) {
+            steps.push(SchemaMigrationStep::RequireProperty {
+                type_kind,
+                type_name: type_name.to_string(),
+                property_name: property.name.clone(),
+            });
         } else if existing.prop_type != property.prop_type {
             steps.push(SchemaMigrationStep::UnsupportedChange {
                 entity: format!(
@@ -833,6 +848,16 @@ fn plan_property_constraints(
                     steps.push(step);
                 }
             }
+            PropertyConstraintShape::Unique if matches!(type_kind, SchemaTypeKind::Node) => {
+                let step = SchemaMigrationStep::AddConstraint {
+                    type_kind,
+                    type_name: type_name.to_string(),
+                    constraint: Constraint::Unique(vec![property_name.to_string()]),
+                };
+                if !steps.contains(&step) {
+                    steps.push(step);
+                }
+            }
             PropertyConstraintShape::Key | PropertyConstraintShape::Unique => {
                 steps.push(SchemaMigrationStep::UnsupportedChange {
                     entity: entity.clone(),
@@ -897,6 +922,17 @@ fn plan_constraints(
         }
         match &constraint {
             ConstraintIR::Index { .. } => {
+                let step = SchemaMigrationStep::AddConstraint {
+                    type_kind,
+                    type_name: type_name.to_string(),
+                    constraint: constraint_from_ir(&constraint, system_columns),
+                };
+                if !steps.contains(&step) {
+                    steps.push(step);
+                }
+            }
+            // #721: a node's @unique is checked against the stored rows at apply.
+            ConstraintIR::Unique { .. } if matches!(type_kind, SchemaTypeKind::Node) => {
                 let step = SchemaMigrationStep::AddConstraint {
                     type_kind,
                     type_name: type_name.to_string(),
@@ -995,6 +1031,16 @@ fn plan_property_metadata(
             });
         }
     }
+}
+
+/// True when `desired` is `accepted` made required: same scalar, list shape
+/// and enum values, nullable before and not nullable after.
+fn nullability_tightening(accepted: &PropType, desired: &PropType) -> bool {
+    accepted.nullable
+        && !desired.nullable
+        && accepted.scalar == desired.scalar
+        && accepted.list == desired.list
+        && accepted.enum_values == desired.enum_values
 }
 
 /// `Some(added)` when `desired` is a PURE enum widening of `accepted`: both

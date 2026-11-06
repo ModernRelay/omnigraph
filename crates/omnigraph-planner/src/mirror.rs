@@ -25,7 +25,7 @@ use crate::bound::{BoundPlan, ValueTable};
 use crate::cost::{AccessPath, AntiJoinStrategy, ExpandMode, ExpandPolicy, ValidateRemoval};
 use crate::error::PlanError;
 use crate::logical::{
-    ColumnRef, CsvSourceSpec, FragmentWriteSpec, GqFilter, KeyJoinKind, Predicate,
+    ColumnRef, CsvSourceSpec, DeltaSourceSpec, FragmentWriteSpec, GqFilter, KeyJoinKind, Predicate,
     RuntimeFilterSpec, ScanAccess, ScanSpec, ValidateSpec,
 };
 use crate::operation::TableRef;
@@ -352,6 +352,9 @@ pub enum NodeMirror {
         max_partitions: u32,
         max_workers: u32,
     },
+    DeltaSource {
+        spec: DeltaSourceSpec,
+    },
     Validate {
         input: NodeId,
         table: String,
@@ -591,6 +594,9 @@ impl From<&PhysicalNode> for NodeMirror {
                 max_partitions: *max_partitions,
                 max_workers: *max_workers,
             },
+            PhysicalNode::DeltaSource { spec } => Self::DeltaSource {
+                spec: spec.as_ref().clone(),
+            },
             PhysicalNode::Validate {
                 input,
                 table,
@@ -821,6 +827,9 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 spec: Box::new(spec),
                 max_partitions,
                 max_workers,
+            },
+            NodeMirror::DeltaSource { spec } => Self::DeltaSource {
+                spec: Box::new(spec),
             },
             NodeMirror::Validate {
                 input,

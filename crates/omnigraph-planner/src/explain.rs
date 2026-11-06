@@ -28,7 +28,10 @@ use crate::validate::ValidationSummary;
 /// Version 7: `pipelines` is present on every planned document and is cut at
 /// every node whose operator holds its whole input, not only at a join's
 /// build side; a pipeline's `sink` may name such a breaker node.
-pub const EXPLAIN_VERSION: u32 = 7;
+/// Version 8: the write node kind `DeltaSource` was added (a write's staged
+/// delta of one table, the leaf under its `Validate`), and `operation`
+/// carries `write` and `committed` for a write.
+pub const EXPLAIN_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EntrySummary {
@@ -68,6 +71,13 @@ pub struct OperationSummary {
     /// A load's `mode`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<&'static str>,
+    /// A write's statement kind (`load`, `mutation`, `blob_cell`,
+    /// `branch_merge`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write: Option<&'static str>,
+    /// The committed image a write's lookups read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committed: Option<&'static str>,
 }
 
 impl OperationSummary {
@@ -93,6 +103,12 @@ impl OperationSummary {
             Operation::Load { ir, .. } => Some(ir.mode.as_str()),
             _ => None,
         };
+        let (write, committed) = match op {
+            Operation::Write {
+                kind, committed, ..
+            } => (Some(kind.as_str()), Some(committed.as_str())),
+            _ => (None, None),
+        };
         Self {
             kind: op.kind(),
             tables,
@@ -100,6 +116,8 @@ impl OperationSummary {
             budget,
             resume,
             mode,
+            write,
+            committed,
         }
     }
 
@@ -111,6 +129,8 @@ impl OperationSummary {
             budget: None,
             resume: None,
             mode: None,
+            write: None,
+            committed: None,
         }
     }
 }

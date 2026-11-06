@@ -23,10 +23,10 @@ use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
 
-use omnigraph_compiler::ir::{LoadCheck, lower_load};
+use omnigraph_compiler::ir::{DeltaClass, LoadCheck, WriteKind, lower_load};
 use omnigraph_compiler::query::ast::{LoadStmt, LoadStmtMode, LoadTarget};
 use omnigraph_planner::{
-    BoundPlan, Decision, MemorySource, NodeTypeSpec, Operation, RouteOverride, Side, SideId,
+    BoundPlan, CommittedSide, Decision, MemorySource, Operation, RouteOverride, Side, SideId,
     TableRef, ValueTable, route,
 };
 
@@ -41,6 +41,8 @@ use crate::storage_layer::{
     DeletedIdBudget, KEYED_WRITE_MAX_BYTES, WriteBudget, retain_keyed_batch,
 };
 use crate::table_store::CapturedSource;
+use crate::validate::load::{JudgedSide, LoadAdmission, RepeatRule, Report, WriteJudge};
+use crate::validate::plan::{WriteTable, judgment_rank, node_type_spec};
 
 /// Result of a load operation.
 #[derive(Debug, Clone, Default)]
@@ -64,6 +66,9 @@ pub struct LoadReceipt {
     /// The planner's document for a `load csv` statement; a JSONL load has none.
     pub plan: Option<omnigraph_planner::explain::Explain>,
     pub executed: LoadExecuted,
+    /// A JSONL load's planner document per table it validated, in table
+    /// order; a `load csv` statement's one document is `plan`.
+    pub validated: Vec<omnigraph_planner::explain::Explain>,
 }
 
 impl LoadReceipt {
@@ -844,6 +849,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     let csv_buffers = memory.charge("load CSV input")?;
     let mut csv_batch = None;
     let mut load_plan = None;
+    let mut csv_judged = None;
     let mut executed = LoadExecuted::default();
     if let LoadAttemptInput::Csv(request, source, handle) = input {
         executed.partitions = 1;
@@ -876,7 +882,18 @@ async fn load_jsonl_reader_once<R: BufRead>(
             ))
             .await;
         }
-        load_plan = decision.explain().cloned();
+        let (judged, explain) = crate::validate::plan::judged_table(
+            decision,
+            request.target.table_key(),
+            if mode == LoadMode::Merge {
+                DeltaClass::Upsert
+            } else {
+                DeltaClass::Insert
+            },
+            Vec::new(),
+        )?;
+        load_plan = Some(explain);
+        csv_judged = Some(judged);
         let capture = source.capture(request).await?;
         let decoding = memory.charge("load CSV decoding")?;
         let prepared = csv::prepare_csv_batches(&catalog, request, capture, &mut |bytes| {
@@ -1219,41 +1236,58 @@ async fn load_jsonl_reader_once<R: BufRead>(
         result.edges_loaded.insert(edge_name, loaded_count);
     }
 
-    // Phase 3: end-of-load validation — one unified evaluator pass over the
-    // accumulated staging (value/enum, uniqueness incl. cross-version, edge-RI,
-    // cardinality) against the pinned pre-load base. `Overwrite` validates each
-    // touched table as its whole new image (that table's committed view empty),
-    // but is PER-TABLE — a table absent from the batch keeps `base`, so an
-    // edges-only overwrite still resolves RI against committed nodes;
-    // `Append`/`Merge` keep `base` everywhere. This shares the evaluator with the
-    // mutation + merge paths, so the surfaces cannot drift.
-    let mut changeset = staging.to_changeset();
-    // Overwrite replaces each touched table; a committed row absent from the new
-    // batch is REMOVED but is not in `to_changeset` (which only records the new
-    // batch). Express those removals as `deleted_ids` so edge-RI (path-b) and
-    // cardinality recompute against them — e.g. overwriting `node:Person` to drop
-    // Bob while a retained `edge:Knows(Alice->Bob)` would otherwise publish an
-    // orphan. (Per-table, like the rest of Overwrite handling.)
-    if mode == LoadMode::Overwrite {
-        let mut removed_id_budget = DeletedIdBudget::new(write_budget);
-        let keys: Vec<String> = changeset.keys().cloned().collect();
-        for table_key in keys {
-            let removed = crate::validate::overwrite_removed_ids(
-                &snapshot,
-                &table_key,
-                changeset.get(&table_key).expect("key from this changeset"),
-                catalog.system_columns,
-                |id| removed_id_budget.retain(id),
-            )
-            .await?;
-            if !removed.is_empty() {
-                changeset
-                    .get_mut(&table_key)
-                    .expect("key from this changeset")
-                    .deleted_ids = removed;
+    let mut tables: Vec<WriteTable> = staging
+        .pending
+        .iter()
+        .filter(|(_, pending)| !pending.batches.is_empty())
+        .map(|(table, pending)| WriteTable {
+            table: table.clone(),
+            delta: match pending_mode {
+                PendingMode::StrictInsert => DeltaClass::Insert,
+                PendingMode::Upsert => DeltaClass::Upsert,
+                PendingMode::Overwrite => DeltaClass::Replace,
+            },
+            rows: pending.batches.iter().map(|b| b.num_rows() as u64).sum(),
+            deleted_ids: Vec::new(),
+        })
+        .collect();
+    tables.sort_by(|a, b| judgment_rank(&a.table).cmp(&judgment_rank(&b.table)));
+    let batches: Vec<Vec<RecordBatch>> = tables
+        .iter()
+        .map(|table| staging.pending_batches(&table.table).to_vec())
+        .collect();
+    let (judged, validated): (Vec<_>, Vec<_>) = match csv_judged {
+        Some(judged) => {
+            if tables.len() != 1 || tables[0].table != judged.table {
+                return Err(OmniError::manifest_internal(format!(
+                    "load csv into {}: the load staged {} tables",
+                    judged.table,
+                    tables.len()
+                )));
             }
+            (vec![judged], Vec::new())
         }
-    }
+        None if tables.is_empty() => (Vec::new(), Vec::new()),
+        None => {
+            let mut planning = snapshot.clone();
+            planning.set_read_caches(crate::db::manifest::SnapshotReadCaches {
+                session: db.read_caches().session.clone(),
+                handles: db.read_caches().handles.clone(),
+                table_wrapper: None,
+            });
+            crate::validate::plan::plan_write(
+                &planning,
+                &catalog,
+                WriteKind::Load,
+                CommittedSide::Base,
+                tables,
+                write_budget.bytes(),
+            )
+            .await?
+            .into_iter()
+            .unzip()
+        }
+    };
     let loaded_rows: usize = result
         .nodes_loaded
         .values()
@@ -1266,22 +1300,42 @@ async fn load_jsonl_reader_once<R: BufRead>(
     if let Some(validation) = &validation {
         validation.entries::<String>(loaded_rows.saturating_mul(VALIDATION_ENTRIES_PER_ROW))?;
     }
-    {
-        let reuse = memory
-            .admit_read_reuse()
-            .and_then(|admitted| read_reuse::LoadReadReuse::new(db, &snapshot, admitted));
-        let validation_snapshot = reuse.as_ref().map(|reuse| {
-            let mut cached = snapshot.clone();
-            cached.set_read_caches(reuse.snapshot_caches());
-            cached
-        });
-        let committed = crate::validate::CommittedState::load(
-            validation_snapshot.as_ref().unwrap_or(&snapshot),
-            mode,
-            &changeset,
-        );
-        let access = crate::validate::AccessPaths::probe_everywhere();
-        crate::validate::validate_changeset_with_access(&changeset, &committed, &catalog, &access)
+    if !judged.is_empty() {
+        let judge = WriteJudge {
+            tables: judged,
+            committed: JudgedSide::Base(snapshot.clone()),
+            write_budget,
+            catalog: Arc::clone(&catalog),
+            report: Report::First,
+            repeat: RepeatRule::for_write(WriteKind::Load),
+        };
+        let mut admit_reuse = || {
+            memory
+                .admit_read_reuse()
+                .and_then(|admitted| read_reuse::LoadReadReuse::new(db, &snapshot, admitted))
+        };
+        let mut removed_id_budget = DeletedIdBudget::new(write_budget);
+        let mut admit_removed = |id: &str| removed_id_budget.retain(id);
+        let retained_edges = retained
+            .as_ref()
+            .map(|_| memory.charge("load retained edges"))
+            .transpose()?;
+        let mut admit_retained = |batch: &RecordBatch| match &retained_edges {
+            Some(charge) => charge.hold(batch),
+            None => Ok(()),
+        };
+        judge
+            .judge_batches(
+                db,
+                batches,
+                &mut LoadAdmission {
+                    phase: None,
+                    bytes: None,
+                    reuse: Some(&mut admit_reuse),
+                    removed: &mut admit_removed,
+                    retained: &mut admit_retained,
+                },
+            )
             .await?;
     }
     drop(validation);
@@ -1308,6 +1362,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
         commit,
         plan: load_plan,
         executed,
+        validated,
     })
 }
 
@@ -1428,6 +1483,7 @@ async fn load_csv_overwrite_plan(
         commit,
         plan: Some(explain),
         executed,
+        validated: Vec::new(),
     })
 }
 
@@ -1499,58 +1555,35 @@ pub(crate) async fn plan_load(
         SideId::Child,
         csv::target_arrow_schema(catalog, &request.target)?,
     );
-    if request.mode == LoadMode::Overwrite {
-        for side in &tables {
-            let key = &side.table.type_key;
-            let endpoint = ir.checks.iter().any(|check| {
-                matches!(
-                    check.check,
-                    omnigraph_compiler::ir::ValidateCheck::EdgeRi { .. }
-                ) && check.consults.as_ref() == Some(key)
-            });
-            if !endpoint && *key != table_key {
-                continue;
-            }
-            let Some(name) = key.strip_prefix("node:") else {
-                continue;
-            };
-            let Some(node) = catalog.node_types.get(name) else {
-                continue;
-            };
-            let Some(entry) = snapshot.dataset(key) else {
-                continue;
-            };
-            source = source
-                .with_node_type(
-                    name,
-                    NodeTypeSpec {
-                        table: side.table.clone(),
-                        version: Some(side.version),
-                        columns: catalog.system_columns,
-                        schema: node.arrow_schema.clone(),
-                        key: node.key.clone().unwrap_or_default(),
-                        object_columns: node
-                            .node_object_fields()
-                            .map(|field| field.name().clone())
-                            .collect(),
-                        object_fields: node
-                            .node_object_members()
-                            .map(|(member, field)| {
-                                arrow_schema::Field::new(
-                                    member,
-                                    field.data_type().clone(),
-                                    field.is_nullable(),
-                                )
-                            })
-                            .collect(),
-                        row_count: Some(entry.entity_count),
-                    },
-                )
-                .with_index_facts(
-                    key,
-                    crate::engine::plan_source::load_index_facts(snapshot, key).await?,
-                );
+    for side in &tables {
+        let key = &side.table.type_key;
+        let endpoint = ir.checks.iter().any(|check| {
+            matches!(
+                check.check,
+                omnigraph_compiler::ir::ValidateCheck::EdgeRi { .. }
+            ) && check.consults.as_ref() == Some(key)
+        });
+        if !endpoint && *key != table_key {
+            continue;
         }
+        let Some(name) = key.strip_prefix("node:") else {
+            continue;
+        };
+        let Some(node) = catalog.node_types.get(name) else {
+            continue;
+        };
+        let Some(entry) = snapshot.dataset(key) else {
+            continue;
+        };
+        source = source
+            .with_node_type(
+                name,
+                node_type_spec(side, node, catalog, Some(entry.entity_count)),
+            )
+            .with_index_facts(
+                key,
+                crate::engine::plan_source::load_index_facts(snapshot, key).await?,
+            );
     }
     let operation = Operation::Load {
         ir: Box::new(ir),
@@ -1563,7 +1596,7 @@ pub(crate) async fn plan_load(
 
 /// The target and every consulted table the base pins, each once in check
 /// order; a table the base predates has no side.
-fn load_sides(
+pub(crate) fn load_sides(
     snapshot: &Snapshot,
     columns: SystemColumns,
     table_key: &str,
@@ -3127,17 +3160,11 @@ fn build_column_from_json(
     write_budget: WriteBudget,
 ) -> Result<ArrayRef> {
     let array: ArrayRef = match data_type {
-        DataType::Utf8 => {
-            let values: Vec<Option<String>> = rows
-                .iter()
-                .map(|row| {
-                    row.get(name)
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                })
-                .collect();
-            Arc::new(StringArray::from(values))
-        }
+        DataType::Utf8 => Arc::new(
+            rows.iter()
+                .map(|row| row.get(name).and_then(|v| v.as_str()))
+                .collect::<StringArray>(),
+        ),
         DataType::Int32 => {
             let mut values = Vec::with_capacity(rows.len());
             for row in rows {
@@ -3776,20 +3803,6 @@ pub(crate) fn parse_date64_literal(value: &str) -> Result<i64> {
 
 // ─── Value constraint validation ─────────────────────────────────────────────
 
-/// The first value constraint `batch` violates, in declaration order.
-pub(crate) fn validate_value_constraints(
-    batch: &RecordBatch,
-    node_type: &omnigraph_compiler::catalog::NodeType,
-) -> Result<()> {
-    match value_constraint_failures(batch, node_type)
-        .into_iter()
-        .next()
-    {
-        Some((_, _, error)) => Err(error),
-        None => Ok(()),
-    }
-}
-
 /// Every `@range` and `@check` constraint of `node_type` that `batch`
 /// violates: one entry per constraint in declaration order (the range
 /// constraints, then the check constraints), the constraint's index, its
@@ -3939,23 +3952,6 @@ fn check_constraint_failure(
                 )),
             )
         })
-}
-
-/// Validate that every enum-typed property in `properties` only contains values
-/// from its declared enum value set. Operates on a single `RecordBatch` so it
-/// can be called from any write path that already holds a batch.
-pub(crate) fn validate_enum_constraints(
-    batch: &RecordBatch,
-    properties: &HashMap<String, omnigraph_compiler::types::PropType>,
-    type_name: &str,
-) -> Result<()> {
-    match enum_constraint_failures(batch, properties, type_name)
-        .into_iter()
-        .next()
-    {
-        Some((_, _, error)) => Err(error),
-        None => Ok(()),
-    }
 }
 
 /// Every enum-typed property of `properties` with a value of `batch` outside
@@ -5588,9 +5584,9 @@ node Doc {
             arrow_schema: schema,
         };
 
-        let result = validate_value_constraints(&batch, &node_type);
-        assert!(result.is_err(), "expected NaN to be rejected");
-        let err = result.unwrap_err().to_string();
+        let failures = value_constraint_failures(&batch, &node_type);
+        let (_, _, err) = failures.first().expect("expected NaN to be rejected");
+        let err = err.to_string();
         assert!(err.contains("NaN"), "error should mention NaN: {}", err);
     }
 

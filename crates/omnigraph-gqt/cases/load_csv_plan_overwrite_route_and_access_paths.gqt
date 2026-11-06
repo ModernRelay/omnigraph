@@ -3,8 +3,9 @@
 # notes: overwrite runs the plan route with every validate stage named by check, table and
 # notes: access path (a text-keyed endpoint probes after the drain, `probe judged`, even under
 # notes: `access scan`), the removal fact and the write stage as fragments; append and merge
-# notes: report the pipeline route with their keyed adapters; the executed report records
-# notes: the partitions and rows that ran.
+# notes: report the pipeline route with their keyed adapters and scan the lookups into the
+# notes: unindexed Person table they keep; the executed report records the partitions and
+# notes: rows that ran.
 
 --- runner
 timeout_ms: 10000
@@ -94,7 +95,7 @@ load csv "knows_more.csv" into edge:Knows mode append header
 
 --- expect plan
 load route: pipeline
-load validate edge_ri edge:Knows from Person: access probe
+load validate edge_ri edge:Knows from Person: access scan
 load validate edge_ri edge:Knows from Person: probe judged
 load validate removal edge:Knows: none
 load write: append strict_insert
@@ -111,7 +112,7 @@ load csv "people_more.csv" into node:Person mode merge header
 
 --- expect plan
 load route: pipeline
-load validate unique node:Person unique [email]: access probe
+load validate unique node:Person unique [email]: access scan
 load validate removal node:Person: none
 load write: merge upsert
 load executed: partitions 1 rows 1
