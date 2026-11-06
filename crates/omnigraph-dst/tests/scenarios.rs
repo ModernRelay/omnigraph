@@ -2607,6 +2607,164 @@ fn merge_history_cost_rows(replay: &str) -> String {
     rows
 }
 
+/// A three-way merge whose `Person` table changed only on the source, by
+/// `source_commits` one-row inserts, one commit each, while the target moved
+/// another table (`Knows`). The merge adopts the source's `Person` through the
+/// pure-insert proof, which follows the source's chain of commits back to the
+/// merge base (issue #1222, cause 2), so this cost follows the source's commit
+/// count; the two labels record it at two counts.
+struct MergeSourceHistoryCost {
+    source_commits: u64,
+    label: &'static str,
+}
+
+impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage>
+    for MergeSourceHistoryCost
+{
+    type Output = ();
+
+    async fn run(&self, resources: &mut omnigraph_dst::memory::MemoryStorage, _workload_seed: u64) {
+        omnigraph_dst::cost::set_label("_merge_setup");
+        let settings = SessionSettings::default()
+            .with("merge_lineage", "on")
+            .unwrap();
+        let db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            ),
+            settings,
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+        db.branch_create("feature").await.unwrap();
+        for commit in 0..self.source_commits {
+            db.mutate(
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(
+                    &[("$name", format!("source-{commit}").as_str())],
+                    &[("$age", 40)],
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        db.mutate(
+            "main",
+            MUTATION_QUERIES,
+            "add_friend",
+            &params(&[("$from", "Bob"), ("$to", "Alice")]),
+        )
+        .await
+        .unwrap();
+        let detached = db.detach();
+        let db = detached.attach(Arc::new(
+            Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                .await
+                .unwrap(),
+        ));
+        let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+        omnigraph_dst::cost::set_label(self.label);
+        let outcome = omnigraph::instrumentation::with_merge_write_probes(
+            probes.clone(),
+            db.branch_merge("feature", "main"),
+        )
+        .await;
+        omnigraph_dst::cost::set_label("_merge_verify");
+        assert_eq!(
+            outcome.unwrap().outcome,
+            omnigraph::db::MergeOutcome::Merged
+        );
+        assert_eq!(
+            probes.proven_insert_history_read_calls(),
+            self.source_commits,
+            "the pure-insert proof must certify every source commit"
+        );
+        assert_eq!(probes.completed_full_walk_classification_calls(), 0);
+        assert_eq!(
+            person_rows_on(&db, "main").await.len(),
+            4 + usize::try_from(self.source_commits).unwrap()
+        );
+    }
+}
+
+fn merge_source_history_cost_rows(replay: &str) -> String {
+    let mut rows = String::new();
+    for (source_commits, label) in [(2, "MergeSourceHistory2"), (32, "MergeSourceHistory32")] {
+        rows.push_str(&labeled_cost_rows(
+            format!("shared-memory://dst-merge-source-cost-{replay}-{label}"),
+            &MergeSourceHistoryCost {
+                source_commits,
+                label,
+            },
+            label,
+        ));
+    }
+    rows
+}
+
+/// The calls of the [`MergeSourceHistoryCost`] merge by realm and kind, at
+/// each source commit count in `MERGE_SOURCE_COMMITS` (default `1,2,8,32`):
+/// attribution for the per-commit cost of the pure-insert proof.
+#[test]
+#[serial]
+#[ignore = "instrument: merge pure-insert proof call attribution by source commit count — run explicitly"]
+fn dst_merge_source_history_cost_paths() {
+    let _s = omnigraph::seams::FailScenario::setup();
+    let counts = std::env::var("MERGE_SOURCE_COMMITS")
+        .unwrap_or_else(|_| "1,2,8,32".to_string())
+        .split(',')
+        .map(|d| d.trim().parse::<u64>().unwrap())
+        .collect::<Vec<_>>();
+    for source_commits in counts {
+        omnigraph_dst::lance_faults::install();
+        let environment = omnigraph_dst::memory::MemoryEnvironment::new(
+            format!("shared-memory://dst-merge-source-paths-{source_commits}"),
+            24_903,
+            omnigraph_dst::UniverseProcess::Shared,
+        );
+        let ledger = omnigraph_dst::cost::arm_with_paths();
+        let run = omnigraph_dst::run_universe(
+            &environment,
+            &MergeSourceHistoryCost {
+                source_commits,
+                label: "MergeSourceHistory",
+            },
+        );
+        let log = ledger.path_log();
+        omnigraph_dst::cost::disarm();
+        run.cleanup.unwrap().unwrap();
+        run.result.unwrap().unwrap();
+        let verbose = std::env::var("MERGE_SOURCE_VERBOSE").is_ok();
+        let mut classes = std::collections::BTreeMap::<String, u64>::new();
+        let mut total = 0;
+        for (row_label, verb, path) in &log {
+            if row_label != "MergeSourceHistory" {
+                continue;
+            }
+            total += 1;
+            let class = warm_read_class(verb, path);
+            if verbose {
+                println!("  {source_commits} {class} {path}");
+            }
+            *classes.entry(class).or_default() += 1;
+        }
+        let classes = classes
+            .iter()
+            .map(|(class, n)| format!("{class}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("source_commits={source_commits:<4} total={total:<5} {classes}");
+    }
+}
+
 /// The cost of a one-row update after `commits` one-row inserts, each on a
 /// reopened handle, before and after `optimize`. Every insert lands as its
 /// own fragment; the update's key filter reads every fragment until
@@ -3704,6 +3862,7 @@ fn dst_bench_cost_count_golden() {
     let full = ledger.render();
     omnigraph_dst::cost::disarm();
     table.push_str(&merge_history_cost_rows("a"));
+    table.push_str(&merge_source_history_cost_rows("a"));
     table.push_str(&branch_write_cost_rows("a"));
     table.push_str(&diff_cost_rows("a"));
     table.push_str(&commit_list_cost_rows("a"));
@@ -3716,6 +3875,7 @@ fn dst_bench_cost_count_golden() {
     let mut table2 = ledger2.render_calls();
     omnigraph_dst::cost::disarm();
     table2.push_str(&merge_history_cost_rows("b"));
+    table2.push_str(&merge_source_history_cost_rows("b"));
     table2.push_str(&branch_write_cost_rows("b"));
     table2.push_str(&diff_cost_rows("b"));
     table2.push_str(&commit_list_cost_rows("b"));
