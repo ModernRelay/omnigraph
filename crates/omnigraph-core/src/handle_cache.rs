@@ -375,6 +375,7 @@ mod tests {
                 mode,
                 ..Default::default()
             };
+            // forbidden-api-allow: test-only raw Lance fixture with many versions for the handle cache
             Dataset::write(reader, uri, Some(params)).await.unwrap();
         }
     }
