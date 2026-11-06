@@ -1,8 +1,10 @@
 # issue: 1277
+# traversal: auto
 # red_on: f7a596cb; Lance 13 simplifies the disjoint IN pair to a literal, so null rows pass the filter.
 # notes: Two IN-list tests on one nullable property, joined so that the lists share no member.
 # notes: For a row whose property is null, every test is null, so no predicate below may select it,
 # notes: on a read, a delete or an update. Overlapping lists are the positive control.
+# notes: The null split must keep the scalar index of `n` for the `=` / `or` spelling (plan steps).
 
 --- runner
 timeout_ms: 10000
@@ -14,7 +16,7 @@ environments:
 node Item {
     slug: String @key
     s: String?
-    n: I64?
+    n: I64? @index
     tag: String?
 }
 edge Next: Item -> Item
@@ -100,6 +102,44 @@ query equality_disjunctions_without_in() {
 
 --- expect shape
 i.slug: String
+
+--- query
+set engine = v2;
+query equality_disjunction_keeps_the_index() {
+    match {
+        $i: Item
+        $i.n = 1 or $i.n = 2
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug": "b"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: access index_probe n
+
+--- query
+set engine = v2;
+query overlapping_equality_disjunctions_keep_the_index() {
+    match {
+        $i: Item
+        ($i.n = 1 or $i.n = 2) and ($i.n = 1 or $i.n = 3)
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug": "b"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: access index_probe n
 
 --- query
 query traversal_target() {

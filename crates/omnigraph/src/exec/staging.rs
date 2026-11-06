@@ -961,14 +961,6 @@ async fn stage_pending_table(
     }))
 }
 
-/// Stage a delete on `table_key` from a combined predicate, mirroring
-/// [`stage_pending_table`] for the delete path. Reopens the dataset at the
-/// pinned `expected` version (strict Delete op) and stages a deletion-vector
-/// transaction via `TableStorage::stage_delete` — staging writes the deletion
-/// file but commits nothing until `commit_all` runs `commit_staged_detached`.
-/// Returns `None` when the predicate matches zero committed rows, so a no-op
-/// delete stages nothing and never moves HEAD (the zero-row drift fix carried
-/// onto the staged path).
 /// The rows of a table that any of a mutation's delete statements matched.
 /// One predicate is used as written. Several are joined as
 /// `p1 IS TRUE OR p2 IS TRUE`, which selects the same rows as `p1 OR p2`, but
@@ -982,6 +974,14 @@ fn combine_delete_predicates(predicates: Vec<Expr>) -> Option<Expr> {
     predicates.into_iter().map(Expr::is_true).reduce(Expr::or)
 }
 
+/// Stage a delete on `table_key` from a combined predicate, mirroring
+/// [`stage_pending_table`] for the delete path. Reopens the dataset at the
+/// pinned `expected` version (strict Delete op) and stages a deletion-vector
+/// transaction via `TableStorage::stage_delete` — staging writes the deletion
+/// file but commits nothing until `commit_all` runs `commit_staged_detached`.
+/// Returns `None` when the predicate matches zero committed rows, so a no-op
+/// delete stages nothing and never moves HEAD (the zero-row drift fix carried
+/// onto the staged path).
 async fn stage_delete_table(
     db: &crate::db::Omnigraph,
     table_key: String,

@@ -1050,6 +1050,12 @@ pub(super) fn build_lance_filter_expr(
 /// than once (see [`split_on_repeatedly_tested_columns`]). `schema` decides
 /// only which columns need the split and the type of their null; whether the
 /// predicate lowers at all depends on the expression alone.
+///
+/// The result is a filter, not a value: it selects the same rows as the
+/// written predicate, but where that predicate is null it may be false. Use it
+/// only where true selects a row and null and false both reject it: a scanner
+/// or delete filter, a conjunct or disjunct of other filters, or under
+/// `IS TRUE` / `IS NOT TRUE`. Never negate it or read its value.
 pub(crate) fn ir_expr_to_df_expr(
     expr: &IRExpr,
     params: &ParamMap,
@@ -1083,8 +1089,12 @@ pub(crate) const MAX_NULL_SPLIT_COLUMNS: usize = 4;
 /// That is the same predicate in three-valued logic. Every rewrite the
 /// simplifier makes in the first branch is exact when `c` is not null, and the
 /// branch is false when `c` is null; the second branch tests no `c` at all, so
-/// constant folding answers it. A column the schema declares non-null needs no
-/// split. More than [`MAX_NULL_SPLIT_COLUMNS`] repeatedly tested columns,
+/// constant folding answers it. When `p[c := NULL]` reads no other column it
+/// is evaluated here (see [`constant_truth`]) and the predicate becomes
+/// `c IS NULL OR p` when it is true and `c IS NOT NULL AND p` when it is false
+/// or null, which keeps Lance's scalar index for the predicate; null becomes
+/// false only at the root of a filter, where both reject the row. A column the
+/// schema declares non-null needs no split. More than [`MAX_NULL_SPLIT_COLUMNS`] repeatedly tested columns,
 /// nullable or not, answer `None` (not pushable), so the verdict never depends
 /// on the schema. Remove the split at the Lance bump whose DataFusion contains
 /// #24258.
@@ -1123,13 +1133,59 @@ fn split_on_repeatedly_tested_columns(
             .ok()?
             .data;
         let column = Expr::Column(Column::from_name(name));
-        expr = column
-            .clone()
-            .is_not_null()
-            .and(expr)
-            .or(column.is_null().and(when_null));
+        expr = match constant_truth(&when_null) {
+            // `p[c := NULL]` is true: `(c IS NULL OR p)` is exact.
+            Some(Some(true)) => column.is_null().or(expr),
+            // False, or null at the root of a filter, where null and false
+            // both reject the row: `(c IS NOT NULL AND p)`.
+            Some(Some(false) | None) => column.is_not_null().and(expr),
+            None => column
+                .clone()
+                .is_not_null()
+                .and(expr)
+                .or(column.is_null().and(when_null)),
+        };
     }
     Some(expr)
+}
+
+/// The value of an expression that reads no column, evaluated without the
+/// simplifier: `Some(Some(b))` for a boolean, `Some(None)` for null, and
+/// `None` when it reads a column or does not evaluate to one boolean.
+///
+/// A null branch `c IS NULL AND NULL` keeps Lance from using a scalar index:
+/// it has no index for a literal, so the branch carries a refine expression,
+/// and an `OR` with a refine on either side drops the index for the whole
+/// predicate (`IndexedExpression::maybe_or`). Folding the branch first keeps
+/// `x = a OR x = b` on a nullable indexed property an index probe.
+fn constant_truth(expr: &datafusion::prelude::Expr) -> Option<Option<bool>> {
+    use arrow_array::{Array, BooleanArray, RecordBatch, RecordBatchOptions};
+    use datafusion::common::DFSchema;
+    use datafusion::logical_expr::ColumnarValue;
+
+    if !expr.column_refs().is_empty() {
+        return None;
+    }
+    let physical = datafusion::physical_expr::create_physical_expr(
+        expr,
+        &DFSchema::empty(),
+        &Default::default(),
+    )
+    .ok()?;
+    let batch = RecordBatch::try_new_with_options(
+        std::sync::Arc::new(Schema::empty()),
+        Vec::new(),
+        &RecordBatchOptions::new().with_row_count(Some(1)),
+    )
+    .ok()?;
+    match physical.evaluate(&batch).ok()? {
+        ColumnarValue::Scalar(ScalarValue::Boolean(value)) => Some(value),
+        ColumnarValue::Scalar(_) => None,
+        ColumnarValue::Array(values) => {
+            let values = values.as_any().downcast_ref::<BooleanArray>()?;
+            (values.len() == 1).then(|| values.is_valid(0).then(|| values.value(0)))
+        }
+    }
 }
 
 /// The columns that two or more `=`, `!=` or `IN` tests with a literal read,
@@ -1530,6 +1586,14 @@ mod null_split_tests {
                 not(col("s").not_eq(lit("x")).and(col("s").not_eq(lit("y"))))
                     .and(not(col("n").eq(lit(1i64)).and(col("n").eq(lit(2i64))))),
             ),
+            (
+                "n = 1 or n = 2",
+                col("n").eq(lit(1i64)).or(col("n").eq(lit(2i64))),
+            ),
+            (
+                "(n = 1 or n = 2) and k = b",
+                (col("n").eq(lit(1i64)).or(col("n").eq(lit(2i64)))).and(col("k").eq(lit("b"))),
+            ),
         ]
     }
 
@@ -1568,6 +1632,34 @@ mod null_split_tests {
             split_on_repeatedly_tested_columns(non_null.clone(), Some(&schema())),
             Some(non_null)
         );
+    }
+
+    /// A null branch that reads no other column is folded to a constant, so
+    /// the pushed predicate keeps one guard and Lance keeps its scalar index;
+    /// one that reads another column keeps both branches.
+    #[test]
+    fn a_constant_null_branch_folds_into_one_guard() {
+        let p = col("n").eq(lit(1i64)).or(col("n").eq(lit(2i64)));
+        assert_eq!(
+            split_on_repeatedly_tested_columns(p.clone(), Some(&schema())),
+            Some(col("n").is_not_null().and(p))
+        );
+        let p = col("s")
+            .is_null()
+            .or(not(col("s").eq(lit("x")).and(col("s").eq(lit("y")))));
+        let split = split_on_repeatedly_tested_columns(p.clone(), Some(&schema()));
+        assert_eq!(split, Some(col("s").is_null().or(p.clone())));
+        let written = selected_rows(p, false);
+        assert!(written.contains(&0), "the null row is selected as written");
+        assert_eq!(selected_rows(split.expect("split"), true), written);
+        let p = col("n")
+            .eq(lit(1i64))
+            .or(col("n").eq(lit(2i64)))
+            .or(col("k").eq(lit("a")));
+        let split = split_on_repeatedly_tested_columns(p.clone(), Some(&schema()))
+            .expect("within the column bound");
+        assert_ne!(split, col("n").is_not_null().and(p.clone()));
+        assert_ne!(split, col("n").is_null().or(p));
     }
 
     /// The bound is on repeatedly tested columns whatever their nullability,
