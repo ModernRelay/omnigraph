@@ -521,26 +521,66 @@ impl OrderedTableCursor {
             Some(_) => Some(snapshot.open_lance_dataset(table_key).await?),
             None => None,
         };
-        Self::from_dataset_with(dataset, eager_signatures, None, table_key, role, id_col).await
+        Self::from_dataset_with(
+            dataset,
+            eager_signatures,
+            None,
+            None,
+            table_key,
+            role,
+            id_col,
+        )
+        .await
     }
 
-    /// An ordered cursor restricted to candidate row keys via an exact
-    /// `id IN (...)` filter, so the three-way classification loop touches only
-    /// rows whose fragments changed between the pinned versions.
-    async fn from_dataset_filtered(
+    /// A three-way cursor over candidate keys, scanning only `fragments`.
+    async fn from_dataset_scoped(
         dataset: Option<Dataset>,
         filter: &str,
+        fragments: Vec<lance_table::format::Fragment>,
         table_key: &str,
         role: &'static str,
         id_col: &'static str,
     ) -> Result<Self> {
-        Self::from_dataset_with(dataset, true, Some(filter), table_key, role, id_col).await
+        Self::from_dataset_with(
+            dataset,
+            true,
+            Some(filter),
+            Some(fragments),
+            table_key,
+            role,
+            id_col,
+        )
+        .await
+    }
+
+    /// An adopt cursor over candidate keys, scanning only `fragments`: the
+    /// fragments of this end that hold a candidate row (`LineageSideScope`).
+    async fn from_dataset_scoped_lazy(
+        dataset: Option<Dataset>,
+        filter: &str,
+        fragments: Vec<lance_table::format::Fragment>,
+        table_key: &str,
+        role: &'static str,
+        id_col: &'static str,
+    ) -> Result<Self> {
+        Self::from_dataset_with(
+            dataset,
+            false,
+            Some(filter),
+            Some(fragments),
+            table_key,
+            role,
+            id_col,
+        )
+        .await
     }
 
     async fn from_dataset_with(
         dataset: Option<Dataset>,
         eager_signatures: bool,
         filter: Option<&str>,
+        fragments: Option<Vec<lance_table::format::Fragment>>,
         table_key: &str,
         role: &'static str,
         id_col: &'static str,
@@ -549,6 +589,7 @@ impl OrderedTableCursor {
             dataset.clone(),
             KeyOrder {
                 filter: filter.map(KeyFilter::Sql),
+                fragments,
                 ..KeyOrder::full()
             },
             WalkSubject {
@@ -1484,6 +1525,7 @@ async fn revalidate_proven_pure_insert_target_incarnation(
 /// TRANSITIONAL — removed by the fragment-adopt work (see [`AdoptDelta`]): a
 /// fragment graft adopts the source's fragments by reference, so there is no
 /// row-level delta to compute.
+#[allow(clippy::too_many_arguments)]
 async fn compute_adopt_delta(
     target_db: &Omnigraph,
     table_key: &str,
@@ -1493,6 +1535,208 @@ async fn compute_adopt_delta(
     materialize_blobs: bool,
     external_preflight: &crate::table_store::ExternalBlobPreflight,
     write_budget: WriteBudget,
+    lineage: MergeLineage,
+) -> Result<Option<AdoptDelta>> {
+    let plan = match lineage {
+        MergeLineage::Off => None,
+        MergeLineage::On | MergeLineage::Verify => {
+            Box::pin(plan_lineage_merge(
+                catalog,
+                base_snapshot,
+                source_snapshot,
+                base_snapshot,
+                table_key,
+            ))
+            .await?
+        }
+    };
+    let Some(plan) = plan else {
+        return Box::pin(compute_adopt_delta_with(
+            target_db,
+            table_key,
+            catalog,
+            base_snapshot,
+            source_snapshot,
+            None,
+            materialize_blobs,
+            external_preflight,
+            write_budget,
+            None,
+        ))
+        .await;
+    };
+    if lineage == MergeLineage::On {
+        return Box::pin(compute_adopt_delta_with(
+            target_db,
+            table_key,
+            catalog,
+            base_snapshot,
+            source_snapshot,
+            Some(&plan),
+            materialize_blobs,
+            external_preflight,
+            write_budget,
+            None,
+        ))
+        .await;
+    }
+    let mut walk_log = Vec::new();
+    let walk = Box::pin(compute_adopt_delta_with(
+        target_db,
+        table_key,
+        catalog,
+        base_snapshot,
+        source_snapshot,
+        None,
+        materialize_blobs,
+        external_preflight,
+        write_budget,
+        Some(&mut walk_log),
+    ))
+    .await?;
+    let mut lineage_log = Vec::new();
+    let _ = Box::pin(compute_adopt_delta_with(
+        target_db,
+        table_key,
+        catalog,
+        base_snapshot,
+        source_snapshot,
+        Some(&plan),
+        materialize_blobs,
+        external_preflight,
+        write_budget,
+        Some(&mut lineage_log),
+    ))
+    .await?;
+    if walk_log != lineage_log {
+        let first_difference = walk_log
+            .iter()
+            .zip(lineage_log.iter())
+            .find(|(walk, lineage)| walk != lineage)
+            .map(|(walk, lineage)| format!("walk {walk:?} vs lineage {lineage:?}"))
+            .unwrap_or_else(|| {
+                format!(
+                    "walk logged {} outcomes, lineage logged {}",
+                    walk_log.len(),
+                    lineage_log.len()
+                )
+            });
+        return Err(OmniError::manifest_internal(format!(
+            "lineage-adopt verify divergence for '{table_key}': {first_difference}; set \
+             merge_lineage = off to run the walk only"
+        )));
+    }
+    Ok(walk)
+}
+
+/// What an adopt delta did with one id, for the `verify` comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdoptOutcome {
+    Deleted,
+    Inserted,
+    Updated,
+}
+
+/// The adopt classification of one ordered cursor pair, shared by the walk
+/// (one pair over both complete ends) and the lineage path (one pair per
+/// candidate chunk, in ascending key order).
+struct AdoptClassification<'a> {
+    append_writer: &'a mut StagedTableWriter,
+    upsert_writer: &'a mut StagedTableWriter,
+    deleted_ids: &'a mut DeleteIdChunks,
+    needs_update: bool,
+    log: Option<&'a mut Vec<(String, AdoptOutcome)>>,
+}
+
+impl AdoptClassification<'_> {
+    async fn classify(
+        &mut self,
+        mut base: OrderedTableCursor,
+        mut source: OrderedTableCursor,
+        materializer: &crate::table_store::TableStore,
+        external_preflight: &crate::table_store::ExternalBlobPreflight,
+    ) -> Result<()> {
+        loop {
+            let base_row = base.peek_cloned().await?;
+            let source_row = source.peek_cloned().await?;
+
+            let next_id = [base_row.as_ref(), source_row.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(|row| row.id.clone())
+                .min();
+            let Some(next_id) = next_id else { break };
+
+            let base_row = if base_row.as_ref().map(|r| r.id.as_str()) == Some(next_id.as_str()) {
+                base.pop().await?
+            } else {
+                None
+            };
+            let source_row = if source_row.as_ref().map(|r| r.id.as_str()) == Some(next_id.as_str())
+            {
+                source.pop().await?
+            } else {
+                None
+            };
+
+            let outcome = match (&base_row, &source_row) {
+                (Some(_), None) => {
+                    // Deleted on source
+                    self.deleted_ids.push(next_id.clone())?;
+                    Some(AdoptOutcome::Deleted)
+                }
+                (None, Some(src)) => {
+                    // New on source → strict fenced insert. No comparison unit is
+                    // needed — a new id is absent from base by construction.
+                    self.append_writer
+                        .push_row(src, materializer, external_preflight)
+                        .await?;
+                    Some(AdoptOutcome::Inserted)
+                }
+                (Some(base), Some(src)) => {
+                    // Present on both — compare lazily (the only case that needs it)
+                    // to tell a changed row from an unchanged one. New/deleted rows
+                    // above skip building the typed unit entirely.
+                    if !src.equals(base).await? {
+                        // Changed on source → upsert.
+                        self.upsert_writer
+                            .push_row(src, materializer, external_preflight)
+                            .await?;
+                        Some(AdoptOutcome::Updated)
+                    } else {
+                        // Unchanged — already on the target's base lineage; drop.
+                        None
+                    }
+                }
+                (None, None) => unreachable!(),
+            };
+            if let Some(outcome) = outcome {
+                self.needs_update = true;
+                if let Some(log) = self.log.as_deref_mut() {
+                    log.push((next_id, outcome));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The adopt delta from one full ordered walk of both ends (`plan` absent)
+/// or from the lineage plan's candidate keys, each end scanned only over its
+/// scoped fragments. The two walk the same ids in the same ascending order
+/// whenever every candidate's live rows lie in the scope.
+#[allow(clippy::too_many_arguments)]
+async fn compute_adopt_delta_with(
+    target_db: &Omnigraph,
+    table_key: &str,
+    catalog: &Catalog,
+    base_snapshot: &Snapshot,
+    source_snapshot: &Snapshot,
+    plan: Option<&LineageMergePlan>,
+    materialize_blobs: bool,
+    external_preflight: &crate::table_store::ExternalBlobPreflight,
+    write_budget: WriteBudget,
+    log: Option<&mut Vec<(String, AdoptOutcome)>>,
 ) -> Result<Option<AdoptDelta>> {
     let full_schema = schema_for_table_key(catalog, table_key)?;
     let schema = if materialize_blobs {
@@ -1510,66 +1754,58 @@ async fn compute_adopt_delta(
         StagedTableWriter::new(&format!("{}_adopt_upsert", table_key), schema, write_budget)?;
     let id_col = catalog.system_columns.id;
     let mut deleted_ids = DeleteIdChunks::new(id_col, write_budget);
-    let mut base =
-        OrderedTableCursor::from_snapshot_lazy(base_snapshot, table_key, "base", id_col).await?;
-    let mut source =
-        OrderedTableCursor::from_snapshot_lazy(source_snapshot, table_key, "source", id_col)
-            .await?;
 
-    let mut needs_update = false;
-
-    loop {
-        let base_row = base.peek_cloned().await?;
-        let source_row = source.peek_cloned().await?;
-
-        let next_id = [base_row.as_ref(), source_row.as_ref()]
-            .into_iter()
-            .flatten()
-            .map(|row| row.id.clone())
-            .min();
-        let Some(next_id) = next_id else { break };
-
-        let base_row = if base_row.as_ref().map(|r| r.id.as_str()) == Some(next_id.as_str()) {
-            base.pop().await?
-        } else {
-            None
-        };
-        let source_row = if source_row.as_ref().map(|r| r.id.as_str()) == Some(next_id.as_str()) {
-            source.pop().await?
-        } else {
-            None
-        };
-
-        match (&base_row, &source_row) {
-            (Some(_), None) => {
-                // Deleted on source
-                deleted_ids.push(next_id)?;
-                needs_update = true;
-            }
-            (None, Some(src)) => {
-                // New on source → strict fenced insert. No comparison unit is
-                // needed — a new id is absent from base by construction.
-                append_writer
-                    .push_row(src, &materializer, external_preflight)
+    let mut state = AdoptClassification {
+        append_writer: &mut append_writer,
+        upsert_writer: &mut upsert_writer,
+        deleted_ids: &mut deleted_ids,
+        needs_update: false,
+        log,
+    };
+    match plan {
+        None => {
+            let base =
+                OrderedTableCursor::from_snapshot_lazy(base_snapshot, table_key, "base", id_col)
                     .await?;
-                needs_update = true;
+            let source = OrderedTableCursor::from_snapshot_lazy(
+                source_snapshot,
+                table_key,
+                "source",
+                id_col,
+            )
+            .await?;
+            Box::pin(state.classify(base, source, &materializer, external_preflight)).await?;
+        }
+        Some(plan) => {
+            let base_fragments =
+                LineageSideScope::fragments(plan.base.as_ref(), &plan.source_scope.base);
+            let source_fragments =
+                LineageSideScope::fragments(plan.source.as_ref(), &plan.source_scope.side);
+            for chunk in &plan.candidate_chunks.chunks {
+                let filter = chunk.filter(id_col)?;
+                let base = OrderedTableCursor::from_dataset_scoped_lazy(
+                    plan.base.clone(),
+                    &filter,
+                    base_fragments.clone(),
+                    table_key,
+                    "base",
+                    id_col,
+                )
+                .await?;
+                let source = OrderedTableCursor::from_dataset_scoped_lazy(
+                    plan.source.clone(),
+                    &filter,
+                    source_fragments.clone(),
+                    table_key,
+                    "source",
+                    id_col,
+                )
+                .await?;
+                Box::pin(state.classify(base, source, &materializer, external_preflight)).await?;
             }
-            (Some(base), Some(src)) => {
-                // Present on both — compare lazily (the only case that needs it)
-                // to tell a changed row from an unchanged one. New/deleted rows
-                // above skip building the typed unit entirely.
-                if !src.equals(base).await? {
-                    // Changed on source → upsert.
-                    upsert_writer
-                        .push_row(src, &materializer, external_preflight)
-                        .await?;
-                    needs_update = true;
-                }
-                // else unchanged — already on the target's base lineage; drop.
-            }
-            (None, None) => unreachable!(),
         }
     }
+    let needs_update = state.needs_update;
 
     if !needs_update {
         return Ok(None);
@@ -1894,6 +2130,71 @@ struct LineageMergePlan {
     source: Option<Dataset>,
     target: Option<Dataset>,
     candidate_chunks: DeleteIdChunks,
+    /// The fragments of the base and of the source that hold a candidate row
+    /// of the base-to-source comparison.
+    source_scope: LineageSideScope,
+    /// The same for the base-to-target comparison; empty when the target
+    /// pins the base.
+    target_scope: LineageSideScope,
+}
+
+impl LineageMergePlan {
+    /// The fragments of each end that can hold a live row of a candidate id.
+    /// A candidate one side changed is live on the other side, if at all, at
+    /// its base position, which the changing side's base scope names; so the
+    /// base scans both base scopes, and each side its own changed fragments
+    /// plus the base fragments the other side changed.
+    fn three_way_fragments(&self) -> [Vec<lance_table::format::Fragment>; 3] {
+        let union = |a: &std::collections::BTreeSet<u64>, b: &std::collections::BTreeSet<u64>| {
+            a.union(b)
+                .copied()
+                .collect::<std::collections::BTreeSet<u64>>()
+        };
+        [
+            LineageSideScope::fragments(
+                self.base.as_ref(),
+                &union(&self.source_scope.base, &self.target_scope.base),
+            ),
+            LineageSideScope::fragments(
+                self.source.as_ref(),
+                &union(&self.source_scope.side, &self.target_scope.base),
+            ),
+            LineageSideScope::fragments(
+                self.target.as_ref(),
+                &union(&self.target_scope.side, &self.source_scope.base),
+            ),
+        ]
+    }
+}
+
+/// The fragment ids, on each end of one lineage comparison, that hold every
+/// candidate row live on that end: rows in a fragment either end lacks or
+/// rewrote, and rows one end deleted at a position the other keeps. A row
+/// outside the scope is live at the same position on both ends, so, with the
+/// exact-id primary key making a live id unique within a version, a
+/// candidate id's live row on either end lies inside that end's scope.
+#[derive(Debug, Default, Clone)]
+struct LineageSideScope {
+    base: std::collections::BTreeSet<u64>,
+    side: std::collections::BTreeSet<u64>,
+}
+
+impl LineageSideScope {
+    fn fragments(
+        dataset: Option<&Dataset>,
+        ids: &std::collections::BTreeSet<u64>,
+    ) -> Vec<lance_table::format::Fragment> {
+        dataset
+            .map(|dataset| {
+                dataset
+                    .get_fragments()
+                    .into_iter()
+                    .filter(|fragment| ids.contains(&fragment.metadata().id))
+                    .map(|fragment| fragment.metadata().clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// Check the owned-key estimate before copying a decoded key into the set.
@@ -2102,6 +2403,7 @@ async fn lineage_side_candidates(
     candidates: &mut std::collections::BTreeSet<String>,
     retained_bytes: &mut u64,
     id_col: &'static str,
+    scope: &mut LineageSideScope,
 ) -> Result<bool> {
     let base_fragments: HashMap<u64, lance::dataset::fragment::FileFragment> = base
         .map(|dataset| {
@@ -2147,6 +2449,12 @@ async fn lineage_side_candidates(
                         crate::instrumentation::record_lineage_candidate_budget_fallback();
                         return Ok(false);
                     };
+                    if side_dv.iter().any(|offset| !base_dv.contains(offset)) {
+                        scope.base.insert(*fragment_id);
+                    }
+                    if base_dv.iter().any(|offset| !side_dv.contains(offset)) {
+                        scope.side.insert(*fragment_id);
+                    }
                     // Consume one compressed-vector pair at a time; never
                     // materialize every changed fragment's offsets up front.
                     // Keep the native reader's substantial I/O future behind
@@ -2188,14 +2496,20 @@ async fn lineage_side_candidates(
                     // incarnations are candidates.
                     side_full.push(side_meta.clone());
                     base_full.push(base_meta.clone());
+                    scope.side.insert(*fragment_id);
+                    scope.base.insert(*fragment_id);
                 }
             }
-            _ => side_full.push(side_meta.clone()),
+            _ => {
+                side_full.push(side_meta.clone());
+                scope.side.insert(*fragment_id);
+            }
         }
     }
     for (fragment_id, base_fragment) in &base_fragments {
         if !side_fragments.contains_key(fragment_id) {
             base_full.push(base_fragment.metadata().clone());
+            scope.base.insert(*fragment_id);
         }
     }
 
@@ -2253,7 +2567,11 @@ async fn plan_lineage_merge(
         Some(_) => Some(source_snapshot.open_lance_dataset(table_key).await?),
         None => None,
     };
+    // A target that pins the base's exact table state (an adopt: only the
+    // source changed the table) is the base dataset; it adds no candidates.
+    let target_is_base = same_manifest_state(base_entry, target_entry);
     let target = match target_entry {
+        Some(_) if target_is_base => base.clone(),
         Some(_) => Some(target_snapshot.open_lance_dataset(table_key).await?),
         None => None,
     };
@@ -2315,22 +2633,27 @@ async fn plan_lineage_merge(
     let discovery_started = std::time::Instant::now();
     let mut candidate_ids = std::collections::BTreeSet::new();
     let mut retained_bytes = 0u64;
+    let mut source_scope = LineageSideScope::default();
+    let mut target_scope = LineageSideScope::default();
     let within_budget = lineage_side_candidates(
         base.as_ref(),
         source.as_ref(),
         &mut candidate_ids,
         &mut retained_bytes,
         catalog.system_columns.id,
+        &mut source_scope,
     )
     .await?
-        && lineage_side_candidates(
-            base.as_ref(),
-            target.as_ref(),
-            &mut candidate_ids,
-            &mut retained_bytes,
-            catalog.system_columns.id,
-        )
-        .await?;
+        && (target_is_base
+            || lineage_side_candidates(
+                base.as_ref(),
+                target.as_ref(),
+                &mut candidate_ids,
+                &mut retained_bytes,
+                catalog.system_columns.id,
+                &mut target_scope,
+            )
+            .await?);
     if !within_budget {
         tracing::debug!(
             table_key,
@@ -2371,6 +2694,8 @@ async fn plan_lineage_merge(
         source,
         target,
         candidate_chunks,
+        source_scope,
+        target_scope,
     }))
 }
 
@@ -2404,27 +2729,31 @@ async fn stage_lineage_table_merge(
     let mut deleted_ids = DeleteIdChunks::new(id_col, write_budget);
     let mut needs_update = false;
 
+    let [base_fragments, source_fragments, target_fragments] = plan.three_way_fragments();
     for chunk in &plan.candidate_chunks.chunks {
         let filter = chunk.filter(id_col)?;
-        let mut base = OrderedTableCursor::from_dataset_filtered(
+        let mut base = OrderedTableCursor::from_dataset_scoped(
             plan.base.clone(),
             &filter,
+            base_fragments.clone(),
             table_key,
             "base",
             id_col,
         )
         .await?;
-        let mut source = OrderedTableCursor::from_dataset_filtered(
+        let mut source = OrderedTableCursor::from_dataset_scoped(
             plan.source.clone(),
             &filter,
+            source_fragments.clone(),
             table_key,
             "source",
             id_col,
         )
         .await?;
-        let mut target = OrderedTableCursor::from_dataset_filtered(
+        let mut target = OrderedTableCursor::from_dataset_scoped(
             plan.target.clone(),
             &filter,
+            target_fragments.clone(),
             table_key,
             "target",
             id_col,
@@ -3370,6 +3699,7 @@ async fn classify_adopt(
     target_active: Option<&str>,
     external_preflight: &crate::table_store::ExternalBlobPreflight,
     write_budget: WriteBudget,
+    lineage: MergeLineage,
 ) -> Result<Option<CandidateTableState>> {
     let Some(source_entry) = source_snapshot.dataset(table_key) else {
         // Source has no such table — nothing to adopt or validate.
@@ -3421,6 +3751,7 @@ async fn classify_adopt(
         advances_head,
         external_preflight,
         write_budget,
+        lineage,
     )
     .await?;
 
@@ -3435,6 +3766,7 @@ async fn classify_adopt(
 
 /// Build an adoption candidate for a target that still matches the merge base.
 /// The caller establishes table identity and whether publication advances HEAD.
+#[allow(clippy::too_many_arguments)]
 async fn classify_general_adopt(
     target_db: &Omnigraph,
     catalog: &Catalog,
@@ -3444,6 +3776,7 @@ async fn classify_general_adopt(
     advances_head: bool,
     external_preflight: &crate::table_store::ExternalBlobPreflight,
     write_budget: WriteBudget,
+    lineage: MergeLineage,
 ) -> Result<CandidateTableState> {
     let delta_budget = if advances_head {
         write_budget
@@ -3459,6 +3792,7 @@ async fn classify_general_adopt(
         advances_head,
         external_preflight,
         delta_budget,
+        lineage,
     )
     .await?;
     match (advances_head, validation_delta) {
@@ -5241,6 +5575,7 @@ impl Omnigraph {
                         target_active.as_deref(),
                         &empty_external_preflight,
                         write_budget,
+                        lineage,
                     )
                     .await?
                     {
@@ -5409,6 +5744,7 @@ impl Omnigraph {
                                     true,
                                     &external_preflight,
                                     write_budget,
+                                    lineage,
                                 )
                                 .await?
                             }
@@ -5423,6 +5759,7 @@ impl Omnigraph {
                                 true,
                                 &external_preflight,
                                 write_budget,
+                                lineage,
                             )
                             .await?
                         }
@@ -5453,6 +5790,7 @@ impl Omnigraph {
                         target_active.as_deref(),
                         &external_preflight,
                         write_budget,
+                        lineage,
                     )
                     .await?
                 };

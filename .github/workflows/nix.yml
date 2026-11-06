@@ -42,7 +42,7 @@ jobs:
             system: x86_64-linux
           - runner: ubuntu-24.04-arm
             system: aarch64-linux
-          - runner: macos-14
+          - runner: macos-15
             system: aarch64-darwin
     steps:
       - name: Checkout source

@@ -88,8 +88,8 @@ pub const OG_MF_103: DiagnosticCode = DiagnosticCode {
 };
 
 /// Tighten nullable to non-nullable. May fail on existing entities with null.
-/// Reserved for a follow-up that wires the validated-tier scan; not
-/// emitted in v0.
+/// Not a planner code: schema apply emits it when its scan of the stored rows
+/// finds a live row holding a null (#721).
 pub const OG_MF_104: DiagnosticCode = DiagnosticCode {
     code: "OG-MF-104",
     family: Family::MF,
@@ -109,6 +109,17 @@ pub const OG_MF_107: DiagnosticCode = DiagnosticCode {
     short: "add edge type with a @card minimum from populated node type",
 };
 
+/// Add `@unique` to a populated node type. May fail when two existing
+/// entities share the key. Not a planner code: schema apply emits it when its
+/// scan of the stored rows finds a repeated key (#721).
+pub const OG_MF_108: DiagnosticCode = DiagnosticCode {
+    code: "OG-MF-108",
+    family: Family::MF,
+    tier: SafetyTier::Validated,
+    default_severity: Severity::Error,
+    short: "add @unique to populated node type",
+};
+
 /// Narrow a scalar (e.g. I64 → I32, F64 → F32). Lossy cast that may
 /// truncate or overflow. Today emitted on any `prop_type` change since
 /// the v1 planner doesn't yet distinguish widening from narrowing.
@@ -124,7 +135,7 @@ pub const OG_MF_106: DiagnosticCode = DiagnosticCode {
 /// (uniqueness, family coverage).
 pub const ALL_CODES: &[DiagnosticCode] = &[
     OG_DS_101, OG_DS_102, OG_DS_103, OG_DS_104, OG_DS_105, OG_MF_103, OG_MF_104, OG_MF_106,
-    OG_MF_107,
+    OG_MF_107, OG_MF_108,
 ];
 
 /// Codes actually emitted by the planner in v0 (i.e. not reserved).
