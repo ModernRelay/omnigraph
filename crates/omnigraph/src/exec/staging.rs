@@ -672,7 +672,7 @@ impl MutationStaging {
                     table_key
                 ))
             })?;
-            let Some(combined) = predicates.into_iter().reduce(Expr::or) else {
+            let Some(combined) = combine_delete_predicates(predicates) else {
                 continue;
             };
             let removed_ids = deleted_ids.get(&table_key).cloned().unwrap_or_default();
@@ -969,6 +969,19 @@ async fn stage_pending_table(
 /// Returns `None` when the predicate matches zero committed rows, so a no-op
 /// delete stages nothing and never moves HEAD (the zero-row drift fix carried
 /// onto the staged path).
+/// The rows of a table that any of a mutation's delete statements matched.
+/// One predicate is used as written. Several are joined as
+/// `p1 IS TRUE OR p2 IS TRUE`, which selects the same rows as `p1 OR p2`, but
+/// keeps one statement's tests from sitting beside another's: Lance's
+/// simplifier folds two disjoint `NOT IN` tests of one nullable column to
+/// `true`, which would also delete the rows whose value is null (#1277).
+fn combine_delete_predicates(predicates: Vec<Expr>) -> Option<Expr> {
+    if predicates.len() < 2 {
+        return predicates.into_iter().next();
+    }
+    predicates.into_iter().map(Expr::is_true).reduce(Expr::or)
+}
+
 async fn stage_delete_table(
     db: &crate::db::Omnigraph,
     table_key: String,
@@ -1365,4 +1378,31 @@ fn dedupe_merge_batches_by_id(
         return Ok(sliced.into_iter().next().unwrap());
     }
     arrow_select::concat::concat_batches(schema, &sliced).map_err(OmniError::arrow_internal)
+}
+
+#[cfg(test)]
+mod delete_predicate_tests {
+    use super::combine_delete_predicates;
+    use crate::engine::lance_filter_support::selected_rows;
+    use datafusion::prelude::{col, lit, not};
+
+    /// Two statements whose disjoint `NOT IN` tests are null for the row whose
+    /// `s` is null matched only the other rows, and the combined predicate
+    /// that Lance's scanning delete takes deletes only those.
+    #[test]
+    fn combined_disjoint_not_in_statements_leave_a_null_row_issue_1277() {
+        let combined = combine_delete_predicates(vec![
+            not(col("s").in_list(vec![lit("y")], false)),
+            not(col("s").in_list(vec![lit("x")], false)),
+        ])
+        .expect("two predicates");
+        assert_eq!(selected_rows(combined.clone(), false), vec![1, 2]);
+        assert_eq!(selected_rows(combined, true), vec![1, 2]);
+        let single = not(col("s").in_list(vec![lit("y")], false));
+        assert_eq!(
+            combine_delete_predicates(vec![single.clone()]),
+            Some(single)
+        );
+        assert_eq!(combine_delete_predicates(Vec::new()), None);
+    }
 }

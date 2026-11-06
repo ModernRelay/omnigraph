@@ -2,7 +2,8 @@ use super::*;
 
 use crate::db::manifest::HistoryReleaseBytes;
 use crate::engine::{
-    evaluate_constant, fill_declared_params, id_in_list_expr, ir_expr_to_df_expr, validate_params,
+    MAX_NULL_SPLIT_COLUMNS, evaluate_constant, exceeds_null_split_columns, fill_declared_params,
+    id_in_list_expr, ir_expr_to_df_expr, validate_params,
 };
 use crate::instrumentation::record_mutation_table_open;
 use crate::loader::append_blob_value;
@@ -459,6 +460,13 @@ fn mutation_predicate_expr(predicate: &IRExpr, params: &ParamMap, schema: &Schem
         )));
     }
     ir_expr_to_df_expr(predicate, params, Some(schema)).ok_or_else(|| {
+        if exceeds_null_split_columns(predicate, params) {
+            return OmniError::manifest(format!(
+                "unsupported expression in mutation predicate: {predicate}: a mutation `where` \
+                 may compare at most {MAX_NULL_SPLIT_COLUMNS} properties more than once each \
+                 with `=`, `!=` or `in`"
+            ));
+        }
         OmniError::manifest(format!(
             "unsupported expression in mutation predicate: {predicate}"
         ))
@@ -731,11 +739,19 @@ pub(super) async fn open_table_for_mutation(
 /// cascade, or — if it is the only match — leaves the node undeleted). Only
 /// rows a prior predicate matched as definitely TRUE should be excluded:
 /// `(prior) IS NOT TRUE` keeps both FALSE and UNKNOWN rows.
+///
+/// Each prior predicate gets its own `IS NOT TRUE` (`(p1 OR p2) IS NOT TRUE`
+/// is `p1 IS NOT TRUE AND p2 IS NOT TRUE`). An `OR` of the priors would put
+/// their tests side by side, where Lance's simplifier folds two disjoint
+/// `NOT IN` tests of one nullable column to `true` and so excludes the rows
+/// whose value is null (#1277); `IS NOT TRUE` has no rewrite there.
 fn dedup_delete_filter(base: &Expr, prior: &[Expr]) -> Expr {
-    match prior.iter().cloned().reduce(Expr::or) {
-        None => base.clone(),
-        Some(excluded) => base.clone().and(excluded.is_not_true()),
-    }
+    prior
+        .iter()
+        .cloned()
+        .fold(base.clone(), |filter, excluded| {
+            filter.and(excluded.is_not_true())
+        })
 }
 
 /// D₂ parse-time check: a single mutation query is either insert/update-only
@@ -2478,5 +2494,26 @@ edge Shared: Endpoint -> Endpoint { label: String }
         assert!(staging.is_empty());
         assert!(staging.paths.is_empty());
         assert!(staging.deleted_ids.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod delete_filter_tests {
+    use super::dedup_delete_filter;
+    use crate::engine::lance_filter_support::selected_rows;
+    use datafusion::prelude::{col, lit, not};
+
+    /// A later statement selects `k = "a"`, the row whose `s` is null; the
+    /// earlier statements' disjoint `NOT IN` tests are null there, so they
+    /// did not match it and must not exclude it.
+    #[test]
+    fn earlier_disjoint_not_in_statements_do_not_exclude_a_null_row_issue_1277() {
+        let prior = [
+            not(col("s").in_list(vec![lit("y")], false)),
+            not(col("s").in_list(vec![lit("x")], false)),
+        ];
+        let filter = dedup_delete_filter(&col("k").eq(lit("a")), &prior);
+        assert_eq!(selected_rows(filter.clone(), false), vec![0]);
+        assert_eq!(selected_rows(filter, true), vec![0]);
     }
 }
