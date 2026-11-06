@@ -5037,7 +5037,7 @@ impl TableStore {
                     held += bytes;
                     if held > Self::PROMOTION_UNIQUE_KEY_BYTES {
                         return Err(OmniError::manifest(format!(
-                            "@unique{} cannot be checked: its keys need more than {} bytes of memory",
+                            "@unique{} cannot be checked: its keys need more than an estimated {} bytes of memory",
                             crate::loader::format_tuple(group),
                             Self::PROMOTION_UNIQUE_KEY_BYTES
                         )));

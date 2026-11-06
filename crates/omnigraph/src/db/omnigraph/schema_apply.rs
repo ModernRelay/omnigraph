@@ -341,14 +341,19 @@ where
         })
         .collect::<BTreeMap<_, _>>();
     // Existing tables whose columns change: added, renamed or dropped
-    // properties. Each evolves by metadata-only Lance commits that keep every
-    // data file; no row is read or rewritten.
+    // properties, and promotions (#721). Each evolves by metadata-only Lance
+    // commits that keep every data file. A promotion also reads the promoted
+    // columns first, and rewrites each fragment whose deleted rows hold a
+    // null in a column about to become required.
     let mut evolved_tables = BTreeSet::new();
     let mut dropped_tables = BTreeSet::new();
     let mut property_renames = HashMap::<String, HashMap<String, String>>::new();
     let mut changed_edge_tables = false;
     let mut promotion_required = HashMap::<String, Vec<String>>::new();
     let mut promotion_unique = HashMap::<String, Vec<Vec<String>>>::new();
+    // Properties this apply adds, by desired table and name: no stored column
+    // holds them yet.
+    let mut added_properties = HashMap::<String, HashSet<String>>::new();
 
     for step in &plan.steps {
         match step {
@@ -380,6 +385,7 @@ where
             SchemaMigrationStep::AddProperty {
                 type_kind,
                 type_name,
+                property_name,
                 ..
             } => {
                 if matches!(type_kind, SchemaTypeKind::Interface) {
@@ -389,6 +395,10 @@ where
                 if table_key.starts_with("edge:") {
                     changed_edge_tables = true;
                 }
+                added_properties
+                    .entry(table_key.clone())
+                    .or_default()
+                    .insert(property_name.clone());
                 evolved_tables.insert(table_key);
             }
             SchemaMigrationStep::RenameProperty {
@@ -410,8 +420,10 @@ where
                     .or_default()
                     .insert(to.clone(), from.clone());
             }
-            // AddConstraint is only ever an `@index` addition (every other
-            // added constraint plans as UnsupportedChange). It records intent
+            // A node's `@unique` (the arm below) is a promotion, checked
+            // against the stored rows. Any other AddConstraint is an `@index`
+            // addition (every other added constraint plans as
+            // UnsupportedChange). It records intent
             // in the desired catalog/IR; the physical index is built off the
             // critical path by ensure_indices/optimize (iss-848), so the apply
             // does no table work for it — a pure metadata change like the two
@@ -711,27 +723,47 @@ where
         let source_dataset = source_ds.dataset();
         // #721: a promotion judges the stored rows under the gates held here,
         // before any table moves; a violation leaves the graph as is. The
-        // steps name the desired columns, the dataset holds them under their
-        // source names until the Project renames them.
-        let source_name = |name: &String| {
-            renames
-                .iter()
-                .find(|(_, to)| to == name)
-                .map_or_else(|| name.clone(), |(from, _)| from.clone())
+        // steps name desired columns. Each resolves by property identity,
+        // from the plan's AddProperty and RenameProperty steps, to the stored
+        // column the scan reads: a property this apply adds has none, a
+        // renamed one reads its source column, any other its own name.
+        let added = added_properties.get(table_key);
+        let renamed = property_renames.get(table_key);
+        let stored_column = |name: &String| -> Option<String> {
+            if added.is_some_and(|added| added.contains(name)) {
+                return None;
+            }
+            Some(
+                renamed
+                    .and_then(|renamed| renamed.get(name))
+                    .unwrap_or(name)
+                    .clone(),
+            )
         };
+        // The planner refuses a new required property (`OG-MF-103`), so a
+        // required promotion always has a stored column.
         let required = promotion_required
             .get(table_key)
-            .map(|columns| columns.iter().map(source_name).collect::<Vec<_>>())
-            .unwrap_or_default();
+            .into_iter()
+            .flatten()
+            .map(|column| {
+                stored_column(column).ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "required promotion of '{table_key}.{column}' names a property this apply adds"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // A `@unique` group that names a property this apply adds holds by
+        // construction: every stored row reads null there, and a key with a
+        // null part is exempt (`loader::composite_unique_key`). Only the
+        // other groups are checked.
         let unique = promotion_unique
             .get(table_key)
-            .map(|groups| {
-                groups
-                    .iter()
-                    .map(|group| group.iter().map(source_name).collect::<Vec<_>>())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+            .into_iter()
+            .flatten()
+            .filter_map(|group| group.iter().map(stored_column).collect::<Option<Vec<_>>>())
+            .collect::<Vec<_>>();
         let mut purge_fragments = Vec::new();
         if !required.is_empty() || !unique.is_empty() {
             let check = TableStore::promotion_check(source_dataset, &required, &unique).await?;
@@ -878,10 +910,13 @@ where
                 &base_branch_identifier,
                 base_graph_head.as_deref(),
             )?;
-            // A Project for renames and drops, then a Merge for additions,
-            // each a detached commit of the previous; the pin names the tip.
-            // Neither writes a data file, so every surviving index keeps its
-            // coverage and no row or Blob payload is read.
+            // A Project for renames, drops and required promotions, then a
+            // Merge for additions, each a detached commit of the previous; the
+            // pin names the tip. Neither writes a data file, so every
+            // surviving index keeps its coverage and neither reads a row or
+            // Blob payload. The #721 purge before them is the exception: it
+            // rewrites whole fragments, Blob payloads included, as compaction
+            // does.
             let declared =
                 super::table_ops::declared_full_text_columns(&desired_catalog, table_key);
             let mut tip_transaction = None;

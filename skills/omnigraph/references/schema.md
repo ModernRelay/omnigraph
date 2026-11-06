@@ -176,6 +176,8 @@ rows under the apply's locks: a live row holding a null (OG-MF-104) or two rows
 sharing a key (OG-MF-108) refuse the apply and change nothing. To add a required
 or unique property to a populated type, add it nullable, load its values, then
 promote it. Promotion may be combined with a `@rename_from` of the same property.
+A `@unique` naming a nullable property added in the same apply needs no row
+check: every stored row holds a null there, and a key with a null part is exempt.
 
 Adding another constraint (`@key`, `@range`, `@check`, an edge `@unique`)
 to an existing type, removing a constraint from a property that stays,

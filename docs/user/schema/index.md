@@ -225,8 +225,10 @@ Making a nullable property required (on a node or an edge) and adding `@unique`
 to a node type read the stored rows first, under the locks the apply holds, and
 change nothing if a row breaks the rule: a live row holding a null refuses with
 `OG-MF-104`, two rows sharing a key with `OG-MF-108`. The `@unique` check holds
-the keys in memory and refuses a table whose keys need more than 1 GiB. A
-refused apply leaves the accepted schema in force. A successful one keeps entity
+the keys in memory and refuses a table whose keys need more than an estimated
+1 GiB. A `@unique` that names a property the same apply adds needs no check,
+because every stored row holds a null there and a key with a null part is not
+compared. A refused apply leaves the accepted schema in force. A successful one keeps entity
 ids, relationships and retained commits, and later writes are checked against
 the new rule. To add a required or unique property to a populated type, add it
 nullable, load its values, then promote it, with a `@rename_from` in the same

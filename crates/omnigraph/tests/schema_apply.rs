@@ -4137,6 +4137,53 @@ async fn issue_721_promotion_with_a_rename_in_the_same_apply() {
     }
 }
 
+// A `@unique` that names a property the same apply adds has no stored column
+// to read: every stored row reads null there, and a key with a null part is
+// exempt, so it holds by construction. The apply must succeed on a populated
+// and on an empty table, at property and at type level, and enforce the rule
+// afterwards, never fail inside the row scan with `No field named`.
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn issue_721_unique_on_a_property_added_in_the_same_apply() {
+    let property_level =
+        "node Decision {\n    slug: String @key\n    ref: String?\n    code: String? @unique\n}\n";
+    let type_level = "node Decision {\n    slug: String @key\n    ref: String?\n    code: String?\n    @unique(ref, code)\n}\n";
+    let populated = "{\"type\":\"Decision\",\"data\":{\"slug\":\"a\",\"ref\":\"D-1\"}}\n\
+                     {\"type\":\"Decision\",\"data\":{\"slug\":\"b\",\"ref\":\"D-1\"}}";
+    for (desired, rows) in [
+        (property_level, Some(populated)),
+        (type_level, Some(populated)),
+        (property_level, None),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
+        if let Some(rows) = rows {
+            db.load_jsonl(rows, LoadMode::Merge).await.unwrap();
+        }
+        let plan = db.plan_schema(desired).await.unwrap();
+        assert!(plan.supported, "{plan:?}");
+        let result = db
+            .apply_schema(desired)
+            .await
+            .unwrap_or_else(|error| panic!("{desired}: {error}"));
+        assert!(result.supported && result.applied);
+
+        db.load_jsonl(
+            r#"{"type":"Decision","data":{"slug":"c","ref":"D-1","code":"X"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .expect("a first code loads");
+        db.load_jsonl(
+            r#"{"type":"Decision","data":{"slug":"d","ref":"D-1","code":"X"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .expect_err("the new @unique rejects a duplicate key");
+    }
+}
+
 // An edge property promotes too: refused while an edge holds a null, applied
 // once every edge is backfilled, and a null edge write is refused afterwards.
 #[tokio::test]
