@@ -42,7 +42,10 @@ jobs:
             asset_name: omnigraph-linux-x86_64
           - runner: ubuntu-24.04-arm
             asset_name: omnigraph-linux-arm64
-          - runner: macos-14
+          # macOS 14 images retired on 2026-11-02 (actions/runner-images#15226).
+          # No deployment target is set, so the archive keeps rustc's default
+          # minimum macOS whatever image builds it.
+          - runner: macos-15
             asset_name: omnigraph-macos-arm64
             # OmniGraph's release text exceeds arm64's +/-128 MiB direct-branch
             # range. Use long calls instead of relying on ld branch islands.
