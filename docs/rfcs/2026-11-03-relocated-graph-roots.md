@@ -337,8 +337,10 @@ written:
 
 - **A publish whose handle holds the read version.** It records the opened
   root's absolute URI for every base, ancestors included, because
-  `Manifest::new_from_previous` copies the handle's in-memory map. That is
-  what Lance writes for any clone made at that location.
+  `Manifest::new_from_previous` copies the handle's in-memory map. A clone
+  does not write this: `do_commit_new_dataset` reloads the source manifest
+  from `ref_path`, and `shallow_clone` copies its recorded bases and adds one
+  base at `ref_path` (the third case).
 - **A publish whose handle does not hold the read version.** Lance checks out
   `read_version` from disk, and the new version keeps the recorded bases.
 - **A branch created on a relocated root.** `create_branch` always reloads
@@ -547,3 +549,6 @@ None block acceptance. The two evidence gates are in `blocked_on`.
     message path, separator normalization, and the main-name residual.
 
   Linked the filed upstream issue (lance#10661) and draft #1235.
+- 2026-11-06: Narrowed the same-version publish case: a clone does not
+  rewrite ancestor bases, because `do_commit_new_dataset` reloads the source
+  manifest and `shallow_clone` adds only the base at `ref_path`.
