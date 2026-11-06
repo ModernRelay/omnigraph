@@ -3559,7 +3559,7 @@ async fn schema_evolution_plans_metadata_only_steps_and_refuses_rewrites() {
             "without a rewrite",
         ),
         (
-            Schema::new(vec![pk_id(), marked("age", DataType::Int32, false, "1")]),
+            Schema::new(vec![pk_id(), marked("age", DataType::Int64, false, "1")]),
             Vec::new(),
             "without a rewrite",
         ),
@@ -3590,6 +3590,17 @@ async fn schema_evolution_plans_metadata_only_steps_and_refuses_rewrites() {
             "expected '{expected}', got: {error}"
         );
     }
+
+    // #721: making a nullable column required is metadata only, and the
+    // Project commit it plans stops preserving nullability.
+    let tightened = Schema::new(vec![pk_id(), marked("age", DataType::Int32, false, "1")]);
+    let plan = TableStore::plan_schema_evolution(&ds, &tightened, &[]).unwrap();
+    assert!(
+        plan.tightens,
+        "a nullable to required column is a tightening"
+    );
+    assert!(plan.merge.is_none());
+    assert!(plan.project.is_some());
 
     // A column written before property markers existed adopts its identity
     // from the target, as the replaced full-table rewrite did.

@@ -61,7 +61,7 @@ use lance_select::mask::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 use omnigraph_compiler::SystemColumns;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::{num::NonZero, sync::Arc};
 
 use crate::blob::{
@@ -990,6 +990,36 @@ pub struct SchemaEvolution {
     /// The `(field id, name)` columns, in order, of the dataset the next step
     /// must be staged against: the planned base, then each step's result.
     expected: Vec<(i32, String)>,
+    /// #721: a column goes from nullable to required, so the `Project` commit
+    /// must not preserve nullability. The caller has judged that no live row
+    /// holds a null.
+    tightens: bool,
+    /// #721: fragments whose deleted rows still hold a null in a column the
+    /// evolution makes required. They are rewritten, deletions materialized,
+    /// before the `Project` ([`TableStore::stage_fragment_rewrite`]).
+    purge_fragments: Vec<u64>,
+}
+
+impl SchemaEvolution {
+    /// Record the fragments to rewrite before the evolution's first step.
+    pub(crate) fn set_purge_fragments(&mut self, fragments: Vec<u64>) {
+        self.purge_fragments = fragments;
+    }
+
+    /// Take the fragments to rewrite; empty after the first call.
+    pub(crate) fn take_purge_fragments(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.purge_fragments)
+    }
+}
+
+/// #721: what the stored rows of a table say about a schema promotion.
+#[derive(Debug, Default)]
+pub(crate) struct PromotionCheck {
+    /// The first rule a live row breaks, with its stable code.
+    pub(crate) violation: Option<String>,
+    /// Fragments whose deleted rows hold a null in a column about to become
+    /// required, sorted. No live row of them holds one.
+    pub(crate) purge_fragments: Vec<u64>,
 }
 
 /// A schema's columns as `(field id, name)` in pre-order: the identity a
@@ -4625,6 +4655,55 @@ impl TableStore {
         options: &CompactionOptions,
     ) -> Result<Option<StagedCompaction>> {
         let plan = Self::plan_table_compaction(ds, options).await?;
+        Self::stage_compaction_plan(ds, plan).await
+    }
+
+    /// #721: rewrite exactly the fragments `fragment_ids` names, one
+    /// single-fragment task each, so the rewrite materializes their deleted
+    /// rows whatever their deleted share (Lance's own shape for deletion
+    /// materialization; `materialize_deletions_threshold` only chooses
+    /// fragments at planning). Staged like [`Self::stage_compaction`];
+    /// `None` when `fragment_ids` is empty. Refuses an id `ds` does not hold.
+    pub async fn stage_fragment_rewrite(
+        &self,
+        ds: &Dataset,
+        fragment_ids: &[u64],
+    ) -> Result<Option<StagedCompaction>> {
+        if fragment_ids.is_empty() {
+            return Ok(None);
+        }
+        let mut tasks = Vec::with_capacity(fragment_ids.len());
+        for id in fragment_ids {
+            let fragment = ds
+                .manifest
+                .fragments
+                .iter()
+                .find(|fragment| fragment.id == *id)
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "fragment {id} to rewrite is not in {} version {}",
+                        ds.uri(),
+                        ds.manifest.version
+                    ))
+                })?;
+            tasks.push(TaskData {
+                fragments: vec![fragment.clone()],
+            });
+        }
+        let plan = CompactionPlan {
+            tasks,
+            read_version: ds.manifest.version,
+            options: CompactionOptions::default(),
+        };
+        Self::stage_compaction_plan(ds, plan).await
+    }
+
+    /// Execute a compaction plan against `ds` and stage its result as one
+    /// `Rewrite`; see [`Self::stage_compaction`].
+    async fn stage_compaction_plan(
+        ds: &Dataset,
+        plan: CompactionPlan,
+    ) -> Result<Option<StagedCompaction>> {
         if plan.num_tasks() == 0 {
             return Ok(None);
         }
@@ -4847,6 +4926,139 @@ impl TableStore {
         Ok(StagedWrite::new(transaction, Vec::new(), Vec::new()))
     }
 
+    /// Most memory, in estimated bytes, the keys of one `@unique` promotion
+    /// check may hold. A table whose keys need more is refused rather than
+    /// risking the process (#721).
+    pub(crate) const PROMOTION_UNIQUE_KEY_BYTES: usize = 1 << 30;
+
+    /// Estimated resident bytes of one held key: its strings plus a fixed
+    /// allowance for the set entry and the vector and string headers.
+    fn promotion_key_bytes(key: &[String]) -> usize {
+        64 + key.iter().map(|part| 24 + part.len()).sum::<usize>()
+    }
+
+    /// #721: judge the rows of `ds` against the constraints a schema promotion
+    /// would add. Reads only the named columns.
+    ///
+    /// The null check reads deleted rows too (`include_deleted_rows`): a
+    /// deleted row keeps its value in the data file, and the column is about
+    /// to become non-nullable in Lance (lance#10557 is the same rule in
+    /// Lance's own `alter_columns`). A null in a live row is a violation
+    /// (`OG-MF-104`). A null only in deleted rows is not: the fragments that
+    /// hold one come back in `purge_fragments`, for the caller to rewrite
+    /// before tightening the column. The key check reads live rows only and
+    /// reports the first key two of them share (`OG-MF-108`); it holds at
+    /// most `PROMOTION_UNIQUE_KEY_BYTES` of keys and refuses a larger table.
+    pub(crate) async fn promotion_check(
+        ds: &Dataset,
+        required: &[String],
+        unique: &[Vec<String>],
+    ) -> Result<PromotionCheck> {
+        let mut check = PromotionCheck::default();
+        let mut purge = BTreeSet::<u64>::new();
+        for column in required {
+            let mut scanner = ds.scan();
+            scanner
+                .project(&[column.as_str()])
+                .map_err(OmniError::storage)?;
+            scanner
+                .with_row_id()
+                .with_row_address()
+                .include_deleted_rows();
+            let mut stream = scanner
+                .try_into_stream()
+                .await
+                .map_err(OmniError::storage)?;
+            let mut live_nulls = 0usize;
+            while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+                let lost = |name: &str| {
+                    OmniError::manifest_internal(format!("promotion scan lost column '{name}'"))
+                };
+                let values = batch.column_by_name(column).ok_or_else(|| lost(column))?;
+                if values.null_count() == 0 {
+                    continue;
+                }
+                // A deleted row comes back with a null `_rowid`.
+                let row_ids = batch
+                    .column_by_name("_rowid")
+                    .ok_or_else(|| lost("_rowid"))?;
+                let row_addrs = batch
+                    .column_by_name("_rowaddr")
+                    .ok_or_else(|| lost("_rowaddr"))?
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt64Array>()
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal("promotion scan: _rowaddr is not UInt64")
+                    })?;
+                for row in 0..batch.num_rows() {
+                    if values.is_valid(row) {
+                        continue;
+                    }
+                    if row_ids.is_null(row) {
+                        purge.insert(row_addrs.value(row) >> 32);
+                    } else {
+                        live_nulls += 1;
+                    }
+                }
+            }
+            if live_nulls > 0 {
+                check.violation = Some(format!(
+                    "[{}] {live_nulls} row(s) hold a null in '{column}'; backfill them before making it required",
+                    omnigraph_compiler::lint::codes::OG_MF_104.code
+                ));
+                return Ok(check);
+            }
+        }
+        for group in unique {
+            let mut scanner = ds.scan();
+            scanner.project(group).map_err(OmniError::storage)?;
+            let mut stream = scanner
+                .try_into_stream()
+                .await
+                .map_err(OmniError::storage)?;
+            let mut seen = HashSet::<Vec<String>>::new();
+            let mut held = 0usize;
+            while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+                let columns = group
+                    .iter()
+                    .map(|name| {
+                        batch.column_by_name(name).cloned().ok_or_else(|| {
+                            OmniError::manifest_internal(format!(
+                                "promotion scan lost column '{name}'"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for row in 0..batch.num_rows() {
+                    let Some(key) = crate::loader::composite_unique_key(&columns, row)? else {
+                        continue;
+                    };
+                    let bytes = Self::promotion_key_bytes(&key);
+                    if seen.contains(&key) {
+                        check.violation = Some(format!(
+                            "[{}] value {} of {} is held by more than one row; make the values distinct before adding @unique",
+                            omnigraph_compiler::lint::codes::OG_MF_108.code,
+                            crate::loader::format_tuple(&key),
+                            crate::loader::format_tuple(group),
+                        ));
+                        return Ok(check);
+                    }
+                    held += bytes;
+                    if held > Self::PROMOTION_UNIQUE_KEY_BYTES {
+                        return Err(OmniError::manifest(format!(
+                            "@unique{} cannot be checked: its keys need more than an estimated {} bytes of memory",
+                            crate::loader::format_tuple(group),
+                            Self::PROMOTION_UNIQUE_KEY_BYTES
+                        )));
+                    }
+                    seen.insert(key);
+                }
+            }
+        }
+        check.purge_fragments = purge.into_iter().collect();
+        Ok(check)
+    }
+
     /// Plan the metadata-only commits that move a table from its dataset
     /// schema to `target`, the desired physical schema in catalog order, with
     /// `renames` naming each renamed column as `(from, to)`. Reads only the
@@ -4882,6 +5094,7 @@ impl TableStore {
         let mut consumed = HashSet::<&str>::new();
         let mut renamed = false;
         let mut added = false;
+        let mut tightens = false;
         for target_field in target.fields() {
             let name = target_field.name().as_str();
             let source = match source_of.get(name) {
@@ -4918,7 +5131,9 @@ impl TableStore {
                 .expect("the source column was found above");
             let desired = lance::datatypes::Field::try_from(target_field.as_ref())
                 .map_err(OmniError::lance_internal)?;
-            if existing.data_type() != desired.data_type() || existing.nullable != desired.nullable
+            let tightening = existing.nullable && !desired.nullable;
+            if existing.data_type() != desired.data_type()
+                || (existing.nullable != desired.nullable && !tightening)
             {
                 return Err(OmniError::manifest_internal(format!(
                     "column '{source}' cannot become '{name}' without a rewrite: {:?} (nullable {}) -> {:?} (nullable {})",
@@ -4929,6 +5144,10 @@ impl TableStore {
                 )));
             }
             let mut field = existing.clone();
+            if tightening {
+                field.nullable = false;
+                tightens = true;
+            }
             if source != name {
                 field.name = name.to_string();
                 renamed = true;
@@ -4990,6 +5209,8 @@ impl TableStore {
                 project,
                 merge: None,
                 expected,
+                tightens,
+                purge_fragments: Vec::new(),
             });
         }
         let project = if renamed || dropped {
@@ -5010,6 +5231,8 @@ impl TableStore {
             project,
             merge: Some(evolved),
             expected,
+            tightens,
+            purge_fragments: Vec::new(),
         })
     }
 
@@ -5041,7 +5264,7 @@ impl TableStore {
             evolution.expected = schema_columns(&schema);
             Operation::Project {
                 schema,
-                preserves_nullability: true,
+                preserves_nullability: !evolution.tightens,
             }
         } else if let Some(schema) = evolution.merge.take() {
             evolution.expected = schema_columns(&schema);
