@@ -1486,6 +1486,10 @@ pub struct MergeWriteProbes {
     pub lineage_candidate_address_take_max_rows: Arc<AtomicU64>,
     pub lineage_candidate_budget_fallback_calls: Arc<AtomicU64>,
     pub proven_insert_history_read_calls: Arc<AtomicU64>,
+    /// Links of the pure-insert proof's chain walk that the one-GET
+    /// detached-link reader did not serve, so Lance's own open and
+    /// transaction read decided them.
+    pub proven_insert_history_fallback_reads: Arc<AtomicU64>,
     /// Bounded row hydrations the two-phase ordered merge cursor performs
     /// after its narrow key sort: take calls, hydrated rows, and measured
     /// hydrated bytes. Cost tests use these to prove payload bytes flow
@@ -1612,6 +1616,10 @@ impl MergeWriteProbes {
     }
     pub fn proven_insert_history_read_calls(&self) -> u64 {
         self.proven_insert_history_read_calls
+            .load(Ordering::Relaxed)
+    }
+    pub fn proven_insert_history_fallback_reads(&self) -> u64 {
+        self.proven_insert_history_fallback_reads
             .load(Ordering::Relaxed)
     }
     pub fn ordered_cursor_hydration_calls(&self) -> u64 {
@@ -1891,6 +1899,13 @@ pub fn record_lineage_candidate_budget_fallback() {
 pub fn record_proven_insert_history_read() {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
         p.proven_insert_history_read_calls
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+pub fn record_proven_insert_history_fallback_read() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.proven_insert_history_fallback_reads
             .fetch_add(1, Ordering::Relaxed);
     });
 }

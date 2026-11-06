@@ -87,12 +87,19 @@ impl DetachedChainLink {
     /// a 16-byte footer whose first 8 bytes are the manifest's offset and
     /// whose last 4 are `MAGIC`, a length-prefixed `pb::Manifest` ending at
     /// the footer, and the length-prefixed `pb::Transaction` at the
-    /// manifest's `transaction_section`. Returns `Ok(None)` for every other
-    /// shape (no inline transaction, another version or branch, a framing
-    /// that does not add up), so the caller can take Lance's own route.
+    /// manifest's `transaction_section`. The manifest is converted with
+    /// Lance's own `Manifest::try_from` and must pass
+    /// `ensure_can_read_manifest`, the check Lance's open path runs, so a
+    /// version written with a reader feature this build does not know (or an
+    /// inconsistent paired flag) is never decoded as a plausible transaction.
+    /// Returns `Ok(None)` for every other shape (a version Lance refuses to
+    /// read, no inline transaction, another version or branch, a framing that
+    /// does not add up), so the caller can take Lance's own route, which
+    /// refuses the same versions Lance refuses.
     pub async fn read(dataset: &Dataset, version: u64) -> lance::Result<Option<Self>> {
         use lance_io::utils::read_message_from_buf;
-        use lance_table::format::{MAGIC, pb};
+        use lance_table::feature_flags::ensure_can_read_manifest;
+        use lance_table::format::{MAGIC, Manifest, pb};
         use lance_table::io::commit::ManifestNamingScheme;
         use object_store::ObjectStoreExt as _;
 
@@ -119,17 +126,21 @@ impl DetachedChainLink {
         else {
             return Ok(None);
         };
-        let manifest = read_message_from_buf::<pb::Manifest>(&manifest)?;
-        if manifest.version != version || manifest.branch != dataset.manifest().branch {
+        let manifest = Manifest::try_from(read_message_from_buf::<pb::Manifest>(&manifest)?)?;
+        if ensure_can_read_manifest(&manifest).is_err()
+            || manifest.version != version
+            || manifest.branch != dataset.manifest().branch
+        {
             return Ok(None);
         }
-        let Some(identity) = Self::identity_of(&manifest) else {
+        let Some(identity) = manifest
+            .transaction_file
+            .as_deref()
+            .and_then(StagedTransactionIdentity::from_transaction_file_name)
+        else {
             return Ok(None);
         };
-        let Some(transaction_pos) = manifest
-            .transaction_section
-            .and_then(|pos| usize::try_from(pos).ok())
-        else {
+        let Some(transaction_pos) = manifest.transaction_section else {
             return Ok(None);
         };
         let Some(transaction) =
@@ -142,15 +153,6 @@ impl DetachedChainLink {
             identity,
             transaction: Transaction::try_from(transaction)?,
         }))
-    }
-
-    fn identity_of(
-        manifest: &lance_table::format::pb::Manifest,
-    ) -> Option<StagedTransactionIdentity> {
-        if manifest.transaction_file.is_empty() {
-            return None;
-        }
-        StagedTransactionIdentity::from_transaction_file_name(&manifest.transaction_file)
     }
 }
 

@@ -7470,61 +7470,195 @@ async fn rfc_0067_detached_commit_from_a_pin_is_private_chains_and_needs_a_retry
 /// version's manifest at `_versions/d{version}.manifest` with a 16-byte footer
 /// (manifest offset, format version, `MAGIC`), the length-prefixed manifest
 /// ending at the footer, and the transaction inline at the manifest's
-/// `transaction_section`, before the manifest. Red when that framing changes
-/// or Lance stops writing the transaction inline: the reader then returns
-/// `None` and the proof takes Lance's five-request route again, which is
-/// still correct but loses the cost (issue #1222).
+/// `transaction_section`, before the manifest. Every shape the proof meets
+/// reads as Lance reads it: appends, a `CreateIndex` link, an append whose
+/// manifest carries an index section in front of the transaction, and links
+/// on a native branch (a legacy table fork, under `tree/`), which are not
+/// read through main. Red when that framing changes or Lance stops writing
+/// the transaction inline: the reader then returns `None` and the proof takes
+/// Lance's five-request route again, which is still correct but loses the
+/// cost (issue #1222).
+///
+/// The reader also refuses every manifest Lance's open path refuses
+/// (`ensure_can_read_manifest`): a reader feature flag this build does not
+/// know, or a paired flag set on one side only. Protobuf decoding ignores
+/// unknown fields, so without that check such a link would decode as a
+/// plausible transaction the proof would certify (invariant: never
+/// reinterpret an unknown persisted format).
 #[tokio::test]
 async fn detached_manifest_file_holds_its_transaction_inline() {
+    use lance_table::feature_flags::{FLAG_FRAGMENT_REUSE_INDEX, can_read_dataset};
+    use lance_table::format::pb;
+    use object_store::ObjectStoreExt as _;
     use omnigraph_core::staging::{DetachedChainLink, StagedTransactionIdentity};
+    use prost::Message as _;
+
+    async fn detached(parent: &Dataset, transaction: Transaction) -> Dataset {
+        CommitBuilder::new(Arc::new(parent.clone()))
+            .with_detached(true)
+            .with_skip_auto_cleanup(true)
+            .execute(transaction)
+            .await
+            .unwrap()
+    }
+
+    async fn append(parent: &Dataset, ids: &[&str]) -> Dataset {
+        detached(parent, rfc0067_staged_append(parent, ids).await).await
+    }
+
+    async fn create_index(parent: &Dataset) -> Dataset {
+        let mut staging = parent.clone();
+        let segment = staging
+            .create_index_builder(&["value"], IndexType::BTree, &ScalarIndexParams::default())
+            .name("value_idx".to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let transaction = Transaction::new(
+            parent.version().version,
+            Operation::CreateIndex {
+                new_indices: vec![segment],
+                removed_indices: Vec::new(),
+            },
+            None,
+        );
+        detached(parent, transaction).await
+    }
+
+    /// The reader returns, through `head`, the identity and transaction
+    /// Lance's own route returns for each version.
+    async fn assert_reads_as_lance(head: &Dataset, versions: &[u64], shape: &str) {
+        for &version in versions {
+            let opened = head.checkout_version(version).await.unwrap();
+            assert!(
+                opened.manifest().transaction_section.is_some(),
+                "{shape}: Lance writes the transaction inline in a detached manifest"
+            );
+            let link = DetachedChainLink::read(head, version)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{shape}: a detached manifest reads as one chain link"));
+            assert_eq!(
+                Some(link.identity),
+                StagedTransactionIdentity::recorded_by(&opened),
+                "{shape}: the identity is the one the manifest records"
+            );
+            assert_eq!(
+                Some(link.transaction),
+                opened.read_transaction().await.unwrap(),
+                "{shape}: the transaction is the one Lance reads"
+            );
+        }
+    }
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().join("t.lance");
     let uri = uri.to_str().unwrap();
     let v1 = rfc0067_create(uri).await;
     let base = rfc0067_pinned(uri, v1.version().version).await;
-    let transaction = rfc0067_staged_append(&base, &["c1"]).await;
-    let d1 = CommitBuilder::new(Arc::new(base))
-        .with_detached(true)
-        .with_skip_auto_cleanup(true)
-        .execute(transaction)
-        .await
-        .unwrap();
-    let chained = rfc0067_staged_append(&d1, &["d1"]).await;
-    let d2 = CommitBuilder::new(Arc::new(d1.clone()))
-        .with_detached(true)
-        .with_skip_auto_cleanup(true)
-        .execute(chained)
-        .await
-        .unwrap();
 
-    for version in [d1.version().version, d2.version().version] {
-        let opened = d2.checkout_version(version).await.unwrap();
-        assert!(
-            opened.manifest().transaction_section.is_some(),
-            "Lance writes the transaction inline in a detached manifest"
-        );
-        let link = DetachedChainLink::read(&d2, version)
-            .await
-            .unwrap()
-            .expect("a detached manifest reads as one chain link");
-        assert_eq!(
-            Some(link.identity),
-            StagedTransactionIdentity::recorded_by(&opened),
-            "the identity is the one the manifest records"
-        );
-        assert_eq!(
-            Some(link.transaction),
-            opened.read_transaction().await.unwrap(),
-            "the transaction is the one Lance reads"
-        );
-    }
+    let d1 = append(&base, &["c1"]).await;
+    let d2 = append(&d1, &["d1"]).await;
+    let indexed = create_index(&d2).await;
     assert!(
-        DetachedChainLink::read(&d2, v1.version().version)
+        matches!(
+            indexed.read_transaction().await.unwrap().unwrap().operation,
+            Operation::CreateIndex { .. }
+        ),
+        "the third link is a CreateIndex commit"
+    );
+    let d4 = append(&indexed, &["e1"]).await;
+    assert!(
+        d4.manifest().index_section.is_some(),
+        "an append after the build carries an index section in front of its transaction"
+    );
+    let main_chain = [&d1, &d2, &indexed, &d4].map(|link| link.version().version);
+    assert_reads_as_lance(&d4, &main_chain, "main").await;
+    assert!(
+        DetachedChainLink::read(&d4, v1.version().version)
             .await
             .unwrap()
             .is_none(),
         "a linear version is not read as a detached link"
+    );
+
+    let mut root = rfc0067_head(uri).await;
+    let feature = root
+        .create_branch("feature", v1.version().version, None)
+        .await
+        .unwrap();
+    assert!(
+        feature.branch_location().path.as_ref().contains("tree/"),
+        "a native branch lives under tree/"
+    );
+    let b1 = append(&feature, &["f1"]).await;
+    let b2 = append(&b1, &["f2"]).await;
+    let branch_chain = [&b1, &b2].map(|link| link.version().version);
+    assert_reads_as_lance(&b2, &branch_chain, "native branch").await;
+    for version in branch_chain {
+        assert!(
+            !matches!(DetachedChainLink::read(&d4, version).await, Ok(Some(_))),
+            "a native branch's link is not read through main"
+        );
+    }
+
+    // Rewrite the top link's manifest with flags Lance refuses, keeping the
+    // framing valid: the transaction and index sections in front stay where
+    // they were, the manifest is re-encoded, and the footer is unchanged.
+    let top = d4.version().version;
+    let store = d4.object_store(None).await.unwrap();
+    let path = ManifestNamingScheme::V2.manifest_path(&d4.branch_location().path, top);
+    let original = store.inner.get(&path).await.unwrap().bytes().await.unwrap();
+    let footer = original.len() - 16;
+    let manifest_pos = usize::try_from(u64::from_le_bytes(
+        original[footer..footer + 8].try_into().unwrap(),
+    ))
+    .unwrap();
+    let length = usize::try_from(u32::from_le_bytes(
+        original[manifest_pos..manifest_pos + 4].try_into().unwrap(),
+    ))
+    .unwrap();
+    let decoded =
+        pb::Manifest::decode(&original[manifest_pos + 4..manifest_pos + 4 + length]).unwrap();
+    let unknown_reader_flag = 1_u64 << 40;
+    assert!(!can_read_dataset(unknown_reader_flag), "bit 40 is unknown");
+    for (case, reader_flags) in [
+        (
+            "an unknown reader flag",
+            decoded.reader_feature_flags | unknown_reader_flag,
+        ),
+        (
+            "a paired flag on the reader side only",
+            decoded.reader_feature_flags | FLAG_FRAGMENT_REUSE_INDEX,
+        ),
+    ] {
+        let mut manifest = decoded.clone();
+        manifest.reader_feature_flags = reader_flags;
+        let body = manifest.encode_to_vec();
+        let mut rewritten = original[..manifest_pos].to_vec();
+        rewritten.extend(u32::try_from(body.len()).unwrap().to_le_bytes());
+        rewritten.extend(body);
+        rewritten.extend_from_slice(&original[footer..]);
+        store
+            .inner
+            .put(&path, bytes::Bytes::from(rewritten).into())
+            .await
+            .unwrap();
+        let lance = DatasetBuilder::from_uri(uri).with_version(top).load().await;
+        assert!(lance.is_err(), "{case}: Lance refuses to open the version");
+        assert!(
+            DetachedChainLink::read(&d4, top).await.unwrap().is_none(),
+            "{case}: the reader refuses it too, so the proof takes Lance's route"
+        );
+    }
+    store
+        .inner
+        .put(&path, original.clone().into())
+        .await
+        .unwrap();
+    assert!(
+        DetachedChainLink::read(&d4, top).await.unwrap().is_some(),
+        "the original manifest reads again: the refusals came from the flags alone"
     );
 }
 

@@ -2687,6 +2687,11 @@ impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage>
             self.source_commits,
             "the pure-insert proof must certify every source commit"
         );
+        assert_eq!(
+            probes.proven_insert_history_fallback_reads(),
+            0,
+            "every detached link is read with one GET of its manifest, never through Lance's open"
+        );
         assert_eq!(probes.completed_full_walk_classification_calls(), 0);
         assert_eq!(
             person_rows_on(&db, "main").await.len(),

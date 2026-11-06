@@ -1047,8 +1047,11 @@ fn opened_at_pin(dataset: &Dataset, entry: &crate::db::DatasetEntry) -> bool {
 /// dataset and asked for its transaction (five dependent requests), because
 /// the walk needs only each link's recorded identity and transaction; any
 /// other link, a manifest that reader does not recognize, or a failed read
-/// takes Lance's own route, whose outcome decides the link as before. The walk is still one request per commit, in sequence: the
-/// next version is known only from the transaction just read (issue #1222).
+/// takes Lance's own route, whose outcome decides the link as before; that
+/// fallback is logged at debug and counted
+/// (`record_proven_insert_history_fallback_read`). The walk is still one
+/// request per commit, in sequence: the next version is known only from the
+/// transaction just read (issue #1222).
 ///
 /// [`DetachedChainLink::read`]: crate::table_store::DetachedChainLink::read
 async fn proven_chain_fragments(
@@ -1095,17 +1098,25 @@ async fn proven_chain_fragments(
         }
         let parent = transaction.read_version;
         crate::instrumentation::record_proven_insert_history_read();
-        (identity, transaction) =
-            match crate::table_store::DetachedChainLink::read(source, parent).await {
-                Ok(Some(link)) => (link.identity, link.transaction),
-                Ok(None) | Err(_) => {
-                    let dataset = source.checkout_version(parent).await.ok()?;
-                    (
-                        crate::table_store::StagedTransactionIdentity::recorded_by(&dataset)?,
-                        dataset.read_transaction().await.ok()??,
-                    )
-                }
-            };
+        (identity, transaction) = match crate::table_store::DetachedChainLink::read(source, parent)
+            .await
+        {
+            Ok(Some(link)) => (link.identity, link.transaction),
+            outcome => {
+                crate::instrumentation::record_proven_insert_history_fallback_read();
+                tracing::debug!(
+                    parent,
+                    detached = lance_table::format::is_detached_version(parent),
+                    error = outcome.err().map(tracing::field::display),
+                    "pure-insert proof: the one-GET detached-link reader did not serve this link; using Lance's open and transaction read"
+                );
+                let dataset = source.checkout_version(parent).await.ok()?;
+                (
+                    crate::table_store::StagedTransactionIdentity::recorded_by(&dataset)?,
+                    dataset.read_transaction().await.ok()??,
+                )
+            }
+        };
     }
     None
 }
