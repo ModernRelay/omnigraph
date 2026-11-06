@@ -8,7 +8,8 @@ use crate::seams::{decide_seam, fail};
 use crate::session::Session;
 use crate::storage_layer::WriteBudget;
 use crate::storage_layer::{
-    KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, ProvenInsertChunk,
+    DeletedIdBudget, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics,
+    ProvenInsertChunk,
 };
 use crate::table_store::{
     MATERIALIZED_BLOB_PAYLOAD_BYTES, certified_insert_absence_rows, deletion_file_identical,
@@ -380,8 +381,9 @@ fn escaped_delete_literal_bytes(id: &str) -> Result<u64> {
 /// [#7185]: https://github.com/lance-format/lance/issues/7185
 #[derive(Debug)]
 struct AdoptDelta {
-    /// New-on-source rows → a streaming strict exact-`id` fenced merge. The
-    /// source stays batch-bounded while retaining `WhenMatched::Fail` semantics.
+    /// New-on-source rows → batch-bounded strict inserts: each chunk probes
+    /// the pinned target for its ids and stages one certified insert-only
+    /// `Update`.
     inserts: Option<StagedTable>,
     /// Changed-on-source rows → a fenced upsert bounded to the
     /// genuinely-changed set, not the whole delta).
@@ -3633,32 +3635,6 @@ async fn scan_proven_pure_inserts_for_validation(
     Ok(())
 }
 
-async fn validate_merge_candidates(
-    catalog: &Catalog,
-    target_snapshot: &Snapshot,
-    changeset: &crate::validate::ChangeSet,
-) -> Result<()> {
-    // Δ-scoped, index-backed validation: the declared constraints are evaluated
-    // over the merge delta against the committed target (queried through its
-    // BTREE indexes), not by re-scanning every catalog table. Value/enum,
-    // uniqueness, edge-RI, and cardinality all route through one evaluator shared
-    // with (eventually) the write path — closing the merge-vs-write drift.
-    let committed = crate::validate::CommittedState::merge(target_snapshot);
-    let constraints = crate::validate::constraints_for(catalog);
-    let violations =
-        crate::validate::evaluate(&constraints, changeset, &committed, catalog).await?;
-    if violations.is_empty() {
-        Ok(())
-    } else {
-        Err(OmniError::MergeConflicts(
-            violations
-                .into_iter()
-                .map(crate::validate::Violation::into_merge_conflict)
-                .collect(),
-        ))
-    }
-}
-
 /// Whether certified pure inserts into node types constrained only by `@key` discharge
 /// every check a fast forward's `ChangeSet` would run: the target holds the base's rows,
 /// and edges keep validation for their cross-table checks.
@@ -4962,11 +4938,12 @@ async fn publish_adopted_delta(
         })?
         .into_parts();
 
-    // Phase 1a: strict-insert the NEW rows through RFC-023's streaming exact-id
-    // adapter. The ordered walk classified them as absent at the pinned base,
-    // but `WhenMatched::Fail` is still required: a concurrent same-key writer
-    // must conflict rather than letting this optimization bypass the fence.
-    // The adapter keeps wide vector/blob rows streaming and batch-bounded.
+    // Phase 1a: strict-insert the NEW rows through RFC-023's exact-id adapter.
+    // The ordered walk classified them as absent at the pinned base; each
+    // chunk still probes its pinned parent and returns `KeyConflict` for an
+    // existing id. Every chunk commits detached, which runs no Lance conflict
+    // pass; the `__manifest` publish CAS orders concurrent writers. The
+    // adapter keeps wide vector/blob rows streaming and batch-bounded.
     let mut chain = MergeChain::new(
         target_txn.authority.staging_witness()?,
         crate::db::omnigraph::table_ops::declared_full_text_columns(&target_txn.catalog, table_key),
@@ -5379,6 +5356,7 @@ impl Omnigraph {
             return Ok(MergeResult {
                 outcome: MergeOutcome::AlreadyUpToDate,
                 commit: None,
+                plans: Vec::new(),
             });
         }
         let head_is_base = base_commit.graph_commit_id == target_head_commit_id;
@@ -5860,12 +5838,15 @@ impl Omnigraph {
         // or real three-way merge retains the complete evaluator.
         let validation_is_redundant =
             is_fast_forward && proven_fast_forward_needs_no_validation(catalog, &candidates);
+        let mut plans = Vec::new();
         if !validation_is_redundant {
             let validation_timing = crate::instrumentation::start_merge_timing(
                 crate::instrumentation::MergeTimingPhase::CandidateValidation,
             );
             let changeset = build_merge_changeset(self, catalog, &candidates).await?;
-            validate_merge_candidates(catalog, target_snapshot, &changeset).await?;
+            plans = self
+                .validate_merge_candidates(target_txn, &changeset, write_budget)
+                .await?;
             validation_timing.finish();
         }
         fail(&BRANCH_MERGE_POST_CANDIDATE_VALIDATION)?;
@@ -5880,6 +5861,7 @@ impl Omnigraph {
                     MergeOutcome::Merged
                 },
                 commit: None,
+                plans,
             });
         }
 
@@ -6225,7 +6207,102 @@ impl Omnigraph {
                 MergeOutcome::Merged
             },
             commit: Some(commit),
+            plans,
         })
+    }
+
+    /// The merge delta judged against the target through every candidate
+    /// table's `Validate` node, planned at the target's pinned version; every
+    /// violation is a [`MergeConflict`], the documents go to the receipt.
+    async fn validate_merge_candidates(
+        &self,
+        target_txn: &WriteTxn,
+        changeset: &crate::validate::ChangeSet,
+        write_budget: WriteBudget,
+    ) -> Result<Vec<omnigraph_planner::Explain>> {
+        use crate::validate::load::{JudgedSide, LoadAdmission, RepeatRule, Report, WriteJudge};
+        use crate::validate::plan::{WriteTable, judgment_rank, plan_write};
+        use omnigraph_compiler::ir::{DeltaClass, WriteKind};
+        use omnigraph_planner::CommittedSide;
+
+        let mut table_keys: Vec<&String> = changeset.keys().collect();
+        table_keys.sort_by(|a, b| judgment_rank(a).cmp(&judgment_rank(b)));
+        let mut tables = Vec::new();
+        let mut batches = Vec::new();
+        for table_key in table_keys {
+            let change = &changeset[table_key];
+            let rows: usize = change.value_batches().map(RecordBatch::num_rows).sum();
+            if rows == 0 && change.deleted_ids.is_empty() {
+                continue;
+            }
+            tables.push(WriteTable {
+                table: table_key.clone(),
+                delta: if rows == 0 {
+                    DeltaClass::Removal
+                } else if change.changed.is_empty() {
+                    DeltaClass::Insert
+                } else {
+                    DeltaClass::Upsert
+                },
+                rows: rows as u64,
+                deleted_ids: change.deleted_ids.clone(),
+            });
+            batches.push(change.value_batches().cloned().collect::<Vec<_>>());
+        }
+        if tables.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut base = target_txn.base.clone();
+        base.set_read_caches(crate::db::manifest::SnapshotReadCaches {
+            session: self.read_caches().session.clone(),
+            handles: self.read_caches().handles.clone(),
+            table_wrapper: None,
+        });
+        let (judged, plans): (Vec<_>, Vec<_>) = plan_write(
+            &base,
+            &target_txn.catalog,
+            WriteKind::BranchMerge,
+            CommittedSide::MergeTarget,
+            tables,
+            write_budget.bytes(),
+        )
+        .await?
+        .into_iter()
+        .unzip();
+        let judge = WriteJudge {
+            tables: judged,
+            committed: JudgedSide::MergeTarget(base),
+            write_budget,
+            catalog: Arc::clone(&target_txn.catalog),
+            report: Report::Every,
+            repeat: RepeatRule::for_write(WriteKind::BranchMerge),
+        };
+        let mut deleted = DeletedIdBudget::new(write_budget);
+        let mut admit_removed = |id: &str| deleted.retain(id);
+        let mut admit_retained = |_: &RecordBatch| Ok(());
+        let violations = judge
+            .judge_batches(
+                self,
+                batches,
+                &mut LoadAdmission {
+                    phase: None,
+                    bytes: None,
+                    reuse: None,
+                    removed: &mut admit_removed,
+                    retained: &mut admit_retained,
+                },
+            )
+            .await?;
+        if violations.is_empty() {
+            Ok(plans)
+        } else {
+            Err(OmniError::MergeConflicts(
+                violations
+                    .into_iter()
+                    .map(crate::validate::Violation::into_merge_conflict)
+                    .collect(),
+            ))
+        }
     }
 }
 

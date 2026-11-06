@@ -11,3 +11,4 @@ mod pipeline_cut;
 mod query_plan;
 mod registry;
 mod scan_access;
+mod write_plan;

@@ -4700,7 +4700,7 @@ async fn query_endpoint_answers_an_explain_load_statement_as_rows() {
         assert_eq!(validate["inputs"][0]["node"], "CsvSource", "{physical}");
         assert_eq!(explain_tree(&body, "logical")["node"], "FragmentWrite");
         assert_eq!(explain_plan_rows(&body, "route"), ["engine"], "{body}");
-        assert_eq!(explain_plan_rows(&body, "explain_version"), ["7"], "{body}");
+        assert_eq!(explain_plan_rows(&body, "explain_version"), ["8"], "{body}");
     }
     assert_eq!(
         main_head_commit_id(&app).await,
@@ -6728,12 +6728,14 @@ async fn aggregate_mutation_memory_refusal_keeps_graph_and_admission_usable() {
 
 /// Two 16 MiB ids are seeded through the engine (no route carries them); a `/mutate`
 /// delete and a `/load` overwrite must each refuse the removed-id sum as a certain 413.
+/// The edge type makes the overwrite's plan scan the removed ids (`removal: scan`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn removed_id_memory_refusals_keep_graph_and_admission_usable() {
     let wide = "x".repeat(16 * 1024 * 1024);
     let temp = init_graph_with_schema_and_data(
         "node First { name: String @key tag: String? }\n\
-         node Second { name: String @key tag: String? }",
+         node Second { name: String @key tag: String? }\n\
+         edge Link: First -> Second",
         &format!(
             "{}\n{}",
             json!({"type": "First", "data": {"name": wide}}),

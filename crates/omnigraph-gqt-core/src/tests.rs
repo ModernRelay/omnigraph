@@ -734,6 +734,7 @@ fn outcome_takes_the_three_merge_words() {
             into,
             as_commit: _,
             expect: MergeExpect::Outcome(got),
+            plan: _,
         } = &step.write
         else {
             panic!(
@@ -880,6 +881,37 @@ fn bind_commit_names_a_write_and_its_consumers_resolve_it() {
         bound_snapshot(read, &bindings).unwrap().as_deref(),
         Some("hb1-c")
     );
+}
+
+/// A step says whether its write stays unpublished and whether a drop names
+/// a commit the case bound; the benchmark's served admission reads both.
+#[test]
+fn as_commit_and_bound_drop_are_visible_per_step() {
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{PROPOSE}{BIND}--- mutate\ncommit drop \"${{c}}\"\n{EXPECT_OK}--- mutate\nquery publish_bob() {{\n    insert Person {{ name: \"carol\" }}\n}}\n{EXPECT_OK}--- mutate\nbranch merge b0 as commit\n--- expect outcome: merged\n--- mutate\nbranch merge b0\n--- expect outcome: merged\n--- mutate\ncommit drop \"hb1-literal\"\n{EXPECT_OK}{QUERY}{EXPECT}"
+    );
+    let case = parse_case("x", &text).unwrap();
+    let want = [
+        ("the `as commit` mutation", true, false),
+        ("drop of the bound commit", false, true),
+        ("a published mutation", false, false),
+        ("the `as commit` merge", true, false),
+        ("a published merge", false, false),
+        ("drop of a literal id", false, false),
+        ("a read", false, false),
+    ];
+    assert_eq!(case.items.len(), want.len());
+    for (item, (label, as_commit, drops_bound)) in case.items.iter().zip(want) {
+        let Item::Step(step) = item else {
+            panic!("{label}: no loop in this case");
+        };
+        assert_eq!(step.as_commit(), as_commit, "{label}: as_commit");
+        assert_eq!(
+            step.drops_bound_commit(),
+            drops_bound,
+            "{label}: drops_bound_commit"
+        );
+    }
 }
 
 /// Every misplacement of a binding is refused with the rule it broke.
@@ -3340,7 +3372,7 @@ async fn traversal_pin_preserves_the_hosts_query_io_probes() {
 }
 
 #[test]
-fn a_load_plan_section_follows_a_load_steps_expect_ok_only() {
+fn a_plan_section_follows_a_load_or_mutate_steps_expect_only() {
     const CSV: &str = "--- csv people.csv\nname\ncarol\n";
     const LOAD: &str =
         "--- mutate\nload csv \"people.csv\" into node:Person mode overwrite header\n";
@@ -3366,5 +3398,11 @@ fn a_load_plan_section_follows_a_load_steps_expect_ok_only() {
     let malformed = text.replace("load route: plan", "load route: express");
     assert!(parse_case("load_plan", &malformed).is_err());
     let on_a_mutation = format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{EXPECT_OK}{PLAN}");
-    assert!(parse_case("load_plan", &on_a_mutation).is_err());
+    let case = parse_case("load_plan", &on_a_mutation).unwrap();
+    let [Item::Step(Step::Mutate(step))] = case.items.as_slice() else {
+        panic!("expected one mutate step carrying a plan expect");
+    };
+    assert_eq!(step.plan.as_ref().map(|plan| plan.lines.len()), Some(2));
+    let before_the_expect = format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{PLAN}{EXPECT_OK}");
+    assert!(parse_case("load_plan", &before_the_expect).is_err());
 }

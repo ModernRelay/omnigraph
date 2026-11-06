@@ -12,19 +12,31 @@
 //! instead, inside whatever lock the engine holds at that point, until the
 //! session's next entry is due. A request no entry names runs at once.
 //!
-//! While a session waits on the script the block drives the paused clock
-//! itself (RFC 0045 §Concurrent block): one tick per scheduler turn up to
-//! [`STUCK_VIRTUAL_BUDGET`] past the last cursor move or request, so the
-//! other sessions' modeled request costs elapse and no engine timer fires;
-//! past that budget the clock stands still and the wall clock decides
-//! starvation (the block's budget, half the case's `timeout_ms`, at most
-//! [`MAX_STARVE_BUDGET`]).
+//! Nothing drives the paused clock (RFC 0045 §Concurrent block): while a
+//! session waits on the script the runtime idles, and tokio moves the clock
+//! only to the earliest pending timer (a request sleeping its modeled cost,
+//! a commit backoff) and never while a task of the runtime's blocking pool
+//! runs, so a session's work on a foreign thread takes no virtual time and
+//! a wait is a function of the model and the request sequence, up to the
+//! one-tick window where a hop onto Lance's CPU pool (a second runtime the
+//! paused clock does not see) wakes before or after a jump to another
+//! session's pending sleep. A far
+//! timer would fire the moment a session parks with nothing nearer pending,
+//! which is why the engine's commits run without Lance's commit timeout
+//! under simulation (`omnigraph_core::lance_commit`); any other far timer
+//! ends the block as its own timeout. Starvation is the wall clock's
+//! verdict, read off the runtime by a guard thread so the runtime can idle:
+//! neither an entry nor a request for the block's budget, half the case's
+//! `timeout_ms`, at most [`MAX_STARVE_BUDGET`], while a session waits on
+//! the script.
 
 use std::fmt;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -38,7 +50,7 @@ use object_store::{
 };
 use omnigraph::object_store_seam::{DecorateObjectStore, OBJECT_STORE};
 use omnigraph::seams::{Behavior, Global, Installed};
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 
 use crate::measure::SESSION;
 
@@ -50,17 +62,9 @@ pub(crate) use omnigraph_gqt_core::concurrent::*;
 /// below this, so the parent's kill never precedes the block's own verdict.
 pub(crate) const MAX_STARVE_BUDGET: Duration = Duration::from_secs(10);
 
-/// Virtual time the block drives the clock past the last cursor move or
-/// request while a session waits on the script: enough for the running
-/// sessions' modeled request costs, short of any engine timer.
-const STUCK_VIRTUAL_BUDGET: Duration = Duration::from_secs(10);
-
-/// The clock step while the block drives the clock: the measure tick.
-const CLOCK_STEP: Duration = crate::measure::TICK;
-
-/// The wall pause per driver turn once the clock stands still, so a stuck
-/// block does not spin a core while it waits out its budget.
-const SPIN_SLEEP: Duration = Duration::from_millis(1);
+/// How often the guard thread reads the wall clock: the latest a starved
+/// block is called, past its budget.
+const GUARD_POLL: Duration = Duration::from_millis(10);
 
 /// The cursor value that aborts every waiter.
 const ABORTED: usize = usize::MAX;
@@ -94,18 +98,31 @@ pub(crate) struct Run {
     /// aborted, so the measure ledger files the drain under `after_abort`.
     draining: Arc<AtomicBool>,
     began: Instant,
-    /// Sessions waiting on the cursor right now; the clock driver runs
-    /// while there is one.
+    /// Sessions waiting on the cursor right now; the budget counts while
+    /// there is one.
     waiters: AtomicUsize,
-    wake_driver: Notify,
-    /// When the cursor last moved or a request last arrived: virtual, then
-    /// wall.
-    moved: Mutex<(tokio::time::Instant, Instant)>,
+    /// When the cursor last moved or a request last arrived, on the wall
+    /// clock.
+    moved: Mutex<Instant>,
     starve_budget: Duration,
+    /// The guard thread and the channel whose drop ends it.
+    guard: Mutex<Option<(Sender<()>, JoinHandle<()>)>>,
+}
+
+/// Ends the guard thread when dropped before [`Run::end`] joined it: the
+/// sender goes, the thread's next poll sees it and returns, unjoined.
+pub(crate) struct StopGuard(Arc<Run>);
+
+impl Drop for StopGuard {
+    fn drop(&mut self) {
+        if let Some((stop, _thread)) = self.0.guard.lock().unwrap().take() {
+            drop(stop);
+        }
+    }
 }
 
 /// A registered waiter on the cursor; the count drops with it, so a wait
-/// the engine cancels (a dropped future) never leaves the driver running.
+/// the engine cancels (a dropped future) never keeps the budget counting.
 struct Waiting<'a>(&'a Run);
 
 impl Drop for Waiting<'_> {
@@ -158,9 +175,9 @@ impl Run {
             draining: Arc::new(AtomicBool::new(false)),
             began: Instant::now(),
             waiters: AtomicUsize::new(0),
-            wake_driver: Notify::new(),
-            moved: Mutex::new((tokio::time::Instant::now(), Instant::now())),
+            moved: Mutex::new(Instant::now()),
             starve_budget,
+            guard: Mutex::new(None),
         });
         let previous = ACTIVE.lock().unwrap().replace(Arc::clone(&run));
         assert!(
@@ -168,7 +185,20 @@ impl Run {
             "a concurrent block began while another block was still active"
         );
         LIVE.store(true, Ordering::Release);
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let watched = Arc::clone(&run);
+        let thread = std::thread::Builder::new()
+            .name("gqt-starve-guard".into())
+            .spawn(move || watched.guard(stopped))
+            .expect("spawn the block's starvation guard");
+        *run.guard.lock().unwrap() = Some((stop, thread));
         run
+    }
+
+    /// A handle whose drop ends the guard thread, held by the step future
+    /// so a block that unwinds before [`Run::end`] leaves no thread polling.
+    pub(crate) fn stop_guard(self: &Arc<Run>) -> StopGuard {
+        StopGuard(Arc::clone(self))
     }
 
     /// The flag every session's task-local shares with this run.
@@ -176,49 +206,48 @@ impl Run {
         Arc::clone(&self.draining)
     }
 
-    /// Drive the clock while a session waits on the script (module doc).
-    /// Polled beside the sessions for the block's whole life; never returns.
-    pub(crate) async fn drive_clock(&self) {
-        loop {
+    /// The guard thread's loop (module doc): every [`GUARD_POLL`] of wall
+    /// time, a block with a session waiting on the script and no progress
+    /// for its budget is starved; ends when `end` drops the sender.
+    fn guard(&self, stopped: Receiver<()>) {
+        while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(GUARD_POLL) {
             if self.waiters.load(Ordering::SeqCst) == 0 || self.aborted() {
-                self.wake_driver.notified().await;
                 continue;
             }
-            let (moved_virtual, moved_wall) = *self.moved.lock().unwrap();
-            if tokio::time::Instant::now().saturating_duration_since(moved_virtual)
-                < STUCK_VIRTUAL_BUDGET
-            {
-                tokio::time::advance(CLOCK_STEP).await;
-            } else if moved_wall.elapsed() >= self.starve_budget {
-                let at = *self.cursor.borrow();
-                let position = match at.checked_sub(1) {
-                    Some(previous) if previous < self.entries.len() => {
-                        format!("after entry {at} `{}`", self.entries[previous].event)
-                    }
-                    _ => format!(
-                        "before entry 1 `{}`",
-                        self.entries
-                            .first()
-                            .map(|e| e.event.to_string())
-                            .unwrap_or_default()
-                    ),
-                };
-                self.fail(format!(
-                    "starved: neither an entry nor a request arrived for {:.1} s of wall time {position}",
-                    self.starve_budget.as_secs_f64()
-                ));
-            } else {
-                std::thread::sleep(SPIN_SLEEP);
+            if self.moved.lock().unwrap().elapsed() < self.starve_budget {
+                continue;
             }
-            tokio::task::yield_now().await;
+            let at = *self.cursor.borrow();
+            let position = match at.checked_sub(1) {
+                Some(previous) if previous < self.entries.len() => {
+                    format!("after entry {at} `{}`", self.entries[previous].event)
+                }
+                _ => format!(
+                    "before entry 1 `{}`",
+                    self.entries
+                        .first()
+                        .map(|e| e.event.to_string())
+                        .unwrap_or_default()
+                ),
+            };
+            self.fail(format!(
+                "starved: neither an entry nor a request arrived for {:.1} s of wall time {position}",
+                self.starve_budget.as_secs_f64()
+            ));
         }
     }
 
-    /// The block is over: no longer the active block; the outcome for the
-    /// evidence row.
+    /// The block is over: no longer the active block, the guard thread
+    /// joined; the outcome for the evidence row.
     pub(crate) fn end(self: &Arc<Run>) -> Outcome {
         LIVE.store(false, Ordering::Release);
         *ACTIVE.lock().unwrap() = None;
+        if let Some((stop, thread)) = self.guard.lock().unwrap().take() {
+            drop(stop);
+            thread
+                .join()
+                .expect("the block's starvation guard panicked");
+        }
         Outcome {
             stuck_at: *self.stuck_at.lock().unwrap(),
             failure: self.failure.lock().unwrap().clone(),
@@ -308,7 +337,6 @@ impl Run {
         drop(failure);
         self.draining.store(true, Ordering::SeqCst);
         self.cursor.send_replace(ABORTED);
-        self.wake_driver.notify_one();
     }
 
     async fn wait_for(&self, entry: usize) {
@@ -317,14 +345,13 @@ impl Run {
         }
         self.waiters.fetch_add(1, Ordering::SeqCst);
         let _waiting = Waiting(self);
-        self.wake_driver.notify_one();
         let mut rx = self.cursor.subscribe();
         let _ = rx.wait_for(|cursor| *cursor >= entry).await;
     }
 
-    /// Progress: the budgets count from here.
+    /// Progress: the budget counts from here.
     fn touch(&self) {
-        *self.moved.lock().unwrap() = (tokio::time::Instant::now(), Instant::now());
+        *self.moved.lock().unwrap() = Instant::now();
     }
 
     /// Entry `at` happened: the cursor moves past it and the session's next
@@ -397,7 +424,7 @@ impl Drop for Permit {
 
 /// A request outside the gate (the control realm's, through the engine's
 /// `StorageAdapter`, which a measured run wraps) is progress for a live
-/// block's budgets like a gated one.
+/// block's budget like a gated one.
 pub(crate) fn touch() {
     if let Some(run) = active() {
         run.touch();
@@ -405,7 +432,7 @@ pub(crate) fn touch() {
 }
 
 /// Hold the request until its turn, if the script names it. Every request
-/// of a live block, named or not, is progress for the budgets.
+/// of a live block, named or not, is progress for the budget.
 async fn gate(verb: Verb, key: &str) -> Permit {
     let Some(run) = active() else {
         return Permit(None);

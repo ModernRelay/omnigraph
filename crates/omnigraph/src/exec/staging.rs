@@ -130,6 +130,12 @@ pub(crate) struct MutationStaging {
     /// rows: validation recounts the srcs a delete empties, and the staged
     /// delete records them on its transaction as the commit's change set.
     pub(crate) deleted_ids: HashMap<String, Vec<String>>,
+    /// Row addresses removed per table, captured by the same scans as
+    /// `deleted_ids`, at the table's pinned version: the staged delete
+    /// writes their deletion vectors without scanning the table again.
+    /// Every recorded delete predicate records its addresses, so their
+    /// union is exactly the rows the combined predicate selects.
+    pub(crate) deleted_row_addrs: HashMap<String, (u64, lance_select::mask::RowAddrTreeMap)>,
     pub(crate) deleted_id_budget: DeletedIdBudget,
     /// Strictest [`MutationOpKind`] seen per table within this query. Drives
     /// the op-kind-aware drift check in [`StagedMutation::commit_all`]: for
@@ -367,6 +373,30 @@ impl MutationStaging {
             .extend(ids);
     }
 
+    /// Record the row addresses, at table version `version`, of the rows a
+    /// delete op on `table_key` removes; see `deleted_row_addrs`. A second
+    /// version for one table is an internal contract failure (one pin per
+    /// table per query).
+    pub(crate) fn record_deleted_row_addrs(
+        &mut self,
+        table_key: &str,
+        version: u64,
+        addrs: lance_select::mask::RowAddrTreeMap,
+    ) -> Result<()> {
+        let entry = self
+            .deleted_row_addrs
+            .entry(table_key.to_string())
+            .or_insert_with(|| (version, lance_select::mask::RowAddrTreeMap::new()));
+        if entry.0 != version {
+            return Err(OmniError::manifest_internal(format!(
+                "delete row addresses for '{table_key}' captured at versions {} and {version}",
+                entry.0
+            )));
+        }
+        entry.1 |= addrs;
+        Ok(())
+    }
+
     /// Delete predicates already recorded for `table_key` by earlier delete
     /// statements in this query. Read before recording the current statement's
     /// predicate so its `affected_*` count can exclude rows a prior statement
@@ -387,37 +417,6 @@ impl MutationStaging {
             .get(table_key)
             .map(|p| p.batches.as_slice())
             .unwrap_or(&[])
-    }
-
-    /// Build the validation [`ChangeSet`](crate::validate::ChangeSet) for this
-    /// staging: every touched table's accumulated rows as the `changed` delta
-    /// (record-batch clone is Arc-cheap — no data copy). Shared by the mutation
-    /// and loader write paths so their validation input cannot drift.
-    pub(crate) fn to_changeset(&self) -> crate::validate::ChangeSet {
-        let mut changeset = crate::validate::ChangeSet::new();
-        let mut __dst_pk: Vec<_> = self.pending.keys().collect();
-        __dst_pk.sort();
-        for table_key in __dst_pk {
-            let batches = self.pending_batches(table_key);
-            if batches.is_empty() {
-                continue;
-            }
-            let mut change = crate::validate::TableChange::default();
-            change.changed.extend(batches.iter().cloned());
-            changeset.insert(table_key.clone(), change);
-        }
-        // Deletes (disjoint from `pending` by D₂) carry their removed ids so the
-        // evaluator recounts the srcs a delete empties (`@card`) and sees removed
-        // rows for RI — the faithful change-set the merge path also builds.
-        let mut __dst_di: Vec<_> = self.deleted_ids.iter().collect();
-        __dst_di.sort_by(|a, b| a.0.cmp(b.0));
-        for (table_key, ids) in __dst_di {
-            if ids.is_empty() {
-                continue;
-            }
-            changeset.entry(table_key.clone()).or_default().deleted_ids = ids.clone();
-        }
-        changeset
     }
 
     /// Schema of the accumulated batches for `table_key`, or `None` if no
@@ -493,6 +492,7 @@ impl MutationStaging {
             write_budget,
             delete_predicates,
             deleted_ids,
+            mut deleted_row_addrs,
             deleted_id_budget: _,
             op_kinds: _,
             overwrite_writers,
@@ -676,8 +676,17 @@ impl MutationStaging {
                 continue;
             };
             let removed_ids = deleted_ids.get(&table_key).cloned().unwrap_or_default();
-            if let Some(entry) =
-                stage_delete_table(db, table_key, combined, path, expected, removed_ids).await?
+            let row_addrs = deleted_row_addrs.remove(&table_key);
+            if let Some(entry) = stage_delete_table(
+                db,
+                table_key,
+                combined,
+                path,
+                expected,
+                removed_ids,
+                row_addrs,
+            )
+            .await?
             {
                 staged_entries.push(entry);
             }
@@ -967,11 +976,24 @@ async fn stage_delete_table(
     path: StagedTablePath,
     expected: u64,
     deleted_ids: Vec<String>,
+    row_addrs: Option<(u64, lance_select::mask::RowAddrTreeMap)>,
 ) -> Result<Option<StagedTableEntry>> {
     let ds = db
         .open_pinned_for_write(&path.full_path, &path.entry)
         .await?;
-    match db.storage().stage_delete(&ds, predicate).await? {
+    // The delete ops captured the matched rows' addresses at the pin; stage
+    // their deletion vectors directly. Addresses from another version than
+    // the one reopened here would name other rows, so that case (and a
+    // predicate recorded without addresses) takes Lance's scanning delete.
+    let staged = match row_addrs {
+        Some((version, addrs)) if version == ds.version() => {
+            db.storage()
+                .stage_delete_rows(&ds, &predicate, &addrs)
+                .await?
+        }
+        _ => db.storage().stage_delete(&ds, predicate).await?,
+    };
+    match staged {
         Some(mut staged) => {
             staged
                 .record_deleted_ids(ds.dataset(), &deleted_ids)
@@ -1174,9 +1196,8 @@ impl StagedMutation {
         fail(&catalog::FORK_BEFORE_CLASSIFY)?;
 
         let witness = txn.authority.staging_witness()?;
-        let mut updates: Vec<DatasetUpdate> = Vec::with_capacity(staged.len());
-        let mut detached_tables = Vec::with_capacity(staged.len());
-        for entry in staged {
+        let witness = &witness;
+        let commits = staged.into_iter().map(|entry| async move {
             let StagedTableEntry {
                 table_key,
                 path,
@@ -1196,7 +1217,7 @@ impl StagedMutation {
             );
             let (detached, identity) = db
                 .storage()
-                .commit_staged_detached(dataset, staged_write, &witness, &declared_full_text)
+                .commit_staged_detached(dataset, staged_write, witness, &declared_full_text)
                 .await?;
             let state = db.storage().table_state(&path.full_path, &detached).await?;
             let target = expected_version + 1;
@@ -1205,16 +1226,24 @@ impl StagedMutation {
                 .with_table_fork_owner(table_fork_owner)
                 .with_staged(state.version, identity.uuid.clone())
                 .with_last_linear_version(path.entry.version_metadata.last_linear_version());
-            detached_tables.push((table_key.clone(), detached));
-            updates.push(DatasetUpdate {
+            let update = DatasetUpdate {
                 identity: path.identity,
-                type_key: table_key,
+                type_key: table_key.clone(),
                 published_dataset_version: target,
                 native_dataset_branch: path.table_branch,
                 entity_count: state.row_count,
                 version_metadata,
-            });
+            };
             fail(&MUTATION_POST_TABLE_COMMIT)?;
+            Ok::<_, OmniError>((table_key, detached, update))
+        });
+        let committed = futures::future::join_all(commits).await;
+        let mut updates: Vec<DatasetUpdate> = Vec::with_capacity(committed.len());
+        let mut detached_tables = Vec::with_capacity(committed.len());
+        for result in committed {
+            let (table_key, detached, update) = result?;
+            detached_tables.push((table_key, detached));
+            updates.push(update);
         }
 
         Ok(CommittedMutation {

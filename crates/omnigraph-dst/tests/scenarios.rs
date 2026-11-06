@@ -2702,6 +2702,281 @@ fn instrument_filtered_update_cost_over_per_commit_fragments() {
     }
 }
 
+/// A keyed lookup and a one-hop traversal on main, in the order a served
+/// graph meets them: a freshly opened handle's first read, then warm repeats,
+/// then a read after another handle published a commit (the stale path). The
+/// graph carries `commits` small update commits on main before the reopen.
+const WARM_READ_QUERIES: &str = r#"
+query get_person($name: String) {
+    match { $p: Person { name: $name } }
+    return { $p.name, $p.age }
+}
+
+query friends_of($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows $q
+    }
+    return { $q.name }
+}
+"#;
+
+/// The labels one [`WarmReadCost`] run measures, in order.
+fn warm_read_labels(commits: u64) -> Vec<String> {
+    [
+        "ReadOpen",
+        "ReadColdLookup",
+        "ReadWarmLookup",
+        "ReadColdHop",
+        "ReadWarmHop",
+        "ReadStaleLookup",
+        "ReadStaleHop",
+    ]
+    .iter()
+    .map(|label| format!("{label}History{commits}"))
+    .collect()
+}
+
+struct WarmReadCost {
+    commits: u64,
+}
+
+impl WarmReadCost {
+    async fn lookup(db: &Session) -> serde_json::Value {
+        db.query(
+            omnigraph::db::ReadTarget::branch("main"),
+            WARM_READ_QUERIES,
+            "get_person",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap()
+        .to_rust_json()
+        .unwrap()
+    }
+
+    async fn hop(db: &Session) -> serde_json::Value {
+        db.query(
+            omnigraph::db::ReadTarget::branch("main"),
+            WARM_READ_QUERIES,
+            "friends_of",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap()
+        .to_rust_json()
+        .unwrap()
+    }
+}
+
+impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for WarmReadCost {
+    type Output = ();
+
+    async fn run(&self, resources: &mut omnigraph_dst::memory::MemoryStorage, _workload_seed: u64) {
+        let labels = warm_read_labels(self.commits);
+        omnigraph_dst::cost::set_label("_read_setup");
+        let writer = Session::from_defaults(
+            Arc::new(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            ),
+            SessionSettings::default(),
+        );
+        writer
+            .load_jsonl(TEST_DATA, LoadMode::Overwrite)
+            .await
+            .unwrap();
+        for revision in 0..self.commits {
+            writer
+                .mutate(
+                    "main",
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(
+                        &[("$name", "Bob")],
+                        &[("$age", 26 + i64::try_from(revision % 2).unwrap())],
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        omnigraph_dst::cost::set_label(&labels[0]);
+        let reader = Session::from_defaults(
+            Arc::new(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap(),
+            ),
+            SessionSettings::default(),
+        );
+        omnigraph_dst::cost::set_label(&labels[1]);
+        let cold_lookup = Self::lookup(&reader).await;
+        omnigraph_dst::cost::set_label(&labels[2]);
+        let warm_lookup = Self::lookup(&reader).await;
+        omnigraph_dst::cost::set_label(&labels[3]);
+        let cold_hop = Self::hop(&reader).await;
+        omnigraph_dst::cost::set_label(&labels[4]);
+        let warm_hop = Self::hop(&reader).await;
+        omnigraph_dst::cost::set_label("_read_external_commit");
+        writer
+            .mutate(
+                "main",
+                MUTATION_QUERIES,
+                "set_age",
+                &mixed_params(&[("$name", "Bob")], &[("$age", 40)]),
+            )
+            .await
+            .unwrap();
+        omnigraph_dst::cost::set_label(&labels[5]);
+        let stale_lookup = Self::lookup(&reader).await;
+        omnigraph_dst::cost::set_label(&labels[6]);
+        let stale_hop = Self::hop(&reader).await;
+        omnigraph_dst::cost::set_label("_read_verify");
+        let alice = serde_json::json!([{"p.name": "Alice", "p.age": 30}]);
+        for rows in [&cold_lookup, &warm_lookup, &stale_lookup] {
+            assert_eq!(rows, &alice);
+        }
+        for rows in [&cold_hop, &warm_hop, &stale_hop] {
+            let mut names = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["q.name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            names.sort();
+            assert_eq!(names, ["Bob", "Charlie"]);
+        }
+        // The reader observes the external commit (no stale serve).
+        let bob = reader
+            .query(
+                omnigraph::db::ReadTarget::branch("main"),
+                WARM_READ_QUERIES,
+                "get_person",
+                &params(&[("$name", "Bob")]),
+            )
+            .await
+            .unwrap()
+            .to_rust_json()
+            .unwrap();
+        assert_eq!(bob, serde_json::json!([{"p.name": "Bob", "p.age": 40}]));
+    }
+}
+
+/// The warm-read rows at two history depths: equal rows across the two show
+/// that read cost is flat in commit history.
+fn warm_read_cost_rows(replay: &str) -> String {
+    let mut rows = String::new();
+    for commits in [2, 32] {
+        let labels = warm_read_labels(commits);
+        let labels = labels.iter().map(String::as_str).collect::<Vec<_>>();
+        rows.push_str(&labeled_cost_rows_of(
+            format!("shared-memory://dst-warm-read-cost-{replay}-{commits}"),
+            &WarmReadCost { commits },
+            &labels,
+        ));
+    }
+    rows
+}
+
+/// Where each warm-read call goes: per label, the calls by realm (the
+/// `__manifest` dataset, `__history`, a graph table, or the control-object
+/// adapter), Lance directory and verb, at several history depths. Prints
+/// only; the counts the golden pins come from [`warm_read_cost_rows`].
+#[test]
+#[serial]
+#[ignore = "instrument: warm-read call attribution by realm — run explicitly"]
+fn dst_warm_read_cost_paths() {
+    let _s = omnigraph::seams::FailScenario::setup();
+    let depths = std::env::var("WARM_READ_DEPTHS")
+        .unwrap_or_else(|_| "0,2,32,128".to_string())
+        .split(',')
+        .map(|d| d.trim().parse::<u64>().unwrap())
+        .collect::<Vec<_>>();
+    for commits in depths {
+        omnigraph_dst::lance_faults::install();
+        let environment = omnigraph_dst::memory::MemoryEnvironment::new(
+            format!("shared-memory://dst-warm-read-paths-{commits}"),
+            24_901,
+            omnigraph_dst::UniverseProcess::Shared,
+        );
+        let ledger = omnigraph_dst::cost::arm_with_paths();
+        let run = omnigraph_dst::run_universe(&environment, &WarmReadCost { commits });
+        let log = ledger.path_log();
+        omnigraph_dst::cost::disarm();
+        run.cleanup.unwrap().unwrap();
+        run.result.unwrap().unwrap();
+        let verbose = std::env::var("WARM_READ_VERBOSE").is_ok();
+        for label in warm_read_labels(commits) {
+            let mut classes = std::collections::BTreeMap::<String, u64>::new();
+            let mut total = 0;
+            for (row_label, verb, path) in &log {
+                if *row_label != label {
+                    continue;
+                }
+                total += 1;
+                let class = warm_read_class(verb, path);
+                if verbose {
+                    println!("  {label} {class} {path}");
+                }
+                *classes.entry(class).or_default() += 1;
+            }
+            let classes = classes
+                .iter()
+                .map(|(class, n)| format!("{class}={n}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("{label:<30} total={total:<4} {classes}");
+        }
+    }
+}
+
+/// `<realm>_<kind>.<verb>` for one logged call, in the GQT measure
+/// vocabulary: realm `manifest` (`__manifest`, a branch tree included),
+/// `history` (`__history`), `table` (a graph table) or `control` (the
+/// adapter); kind the Lance directory.
+fn warm_read_class(verb: &str, path: &str) -> String {
+    let (path, verb) = match path.strip_suffix("#head") {
+        Some(path) => (path, "head".to_string()),
+        None => (
+            path.split('#').next().unwrap(),
+            verb.split('.').nth(1).unwrap().to_string(),
+        ),
+    };
+    if verb_is_control(path) {
+        return format!("control.{verb}");
+    }
+    let realm = if path.contains("__manifest") {
+        "manifest"
+    } else if path.contains("__history") {
+        "history"
+    } else {
+        "table"
+    };
+    let kind = [
+        "_versions",
+        "data",
+        "_transactions",
+        "_deletions",
+        "_indices",
+        "_refs",
+    ]
+    .iter()
+    .find(|kind| path.contains(&format!("/{kind}/")) || path.ends_with(&format!("/{kind}")))
+    .copied()
+    .unwrap_or("other");
+    format!("{realm}_{kind}.{verb}")
+}
+
+fn verb_is_control(path: &str) -> bool {
+    path.starts_with("shared-memory://")
+}
+
 fn labeled_cost_rows<S>(root: String, scenario: &S, label: &str) -> String
 where
     S: omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage, Output = ()>,
@@ -3435,6 +3710,7 @@ fn dst_bench_cost_count_golden() {
     table.push_str(&writer_buffer_cost_rows("a"));
     table.push_str(&overwrite_removal_cost_rows("a"));
     table.push_str(&endpoint_probe_cost_rows("a"));
+    table.push_str(&warm_read_cost_rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-b", &sc);
     let mut table2 = ledger2.render_calls();
@@ -3446,6 +3722,7 @@ fn dst_bench_cost_count_golden() {
     table2.push_str(&writer_buffer_cost_rows("b"));
     table2.push_str(&overwrite_removal_cost_rows("b"));
     table2.push_str(&endpoint_probe_cost_rows("b"));
+    table2.push_str(&warm_read_cost_rows("b"));
     assert_eq!(
         table, table2,
         "the counting pass must replay identically before any golden claim"
@@ -6934,13 +7211,16 @@ async fn dst_publication_requests_get_a_definite_outcome_issue_1067() {
 /// at a seeded moment that can fall before, during or after a successor's
 /// watch. A beat that lands during the watch sends the successor away, which
 /// is the safe direction; the successor that claims the lock does so only
-/// after a lease and a half of silence since the last beat it saw; and the
-/// dead owner's beats that land after the claim fence nothing: the
-/// successor keeps renewing, and a third process watching it refuses.
+/// after a lease and a half of silence since the last beat it saw, then
+/// replaces the record by if-match on the version it read; and the dead
+/// owner's beats that land after the claim fence nothing: the successor
+/// keeps renewing, and a third process watching it refuses.
 #[test]
 #[serial]
 fn dst_successor_takes_over_a_dead_owners_lease_issue_1067() {
-    use omnigraph_cluster::lease_protocol::{LeaseKeeper, Watch, lease_dir, watch_and_claim};
+    use omnigraph_cluster::lease_protocol::{
+        LeaseKeeper, Watch, lease_dir, leased_lock_record, watch_and_claim,
+    };
     use std::time::Duration;
     use tokio::time::Instant;
 
@@ -6958,10 +7238,27 @@ fn dst_successor_takes_over_a_dead_owners_lease_issue_1067() {
             let store: Arc<dyn omnigraph_storage::StorageAdapter> =
                 Arc::new(omnigraph_storage::ObjectStorageAdapter::in_memory());
             let root = "cluster";
-            let owner =
-                LeaseKeeper::start(store.clone(), root, "owner", SECONDS, Instant::now(), None)
-                    .await
-                    .expect("the owner's first beat lands");
+            let lock_uri = format!("{root}/{}", omnigraph_cluster::CLUSTER_LOCK_FILE);
+            let lock_sent = Instant::now();
+            store
+                .write_text(&lock_uri, &leased_lock_record("owner", SECONDS))
+                .await
+                .unwrap();
+            let (_, version) = store
+                .read_text_versioned(&lock_uri)
+                .await
+                .expect("the owner's record is visible");
+            let owner = LeaseKeeper::start(
+                store.clone(),
+                root,
+                &lock_uri,
+                "owner",
+                SECONDS,
+                lock_sent,
+                None,
+            )
+            .await
+            .expect("the owner's first beat lands");
             tokio::time::sleep(Duration::from_millis(rng.below(90_000))).await;
             drop(owner);
             let died = Instant::now();
@@ -7014,12 +7311,26 @@ fn dst_successor_takes_over_a_dead_owners_lease_issue_1067() {
                 "seed {seed}"
             );
 
+            let replaced = Instant::now();
+            assert!(
+                store
+                    .write_text_if_match(
+                        &lock_uri,
+                        &leased_lock_record("successor", SECONDS),
+                        &version
+                    )
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "seed {seed}: the successor's if-match applies"
+            );
             let successor = LeaseKeeper::start(
                 store.clone(),
                 root,
+                &lock_uri,
                 "successor",
                 SECONDS,
-                Instant::now(),
+                replaced,
                 None,
             )
             .await

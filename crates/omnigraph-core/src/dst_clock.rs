@@ -62,6 +62,22 @@ fn next_logical_ms() -> Option<u64> {
     CLOCK.with(|clock| clock.now_ms())
 }
 
+/// Whether this thread runs under simulation: a harness installed the clock
+/// seam on it. Production never installs one, so this is `false` there, and
+/// without the `dst` feature it is `false` by construction.
+#[cfg(feature = "dst")]
+pub fn simulated() -> bool {
+    CLOCK.with(|_| ()).is_some()
+}
+
+/// Whether this thread runs under simulation; without the `dst` feature no
+/// clock can be installed, so never.
+#[cfg(not(feature = "dst"))]
+#[inline(always)]
+pub fn simulated() -> bool {
+    false
+}
+
 /// Seam for `chrono::Utc::now()` call sites. Without the `dst` feature:
 /// the real clock, directly.
 #[cfg(not(feature = "dst"))]

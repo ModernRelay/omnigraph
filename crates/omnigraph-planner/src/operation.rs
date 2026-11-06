@@ -1,5 +1,5 @@
 use omnigraph_compiler::SystemColumns;
-use omnigraph_compiler::ir::{LoadIR, QueryIR};
+use omnigraph_compiler::ir::{LoadIR, QueryIR, WriteKind, WriteTableIR};
 use serde::{Deserialize, Serialize};
 
 /// Where a table's rows come from: a pinned dataset in the graph's store,
@@ -105,6 +105,28 @@ pub struct ScopeSpec {
     pub deletes: bool,
 }
 
+/// The committed image a write's lookups read: the transaction's pinned
+/// base (a load, a mutation's existence and uniqueness checks), the merge
+/// target (a branch merge), or the base with `@card` counted on the live
+/// branch (a mutation, #298).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommittedSide {
+    Base,
+    MergeTarget,
+    Live,
+}
+
+impl CommittedSide {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Base => "base",
+            Self::MergeTarget => "merge_target",
+            Self::Live => "live",
+        }
+    }
+}
+
 /// The gate's only input type. Each variant is one operation the engine may
 /// hand to the planner. Read queries build engine plans directly; the
 /// registry admits other operations by their resolved plan's shape.
@@ -138,6 +160,15 @@ pub enum Operation {
         tables: Vec<Side>,
         source_bytes: u64,
     },
+    /// One table of a write the executor stages (a JSONL load, a mutation, a
+    /// blob cell, a branch merge): the planner builds its `Validate` node, the
+    /// executor's judge runs it; `tables` pins the target and consulted tables.
+    Write {
+        ir: Box<WriteTableIR>,
+        kind: WriteKind,
+        tables: Vec<Side>,
+        committed: CommittedSide,
+    },
 }
 
 impl Operation {
@@ -148,6 +179,7 @@ impl Operation {
             Self::MergeClassify { .. } => "merge_classify",
             Self::Query(_) => "query",
             Self::Load { .. } => "load",
+            Self::Write { .. } => "write",
         }
     }
 
@@ -161,7 +193,7 @@ impl Operation {
                 target,
             } => vec![base, source, target],
             Self::Query(_) => Vec::new(),
-            Self::Load { tables, .. } => tables.iter().collect(),
+            Self::Load { tables, .. } | Self::Write { tables, .. } => tables.iter().collect(),
         }
     }
 }

@@ -11,6 +11,7 @@ use crate::session::Session;
 use crate::storage_layer::{DeletedIdBudget, PendingScanBudget, SnapshotHandle, WriteBudget};
 use datafusion::prelude::Expr;
 use futures::TryStreamExt;
+use lance_select::mask::RowAddrTreeMap;
 
 // ─── Mutation helpers ────────────────────────────────────────────────────────
 
@@ -564,6 +565,8 @@ use super::staging::{MutationStaging, PendingMode};
 pub(super) struct CommittedStagedMutation {
     pub(super) committed: super::staging::CommittedMutation,
     lineage_intent: crate::db::manifest::LineageIntent,
+    /// The planner's document per validated table, for the receipt.
+    pub(super) plans: Vec<omnigraph_planner::Explain>,
 }
 
 /// Where a declaration's write lands, resolved from the parsed declaration
@@ -1053,30 +1056,103 @@ impl Session {
 }
 
 impl Omnigraph {
-    /// End-of-query validation for a constructive mutation: build the change-set
-    /// from the accumulated staging and run the unified evaluator (value/enum,
-    /// uniqueness incl. cross-version, edge-RI, cardinality) against committed
-    /// state. Read-your-writes is inherent — every same-query insert is already
-    /// in the change-set. Destructive queries (D2) stage no constructive batches,
-    /// so the change-set is empty and this is a no-op (deletes cascade).
+    /// End-of-query validation of a mutation: every staged table planned as an
+    /// upsert and every deleted-from table as a removal, judged against the
+    /// pinned base and, for `@card` (#298), the live branch; documents for the receipt.
     async fn validate_staged_mutation(
         &self,
         staging: &MutationStaging,
         txn: &crate::db::WriteTxn,
-    ) -> Result<()> {
-        // RI/uniqueness read the write's already-validated pinned base (`txn.base`),
-        // NOT a fresh `snapshot_for_branch` — per-table resolution must not add a
-        // schema-contract validation beyond capture + the pre-effect gate.
-        // Cardinality reads a fresh manifest-visible branch snapshot (the #298
-        // stale-handle fix) via `CommittedState::write`; it never follows an
-        // unpublished raw Lance HEAD or a not-yet-created first-touch ref.
-        let committed =
-            crate::validate::CommittedState::write(&txn.base, self, txn.branch.as_deref());
-        // `to_changeset` carries both constructive batches and the ids the delete
-        // ops captured from their own scans (`deleted_ids`), so the evaluator
-        // recounts the srcs a delete empties (`@card`) and sees removed rows for
-        // RI — the faithful change-set the merge path also builds.
-        crate::validate::validate_changeset(&staging.to_changeset(), &committed, &txn.catalog).await
+    ) -> Result<Vec<omnigraph_planner::Explain>> {
+        use crate::validate::load::{JudgedSide, RepeatRule, Report, WriteJudge};
+        use crate::validate::plan::{WriteTable, judgment_rank, plan_write};
+        use omnigraph_compiler::ir::{DeltaClass, WriteKind};
+        use omnigraph_planner::CommittedSide;
+
+        let mut tables: Vec<WriteTable> = staging
+            .pending
+            .iter()
+            .filter(|(_, pending)| !pending.batches.is_empty())
+            .map(|(table, pending)| WriteTable {
+                table: table.clone(),
+                delta: DeltaClass::Upsert,
+                rows: pending.batches.iter().map(|b| b.num_rows() as u64).sum(),
+                deleted_ids: Vec::new(),
+            })
+            .chain(
+                staging
+                    .deleted_ids
+                    .iter()
+                    .filter(|(_, ids)| !ids.is_empty())
+                    .map(|(table, ids)| WriteTable {
+                        table: table.clone(),
+                        delta: DeltaClass::Removal,
+                        rows: 0,
+                        deleted_ids: ids.clone(),
+                    }),
+            )
+            .collect();
+        if tables.is_empty() {
+            return Ok(Vec::new());
+        }
+        tables.sort_by(|a, b| judgment_rank(&a.table).cmp(&judgment_rank(&b.table)));
+        // The base pins exact table versions, which this write's own opens
+        // (`open_pinned_for_write`) already read through the shared session
+        // and the held-handle cache keyed by that pin; validation reads the
+        // same versions through them too, instead of a zero-capacity
+        // statement session, on which each validation's open of a table
+        // rereads its manifest and every index lookup rereads the manifest's
+        // index section.
+        let mut base = txn.base.clone();
+        base.set_read_caches(crate::db::manifest::SnapshotReadCaches {
+            session: self.read_caches().session.clone(),
+            handles: self.read_caches().handles.clone(),
+            table_wrapper: None,
+        });
+        let write_budget = staging.write_budget();
+        let batches: Vec<Vec<RecordBatch>> = tables
+            .iter()
+            .map(|table| staging.pending_batches(&table.table).to_vec())
+            .collect();
+        let (judged, plans): (Vec<_>, Vec<_>) = plan_write(
+            &base,
+            &txn.catalog,
+            WriteKind::Mutation,
+            CommittedSide::Live,
+            tables,
+            write_budget.bytes(),
+        )
+        .await?
+        .into_iter()
+        .unzip();
+        let judge = WriteJudge {
+            tables: judged,
+            committed: JudgedSide::Live {
+                base,
+                branch: txn.branch.clone(),
+            },
+            write_budget,
+            catalog: Arc::clone(&txn.catalog),
+            report: Report::First,
+            repeat: RepeatRule::for_write(WriteKind::Mutation),
+        };
+        let mut deleted = DeletedIdBudget::new(write_budget);
+        let mut admit_removed = |id: &str| deleted.retain(id);
+        let mut admit_retained = |_: &RecordBatch| Ok(());
+        judge
+            .judge_batches(
+                self,
+                batches,
+                &mut crate::validate::load::LoadAdmission {
+                    phase: None,
+                    bytes: None,
+                    reuse: None,
+                    removed: &mut admit_removed,
+                    retained: &mut admit_retained,
+                },
+            )
+            .await?;
+        Ok(plans)
     }
 
     async fn mutate_with_current_actor(
@@ -1251,10 +1327,11 @@ impl Omnigraph {
                     result: total,
                     commit: None,
                     branch: addressed,
+                    plans: Vec::new(),
                 })
             }
             Ok(total) => {
-                let committed = self
+                let mut committed = self
                     .commit_staged_mutation(
                         staging,
                         &txn,
@@ -1263,6 +1340,7 @@ impl Omnigraph {
                         history_release_bytes,
                     )
                     .await?;
+                let plans = std::mem::take(&mut committed.plans);
                 let publication = route.publication(&txn).map_err(OmniError::unpublished)?;
                 let commit = self
                     .publish_committed_mutation(committed, &txn, actor_id, publication)
@@ -1271,6 +1349,7 @@ impl Omnigraph {
                     result: total,
                     commit: Some(commit),
                     branch: addressed,
+                    plans,
                 })
             }
         }
@@ -1290,7 +1369,7 @@ impl Omnigraph {
         history_release_bytes: HistoryReleaseBytes,
     ) -> Result<CommittedStagedMutation> {
         let requested = txn.branch.as_deref();
-        self.validate_staged_mutation(&staging, txn).await?;
+        let plans = self.validate_staged_mutation(&staging, txn).await?;
         // From the first staged file to the publisher call, every durable
         // effect is a fresh file or a detached version no manifest names: a
         // failure here is definite (`Unpublished`), whatever its cause, and a
@@ -1311,6 +1390,7 @@ impl Omnigraph {
         Ok(CommittedStagedMutation {
             committed,
             lineage_intent,
+            plans,
         })
     }
 
@@ -1332,6 +1412,7 @@ impl Omnigraph {
                     gates: _held_gates,
                 },
             lineage_intent,
+            plans: _,
         } = committed;
         // `_held_gates` holds the shared schema permit, branch effect gate,
         // and sorted table gates acquired by `commit_all`. They remain held
@@ -1842,9 +1923,20 @@ impl Omnigraph {
         // Delete is a STRICT op, so collapse #1 never skips its open.
         let ds = handle.expect("strict Delete op always opens its dataset");
 
-        let scan_filter =
-            dedup_delete_filter(&pred_expr, staging.recorded_delete_predicates(&table_key));
-        let deleted_ids = scan_deleted_ids(
+        // A `<key> = v` conjunct on a single String key also selects the
+        // derived `id = v`, so with an id BTREE the scan narrows through
+        // the index instead of reading the key column of every fragment.
+        // The recorded predicate stays the written one.
+        let scan_predicate =
+            match delete_key_id_conjunct(self, &ds, type_name, predicate, params, txn).await? {
+                Some(id_conjunct) => pred_expr.clone().and(id_conjunct),
+                None => pred_expr.clone(),
+            };
+        let scan_filter = dedup_delete_filter(
+            &scan_predicate,
+            staging.recorded_delete_predicates(&table_key),
+        );
+        let (deleted_ids, deleted_addrs) = scan_deleted_ids(
             self,
             &ds,
             txn.catalog.system_columns.id,
@@ -1871,6 +1963,7 @@ impl Omnigraph {
         // path/version/op-kind via `ensure_path`.
         fail(&MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE)?;
         staging.record_delete(&table_key, pred_expr.clone());
+        staging.record_deleted_row_addrs(&table_key, ds.version(), deleted_addrs)?;
 
         let mut affected_edges = 0usize;
 
@@ -1929,7 +2022,7 @@ impl Omnigraph {
             // Scan (not count) the cascade-removed edge ids so validation
             // recounts the OTHER endpoint's @card after the cascade; `len()` is
             // the affected count.
-            let matched_ids = scan_deleted_ids(
+            let (matched_ids, matched_addrs) = scan_deleted_ids(
                 self,
                 &edge_ds,
                 txn.catalog.system_columns.id,
@@ -1943,6 +2036,11 @@ impl Omnigraph {
             if matched > 0 {
                 staging.record_deleted_ids(&edge_table_key, matched_ids);
                 staging.record_delete(&edge_table_key, cascade_filter);
+                staging.record_deleted_row_addrs(
+                    &edge_table_key,
+                    edge_ds.version(),
+                    matched_addrs,
+                )?;
             }
         }
 
@@ -1999,7 +2097,7 @@ impl Omnigraph {
         // a delete emptying a src below @card min is rejected; `len()` is the
         // affected count. One scan replaces the former count-here + resolve-at-
         // validation re-scan.
-        let deleted_ids = scan_deleted_ids(
+        let (deleted_ids, deleted_addrs) = scan_deleted_ids(
             self,
             &ds,
             txn.catalog.system_columns.id,
@@ -2012,6 +2110,7 @@ impl Omnigraph {
         if affected > 0 {
             staging.record_deleted_ids(&table_key, deleted_ids);
             staging.record_delete(&table_key, pred_expr.clone());
+            staging.record_deleted_row_addrs(&table_key, ds.version(), deleted_addrs)?;
             self.invalidate_graph_index().await;
         }
 
@@ -2022,33 +2121,121 @@ impl Omnigraph {
     }
 }
 
+/// The derived-id conjunct of a node delete whose predicate has a top-level
+/// `<key> = <String literal or parameter>` conjunct on the type's single
+/// String `@key`: every write derives a keyed node's id from its key
+/// (`loader::canonical_key_id`), so `key = v` implies `id = derive(v)` and
+/// adding the conjunct selects the same rows. The read planner narrows the
+/// same shape (`scan_access::narrow_key`). Only when the pinned table has an
+/// id BTREE: without one the extra column would only add bytes.
+async fn delete_key_id_conjunct(
+    db: &Omnigraph,
+    ds: &SnapshotHandle,
+    type_name: &str,
+    predicate: &IRExpr,
+    params: &ParamMap,
+    txn: &crate::db::WriteTxn,
+) -> Result<Option<Expr>> {
+    let type_key = format!("node:{type_name}");
+    let Some(node) = txn.catalog.node_types.get(type_name) else {
+        return Ok(None);
+    };
+    let Some([key]) = node.key.as_deref() else {
+        return Ok(None);
+    };
+    let mut derived = None;
+    for conjunct in predicate.clone().into_conjuncts() {
+        let Some((left, omnigraph_compiler::query::ast::CompOp::Eq, right)) =
+            conjunct.comparison_parts()
+        else {
+            continue;
+        };
+        for (property, value) in [(left, right), (right, left)] {
+            let IRExpr::PropAccess { property, .. } = property else {
+                continue;
+            };
+            if property != key {
+                continue;
+            }
+            let literal = match value {
+                IRExpr::Literal(literal, _) => Some(literal),
+                IRExpr::Param(name, _) => params.get(name),
+                _ => None,
+            };
+            let Some(literal) = literal else {
+                continue;
+            };
+            if let Some(id) = crate::engine::plan_source::canonical_key_id_of(
+                &txn.catalog,
+                &type_key,
+                literal,
+                value.ty(),
+            )? {
+                derived = Some(id);
+                break;
+            }
+        }
+        if derived.is_some() {
+            break;
+        }
+    }
+    let Some(id) = derived else {
+        return Ok(None);
+    };
+    let id_column = txn.catalog.system_columns.id;
+    if !db.storage().has_btree_index(ds, id_column).await? {
+        return Ok(None);
+    }
+    Ok(Some(
+        datafusion::prelude::col(id_column).eq(datafusion::prelude::lit(id)),
+    ))
+}
+
 /// Walk the exact typed predicate a batch at a time, admitting each id against
-/// `budget` before copying it.
+/// `budget` before copying it, and keep each matched row's address so the
+/// staged delete removes exactly these rows without scanning again.
 async fn scan_deleted_ids(
     db: &Omnigraph,
     snapshot: &SnapshotHandle,
     id_column: &str,
     filter: Expr,
     budget: &mut DeletedIdBudget,
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, RowAddrTreeMap)> {
     let mut stream = db
         .storage()
-        .scan_filtered(snapshot, Some(&[id_column]), filter)
+        .scan_filtered_row_addrs(snapshot, &[id_column], filter)
         .await?;
     let mut removed = Vec::new();
+    let mut addrs = RowAddrTreeMap::new();
     while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
         let ids = batch
             .column(0)
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| OmniError::manifest_internal("delete id scan did not return Utf8"))?;
+        let row_addrs = batch
+            .column_by_name(lance_core::ROW_ADDR)
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| {
+                OmniError::manifest_internal("delete id scan did not return UInt64 row addresses")
+            })?;
+        if row_addrs.len() != ids.len() || row_addrs.null_count() != 0 {
+            return Err(OmniError::manifest_internal(
+                "delete id scan returned an address column that does not match its ids",
+            ));
+        }
         for i in 0..ids.len() {
             let id = ids.value(i);
             budget.retain(id)?;
             removed.push(id.to_owned());
+            if !addrs.insert(row_addrs.value(i)) {
+                return Err(OmniError::manifest_internal(
+                    "delete id scan returned one row address twice",
+                ));
+            }
         }
     }
-    Ok(removed)
+    Ok((removed, addrs))
 }
 
 /// Concat the matched batches from `scan_with_pending` into a single batch.

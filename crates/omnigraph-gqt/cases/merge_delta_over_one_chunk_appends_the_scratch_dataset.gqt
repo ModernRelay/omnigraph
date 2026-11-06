@@ -1,0 +1,54 @@
+# issue: none
+# notes: a three-way branch merge whose delta exceeds one write chunk (8192 rows) appends its second chunk to the merge scratch dataset through `append_or_create_batch`, the one scratch append that commits through the engine's commit constructor; the merged graph holds every row of both sides
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    name: String @key
+    v: I64
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","v":0}}
+
+--- mutate
+branch create work
+
+--- expect ok
+
+--- load generate: v1 seed: 7 mode: append branch: work
+tables:
+  - kind: node
+    name: Person
+    rows: 9000
+    commits: 3
+    columns:
+      name: {kind: key, prefix: person-, width: 5}
+      v: {kind: ordinal, start: 0, step: 1}
+
+--- expect ok
+
+--- mutate
+query add_bob() { insert Person { name: "bob", v: 1 } }
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge work
+
+--- expect outcome: merged
+
+--- query
+query people() { match { $p: Person } return { count($p) as n } }
+
+--- expect unordered
+{"n": 9002}
+
+--- expect shape
+n: I64

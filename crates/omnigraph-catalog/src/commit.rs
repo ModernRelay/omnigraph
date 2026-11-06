@@ -41,7 +41,7 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use lance::Dataset;
 use lance::dataset::transaction::{Operation, TransactionBuilder};
-use lance::dataset::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
+use lance::dataset::{InsertBuilder, WriteMode, WriteParams};
 use lance_file::version::LanceFileVersion;
 use lance_table::format::Fragment;
 
@@ -177,10 +177,10 @@ async fn overwrite_probed(
         .await
         .map_err(OmniError::storage)?;
     let builder = match placement {
-        Placement::Linear => CommitBuilder::new(dataset).with_max_retries(0),
+        Placement::Linear => crate::lance_commit::commit_builder(dataset).with_max_retries(0),
         Placement::Detached { properties } => {
             transaction.transaction_properties = Some(Arc::new(properties));
-            CommitBuilder::new(dataset)
+            crate::lance_commit::commit_builder(dataset)
                 .with_detached(true)
                 .with_max_retries(DETACHED_VERSION_RETRIES)
         }
@@ -292,7 +292,7 @@ pub(crate) async fn commit_overwrite(
         .execute_uncommitted(batches)
         .await
         .map_err(map_lance_publish_error)?;
-    CommitBuilder::new(dataset)
+    crate::lance_commit::commit_builder(dataset)
         .with_max_retries(0)
         .with_skip_auto_cleanup(true)
         .execute(transaction)

@@ -40,19 +40,49 @@ impl PreparedGraphCreate {
         self.validated_schema_ir().map(|_| ())
     }
 
+    /// The init claim one apply of this token writes. A narrow extension of
+    /// the existing init claim: the deployment ledger already holds the full
+    /// token, and the claim binds its exact bytes by digest. It also names
+    /// the apply by a fresh id, because the storage adapter reads a lost
+    /// create's answer back from the stored bytes: two applies of one token
+    /// must not write the same claim, or both would read it as their own.
     pub(super) fn claim_payload(&self) -> Result<String> {
+        Ok(serde_json::json!({
+            "version": PREPARED_CLAIM_VERSION,
+            "prepared_digest": self.digest()?,
+            "graph_commit_id": self.graph_commit_id(),
+            "root": self.root(),
+            "attempt_id": crate::dst_ids::new_ulid().to_string(),
+        })
+        .to_string())
+    }
+
+    /// Whether `claim` is an init claim some apply of this token wrote:
+    /// this version's, whatever its attempt, or the exact claim of the
+    /// version before it, which named no attempt.
+    pub(super) fn holds_claim(&self, claim: &str) -> Result<bool> {
+        let Ok(claim) = serde_json::from_str::<PreparedClaim>(claim) else {
+            return Ok(false);
+        };
+        let attempt_matches_version = match (claim.version, &claim.attempt_id) {
+            (PREPARED_CLAIM_VERSION, Some(attempt)) => !attempt.is_empty(),
+            (LEGACY_PREPARED_CLAIM_VERSION, None) => true,
+            _ => false,
+        };
+        Ok(attempt_matches_version
+            && claim.prepared_digest == self.digest()?
+            && claim.graph_commit_id == self.graph_commit_id()
+            && claim.root == self.root())
+    }
+
+    fn digest(&self) -> Result<String> {
         self.validate()?;
-        // A narrow extension of the existing init claim. The deployment ledger
-        // already holds the full token; the claim binds its exact bytes.
-        let digest = format!(
+        Ok(format!(
             "{:x}",
             Sha256::digest(
                 serde_json::to_vec(self).map_err(|error| OmniError::manifest(error.to_string()))?
             )
-        );
-        Ok(serde_json::json!({ "version": 2, "prepared_digest": digest,
-            "graph_commit_id": self.graph_commit_id(), "root": self.root() })
-        .to_string())
+        ))
     }
 
     pub(super) fn genesis(&self) -> &GenesisManifestAttempt {
@@ -87,6 +117,23 @@ impl PreparedGraphCreate {
         }
         Ok(schema_ir)
     }
+}
+
+/// The prepared init claim's version: 3 names the apply that wrote it.
+const PREPARED_CLAIM_VERSION: u32 = 3;
+/// Written by earlier releases, with no attempt id; still recognized when
+/// settling an interrupted birth after an upgrade.
+const LEGACY_PREPARED_CLAIM_VERSION: u32 = 2;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedClaim {
+    version: u32,
+    prepared_digest: String,
+    graph_commit_id: String,
+    root: String,
+    #[serde(default)]
+    attempt_id: Option<String>,
 }
 
 /// Read-only evidence about one exact initialization. `Absent` is only a current
@@ -204,13 +251,7 @@ impl Omnigraph {
         let access = crate::lance_access::LanceAccessContext::with_storage(storage.as_ref());
         let storage = crate::storage::decorate(storage);
         let claim_uri = init_claim_uri(prepared.root());
-        let expected_claim = prepared.claim_payload()?;
-        if storage
-            .read_text_if_exists_bounded(&claim_uri, 4096)
-            .await?
-            .as_deref()
-            != Some(expected_claim.as_str())
-        {
+        if !holds_token_claim(prepared, storage.as_ref(), &claim_uri).await? {
             return Ok(GraphCreateReconciliation::Unknown);
         }
         let manifest = crate::db::manifest::manifest_uri(prepared.root());
@@ -283,11 +324,7 @@ impl Omnigraph {
         if !birth_versions(&manifest, storage.as_ref())
             .await?
             .is_empty()
-            || storage
-                .read_text_if_exists_bounded(&claim_uri, 4096)
-                .await?
-                .as_deref()
-                != Some(expected_claim.as_str())
+            || !holds_token_claim(prepared, storage.as_ref(), &claim_uri).await?
         {
             return Ok(GraphCreateReconciliation::Unknown);
         }
@@ -376,6 +413,19 @@ pub(super) async fn require_empty_create_target(
         )
         .await?;
     Ok(())
+}
+
+/// Whether the init claim at `claim_uri` was written by an apply of
+/// `prepared`.
+async fn holds_token_claim(
+    prepared: &PreparedGraphCreate,
+    storage: &dyn StorageAdapter,
+    claim_uri: &str,
+) -> Result<bool> {
+    match storage.read_text_if_exists_bounded(claim_uri, 4096).await? {
+        Some(claim) => prepared.holds_claim(&claim),
+        None => Ok(false),
+    }
 }
 
 async fn bound_birth_inventory(uri: &str, storage: &dyn StorageAdapter) -> Result<()> {

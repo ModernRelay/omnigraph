@@ -56,22 +56,27 @@ pub use cost::{
     ExpandCostInputs, ExpandMode, ExpandPolicy, HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO,
     HYDRATE_ROW_RATIO, IndexCoverage, PROBE_CHUNK_KEYS, SOURCE_PARTITION_BYTES, ValidateAccess,
     ValidateCostInputs, ValidateIndexCoverage, ValidateRemoval, chain_rows, choose_access_path,
-    choose_anti_join_strategy, choose_expand_mode, choose_validate_access, direction_probe_factor,
-    estimate_rows, executed_hops, hydrate_chunk_bytes, scan_row_estimate, should_switch_to_csr,
+    choose_anti_join_strategy, choose_expand_mode, choose_validate_access,
+    coverage_validate_access, direction_probe_factor, estimate_rows, executed_hops,
+    hydrate_chunk_bytes, scan_row_estimate, should_switch_to_csr,
 };
 pub use error::PlanError;
 pub use explain::Explain;
 pub use gate::{Decision, Unrouted, accept_query, accept_query_explained, plan_query, route};
 pub use logical::{
-    Census, ColumnRef, ConsultedImage, CsvSourceSpec, FragmentWriteSpec, IndexQuery, JoinKind,
-    KeyJoinKind, LogicalId, LogicalKind, LogicalNode, LogicalPlan, Predicate, RuntimeFilterKind,
-    RuntimeFilterSpec, RuntimeInput, ScanAccess, ScanSpec, SearchArm, ValidateSpec,
+    Census, ColumnRef, ConsultedImage, CsvSourceSpec, DeltaSourceSpec, FragmentWriteSpec,
+    IndexQuery, JoinKind, KeyJoinKind, LogicalId, LogicalKind, LogicalNode, LogicalPlan, Predicate,
+    RuntimeFilterKind, RuntimeFilterSpec, RuntimeInput, ScanAccess, ScanSpec, SearchArm,
+    ValidateSpec,
 };
 pub use lower::{
-    AggregateFields, ContainsJoinFields, CsvSourceFields, ExpandFields, FragmentWriteFields,
-    HashJoinFields, Lower, RankFuseFields, SortMergeJoinFields, ValidateFields,
+    AggregateFields, ContainsJoinFields, CsvSourceFields, DeltaSourceFields, ExpandFields,
+    FragmentWriteFields, HashJoinFields, Lower, RankFuseFields, SortMergeJoinFields,
+    ValidateFields,
 };
-pub use operation::{Operation, PageBudgetSpec, ScopeSpec, Side, TableRef, TableSource};
+pub use operation::{
+    CommittedSide, Operation, PageBudgetSpec, ScopeSpec, Side, TableRef, TableSource,
+};
 pub use optimizer::{Bounds, physical_plan, rewrite};
 pub use output::{NodeObjectType, validate_output_schemas};
 pub use passes::{PassId, PassRow, PassStage, pass_rows};

@@ -22,6 +22,19 @@
 //!   could still overwrite by landing late, is refused, and the scope refuses
 //!   a clean release. Other keys are unaffected. Rename accounts for its
 //!   source deletion too.
+//! - A request the store refused before it could apply (a permission or
+//!   authentication failure, a missing bucket or container, an invalid path,
+//!   an unsupported operation) leaves nothing to settle, on any key: every
+//!   such request goes to a single-attempt client, so no earlier copy of it
+//!   was sent.
+//! - A key left unsettled by a conditional request admits a request with the
+//!   same precondition: its owner's re-issue. The precondition fences the
+//!   earlier copy, so the re-issue's success settles the key: no earlier
+//!   copy can apply after it. Its conflict or refusal settles nothing, since
+//!   the earlier copy may be what conflicted (S3 answers 409 while another
+//!   conditional write to the key is in flight); the owner's read of the key
+//!   settles it once the precondition no longer holds there. Every other
+//!   request to the key stays refused.
 //! - A manifest write the store did not acknowledge may still land after
 //!   Lance reads it back as absent and tries to delete its transaction file.
 //!   One sticky flag therefore refuses transaction-file deletion throughout
@@ -53,11 +66,18 @@
 //! further attempt and no retry. A request already sent may still be
 //! applied by the store, as after a crash, and its caller sees an ambiguous
 //! error rather than this scope's definite refusal.
+//!
+//! [`StorageIoScope::fence_at`] fences the scope at a deadline, the end of
+//! its owner's lease, without the task that set it. After a pause of the
+//! whole process any task may resume first, so admission, a multipart part
+//! and every poll of an admitted request check the deadline before they
+//! send anything, and the first to find it passed fences the scope.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -69,6 +89,7 @@ use object_store::{
     ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result,
 };
 use tokio::sync::Notify;
+use tokio::time::Instant;
 
 /// Shared mutation accounting for an explicitly owned storage lifetime.
 ///
@@ -95,10 +116,13 @@ struct ScopeState {
     closed: bool,
     /// The owner lost its right to write: nothing more is sent.
     fenced: bool,
-    /// Mutable keys whose last request has an unknown outcome. Bounded by
-    /// [`MAX_UNSETTLED_KEYS`]; past the bound `unsettled_overflow` refuses
-    /// every mutation rather than growing.
-    unsettled: BTreeSet<Path>,
+    /// When the owner's right to write ends, if it is leased.
+    deadline: Option<Instant>,
+    /// Mutable keys whose last request has an unknown outcome, each with
+    /// that request's precondition (`None` for an unconditional request).
+    /// Bounded by [`MAX_UNSETTLED_KEYS`]; past the bound
+    /// `unsettled_overflow` refuses every mutation rather than growing.
+    unsettled: BTreeMap<Path, Option<Precondition>>,
     unsettled_overflow: bool,
     /// An unacknowledged manifest write may still land. Retain transaction
     /// files for this scope's lifetime with bounded, conservative state.
@@ -111,22 +135,45 @@ struct ScopeState {
 pub const MAX_UNSETTLED_KEYS: usize = 4096;
 
 impl ScopeState {
-    /// The first unsettled key `request` touches: its own key, or for a
-    /// recursive delete any key under its prefix.
+    /// Whether `request` touches an unsettled key: its own key, or for a
+    /// recursive delete any key under its prefix. A request with the
+    /// precondition that left its key unsettled, its owner's re-issue, is
+    /// admitted (see the module documentation).
     fn unsettled_conflict(&self, request: &Request) -> bool {
         if request.op == "delete_prefix" {
             let prefix = request.path.as_ref();
-            return self.unsettled.iter().any(|key| {
+            return self.unsettled.keys().any(|key| {
                 key.as_ref() == prefix || key.as_ref().starts_with(&format!("{prefix}/"))
             });
         }
-        self.unsettled.contains(&request.path)
+        match self.unsettled.get(&request.path) {
+            None => false,
+            Some(Some(precondition)) => request.precondition.as_ref() != Some(precondition),
+            Some(None) => true,
+        }
     }
 
-    fn unsettle(&mut self, path: &Path) {
+    /// Fence when the deadline has passed; whether this call fenced.
+    fn reached_deadline(&mut self) -> bool {
+        if self.fenced
+            || !self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return false;
+        }
+        self.closed = true;
+        self.fenced = true;
+        true
+    }
+
+    fn unsettle(&mut self, path: &Path, precondition: Option<Precondition>) {
+        if self.unsettled.contains_key(path) {
+            return;
+        }
         if self.unsettled.len() < MAX_UNSETTLED_KEYS {
-            self.unsettled.insert(path.clone());
-        } else if !self.unsettled.contains(path) {
+            self.unsettled.insert(path.clone(), precondition);
+        } else {
             self.unsettled_overflow = true;
         }
     }
@@ -147,6 +194,16 @@ impl StorageIoScope {
     /// How many mutable keys this scope holds unsettled.
     pub fn unsettled_keys(&self) -> usize {
         self.inner.state.lock().unwrap().unsettled.len()
+    }
+
+    /// A read of `path` showed that `precondition` no longer holds, so no
+    /// copy of the request it left unsettled can still apply: settle the
+    /// key. A key left unsettled by another request stays.
+    pub(crate) fn settle_failed_precondition(&self, path: &Path, precondition: &Precondition) {
+        let mut state = self.inner.state.lock().unwrap();
+        if state.unsettled.get(path) == Some(&Some(precondition.clone())) {
+            state.unsettled.remove(path);
+        }
     }
 
     pub fn pending(&self) -> usize {
@@ -172,8 +229,31 @@ impl StorageIoScope {
         self.inner.fence.notify_waiters();
     }
 
+    /// Fence the scope at `deadline` unless a later call moves it, for an
+    /// owner whose lease ends then: from `deadline` the first request, part
+    /// or check to run fences it, before sending anything, whichever task
+    /// that is. Returns false, and moves nothing, once the scope is fenced.
+    pub fn fence_at(&self, deadline: Instant) -> bool {
+        let mut state = self.inner.state.lock().unwrap();
+        if state.fenced {
+            return false;
+        }
+        state.deadline = Some(deadline);
+        true
+    }
+
+    /// Whether the scope is fenced. Past its deadline it is, from the first
+    /// call that notices.
     pub fn is_fenced(&self) -> bool {
-        self.inner.state.lock().unwrap().fenced
+        let (fenced, reached) = {
+            let mut state = self.inner.state.lock().unwrap();
+            let reached = state.reached_deadline();
+            (state.fenced, reached)
+        };
+        if reached {
+            self.inner.fence.notify_waiters();
+        }
+        fenced
     }
 
     /// Resolves once the scope is fenced.
@@ -191,12 +271,22 @@ impl StorageIoScope {
 
     /// Run an admitted request until it answers or the scope is fenced. A
     /// fence drops the request's future, so its client sends nothing more.
+    /// Every poll checks the fence before the request's own: a request that
+    /// resumes past the deadline sends no further attempt.
     async fn until_fenced<T>(
         &self,
         request: impl std::future::Future<Output = Result<T>>,
     ) -> Result<T> {
+        let checked = std::future::poll_fn(|_| {
+            if self.is_fenced() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        });
         tokio::select! {
             biased;
+            () = checked => Err(fenced_in_flight_error()),
             result = request => result,
             () = self.fenced() => Err(fenced_in_flight_error()),
         }
@@ -244,6 +334,11 @@ impl StorageIoScope {
 
     pub(crate) fn begin(&self, request: Request) -> Result<Mutation> {
         let mut state = self.inner.state.lock().unwrap();
+        if state.reached_deadline() {
+            drop(state);
+            self.inner.fence.notify_waiters();
+            return Err(fenced_error());
+        }
         if state.closed {
             return Err(closed_error());
         }
@@ -263,11 +358,13 @@ impl StorageIoScope {
             );
             return Err(transaction_file_held_error());
         }
+        let reissue = state.unsettled.contains_key(&request.path);
         state.pending += 1;
         Ok(Mutation {
             scope: self.clone(),
             settled: false,
             hold_transactions: request.writes_manifest,
+            reissue,
             request,
         })
     }
@@ -279,6 +376,11 @@ impl StorageIoScope {
         // A close lets an admitted upload finish or abort; a fence sends
         // nothing more, its cleanup included. Leftover parts are the
         // bucket's to expire.
+        if state.reached_deadline() {
+            drop(state);
+            self.inner.fence.notify_waiters();
+            return Err(fenced_error());
+        }
         if state.fenced {
             return Err(fenced_error());
         }
@@ -295,6 +397,7 @@ impl StorageIoScope {
             // Completion can publish before returning or being cancelled.
             // A later successful abort cannot erase that earlier evidence.
             hold_transactions: request.writes_manifest && request.op == "multipart complete",
+            reissue: false,
             request,
         })
     }
@@ -319,14 +422,36 @@ pub(crate) enum KeyClass {
     Mutable,
 }
 
+/// What a conditional request requires of its key. Two requests with the
+/// same key and precondition are one request sent twice: an owner's
+/// re-issue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Precondition {
+    /// Create only if no object exists.
+    Absent,
+    /// Replace only the version named, by ETag or version id.
+    Matches(String),
+}
+
+impl Precondition {
+    pub(crate) fn update(version: &object_store::UpdateVersion) -> Self {
+        Self::Matches(format!(
+            "{}/{}",
+            version.e_tag.as_deref().unwrap_or_default(),
+            version.version.as_deref().unwrap_or_default()
+        ))
+    }
+}
+
 /// One mutating request as the scope accounts for it.
 #[derive(Clone, Debug)]
 pub(crate) struct Request {
     op: &'static str,
     path: Path,
-    /// A put-if-absent or if-match request, whose conflict is a definite
-    /// refusal and whose late landing applies at most once.
-    conditional: bool,
+    /// What a put-if-absent or if-match request requires of its key. Its
+    /// conflict is a definite refusal and its late landing applies at most
+    /// once.
+    precondition: Option<Precondition>,
     class: KeyClass,
     /// This request may write a manifest which names a transaction file.
     writes_manifest: bool,
@@ -337,7 +462,7 @@ impl Request {
         Self {
             op,
             path: path.clone(),
-            conditional,
+            precondition: conditional.then_some(Precondition::Absent),
             class: if op == "delete_prefix" {
                 // A directory name never proves its descendants immutable.
                 KeyClass::Mutable
@@ -347,6 +472,10 @@ impl Request {
             writes_manifest: matches!(op, "put" | "copy" | "rename" | "multipart")
                 && file_in_directory(path, "_versions", ".manifest"),
         }
+    }
+
+    fn conditional(&self) -> bool {
+        self.precondition.is_some()
     }
 
     fn deletes_transactions(&self) -> bool {
@@ -481,32 +610,54 @@ pub(crate) struct Mutation {
     /// Set for a manifest write until the store acknowledges it or refuses it
     /// definitively: on drop, this scope holds transaction-file deletion.
     hold_transactions: bool,
+    /// This request is its owner's re-issue of the conditional request that
+    /// left its key unsettled.
+    reissue: bool,
     request: Request,
+}
+
+/// Whether a request was refused before it could apply: by the store, or by
+/// this scope before sending it. Every request that can leave a key
+/// unsettled goes to a single-attempt client, so no earlier copy of it was
+/// sent, and the shared classification's single-attempt rule applies.
+fn refused_before_applying(error: &object_store::Error) -> bool {
+    crate::conditional::classify_failed_request(
+        error,
+        crate::conditional::RequestClient::SingleAttempt,
+    ) == crate::conditional::FailedRequest::Refused
 }
 
 impl Mutation {
     /// Settle on success, on a definite refusal (a conditional request's
-    /// conflict, a delete's "not found"), and on any failure of an immutable
-    /// key. Everything else leaves the scope uncertain when this guard
-    /// drops, and is logged here because the error may be swallowed above
-    /// and the later refusals name only the scope.
+    /// conflict, a delete's "not found", a store's refusal before applying),
+    /// and on any failure of an immutable key. Everything else leaves the
+    /// scope uncertain when this guard drops, and is logged here because the
+    /// error may be swallowed above and the later refusals name only the
+    /// scope. A re-issue's success also settles the earlier copy it repeats.
     pub(crate) fn finish<T>(mut self, result: Result<T>) -> Result<T> {
         let Err(error) = &result else {
             self.settled = true;
             self.hold_transactions = false;
+            self.settle_earlier_copy();
             return result;
         };
-        let conflict = self.request.conditional
-            && matches!(
-                error,
+        let conflict = self.request.conditional()
+            && match error {
                 object_store::Error::AlreadyExists { .. }
-                    | object_store::Error::Precondition { .. }
-            );
+                | object_store::Error::Precondition { .. } => true,
+                // An if-match request on an absent key can never apply.
+                object_store::Error::NotFound { .. } => {
+                    matches!(self.request.precondition, Some(Precondition::Matches(_)))
+                }
+                _ => false,
+            };
         let already_gone = matches!(self.request.op, "delete" | "rename source delete")
             && matches!(error, object_store::Error::NotFound { .. });
-        self.settled = conflict || already_gone || self.request.class == KeyClass::Immutable;
+        let refused = refused_before_applying(error);
+        self.settled =
+            conflict || already_gone || refused || self.request.class == KeyClass::Immutable;
         // A definite refusal is the caller's own outcome and is not logged.
-        if conflict || already_gone {
+        if conflict || already_gone || refused {
             self.hold_transactions = false;
             return result;
         }
@@ -514,7 +665,7 @@ impl Mutation {
             tracing::warn!(
                 op = self.request.op,
                 path = %self.request.path,
-                conditional = self.request.conditional,
+                conditional = self.request.conditional(),
                 error = %error,
                 "storage request failed on an immutable key; the physical scope remains settled"
             );
@@ -522,7 +673,7 @@ impl Mutation {
             tracing::error!(
                 op = self.request.op,
                 path = %self.request.path,
-                conditional = self.request.conditional,
+                conditional = self.request.conditional(),
                 error = %error,
                 "storage request outcome unknown on a mutable key; this key is now unsettled"
             );
@@ -533,6 +684,20 @@ impl Mutation {
     pub(crate) fn settle(mut self) {
         self.settled = true;
         self.hold_transactions = false;
+    }
+
+    /// A re-issue the store applied is the last copy that could apply: the
+    /// earlier one is fenced by the same precondition.
+    fn settle_earlier_copy(&self) {
+        if self.reissue {
+            self.scope
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .unsettled
+                .remove(&self.request.path);
+        }
     }
 
     /// The previous request was acknowledged. Account the next request before
@@ -577,7 +742,7 @@ impl Drop for Mutation {
                     path = %self.request.path,
                     "storage request abandoned on a mutable key; this key is now unsettled"
                 );
-                state.unsettle(&self.request.path);
+                state.unsettle(&self.request.path, self.request.precondition.clone());
             }
         }
         state.hold_transaction_deletes |= self.hold_transactions;
@@ -599,7 +764,7 @@ struct ScopedObjectStore {
 impl ScopedObjectStore {
     /// The client a request goes to (see the module documentation).
     fn client(&self, request: &Request) -> &Arc<dyn ObjectStore> {
-        if request.conditional || request.class == KeyClass::Mutable {
+        if request.conditional() || request.class == KeyClass::Mutable {
             &self.single
         } else {
             &self.inner
@@ -624,10 +789,11 @@ impl ObjectStore for ScopedObjectStore {
     ) -> Result<PutResult> {
         let conditional = !matches!(opts.mode, object_store::PutMode::Overwrite);
         let mut request = Request::new("put", path, conditional);
-        if matches!(opts.mode, object_store::PutMode::Update(_)) {
+        if let object_store::PutMode::Update(version) = &opts.mode {
             // If-match can replace existing bytes, including a publication
             // key. Only Create has the numbered-manifest exemption.
             request.class = KeyClass::Mutable;
+            request.precondition = Some(Precondition::update(version));
         }
         let client = Arc::clone(self.client(&request));
         let mutation = self.scope.begin(request)?;
@@ -872,6 +1038,8 @@ mod tests {
     struct Fault {
         point: Point,
         lost_ack: bool,
+        /// Refuse a put at `point` before it applies, as a permission error.
+        refuse: bool,
         entered: Notify,
         resume: Notify,
     }
@@ -912,6 +1080,12 @@ mod tests {
             data: PutPayload,
             opts: PutOptions,
         ) -> Result<PutResult> {
+            if self.fault.refuse && self.fault.point == Point::Put {
+                return Err(object_store::Error::PermissionDenied {
+                    path: p.to_string(),
+                    source: "refused by the fault fixture".into(),
+                });
+            }
             self.fault
                 .after(Point::Put, self.inner.put_opts(p, data, opts).await)
                 .await
@@ -1025,6 +1199,7 @@ mod tests {
         let fault = Arc::new(Fault {
             point,
             lost_ack,
+            refuse: false,
             entered: Notify::new(),
             resume: Notify::new(),
         });
@@ -1160,6 +1335,143 @@ mod tests {
         scope.close();
         scope.wait_idle().await;
         assert!(scope.is_uncertain(), "a clean release still refuses");
+    }
+
+    /// A conditional request whose answer was lost leaves its key unsettled
+    /// with its precondition. Only a request with that precondition, its
+    /// owner's re-issue, is admitted. The re-issue's conflict settles
+    /// nothing, since the earlier copy may be what it met; a read showing the
+    /// precondition no longer holds settles the key, and so does the
+    /// re-issue's success.
+    #[tokio::test]
+    async fn a_conditional_reissue_is_admitted_issue_1067() {
+        let (scope, store, _) = fixture(Point::Put, true).await;
+        let lock = Path::from("__cluster/lock.json");
+        let create = || PutOptions::from(object_store::PutMode::Create);
+        assert!(
+            store
+                .put_opts(&lock, "owner-a".into(), create())
+                .await
+                .is_err(),
+            "the create's answer is lost"
+        );
+        assert_eq!(scope.unsettled_keys(), 1);
+
+        for (what, refused) in [
+            ("an unconditional put", store.put(&lock, "x".into()).await),
+            (
+                "an if-match put",
+                store
+                    .put_opts(
+                        &lock,
+                        "x".into(),
+                        object_store::PutMode::Update(object_store::UpdateVersion {
+                            e_tag: Some("etag".into()),
+                            version: None,
+                        })
+                        .into(),
+                    )
+                    .await,
+            ),
+        ] {
+            let refused = refused.unwrap_err();
+            assert!(
+                refused.to_string().contains("unknown outcome"),
+                "{what}: {refused}"
+            );
+        }
+
+        let conflict = store
+            .put_opts(&lock, "owner-a".into(), create())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(conflict, object_store::Error::AlreadyExists { .. }),
+            "the re-issue is sent and meets the first copy: {conflict}"
+        );
+        assert_eq!(scope.unsettled_keys(), 1, "a conflict settles nothing");
+        scope.settle_failed_precondition(&lock, &Precondition::Matches("etag/".into()));
+        assert_eq!(scope.unsettled_keys(), 1, "another precondition's read");
+        scope.settle_failed_precondition(&lock, &Precondition::Absent);
+        assert!(!scope.is_uncertain(), "the object exists: the key settles");
+        store
+            .delete(&lock)
+            .await
+            .expect("the settled key admits every request again");
+
+        // A conditional copy whose request was lost before it applied: the
+        // re-issue applies, and its success settles the key.
+        let (scope, store, _, inner) = fixture_with_inner(Point::Copy, true).await;
+        let target = Path::from("target");
+        assert!(
+            store
+                .copy_if_not_exists(&Path::from("source"), &target)
+                .await
+                .is_err()
+        );
+        inner.delete(&target).await.unwrap();
+        assert_eq!(scope.unsettled_keys(), 1);
+        store
+            .put_opts(&target, "data".into(), create())
+            .await
+            .expect("the re-issue applies");
+        assert!(!scope.is_uncertain(), "its success settled the key");
+    }
+
+    /// A store's refusal before applying leaves nothing to settle, and a
+    /// refused re-issue keeps the uncertainty its first copy left.
+    #[tokio::test]
+    async fn a_refused_request_leaves_its_key_settled_issue_1067() {
+        let scope = StorageIoScope::new();
+        let refusing = |refuse: bool| {
+            scope.wrap_object_store(Arc::new(FaultStore {
+                inner: Arc::new(InMemory::new()),
+                fault: Arc::new(Fault {
+                    point: Point::Put,
+                    lost_ack: !refuse,
+                    refuse,
+                    entered: Notify::new(),
+                    resume: Notify::new(),
+                }),
+            }))
+        };
+        let key = Path::from("__cluster/state.json");
+        let create = || PutOptions::from(object_store::PutMode::Create);
+
+        let store = refusing(true);
+        for mode in [
+            object_store::PutMode::Overwrite,
+            object_store::PutMode::Create,
+        ] {
+            let refused = store
+                .put_opts(&key, "state".into(), mode.into())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(refused, object_store::Error::PermissionDenied { .. }),
+                "{refused}"
+            );
+        }
+        assert!(!scope.is_uncertain(), "a refusal settles its key");
+
+        // The scope keys by path, so one scope over two clients of one key
+        // space models a lost answer followed by a refused re-issue.
+        let lost = refusing(false);
+        assert!(lost.put_opts(&key, "a".into(), create()).await.is_err());
+        assert_eq!(scope.unsettled_keys(), 1);
+        let refused = store
+            .put_opts(&key, "a".into(), create())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, object_store::Error::PermissionDenied { .. }),
+            "the re-issue is admitted and refused: {refused}"
+        );
+        assert_eq!(
+            scope.unsettled_keys(),
+            1,
+            "the first copy can still land after a refused re-issue"
+        );
     }
 
     /// Counts the requests one client of a store serves.
@@ -2092,6 +2404,130 @@ mod tests {
             "original",
             "reads continue"
         );
+    }
+
+    /// A store whose put sends a first attempt and, after a backoff, a
+    /// second, the way a retrying client resends.
+    #[derive(Debug, Default)]
+    struct Resending {
+        inner: InMemory,
+        sent: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Resending {
+        fn sent(&self) -> usize {
+            self.sent.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl fmt::Display for Resending {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("Resending")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for Resending {
+        async fn put_opts(&self, p: &Path, d: PutPayload, o: PutOptions) -> Result<PutResult> {
+            self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.put_opts(p, d, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            p: &Path,
+            o: PutMultipartOptions,
+        ) -> Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(p, o).await
+        }
+        async fn get_opts(&self, p: &Path, o: GetOptions) -> Result<GetResult> {
+            self.inner.get_opts(p, o).await
+        }
+        fn delete_stream(
+            &self,
+            paths: BoxStream<'static, Result<Path>>,
+        ) -> BoxStream<'static, Result<Path>> {
+            self.inner.delete_stream(paths)
+        }
+        fn list(&self, p: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+            self.inner.list(p)
+        }
+        async fn list_with_delimiter(&self, p: Option<&Path>) -> Result<ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy_opts(&self, from: &Path, to: &Path, o: CopyOptions) -> Result<()> {
+            self.inner.copy_opts(from, to, o).await
+        }
+    }
+
+    /// A leased owner's scope fences itself at its deadline, without the
+    /// task that set it: after a pause of the whole process any task may
+    /// resume first. A request admitted before the deadline sends no
+    /// attempt after it, a request or part that starts after it is refused
+    /// before it is sent, and a fenced scope's deadline no longer moves. A
+    /// deadline moved forward before it passes keeps the scope open.
+    #[tokio::test(start_paused = true)]
+    async fn a_scope_fences_itself_at_its_deadline_issue_1067() {
+        let refused_unsent = |error: object_store::Error| {
+            assert!(
+                matches!(
+                    error,
+                    object_store::Error::Generic { store, .. } if store == OWNED_STORE_NAME
+                ),
+                "refused before it is sent: {error}"
+            );
+        };
+
+        let scope = StorageIoScope::new();
+        let resending = Arc::new(Resending::default());
+        let store = scope.wrap_object_store(resending.clone());
+        let start = Instant::now();
+        assert!(scope.fence_at(start + Duration::from_secs(3)));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(scope.fence_at(start + Duration::from_secs(6)));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!scope.is_fenced(), "the deadline moved before it passed");
+        let path = Path::from("g/node_Person/data/3f2c4d9e.lance");
+        let mut upload = store.put_multipart(&path).await.unwrap();
+        upload.put_part("data".into()).await.unwrap();
+        // The first attempt goes now; the second would go after the
+        // deadline, when nothing else has run to fence the scope.
+        let error = store
+            .put(&Path::from("target"), "data".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                object_store::Error::Generic { store, .. } if store == FENCED_REQUEST_STORE_NAME
+            ),
+            "{error}"
+        );
+        assert_eq!(resending.sent(), 1, "no attempt is sent past the deadline");
+        assert!(scope.is_fenced());
+        assert!(!scope.fence_at(Instant::now() + Duration::from_secs(60)));
+        refused_unsent(upload.put_part("more".into()).await.unwrap_err());
+        refused_unsent(upload.complete().await.map(|_| ()).unwrap_err());
+        drop(upload);
+        scope.wait_idle().await;
+
+        // A request that is the first to run after the deadline fences the
+        // scope itself.
+        let scope = StorageIoScope::new();
+        let resending = Arc::new(Resending::default());
+        let store = scope.wrap_object_store(resending.clone());
+        assert!(scope.fence_at(Instant::now() + Duration::from_secs(1)));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        refused_unsent(
+            store
+                .put(&Path::from("target"), "data".into())
+                .await
+                .map(|_| ())
+                .unwrap_err(),
+        );
+        assert_eq!(resending.sent(), 0);
+        assert!(scope.is_fenced());
     }
 
     /// A delete the store answers "not found" is definite on any key, and a
