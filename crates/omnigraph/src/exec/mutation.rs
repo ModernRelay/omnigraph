@@ -512,6 +512,7 @@ fn column_patch_plan(
     schema: &SchemaRef,
     resolved: &HashMap<String, Literal>,
     id_column: &str,
+    rows_allowed: bool,
 ) -> Result<Option<ColumnPatchPlan>> {
     if resolved.is_empty()
         || resolved
@@ -541,13 +542,11 @@ fn column_patch_plan(
         return Ok(None);
     }
     let mut assigned = Vec::with_capacity(resolved.len());
-    let mut assigned_row_bytes = 0_u64;
     for field in schema.fields() {
         if let Some(value) = resolved.get(field.name()) {
             let one = literal_to_typed_array(value, field.data_type(), 1)?;
-            assigned_row_bytes = assigned_row_bytes
-                .saturating_add(one.to_data().get_slice_memory_size().unwrap_or(0) as u64);
-            assigned.push(field.name().clone());
+            let row_bytes = one.to_data().get_slice_memory_size().unwrap_or(0) as u64;
+            assigned.push((field.name().clone(), row_bytes));
         }
     }
     let carried_indices = schema
@@ -573,7 +572,7 @@ fn column_patch_plan(
             id_column: id_column.to_string(),
             assigned,
             omitted,
-            assigned_row_bytes,
+            rows_allowed,
         },
         carried,
         patch_columns,
@@ -1635,6 +1634,10 @@ impl Omnigraph {
                         MutationTarget::Node { type_name }
                             if writes_per_node_type.get(type_name.as_str()) == Some(&1)
                     );
+                    // A mutation that writes no other table: only there is
+                    // the update's own write budget not shared, so only there
+                    // may a cheaper row rewrite carry payload a patch would not.
+                    let only_write = ir.ops.len() == 1;
                     self.execute_update(
                         target,
                         assignments,
@@ -1644,6 +1647,7 @@ impl Omnigraph {
                         staging,
                         txn,
                         sole_write,
+                        only_write,
                     )
                     .await?
                 }
@@ -1850,6 +1854,7 @@ impl Omnigraph {
         staging: &mut MutationStaging,
         txn: &crate::db::WriteTxn,
         sole_write: bool,
+        only_write: bool,
     ) -> Result<MutationResult> {
         let catalog = &txn.catalog;
         let type_name = match target {
@@ -1930,7 +1935,15 @@ impl Omnigraph {
         let ds = handle.expect("strict Update op always opens its dataset");
 
         if let Some(plan) = sole_write
-            .then(|| column_patch_plan(node_type, &schema, &resolved, catalog.system_columns.id))
+            .then(|| {
+                column_patch_plan(
+                    node_type,
+                    &schema,
+                    &resolved,
+                    catalog.system_columns.id,
+                    only_write,
+                )
+            })
             .transpose()?
             .flatten()
         {
@@ -1967,11 +1980,13 @@ impl Omnigraph {
                     affected_edges: 0,
                 });
             }
-            match matches.mode {
-                crate::table_store::UpdateWriteMode::ColumnPatch => {
+            // The patch: the carried columns of `batches` (whole rows hold
+            // them too) with the assigned values.
+            let stage_patch =
+                |staging: &mut MutationStaging, batches: Vec<RecordBatch>| -> Result<()> {
                     let matched = concat_match_batches_to_schema(
                         &plan.carried,
-                        rebind_by_name(&plan.carried, matches.batches)?,
+                        rebind_by_name(&plan.carried, batches)?,
                     )?;
                     let updated = apply_assignments(
                         &plan.carried,
@@ -1980,7 +1995,11 @@ impl Omnigraph {
                         &blob_props,
                         staging.write_budget(),
                     )?;
-                    staging.append_column_patch(&table_key, updated, plan.patch_columns)?;
+                    staging.append_column_patch(&table_key, updated, plan.patch_columns.clone())
+                };
+            match matches.mode {
+                crate::table_store::UpdateWriteMode::ColumnPatch => {
+                    stage_patch(staging, matches.batches)?;
                 }
                 crate::table_store::UpdateWriteMode::Rows => {
                     let matched = concat_match_batches_to_schema(
@@ -1995,12 +2014,20 @@ impl Omnigraph {
                         staging.write_budget(),
                     )?;
                     let updated_schema = updated.schema();
-                    staging.append_batch(
+                    // A refused row rewrite takes the patch, so admission
+                    // never depends on the mode (`append_batch` refuses before
+                    // it stages anything).
+                    match staging.append_batch(
                         &table_key,
                         updated_schema,
                         PendingMode::Upsert,
                         updated,
-                    )?;
+                    ) {
+                        Err(OmniError::ResourceLimitExceeded { .. }) => {
+                            stage_patch(staging, vec![matched])?;
+                        }
+                        result => result?,
+                    }
                 }
             }
             return Ok(MutationResult {

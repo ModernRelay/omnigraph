@@ -526,17 +526,36 @@ carried columns (every column but the unassigned Blob and vector columns) with
 `_rowid` and `_rowaddr`. A patch writes the touched fragments' rows times the
 source row's bytes; a row rewrite reads and writes the matched rows whole,
 their carried columns, vectors and managed Blob payloads (`UpdateWriteCost`).
-The cheaper one wins, taking the omitted columns' descriptors and vectors by
-`_rowid` only when the carried columns and vectors alone do not settle it. A
-stored external reference in an omitted Blob selects the patch, which keeps it
-without reading or refusing it, even when an assigned column is indexed (the
-touched fragments then leave that index until the next reconciliation).
-Otherwise an index on an assigned column selects rows, because the patch would
-withdraw every touched fragment from that index. On a
-table whose omitted columns are all vectors, the scan reads the vectors too,
-so a row rewrite reads exactly what it always did. The pending batch keeps the
-carried columns, which validation reads (key and `@unique` groups, value
-constraints); staging cuts the source from it.
+An index on an assigned column adds one read of that column over the touched
+rows to the patch's cost, since the patch withdraws every touched fragment
+from that index until the next reconciliation. The cheaper one wins, taking
+the omitted columns' descriptors and vectors by `_rowid` only when the carried
+columns and vectors alone do not settle it. A stored external reference in an
+omitted Blob selects the patch, which keeps it without reading or refusing it.
+On a table whose omitted columns are all vectors, the scan reads the vectors
+too, so a row rewrite reads exactly what it always did. The pending batch
+keeps the carried columns, which validation reads (key and `@unique` groups,
+value constraints); staging cuts the source from it.
+
+The choice is a physical plan decision and never decides the outcome. For one
+snapshot and one statement, admission is a function of the matched rows and
+the request: the scan charges the carried columns, which both modes hold, and
+a row rewrite that would exceed the write budget (its carried Blob payload, or
+its whole rows at `append_batch`) takes the patch, which then fits. Payload
+lengths come from the descriptors, so that overrun is found before a payload
+is read. A mutation that writes another table shares one write budget with
+the update, and a row rewrite's charge would decide that table's admission,
+so there the update always patches. An index on the assigned column or the
+fragment a row shares therefore changes cost, never whether the write is
+admitted (`write_max_bytes_update_carried_blob.gqt`).
+
+A patch may withdraw touched fragments from an index on an assigned column
+while they stay in the manifest, and the index keeps its old entries for them.
+That is safe while a lagging index is rebuilt whole (`stage_index_fold`, the
+"Index segments" fence in [lance.md](lance.md)). An incremental reconciliation
+that adds a delta segment over a patched fragment must treat the fragment as
+moved, excluding the older segments' entries for it, or the stale entries pass
+the coverage mask.
 
 The join key is rewritten byte for byte, and Lance lists it in
 `fields_modified`, which would withdraw each touched fragment from the `id`

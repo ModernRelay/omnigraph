@@ -55,7 +55,10 @@ to a nullable Blob clears it. An update that assigns no Blob and is its
 mutation's only statement writing the type can write just the assigned
 properties: the row's other Blobs and vectors are not read or rewritten, and a
 stored external reference is kept as is. It does so whenever a matched row
-holds a stored external reference, and otherwise when that writes fewer bytes.
+holds a stored external reference, when rewriting the rows would exceed
+`write_max_bytes` or the mutation writes another type, and otherwise when that
+writes fewer bytes, so such an update is never refused for the Blobs it does
+not assign.
 Otherwise every other Blob of a matched row is carried (read and rewritten as
 managed bytes, counted toward `write_max_bytes`), so carrying a stored external
 reference needs the graph's external Blob policy to admit its source;

@@ -6220,8 +6220,8 @@ impl TableStore {
                 .checked_add(width)
                 .ok_or_else(|| OmniError::manifest_internal("vector row bytes overflow"))?;
         }
-        let mut assigned_field_ids = HashSet::new();
-        for name in &request.assigned {
+        let mut assigned_field_ids: Vec<(HashSet<i32>, u64)> = Vec::new();
+        for (name, row_bytes) in &request.assigned {
             let field = schema.field(name).ok_or_else(|| {
                 OmniError::manifest_internal(format!(
                     "scan_update_matches: assigned column '{name}' is not in the table"
@@ -6232,24 +6232,30 @@ impl TableStore {
                     "scan_update_matches: '{name}' cannot be a column patch's assigned column"
                 )));
             }
+            let mut ids = HashSet::new();
             let mut pending = vec![field];
             while let Some(field) = pending.pop() {
-                assigned_field_ids.insert(field.id);
+                ids.insert(field.id);
                 pending.extend(field.children.iter());
             }
+            assigned_field_ids.push((ids, *row_bytes));
         }
-        let assigned_indexed = ds
-            .load_indices()
-            .await
-            .map_err(OmniError::storage)?
+        let indices = ds.load_indices().await.map_err(OmniError::storage)?;
+        let indexed_assigned_row_bytes = assigned_field_ids
             .iter()
-            .filter(|index| !is_system_index(index))
-            .any(|index| {
-                index
-                    .fields
+            .filter(|(ids, _)| {
+                indices
                     .iter()
-                    .any(|id| assigned_field_ids.contains(id))
-            });
+                    .filter(|index| !is_system_index(index))
+                    .any(|index| index.fields.iter().any(|id| ids.contains(id)))
+            })
+            .map(|(_, row_bytes)| *row_bytes)
+            .fold(0_u64, u64::saturating_add);
+        let assigned_row_bytes = request
+            .assigned
+            .iter()
+            .map(|(_, row_bytes)| *row_bytes)
+            .fold(0_u64, u64::saturating_add);
 
         let carried_names = schema
             .fields
@@ -6307,7 +6313,8 @@ impl TableStore {
             .await?;
 
         let mut cost = UpdateWriteCost {
-            assigned_indexed,
+            indexed_assigned_row_bytes,
+            rows_disallowed: !request.rows_allowed,
             ..UpdateWriteCost::default()
         };
         let mut fragments = HashSet::new();
@@ -6319,13 +6326,11 @@ impl TableStore {
                 continue;
             }
             account.ensure_additional_rows(batch.num_rows())?;
+            // Admission charges the carried columns alone, what a patch
+            // retains, whichever mode the update then takes.
             let rows = predicate_rows_as(&carried, &batch)?;
             carried_bytes = carried_bytes
-                .checked_add(if scan_vectors {
-                    batch.get_array_memory_size() as u64
-                } else {
-                    rows.get_array_memory_size() as u64
-                })
+                .checked_add(rows.get_array_memory_size() as u64)
                 .ok_or_else(|| OmniError::manifest_internal("pending scan byte count overflow"))?;
             account.remaining_bytes_after(carried_bytes)?;
             let addresses = batch
@@ -6343,9 +6348,13 @@ impl TableStore {
                         "expected a Utf8 id column in an update's match scan",
                     )
                 })?;
+            // The offsets bound this batch's values: a slice shares its
+            // parent's whole values buffer.
+            let offsets = ids.value_offsets();
+            let id_values = offsets[offsets.len() - 1] - offsets[0];
             cost.id_bytes = cost
                 .id_bytes
-                .saturating_add(ids.value_data().len() as u64)
+                .saturating_add(u64::try_from(id_values).unwrap_or(0))
                 .saturating_add(4 * ids.len() as u64);
             cost.carried_bytes = cost.carried_bytes.saturating_add(value_bytes(&rows));
             cost.matched_rows = cost.matched_rows.saturating_add(rows.num_rows() as u64);
@@ -6363,7 +6372,7 @@ impl TableStore {
             scanned.push((rows, row_ids));
         }
         cost.vector_bytes = vector_row_bytes.saturating_mul(cost.matched_rows);
-        cost.assigned_bytes = request.assigned_row_bytes.saturating_mul(cost.matched_rows);
+        cost.assigned_bytes = assigned_row_bytes.saturating_mul(cost.matched_rows);
         cost.touched_rows = ds
             .manifest
             .fragments
@@ -6397,10 +6406,20 @@ impl TableStore {
             return patch(scanned, &mut account, cost);
         }
         if scan_vectors {
+            // A row rewrite that does not fit the write budget takes the
+            // patch, which always fits when the carried columns do, so the
+            // budget constrains the choice and never decides admission.
+            let mut trial = account.clone();
             let mut batches = Vec::with_capacity(scanned_whole.len());
             for whole in scanned_whole {
-                account.add_batch(&whole)?;
-                batches.push(whole);
+                match trial.add_batch(&whole) {
+                    Ok(()) => batches.push(whole),
+                    Err(OmniError::ResourceLimitExceeded { .. }) => {
+                        cost.rows_over_budget = true;
+                        return patch(scanned, &mut account, cost);
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             return Ok(UpdateMatches {
                 mode: UpdateWriteMode::Rows,
@@ -6445,64 +6464,44 @@ impl TableStore {
         }
 
         // Rows: rebuild the taken Blobs and join them to the carried columns.
-        // The carried columns were charged above; the payload budget is what
-        // remains of the table's write budget after them.
+        // A row rewrite that does not fit the write budget takes the patch,
+        // which fits whenever the carried columns do (they were charged
+        // above), so the budget constrains the choice and never decides the
+        // outcome. Payload lengths are known from the descriptors, so an
+        // overrun is found before any payload is read; the rows are charged
+        // to a trial account, kept only when every batch fits.
+        let payload_fits = account
+            .payload_bytes
+            .checked_add(cost.managed_blob_bytes)
+            .is_some_and(|payload| payload <= account.write_budget.bytes());
+        if !payload_fits {
+            cost.rows_over_budget = true;
+            return patch(scanned, &mut account, cost);
+        }
+        let mut trial = account.clone();
         let mut batches = Vec::with_capacity(scanned.len());
-        for ((rows, row_ids), omitted) in scanned.into_iter().zip(taken) {
-            account.remaining_bytes_after(rows.get_array_memory_size() as u64)?;
-            let payload_budget = account.write_budget.bytes() - account.payload_bytes;
-            let omitted = if omitted_blobs.is_empty() {
-                omitted
-            } else {
-                match self
-                    .materialize_blob_batch_with_row_ids(
-                        ds,
-                        &omitted_schema,
-                        omitted.clone(),
-                        &row_ids,
-                        Some(payload_budget),
-                        None,
-                        None,
-                    )
-                    .await
-                {
-                    Err(OmniError::ResourceLimitExceeded {
-                        ref resource,
-                        actual,
-                        ..
-                    }) if resource == MATERIALIZED_BLOB_PAYLOAD_BYTES => {
-                        let actual =
-                            account.payload_bytes.checked_add(actual).ok_or_else(|| {
-                                OmniError::manifest_internal("pending scan byte count overflow")
-                            })?;
-                        return Err(OmniError::resource_limit(
-                            MATERIALIZED_BLOB_PAYLOAD_BYTES,
-                            account.write_budget.bytes(),
-                            actual,
-                        ));
-                    }
-                    Err(error) => return Err(error),
-                    Ok(materialized) => materialized,
+        for ((rows, row_ids), omitted) in scanned.iter().zip(taken) {
+            let whole = match self
+                .rows_with_omitted(
+                    ds,
+                    &full,
+                    &omitted_schema,
+                    !omitted_blobs.is_empty(),
+                    rows,
+                    omitted,
+                    row_ids,
+                    &trial,
+                )
+                .await
+                .and_then(|whole| trial.add_batch(&whole).map(|()| whole))
+            {
+                Ok(whole) => whole,
+                Err(OmniError::ResourceLimitExceeded { .. }) => {
+                    cost.rows_over_budget = true;
+                    return patch(scanned, &mut account, cost);
                 }
+                Err(error) => return Err(error),
             };
-            let columns = full
-                .fields()
-                .iter()
-                .map(|field| {
-                    rows.column_by_name(field.name())
-                        .or_else(|| omitted.column_by_name(field.name()))
-                        .cloned()
-                        .ok_or_else(|| {
-                            OmniError::manifest_internal(format!(
-                                "an update's matched rows lack column '{}'",
-                                field.name()
-                            ))
-                        })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let whole =
-                RecordBatch::try_new(full.clone(), columns).map_err(OmniError::arrow_internal)?;
-            account.add_batch(&whole)?;
             batches.push(whole);
         }
         Ok(UpdateMatches {
@@ -6510,6 +6509,55 @@ impl TableStore {
             cost,
             batches,
         })
+    }
+
+    /// One batch of an update's matched rows, whole: the carried `rows` joined
+    /// to their `omitted` columns, whose Blobs are rebuilt as logical values
+    /// within what remains of `account`'s payload budget.
+    #[allow(clippy::too_many_arguments)]
+    async fn rows_with_omitted(
+        &self,
+        ds: &Dataset,
+        full: &SchemaRef,
+        omitted_schema: &LanceSchema,
+        has_blobs: bool,
+        rows: &RecordBatch,
+        omitted: RecordBatch,
+        row_ids: &[u64],
+        account: &PendingScanAccount,
+    ) -> Result<RecordBatch> {
+        account.remaining_bytes_after(rows.get_array_memory_size() as u64)?;
+        let omitted = if has_blobs {
+            let payload_budget = account.write_budget.bytes() - account.payload_bytes;
+            self.materialize_blob_batch_with_row_ids(
+                ds,
+                omitted_schema,
+                omitted,
+                row_ids,
+                Some(payload_budget),
+                None,
+                None,
+            )
+            .await?
+        } else {
+            omitted
+        };
+        let columns = full
+            .fields()
+            .iter()
+            .map(|field| {
+                rows.column_by_name(field.name())
+                    .or_else(|| omitted.column_by_name(field.name()))
+                    .cloned()
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "an update's matched rows lack column '{}'",
+                            field.name()
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        RecordBatch::try_new(full.clone(), columns).map_err(OmniError::arrow_internal)
     }
 
     /// `count_rows` variant that respects staged writes. Used for
@@ -6846,13 +6894,17 @@ fn assign_row_id_meta(fragments: &mut [Fragment], start_row_id: u64) -> Result<(
 pub struct UpdateMatchRequest {
     /// The graph's system id column, the patch's join key.
     pub id_column: String,
-    /// The assigned columns, none a Blob.
-    pub assigned: Vec<String>,
+    /// The assigned columns, none a Blob, each with the bytes one row's
+    /// value occupies in the patch source.
+    pub assigned: Vec<(String, u64)>,
     /// Unassigned Blob and fixed-width vector columns: a column patch neither
     /// reads nor writes them.
     pub omitted: Vec<String>,
-    /// Bytes one row's assigned values occupy in the patch source.
-    pub assigned_row_bytes: u64,
+    /// Whether the update may rewrite whole rows. A mutation that writes
+    /// another table shares one write budget with it, and a row rewrite
+    /// charges carried payload a patch does not, so there the update patches
+    /// and its charge does not depend on the mode.
+    pub rows_allowed: bool,
 }
 
 /// How an update's matched rows reach Lance.
@@ -6873,6 +6925,11 @@ pub enum UpdateWriteMode {
 /// Blob payloads. Both read about what they write, and both write one object
 /// per touched fragment (a patch file or a deletion vector), so the object
 /// count does not separate them.
+///
+/// The choice is a physical plan decision and never decides the outcome:
+/// admission charges the carried columns, which both modes hold, and a row
+/// rewrite that would exceed the write budget takes the patch
+/// (`rows_over_budget`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UpdateWriteCost {
     pub matched_rows: u64,
@@ -6888,21 +6945,29 @@ pub struct UpdateWriteCost {
     pub vector_bytes: u64,
     /// The matched rows' managed Blob payloads in omitted columns.
     pub managed_blob_bytes: u64,
+    /// Bytes one row's values occupy in the assigned columns an index covers.
+    /// A patch withdraws every touched fragment from such an index until the
+    /// next reconciliation, so reads of the column scan those fragments: one
+    /// read of the column over them is added to the patch's cost.
+    pub indexed_assigned_row_bytes: u64,
     /// An omitted Blob column of a matched row holds an external reference.
     pub external_blob: bool,
-    /// An index covers an assigned column; a patch would withdraw every
-    /// touched fragment from it.
-    pub assigned_indexed: bool,
+    /// The mutation writes another table, so the update patches.
+    pub rows_disallowed: bool,
+    /// The row rewrite would exceed the write budget, so the update patches.
+    pub rows_over_budget: bool,
 }
 
 impl UpdateWriteCost {
-    /// The bytes a column patch writes: the source row times the touched rows.
+    /// The bytes a column patch costs: the source row times the touched rows,
+    /// plus a read of each indexed assigned column over the touched rows.
     pub fn patch_bytes(&self) -> u128 {
         if self.matched_rows == 0 {
             return 0;
         }
         let source = u128::from(self.id_bytes) + u128::from(self.assigned_bytes);
         source * u128::from(self.touched_rows) / u128::from(self.matched_rows)
+            + u128::from(self.indexed_assigned_row_bytes) * u128::from(self.touched_rows)
     }
 
     /// The bytes a row rewrite writes: every matched row whole.
@@ -6913,15 +6978,17 @@ impl UpdateWriteCost {
     }
 
     /// A stored external reference takes the patch, which keeps it unread;
-    /// an indexed assigned column takes rows, which keep index coverage of the
-    /// touched fragments; otherwise the smaller write wins.
+    /// so does a mutation that writes another table, or a row rewrite over
+    /// the write budget. Otherwise the smaller cost wins.
     pub fn mode(&self) -> UpdateWriteMode {
-        if self.external_blob {
+        if self.external_blob
+            || self.rows_disallowed
+            || self.rows_over_budget
+            || self.patch_bytes() < self.rows_bytes()
+        {
             UpdateWriteMode::ColumnPatch
-        } else if self.assigned_indexed || self.patch_bytes() >= self.rows_bytes() {
-            UpdateWriteMode::Rows
         } else {
-            UpdateWriteMode::ColumnPatch
+            UpdateWriteMode::Rows
         }
     }
 }
@@ -6966,6 +7033,7 @@ fn value_bytes(batch: &RecordBatch) -> u64 {
 /// retained batches, while `initial_bytes` represents every table retained by
 /// `MutationStaging`, so a chained cross-table update receives only the
 /// remaining graph-operation byte budget.
+#[derive(Clone)]
 struct PendingScanAccount {
     table_key: String,
     rows: u64,
@@ -8574,19 +8642,44 @@ mod tests {
             ..point
         };
         assert_eq!(all.mode(), UpdateWriteMode::ColumnPatch);
-        // An indexed assigned column keeps whole rows, which keep its coverage.
+        // An index on the assigned column adds a read of it over the touched
+        // rows to the patch: still cheaper than rewriting a 1 MiB Blob, not
+        // than rewriting a narrow row that the patch already loses to.
         let indexed = UpdateWriteCost {
-            assigned_indexed: true,
+            indexed_assigned_row_bytes: 4,
             ..blob
         };
-        assert_eq!(indexed.mode(), UpdateWriteMode::Rows);
-        // A stored external reference takes the patch whatever the estimate.
-        for cost in [point, indexed] {
-            let external = UpdateWriteCost {
-                external_blob: true,
-                ..cost
-            };
-            assert_eq!(external.mode(), UpdateWriteMode::ColumnPatch);
+        assert_eq!(indexed.patch_bytes(), 512 * 34 + 512 * 4);
+        assert_eq!(indexed.mode(), UpdateWriteMode::ColumnPatch);
+        let indexed_all = UpdateWriteCost {
+            matched_rows: 512,
+            id_bytes: 512 * 30,
+            assigned_bytes: 512 * 4,
+            carried_bytes: 512 * 40,
+            indexed_assigned_row_bytes: 30,
+            ..point
+        };
+        assert_eq!(indexed_all.mode(), UpdateWriteMode::Rows);
+        // A stored external reference, a mutation writing another table, and
+        // a row rewrite over the write budget take the patch whatever the
+        // estimate.
+        for cost in [point, indexed_all] {
+            for forced in [
+                UpdateWriteCost {
+                    external_blob: true,
+                    ..cost
+                },
+                UpdateWriteCost {
+                    rows_disallowed: true,
+                    ..cost
+                },
+                UpdateWriteCost {
+                    rows_over_budget: true,
+                    ..cost
+                },
+            ] {
+                assert_eq!(forced.mode(), UpdateWriteMode::ColumnPatch);
+            }
         }
         // Equal bytes keep the row rewrite; no match writes nothing.
         let tie = UpdateWriteCost {

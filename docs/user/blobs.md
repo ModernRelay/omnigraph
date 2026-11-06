@@ -51,6 +51,10 @@ reference stays as it is. It does so whenever a matched row holds a stored
 external reference, and otherwise when it writes fewer bytes than rewriting
 the matched rows whole. That is the usual case when the rows hold large Blobs
 or vectors. A one-row update in a large table of small rows rewrites the row.
+Such an update is never refused for the Blobs it does not assign: when
+rewriting the rows would exceed `write_max_bytes`, or when the mutation also
+writes another type, it writes just the assigned properties. Whether it is
+admitted never depends on an index or on how the rows are stored.
 
 An update that rewrites whole rows carries every Blob cell of a matched row it
 does not assign: it reads the cell and rewrites it as managed bytes, and those

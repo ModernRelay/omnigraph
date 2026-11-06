@@ -6,6 +6,10 @@
 # notes: a patch over a fragment with a deleted row read the same on both branches. Validation
 # notes: refuses a patched `@range` or `@unique` violation as it refuses a whole-row one, and a
 # notes: three-way branch merge of patched commits gives what one of whole-row commits gives.
+# notes: The rows cannot show which path ran. The patch on `main` is pinned by the Rust test
+# notes: `writes.rs::update_of_one_scalar_patches_instead_of_rewriting_blobs_and_vectors_issue_1264`
+# notes: (the committed transaction is `RewriteColumns`) and by the DST storage-cost golden rows
+# notes: `UpdatePatchBlob*` against `UpdateRowsBlob1M`.
 
 --- runner
 timeout_ms: 10000
