@@ -790,6 +790,17 @@ pub(crate) fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
             type_name,
             render_annotations(annotations)
         ),
+        SchemaMigrationStep::RequireProperty {
+            type_kind,
+            type_name,
+            property_name,
+        } => format!(
+            "make property '{}.{}' of {} '{}' required",
+            type_name,
+            property_name,
+            schema_type_kind_label(*type_kind),
+            type_name,
+        ),
         SchemaMigrationStep::DropType { type_kind, name } => format!(
             "drop {} type '{}'",
             schema_type_kind_label(*type_kind),
