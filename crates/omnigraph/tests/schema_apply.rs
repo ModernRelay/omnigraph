@@ -3827,7 +3827,9 @@ async fn issue_721_promotion_refuses_while_a_null_or_duplicate_remains() {
         .await
         .expect_err("a null remains");
     assert!(
-        error.to_string().contains("Decision") && error.to_string().contains("'ref'"),
+        error.to_string().contains("Decision")
+            && error.to_string().contains("'ref'")
+            && error.to_string().contains("OG-MF-104"),
         "{error}"
     );
 
@@ -3837,9 +3839,14 @@ async fn issue_721_promotion_refuses_while_a_null_or_duplicate_remains() {
     )
     .await
     .unwrap();
-    db.apply_schema(ISSUE_721_V2)
+    let error = db
+        .apply_schema(ISSUE_721_V2)
         .await
         .expect_err("a duplicate remains");
+    assert!(
+        error.to_string().contains("OG-MF-108") && error.to_string().contains("D-1"),
+        "{error}"
+    );
 
     // The previous schema stays usable: a null is still accepted.
     db.load_jsonl(
@@ -3939,56 +3946,236 @@ async fn issue_721_promotion_tightens_the_lance_column() {
     );
 }
 
-// A deleted row keeps its null in the data file, so the null check counts it:
-// the promotion is refused until `optimize` rewrites the fragment, and then
-// applies. A later schema change and write also succeed.
+/// Every value of `column` in `table` at main's head, deleted rows included,
+/// as `(deleted, is_null)`.
+async fn issue_721_physical_values(
+    db: &Omnigraph,
+    uri: &str,
+    table: &str,
+    column: &str,
+) -> Vec<(bool, bool)> {
+    use arrow_array::Array;
+    use futures::TryStreamExt;
+    // The snapshot API hides deleted rows, so read the pinned Lance version.
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let entry = snapshot.dataset(table).unwrap().clone();
+    let dataset = lance::Dataset::open(&format!("{uri}/{}", entry.dataset_path))
+        .await
+        .unwrap()
+        .checkout_version(entry.version_metadata.staged_version().unwrap())
+        .await
+        .unwrap();
+    let mut scanner = dataset.scan();
+    scanner.project(&[column]).unwrap();
+    scanner.with_row_id().include_deleted_rows();
+    let batches: Vec<_> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut values = Vec::new();
+    for batch in batches {
+        let row_ids = batch.column_by_name("_rowid").unwrap();
+        let column = batch.column_by_name(column).unwrap();
+        for row in 0..batch.num_rows() {
+            values.push((row_ids.is_null(row), column.is_null(row)));
+        }
+    }
+    values
+}
+
+// A deleted row keeps its null in the data file. Promotion rewrites the
+// fragments holding one, deletions materialized, before tightening the
+// column, whatever share of the fragment is deleted: half of it here, and 1
+// of 61 rows, below Lance's 10% `materialize_deletions_threshold`, which
+// `optimize` would leave in place. A later schema change, optimize and write
+// also succeed.
 #[tokio::test]
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
-async fn issue_721_deleted_null_row_before_promotion() {
+async fn issue_721_deleted_null_row_is_purged_by_promotion() {
+    for filled in [1usize, 60] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
+        let mut rows = (0..filled)
+            .map(|i| format!(r#"{{"type":"Decision","data":{{"slug":"s{i}","ref":"D-{i}"}}}}"#))
+            .collect::<Vec<_>>();
+        rows.push(r#"{"type":"Decision","data":{"slug":"gone"}}"#.to_string());
+        db.load_jsonl(&rows.join("\n"), LoadMode::Merge)
+            .await
+            .unwrap();
+        mutate_main(
+            &db,
+            "query rm($slug: String) { delete Decision where slug = $slug }",
+            "rm",
+            &params(&[("slug", "gone")]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            issue_721_physical_values(&db, uri, "node:Decision", "ref")
+                .await
+                .contains(&(true, true)),
+            "the deleted row still holds its null before promotion ({filled} filled)"
+        );
+        let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+
+        db.apply_schema(ISSUE_721_V2)
+            .await
+            .unwrap_or_else(|error| panic!("promotion applies ({filled} filled): {error}"));
+
+        let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+        let values = issue_721_physical_values(&db, uri, "node:Decision", "ref").await;
+        assert_eq!(
+            values.len(),
+            filled,
+            "only live rows remain ({filled} filled)"
+        );
+        assert!(values.iter().all(|(_, null)| !null), "no null is stored");
+        assert!(
+            !after
+                .open_dataset("node:Decision")
+                .await
+                .unwrap()
+                .schema()
+                .field("ref")
+                .unwrap()
+                .nullable
+        );
+        assert_eq!(
+            after
+                .dataset("node:Decision")
+                .unwrap()
+                .published_dataset_version,
+            before
+                .dataset("node:Decision")
+                .unwrap()
+                .published_dataset_version
+                + 1,
+            "the rewrite and the tightening publish once"
+        );
+        let v3 = "node Decision {\n    slug: String @key\n    ref: String @unique\n    note: String?\n}\n";
+        db.apply_schema(v3)
+            .await
+            .expect("a later column addition applies");
+        db.optimize().await.expect("optimize succeeds");
+        db.load_jsonl(
+            r#"{"type":"Decision","data":{"slug":"d","ref":"D-new","note":"n"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .expect("a write after the later change succeeds");
+    }
+}
+
+// A promotion in the same apply as a rename of its property reads the stored
+// column under its old name: required and @unique both apply, a null or a
+// duplicate under the old name still refuses, and the renamed property keeps
+// enforcing both rules.
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn issue_721_promotion_with_a_rename_in_the_same_apply() {
+    let renamed = "node Decision {\n    slug: String @key\n    code: String @unique @rename_from(\"ref\")\n}\n";
+    for (rows, refusal) in [
+        (
+            "{\"type\":\"Decision\",\"data\":{\"slug\":\"a\",\"ref\":\"D-1\"}}\n\
+             {\"type\":\"Decision\",\"data\":{\"slug\":\"b\"}}",
+            Some("OG-MF-104"),
+        ),
+        (
+            "{\"type\":\"Decision\",\"data\":{\"slug\":\"a\",\"ref\":\"D-1\"}}\n\
+             {\"type\":\"Decision\",\"data\":{\"slug\":\"b\",\"ref\":\"D-1\"}}",
+            Some("OG-MF-108"),
+        ),
+        (
+            "{\"type\":\"Decision\",\"data\":{\"slug\":\"a\",\"ref\":\"D-1\"}}\n\
+             {\"type\":\"Decision\",\"data\":{\"slug\":\"b\",\"ref\":\"D-2\"}}",
+            None,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
+        db.load_jsonl(rows, LoadMode::Merge).await.unwrap();
+        let plan = db.plan_schema(renamed).await.unwrap();
+        assert!(plan.supported, "{plan:?}");
+        match refusal {
+            Some(code) => {
+                let error = db
+                    .apply_schema(renamed)
+                    .await
+                    .expect_err("a row breaks a rule");
+                assert!(error.to_string().contains(code), "{error}");
+                assert!(!error.to_string().contains("No field named"), "{error}");
+            }
+            None => {
+                db.apply_schema(renamed)
+                    .await
+                    .expect("the renamed promotion applies");
+                db.load_jsonl(
+                    r#"{"type":"Decision","data":{"slug":"c"}}"#,
+                    LoadMode::Merge,
+                )
+                .await
+                .expect_err("code is required");
+                db.load_jsonl(
+                    r#"{"type":"Decision","data":{"slug":"c","code":"D-2"}}"#,
+                    LoadMode::Merge,
+                )
+                .await
+                .expect_err("code is unique");
+                db.load_jsonl(
+                    r#"{"type":"Decision","data":{"slug":"c","code":"D-3"}}"#,
+                    LoadMode::Merge,
+                )
+                .await
+                .expect("a distinct code loads");
+            }
+        }
+    }
+}
+
+// An edge property promotes too: refused while an edge holds a null, applied
+// once every edge is backfilled, and a null edge write is refused afterwards.
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn issue_721_edge_property_promotes_to_required() {
+    let v1 = "node P {\n    slug: String @key\n}\nedge Cites: P -> P {\n    why: String?\n}\n";
+    let v2 = "node P {\n    slug: String @key\n}\nedge Cites: P -> P {\n    why: String\n}\n";
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
+    let db = helpers::session(Omnigraph::init(uri, v1).await.unwrap());
     db.load_jsonl(
-        "{\"type\":\"Decision\",\"data\":{\"slug\":\"a\",\"ref\":\"D-1\"}}\n\
-         {\"type\":\"Decision\",\"data\":{\"slug\":\"gone\"}}",
-        LoadMode::Merge,
+        "{\"type\":\"P\",\"data\":{\"slug\":\"a\"}}\n\
+         {\"type\":\"P\",\"data\":{\"slug\":\"b\"}}\n\
+         {\"edge\":\"Cites\",\"from\":\"a\",\"to\":\"b\",\"data\":{}}",
+        LoadMode::Append,
     )
     .await
     .unwrap();
-    mutate_main(
-        &db,
-        "query rm($slug: String) { delete Decision where slug = $slug }",
-        "rm",
-        &params(&[("slug", "gone")]),
+    let error = db.apply_schema(v2).await.expect_err("an edge holds a null");
+    assert!(error.to_string().contains("OG-MF-104"), "{error}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = helpers::session(Omnigraph::init(uri, v1).await.unwrap());
+    db.load_jsonl(
+        "{\"type\":\"P\",\"data\":{\"slug\":\"a\"}}\n\
+         {\"type\":\"P\",\"data\":{\"slug\":\"b\"}}\n\
+         {\"edge\":\"Cites\",\"from\":\"a\",\"to\":\"b\",\"data\":{\"why\":\"x\"}}",
+        LoadMode::Append,
     )
     .await
     .unwrap();
-    let error = db
-        .apply_schema(ISSUE_721_V2)
+    db.apply_schema(v2)
         .await
-        .expect_err("a deleted row still holds the null");
-    assert!(
-        error.to_string().contains("deleted rows included"),
-        "{error}"
-    );
-    db.optimize()
-        .await
-        .expect("optimize purges the deleted row");
-    db.apply_schema(ISSUE_721_V2)
-        .await
-        .expect("promotion applies");
-    let v3 =
-        "node Decision {\n    slug: String @key\n    ref: String @unique\n    note: String?\n}\n";
-    db.apply_schema(v3)
-        .await
-        .expect("a later column addition applies");
-    db.optimize()
-        .await
-        .expect("compaction rewrites the fragment holding the deleted null");
+        .expect("a backfilled edge property promotes");
     db.load_jsonl(
-        r#"{"type":"Decision","data":{"slug":"d","ref":"D-2","note":"n"}}"#,
-        LoadMode::Merge,
+        "{\"edge\":\"Cites\",\"from\":\"b\",\"to\":\"a\",\"data\":{}}",
+        LoadMode::Append,
     )
     .await
-    .expect("a write after the later change succeeds");
+    .expect_err("an edge without why is refused");
 }

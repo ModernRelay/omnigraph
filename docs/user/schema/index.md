@@ -221,17 +221,19 @@ their values. They still grow with the table's metadata: its columns, its
 indexes and its fragments, of which a table written by many small commits has
 more until `omnigraph optimize` compacts them.
 
-Making a nullable property required and adding `@unique` to a node type read the
-stored rows first, under the locks the apply holds, and change nothing if a row
-breaks the rule. A property becomes required only when no row holds a null,
-deleted rows included; run `omnigraph optimize` to purge a deleted row that still
-holds one. `@unique` is added only when no two rows share the key, and the check
-refuses a table of more than 5,000,000 distinct keys. A refused apply leaves the
-accepted schema in force. A successful one keeps entity ids, relationships and
-retained commits, and later writes are checked against the new rule. To add a
-required or unique property to a populated type, add it nullable, load its
-values, then promote it. Promotion rewrites no data file; making a property
-required also makes its storage column non-nullable in one extra table commit.
+Making a nullable property required (on a node or an edge) and adding `@unique`
+to a node type read the stored rows first, under the locks the apply holds, and
+change nothing if a row breaks the rule: a live row holding a null refuses with
+`OG-MF-104`, two rows sharing a key with `OG-MF-108`. The `@unique` check holds
+the keys in memory and refuses a table whose keys need more than 1 GiB. A
+refused apply leaves the accepted schema in force. A successful one keeps entity
+ids, relationships and retained commits, and later writes are checked against
+the new rule. To add a required or unique property to a populated type, add it
+nullable, load its values, then promote it, with a `@rename_from` in the same
+apply if you like. Promotion rewrites no data file, with one exception: a
+deleted row keeps its value in storage, so a fragment whose deleted rows hold a
+null in the promoted property is rewritten without them. Making a property
+required also makes its storage column non-nullable.
 
 Applying changed schema text, including comments or formatting, records the new
 source in one graph commit even when no table changes are needed. Applying the
@@ -283,7 +285,11 @@ code rather than the message text.
 | `OG-DS-103` | Drop an edge type that contains entities. |
 | `OG-DS-104` | Drop a populated property. |
 | `OG-MF-103` | Add a required property to a populated type. |
+| `OG-MF-104` | Make a property required while a stored row holds a null (reported by `schema apply`). |
 | `OG-MF-106` | Change a property's type, including enum narrowing or renaming. |
 | `OG-MF-107` | Add an edge type with a non-zero `@card` minimum from an existing node type. |
+| `OG-MF-108` | Add `@unique` to a node type while two stored rows share a key (reported by `schema apply`). |
 
-`omnigraph schema plan` includes these codes in human and JSON output.
+`omnigraph schema plan` includes these codes in human and JSON output, except
+`OG-MF-104` and `OG-MF-108`, which only `schema apply` can know from the stored
+rows.

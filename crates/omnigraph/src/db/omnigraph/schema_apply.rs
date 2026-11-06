@@ -709,28 +709,46 @@ where
             .unwrap_or_default();
         renames.sort();
         let source_dataset = source_ds.dataset();
-        // #721: a promotion judges the committed rows under the gates held
-        // here, before any table moves; a violation leaves the graph as is.
+        // #721: a promotion judges the stored rows under the gates held here,
+        // before any table moves; a violation leaves the graph as is. The
+        // steps name the desired columns, the dataset holds them under their
+        // source names until the Project renames them.
+        let source_name = |name: &String| {
+            renames
+                .iter()
+                .find(|(_, to)| to == name)
+                .map_or_else(|| name.clone(), |(from, _)| from.clone())
+        };
         let required = promotion_required
             .get(table_key)
-            .cloned()
+            .map(|columns| columns.iter().map(source_name).collect::<Vec<_>>())
             .unwrap_or_default();
-        let unique = promotion_unique.get(table_key).cloned().unwrap_or_default();
+        let unique = promotion_unique
+            .get(table_key)
+            .map(|groups| {
+                groups
+                    .iter()
+                    .map(|group| group.iter().map(source_name).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut purge_fragments = Vec::new();
         if !required.is_empty() || !unique.is_empty() {
-            if let Some(violation) =
-                TableStore::promotion_violation(source_dataset, &required, &unique).await?
-            {
+            let check = TableStore::promotion_check(source_dataset, &required, &unique).await?;
+            if let Some(violation) = check.violation {
                 return Err(OmniError::manifest(format!(
-                    "[promotion refused] {table_key}: {violation}"
+                    "schema apply refused for '{table_key}': {violation}"
                 )));
             }
+            purge_fragments = check.purge_fragments;
         }
-        let evolution = TableStore::plan_schema_evolution(source_dataset, &target, &renames)
+        let mut evolution = TableStore::plan_schema_evolution(source_dataset, &target, &renames)
             .map_err(|error| {
                 OmniError::manifest(format!(
                     "schema apply cannot evolve table '{source_table_key}' in place: {error}"
                 ))
             })?;
+        evolution.set_purge_fragments(purge_fragments);
         evolutions.insert(table_key.clone(), evolution);
     }
 
@@ -867,6 +885,22 @@ where
             let declared =
                 super::table_ops::declared_full_text_columns(&desired_catalog, table_key);
             let mut tip_transaction = None;
+            // #721: fragments whose deleted rows hold a null in a column about
+            // to become required are rewritten first, deletions materialized,
+            // so no data file of the tightened column holds a null.
+            if let Some(staged) = db
+                .storage()
+                .stage_fragment_rewrite(&tip, &evolution.take_purge_fragments())
+                .await?
+            {
+                let (next, transaction) = db
+                    .storage()
+                    .commit_staged_detached(tip, staged, &witness, &declared)
+                    .await?;
+                tip = next;
+                tip_transaction = Some(transaction);
+                fail(&SCHEMA_APPLY_POST_TABLE_COMMIT)?;
+            }
             while let Some(staged) = db
                 .storage()
                 .stage_schema_evolution(&tip, &mut evolution)

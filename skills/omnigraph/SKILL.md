@@ -258,10 +258,11 @@ value means, and which paths agents reason along. Design for **convergence**:
 two agents given the same input should write the same graph and read the same
 meaning back. Decide conservatively what to model; once modeled, constrain
 precisely, because changing a commitment later is a rebuild (adding
-`@key`/`@unique`/`@range`/`@check` or a required edge to an existing type,
-changing cardinality, removing a constraint from a property that stays, and
-`T?` ↔ `T` are refused; only `@index` additions, nullable additions, enum
-widening, renames and drops apply in place).
+`@key`/`@range`/`@check`, an edge `@unique` or a required edge to an existing
+type, changing cardinality, removing a constraint from a property that stays,
+and `T` → `T?` are refused; `@index` additions, nullable additions, enum
+widening, renames, drops, `T?` → `T` and a node `@unique` apply in place, the
+last two only when the stored rows already satisfy them).
 
 In short: Gruber's five criteria (clarity · coherence · extendibility · minimal
 encoding bias · minimal commitment) · neither too loose (one meaning, many
