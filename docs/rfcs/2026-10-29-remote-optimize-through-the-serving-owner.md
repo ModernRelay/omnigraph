@@ -2,18 +2,16 @@
 rfc: "2026-10-29-remote-optimize-through-the-serving-owner"
 title: "Remote optimize through the serving owner"
 track: maintainer
-status: draft
-implementation: not-started
+status: accepted
+implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-29
-updated: 2026-11-01
+updated: 2026-11-06
 discussion: https://github.com/ModernRelay/omnigraph/pull/1214
 supersedes: []
 superseded_by: []
 blocked_on:
-  - "PR #1175: the `maintain` policy action and the actor-taking `optimize_as` entry point."
-  - "PR #1176: re-issue and read-back of conditional control-object writes, which the operation record's four puts depend on."
   - "An in-region measurement on a serving host that sets the `max_gate_hold` default and the server's resource ceilings before the route is enabled."
 ---
 
@@ -207,7 +205,10 @@ grant it. The request carries:
 - `concurrency`: how many tables are planned at once, and how many are
   rewritten at once.
 - a cancellation handle (§1.9);
-- an optional `before_publish` callback (§1.6).
+- an optional `before_publish` callback (§1.6);
+- `authority`: where the run's write authority is captured when main moved
+  before the gates (§1.2): `BeforeGates`, the default, refuses the run, and
+  `UnderGates`, which the served path sets, captures again under the gates.
 
 The served path sets every limit from serve settings, plans
 `maintenance_planning_concurrency` tables ahead (a serve setting; planning only
@@ -436,7 +437,9 @@ none.
 - **Before the publication.** Every failure carries `BeforeEffect` when
   nothing durable happened, a refusal at authority revalidation included,
   and `Unpublished` after detached commits or
-  staged index files. Today a DataFusion error or a `RecoveryRequired` inside optimize
+  staged index files. A policy denial alone keeps its typed shape, as at
+  every `_as` door: it is before any effect by nature, and the policy
+  chassis matches it bare. Today a DataFusion error or a `RecoveryRequired` inside optimize
   carries no completion evidence, and the server reads either as uncertain
   and contains the process (`ApiError::translated`); any other internal
   error is reported under its own code, also without evidence. This slice
@@ -965,8 +968,9 @@ accepted id that never runs and, under shutdown, a caller told 503 with
   root is still readable, it runs the §2.4 walk to its end on each record's
   settlement branch, since history can still answer, and writes what the
   walk settles. Only once root absence is verified, and the walk cannot
-  run, does each record still non-terminal become terminal with reason
-  `graph_deleted` and its publication `unknown`. That asserts no fact about
+  run, does each record still non-terminal become terminal in the state
+  `unsettled`, with reason `graph_deleted` and its publication unknown, and
+  the graph's kind state is dropped. That asserts no fact about
   history; it records that the only authority that could answer is gone,
   and a missing root then ends the record instead of failing admission for
   the cluster. A record names its graph's `schema_identity_domain` (§2.2),
@@ -1024,7 +1028,7 @@ deployment gate and the cluster lock then agree on one unit.
   |---|---|
   | `succeeded` (deferred, failed or pending tables included), acceptance with `--no-wait`, or an observation with `--no-wait` | 0 |
   | Refused before acceptance, or terminal `failed`, `cancelled` or `interrupted`: no graph effects | 1 |
-  | Publication in doubt, `unknown` after a lost response, or the local wait ended before a terminal record | 2 |
+  | Publication in doubt (`publishing`, or terminal `unsettled`), `unknown` after a lost response, or the local wait ended before a terminal record | 2 |
   | The same id with a different request | 4 |
   | Another operation is active in the scope | 75 |
 
@@ -1423,3 +1427,10 @@ dated pending entry in its decision log:
   - **Pending amendment.** The server-runtime entry names
     `operations.json`.
   - **Authority row.** The served path alone drops the pre-gate refusal.
+- 2026-11-06: Accepted with the engine slice (PR #1275) green and the served
+  slice (PR #1282) open. Three details follow the implementation: the engine
+  request carries `authority` (§1.1), so the served path asks for the capture
+  under the gates and a direct caller keeps the refusal; a policy denial keeps
+  its typed shape instead of `BeforeEffect` (§1.7); and a record a graph
+  deletion ends is terminal in the state `unsettled` (§3.4, §4). #1175's
+  commits ride in #1275, and #1176 is merged, so neither blocks the RFC.
