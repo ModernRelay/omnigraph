@@ -211,9 +211,11 @@ replaced base pin from that cache, so a steadily written table holds its
 current version rather than its recent history; the cache also bounds the
 decoded manifest bytes its handles keep alive, since a manifest lists every
 fragment. `commit_all` enters the gates, revalidates the complete
-authority (for a branch other than the handle's bound one, the captured
-manifest probe first: an unchanged version and branch identifier keep the
-captured authority, a mismatch is a fresh coherent capture), and commits
+authority (for the handle's bound branch, the probe taken beside the staging
+puts serves when it answered current and no publish has installed on the
+handle since; for another branch, the captured manifest probe first: an
+unchanged version and branch identifier keep the captured authority, a
+mismatch is a fresh coherent capture), and commits
 every participant as a detached version of its pinned
 base: no recovery sidecar is armed, a table's linear HEAD never moves, and
 nothing can rebase. Every detached commit records the authority it was staged
