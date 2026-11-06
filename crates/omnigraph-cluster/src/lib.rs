@@ -30,7 +30,7 @@ mod deployment;
 mod diff;
 mod graph_read;
 mod lease;
-mod maintenance;
+mod operations;
 mod serve;
 mod state_lock;
 mod store;
@@ -58,12 +58,14 @@ use config::{
 pub use deployment::*;
 use diff::{ResourceKind, compute_blast_radius, resource_kind};
 pub use graph_read::GraphReadAuthority;
-pub use maintenance::{
-    Admitted, CLUSTER_MAINTENANCE_FILE, MAX_MAINTENANCE_BYTES, MAX_MAINTENANCE_RECORD_BYTES,
-    MAX_MAINTENANCE_TERMINAL, MAX_MAINTENANCE_UNRESOLVED, MaintenanceKind, MaintenanceLedger,
-    MaintenanceOperation, MaintenanceRefusal, MaintenanceState, MaintenanceTableOutcome,
-    MaintenanceTailOutcome, MaintenanceTimings, MaintenanceWrite, OptimizeOptions, Resolution,
-    canonical_maintenance_id, maintenance_request_digest, new_maintenance_id,
+pub use operations::{
+    AdmissionRefusal, AdmissionScope, Admitted, CLUSTER_OPERATIONS_FILE, KindStates,
+    MAX_OPERATION_BYTES, MAX_OUTCOME_DETAIL_BYTES, MAX_TABLE_OUTCOMES, MAX_TERMINAL_OPERATIONS,
+    MAX_TERMINAL_OPERATIONS_BYTES, MAX_UNRESOLVED_OPERATIONS, Operation, OperationKind,
+    OperationOutcome, OperationRecord, OperationRequest, OperationState, OperationTimings,
+    OperationWrite, OptimizeOptions, OptimizeOutcome, OptimizeState, Resolution,
+    ResolutionProgress, TableOutcome, TailOutcome, canonical_operation_id, new_operation_id,
+    operation_id_time_ms, operation_request_digest, truncate_detail,
 };
 #[cfg(any(test, feature = "test-util"))]
 pub use serve::read_serving_snapshot_with_display_root;

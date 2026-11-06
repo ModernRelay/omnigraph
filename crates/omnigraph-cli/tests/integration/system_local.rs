@@ -1222,13 +1222,13 @@ rules:
       branch_scope: any
 "#;
 
-/// `optimize` against a server target runs served maintenance: it prints
+/// `optimize` against a server target runs a recorded operation: it prints
 /// the id it minted, waits for the terminal record, observes a submitted
 /// operation by id, answers `unknown` with exit 2, and returns after
 /// acceptance with `--no-wait`. A direct target refuses the served flags.
 #[test]
-fn local_cli_optimize_runs_served_maintenance() {
-    if skip_system_e2e("local_cli_optimize_runs_served_maintenance") {
+fn local_cli_optimize_runs_a_recorded_operation() {
+    if skip_system_e2e("local_cli_optimize_runs_a_recorded_operation") {
         return;
     }
     let cluster = converged_loaded_cluster("knowledge", Some(MAINTAIN_POLICY_YAML));
@@ -1236,7 +1236,7 @@ fn local_cli_optimize_runs_served_maintenance() {
         cluster.path(),
         &[
             ("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", POLICY_TOKENS_JSON),
-            ("OMNIGRAPH_MAINTENANCE_ROUTES", "true"),
+            ("OMNIGRAPH_OPERATION_ROUTES", "true"),
         ],
     );
     let optimize = |extra: &[&str]| {
@@ -1260,10 +1260,10 @@ fn local_cli_optimize_runs_served_maintenance() {
     let stderr = String::from_utf8_lossy(&run.stderr);
     let id = stderr
         .lines()
-        .find_map(|line| line.strip_prefix("maintenance id: "))
+        .find_map(|line| line.strip_prefix("operation id: "))
         .unwrap_or_else(|| panic!("the id is printed before the request: {stderr}"))
         .to_string();
-    assert_eq!(record["operation"]["maintenance_id"], id.as_str());
+    assert_eq!(record["operation"]["operation_id"], id.as_str());
 
     let observed = optimize(&["--operation", &id]);
     assert_eq!(observed.status.code(), Some(0), "{observed:?}");

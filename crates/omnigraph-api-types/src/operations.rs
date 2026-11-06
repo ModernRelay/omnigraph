@@ -145,10 +145,9 @@ const PROBE: &str = "Process probe, not a graph command.";
 const OAUTH: &str = "Protocol-defined OAuth discovery, not a graph operation.";
 const DEPLOYMENT: &str = "Deployment control is not an MCP agent tool.";
 const BYTE_STREAM: &str = "MCP tools do not carry this byte-stream contract.";
-const MAINTENANCE: &str =
-    "Served maintenance runs under a durable operation record, not as an MCP agent tool.";
-const MAINTENANCE_CANCEL_CLI: &str =
-    "The CLI does not cancel a served maintenance operation; a scheduler or an HTTP client does.";
+const RECORDED: &str = "A recorded operation runs under the cluster's durable operation record, not as an MCP agent tool.";
+const RECORDED_CANCEL_CLI: &str =
+    "The CLI does not cancel a recorded operation; a scheduler or an HTTP client does.";
 
 /// Every operation in the generated HTTP specification. Protocol endpoints
 /// (`/mcp`, `/openapi.json`) and the catalogue's reserved-id dispatch retain
@@ -417,32 +416,32 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
     operation(
         "start optimize",
         HttpMethod::Post,
-        "/graphs/{graph_id}/maintenance/optimize",
+        "/graphs/{graph_id}/operations/optimize",
         Capability::Write,
         None,
-        Surface::absent(MAINTENANCE),
+        Surface::absent(RECORDED),
         Surface::bound(&["optimize"]),
     ),
     operation(
-        "get maintenance operation",
+        "get operation",
         HttpMethod::Get,
-        "/graphs/{graph_id}/maintenance/{maintenance_id}",
+        "/graphs/{graph_id}/operations/{operation_id}",
         Capability::Read,
         None,
-        Surface::absent(MAINTENANCE),
+        Surface::absent(RECORDED),
         Surface::restricted(
             &["optimize"],
             "--operation observes an existing operation, and the wait polls it.",
         ),
     ),
     operation(
-        "cancel maintenance operation",
+        "cancel operation",
         HttpMethod::Post,
-        "/graphs/{graph_id}/maintenance/{maintenance_id}/cancel",
+        "/graphs/{graph_id}/operations/{operation_id}/cancel",
         Capability::Write,
         None,
-        Surface::absent(MAINTENANCE),
-        Surface::absent(MAINTENANCE_CANCEL_CLI),
+        Surface::absent(RECORDED),
+        Surface::absent(RECORDED_CANCEL_CLI),
     ),
     operation(
         "diff",

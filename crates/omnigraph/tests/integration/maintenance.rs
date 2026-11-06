@@ -867,7 +867,9 @@ async fn optimize_skips_an_artifact_over_its_size_limit() {
 
 /// main's history settles a publication whose answer was lost: the input
 /// head's child answers the run's nonce, another nonce did not commit, a
-/// later commit on main changes neither, and an unmoved head stays in doubt.
+/// later commit on main changes neither, an unmoved head stays in doubt, and
+/// a page that ends before the child hands its unvisited parent to the next
+/// page, which settles it.
 #[tokio::test]
 async fn resolve_publication_judges_the_input_heads_child() {
     use omnigraph::db::PublicationLookup;
@@ -886,7 +888,7 @@ async fn resolve_publication_judges_the_input_heads_child() {
         let version = publication.input_manifest_version;
         let db = &db;
         async move {
-            db.resolve_publication(&nonce, input.as_deref(), version)
+            db.resolve_publication(None, &nonce, input.as_deref(), version, None, 256)
                 .await
                 .unwrap()
         }
@@ -913,13 +915,36 @@ async fn resolve_publication_judges_the_input_heads_child() {
     let head = db.list_commits(None).await.unwrap()[0].clone();
     assert_eq!(
         db.resolve_publication(
+            None,
             &publication.nonce,
             Some(&head.graph_commit_id),
-            head.graph_manifest_version
+            head.graph_manifest_version,
+            None,
+            256
         )
         .await
         .unwrap(),
         PublicationLookup::HeadUnchanged
+    );
+
+    // One commit per page: the tip's page ends before the child and names
+    // the child as its next; the page from there settles the run.
+    let input = publication.input_commit.as_deref();
+    let version = publication.input_manifest_version;
+    let PublicationLookup::Walking { next, visited } = db
+        .resolve_publication(None, &publication.nonce, input, version, None, 1)
+        .await
+        .unwrap()
+    else {
+        panic!("a one-commit page from the tip does not reach the child");
+    };
+    assert_eq!(visited, 1);
+    assert_eq!(next, commit, "the cursor is the unvisited parent");
+    assert_eq!(
+        db.resolve_publication(None, &publication.nonce, input, version, Some(&next), 1)
+            .await
+            .unwrap(),
+        committed
     );
 }
 

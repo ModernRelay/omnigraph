@@ -2096,7 +2096,7 @@ impl GraphClient {
     }
 
     /// Create `name` at `start`: a branch's head, or a published graph commit.
-    /// Submit a served optimize; the record, or the server's refusal.
+    /// Submit a recorded optimize; the record, or the server's refusal.
     pub(crate) async fn start_optimize(&self, body: Value) -> Result<Value> {
         let GraphClient::Remote {
             http,
@@ -2106,12 +2106,12 @@ impl GraphClient {
             ..
         } = self
         else {
-            bail!("served maintenance needs a server target");
+            bail!("a recorded operation needs a server target");
         };
         remote_json_bounded(
             http,
             Method::POST,
-            remote_url(base_url, &["maintenance", "optimize"], &[])?,
+            remote_url(base_url, &["operations", "optimize"], &[])?,
             Some(body),
             token.as_deref(),
             None,
@@ -2120,8 +2120,8 @@ impl GraphClient {
         .await
     }
 
-    /// Look a served maintenance operation up by its id.
-    pub(crate) async fn maintenance_operation(&self, maintenance_id: &str) -> Result<Value> {
+    /// Look a recorded operation up by its id.
+    pub(crate) async fn operation(&self, operation_id: &str) -> Result<Value> {
         let GraphClient::Remote {
             http,
             base_url,
@@ -2130,12 +2130,12 @@ impl GraphClient {
             ..
         } = self
         else {
-            bail!("served maintenance needs a server target");
+            bail!("a recorded operation needs a server target");
         };
         remote_json_bounded(
             http,
             Method::GET,
-            remote_url(base_url, &["maintenance", maintenance_id], &[])?,
+            remote_url(base_url, &["operations", operation_id], &[])?,
             None,
             token.as_deref(),
             None,

@@ -1,4 +1,5 @@
-//! `omnigraph optimize` against a server target. The command mints an id,
+//! `omnigraph optimize` against a server target, a recorded operation. The
+//! command mints an id,
 //! prints it before it sends anything, submits, and waits for the operation's
 //! terminal record. After a lost response it looks the operation up by that
 //! id; it never submits the same work again.
@@ -38,7 +39,7 @@ pub(crate) struct ServedOptimize {
 enum Refusal {
     /// The id names another request.
     DifferentRequest,
-    /// Another maintenance operation holds the cluster's slot.
+    /// Another operation holds the scope's active slot.
     AnotherActive,
     /// Refused before acceptance: nothing ran.
     BeforeAcceptance,
@@ -54,7 +55,7 @@ fn classify(error: &color_eyre::Report) -> Refusal {
         409 if remote
             .output
             .error
-            .starts_with("[maintenance_request_mismatch]") =>
+            .starts_with("[operation_request_mismatch]") =>
         {
             Refusal::DifferentRequest
         }
@@ -64,8 +65,8 @@ fn classify(error: &color_eyre::Report) -> Refusal {
     }
 }
 
-fn request_body(request: &ServedOptimize, maintenance_id: &str) -> Value {
-    let mut body = json!({ "maintenance_id": maintenance_id });
+fn request_body(request: &ServedOptimize, operation_id: &str) -> Value {
+    let mut body = json!({ "operation_id": operation_id });
     if !request.tables.is_empty() {
         body["tables"] = json!(request.tables);
     }
@@ -80,7 +81,10 @@ fn state(record: &Value) -> Option<&str> {
 }
 
 fn is_terminal(state: &str) -> bool {
-    matches!(state, "succeeded" | "failed" | "cancelled" | "interrupted")
+    matches!(
+        state,
+        "succeeded" | "failed" | "cancelled" | "interrupted" | "unsettled"
+    )
 }
 
 pub(crate) async fn run(
@@ -89,11 +93,11 @@ pub(crate) async fn run(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
-    let (maintenance_id, mut answer) = match &request.operation {
-        Some(id) => (id.clone(), client.maintenance_operation(id).await),
+    let (operation_id, mut answer) = match &request.operation {
+        Some(id) => (id.clone(), client.operation(id).await),
         None => {
-            let id = omnigraph_cluster::new_maintenance_id();
-            writeln!(stderr, "maintenance id: {id}")?;
+            let id = omnigraph_cluster::new_operation_id();
+            writeln!(stderr, "operation id: {id}")?;
             stderr.flush()?;
             match client.start_optimize(request_body(&request, &id)).await {
                 Ok(record) => (id, Ok(record)),
@@ -115,7 +119,7 @@ pub(crate) async fn run(
                             stderr,
                             "no definite answer for {id} ({error}); looking it up, never resubmitting"
                         )?;
-                        let answer = client.maintenance_operation(&id).await;
+                        let answer = client.operation(&id).await;
                         (id, answer)
                     }
                 },
@@ -129,7 +133,7 @@ pub(crate) async fn run(
             if record["lookup"] == "unknown" {
                 writeln!(
                     stderr,
-                    "the server holds no record of maintenance operation {maintenance_id}; that proves neither that it ran nor that it did not, and submitting the same work again would be a new operation"
+                    "the server holds no record of operation {operation_id}; that proves neither that it ran nor that it did not, and submitting the same work again would be a new operation"
                 )?;
                 if request.json {
                     write_json(record, stdout)?;
@@ -138,10 +142,12 @@ pub(crate) async fn run(
             }
             match state(record) {
                 Some(state) if request.no_wait || is_terminal(state) => {
-                    write_record(&maintenance_id, record, request.json, stdout)?;
+                    write_record(&operation_id, record, request.json, stdout)?;
                     return Ok(Completion::exit(match state {
                         _ if !is_terminal(state) => SUCCEEDED,
                         "succeeded" => SUCCEEDED,
+                        // The authority that could settle the publication is gone.
+                        "unsettled" => IN_DOUBT,
                         _ => NO_EFFECTS,
                     }));
                 }
@@ -150,22 +156,22 @@ pub(crate) async fn run(
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             match &answer {
-                Ok(record) => write_record(&maintenance_id, record, request.json, stdout)?,
+                Ok(record) => write_record(&operation_id, record, request.json, stdout)?,
                 Err(error) => writeln!(stderr, "error: {error}")?,
             }
             writeln!(
                 stderr,
-                "stopped waiting; the operation continues on the server: observe it with `omnigraph optimize --operation {maintenance_id}`"
+                "stopped waiting; the operation continues on the server: observe it with `omnigraph optimize --operation {operation_id}`"
             )?;
             return Ok(Completion::exit(IN_DOUBT));
         }
         tokio::time::sleep(POLL).await;
-        answer = client.maintenance_operation(&maintenance_id).await;
+        answer = client.operation(&operation_id).await;
     }
 }
 
 fn write_record(
-    maintenance_id: &str,
+    operation_id: &str,
     record: &Value,
     json: bool,
     stdout: &mut dyn Write,
@@ -175,8 +181,9 @@ fn write_record(
     }
     let operation = &record["operation"];
     let state = operation["state"].as_str().unwrap_or("unknown");
-    writeln!(stdout, "optimize {state} — maintenance {maintenance_id}")?;
-    if let Some(tables) = operation["tables"].as_array() {
+    writeln!(stdout, "optimize {state} — operation {operation_id}")?;
+    let outcome = &operation["outcome"];
+    if let Some(tables) = outcome["tables"].as_array() {
         for table in tables {
             let subject = graph_type_subject(table["type_key"].as_str().unwrap_or(""));
             let outcome = table["outcome"].as_str().unwrap_or("");
@@ -200,7 +207,7 @@ fn write_record(
     if let Some(commit) = operation["published_commit"].as_str() {
         writeln!(stdout, "graph commit: {commit}")?;
     }
-    if let Some(key) = operation["resume_at"].as_str() {
+    if let Some(key) = outcome["resume_at"].as_str() {
         writeln!(stdout, "resume at: {}", graph_type_subject(key))?;
     }
     if let Some(reason) = operation["reason"].as_str() {
@@ -236,7 +243,7 @@ mod tests {
             classify(&remote(
                 409,
                 "conflict",
-                "[maintenance_request_mismatch] maintenance id x names a different request"
+                "[operation_request_mismatch] operation id x names a different request"
             )),
             Refusal::DifferentRequest
         );
@@ -271,7 +278,7 @@ mod tests {
         assert_eq!(
             request_body(&request, "01JC0000000000000000000001"),
             json!({
-                "maintenance_id": "01JC0000000000000000000001",
+                "operation_id": "01JC0000000000000000000001",
                 "tables": ["node:Person"],
                 "max_gate_hold_ms": 30_000,
             })

@@ -11,8 +11,8 @@ mod handlers;
 mod http_contract;
 mod http_operations;
 mod ingress;
-mod maintenance;
-pub use maintenance::MaintenanceSettings;
+mod recorded_operations;
+pub use recorded_operations::OperationSettings;
 mod mcp;
 pub mod operations;
 mod redacted_cause;
@@ -125,7 +125,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         (name = "cluster", description = "Cluster deployment planning and execution"),
         (name = "commits", description = "Graph commit history and publication"),
         (name = "health", description = "Process health and readiness probes"),
-        (name = "maintenance", description = "Served maintenance operations and their records"),
+        (name = "operations", description = "Recorded operations: optimize through the serving owner, looked up and cancelled by id"),
         (name = "management", description = "Server graph inventory and OAuth resource metadata"),
         (name = "mutations", description = "Graph mutations and data loading"),
         (name = "queries", description = "Inline and stored queries, and graph exports"),
@@ -173,9 +173,9 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_merge_base,
         handlers::server_changes_feed,
         handlers::server_changes_baseline,
-        maintenance::start_optimize,
-        maintenance::get_maintenance_operation,
-        maintenance::cancel_maintenance_operation,
+        recorded_operations::start_optimize,
+        recorded_operations::get_operation,
+        recorded_operations::cancel_operation,
     ),
     components(schemas(api::EntityKind, api::CommitListing, api::ChangeBaselineRecord, api::ChangeErrorOutput)),
     modifiers(&SecurityAddon),
@@ -427,8 +427,9 @@ pub struct AppState {
     // drain is not qualified native settlement, so the server never unlocks.
     cluster_admission: Option<omnigraph_cluster::ClusterAdmission>,
     deployments: Arc<deployment::DeploymentRuntime>,
-    /// Served maintenance: the record gate and the run this process holds.
-    maintenance: Arc<maintenance::MaintenanceRuntime>,
+    /// Recorded operations: the record gate, the admission gates and the
+    /// runs this process holds.
+    recorded: Arc<recorded_operations::RecordedOperations>,
     /// Runtime routing and availability for every configured graph.
     /// Middleware injects an admitted `serving::GraphRequest` or refuses a blocked
     /// graph before collecting its request body.
@@ -868,7 +869,7 @@ impl AppState {
         Self {
             cluster_admission: None,
             deployments: Arc::new(deployment::DeploymentRuntime::default()),
-            maintenance: Arc::new(maintenance::MaintenanceRuntime::default()),
+            recorded: Arc::new(recorded_operations::RecordedOperations::default()),
             routing: GraphRouting {
                 registry,
                 config_path: None,
@@ -923,7 +924,7 @@ impl AppState {
         Ok(Self {
             cluster_admission: None,
             deployments: Arc::new(deployment::DeploymentRuntime::default()),
-            maintenance: Arc::new(maintenance::MaintenanceRuntime::default()),
+            recorded: Arc::new(recorded_operations::RecordedOperations::default()),
             routing: GraphRouting {
                 registry,
                 config_path,
@@ -1053,11 +1054,11 @@ impl AppState {
         self
     }
 
-    /// Attach the served maintenance settings; the routes are off without
+    /// Attach the recorded-operation settings; the routes are off without
     /// them.
     #[must_use]
-    pub fn with_maintenance_settings(mut self, settings: MaintenanceSettings) -> Self {
-        self.maintenance = Arc::new(maintenance::MaintenanceRuntime::new(settings));
+    pub fn with_operation_settings(mut self, settings: OperationSettings) -> Self {
+        self.recorded = Arc::new(recorded_operations::RecordedOperations::new(settings));
         self
     }
 
@@ -4073,9 +4074,9 @@ async fn serve_config(
         )
         .with_process_defaults(process_defaults)
         .with_mcp_settings(mcp)
-        .with_maintenance_settings(
-            MaintenanceSettings::from_env()
-                .map_err(|error| eyre!("maintenance setting refused at startup: {error}"))?,
+        .with_operation_settings(
+            OperationSettings::from_env()
+                .map_err(|error| eyre!("operation setting refused at startup: {error}"))?,
         );
     deployment::initialize_boot_activation(&state);
     let retained_admission = state.cluster_admission.clone();

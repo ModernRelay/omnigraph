@@ -1133,36 +1133,37 @@ impl ClusterStore {
         Ok(())
     }
 
-    // ---- maintenance record ----
+    // ---- operation record ----
 
     /// The record and its backend version token, or `None` when the root has
     /// none yet. One bounded GET; a read error stays loud.
-    pub(crate) async fn read_maintenance(
+    pub(crate) async fn read_operations(
         &self,
-    ) -> Result<Option<(crate::maintenance::MaintenanceLedger, String)>, Diagnostic> {
-        let uri = self.uri(crate::maintenance::CLUSTER_MAINTENANCE_FILE);
+    ) -> Result<Option<(crate::operations::OperationRecord, String)>, Diagnostic> {
+        let uri = self.uri(crate::operations::CLUSTER_OPERATIONS_FILE);
         match self.read_versioned_opt(&uri).await {
-            Ok(Some((text, version))) => Ok(Some((crate::maintenance::decode(&text)?, version))),
+            Ok(Some((text, version))) => Ok(Some((crate::operations::decode(&text)?, version))),
             Ok(None) => Ok(None),
             Err(error) => Err(Diagnostic::error(
-                "maintenance_record_read_error",
-                crate::maintenance::CLUSTER_MAINTENANCE_FILE,
-                format!("could not read the maintenance record: {error}"),
+                "operation_record_read_error",
+                crate::operations::CLUSTER_OPERATIONS_FILE,
+                format!("could not read the operation record: {error}"),
             )),
         }
     }
 
     /// One conditional put of the record against the version the writer read
-    /// (`None`: the record must not exist yet). A backend error is no definite
-    /// answer, so it is reported in doubt, never as a conflict.
-    pub(crate) async fn write_maintenance(
+    /// (`None`: the record must not exist yet). The adapter re-issues an
+    /// ambiguous answer and reads the key back; what it still cannot settle
+    /// is reported in doubt, never as a conflict.
+    pub(crate) async fn write_operations(
         &self,
-        ledger: &crate::maintenance::MaintenanceLedger,
+        record: &crate::operations::OperationRecord,
         expected_version: Option<&str>,
-    ) -> Result<crate::maintenance::MaintenanceWrite, Diagnostic> {
-        use crate::maintenance::MaintenanceWrite;
-        let payload = crate::maintenance::encode(ledger)?;
-        let uri = self.uri(crate::maintenance::CLUSTER_MAINTENANCE_FILE);
+    ) -> Result<crate::operations::OperationWrite, Diagnostic> {
+        use crate::operations::OperationWrite;
+        let payload = crate::operations::encode(record)?;
+        let uri = self.uri(crate::operations::CLUSTER_OPERATIONS_FILE);
         let answer = match expected_version {
             None => self
                 .adapter
@@ -1176,17 +1177,15 @@ impl ClusterStore {
                 .map(|written| written.map(Some)),
         };
         Ok(match answer {
-            Ok(Some(Some(version))) => MaintenanceWrite::Written { version },
+            Ok(Some(Some(version))) => OperationWrite::Written { version },
             // A create answers no token; the next write reads one back.
             Ok(Some(None)) => match self.read_versioned_opt(&uri).await {
-                Ok(Some((text, version))) if text == payload => {
-                    MaintenanceWrite::Written { version }
-                }
-                Ok(_) => MaintenanceWrite::Conflict,
-                Err(error) => MaintenanceWrite::InDoubt { error },
+                Ok(Some((text, version))) if text == payload => OperationWrite::Written { version },
+                Ok(_) => OperationWrite::Conflict,
+                Err(error) => OperationWrite::InDoubt { error },
             },
-            Ok(None) => MaintenanceWrite::Conflict,
-            Err(error) => MaintenanceWrite::InDoubt {
+            Ok(None) => OperationWrite::Conflict,
+            Err(error) => OperationWrite::InDoubt {
                 error: error.to_string(),
             },
         })
