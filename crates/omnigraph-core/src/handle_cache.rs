@@ -5,6 +5,7 @@ use std::sync::Arc;
 use lance::Dataset;
 use lance::io::WrappingObjectStore;
 use lance::session::Session;
+use lance_core::deepsize::DeepSizeOf;
 use lance_io::object_store::ChainedWrappingObjectStore;
 use tokio::sync::Mutex;
 
@@ -58,14 +59,39 @@ where
         self.lru.clear();
     }
 
+    /// Remove one entry, returning its value.
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        let value = self.entries.remove(key)?;
+        self.lru.retain(|existing| existing != key);
+        Some(value)
+    }
+
+    /// Remove the least recently used entry.
+    pub fn pop_oldest(&mut self) -> Option<(K, V)> {
+        while let Some(oldest) = self.lru.pop_front() {
+            if let Some(value) = self.entries.remove(&oldest) {
+                return Some((oldest, value));
+            }
+        }
+        None
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.entries.values()
+    }
+
     #[cfg(any(test, feature = "test-util"))]
     pub fn contains_key(&self, key: &K) -> bool {
         self.entries.contains_key(key)
     }
 
-    #[cfg(any(test, feature = "test-util"))]
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn keys_by_recency(&self) -> Vec<K> {
+        self.lru.iter().cloned().collect()
     }
 
     pub fn touch(&mut self, key: K) {
@@ -74,12 +100,18 @@ where
     }
 }
 
-/// Max held `Dataset` handles. A handle holds only Arcs (object store + manifest),
-/// never table data, so this is cheap; it bounds how many `(table, branch,
-/// version, e_tag)` cells stay warm. One graph's live table set across a couple
-/// of branches at the current version fits comfortably, with headroom for the
-/// recently-superseded versions left by writes until they age out.
+/// Most held `Dataset` handles.
 const TABLE_HANDLE_CACHE_CAP: usize = 64;
+
+/// Most bytes of decoded Lance manifest the held handles keep alive, weighed
+/// as Lance weighs a manifest in its own metadata cache (`DeepSizeOf`). A
+/// manifest lists every fragment of its version, so one handle's size is
+/// linear in the table's fragment count; the count cap alone let 64 versions
+/// of one hot table hold 64 copies of its fragment list (issue 859). The
+/// newest entry is always admitted, so a single larger manifest still stays
+/// warm. Evicting an entry costs at most one reopen; keys are version-exact,
+/// so it never changes a result.
+const TABLE_HANDLE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableHandleKey {
@@ -92,6 +124,24 @@ pub struct TableHandleKey {
     pub e_tag: Option<String>,
 }
 
+impl TableHandleKey {
+    pub fn new(
+        table_path: &str,
+        table_branch: Option<&str>,
+        version: u64,
+        staged_version: Option<u64>,
+        e_tag: Option<&str>,
+    ) -> Self {
+        Self {
+            table_path: table_path.to_string(),
+            table_branch: table_branch.map(str::to_string),
+            version,
+            staged_version,
+            e_tag: e_tag.map(str::to_string),
+        }
+    }
+}
+
 /// Held open-`Dataset` handles keyed by `(table_path, branch, version, pin,
 /// e_tag)` — the version-keyed analogue of LanceDB's `DatasetConsistencyWrapper`
 /// (`rust/lancedb/src/table/dataset.rs`). A warm read reuses a held handle with
@@ -99,15 +149,37 @@ pub struct TableHandleKey {
 /// the shared `Session`. Version, pin and e_tag are in the key, so a write (or a
 /// delete/recreate that reuses a version number on object stores with e_tags) is
 /// simply a new key. A same-branch manifest refresh clears this cache as the
-/// fallback for e_tag-less table locations. Only read-path Data opens use this —
-/// writes open HEAD directly and never receive a pinned handle.
+/// fallback for e_tag-less table locations. Live branch reads and the pinned
+/// base a writer stages on both open through it.
+///
+/// Retention is bounded twice: by entry count and by the decoded manifest
+/// bytes the entries keep alive (`TABLE_HANDLE_CACHE_BYTES`). A writer that
+/// publishes a new pin evicts the pin it staged on (`evict`), so a steadily
+/// written table holds its current version, not its recent history.
 #[derive(Default)]
 pub struct TableHandleCache {
     inner: Mutex<TableHandleCacheInner>,
 }
 
 struct TableHandleCacheInner {
-    entries: LruMap<TableHandleKey, Dataset>,
+    entries: LruMap<TableHandleKey, HeldHandle>,
+    byte_budget: usize,
+}
+
+struct HeldHandle {
+    dataset: Dataset,
+    /// `DeepSizeOf` of the dataset's manifest, measured once on admission.
+    manifest_bytes: usize,
+}
+
+/// What the held handles occupy: the count and the decoded manifest bytes the
+/// byte budget weighs.
+#[cfg(any(test, feature = "test-util"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HandleCacheOccupancy {
+    pub handles: usize,
+    pub fragments: usize,
+    pub manifest_bytes: usize,
 }
 
 impl TableHandleCache {
@@ -136,17 +208,11 @@ impl TableHandleCache {
         session: Option<&Arc<Session>>,
         statement_wrapper: Option<Arc<crate::read_memo::RangeMemoWrapper>>,
     ) -> Result<Dataset> {
-        let key = TableHandleKey {
-            table_path: dataset_path.to_string(),
-            table_branch: table_branch.map(str::to_string),
-            version,
-            staged_version,
-            e_tag: e_tag.map(str::to_string),
-        };
+        let key = TableHandleKey::new(dataset_path, table_branch, version, staged_version, e_tag);
         {
             let mut inner = self.inner.lock().await;
-            if let Some(ds) = inner.entries.get(&key).cloned() {
-                return Ok(ds);
+            if let Some(held) = inner.entries.get(&key) {
+                return Ok(held.dataset.clone());
             }
         }
         let memo = statement_wrapper.clone();
@@ -177,11 +243,19 @@ impl TableHandleCache {
         if let (Some(memo), Some(session)) = (memo, session) {
             memo.register_dataset(&ds, session).await;
         }
+        // O(fragments), like the decode this miss already paid.
+        let manifest_bytes = ds.manifest().deep_size_of();
         let mut inner = self.inner.lock().await;
-        if let Some(existing) = inner.entries.get(&key).cloned() {
-            return Ok(existing);
+        if let Some(existing) = inner.entries.get(&key) {
+            return Ok(existing.dataset.clone());
         }
-        inner.insert(key, ds.clone());
+        inner.insert(
+            key,
+            HeldHandle {
+                dataset: ds.clone(),
+                manifest_bytes,
+            },
+        );
         Ok(ds)
     }
 
@@ -195,21 +269,70 @@ impl TableHandleCache {
         staged_version: Option<u64>,
         e_tag: Option<&str>,
     ) -> Option<Dataset> {
-        let key = TableHandleKey {
-            table_path: dataset_path.to_string(),
-            table_branch: table_branch.map(str::to_string),
-            version,
-            staged_version,
-            e_tag: e_tag.map(str::to_string),
-        };
+        let key = TableHandleKey::new(dataset_path, table_branch, version, staged_version, e_tag);
         let mut inner = self.inner.lock().await;
-        inner.entries.get(&key).cloned()
+        inner.entries.get(&key).map(|held| held.dataset.clone())
+    }
+
+    /// Drop the handle for exactly this pin, if held. A writer calls it for
+    /// the pin it staged on once its publication names a newer one: that
+    /// version left the branch's working set. A reader still at the old pin
+    /// keeps its own `Dataset` clone; one that opens it again pays one open.
+    pub async fn evict(&self, key: &TableHandleKey) {
+        let mut inner = self.inner.lock().await;
+        inner.entries.remove(key);
+    }
+
+    /// The held handles' count, fragment entries and weighed manifest bytes.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn occupancy(&self) -> HandleCacheOccupancy {
+        let inner = self.inner.lock().await;
+        inner
+            .entries
+            .values()
+            .fold(HandleCacheOccupancy::default(), |mut total, held| {
+                total.handles += 1;
+                total.fragments += held.dataset.manifest().fragments.len();
+                total.manifest_bytes += held.manifest_bytes;
+                total
+            })
+    }
+
+    #[cfg(test)]
+    fn with_limits(cap: usize, byte_budget: usize) -> Self {
+        Self {
+            inner: Mutex::new(TableHandleCacheInner {
+                entries: LruMap::new(cap),
+                byte_budget,
+            }),
+        }
+    }
+
+    /// The keys held, least recently used first.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn held_keys(&self) -> Vec<TableHandleKey> {
+        let inner = self.inner.lock().await;
+        inner.entries.keys_by_recency()
     }
 }
 
 impl TableHandleCacheInner {
-    fn insert(&mut self, key: TableHandleKey, value: Dataset) {
+    /// Admit `key`, then evict least recently used entries until the held
+    /// manifests fit the byte budget. The newest entry always stays.
+    fn insert(&mut self, key: TableHandleKey, value: HeldHandle) {
         self.entries.insert(key, value);
+        while self.entries.len() > 1
+            && self
+                .entries
+                .values()
+                .map(|held| held.manifest_bytes)
+                .sum::<usize>()
+                > self.byte_budget
+        {
+            if self.entries.pop_oldest().is_none() {
+                break;
+            }
+        }
     }
 }
 
@@ -217,6 +340,130 @@ impl Default for TableHandleCacheInner {
     fn default() -> Self {
         Self {
             entries: LruMap::new(TABLE_HANDLE_CACHE_CAP),
+            byte_budget: TABLE_HANDLE_CACHE_BYTES,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{DataType, Field, Schema};
+    use lance::dataset::{WriteMode, WriteParams};
+
+    use super::*;
+
+    /// One Lance table with `versions` versions; version `v` lists `v`
+    /// fragments, the shape a steadily appended graph table has.
+    async fn appended_table(uri: &str, versions: u64) {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        for v in 1..=versions {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![v as i32]))],
+            )
+            .unwrap();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            let mode = if v == 1 {
+                WriteMode::Create
+            } else {
+                WriteMode::Append
+            };
+            let params = WriteParams {
+                mode,
+                ..Default::default()
+            };
+            Dataset::write(reader, uri, Some(params)).await.unwrap();
+        }
+    }
+
+    async fn open(cache: &TableHandleCache, uri: &str, version: u64) -> Dataset {
+        cache
+            .get_or_open("t", None, version, None, None, None, None, uri, None, None)
+            .await
+            .unwrap()
+    }
+
+    /// Issue 859: every commit of a hot table is a new key, and each held
+    /// version decodes its own fragment list, so a count cap alone held 64
+    /// copies of it. The byte budget keeps the held manifests within bounds
+    /// whatever the commit count, and the newest version stays held.
+    #[tokio::test]
+    async fn superseded_versions_fit_the_manifest_byte_budget_issue_859() {
+        const VERSIONS: u64 = 80;
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("t.lance");
+        let uri = uri.to_str().unwrap();
+        appended_table(uri, VERSIONS).await;
+
+        let newest_bytes = open(&TableHandleCache::default(), uri, VERSIONS)
+            .await
+            .manifest()
+            .deep_size_of();
+        let budget = 4 * newest_bytes;
+        let cache = TableHandleCache::with_limits(TABLE_HANDLE_CACHE_CAP, budget);
+        for version in 1..=VERSIONS {
+            open(&cache, uri, version).await;
+            let occupancy = cache.occupancy().await;
+            assert!(
+                occupancy.manifest_bytes <= budget,
+                "after version {version}: {occupancy:?} exceeds the {budget}-byte budget"
+            );
+        }
+        let held = cache.held_keys().await;
+        assert_eq!(
+            held.last().map(|key| key.version),
+            Some(VERSIONS),
+            "the newest version stays held"
+        );
+        assert!(
+            held.len() < TABLE_HANDLE_CACHE_CAP,
+            "the byte budget, not the count cap, bounded {} held versions",
+            held.len()
+        );
+    }
+
+    /// A manifest larger than the whole budget is still admitted alone, so
+    /// the newest open is always warm.
+    #[tokio::test]
+    async fn newest_handle_is_admitted_over_the_byte_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("t.lance");
+        let uri = uri.to_str().unwrap();
+        appended_table(uri, 3).await;
+
+        let cache = TableHandleCache::with_limits(TABLE_HANDLE_CACHE_CAP, 1);
+        open(&cache, uri, 2).await;
+        open(&cache, uri, 3).await;
+        let held = cache.held_keys().await;
+        assert_eq!(held.iter().map(|key| key.version).collect::<Vec<_>>(), [3]);
+    }
+
+    /// `evict` drops exactly the named pin and leaves every other held.
+    #[tokio::test]
+    async fn evict_drops_only_the_named_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("t.lance");
+        let uri = uri.to_str().unwrap();
+        appended_table(uri, 3).await;
+
+        let cache = TableHandleCache::default();
+        for version in 1..=3 {
+            open(&cache, uri, version).await;
+        }
+        cache
+            .evict(&TableHandleKey::new("t", None, 2, None, None))
+            .await;
+        cache
+            .evict(&TableHandleKey::new("t", Some("other"), 3, None, None))
+            .await;
+        let held = cache.held_keys().await;
+        assert_eq!(
+            held.iter().map(|key| key.version).collect::<Vec<_>>(),
+            [1, 3]
+        );
+        assert_eq!(cache.occupancy().await.handles, 2);
     }
 }
