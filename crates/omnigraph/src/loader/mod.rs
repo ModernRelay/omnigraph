@@ -831,6 +831,12 @@ async fn load_jsonl_reader_once<R: BufRead>(
     })?;
     let catalog = Arc::clone(&txn.catalog);
     let snapshot = txn.base.clone();
+    let mut planning = snapshot.clone();
+    planning.set_read_caches(crate::db::manifest::SnapshotReadCaches {
+        session: db.read_caches().session.clone(),
+        handles: db.read_caches().handles.clone(),
+        table_wrapper: None,
+    });
 
     // Phase 1: Parse all lines, spool into per-type collections
     let mut node_rows: HashMap<String, Vec<JsonValue>> = HashMap::new();
@@ -856,7 +862,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
         executed.source_bytes = source.bytes.size();
         let decision = plan_load(
             &catalog,
-            &snapshot,
+            &planning,
             request,
             source.bytes.size(),
             memory.limit(),
@@ -1268,25 +1274,17 @@ async fn load_jsonl_reader_once<R: BufRead>(
             (vec![judged], Vec::new())
         }
         None if tables.is_empty() => (Vec::new(), Vec::new()),
-        None => {
-            let mut planning = snapshot.clone();
-            planning.set_read_caches(crate::db::manifest::SnapshotReadCaches {
-                session: db.read_caches().session.clone(),
-                handles: db.read_caches().handles.clone(),
-                table_wrapper: None,
-            });
-            crate::validate::plan::plan_write(
-                &planning,
-                &catalog,
-                WriteKind::Load,
-                CommittedSide::Base,
-                tables,
-                write_budget.bytes(),
-            )
-            .await?
-            .into_iter()
-            .unzip()
-        }
+        None => crate::validate::plan::plan_write(
+            &planning,
+            &catalog,
+            WriteKind::Load,
+            CommittedSide::Base,
+            tables,
+            write_budget.bytes(),
+        )
+        .await?
+        .into_iter()
+        .unzip(),
     };
     let loaded_rows: usize = result
         .nodes_loaded
@@ -1506,7 +1504,7 @@ async fn publish_staged_load(
         detached: _,
         gates: _held_gates,
     } = staged
-        .commit_all(db, branch, txn)
+        .commit_all(db, branch, txn, None)
         .await
         .map_err(OmniError::unpublished)?;
     fail(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER).map_err(OmniError::unpublished)?;

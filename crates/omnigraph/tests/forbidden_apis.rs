@@ -1121,7 +1121,7 @@ durable_calls! {
     ("db/omnigraph/table_ops.rs", ".commit_staged(", 1, WriteProtocol::Composed("shared merge/Optimize index tail")),
     ("db/omnigraph/table_ops.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached index batch")),
     ("exec/staging.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("Mutation/Load detached staging (RFC 0067)")),
-    ("exec/staging.rs", ".dataset()", 1, WriteProtocol::Exact("Mutation/Load detached staging (RFC 0067)")),
+    ("exec/staging.rs", ".dataset()", 2, WriteProtocol::Exact("Mutation/Load detached staging (RFC 0067)")),
     ("exec/mutation.rs", "commit_updates_on_branch_with_expected(", 1, MUTATION_V9),
     ("loader/mod.rs", "commit_updates_on_branch_with_expected(", 1, LOAD_V9),
     ("exec/merge.rs", "commit_updates_on_branch_with_expected(", 1, MERGE_V9),
