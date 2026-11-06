@@ -27,6 +27,9 @@ pub mod conditional;
 use conditional::{Answer, ConditionalRequest, Resolution, Step};
 pub use conditional::{CONDITIONAL_REQUEST_REISSUES, RequestClient};
 
+mod read_through;
+pub use read_through::{FrozenDirectory, ReadThroughStore};
+
 pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// The typed condition established at a storage-substrate boundary.
@@ -1494,6 +1497,27 @@ impl ObjectStorageAdapter {
     pub fn in_memory() -> Self {
         Self {
             store: Arc::new(InMemory::new()),
+            scope: None,
+            codec: UriCodec::Memory,
+            supports_conditional_update: true,
+            #[cfg(test)]
+            omit_read_etag: false,
+            #[cfg(test)]
+            omit_write_etag: false,
+        }
+    }
+
+    /// A prepared store under DST: the in-memory backend over a frozen
+    /// directory mounted at `prefix` ([`ReadThroughStore`]), so reads of the
+    /// directory's objects fall through to it, every write stays in memory,
+    /// and conditional updates keep the memory backend's full contract.
+    pub fn read_through(frozen: Arc<FrozenDirectory>, prefix: ObjectPath) -> Self {
+        Self {
+            store: Arc::new(ReadThroughStore::new(
+                Arc::new(InMemory::new()),
+                frozen,
+                prefix,
+            )),
             scope: None,
             codec: UriCodec::Memory,
             supports_conditional_update: true,

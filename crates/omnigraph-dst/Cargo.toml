@@ -33,13 +33,14 @@ tokio = { workspace = true, features = ["test-util"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
+# The frozen directory a prepared store mounts, and the control-object
+# adapter the cluster lock's protocol writes through in `scenarios.rs`.
+omnigraph-storage = { path = "../omnigraph-storage", version = "0.15.0" }
 
 [dev-dependencies]
 serial_test = "3"
 # The cluster lock's lease protocol, simulated in `scenarios.rs`.
 omnigraph-cluster = { path = "../omnigraph-cluster", version = "0.15.0", features = ["test-util"] }
-# The control-object adapter that protocol writes through.
-omnigraph-storage = { path = "../omnigraph-storage", version = "0.15.0" }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)"] }

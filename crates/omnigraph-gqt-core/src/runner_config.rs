@@ -53,7 +53,7 @@ impl Environment {
             Execution::Engine { storage } => storage,
             Execution::Dst { .. } => {
                 let root = uri.strip_prefix("file://").ok_or(
-                    "invalid_case: under omnigraph-engine-dst --store takes a file:// root, restored into the in-memory environment",
+                    "invalid_case: under omnigraph-engine-dst --store takes a file:// root, read through below the in-memory environment",
                 )?;
                 if !std::path::Path::new(root).is_dir() {
                     return Err(format!(
