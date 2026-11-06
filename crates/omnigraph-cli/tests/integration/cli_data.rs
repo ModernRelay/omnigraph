@@ -1253,10 +1253,11 @@ fn index_build_builds_missing_and_lagging_indexes_on_a_branch_issue_840() {
 
 #[test]
 fn maintenance_refuses_server_targets_before_network() {
+    // `optimize` runs served maintenance on a server target; the rest are
+    // direct-storage commands.
     let server = crate::support::managed_http::IntentApiFixture::graph(Vec::new());
     for command in [
-        &["optimize"][..],
-        &["index", "build"],
+        &["index", "build"][..],
         &["index", "rebuild", "--kind", "full-text"],
         &["rebuild-full-text-indexes"],
         &["repair"],

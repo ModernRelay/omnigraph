@@ -12,6 +12,7 @@ use crate::output::{
 };
 
 pub(crate) mod args;
+mod served;
 pub(crate) use args::{
     CleanupArgs, IndexBuildArgs, IndexCommand, IndexRebuildArgs, IndexRebuildKind, OptimizeArgs,
     RebuildFullTextIndexesArgs, RepairArgs, UpgradeArgs,
@@ -45,16 +46,53 @@ pub(crate) async fn run_optimize(
     let OptimizeArgs {
         tables,
         max_gate_hold,
+        no_wait,
+        operation,
+        timeout,
         json,
     } = args;
+    let max_gate_hold = max_gate_hold
+        .as_deref()
+        .map(parse_duration_arg)
+        .transpose()?;
+    if matches!(
+        scope.target.binding,
+        crate::targets::TargetBinding::Server { .. } | crate::targets::TargetBinding::Managed(_)
+    ) {
+        let client = crate::client::GraphClient::from_target(
+            scope.operator,
+            scope.target,
+            scope.graph,
+            None,
+            stderr,
+        )
+        .await?;
+        let timeout = timeout.as_deref().map(parse_duration_arg).transpose()?;
+        return served::run(
+            &client,
+            served::ServedOptimize {
+                tables,
+                max_gate_hold,
+                no_wait,
+                operation,
+                timeout,
+                json,
+            },
+            stdout,
+            stderr,
+        )
+        .await;
+    }
+    if no_wait || operation.is_some() || timeout.is_some() {
+        bail!("--no-wait, --operation and --timeout apply to a server target only");
+    }
     let mut request = omnigraph::db::OptimizeRequest::default();
     if !tables.is_empty() {
         request = request.with_tables(tables);
     }
     if let Some(hold) = max_gate_hold {
-        request = request.with_limits(
-            omnigraph::db::OptimizeLimits::default().with_max_gate_hold(parse_duration_arg(&hold)?),
-        );
+        request =
+            request.with_limits(omnigraph::db::OptimizeLimits::default().with_max_gate_hold(hold));
     }
     let uri = crate::scope::direct_graph_uri(scope.target, scope.graph).await?;
     let binding = crate::scope::capture_storage_binding(scope.target)?.for_uri(&uri)?;

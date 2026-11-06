@@ -32,7 +32,7 @@ commit-page default remains with the separate pagination design.
 | `flat-path` | `/readyz` | `get=readiness` | Process probe. |
 | `flat-path` | `/.well-known/oauth-protected-resource` | `get=oauthProtectedResourceMetadata` | RFC 9728 path; retain the SDK name for compatibility. |
 | `flat-path` | `/.well-known/oauth-protected-resource/{resource_path}` | `get=oauthProtectedResourceMetadataAtResourcePath` | RFC 9728 path; retain the SDK name for compatibility. |
-| `path-parameters` | New path parameters | `graph_id branch_name commit_id query_name deployment_id resource_path` | Resource-qualified names; OAuth keeps its protocol name. |
+| `path-parameters` | New path parameters | `graph_id branch_name commit_id query_name deployment_id maintenance_id resource_path` | Resource-qualified names; OAuth keeps its protocol name. |
 | `query-parameters` | Query parameter names | `snake_case` | Choices use one enum; commit listing uses history, unpublished or unattached. |
 | `parameter-descriptions` | Every parameter | `required` | Document meaning, defaults, and refusal conditions. |
 | `header-names` | Parameters and response headers | `Title-Case` | Standard headers keep their HTTP meaning. |

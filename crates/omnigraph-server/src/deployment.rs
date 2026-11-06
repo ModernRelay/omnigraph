@@ -563,6 +563,14 @@ async fn execute(
             }
         }
     }
+    // A maintenance run on an affected graph stops at its next safe boundary;
+    // the drain then waits for at most one table's rewrite, the publication,
+    // the configuration clear and an issued artifact write.
+    state.maintenance.cancel(
+        None,
+        Some(&affected),
+        &format!("deployment {}", request.deployment_id),
+    );
     let transition = state
         .routing
         .registry

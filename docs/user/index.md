@@ -49,6 +49,7 @@ deployment.
 - [Server logs and traces](operations/observability.md)
 - [Authorization and actors](operations/policy.md)
 - [Maintenance](operations/maintenance.md)
+- [Served maintenance](operations/served-maintenance.md)
 - [S3 cluster roots](operations/s3-cluster-roots.md): deployment, recovery and maintenance with the server stopped
 - [Upgrade from 0.13 to 0.14](operations/upgrade-0.14.md): checklist, YAML and CLI replacements
 - [Storage-format upgrades](operations/upgrade.md)

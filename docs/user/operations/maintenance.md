@@ -9,8 +9,8 @@ OmniGraph provides five direct-storage maintenance commands:
 - `cleanup` permanently removes unretained table versions and unused table
   forks left by branches created before storage format v11.
 
-They do not run through the HTTP server. Address a standalone graph directly,
-or select a graph from a cluster root:
+They do not run through the HTTP server; a cluster server runs optimize through
+[served maintenance](served-maintenance.md). Address a graph directly, or from a cluster root:
 
 ```bash
 omnigraph optimize --target ./graph.omni
