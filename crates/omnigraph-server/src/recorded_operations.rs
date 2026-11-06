@@ -9,17 +9,24 @@
 //! operation and holds its graph request, so a deployment that affects the
 //! graph cancels it before draining it, and shutdown cancels it too.
 //!
-//! Each admission scope has one in-process gate, a mutex taken with a try-lock
-//! by the handler and held by the owned operation until it drops, so the check
-//! of the scope's active slot, the registration and the acceptance put happen
-//! under one gate: two submissions cannot both read an empty slot and both
-//! start. The acceptance put is the operation's first step, not the handler's.
+//! The record has one writer in this process: every read a write follows and
+//! every write hold the cluster admission's record gate
+//! (`ClusterAdmission::lock_operations`), the deletion's settlement included,
+//! and the live runs this process holds change under that same gate, so a
+//! lookup never sees a run that has ended but whose record is still active.
+//! Each admission scope also has one in-process gate, a mutex taken with a
+//! try-lock by the handler and held by the owned operation until it drops. The
+//! acceptance put is the operation's first step, not the handler's, under the
+//! record gate the handler still holds: two submissions cannot both read an
+//! empty slot and both start, and a client disconnect cannot separate a
+//! durable acceptance from execution.
 //!
 //! A write whose answer is lost stops the run's writes. The next admission or
-//! lookup reads the record back: an `accepted` or `running` operation no live
-//! run holds is `interrupted`, a `publishing` one waits on its settlement
-//! branch's history, one page of the first-parent chain per attempt, and a
-//! lost terminal write is re-issued before any other.
+//! lookup re-applies the lost change to the record as it then stands, settles
+//! an `accepted` or `running` operation no live run holds as `interrupted`,
+//! and advances a `publishing` one by one page of its settlement branch's
+//! history, a walk that runs outside the gate and is applied only to a record
+//! whose cursor is still the one it started from.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as SyncMutex, PoisonError};
@@ -33,8 +40,8 @@ use omnigraph::db::{
 };
 use omnigraph_cluster::{
     AdmissionRefusal, AdmissionScope, Admitted, ClusterAdmission, Operation, OperationKind,
-    OperationRecord, OperationRequest, OperationState, OperationWrite, OptimizeOptions, Resolution,
-    TableOutcome, TailOutcome,
+    OperationRecord, OperationRequest, OperationState, OperationWrite, OperationsLock,
+    OperationsUpdate, OptimizeOptions, Resolution, ResolutionProgress, TableOutcome, TailOutcome,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
@@ -208,20 +215,23 @@ struct LiveRun {
     cancel_reason: Option<String>,
 }
 
-#[derive(Default)]
-struct RecordState {
-    /// A terminal write whose answer was lost. This process alone writes the
-    /// record and knows the outcome, so it is re-issued against whatever a
-    /// re-read shows before any other write.
-    unsettled: Option<OperationRecord>,
+/// A final record write whose answer was lost. The outcome is known here, so
+/// the change is applied again to the record as it stands at the next access,
+/// never as an old snapshot over a newer record.
+enum PendingEnding {
+    Finish(Box<Operation>),
+    Defer {
+        operation_id: String,
+        reason: String,
+    },
 }
 
 pub(crate) struct RecordedOperations {
     settings: OperationSettings,
-    /// Serializes every read and write of the record in this process.
-    record: Arc<Mutex<RecordState>>,
+    pending: SyncMutex<Option<PendingEnding>>,
     /// One admission gate per scope, held by the owned operation.
     gates: BTreeMap<AdmissionScope, Arc<Mutex<()>>>,
+    /// The runs this process holds; changed only under the record gate.
     live: SyncMutex<Vec<LiveRun>>,
 }
 
@@ -235,7 +245,7 @@ impl RecordedOperations {
     pub(crate) fn new(settings: OperationSettings) -> Self {
         Self {
             settings,
-            record: Arc::default(),
+            pending: SyncMutex::default(),
             gates: BTreeMap::from([(AdmissionScope::Maintenance, Arc::default())]),
             live: SyncMutex::default(),
         }
@@ -257,12 +267,30 @@ impl RecordedOperations {
             .push(run);
     }
 
-    fn clear_live(&self, operation_id: &str) -> Option<String> {
+    fn clear_live(&self, operation_id: &str) {
         let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
-        let index = live
+        live.retain(|run| run.operation_id != operation_id);
+    }
+
+    fn cancel_reason(&self, operation_id: &str) -> Option<String> {
+        self.live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .position(|run| run.operation_id == operation_id)?;
-        live.remove(index).cancel_reason
+            .find(|run| run.operation_id == operation_id)
+            .and_then(|run| run.cancel_reason.clone())
+    }
+
+    /// [`Self::cancel`] under the record gate, so a submission mid-admission
+    /// is either not yet accepted or already live and told.
+    pub(crate) fn cancel_under(
+        &self,
+        _lock: &OperationsLock,
+        operation_id: Option<&str>,
+        graphs: Option<&[String]>,
+        reason: &str,
+    ) -> bool {
+        self.cancel(operation_id, graphs, reason)
     }
 
     /// Cancel the live run `operation_id` (every live run when `None`) on one
@@ -407,73 +435,20 @@ fn request_mismatch(operation_id: &str) -> ApiError {
     ))
 }
 
-/// The record, read under the gate after settling a lost terminal write, and
-/// checked against the cluster's ledger.
-struct Loaded {
-    record: OperationRecord,
-    version: Option<String>,
-    outstanding_deployment: Option<String>,
-}
-
-async fn load(owner: &ClusterAdmission, state: &mut RecordState) -> Result<Loaded, ApiError> {
-    let (ledger_id, outstanding_deployment) = owner.operations_context().await.map_err(refusal)?;
-    let mut read = owner.read_operations().await.map_err(refusal)?;
-    if let Some(intended) = state.unsettled.as_ref() {
-        match &read {
-            Some((current, _)) if current == intended => {}
-            _ => {
-                let expected = read.as_ref().map(|(_, version)| version.as_str());
-                match owner
-                    .write_operations(intended, expected)
-                    .await
-                    .map_err(refusal)?
-                {
-                    OperationWrite::Written { version } => {
-                        read = Some((intended.clone(), version));
-                    }
-                    OperationWrite::Conflict => {
-                        return Err(ApiError::conflict(
-                            "the operation record changed while a terminal write was unsettled",
-                        ));
-                    }
-                    OperationWrite::InDoubt { error } => {
-                        return Err(ApiError::new(
-                            ErrorCode::OutcomeUnknown,
-                            format!(
-                                "a terminal operation record write is still unsettled ({error}); retry later"
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-        state.unsettled = None;
-    }
-    let (record, version) = match read {
-        Some((record, version)) => (record, Some(version)),
-        None => (OperationRecord::new(ledger_id.clone()), None),
+/// One page of the settlement branch's history for each unresolved
+/// publication, read outside the record gate from the record as it stands.
+/// Each answer carries the resolution progress it started from, so the gate
+/// applies it only to a record that has not moved on since.
+async fn walk_unresolved(
+    state: &AppState,
+    owner: &ClusterAdmission,
+) -> Vec<(String, Option<ResolutionProgress>, Resolution)> {
+    let Ok(Some((record, _))) = owner.peek_operations().await else {
+        return Vec::new();
     };
-    if record.ledger_id != ledger_id {
-        return Err(ApiError::conflict(format!(
-            "[operation_record_foreign] the operation record names ledger {} but this cluster's ledger is {ledger_id}; move the record aside",
-            record.ledger_id
-        )));
-    }
-    Ok(Loaded {
-        record,
-        version,
-        outstanding_deployment,
-    })
-}
-
-/// Settle operations no live run holds, then advance each unresolved
-/// publication whose graph this server serves by one page of its settlement
-/// branch's history.
-async fn resolve(state: &AppState, record: &mut OperationRecord) -> bool {
-    let live = state.recorded.live_ids();
-    let mut changed = record.interrupt_orphans(&live);
     let limit = state.recorded.settings.resolution_walk_limit;
-    for operation in record.unresolved.clone() {
+    let mut walks = Vec::new();
+    for operation in &record.unresolved {
         let (Some(nonce), Some(version)) = (&operation.nonce, operation.input_manifest_version)
         else {
             continue;
@@ -532,42 +507,100 @@ async fn resolve(state: &AppState, record: &mut OperationRecord) -> bool {
                 ),
             },
         };
-        changed |= record.settle(&operation.operation_id, resolution);
+        walks.push((
+            operation.operation_id.clone(),
+            operation.resolution.clone(),
+            resolution,
+        ));
     }
-    changed
+    walks
 }
 
-/// Load and resolve under the gate, writing the resolution when it changed
-/// the record.
-async fn load_resolved(
+fn record_refusal(error: omnigraph_cluster::Diagnostic) -> ApiError {
+    match error.code.as_str() {
+        "operation_record_outcome_unknown" => ApiError::new(
+            ErrorCode::OutcomeUnknown,
+            format!(
+                "{}; look the operation up by its id before submitting another",
+                error.message
+            ),
+        ),
+        _ => refusal(error),
+    }
+}
+
+/// Every record change this process makes, under the gate: a pending ending
+/// re-applied, orphans settled, the walks applied where the record still
+/// matches, then `change`. The record comes back as written.
+async fn update<T>(
     state: &AppState,
     owner: &ClusterAdmission,
-    guard: &mut RecordState,
-) -> Result<Loaded, ApiError> {
-    let mut loaded = load(owner, guard).await?;
-    if resolve(state, &mut loaded.record).await {
-        match owner
-            .write_operations(&loaded.record, loaded.version.as_deref())
-            .await
-            .map_err(refusal)?
-        {
-            OperationWrite::Written { version } => loaded.version = Some(version),
-            OperationWrite::Conflict => {
-                return Err(ApiError::conflict(
-                    "the operation record changed during resolution; retry",
-                ));
+    lock: &OperationsLock,
+    walks: &[(String, Option<ResolutionProgress>, Resolution)],
+    change: impl FnOnce(&mut OperationRecord) -> (bool, T),
+) -> Result<OperationsUpdate<T>, ApiError> {
+    let pending = state
+        .recorded
+        .pending
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    let live = state.recorded.live_ids();
+    let outcome = owner
+        .update_operations(lock, |record| {
+            let mut changed = false;
+            if let Some(pending) = &pending {
+                changed |= match pending {
+                    PendingEnding::Finish(operation) => {
+                        record.active_mut(&operation.operation_id).is_some()
+                            && record.finish((**operation).clone()).is_ok()
+                    }
+                    PendingEnding::Defer {
+                        operation_id,
+                        reason,
+                    } => {
+                        record.active_mut(operation_id).is_some()
+                            && record
+                                .defer_publication(operation_id, reason.clone())
+                                .is_ok()
+                    }
+                };
             }
-            OperationWrite::InDoubt { error } => {
-                return Err(ApiError::new(
-                    ErrorCode::OutcomeUnknown,
-                    format!(
-                        "resolving the operation record has no definite answer ({error}); retry later"
-                    ),
-                ));
+            changed |= record.interrupt_orphans(&live);
+            for (operation_id, started_at, resolution) in walks {
+                if record
+                    .unresolved
+                    .iter()
+                    .any(|op| op.operation_id == *operation_id && op.resolution == *started_at)
+                {
+                    changed |= record.settle(operation_id, resolution.clone());
+                }
             }
+            let (more, value) = change(record);
+            Ok((changed || more, value))
+        })
+        .await;
+    match outcome {
+        Ok(update) => Ok(update),
+        Err(error) => {
+            if let Some(pending) = pending
+                && error.code == "operation_record_outcome_unknown"
+            {
+                *state
+                    .recorded
+                    .pending
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(pending);
+            }
+            Err(record_refusal(error))
         }
     }
-    Ok(loaded)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 fn output(state: &AppState, operation: Option<Operation>) -> (StatusCode, Json<OperationOutput>) {
@@ -593,12 +626,12 @@ fn output(state: &AppState, operation: Option<Operation>) -> (StatusCode, Json<O
     )
 }
 
-fn validate(settings: &OperationSettings, input: &StartOptimizeRequest) -> Result<(), ApiError> {
-    if !omnigraph_cluster::canonical_operation_id(&input.operation_id) {
-        return Err(ApiError::bad_request(
-            "operation_id must be a canonical ULID",
-        ));
-    }
+/// The ceiling a new request must respect; a repeat of a retained id is
+/// answered before this, so lowering the ceiling never hides a record.
+fn validate_new(
+    settings: &OperationSettings,
+    input: &StartOptimizeRequest,
+) -> Result<(), ApiError> {
     if let Some(hold) = input.max_gate_hold_ms
         && Duration::from_millis(hold) > settings.max_gate_hold
     {
@@ -641,40 +674,31 @@ pub(crate) async fn start_optimize(
     authorize(&handle, &actor, OperationKind::Optimize)?;
     state.recorded.require_enabled()?;
     let ApiJson(input) = request?;
-    validate(&state.recorded.settings, &input)?;
+    if !omnigraph_cluster::canonical_operation_id(&input.operation_id) {
+        return Err(ApiError::bad_request(
+            "operation_id must be a canonical ULID",
+        ));
+    }
     let owner = admission(&state)?;
     let graph = handle.key.graph_id.to_string();
     let principal = actor.actor_id.to_string();
     let kind = OperationKind::Optimize;
+    let schema_identity_domain = handle
+        .engine
+        .schema_contract_digest()
+        .schema_identity_domain;
 
-    // The scope's gate: taken here, held by the owned operation until it
-    // drops, so the slot check, the registration and the acceptance put are
-    // one admission.
-    let gate = state
-        .recorded
-        .gate(kind.scope())
-        .try_lock_owned()
-        .map_err(|_| {
-            ApiError::too_many_requests(format!(
-                "an operation is being admitted in the {} scope; retry",
-                kind.scope().as_str()
-            ))
-        })?;
-    let mut record = Arc::clone(&state.recorded.record).lock_owned().await;
-    let mut loaded = load_resolved(&state, &owner, &mut record).await?;
-    if let (Some(mark), Some(time)) = (
-        loaded.record.eviction_mark_ms,
-        omnigraph_cluster::operation_id_time_ms(&input.operation_id),
-    ) && time <= mark
-    {
-        return Err(ApiError::conflict(format!(
-            "[operation_id_expired] operation id {} is at or before the record's eviction mark; mint a new id",
-            input.operation_id
-        )));
-    }
+    let walks = walk_unresolved(&state, &owner).await;
+    let lock = owner.lock_operations().await;
+    let loaded = update(&state, &owner, &lock, &walks, |_| (false, ())).await?;
+    let OperationsUpdate {
+        record: mut admitted,
+        version,
+        outstanding_deployment,
+        ..
+    } = loaded;
     let start_at = if input.tables.is_none() {
-        loaded
-            .record
+        admitted
             .kind_state
             .optimize
             .get(&graph)
@@ -682,10 +706,6 @@ pub(crate) async fn start_optimize(
     } else {
         None
     };
-    let schema_identity_domain = handle
-        .engine
-        .schema_contract_digest()
-        .schema_identity_domain;
     let operation = Operation::accepted(
         input.operation_id.clone(),
         graph.clone(),
@@ -694,19 +714,22 @@ pub(crate) async fn start_optimize(
         principal,
         start_at,
     );
-    if let Some(existing) = loaded.record.find(&graph, &input.operation_id) {
+    // A retained id answers first, whatever the ceiling, the mark or the
+    // slot says: the same request returns the record, another is a mismatch.
+    if let Some(existing) = admitted.find(&graph, &input.operation_id) {
         return if existing.request_digest == operation.request_digest {
             Ok(output(&state, Some(existing.clone())))
         } else {
             Err(request_mismatch(&input.operation_id))
         };
     }
-    if let Some(deployment) = &loaded.outstanding_deployment {
+    validate_new(&state.recorded.settings, &input)?;
+    if let Some(deployment) = &outstanding_deployment {
         return Err(ApiError::conflict(format!(
             "deployment {deployment} is outstanding; submit the operation after it completes"
         )));
     }
-    match loaded.record.admit(operation.clone()) {
+    match admitted.admit(operation.clone(), now_ms()) {
         Ok(Admitted::New) => {}
         Ok(Admitted::Existing(existing)) => return Ok(output(&state, Some(*existing))),
         Err(AdmissionRefusal::DifferentRequest) => {
@@ -732,7 +755,25 @@ pub(crate) async fn start_optimize(
                 input.operation_id
             )));
         }
+        Err(AdmissionRefusal::FutureDated { latest_ms }) => {
+            return Err(ApiError::bad_request(format!(
+                "operation id {} is dated after this server's clock allows ({latest_ms} ms); mint an id from the current time",
+                input.operation_id
+            )));
+        }
     }
+    // The scope's gate: the active slot was free, so only a submission whose
+    // acceptance is in flight holds it, and the record gate orders that.
+    let gate = state
+        .recorded
+        .gate(kind.scope())
+        .try_lock_owned()
+        .map_err(|_| {
+            ApiError::too_many_requests(format!(
+                "an operation is being admitted in the {} scope; retry",
+                kind.scope().as_str()
+            ))
+        })?;
 
     let accepted_at = Instant::now();
     let (accepted, acceptance) = oneshot::channel::<Acceptance>();
@@ -745,14 +786,15 @@ pub(crate) async fn start_optimize(
         graph = %operation.graph,
     );
     let operation_id = input.operation_id.clone();
-    let admitted = loaded.record;
-    let version = loaded.version;
     let submitted = state.operations.submit(
         (ingress, handle, gate),
         async move {
             // The acceptance put is the operation's first step, under the
-            // record gate the handler still holds.
-            let written = owner.write_operations(&admitted, version.as_deref()).await;
+            // record gate the handler took; the run is live before the gate
+            // is released, so no lookup can see an accepted record no run holds.
+            let written = owner
+                .write_operations(&lock, &admitted, version.as_deref())
+                .await;
             let answer = match written {
                 Ok(OperationWrite::Written { .. }) => Ok(operation.clone()),
                 Ok(OperationWrite::Conflict) => Err(ApiError::conflict(
@@ -773,7 +815,7 @@ pub(crate) async fn start_optimize(
                     cancel_reason: None,
                 });
             }
-            drop(record);
+            drop(lock);
             let _ = accepted.send(answer);
             if !landed {
                 return OwnedResult::from(Ok(()));
@@ -789,37 +831,32 @@ pub(crate) async fn start_optimize(
             .await
         }
         .instrument(span),
-    );
-    let response = match submitted {
-        Ok(response) => response,
-        // Nothing was written: the gate and the record guard dropped with
-        // the future.
-        Err(error) => return Err(error),
-    };
-    let result = response.result();
+    )?;
+    let result = submitted.result();
     tokio::pin!(result);
     tokio::select! {
         biased;
         accepted = acceptance => match accepted {
             Ok(Ok(operation)) => Ok(output(&state, Some(operation))),
             Ok(Err(error)) => Err(error),
-            Err(_) => result.await.map(|()| output(&state, None)),
+            // The operation ended before it answered: read what it left.
+            Err(_) => {
+                result.await?;
+                let owner = admission(&state)?;
+                Ok(output(&state, owner_record(&owner, &input.operation_id).await))
+            }
         },
         result = &mut result => {
             result?;
-            let accepted = {
-                let _record = state.recorded.record.lock().await;
-                owner_record(&state, &input.operation_id).await
-            };
-            Ok(output(&state, accepted))
+            let owner = admission(&state)?;
+            Ok(output(&state, owner_record(&owner, &input.operation_id).await))
         }
     }
 }
 
 /// The operation as the record holds it, read for a response.
-async fn owner_record(state: &AppState, operation_id: &str) -> Option<Operation> {
-    let owner = state.cluster_admission.as_ref()?;
-    let (record, _) = owner.read_operations().await.ok()??;
+async fn owner_record(owner: &ClusterAdmission, operation_id: &str) -> Option<Operation> {
+    let (record, _) = owner.peek_operations().await.ok()??;
     record
         .operations()
         .find(|op| op.operation_id == operation_id)
@@ -833,24 +870,24 @@ async fn transition(
     operation_id: &str,
     change: impl FnOnce(&mut Operation),
 ) -> Result<(), String> {
-    let mut record = state.recorded.record.lock().await;
-    let mut loaded = load(owner, &mut record)
-        .await
-        .map_err(|error| error.message.to_string())?;
-    let Some(active) = loaded.record.active_mut(operation_id) else {
-        return Err(format!(
+    let lock = owner.lock_operations().await;
+    let updated = update(state, owner, &lock, &[], |record| {
+        match record.active_mut(operation_id) {
+            Some(active) => {
+                change(active);
+                (true, true)
+            }
+            None => (false, false),
+        }
+    })
+    .await
+    .map_err(|error| error.message.to_string())?;
+    if updated.value {
+        Ok(())
+    } else {
+        Err(format!(
             "operation {operation_id} no longer holds its scope's active slot"
-        ));
-    };
-    change(active);
-    match owner
-        .write_operations(&loaded.record, loaded.version.as_deref())
-        .await
-    {
-        Ok(OperationWrite::Written { .. }) => Ok(()),
-        Ok(OperationWrite::Conflict) => Err("the operation record changed".to_string()),
-        Ok(OperationWrite::InDoubt { error }) => Err(error),
-        Err(error) => Err(error.message),
+        ))
     }
 }
 
@@ -962,7 +999,7 @@ async fn run(
         .optimize_as(Some(operation.principal.as_str()), request)
         .await;
     watch.abort();
-    let cancel_reason = state.recorded.clear_live(&id);
+    let cancel_reason = state.recorded.cancel_reason(&id);
 
     operation.timings.queued_ms = Some(started.duration_since(accepted_at).as_millis() as u64);
     operation.timings.compute_ms = Some(started.elapsed().as_millis() as u64);
@@ -989,40 +1026,48 @@ async fn run(
                 Ending::Unresolved(format!("the publication has no definite answer: {message}"))
             } else {
                 operation.state = OperationState::Failed;
-                operation.reason = Some(message);
+                operation.reason = Some(omnigraph_cluster::truncate_detail(message));
                 Ending::Terminal(Box::new(operation))
             };
             (ending, Some(ApiError::from_omni(error)))
         }
     };
     {
-        let mut record = state.recorded.record.lock().await;
-        let written = async {
-            let mut loaded = load(&owner, &mut record).await.ok()?;
-            match &ending {
-                Ending::Terminal(terminal) => {
-                    loaded.record.finish((**terminal).clone()).ok()?;
-                }
-                Ending::Unresolved(reason) => {
-                    loaded.record.defer_publication(&id, reason.clone()).ok()?;
-                }
-                Ending::Silent => return Some(()),
-            }
-            match owner
-                .write_operations(&loaded.record, loaded.version.as_deref())
-                .await
-            {
-                Ok(OperationWrite::Written { .. }) => Some(()),
-                Ok(OperationWrite::InDoubt { .. }) if matches!(ending, Ending::Terminal(_)) => {
-                    record.unsettled = Some(loaded.record);
-                    Some(())
-                }
-                _ => None,
-            }
-        }
+        // The run leaves the live set in the same step as its final write, so
+        // a lookup under the gate never meets an ended run still marked active.
+        let lock = owner.lock_operations().await;
+        let pending = match &ending {
+            Ending::Terminal(terminal) => Some(PendingEnding::Finish(terminal.clone())),
+            Ending::Unresolved(reason) => Some(PendingEnding::Defer {
+                operation_id: id.clone(),
+                reason: reason.clone(),
+            }),
+            Ending::Silent => None,
+        };
+        let written = update(&state, &owner, &lock, &[], |record| {
+            let changed = match &ending {
+                Ending::Terminal(terminal) => record.finish((**terminal).clone()).is_ok(),
+                Ending::Unresolved(reason) => record.defer_publication(&id, reason.clone()).is_ok(),
+                Ending::Silent => false,
+            };
+            state.recorded.clear_live(&id);
+            (changed, ())
+        })
         .await;
-        if written.is_none() {
-            tracing::warn!(operation_id = %id, "the recorded operation's final record write did not land; a later read settles it");
+        if let Err(error) = written {
+            // The outcome is known here; it is applied again at the next
+            // access to the record as it then stands.
+            state.recorded.clear_live(&id);
+            if error.code == ErrorCode::OutcomeUnknown
+                && let Some(pending) = pending
+            {
+                *state
+                    .recorded
+                    .pending
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(pending);
+            }
+            tracing::warn!(operation_id = %id, error = %error.message, "the recorded operation's final record write did not land; a later access re-applies it");
         }
     }
     match failure {
@@ -1118,17 +1163,32 @@ async fn find_authorized(
     handle: &GraphRequest,
     actor: &AuthenticatedActor,
     operation_id: &str,
+    cancel_by: Option<&str>,
 ) -> Result<Option<Operation>, ApiError> {
     let owner = admission(state)?;
     let graph = handle.key.graph_id.to_string();
-    let mut record = state.recorded.record.lock().await;
-    let loaded = load_resolved(state, &owner, &mut record).await?;
-    let operation = loaded.record.find(&graph, operation_id).cloned();
-    drop(record);
+    let walks = walk_unresolved(state, &owner).await;
+    let lock = owner.lock_operations().await;
+    let updated = update(state, &owner, &lock, &walks, |record| {
+        (false, record.find(&graph, operation_id).cloned())
+    })
+    .await?;
+    let operation = updated.value;
     let kind = operation
         .as_ref()
         .map_or(OperationKind::Optimize, Operation::kind);
     authorize(handle, actor, kind)?;
+    if let (Some(actor), Some(op)) = (cancel_by, &operation)
+        && !op.state.is_terminal()
+        && op.state != OperationState::Publishing
+    {
+        state.recorded.cancel_under(
+            &lock,
+            Some(&op.operation_id),
+            None,
+            &format!("cancelled by {actor}"),
+        );
+    }
     Ok(operation)
 }
 
@@ -1154,7 +1214,7 @@ pub(crate) async fn get_operation(
     let actor = authenticated(actor)?;
     authorize(&handle, &actor, OperationKind::Optimize)?;
     state.recorded.require_enabled()?;
-    let operation = find_authorized(&state, &handle, &actor, &path.operation_id).await?;
+    let operation = find_authorized(&state, &handle, &actor, &path.operation_id, None).await?;
     Ok(output(&state, operation).1)
 }
 
@@ -1181,17 +1241,14 @@ pub(crate) async fn cancel_operation(
     let actor = authenticated(actor)?;
     authorize(&handle, &actor, OperationKind::Optimize)?;
     state.recorded.require_enabled()?;
-    let operation = find_authorized(&state, &handle, &actor, &path.operation_id).await?;
-    if let Some(op) = &operation
-        && !op.state.is_terminal()
-        && op.state != OperationState::Publishing
-    {
-        state.recorded.cancel(
-            Some(&op.operation_id),
-            None,
-            &format!("cancelled by {}", actor.actor_id),
-        );
-    }
+    let operation = find_authorized(
+        &state,
+        &handle,
+        &actor,
+        &path.operation_id,
+        Some(actor.actor_id.as_ref()),
+    )
+    .await?;
     Ok(output(&state, operation))
 }
 
@@ -1259,9 +1316,12 @@ mod tests {
         assert!(runtime.cancel(None, Some(&["g".to_string()][..]), "deployment d"));
         assert!(cancellation.is_cancelled());
         assert_eq!(
-            runtime.clear_live("01JBQZ00000000000000000001").as_deref(),
+            runtime
+                .cancel_reason("01JBQZ00000000000000000001")
+                .as_deref(),
             Some("deployment d")
         );
+        runtime.clear_live("01JBQZ00000000000000000001");
         assert!(runtime.live_ids().is_empty());
     }
 }

@@ -1153,9 +1153,9 @@ impl ClusterStore {
     }
 
     /// One conditional put of the record against the version the writer read
-    /// (`None`: the record must not exist yet). The adapter re-issues an
-    /// ambiguous answer and reads the key back; what it still cannot settle
-    /// is reported in doubt, never as a conflict.
+    /// (`None`: the record must not exist yet). The adapter's conditional
+    /// write resolves an ambiguous answer itself (re-issue and read-back);
+    /// what it still cannot settle is reported in doubt, never as a conflict.
     pub(crate) async fn write_operations(
         &self,
         record: &crate::operations::OperationRecord,

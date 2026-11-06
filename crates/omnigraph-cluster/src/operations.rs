@@ -45,6 +45,10 @@ pub const MAX_UNRESOLVED_OPERATIONS: usize = 4;
 pub const MAX_TABLE_OUTCOMES: usize = 1024;
 /// The longest detail a per-table or tail outcome keeps.
 pub const MAX_OUTCOME_DETAIL_BYTES: usize = 512;
+/// How far ahead of the server's clock an operation id's ULID time may be.
+/// The eviction mark is the newest evicted id's time, so an id dated far in
+/// the future would, once evicted, refuse every honest id after it.
+pub const MAX_OPERATION_ID_LEAD_MS: u64 = 60_000;
 
 const OPERATIONS_VERSION: u32 = 1;
 
@@ -353,6 +357,9 @@ pub enum AdmissionRefusal {
     Unresolved,
     /// The id's ULID time is at or before the eviction mark.
     Expired { eviction_mark_ms: u64 },
+    /// The id's ULID time is more than [`MAX_OPERATION_ID_LEAD_MS`] ahead of
+    /// the server's clock.
+    FutureDated { latest_ms: u64 },
 }
 
 /// Admission's answer for a request it does not refuse.
@@ -517,10 +524,17 @@ impl OperationRecord {
     }
 
     /// Hold `operation` in its scope's active slot, or answer the existing
-    /// record of the same request. Callers resolve orphans first
-    /// ([`Self::interrupt_orphans`]) so a record that landed after an in-doubt
-    /// acceptance never holds the slot.
-    pub fn admit(&mut self, operation: Operation) -> Result<Admitted, AdmissionRefusal> {
+    /// record of the same request. The order is the admission contract: a
+    /// retained id answers first, whatever the mark or the slot says; then the
+    /// id's time is judged against the eviction mark and against `now_ms`,
+    /// the server's clock; then the scope's slot and the unresolved cap.
+    /// Callers resolve orphans first ([`Self::interrupt_orphans`]) so a
+    /// record that landed after an in-doubt acceptance never holds the slot.
+    pub fn admit(
+        &mut self,
+        operation: Operation,
+        now_ms: u64,
+    ) -> Result<Admitted, AdmissionRefusal> {
         if let Some(existing) = self
             .operations()
             .find(|op| op.operation_id == operation.operation_id)
@@ -533,14 +547,17 @@ impl OperationRecord {
                 Err(AdmissionRefusal::DifferentRequest)
             };
         }
-        if let (Some(mark), Some(time)) = (
-            self.eviction_mark_ms,
-            operation_id_time_ms(&operation.operation_id),
-        ) && time <= mark
+        let time = operation_id_time_ms(&operation.operation_id);
+        if let (Some(mark), Some(time)) = (self.eviction_mark_ms, time)
+            && time <= mark
         {
             return Err(AdmissionRefusal::Expired {
                 eviction_mark_ms: mark,
             });
+        }
+        let latest_ms = now_ms.saturating_add(MAX_OPERATION_ID_LEAD_MS);
+        if time.is_some_and(|time| time > latest_ms) {
+            return Err(AdmissionRefusal::FutureDated { latest_ms });
         }
         let scope = operation.scope();
         if let Some(active) = self.active.get(&scope) {
@@ -993,6 +1010,19 @@ mod tests {
         op
     }
 
+    /// A server clock every test id is behind.
+    const NOW_MS: u64 = 2_000_000;
+
+    trait AdmitNow {
+        fn admit_now(&mut self, operation: Operation) -> Result<Admitted, AdmissionRefusal>;
+    }
+
+    impl AdmitNow for OperationRecord {
+        fn admit_now(&mut self, operation: Operation) -> Result<Admitted, AdmissionRefusal> {
+            self.admit(operation, NOW_MS)
+        }
+    }
+
     #[test]
     fn ids_used_by_these_tests_are_canonical() {
         assert!(canonical_ulid(LEDGER), "{LEDGER}");
@@ -1003,9 +1033,9 @@ mod tests {
     #[test]
     fn admission_holds_one_active_operation_per_scope_and_answers_a_repeat() {
         let mut record = OperationRecord::new(LEDGER);
-        assert_eq!(record.admit(operation(1, "g")), Ok(Admitted::New));
+        assert_eq!(record.admit_now(operation(1, "g")), Ok(Admitted::New));
         assert_eq!(
-            record.admit(operation(1, "g")),
+            record.admit_now(operation(1, "g")),
             Ok(Admitted::Existing(Box::new(operation(1, "g"))))
         );
         let mut other = operation(1, "g");
@@ -1015,9 +1045,12 @@ mod tests {
         });
         other.request_digest =
             operation_request_digest("g", DOMAIN, "main", &other.request, "act-op");
-        assert_eq!(record.admit(other), Err(AdmissionRefusal::DifferentRequest));
         assert_eq!(
-            record.admit(operation(2, "h")),
+            record.admit_now(other),
+            Err(AdmissionRefusal::DifferentRequest)
+        );
+        assert_eq!(
+            record.admit_now(operation(2, "h")),
             Err(AdmissionRefusal::Active {
                 scope: AdmissionScope::Maintenance,
                 operation_id: id(1)
@@ -1035,7 +1068,7 @@ mod tests {
     #[test]
     fn an_orphan_is_interrupted_unless_it_was_publishing() {
         let mut record = OperationRecord::new(LEDGER);
-        record.admit(operation(1, "g")).unwrap();
+        record.admit_now(operation(1, "g")).unwrap();
         assert!(
             !record.interrupt_orphans(&[id(1)]),
             "a live run keeps its slot"
@@ -1044,7 +1077,7 @@ mod tests {
         assert_eq!(record.terminal[0].state, OperationState::Interrupted);
         assert!(record.active.is_empty());
 
-        record.admit(operation(2, "g")).unwrap();
+        record.admit_now(operation(2, "g")).unwrap();
         record.active_mut(&id(2)).unwrap().state = OperationState::Publishing;
         assert!(record.interrupt_orphans(&[]));
         assert_eq!(record.unresolved[0].operation_id, id(2));
@@ -1055,13 +1088,13 @@ mod tests {
     fn a_fifth_unresolved_publication_refuses_admission() {
         let mut record = OperationRecord::new(LEDGER);
         for n in 1..=MAX_UNRESOLVED_OPERATIONS as u8 {
-            record.admit(operation(n, "g")).unwrap();
+            record.admit_now(operation(n, "g")).unwrap();
             record
                 .defer_publication(&id(n), "head unchanged".to_string())
                 .unwrap();
         }
         assert_eq!(
-            record.admit(operation(9, "g")),
+            record.admit_now(operation(9, "g")),
             Err(AdmissionRefusal::Unresolved)
         );
         record.validate().unwrap();
@@ -1070,7 +1103,7 @@ mod tests {
     #[test]
     fn history_settles_an_unresolved_publication_once_and_a_walk_keeps_its_cursor() {
         let mut record = OperationRecord::new(LEDGER);
-        record.admit(operation(1, "g")).unwrap();
+        record.admit_now(operation(1, "g")).unwrap();
         record
             .active_mut(&id(1))
             .unwrap()
@@ -1132,7 +1165,7 @@ mod tests {
             "a terminal record is never rewritten"
         );
 
-        record.admit(operation(2, "g")).unwrap();
+        record.admit_now(operation(2, "g")).unwrap();
         record
             .defer_publication(&id(2), "head unchanged".to_string())
             .unwrap();
@@ -1147,7 +1180,7 @@ mod tests {
         let mut record = OperationRecord::new(LEDGER);
         assert_eq!(record.eviction_mark_ms, None);
         for n in 1..=(MAX_TERMINAL_OPERATIONS as u8 + 3) {
-            record.admit(operation(n, "g")).unwrap();
+            record.admit_now(operation(n, "g")).unwrap();
             record
                 .finish(finished(operation(n, "g"), OperationState::Succeeded))
                 .unwrap();
@@ -1166,7 +1199,7 @@ mod tests {
         // A late retry of an evicted id, and a fresh id minted at or before
         // the mark, are refused; one after it is admitted.
         assert_eq!(
-            record.admit(operation(2, "g")),
+            record.admit_now(operation(2, "g")),
             Err(AdmissionRefusal::Expired {
                 eviction_mark_ms: 1_000_003
             })
@@ -1174,15 +1207,41 @@ mod tests {
         let mut at_mark = operation(9, "g");
         at_mark.operation_id = id_at(1_000_003, 999);
         assert_eq!(
-            record.admit(at_mark),
+            record.admit_now(at_mark),
             Err(AdmissionRefusal::Expired {
                 eviction_mark_ms: 1_000_003
             })
         );
         let mut after = operation(9, "g");
         after.operation_id = id_at(1_000_004, 999);
-        assert_eq!(record.admit(after), Ok(Admitted::New));
+        assert_eq!(record.admit_now(after), Ok(Admitted::New));
         record.validate().unwrap();
+    }
+
+    #[test]
+    fn an_id_dated_ahead_of_the_server_clock_is_refused_and_never_sets_the_mark() {
+        let mut record = OperationRecord::new(LEDGER);
+        let mut ahead = operation(1, "g");
+        ahead.operation_id = id_at(NOW_MS + MAX_OPERATION_ID_LEAD_MS + 1, 7);
+        assert_eq!(
+            record.admit_now(ahead),
+            Err(AdmissionRefusal::FutureDated {
+                latest_ms: NOW_MS + MAX_OPERATION_ID_LEAD_MS
+            })
+        );
+        let mut within = operation(2, "g");
+        within.operation_id = id_at(NOW_MS + MAX_OPERATION_ID_LEAD_MS, 8);
+        assert_eq!(record.admit_now(within), Ok(Admitted::New));
+        // A retained id answers before the clock is consulted.
+        let repeat = record
+            .active_in(AdmissionScope::Maintenance)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            record.admit(repeat.clone(), 0),
+            Ok(Admitted::Existing(Box::new(repeat)))
+        );
+        assert_eq!(record.eviction_mark_ms, None);
     }
 
     #[test]
@@ -1200,7 +1259,7 @@ mod tests {
             max_gate_hold_ms: None,
         });
         listed.optimize_outcome_mut().unwrap().resume_at = Some("node:Other".to_string());
-        record.admit(listed.clone()).unwrap();
+        record.admit_now(listed.clone()).unwrap();
         record
             .finish(finished(listed, OperationState::Succeeded))
             .unwrap();
@@ -1217,11 +1276,11 @@ mod tests {
     #[test]
     fn graph_deletion_settles_the_lifetimes_non_terminal_records() {
         let mut record = OperationRecord::new(LEDGER);
-        record.admit(operation(1, "g")).unwrap();
+        record.admit_now(operation(1, "g")).unwrap();
         record
             .defer_publication(&id(1), "head unchanged".to_string())
             .unwrap();
-        record.admit(operation(2, "g")).unwrap();
+        record.admit_now(operation(2, "g")).unwrap();
         record.active_mut(&id(2)).unwrap().state = OperationState::Publishing;
         record.kind_state.optimize.insert(
             "g".to_string(),
@@ -1253,14 +1312,14 @@ mod tests {
     #[test]
     fn orphaning_one_lifetime_leaves_another_graphs_run_in_its_slot() {
         let mut record = OperationRecord::new(LEDGER);
-        record.admit(operation(1, "h")).unwrap();
+        record.admit_now(operation(1, "h")).unwrap();
         assert!(
             !record.orphan_lifetime("g", DOMAIN),
             "another graph's active run is not this lifetime's"
         );
         assert_eq!(record.active.len(), 1);
         record.active.clear();
-        record.admit(operation(2, "g")).unwrap();
+        record.admit_now(operation(2, "g")).unwrap();
         record.active_mut(&id(2)).unwrap().state = OperationState::Publishing;
         assert!(record.orphan_lifetime("g", DOMAIN));
         assert_eq!(record.unresolved[0].operation_id, id(2));
@@ -1313,7 +1372,7 @@ mod tests {
             OperationWrite::Conflict,
             "a create over an existing record conflicts"
         );
-        record.admit(operation(1, "g")).unwrap();
+        record.admit_now(operation(1, "g")).unwrap();
         let OperationWrite::Written { version: second } =
             store.write_operations(&record, Some(&first)).await.unwrap()
         else {

@@ -44,8 +44,9 @@ pub mod lease_protocol {
     pub use crate::state_lock::leased_lock_record;
 }
 pub use admission::{
-    ClusterAdmission, ClusterAdmissionPurpose, acquire_cluster_admission, acquire_graph_admission,
-    acquire_graph_admission_with_binding, canonical_graph_uri,
+    ClusterAdmission, ClusterAdmissionPurpose, OperationsLock, OperationsUpdate,
+    acquire_cluster_admission, acquire_graph_admission, acquire_graph_admission_with_binding,
+    canonical_graph_uri,
 };
 pub use authorization::{
     AuthorizedEffect, AuthorizedPlanOutput, IdentityAuthorization, PlanAuthorization,

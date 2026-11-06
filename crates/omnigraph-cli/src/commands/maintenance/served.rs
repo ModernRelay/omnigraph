@@ -17,6 +17,8 @@ use crate::helpers::RemoteErrorCli;
 use crate::output::{graph_type_subject, write_json};
 
 const POLL: Duration = Duration::from_millis(500);
+/// Consecutive lookups without a definite answer before the wait gives up.
+const UNANSWERED_LOOKUPS: u32 = 5;
 
 /// The exits of a served optimize.
 const SUCCEEDED: i32 = 0;
@@ -128,7 +130,33 @@ pub(crate) async fn run(
     };
 
     let deadline = request.timeout.map(|timeout| Instant::now() + timeout);
+    let mut unanswered = 0_u32;
     loop {
+        match &answer {
+            Ok(_) => unanswered = 0,
+            // A definite refusal ends the wait with its own exit; a lost
+            // answer is retried a bounded number of times.
+            Err(error) => match classify(error) {
+                Refusal::DifferentRequest => {
+                    writeln!(stderr, "error: {error}")?;
+                    return Ok(Completion::exit(DIFFERENT_REQUEST));
+                }
+                Refusal::BeforeAcceptance => {
+                    writeln!(stderr, "error: {error}")?;
+                    return Ok(Completion::exit(NO_EFFECTS));
+                }
+                Refusal::AnotherActive | Refusal::Unanswered => {
+                    unanswered += 1;
+                    if unanswered >= UNANSWERED_LOOKUPS {
+                        writeln!(
+                            stderr,
+                            "no answer from the server after {UNANSWERED_LOOKUPS} lookups of {operation_id} ({error}); the operation may still run, observe it with `omnigraph optimize --operation {operation_id}`"
+                        )?;
+                        return Ok(Completion::exit(IN_DOUBT));
+                    }
+                }
+            },
+        }
         if let Ok(record) = &answer {
             if record["lookup"] == "unknown" {
                 writeln!(

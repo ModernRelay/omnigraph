@@ -2377,7 +2377,9 @@ async fn complete_graph_deletion(
 /// slot and its publication is judged by the settlement branch's history, the
 /// walk run to its end; once the root is verifiably absent, every record still
 /// non-terminal becomes `unsettled` with reason `graph_deleted`. One
-/// conditional write when anything changed.
+/// conditional write under the record's gate when anything changed. A record
+/// the server already refuses (unreadable, or naming another ledger) is
+/// logged and left alone: it gates admission, never the deletion.
 async fn settle_graph_operations(
     store: &ClusterStore,
     admission: &ClusterAdmission,
@@ -2385,8 +2387,14 @@ async fn settle_graph_operations(
     schema_identity_domain: &str,
     root_readable: bool,
 ) -> Result<(), Diagnostic> {
-    let Some((mut record, version)) = admission.read_operations().await? else {
-        return Ok(());
+    let lock = admission.lock_operations().await;
+    let record = match admission.read_operations(&lock).await {
+        Ok(Some((record, _))) => record,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            tracing::warn!(graph, error = %error.message, "graph deletion leaves an unreadable operation record alone");
+            return Ok(());
+        }
     };
     if record
         .non_terminal_of(graph, schema_identity_domain)
@@ -2395,9 +2403,12 @@ async fn settle_graph_operations(
     {
         return Ok(());
     }
-    let mut changed = false;
+    // The history walks read only, from the record as it stands after the
+    // lifetime's active records are released.
+    let mut resolutions = Vec::new();
     if root_readable {
-        changed |= record.orphan_lifetime(graph, schema_identity_domain);
+        let mut released = record.clone();
+        released.orphan_lifetime(graph, schema_identity_domain);
         let uri = store.graph_root(graph);
         let opened = match store.graph_storage(&uri) {
             Ok(storage) => Omnigraph::open_read_only_with_storage(&uri, storage)
@@ -2406,7 +2417,7 @@ async fn settle_graph_operations(
             Err(_) => None,
         };
         if let Some(db) = opened {
-            for operation in record.non_terminal_of(graph, schema_identity_domain) {
+            for operation in released.non_terminal_of(graph, schema_identity_domain) {
                 let (Some(nonce), Some(input_version)) =
                     (&operation.nonce, operation.input_manifest_version)
                 else {
@@ -2463,27 +2474,31 @@ async fn settle_graph_operations(
                         }
                     }
                 };
-                changed |= record.settle(&operation.operation_id, resolution);
+                resolutions.push((operation.operation_id.clone(), resolution));
             }
         }
-    } else {
-        changed |= record.settle_graph_deleted(graph, schema_identity_domain);
     }
-    if !changed {
-        return Ok(());
-    }
-    match admission.write_operations(&record, Some(&version)).await? {
-        crate::OperationWrite::Written { .. } => Ok(()),
-        crate::OperationWrite::Conflict => Err(Diagnostic::error(
-            "operation_record_changed",
-            crate::CLUSTER_OPERATIONS_FILE,
-            "the operation record changed while the graph deletion settled its operations",
-        )),
-        crate::OperationWrite::InDoubt { error } => Err(Diagnostic::error(
-            "deployment_outcome_unknown",
-            crate::CLUSTER_OPERATIONS_FILE,
-            format!("settling the graph's recorded operations has no definite answer: {error}"),
-        )),
+    let outcome = admission
+        .update_operations(&lock, |record| {
+            let mut changed = false;
+            if root_readable {
+                changed |= record.orphan_lifetime(graph, schema_identity_domain);
+                for (operation_id, resolution) in resolutions {
+                    changed |= record.settle(&operation_id, resolution);
+                }
+            } else {
+                changed |= record.settle_graph_deleted(graph, schema_identity_domain);
+            }
+            Ok((changed, ()))
+        })
+        .await;
+    match outcome {
+        Ok(_) => Ok(()),
+        Err(error) if error.code == "operation_record_foreign" => {
+            tracing::warn!(graph, error = %error.message, "graph deletion leaves a foreign operation record alone");
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 

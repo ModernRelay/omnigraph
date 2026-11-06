@@ -58,7 +58,7 @@ reason to resubmit the same work under the same id.
 |---|---|
 | The same id with a different request (message prefix `[operation_request_mismatch]`); an id at or before the record's eviction mark (`[operation_id_expired]`, mint a new one); an outstanding deployment; four unresolved publications; a record from another ledger at this root (`[operation_record_foreign]`) | 409 `conflict` |
 | Another operation is active in the maintenance scope (its id is in the message), or the scope is admitting one | 429 `too_many_requests`, with `Retry-After` |
-| A gate hold above the server's ceiling, or an `operation_id` that is not a canonical ULID | 400 `bad_request` |
+| A gate hold above the server's ceiling, an `operation_id` that is not a canonical ULID, or one dated more than a minute ahead of the server's clock | 400 `bad_request` |
 | The routes are off, or the server is draining | 503 `service_unavailable` |
 | A record write without a definite answer | 500 `outcome_unknown`; look the id up |
 
@@ -75,7 +75,7 @@ and `--timeout` bounds the wait, not the operation. `--tables` and
 |---|---|
 | `succeeded`, or accepted or observed with `--no-wait` | 0 |
 | Refused before acceptance, or `failed`, `cancelled` or `interrupted` | 1 |
-| Still `publishing` or running when the wait ended, `unsettled`, or `unknown` after a lost response | 2 |
+| Still `publishing` or running when the wait ended, `unsettled`, `unknown` after a lost response, or five lookups in a row without a definite answer | 2 |
 | The same id with a different request | 4 |
 | Another operation is active in the scope | 75 |
 
@@ -114,4 +114,7 @@ operation the same way, and the record names the reason.
 The record keeps the 32 newest terminal operations and the time of the newest
 id it evicted: an older id answers `unknown`, and a submission under an id
 minted at or before that time is refused as expired, so an evicted operation
-never runs again.
+never runs again. A retained id always answers its record first, whatever the
+mark says. Because the mark is a caller's time, an id dated more than a minute
+ahead of the server's clock is refused before it is accepted; otherwise one
+such id, once evicted, would refuse every honest id after it.

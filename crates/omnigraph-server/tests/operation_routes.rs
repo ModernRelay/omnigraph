@@ -71,7 +71,8 @@ async fn single_graph_state(settings: Option<OperationSettings>) -> (tempfile::T
 }
 
 /// Off by default; an actor without `maintain` is refused first; a server
-/// without cluster admission has no record to keep.
+/// without cluster admission has no record to keep, and refuses before the
+/// ceiling is checked.
 #[tokio::test]
 async fn routes_refuse_without_a_grant_an_operator_switch_or_a_cluster() {
     let route = "/graphs/default/operations/optimize";
@@ -97,16 +98,8 @@ async fn routes_refuse_without_a_grant_an_operator_switch_or_a_cluster() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
-    let (status, error) = json_response(
-        &app,
-        post(
-            route,
-            "op-secret",
-            json!({ "operation_id": OPERATION_ID, "max_gate_hold_ms": 3_600_000 }),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    // The ceiling is admission's last check (RFC §3.2): without a cluster the
+    // record refuses first; the journey below covers the 400.
     let (status, error) = json_response(&app, post(route, "op-secret", body)).await;
     assert_eq!(status, StatusCode::CONFLICT, "{error}");
     assert!(
@@ -285,6 +278,14 @@ async fn recorded_optimize_keeps_a_record_a_caller_reads_by_id() {
     let body = json!({ "operation_id": OPERATION_ID, "max_gate_hold_ms": 30_000 });
     let (status, refused) = client.submit("read-secret", body.clone()).await;
     assert_eq!(status, 403, "{refused}");
+    let (status, refused) = client
+        .submit(
+            "op-secret",
+            json!({ "operation_id": OPERATION_ID, "max_gate_hold_ms": 3_600_000 }),
+        )
+        .await;
+    assert_eq!(status, 400, "a gate hold over the ceiling: {refused}");
+    assert_eq!(refused["code"], "bad_request", "{refused}");
 
     let (status, accepted) = client.submit("op-secret", body.clone()).await;
     assert!(matches!(status, 200 | 202), "{status}: {accepted}");

@@ -102,8 +102,12 @@ preserved for explicit conversion checks, never executed by a fallback sweep.
 separate from `state.json`, whose `deny_unknown_fields` ledger older binaries
 must keep reading. It names the cluster's ledger id; a record naming another
 ledger is refused with `operation_record_foreign` and never merged. Only the
-lock holder writes it (`ClusterAdmission::write_operations` checks the lock
-first), each write a conditional put against the version read: at
+lock holder writes it, and in that process every read a write follows and
+every write hold the admission's record gate (`ClusterAdmission::lock_operations`,
+`update_operations`: read, apply, one conditional put), the server's routes,
+the runs' state changes and the graph deletion's settlement alike; the
+server's live-run set changes under the same gate, so a lookup never meets a
+run that ended while its record was still active. Each write is a conditional put against the version read: at
 acceptance, when the run starts, in the optimize run's before-publish hook
 (`publishing`, with the intent nonce, the input head and the per-table
 outcomes), and at the end. The record is generic over `kind`: the header
@@ -111,7 +115,7 @@ keys its active operations by admission scope and each kind's state by graph
 and kind, and each record names its settlement branch; `optimize` is the
 first kind. A write with no definite answer (`OperationWrite::InDoubt`) stops
 the run's writes; the server's next admission or lookup reads the record
-back. An `accepted` or `running` operation no live run holds becomes
+back and re-applies a lost final change to the record as it then stands. An `accepted` or `running` operation no live run holds becomes
 `interrupted`, and a `publishing` one joins at most four unresolved
 operations, settled by `Omnigraph::resolve_publication` once the settlement
 branch's graph head moves: one page of the branch's first-parent chain per
@@ -120,7 +124,9 @@ parent kept as the record's cursor, until the input head's child answers the
 nonce or proves the run did not commit. A lost terminal write is re-issued
 first. Terminal records are bounded by the deployment receipts' values; the
 newest evicted id's ULID time is the eviction mark, and an id at or before it
-is refused. A graph deletion settles the lifetime's non-terminal records in
+is refused; an id dated more than `MAX_OPERATION_ID_LEAD_MS` ahead of the
+server's clock is refused too, since once evicted it would set the mark for
+everyone. A retained id answers before either check. A graph deletion settles the lifetime's non-terminal records in
 `complete_graph_deletion`: by the history rule while the root answers, and as
 `unsettled` (`graph_deleted`) once its absence is verified. The server side
 is `crates/omnigraph-server/src/recorded_operations.rs`: one admission gate
