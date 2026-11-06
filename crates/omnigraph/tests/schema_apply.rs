@@ -4065,7 +4065,9 @@ async fn issue_721_deleted_null_row_is_purged_by_promotion() {
         db.apply_schema(v3)
             .await
             .expect("a later column addition applies");
-        db.optimize().await.expect("optimize succeeds");
+        db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+            .expect("optimize succeeds");
         db.load_jsonl(
             r#"{"type":"Decision","data":{"slug":"d","ref":"D-new","note":"n"}}"#,
             LoadMode::Merge,

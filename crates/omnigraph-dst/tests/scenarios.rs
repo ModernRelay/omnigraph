@@ -2677,7 +2677,9 @@ fn instrument_filtered_update_cost_over_per_commit_fragments() {
             omnigraph_dst::cost::set_label("UpdateWarmBeforeOptimize");
             Self::set_age(&db, 41).await;
             omnigraph_dst::cost::set_label("_optimize");
-            db.optimize().await.unwrap();
+            db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+                .await
+                .unwrap();
             let db = Self::reopen(db, resources).await;
             omnigraph_dst::cost::set_label("UpdateColdAfterOptimize");
             Self::set_age(&db, 42).await;
