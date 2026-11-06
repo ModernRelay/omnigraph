@@ -877,14 +877,14 @@ pub async fn optimize_all_datasets(
     actor: Option<&str>,
     request: OptimizeRequest,
 ) -> Result<OptimizeReport> {
-    // Nothing durable happens before the first table's staging, so every
+    // A policy denial keeps its typed shape, as at every `_as` door. Nothing
+    // durable happens before the first table's staging, so every other
     // refusal up to there carries `BeforeEffect`.
     db.enforce(
         omnigraph_policy::PolicyAction::Maintain,
         &omnigraph_policy::ResourceScope::Branch("main".to_string()),
         actor,
-    )
-    .map_err(OmniError::before_effect)?;
+    )?;
     let concurrency = request
         .concurrency
         .unwrap_or_else(OptimizeConcurrency::from_env);

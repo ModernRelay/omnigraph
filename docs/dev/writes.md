@@ -275,7 +275,8 @@ its complete authority again under the held gates instead, because writers in
 the same process move main while a run waits and none can move it while the
 gates are held, so that capture is the attempt's one authority and never a
 mix of the two. Every refusal before the first table's staging, this one
-included, carries `CompletionEvidence::BeforeEffect`.
+included, carries `CompletionEvidence::BeforeEffect`; a policy denial keeps
+its typed shape, as at every `_as` door.
 
 A run with `max_gate_hold` defers every table whose turn comes after the
 deadline, measured from gate acquisition, and publishes the tables it finished
