@@ -226,7 +226,8 @@ this binary serves: it respells the legacy
 `id`/`src`/`dst` system columns and requires only `main` and no user property
 starting with `_`. Both are standalone, offline operations: stop every process
 using the graph and keep a verified whole-root backup (a whole-root copy also
-opens at a new path on the same kind of storage, with every branch);
+opens at a new path on the same kind of storage, with every branch, though
+Omnigraph 0.14.0 and earlier read some branch files at the create-time path);
 cluster-managed roots refuse. Read
 [converting a graph](migrations.md#convert-a-v8-v9-or-v13-graph) before
 executing.

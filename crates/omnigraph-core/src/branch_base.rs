@@ -1,5 +1,6 @@
 //! Graph-internal branch bases follow the opened root (the relocated graph
-//! roots RFC, `docs/rfcs/2026-11-03-relocated-graph-roots.md`).
+//! roots RFC, <https://github.com/ModernRelay/omnigraph/pull/1234>, until it
+//! lands under `docs/rfcs/`).
 //!
 //! Lance 13 `Dataset::create_branch` is a shallow clone. It records the
 //! source branch's absolute URI as a dataset-root `BasePath` named for that

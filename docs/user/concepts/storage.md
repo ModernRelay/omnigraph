@@ -53,7 +53,8 @@ reads and writes only objects under the root you opened.
 - If the copy is missing an object, the read that needs it fails and names the
   root you opened. It never reads that object from the original location.
 - A graph whose storage names a location outside its root is refused when it
-  is opened. Omnigraph never writes such a graph.
+  is opened. Omnigraph never writes such a graph; a table branched or cloned
+  by another Lance tool can.
 - To move a graph between kinds of storage (local, S3, Azure), export it and
   load it into a new graph instead.
 - Restore a graph that a cluster manages at the location its cluster
