@@ -1041,6 +1041,16 @@ fn opened_at_pin(dataset: &Dataset, entry: &crate::db::DatasetEntry) -> bool {
 /// base pin, certifying each as an exact-id fenced insert or an index-only
 /// commit (which moves no row); the new fragments are the source's fragments
 /// the base lacks, and the rows are the chain's.
+///
+/// A detached link is read from its manifest file alone
+/// ([`DetachedChainLink::read`], one request) rather than opened as a
+/// dataset and asked for its transaction (five dependent requests), because
+/// the walk needs only each link's recorded identity and transaction; any
+/// other link, a manifest that reader does not recognize, or a failed read
+/// takes Lance's own route, whose outcome decides the link as before. The walk is still one request per commit, in sequence: the
+/// next version is known only from the transaction just read (issue #1222).
+///
+/// [`DetachedChainLink::read`]: crate::table_store::DetachedChainLink::read
 async fn proven_chain_fragments(
     source: &Dataset,
     base: &Dataset,
@@ -1048,12 +1058,11 @@ async fn proven_chain_fragments(
     id_field_id: i32,
     expected_schema_preorder_ids: &[u32],
 ) -> Option<(Vec<lance_table::format::Fragment>, u64)> {
-    let mut dataset = source.clone();
     let mut proven_rows = 0_u64;
+    let mut identity = crate::table_store::StagedTransactionIdentity::recorded_by(source)?;
+    crate::instrumentation::record_proven_insert_history_read();
+    let mut transaction = source.read_transaction().await.ok()??;
     for _ in 0..PURE_INSERT_HISTORY_MAX_VERSIONS {
-        let identity = crate::table_store::StagedTransactionIdentity::recorded_by(&dataset)?;
-        crate::instrumentation::record_proven_insert_history_read();
-        let transaction = dataset.read_transaction().await.ok()??;
         let rows = if is_index_only_commit(&transaction, identity.read_version) {
             0
         } else {
@@ -1084,10 +1093,19 @@ async fn proven_chain_fragments(
             })?;
             return (fragment_rows == proven_rows).then_some((fragments, proven_rows));
         }
-        dataset = dataset
-            .checkout_version(transaction.read_version)
-            .await
-            .ok()?;
+        let parent = transaction.read_version;
+        crate::instrumentation::record_proven_insert_history_read();
+        (identity, transaction) =
+            match crate::table_store::DetachedChainLink::read(source, parent).await {
+                Ok(Some(link)) => (link.identity, link.transaction),
+                Ok(None) | Err(_) => {
+                    let dataset = source.checkout_version(parent).await.ok()?;
+                    (
+                        crate::table_store::StagedTransactionIdentity::recorded_by(&dataset)?,
+                        dataset.read_transaction().await.ok()??,
+                    )
+                }
+            };
     }
     None
 }

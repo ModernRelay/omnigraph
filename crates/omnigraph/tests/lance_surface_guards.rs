@@ -7464,6 +7464,70 @@ async fn rfc_0067_detached_commit_from_a_pin_is_private_chains_and_needs_a_retry
     );
 }
 
+/// The pure-insert merge proof reads each detached link of a source chain
+/// from its manifest file alone (`DetachedChainLink::read` in
+/// `omnigraph-core/src/staging.rs`, one GET): Lance 13 writes a detached
+/// version's manifest at `_versions/d{version}.manifest` with a 16-byte footer
+/// (manifest offset, format version, `MAGIC`), the length-prefixed manifest
+/// ending at the footer, and the transaction inline at the manifest's
+/// `transaction_section`, before the manifest. Red when that framing changes
+/// or Lance stops writing the transaction inline: the reader then returns
+/// `None` and the proof takes Lance's five-request route again, which is
+/// still correct but loses the cost (issue #1222).
+#[tokio::test]
+async fn detached_manifest_file_holds_its_transaction_inline() {
+    use omnigraph_core::staging::{DetachedChainLink, StagedTransactionIdentity};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("t.lance");
+    let uri = uri.to_str().unwrap();
+    let v1 = rfc0067_create(uri).await;
+    let base = rfc0067_pinned(uri, v1.version().version).await;
+    let transaction = rfc0067_staged_append(&base, &["c1"]).await;
+    let d1 = CommitBuilder::new(Arc::new(base))
+        .with_detached(true)
+        .with_skip_auto_cleanup(true)
+        .execute(transaction)
+        .await
+        .unwrap();
+    let chained = rfc0067_staged_append(&d1, &["d1"]).await;
+    let d2 = CommitBuilder::new(Arc::new(d1.clone()))
+        .with_detached(true)
+        .with_skip_auto_cleanup(true)
+        .execute(chained)
+        .await
+        .unwrap();
+
+    for version in [d1.version().version, d2.version().version] {
+        let opened = d2.checkout_version(version).await.unwrap();
+        assert!(
+            opened.manifest().transaction_section.is_some(),
+            "Lance writes the transaction inline in a detached manifest"
+        );
+        let link = DetachedChainLink::read(&d2, version)
+            .await
+            .unwrap()
+            .expect("a detached manifest reads as one chain link");
+        assert_eq!(
+            Some(link.identity),
+            StagedTransactionIdentity::recorded_by(&opened),
+            "the identity is the one the manifest records"
+        );
+        assert_eq!(
+            Some(link.transaction),
+            opened.read_transaction().await.unwrap(),
+            "the transaction is the one Lance reads"
+        );
+    }
+    assert!(
+        DetachedChainLink::read(&d2, v1.version().version)
+            .await
+            .unwrap()
+            .is_none(),
+        "a linear version is not read as a detached link"
+    );
+}
+
 /// The pure-insert merge proof crosses a `CreateIndex` link as a commit that
 /// moves no row (`is_index_only_commit` in `table_store.rs`). Lance 13
 /// applies `CreateIndex` with every fragment of the version it read and

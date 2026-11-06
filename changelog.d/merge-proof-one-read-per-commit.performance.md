@@ -1,0 +1,1 @@
+- A branch merge proves a table the source only inserted into with one storage request per source commit instead of about five, so merging a branch of many small commits waits on far fewer round trips.

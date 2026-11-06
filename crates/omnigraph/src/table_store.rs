@@ -85,11 +85,13 @@ pub(crate) use crate::error::is_scratch_exhaustion;
 pub(crate) use omnigraph_core::dataset_index::FtsFilterDemand;
 pub use omnigraph_core::dataset_index::IndexCoverage;
 pub(crate) use omnigraph_core::fts_compat;
+pub(crate) use omnigraph_core::staging::{
+    DetachedChainLink, StagedTransactionIdentity, StagingWitness,
+};
 #[cfg(test)]
 pub(crate) use omnigraph_core::staging::{
     STAGED_AGAINST_BRANCH_INCARNATION, STAGED_AGAINST_GRAPH_HEAD,
 };
-pub(crate) use omnigraph_core::staging::{StagedTransactionIdentity, StagingWitness};
 
 /// Durable proof carried by an OmniGraph insertion-only transaction.
 ///

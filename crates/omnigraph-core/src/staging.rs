@@ -40,7 +40,12 @@ impl StagedTransactionIdentity {
     /// The identity a manifest records, or `None` when it names no
     /// transaction file or the name has an unrecognized shape.
     pub fn recorded_by(dataset: &Dataset) -> Option<Self> {
-        let name = dataset.manifest().transaction_file.as_deref()?;
+        Self::from_transaction_file_name(dataset.manifest().transaction_file.as_deref()?)
+    }
+
+    /// The identity a manifest's transaction file name
+    /// (`{read_version}-{uuid}.txn`) records.
+    fn from_transaction_file_name(name: &str) -> Option<Self> {
         let (read_version, uuid) = name.strip_suffix(".txn")?.split_once('-')?;
         Some(Self {
             read_version: read_version.parse().ok()?,
@@ -53,6 +58,122 @@ impl StagedTransactionIdentity {
     pub fn base_is_detached(&self) -> bool {
         is_detached_version(self.read_version)
     }
+}
+
+/// One commit of a chain of detached commits, read from its manifest file
+/// alone: the identity its transaction file name records and the transaction
+/// stored inline in the same file.
+#[derive(Debug, Clone)]
+pub struct DetachedChainLink {
+    pub identity: StagedTransactionIdentity,
+    pub transaction: Transaction,
+}
+
+impl DetachedChainLink {
+    /// Read detached `version` of `dataset`'s branch with one whole-object
+    /// GET of its manifest, decoding the manifest and its inline transaction
+    /// from those bytes.
+    ///
+    /// Opening the version (`Dataset::checkout_version`) and then
+    /// `Dataset::read_transaction` costs five dependent requests on a
+    /// detached version, whose location Lance resolves without a size: a
+    /// HEAD and a tail read to open the manifest, then a HEAD and range reads
+    /// of the same file for the inline transaction. A chain walk needs only
+    /// the transaction and the identity, so this reads the file once.
+    ///
+    /// The framing is Lance's own (`lance_table::io::manifest::read_manifest`
+    /// and `Dataset::read_transaction`, pinned by
+    /// `lance_surface_guards::detached_manifest_file_holds_its_transaction_inline`):
+    /// a 16-byte footer whose first 8 bytes are the manifest's offset and
+    /// whose last 4 are `MAGIC`, a length-prefixed `pb::Manifest` ending at
+    /// the footer, and the length-prefixed `pb::Transaction` at the
+    /// manifest's `transaction_section`. Returns `Ok(None)` for every other
+    /// shape (no inline transaction, another version or branch, a framing
+    /// that does not add up), so the caller can take Lance's own route.
+    pub async fn read(dataset: &Dataset, version: u64) -> lance::Result<Option<Self>> {
+        use lance_io::utils::read_message_from_buf;
+        use lance_table::format::{MAGIC, pb};
+        use lance_table::io::commit::ManifestNamingScheme;
+        use object_store::ObjectStoreExt as _;
+
+        if !is_detached_version(version) {
+            return Ok(None);
+        }
+        let store = dataset.object_store(None).await?;
+        let path = ManifestNamingScheme::V2.manifest_path(&dataset.branch_location().path, version);
+        let bytes = store.inner.get(&path).await?.bytes().await?;
+        let Some(footer_start) = bytes.len().checked_sub(16) else {
+            return Ok(None);
+        };
+        if !bytes.ends_with(MAGIC) {
+            return Ok(None);
+        }
+        let Ok(manifest_pos) = usize::try_from(u64::from_le_bytes(
+            bytes[footer_start..footer_start + 8]
+                .try_into()
+                .expect("an 8-byte slice"),
+        )) else {
+            return Ok(None);
+        };
+        let Some(manifest) = length_prefixed_message(&bytes, manifest_pos, footer_start, true)
+        else {
+            return Ok(None);
+        };
+        let manifest = read_message_from_buf::<pb::Manifest>(&manifest)?;
+        if manifest.version != version || manifest.branch != dataset.manifest().branch {
+            return Ok(None);
+        }
+        let Some(identity) = Self::identity_of(&manifest) else {
+            return Ok(None);
+        };
+        let Some(transaction_pos) = manifest
+            .transaction_section
+            .and_then(|pos| usize::try_from(pos).ok())
+        else {
+            return Ok(None);
+        };
+        let Some(transaction) =
+            length_prefixed_message(&bytes, transaction_pos, manifest_pos, false)
+        else {
+            return Ok(None);
+        };
+        let transaction = read_message_from_buf::<pb::Transaction>(&transaction)?;
+        Ok(Some(Self {
+            identity,
+            transaction: Transaction::try_from(transaction)?,
+        }))
+    }
+
+    fn identity_of(
+        manifest: &lance_table::format::pb::Manifest,
+    ) -> Option<StagedTransactionIdentity> {
+        if manifest.transaction_file.is_empty() {
+            return None;
+        }
+        StagedTransactionIdentity::from_transaction_file_name(&manifest.transaction_file)
+    }
+}
+
+/// The bytes of the message Lance writes at `pos`, a little-endian `u32`
+/// length then the body: the body must end exactly at `end` when `exact`,
+/// and at or before it otherwise. `None` when the framing does not fit, so a
+/// malformed offset never slices out of bounds.
+fn length_prefixed_message(
+    bytes: &bytes::Bytes,
+    pos: usize,
+    end: usize,
+    exact: bool,
+) -> Option<bytes::Bytes> {
+    if end > bytes.len() {
+        return None;
+    }
+    let body_start = pos.checked_add(4).filter(|start| *start <= end)?;
+    let length = u32::from_le_bytes(bytes[pos..body_start].try_into().ok()?);
+    let body_end = body_start.checked_add(usize::try_from(length).ok()?)?;
+    if body_end > end || (exact && body_end != end) {
+        return None;
+    }
+    Some(bytes.slice(pos..body_end))
 }
 
 /// Whether a Lance version id names a detached version (RFC 0067).
@@ -148,5 +269,60 @@ impl StagingWitness {
             self.graph_head.clone().unwrap_or_default(),
         );
         transaction.transaction_properties = Some(Arc::new(properties));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::length_prefixed_message;
+    use bytes::Bytes;
+
+    fn framed(body: &[u8]) -> Vec<u8> {
+        let mut out = u32::try_from(body.len()).unwrap().to_le_bytes().to_vec();
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[test]
+    fn length_prefixed_message_takes_exactly_the_framed_body() {
+        let mut file = vec![9_u8; 3];
+        file.extend(framed(b"abc"));
+        let bytes = Bytes::from(file);
+        assert_eq!(
+            length_prefixed_message(&bytes, 3, 10, true).as_deref(),
+            Some(&framed(b"abc")[..])
+        );
+        assert!(length_prefixed_message(&bytes, 3, 10, false).is_some());
+        let mut padded = bytes.to_vec();
+        padded.push(0);
+        let padded = Bytes::from(padded);
+        assert!(
+            length_prefixed_message(&padded, 3, 11, true).is_none(),
+            "an exact message must end at the bound"
+        );
+        assert!(length_prefixed_message(&padded, 3, 11, false).is_some());
+    }
+
+    #[test]
+    fn length_prefixed_message_refuses_a_frame_that_does_not_fit() {
+        let bytes = Bytes::from(framed(b"abc"));
+        assert!(
+            length_prefixed_message(&bytes, 0, 6, false).is_none(),
+            "body past the bound"
+        );
+        assert!(
+            length_prefixed_message(&bytes, 4, 7, false).is_none(),
+            "no room for a length"
+        );
+        assert!(length_prefixed_message(&bytes, usize::MAX, 7, false).is_none());
+        assert!(
+            length_prefixed_message(&bytes, 0, 8, false).is_none(),
+            "bound past the bytes"
+        );
+        let huge = Bytes::from(u32::MAX.to_le_bytes().to_vec());
+        assert!(
+            length_prefixed_message(&huge, 0, 4, false).is_none(),
+            "length past the end"
+        );
     }
 }
