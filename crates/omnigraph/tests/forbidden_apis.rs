@@ -1100,7 +1100,7 @@ durable_calls! {
     ("storage_layer.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("db/omnigraph/promotion.rs", "SnapshotHandle::new(", 1, WriteProtocol::ReadOnlyAccess),
-    ("storage_layer.rs", ".dataset()", 38, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".dataset()", 39, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".into_arc()", 6, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", "SnapshotHandle::new(", 4, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("table_store.rs", "Dataset::write(", 2, WriteProtocol::EphemeralScratch),
