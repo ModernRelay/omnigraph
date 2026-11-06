@@ -1519,8 +1519,9 @@ async fn prepare_optimize_table(
     // The lag measured here is complete: a stable-row-id rewrite carries every
     // row-id-domain index's coverage to the new fragments (Lance 13's
     // `manifest_build.rs`; only zone-map, Bloom and FM indexes report row
-    // addresses, and the engine builds none), so compaction alone causes no
-    // fold after it.
+    // addresses, and the engine builds none, and only a data overlay newer
+    // than an index drops a fragment from it, and no engine writer creates
+    // one), so compaction alone causes no fold after it.
     let index_work = needs_reindex || index_work.needs_commit;
     let source_bytes = match measure_plan(snapshot.dataset(), &source, index_work, limits).await? {
         Ok(source_bytes) => source_bytes,
@@ -1705,7 +1706,8 @@ async fn apply_optimize_table_effects(
     // Fold every index whose coverage lags (appended fragments) as a detached
     // rebuild chained on the rewrite. The rewrite itself leaves none lagging:
     // Lance 13 carries a row-id-domain index's coverage to the new fragments,
-    // and the engine builds no address-domain index.
+    // the engine builds no address-domain index, and no engine writer creates
+    // the data overlays that would also drop coverage.
     let (fold, skipped_folds) = db.storage().stage_index_fold(&tip).await?;
     if let Some(staged) = fold {
         if tip_identity.is_some() {

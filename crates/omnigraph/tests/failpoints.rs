@@ -5107,6 +5107,7 @@ async fn optimize_captures_its_authority_under_the_gates_when_asked() {
         .unwrap()
         .version()
         .version;
+    let person_rows_after_write = helpers::count_rows(&writer_db, "node:Person").await;
 
     rendezvous.release();
     let report = tokio::time::timeout(std::time::Duration::from_secs(20), optimize)
@@ -5152,6 +5153,14 @@ async fn optimize_captures_its_authority_under_the_gates_when_asked() {
             .iter()
             .any(|stat| stat.type_key == "node:Person" && stat.committed()),
         "Person was rewritten on top of the concurrent write: {report:?}",
+    );
+    // The rewrite planned under the new capture keeps the row that moved
+    // main: a plan from the old capture would have dropped it.
+    let fresh = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    assert_eq!(
+        helpers::count_rows(&fresh, "node:Person").await,
+        person_rows_after_write,
+        "the concurrent insert survives the rewrite",
     );
     let recovery_dir = dir.path().join("__recovery");
     let sidecars: Vec<_> = std::fs::read_dir(&recovery_dir)
