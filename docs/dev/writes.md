@@ -206,7 +206,11 @@ in memory. It performs all type, value, uniqueness, endpoint, cardinality, and
 resource validation before staging. `stage_all` opens each touched table at
 its pin through the read-handle cache (the registration's `staged_version`
 when it carries one) and produces one exact transaction per table without
-moving HEAD. `commit_all` enters the gates, revalidates the complete
+moving HEAD. Once a publication names the new pins, the writer evicts each
+replaced base pin from that cache, so a steadily written table holds its
+current version rather than its recent history; the cache also bounds the
+decoded manifest bytes its handles keep alive, since a manifest lists every
+fragment. `commit_all` enters the gates, revalidates the complete
 authority (for a branch other than the handle's bound one, the captured
 manifest probe first: an unchanged version and branch identifier keep the
 captured authority, a mismatch is a fresh coherent capture), and commits
