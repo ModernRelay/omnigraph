@@ -266,6 +266,17 @@ unpublished staging the collector reclaims once it is dead. A strict mutation
 prepared before Optimize's publication reports the same read-set conflict as
 it would after any other writer.
 
+Optimize captures its write authority before it takes the shared schema,
+main-branch and table gates, and rechecks it under them. On the direct path
+(`AuthorityCapture::BeforeGates`, the default) a head that moved while the
+run waited refuses the run: outside a serving process no gate fences the
+writer that moved it. A served run (`AuthorityCapture::UnderGates`) captures
+its complete authority again under the held gates instead, because writers in
+the same process move main while a run waits and none can move it while the
+gates are held, so that capture is the attempt's one authority and never a
+mix of the two. Every refusal before the first table's staging, this one
+included, carries `CompletionEvidence::BeforeEffect`.
+
 A run with `max_gate_hold` defers every table whose turn comes after the
 deadline, measured from gate acquisition, and publishes the tables it finished
 (`run_table_pipeline`). A table whose own planning or staging fails with
@@ -299,7 +310,10 @@ helper, `table_ops::commit_updates_on_branch_with_expected`: it runs once,
 after the updates are prepared and before the coordinator lock and the
 publisher's first attempt, with the lineage intent's nonce and the captured
 head. Its failure publishes nothing and is `Unpublished`. The helper's other
-callers pass no hook.
+callers pass no hook. The hook runs under every writer gate and has no bound
+of its own, so it is part of the publication in the writer wait a bounded run
+promises: `max_gate_hold`, plus one table's rewrite, plus the publication with
+its hook, plus the configuration clear.
 
 The index writer (`ensure_indices`, which `omnigraph index build` runs on any
 branch, and the explicit full-text rebuild) follows the same protocol: it

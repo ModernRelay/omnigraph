@@ -659,6 +659,23 @@ impl std::fmt::Debug for OptimizeBeforePublish {
     }
 }
 
+/// Where a run's write authority is captured when main moved between the
+/// capture before the gates and the gates themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthorityCapture {
+    /// The direct path: the capture before the gates is the attempt's
+    /// authority, and a head that moved while the run waited refuses the run
+    /// before any effect. Outside a serving process no gate fences the writer
+    /// that moved it, so the refusal is the evidence of that writer.
+    #[default]
+    BeforeGates,
+    /// The served path: writers in the same process move main while the run
+    /// waits for its gates, and no writer can move it while they are held, so
+    /// a moved head is captured again under the gates and that capture is the
+    /// attempt's one authority, never a mix of the two.
+    UnderGates,
+}
+
 /// What one optimize run is asked to do. The default is the direct run as it
 /// has always been: every table on main, no bound, and both concurrencies from
 /// `OMNIGRAPH_MAINTENANCE_CONCURRENCY`.
@@ -677,9 +694,15 @@ pub struct OptimizeRequest {
     pub concurrency: Option<OptimizeConcurrency>,
     pub before_publish: Option<OptimizeBeforePublish>,
     pub cancellation: Option<OptimizeCancellation>,
+    pub authority: AuthorityCapture,
 }
 
 impl OptimizeRequest {
+    pub fn with_authority(mut self, authority: AuthorityCapture) -> Self {
+        self.authority = authority;
+        self
+    }
+
     pub fn with_tables<I, S>(mut self, tables: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -854,30 +877,46 @@ pub async fn optimize_all_datasets(
     actor: Option<&str>,
     request: OptimizeRequest,
 ) -> Result<OptimizeReport> {
+    // Nothing durable happens before the first table's staging, so every
+    // refusal up to there carries `BeforeEffect`.
     db.enforce(
         omnigraph_policy::PolicyAction::Maintain,
         &omnigraph_policy::ResourceScope::Branch("main".to_string()),
         actor,
-    )?;
+    )
+    .map_err(OmniError::before_effect)?;
     let concurrency = request
         .concurrency
         .unwrap_or_else(OptimizeConcurrency::from_env);
-    let _export_exclusion = db.reserve_export_destructive_control()?;
-    db.ensure_schema_state_valid().await?;
+    let _export_exclusion = db
+        .reserve_export_destructive_control()
+        .map_err(OmniError::before_effect)?;
+    db.ensure_schema_state_valid()
+        .await
+        .map_err(OmniError::before_effect)?;
 
     // Capture complete graph authority before entering any writer gate, then
     // revalidate it after schema -> main -> table acquisition. A concurrent
-    // graph or schema publish therefore refuses this attempt before any
-    // physical maintenance effect.
-    let authority_txn = db.open_write_txn(None).await?;
-    fail(&OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES)?;
+    // graph or schema publish refuses this attempt before any physical
+    // maintenance effect, or, when the request captures under the gates, is
+    // read again there (`AuthorityCapture`).
+    let authority_txn = db
+        .open_write_txn(None)
+        .await
+        .map_err(OmniError::before_effect)?;
+    fail(&OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES).map_err(OmniError::before_effect)?;
 
     // Canonical writer order: schema -> branch -> sorted tables. Planning reads
     // catalog index intent, so it must use an operation-local accepted catalog
     // under the same schema gate as schema apply and the exact RFC-022 writers.
     let schema_permit = db.write_queue().acquire_schema_shared().await;
-    db.refresh_coordinator_only().await?;
-    let catalog = db.load_accepted_catalog_with_schema_gate_held().await?;
+    db.refresh_coordinator_only()
+        .await
+        .map_err(OmniError::before_effect)?;
+    let catalog = db
+        .load_accepted_catalog_with_schema_gate_held()
+        .await
+        .map_err(OmniError::before_effect)?;
     let table_keys = all_table_keys(&catalog);
     let visit_order = request
         .visit_order(&table_keys)
@@ -894,11 +933,39 @@ pub async fn optimize_all_datasets(
     let table_guards = db.write_queue().acquire_many(&queue_keys).await;
     let gates_acquired = Instant::now();
 
-    let snapshot = db.revalidate_write_txn(&authority_txn).await?;
+    // Under the gates no writer in this process can move main, so a capture
+    // taken here is coherent on its own (invariant 3): the served path takes
+    // it when the one before the gates has moved, and the direct path keeps
+    // the refusal.
+    let (authority_txn, snapshot) = match db.revalidate_write_txn(&authority_txn).await {
+        Ok(snapshot) => (authority_txn, snapshot),
+        Err(error)
+            if request.authority == AuthorityCapture::UnderGates && error.is_read_set_changed() =>
+        {
+            tracing::info!(
+                target: "omnigraph::optimize",
+                error = %error,
+                "main moved before optimize held its gates; capturing its authority under them"
+            );
+            let recaptured = db
+                .open_write_txn(None)
+                .await
+                .map_err(OmniError::before_effect)?;
+            let snapshot = db
+                .revalidate_write_txn(&recaptured)
+                .await
+                .map_err(OmniError::before_effect)?;
+            (recaptured, snapshot)
+        }
+        Err(error) => return Err(error.before_effect()),
+    };
     let input_commit = authority_txn.authority.graph_head.clone();
     let input_manifest_version = authority_txn.base.graph_manifest_version();
 
-    let witness = authority_txn.authority.staging_witness()?;
+    let witness = authority_txn
+        .authority
+        .staging_witness()
+        .map_err(OmniError::before_effect)?;
     let table_tasks = visit_order
         .into_iter()
         .filter_map(|table_key| {
@@ -1449,6 +1516,11 @@ async fn prepare_optimize_table(
         .iter()
         .flat_map(|task| task.fragments.iter().cloned())
         .collect::<Vec<_>>();
+    // The lag measured here is complete: a stable-row-id rewrite carries every
+    // row-id-domain index's coverage to the new fragments (Lance 13's
+    // `manifest_build.rs`; only zone-map, Bloom and FM indexes report row
+    // addresses, and the engine builds none), so compaction alone causes no
+    // fold after it.
     let index_work = needs_reindex || index_work.needs_commit;
     let source_bytes = match measure_plan(snapshot.dataset(), &source, index_work, limits).await? {
         Ok(source_bytes) => source_bytes,
@@ -1630,9 +1702,10 @@ async fn apply_optimize_table_effects(
         tip_identity = Some(identity);
         fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
     }
-    // Fold every index whose coverage lags (appended fragments, or a vector
-    // index that keeps row addresses and dropped the compacted fragments)
-    // as a detached rebuild chained on the rewrite.
+    // Fold every index whose coverage lags (appended fragments) as a detached
+    // rebuild chained on the rewrite. The rewrite itself leaves none lagging:
+    // Lance 13 carries a row-id-domain index's coverage to the new fragments,
+    // and the engine builds no address-domain index.
     let (fold, skipped_folds) = db.storage().stage_index_fold(&tip).await?;
     if let Some(staged) = fold {
         if tip_identity.is_some() {

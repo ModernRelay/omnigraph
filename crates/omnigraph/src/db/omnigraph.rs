@@ -54,10 +54,10 @@ pub(crate) use export::{
     LogicalBlobValue, RangedExternalBlobs, logical_row_image, row_blob_values,
 };
 pub use optimize::{
-    ArtifactRefresh, ArtifactSkip, CleanupPolicyOptions, ConfigurationClear, DatasetCleanupStats,
-    DatasetOptimizeStats, DeferReason, OptimizeBeforePublish, OptimizeCancellation,
-    OptimizeConcurrency, OptimizeLimits, OptimizePublication, OptimizeReport, OptimizeRequest,
-    ResourceExceeded, ResourceMeasure, RunCancellation, SkipReason, TableCeilings,
+    ArtifactRefresh, ArtifactSkip, AuthorityCapture, CleanupPolicyOptions, ConfigurationClear,
+    DatasetCleanupStats, DatasetOptimizeStats, DeferReason, OptimizeBeforePublish,
+    OptimizeCancellation, OptimizeConcurrency, OptimizeLimits, OptimizePublication, OptimizeReport,
+    OptimizeRequest, ResourceExceeded, ResourceMeasure, RunCancellation, SkipReason, TableCeilings,
     TableOptimizeOutcome,
 };
 use prepared_create::initial_schema_ir;

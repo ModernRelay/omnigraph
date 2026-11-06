@@ -5022,6 +5022,11 @@ async fn optimize_refuses_when_graph_authority_moves_before_its_gates() {
     let error = outcome.expect_err(
         "Optimize must refuse a token whose graph head moved before it acquired its gates",
     );
+    assert_eq!(
+        error.completion_evidence(),
+        Some(CompletionEvidence::BeforeEffect),
+        "a refusal at authority revalidation happens before any effect: {error}"
+    );
     let rendered = error.to_string();
     assert!(
         rendered.contains("read set")
@@ -5047,6 +5052,112 @@ async fn optimize_refuses_when_graph_authority_moves_before_its_gates() {
         sidecars.is_empty(),
         "a pre-effect authority refusal must leave no Optimize sidecar: {sidecars:?}",
     );
+}
+
+/// The served path asks for its authority under the gates
+/// (`AuthorityCapture::UnderGates`): writers in the same process move main
+/// while a run waits for its gates, and none can move it while they are held,
+/// so the run captures again there instead of refusing, and publishes on the
+/// moved head.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+#[serial(optimize)]
+async fn optimize_captures_its_authority_under_the_gates_when_asked() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    seed_optimize_race_graph(&dir).await;
+
+    let optimize_db = std::sync::Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
+    let writer_db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    let person_uri = node_table_uri(optimize_db.as_ref(), "Person").await;
+    let graph_head_before = branch_head_commit_id(dir.path(), "main").await.unwrap();
+
+    let rendezvous = helpers::failpoint::Rendezvous::park_first(
+        &catalog::OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES,
+    );
+    let optimize_task_db = std::sync::Arc::clone(&optimize_db);
+    let optimize = tokio::spawn(async move {
+        optimize_task_db
+            .optimize_as(
+                None,
+                omnigraph::db::OptimizeRequest::default()
+                    .with_authority(omnigraph::db::AuthorityCapture::UnderGates),
+            )
+            .await
+    });
+    rendezvous.wait_until_reached().await;
+
+    mutate_main(
+        &writer_db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "authority-mover")], &[("$age", 41)]),
+    )
+    .await
+    .expect("the concurrent write must commit while Optimize waits");
+    let graph_head_after = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    assert_ne!(
+        graph_head_before, graph_head_after,
+        "the fixture must actually move the graph head, or this test is vacuous",
+    );
+    let person_head_after_write = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .version()
+        .version;
+
+    rendezvous.release();
+    let report = tokio::time::timeout(std::time::Duration::from_secs(20), optimize)
+        .await
+        .expect("Optimize task hung after releasing the authority-capture rendezvous")
+        .unwrap()
+        .expect("a run capturing under its gates publishes on the moved head");
+    drop(rendezvous);
+
+    assert_eq!(
+        report.input_commit.as_deref(),
+        Some(graph_head_after.as_str()),
+        "the capture under the gates is the attempt's authority: {report:?}"
+    );
+    assert!(
+        report.tables.iter().any(|stat| stat.committed()),
+        "the seeded compaction work must publish: {report:?}"
+    );
+    assert_eq!(
+        report.graph_commit_id.as_deref(),
+        Some(
+            branch_head_commit_id(dir.path(), "main")
+                .await
+                .unwrap()
+                .as_str()
+        ),
+        "the run's commit is main's head"
+    );
+    // Every table write is a detached commit, so Person's linear HEAD never
+    // moves; the rewrite shows in the report and in main's new head.
+    assert_eq!(
+        lance::Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .version()
+            .version,
+        person_head_after_write,
+        "a table's linear HEAD stays where it was",
+    );
+    assert!(
+        report
+            .tables
+            .iter()
+            .any(|stat| stat.type_key == "node:Person" && stat.committed()),
+        "Person was rewritten on top of the concurrent write: {report:?}",
+    );
+    let recovery_dir = dir.path().join("__recovery");
+    let sidecars: Vec<_> = std::fs::read_dir(&recovery_dir)
+        .map(|entries| entries.filter_map(|entry| entry.ok()).collect())
+        .unwrap_or_default();
+    assert!(sidecars.is_empty(), "no Optimize sidecar: {sidecars:?}");
 }
 
 /// Optimize retains main's branch gate after its final recovery relist and

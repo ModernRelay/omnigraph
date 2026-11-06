@@ -92,20 +92,18 @@ and `artifact` outcomes, which never fail a published run.
 Optimize also persists the traversal-adjacency artifact
 (`__graph_index/csr-current.bin`), which cold traversal builds load instead of
 scanning every edge dataset. It is derived: every load is verified and falls
-back to the in-memory build, so a stale copy or a failed write costs only its
-speedup, and a failed write is reported as the `artifact` outcome. Optimize
-builds it after releasing the writer gates, and only when the run advanced an
-edge dataset or no artifact exists.
+back to the in-memory build, so a stale copy or a failed write (the `artifact`
+outcome) costs only its speedup. Optimize builds it after releasing the writer
+gates, and only when the run advanced an edge dataset or no artifact exists; a
+build skipped for its size is counted again, up to the limit, by each such run.
 
 Existing full-text indexes are preserved rather than incrementally merged.
 Unindexed rows remain searchable, but a growing uncovered tail can cost more to
 scan. Use `index rebuild --kind full-text` to refresh that coverage or migrate
 an old analyzer generation. Optimize reports uncovered full-text coverage under
 `pending_indexes` with this remedy. Deferred coverage alone creates no graph
-commit or maintenance work.
-
-A vector index whose property has no usable vectors remains pending rather than
-failing the run. Run optimize again after loading or generating vectors.
+commit or maintenance work. A vector index whose property has no usable vectors
+also stays pending; run optimize again after loading or generating vectors.
 
 ## Build indexes
 

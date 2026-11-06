@@ -524,6 +524,15 @@ async fn person_pin(db: &Omnigraph) -> u64 {
         .published_dataset_version
 }
 
+async fn doc_pin(db: &Omnigraph) -> u64 {
+    db.snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .dataset("node:Doc")
+        .unwrap()
+        .published_dataset_version
+}
+
 /// Each per-table ceiling defers a table over it with nothing written; the
 /// plan holds a deletion file, which records no size, so the byte measure
 /// reads it from storage.
@@ -608,6 +617,99 @@ async fn optimize_defers_a_table_over_a_ceiling_and_writes_nothing_for_it() {
     assert!(
         person.source_bytes.is_some_and(|bytes| bytes > 0),
         "{person:?}"
+    );
+}
+
+/// A stable-row-id rewrite carries every BTREE and vector index's coverage to
+/// the new fragments (Lance 13 drops coverage only for zone-map, Bloom and FM
+/// indexes, which the engine does not build), so compaction alone is no index
+/// work: the index-rows ceiling counts only a rebuild the plan already shows,
+/// and the rewrite publishes as one link with no fold after it.
+#[tokio::test]
+async fn optimize_rewrite_keeps_index_coverage_so_index_rows_count_only_a_lagging_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = "node Doc {\n    slug: String @key\n    note: String?\n    n: I64 @index\n    embedding: Vector(4) @index\n}\n";
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), schema)
+            .await
+            .unwrap(),
+    );
+    let lines = (0..4)
+        .map(|i| {
+            serde_json::json!({
+                "type": "Doc",
+                "data": {"slug": format!("d{i}"), "note": "n", "n": i, "embedding": [i as f32, 0.0, 0.0, 0.0]},
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    db.load_jsonl(&lines, LoadMode::Overwrite).await.unwrap();
+    // Settle every index, then prove the table has nothing left to do and
+    // every declared index exists.
+    db.optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    let settled = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        settled.tables.iter().all(|stat| !stat.committed()),
+        "test precondition: {settled:?}"
+    );
+    let ds = snapshot_main(&db)
+        .await
+        .unwrap()
+        .open_dataset("node:Doc")
+        .await
+        .unwrap();
+    assert!(ds.has_btree_index("n").await.unwrap(), "test precondition");
+    assert!(
+        ds.has_vector_index("embedding").await.unwrap(),
+        "test precondition"
+    );
+    // Dropping a property is compaction work while every index covers every
+    // fragment.
+    assert!(
+        db.apply_schema("node Doc {\n    slug: String @key\n    n: I64 @index\n    embedding: Vector(4) @index\n}\n")
+            .await
+            .unwrap()
+            .applied
+    );
+    let pin = doc_pin(&db).await;
+
+    let report = db
+        .optimize_as(
+            None,
+            OptimizeRequest::default().with_limits(
+                OptimizeLimits::default()
+                    .with_table_ceilings(TableCeilings::default().with_index_rows(1)),
+            ),
+        )
+        .await
+        .unwrap();
+    let doc = report
+        .tables
+        .iter()
+        .find(|stat| stat.type_key == "node:Doc")
+        .unwrap();
+    assert!(
+        doc.committed(),
+        "a rewrite with no lagging index is not index work: {doc:?}"
+    );
+    assert_eq!(
+        doc_pin(&db).await,
+        pin + 1,
+        "the rewrite is the table's only link: no fold follows it"
+    );
+    let settled = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        settled.tables.iter().all(|stat| !stat.committed()),
+        "every index still covers every fragment: {settled:?}"
     );
 }
 
