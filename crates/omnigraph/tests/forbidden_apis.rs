@@ -1233,6 +1233,11 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     "compact_files(",
     ".optimize_indices(",
     "cleanup_old_versions(",
+    // No engine writer creates a data overlay: Lance drops an index's coverage
+    // of a fragment whose overlay is newer than the index, and optimize's
+    // index-rows ceiling measures the lag before the rewrite (lance.md, "Index
+    // coverage").
+    "Operation::DataOverlay",
     ".update_config(",
     ".update_schema_metadata(",
     "write_schema_contract_staging(",
