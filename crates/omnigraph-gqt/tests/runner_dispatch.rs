@@ -994,21 +994,40 @@ fn prepared_store_under_dst_runs_a_concurrent_block_and_leaves_the_root_unchange
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let (_, summary) = report(&output);
+    let (saved, summary) = report(&output);
     assert_eq!(summary["attempts"][0]["input"]["store"], uri);
     let observations = summary["attempts"][0]["outcome"]["Ok"]["observations"]
         .as_array()
         .unwrap()
         .clone();
-    assert!(
-        observations.iter().any(|event| {
-            event.as_str().is_some_and(|text| {
-                text.starts_with("prepared store: ") && text.contains("objects")
+    assert_eq!(
+        observations
+            .iter()
+            .filter(|event| {
+                event.as_str().is_some_and(|text| {
+                    text.starts_with("prepared store: ")
+                        && text.ends_with("read through below the ledger")
+                })
             })
-        }),
-        "{observations:?}"
+            .count(),
+        1,
+        "one trace line per attempt: {observations:?}"
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("GQT measure:"));
+    let replay = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg("--replay")
+        .arg(saved)
+        .output()
+        .unwrap();
+    assert!(
+        !replay.status.success(),
+        "a prepared root is not frozen by the report"
+    );
+    assert!(
+        String::from_utf8_lossy(&replay.stderr)
+            .contains("external-store invocations cannot replay")
+    );
+    assert!(report(&replay).1["attempts"].as_array().unwrap().is_empty());
     runtime.block_on(async {
         let db = omnigraph::db::Omnigraph::open(&uri).await.unwrap();
         let session =
@@ -1028,7 +1047,7 @@ fn prepared_store_under_dst_runs_a_concurrent_block_and_leaves_the_root_unchange
 
 #[cfg(tokio_unstable)]
 #[test]
-fn prepared_store_under_dst_runs_seams_on_the_copy_and_refuses_foreign_entries() {
+fn prepared_store_under_dst_runs_seams_on_the_view_ignores_foreign_files_and_refuses_symlinks() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("graph");
     let uri = format!("file://{}", root.display());
@@ -1082,19 +1101,20 @@ fn prepared_store_under_dst_runs_seams_on_the_copy_and_refuses_foreign_entries()
             "{name}: {observations:?}"
         );
     }
-    std::fs::write(root.join(".stray"), b"not an engine object").unwrap();
-    let output = run("copy_windowed.gqt", &windowed);
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(!output.status.success());
-    assert!(
-        text.contains("prepared store holds an object of kind UNKNOWN: .stray"),
-        "{text}"
-    );
-    std::fs::remove_file(root.join(".stray")).unwrap();
+    for foreign in [".stray", "notes.txt"] {
+        std::fs::write(root.join(foreign), b"not an engine object").unwrap();
+        let output = run("copy_windowed.gqt", &windowed);
+        assert!(
+            output.status.success(),
+            "{foreign}: a foreign file the engine never reads is the directory's business: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(root.join(foreign)).unwrap(),
+            b"not an engine object"
+        );
+        std::fs::remove_file(root.join(foreign)).unwrap();
+    }
     std::os::unix::fs::symlink(".", root.join("loop")).unwrap();
     let output = run("copy_windowed.gqt", &windowed);
     let text = format!(

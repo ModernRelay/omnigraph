@@ -73,11 +73,51 @@ pub async fn list_branch_contents(dataset: &Dataset) -> Result<HashMap<String, B
 /// Read one physical ref through the same bounded retry boundary; the caller
 /// maps `RefNotFound` to its own public miss.
 pub async fn get_branch_contents(dataset: &Dataset, branch: &str) -> lance::Result<BranchContents> {
+    check_valid_branch(branch)?;
+    let root = dataset.branch_location().find_main()?;
+    let store = dataset.object_store(None).await?;
+    let path = branch_contents_path(&root.path, branch);
+    let (path, store) = (&path, &store);
     read_branch_refs(
-        || async move { dataset.branches().get(branch).await },
+        || async move {
+            match read_ref_contents(store, path, branch).await {
+                Err(lance::Error::NotFound { .. }) => Err(lance::Error::RefNotFound {
+                    message: format!("branch {branch} does not exist"),
+                }),
+                result => result,
+            }
+        },
         is_raced_ref_read,
     )
     .await
+}
+
+/// Read one ref object in a single GET. Lance's `BranchContents::from_path`
+/// heads the object for its size and then reads that range, and
+/// `Branches::get` heads it once more for existence: three requests, and the
+/// head/range pair can observe a rewrite between them (the torn read the
+/// retry boundary above absorbs). One GET returns one whole object version.
+/// A ref written before identifiers existed falls back to Lance's reader,
+/// which derives its private synthetic identifier.
+pub(crate) async fn read_ref_contents(
+    store: &lance::io::ObjectStore,
+    path: &object_store::path::Path,
+    name: &str,
+) -> lance::Result<BranchContents> {
+    let bytes = store
+        .inner
+        .get(path)
+        .await
+        .map_err(lance::Error::from)?
+        .bytes()
+        .await
+        .map_err(lance::Error::from)?;
+    let contents: BranchContents = serde_json::from_slice(&bytes)
+        .map_err(|error| lance::Error::corrupt_file(path.clone(), error.to_string()))?;
+    if contents.identifier == BranchIdentifier::missing_identifier_sentinel() {
+        return BranchContents::from_path(path, store, name).await;
+    }
+    Ok(contents)
 }
 
 /// Read one physical ref's exact lifetime identity; same boundary and
@@ -86,17 +126,19 @@ pub async fn get_branch_identifier(
     dataset: &Dataset,
     native: &str,
 ) -> lance::Result<BranchIdentifier> {
-    read_branch_refs(
-        || async move { dataset.branches().get_identifier(Some(native)).await },
-        is_raced_ref_read,
-    )
-    .await
+    get_branch_contents(dataset, native)
+        .await
+        .map(|contents| contents.identifier)
 }
 
 /// The identity of the ref a dataset handle is checked out on, through the
 /// same boundary; every engine read of `Dataset::branch_identifier` goes here.
 pub async fn dataset_branch_identifier(dataset: &Dataset) -> lance::Result<BranchIdentifier> {
-    read_branch_refs(|| dataset.branch_identifier(), is_raced_ref_read).await
+    match dataset.manifest().branch.as_deref() {
+        // `Dataset::branch_identifier` answers main without a read.
+        None => Ok(BranchIdentifier::main()),
+        Some(native) => get_branch_identifier(dataset, native).await,
+    }
 }
 
 /// Resolve a logical branch to its single live native ref by reading only that
@@ -129,7 +171,7 @@ async fn live_manifest_branches_matching(
         }
         let path = lance::dataset::refs::branch_contents_path(&root.path, &native);
         let (path, store, name) = (&path, &store, native.as_str());
-        let read = || async move { BranchContents::from_path(path, store, name).await };
+        let read = || async move { read_ref_contents(store, path, name).await };
         match read_branch_refs(read, is_torn_ref_read).await {
             Ok(contents) => {
                 if manifest_branch_is_live(&native, &contents)? {
@@ -1003,6 +1045,9 @@ mod tests {
         /// `head` reports a size that cuts the object inside its first
         /// multi-byte character, so the prefix is not UTF-8 at all.
         StaleHeadSizeMidChar,
+        /// A whole-object GET answers the object less its last two bytes:
+        /// an unreadable ref for a reader that sends no HEAD.
+        TruncatedBody,
     }
 
     impl InjectedRefRead {
@@ -1146,6 +1191,27 @@ mod tests {
                         result.meta.size -= 2;
                         return Ok(result);
                     }
+                    InjectedRefRead::TruncatedBody if !options.head => {
+                        let result = self.target.get_opts(location, options).await?;
+                        let (meta, range, attributes, extensions) = (
+                            result.meta.clone(),
+                            result.range.clone(),
+                            result.attributes.clone(),
+                            result.extensions.clone(),
+                        );
+                        let bytes = result.bytes().await?;
+                        let cut = bytes.slice(..bytes.len().saturating_sub(2));
+                        return Ok(GetResult {
+                            payload: object_store::GetResultPayload::Stream(Box::pin(
+                                futures::stream::once(async move { Ok(cut) }),
+                            )),
+                            meta,
+                            range,
+                            attributes,
+                            extensions,
+                        });
+                    }
+                    InjectedRefRead::TruncatedBody => {}
                     InjectedRefRead::StaleHeadSizeMidChar => {
                         let mut result = self.target.get_opts(location, options).await?;
                         let bytes = self.target.get(location).await?.bytes().await?;
@@ -1327,7 +1393,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(contents.parent_version, version);
-        assert_eq!(fault.injected_failures(), 2);
+        // An exact ref read is one GET of the whole object: it sends no HEAD,
+        // so the stale size this fault answers a HEAD with is never observed
+        // and the rewrite race between a HEAD and a ranged GET cannot occur.
+        assert_eq!(fault.injected_failures(), 0);
     }
 
     #[tokio::test]
@@ -1379,7 +1448,8 @@ mod tests {
 
         let identifier = get_branch_identifier(&wrapped, "retiring").await.unwrap();
         assert_eq!(identifier, expected);
-        assert_eq!(fault.injected_failures(), 2);
+        // One GET, no HEAD: the stale-size answer is never requested.
+        assert_eq!(fault.injected_failures(), 0);
     }
 
     /// The nightly's failure shape: resolving one branch read every ref, so
@@ -1518,9 +1588,11 @@ mod tests {
             assert_eq!(
                 resolve_live_native_branch(&wrapped, logical).await.unwrap(),
                 Some(native.clone()),
-                "a torn ref read must retry without reporting the branch absent"
+                "a ref rewritten during the read must not report the branch absent"
             );
-            assert_eq!(transient.injected_failures(), 1);
+            // Resolution reads each candidate ref in one GET, so no HEAD
+            // answers a stale size and no torn read occurs.
+            assert_eq!(transient.injected_failures(), 0);
 
             let identity = dataset.branches().get(&native).await.unwrap().identifier;
             retire_branch_recoverably(&dataset, &native, &identity)
@@ -1570,7 +1642,7 @@ mod tests {
             let persistent = Arc::new(VanishingBranchRefFault::new(
                 &format!("{native}.json"),
                 usize::MAX,
-                InjectedRefRead::StaleHeadSize,
+                InjectedRefRead::TruncatedBody,
             ));
             let wrapped = dataset.with_object_store_wrappers(vec![
                 Arc::clone(&persistent) as Arc<dyn WrappingObjectStore>

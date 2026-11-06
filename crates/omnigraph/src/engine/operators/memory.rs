@@ -9,19 +9,11 @@ use arrow_array::{Array, RecordBatch, RecordBatchOptions, UInt32Array};
 use arrow_schema::{DataType, SchemaRef};
 use datafusion::arrow::array::ArrayData;
 use datafusion::arrow::buffer::Buffer;
-use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DataFusionError, Result as DfResult};
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
-use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion::physical_plan::sorts::{
-    sort::SortExec, sort_preserving_merge::SortPreservingMergeExec,
-};
-use datafusion::physical_plan::{
-    ExecutionPlan, ExecutionPlanProperties, SendableRecordBatchStream,
-};
+use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use futures::StreamExt;
-use lance_datafusion::exec::HardCapBatchSizeExec;
 
 use super::load_budget::{LoadBudget, ShareClass};
 use crate::engine::context::{QueryWorkLease, QueryWorkScope};
@@ -833,30 +825,7 @@ impl WorkMemory {
         plan: Arc<dyn ExecutionPlan>,
     ) -> DfResult<(Arc<dyn ExecutionPlan>, SendableRecordBatchStream)> {
         let input_limit = crate::table_store::sort_input_batch_bytes(self.resources.limit);
-        let plan = plan
-            .transform_down(|node| {
-                if node.downcast_ref::<SortExec>().is_some() {
-                    let children = node
-                        .children()
-                        .into_iter()
-                        .map(|child| {
-                            Arc::new(HardCapBatchSizeExec::new(Arc::clone(child), input_limit))
-                                as Arc<dyn ExecutionPlan>
-                        })
-                        .collect();
-                    Ok(Transformed::yes(node.with_new_children(children)?))
-                } else {
-                    Ok(Transformed::no(node))
-                }
-            })?
-            .data;
-        let plan: Arc<dyn ExecutionPlan> = if plan.output_partitioning().partition_count() == 1 {
-            plan
-        } else if let Some(ordering) = plan.output_ordering() {
-            Arc::new(SortPreservingMergeExec::new(ordering.clone(), plan))
-        } else {
-            Arc::new(CoalescePartitionsExec::new(plan))
-        };
+        let plan = crate::table_store::cap_sort_inputs_and_merge_partitions(plan, input_limit)?;
         let stream = plan.execute(0, Arc::clone(&self.ctx))?;
         Ok((plan, stream))
     }

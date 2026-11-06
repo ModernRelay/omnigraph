@@ -4,12 +4,14 @@
 //! attaches, every consulted table's row count and index facts at the
 //! committed version, so planning a write reads metadata and never a row.
 
+use std::collections::{BTreeSet, HashMap};
+
 use omnigraph_compiler::catalog::{Catalog, NodeType};
 use omnigraph_compiler::ir::{DeltaClass, WriteKind, lower_write_table};
 use omnigraph_compiler::query::ast::LoadTarget;
 use omnigraph_planner::{
-    CommittedSide, Decision, Explain, MemorySource, NodeTypeSpec, Operation, PhysicalNode,
-    RouteOverride, Side, SideId, route,
+    CommittedSide, Decision, Explain, IndexFact, MemorySource, NodeTypeSpec, Operation,
+    PhysicalNode, RouteOverride, Side, SideId, route,
 };
 
 use super::load::JudgedTable;
@@ -46,7 +48,8 @@ pub(crate) async fn plan_write(
     tables: Vec<WriteTable>,
     write_max_bytes: u64,
 ) -> Result<Vec<(JudgedTable, Explain)>> {
-    let mut planned = Vec::with_capacity(tables.len());
+    let mut lowered = Vec::with_capacity(tables.len());
+    let mut consulted = BTreeSet::new();
     for table in tables {
         let target = load_target(&table.table)?;
         let ir = lower_write_table(
@@ -57,6 +60,23 @@ pub(crate) async fn plan_write(
             table.rows,
         );
         let sides = load_sides(snapshot, catalog.system_columns, &table.table, &ir.checks);
+        consulted.extend(
+            sides
+                .iter()
+                .map(|side| side.table.type_key.clone())
+                .filter(|key| snapshot.dataset(key).is_some()),
+        );
+        lowered.push((table, target, ir, sides));
+    }
+    let facts = futures::future::try_join_all(consulted.iter().map(|key| async move {
+        let facts = crate::engine::plan_source::load_index_facts(snapshot, key).await?;
+        Ok::<_, OmniError>((key.as_str(), facts))
+    }))
+    .await?;
+    let facts: HashMap<&str, Vec<IndexFact>> = facts.into_iter().collect();
+    let bounds = crate::engine::engine_bounds(write_max_bytes, write_max_bytes, 1);
+    let mut planned = Vec::with_capacity(lowered.len());
+    for (table, target, ir, sides) in lowered {
         let mut source = MemorySource::default()
             .with_schema(SideId::Child, csv::target_arrow_schema(catalog, &target)?);
         for side in &sides {
@@ -73,10 +93,12 @@ pub(crate) async fn plan_write(
                     node_type_spec(side, node, catalog, Some(entry.entity_count)),
                 );
             }
-            source = source.with_index_facts(
-                key,
-                crate::engine::plan_source::load_index_facts(snapshot, key).await?,
-            );
+            let facts = facts.get(key).cloned().ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "Validate: no index facts were read for the consulted table {key}"
+                ))
+            })?;
+            source = source.with_index_facts(key, facts);
         }
         let operation = Operation::Write {
             ir: Box::new(ir),
@@ -84,7 +106,6 @@ pub(crate) async fn plan_write(
             tables: sides,
             committed,
         };
-        let bounds = crate::engine::engine_bounds(write_max_bytes, write_max_bytes, 1);
         let decision = route(&operation, &source, RouteOverride::Registry, &bounds);
         planned.push(judged_table(
             decision,

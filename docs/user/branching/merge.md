@@ -176,7 +176,9 @@ The `merge_lineage` [session setting](../queries/index.md#session-settings)
 merge_lineage=off`, or the request's `settings` field; process default
 `OMNIGRAPH_MERGE_LINEAGE`) selects how a branch merge finds what changed. `on`
 (the release default) discovers candidates from Lance version metadata —
-fragment lists and deletion files — and compares candidate rows. Known deleted
+fragment lists and deletion files — and compares candidate rows, for tables
+both branches changed and for tables only the source changed (including a
+fast forward), so its cost follows what changed rather than the table size. Known deleted
 row positions use bounded direct reads. Candidate filtering may still scan data
 when an applicable index is absent; a fail-closed
 precondition gate falls back to the full three-way scan whenever any
