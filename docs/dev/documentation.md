@@ -283,7 +283,7 @@ v0.12.0 through v0.14.0 are format 1, and each snapshot records its format, so
 their snapshots keep that shape. v0.14.0's GitHub release body was replaced
 by hand after publication with a format-2 page; its snapshot is unchanged. v0.12.0's hand-written document was converted
 into two notes, `changelog.d/a-release-highlights.added.md` and
-`changelog.d/a-compatibility-and-behavior-changes.changed.md`. The v0.14.1
+`changelog.d/a-compatibility-and-behavior-changes.changed.md`. The v0.15.0
 cycle is the first in format 2; a format-2 GitHub release body is the snapshot
 without its heading, status line and provenance comment. The length caps and
 the release file apply only to a format-2 cycle. Generated snapshots require
