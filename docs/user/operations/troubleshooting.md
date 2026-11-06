@@ -305,3 +305,22 @@ omnigraph repair --target ./graph.omni --json
 For server requests, retain the HTTP status, response body, request path,
 timestamp, and server logs. Redact bearer tokens and storage credentials before
 sharing diagnostics.
+
+## Lance cache limits
+
+Each open graph has its own Lance index and metadata caches, and neither is
+bounded by the server's admission limits. These process-wide environment variables
+set their capacities when a graph is opened; sizes are integer bytes, and invalid
+numbers warn and use the default. Zero is valid and retains nothing. The retained total is the capacity times the
+number of open graphs. They bound what the caches retain, not process RSS.
+
+| Variable | Default | Resource |
+|---|---:|---|
+| `OMNIGRAPH_LANCE_INDEX_CACHE_BYTES` | 6442450944 (6 GiB) | Opened index data, per graph |
+| `OMNIGRAPH_LANCE_METADATA_CACHE_BYTES` | 1073741824 (1 GiB) | File and table metadata, per graph |
+
+The engine builds a vector index as one partition, about the size of the
+property's vectors, and a partition larger than the index cache is not retained.
+Each `nearest` then reads it again, which can cost more memory and latency than
+the cache saves. Size the index cache above the vector properties you query
+regularly.
