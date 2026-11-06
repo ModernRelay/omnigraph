@@ -229,8 +229,8 @@ async fn execute_case_with_storage(
     prepared: Option<&str>,
 ) -> Result<(), String> {
     let db = match (prepared, case.fixture.as_ref()) {
-        (Some(restored), _) => {
-            GqtHost.observe(|| restored.to_string());
+        (Some(mounted), _) => {
+            GqtHost.observe(|| mounted.to_string());
             Omnigraph::open_with_storage(uri, storage.clone())
                 .await
                 .map_err(|e| format!("open failed: {e}"))?

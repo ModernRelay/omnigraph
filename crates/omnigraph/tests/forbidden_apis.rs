@@ -1089,6 +1089,8 @@ durable_calls! {
     ("omnigraph-storage/scoped.rs", ".put_part(", 1, WriteProtocol::Composed("tracked child of an owned multipart upload")),
     ("omnigraph-storage/scoped.rs", ".complete(", 1, WriteProtocol::Composed("owned multipart publication, never success after uncertain part completion")),
     ("omnigraph-storage/scoped.rs", ".abort(", 1, WriteProtocol::Composed("owned multipart cleanup retained across detached abort")),
+    ("omnigraph-storage/read_through.rs", ".put_opts(", 5, WriteProtocol::Composed("memory-layer put over a frozen directory (a prepared store under DST): overwrite, create, update of a layer object, update of a directory object landing as a create, and the copy's put")),
+    ("omnigraph-storage/read_through.rs", ".delete(", 1, WriteProtocol::Composed("memory-layer delete over a frozen directory, which it masks")),
     ("engine/operators/memory.rs", ".abort(", 1, WriteProtocol::ReadTaskCancellation),
     ("omnigraph-storage/lib.rs", ".rename(", 1, WriteProtocol::Composed("object storage rename primitive")),
     ("storage_layer.rs", ".force_delete_branch(", 1, WriteProtocol::NativeRefControl),
@@ -2681,6 +2683,12 @@ const MUTABLE_KEY_REQUESTS: &[(&str, &str, usize, &str)] = &[
         ".delete(",
         2,
         "the scope's own delete and rename-source delete; a mutable key's unknown outcome leaves it unsettled",
+    ),
+    (
+        "omnigraph-storage/read_through.rs",
+        ".delete(",
+        1,
+        "the read-through store's delete removes the memory layer's object in this process and masks the frozen directory's; DST only, nothing lands late",
     ),
     (
         "storage_layer.rs",
