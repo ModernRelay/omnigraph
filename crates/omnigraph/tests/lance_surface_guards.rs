@@ -9091,3 +9091,301 @@ async fn row_identity_discovery_stamps_row_ids_and_rewrites_lance_13() {
         "compaction carries every live row's id and stamp into the rewritten fragments"
     );
 }
+
+/// Issue #1264: the column patch an `update` stages. A `RewriteColumns`
+/// merge-insert of `(id, score)` over a table with a Blob and a vector column
+/// attaches one data file per touched fragment and never touches the Blob or
+/// vector bytes; it lists the join key in `fields_modified`, so as Lance
+/// stages it the touched fragments leave the `id` index. With the key removed
+/// from `fields_modified`, which the engine does because the patch rewrites
+/// the key byte for byte and moves no row, the index keeps them and still
+/// finds every row. Only the patched rows are restamped, with the read
+/// version plus one, and every row keeps its stable row id. Goes red if
+/// Lance stops listing the key (drop `keep_key_index_coverage`) or stops
+/// restamping or keeping row ids (revisit the change-feed's row-identity
+/// route for column patches).
+#[tokio::test]
+async fn column_patch_keeps_blob_files_row_ids_and_key_index_coverage_issue_1264() {
+    use arrow_array::types::{Int32Type, UInt64Type};
+    use lance::dataset::MergeInsertWriteMode;
+    use lance::dataset::transaction::UpdateMode;
+
+    const DIM: i32 = 4;
+    const ROWS: usize = 8;
+
+    async fn commit_detached(ds: &Dataset, transaction: Transaction) -> Dataset {
+        CommitBuilder::new(Arc::new(ds.clone()))
+            .with_detached(true)
+            .with_skip_auto_cleanup(true)
+            .execute(transaction)
+            .await
+            .unwrap()
+    }
+
+    async fn id_coverage(ds: &Dataset) -> Vec<u32> {
+        let indices = ds.load_indices().await.unwrap();
+        let index = indices
+            .iter()
+            .find(|index| index.name == "id_idx")
+            .expect("the id index");
+        index
+            .fragment_bitmap
+            .as_ref()
+            .map(|bitmap| bitmap.iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// `(id, score, row id, stamp)` per row, and the Blob bytes.
+    async fn rows(ds: &Dataset) -> Vec<(String, Option<i32>, u64, u64, Vec<u8>)> {
+        let mut scanner = ds.scan();
+        scanner.with_row_id();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        let batch = scanner
+            .project(&["id", "score", "content", ROW_LAST_UPDATED_AT_VERSION])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = batch.column_by_name("id").unwrap().as_string::<i32>();
+        let scores = batch
+            .column_by_name("score")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>();
+        let stamps = batch
+            .column_by_name(ROW_LAST_UPDATED_AT_VERSION)
+            .unwrap()
+            .as_primitive::<UInt64Type>();
+        let contents = batch.column_by_name("content").unwrap().as_binary::<i64>();
+        let mut rows = (0..batch.num_rows())
+            .map(|row| {
+                (
+                    ids.value(row).to_string(),
+                    scores.is_valid(row).then(|| scores.value(row)),
+                    row_ids.value(row),
+                    stamps.value(row),
+                    contents.value(row).to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    }
+
+    async fn lookup(ds: &Dataset, id: &str) -> Vec<(String, Option<i32>)> {
+        let mut scanner = ds.scan();
+        scanner.filter(&format!("id = '{id}'")).unwrap();
+        let batch = scanner
+            .project(&["id", "score"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = batch.column_by_name("id").unwrap().as_string::<i32>();
+        let scores = batch
+            .column_by_name("score")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        (0..batch.num_rows())
+            .map(|row| {
+                (
+                    ids.value(row).to_string(),
+                    scores.is_valid(row).then(|| scores.value(row)),
+                )
+            })
+            .collect()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("patch.lance");
+    let uri = uri.to_str().unwrap();
+    let mut pk = HashMap::new();
+    pk.insert(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false).with_metadata(pk),
+        Field::new("score", DataType::Int32, true),
+        lance::blob::blob_field("content", true),
+        Field::new(
+            "emb",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), DIM),
+            true,
+        ),
+    ]));
+    let ids = (0..ROWS).map(|row| format!("k{row}")).collect::<Vec<_>>();
+    let mut content = BlobArrayBuilder::new(ROWS);
+    for row in 0..ROWS {
+        content.push_bytes(vec![row as u8; 64 * 1024]).unwrap();
+    }
+    let emb = arrow_array::FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        DIM,
+        Arc::new(Float32Array::from(
+            (0..ROWS * DIM as usize)
+                .map(|value| value as f32)
+                .collect::<Vec<_>>(),
+        )),
+        None,
+    )
+    .unwrap();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(ids.clone())),
+            Arc::new(Int32Array::from(vec![None::<i32>; ROWS])),
+            content.finish().unwrap(),
+            Arc::new(emb),
+        ],
+    )
+    .unwrap();
+    let mut base = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    base.create_index(
+        &["id"],
+        IndexType::Scalar,
+        Some("id_idx".to_string()),
+        &ScalarIndexParams::default(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(base.get_fragments().len(), 1);
+    let fragment = base.get_fragments()[0].metadata().clone();
+    assert_eq!(id_coverage(&base).await, vec![fragment.id as u32]);
+    let id_field = base.schema().field("id").unwrap().id as u32;
+    let score_field = base.schema().field("score").unwrap().id as u32;
+    let before = rows(&base).await;
+
+    // Stage the patch of two rows, as the engine's KnownPresentColumnPatch does.
+    let source_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("score", DataType::Int32, true),
+    ]));
+    let source = RecordBatch::try_new(
+        source_schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["k2", "k5"])),
+            Arc::new(Int32Array::from(vec![Some(20), Some(50)])),
+        ],
+    )
+    .unwrap();
+    let mut builder =
+        MergeInsertBuilder::try_new(Arc::new(base.clone()), vec!["id".into()]).unwrap();
+    builder.when_matched(WhenMatched::UpdateAll);
+    builder.when_not_matched(WhenNotMatched::DoNothing);
+    builder.write_mode(MergeInsertWriteMode::RewriteColumns);
+    builder.conflict_retries(0);
+    let staged = builder
+        .try_build()
+        .unwrap()
+        .execute_uncommitted(lance_datafusion::utils::reader_to_stream(Box::new(
+            RecordBatchIterator::new(vec![Ok(source)], source_schema),
+        )))
+        .await
+        .unwrap();
+    assert_eq!(staged.stats.num_updated_rows, 2);
+    assert_eq!(staged.stats.num_inserted_rows, 0);
+    let Operation::Update {
+        removed_fragment_ids,
+        updated_fragments,
+        new_fragments,
+        fields_modified,
+        update_mode,
+        inserted_rows_filter,
+        updated_fragment_offsets,
+        ..
+    } = &staged.transaction.operation
+    else {
+        panic!("a column patch stages an Update");
+    };
+    assert!(removed_fragment_ids.is_empty() && new_fragments.is_empty());
+    assert_eq!(update_mode, &Some(UpdateMode::RewriteColumns));
+    assert!(inserted_rows_filter.is_none());
+    assert!(updated_fragment_offsets.is_some());
+    assert_eq!(updated_fragments.len(), 1);
+    let patched = &updated_fragments[0];
+    assert_eq!(patched.id, fragment.id);
+    assert_eq!(
+        patched.files.len(),
+        fragment.files.len() + 1,
+        "the patch attaches one data file"
+    );
+    for (old, new) in fragment.files.iter().zip(&patched.files) {
+        assert_eq!(old.path, new.path, "the existing data files are kept");
+    }
+    let mut patch_fields = patched.files.last().unwrap().fields.to_vec();
+    patch_fields.sort();
+    assert_eq!(
+        patch_fields,
+        vec![id_field as i32, score_field as i32],
+        "the patch file holds the key and the patched column, never the Blob or vector"
+    );
+    let mut modified = fields_modified.clone();
+    modified.sort();
+    assert_eq!(
+        modified,
+        vec![id_field, score_field],
+        "Lance lists the rewritten key in fields_modified"
+    );
+
+    // As staged, the touched fragment leaves the id index.
+    let as_staged = commit_detached(&base, staged.transaction.clone()).await;
+    assert!(
+        id_coverage(&as_staged).await.is_empty(),
+        "a listed key withdraws the touched fragment from the key's index"
+    );
+
+    // Without the key in fields_modified, the index keeps the fragment.
+    let mut transaction = staged.transaction.clone();
+    if let Operation::Update {
+        fields_modified, ..
+    } = &mut transaction.operation
+    {
+        fields_modified.retain(|field| *field != id_field);
+    }
+    let kept = commit_detached(&base, transaction).await;
+    assert_eq!(id_coverage(&kept).await, vec![fragment.id as u32]);
+    let after = rows(&kept).await;
+    for (old, new) in before.iter().zip(&after) {
+        assert_eq!(old.0, new.0);
+        assert_eq!(old.2, new.2, "{}: the row keeps its stable row id", old.0);
+        assert_eq!(old.4, new.4, "{}: the Blob bytes are unchanged", old.0);
+        if old.0 == "k2" || old.0 == "k5" {
+            assert_eq!(
+                new.3,
+                base.version().version + 1,
+                "{}: a patched row is stamped with the read version plus one",
+                old.0
+            );
+        } else {
+            assert_eq!(old.1, new.1);
+            assert_eq!(old.3, new.3, "{}: an unpatched row keeps its stamp", old.0);
+        }
+    }
+    assert_eq!(after[2].1, Some(20));
+    assert_eq!(after[5].1, Some(50));
+    for id in &ids {
+        let expected = match id.as_str() {
+            "k2" => Some(20),
+            "k5" => Some(50),
+            _ => None,
+        };
+        assert_eq!(
+            lookup(&kept, id).await,
+            vec![(id.clone(), expected)],
+            "{id}: the kept index finds the row once, with its patched value"
+        );
+    }
+}

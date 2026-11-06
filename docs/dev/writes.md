@@ -507,6 +507,53 @@ contiguous, structurally valid history. The certificate is an optimization
 capability, not an authenticity mechanism; unfamiliar or cleaned history falls
 back to the general merge.
 
+### Column-patch updates
+
+An `update` that assigns no Blob, leaves at least one Blob or fixed-width
+vector column unassigned, and is the only statement of its mutation writing
+the type (no other write can join it in the table's one keyed write) may stage
+a column patch: `KeyedWriteSemantics::KnownPresentColumnPatch`, Lance's
+`MergeInsertWriteMode::RewriteColumns` with `WhenNotMatched::DoNothing`. Its
+source is `id` plus the assigned columns. Lance attaches one data file per
+touched fragment holding those columns for every row of the fragment,
+tombstones their older copies, and never reads or writes the other columns.
+Rows keep their fragment and stable row id; Lance restamps the patched rows'
+`_row_last_updated_at_version` with the read version plus one, as a row
+rewrite does.
+
+`TableStore::scan_update_matches` decides per update, from one scan of the
+carried columns (every column but the unassigned Blob and vector columns) with
+`_rowid` and `_rowaddr`. A patch writes the touched fragments' rows times the
+source row's bytes; a row rewrite reads and writes the matched rows whole,
+their carried columns, vectors and managed Blob payloads (`UpdateWriteCost`).
+The cheaper one wins, taking the omitted columns' descriptors and vectors by
+`_rowid` only when the carried columns and vectors alone do not settle it. A
+stored external reference in an omitted Blob selects the patch, which keeps it
+without reading or refusing it, even when an assigned column is indexed (the
+touched fragments then leave that index until the next reconciliation).
+Otherwise an index on an assigned column selects rows, because the patch would
+withdraw every touched fragment from that index. On a
+table whose omitted columns are all vectors, the scan reads the vectors too,
+so a row rewrite reads exactly what it always did. The pending batch keeps the
+carried columns, which validation reads (key and `@unique` groups, value
+constraints); staging cuts the source from it.
+
+The join key is rewritten byte for byte, and Lance lists it in
+`fields_modified`, which would withdraw each touched fragment from the `id`
+index. The adapter removes it (`keep_key_index_coverage`): the values and
+stable row ids the index holds are unchanged. Every other index on an
+unpatched column keeps its coverage of the touched fragments, unlike a row
+rewrite, whose new fragment no index covers. A patch carries no inserted-row
+filter and no insertion-absence certificate; the branch merge's pure-insert
+proof treats it as an ordinary update. The change feed derives an adjacent
+patch commit by row identity (`candidate_scan::interval_candidate_plan`)
+rather than the touched-fragment suffix, which a patch leaves empty. The old
+copies of the patched columns stay in the fragment's earlier data files until
+a compaction rewrites the fragment, as a row rewrite's deleted rows stay until
+their deletions are materialized. Dropped-column erasure is unaffected: the
+newest copy of a column lives in a file that lists it, so a drop still marks
+the fragment for `optimize`.
+
 Full-text builds stage an artifact-scoped analyzer certificate before their
 CreateIndex metadata is published. The explicit rebuild uses this same writer;
 it does not rewrite retained snapshots or add a separate migration publisher.
@@ -571,6 +618,7 @@ Overwrite can preserve an allowed external descriptor through Lance
 external bytes under the operation's `write_max_bytes` Blob payload budget because Lance's MergeInsert
 surface has no equivalent reference-preservation hook. A pointer-only branch
 adoption does no source I/O. An update never reads the Blobs it assigns; a
+column-patch update keeps every other Blob unread; in a whole-row update a
 carried stored external reference the policy refuses fails as
 `StoredExternalBlobDenied` before effects. See [blob.md](blob.md).
 

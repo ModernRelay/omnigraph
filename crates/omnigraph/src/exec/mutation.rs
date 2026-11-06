@@ -492,6 +492,116 @@ fn first_unbound_param<'a>(expr: &'a IRExpr, params: &ParamMap) -> Option<&'a st
     }
 }
 
+/// How an `update` may stage a column patch (issue #1264): the columns it
+/// leaves unread, what it returns for validation and what Lance writes.
+struct ColumnPatchPlan {
+    request: crate::table_store::UpdateMatchRequest,
+    /// The node's schema without the omitted columns, catalog order.
+    carried: SchemaRef,
+    /// `id` and the assigned columns, catalog order.
+    patch_columns: Vec<String>,
+}
+
+/// The column patch an update of `node_type` assigning `resolved` may stage,
+/// or `None` when the update must write whole rows: it assigns nothing or a
+/// Blob (Lance patches no Blob column), leaves no Blob or vector column
+/// unassigned, or a key or uniqueness group names an omitted column, whose
+/// values validation must read.
+fn column_patch_plan(
+    node_type: &omnigraph_compiler::catalog::NodeType,
+    schema: &SchemaRef,
+    resolved: &HashMap<String, Literal>,
+    id_column: &str,
+) -> Result<Option<ColumnPatchPlan>> {
+    if resolved.is_empty()
+        || resolved
+            .keys()
+            .any(|name| node_type.blob_properties.contains(name))
+    {
+        return Ok(None);
+    }
+    let omitted = schema
+        .fields()
+        .iter()
+        .filter(|field| {
+            !resolved.contains_key(field.name())
+                && (node_type.blob_properties.contains(field.name())
+                    || matches!(field.data_type(), DataType::FixedSizeList(_, _)))
+        })
+        .map(|field| field.name().clone())
+        .collect::<Vec<_>>();
+    if omitted.is_empty()
+        || node_type
+            .key
+            .iter()
+            .chain(node_type.unique_constraints.iter())
+            .flatten()
+            .any(|column| omitted.contains(column))
+    {
+        return Ok(None);
+    }
+    let mut assigned = Vec::with_capacity(resolved.len());
+    let mut assigned_row_bytes = 0_u64;
+    for field in schema.fields() {
+        if let Some(value) = resolved.get(field.name()) {
+            let one = literal_to_typed_array(value, field.data_type(), 1)?;
+            assigned_row_bytes = assigned_row_bytes
+                .saturating_add(one.to_data().get_slice_memory_size().unwrap_or(0) as u64);
+            assigned.push(field.name().clone());
+        }
+    }
+    let carried_indices = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| !omitted.contains(field.name()))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let carried = Arc::new(
+        schema
+            .project(&carried_indices)
+            .map_err(OmniError::arrow_internal)?,
+    );
+    let patch_columns = schema
+        .fields()
+        .iter()
+        .filter(|field| field.name() == id_column || resolved.contains_key(field.name()))
+        .map(|field| field.name().clone())
+        .collect();
+    Ok(Some(ColumnPatchPlan {
+        request: crate::table_store::UpdateMatchRequest {
+            id_column: id_column.to_string(),
+            assigned,
+            omitted,
+            assigned_row_bytes,
+        },
+        carried,
+        patch_columns,
+    }))
+}
+
+/// `batches` with their columns in `schema`'s order, matched by name.
+fn rebind_by_name(schema: &SchemaRef, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+    batches
+        .into_iter()
+        .map(|batch| {
+            let columns = schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    batch.column_by_name(field.name()).cloned().ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "update scan lacks column '{}'",
+                            field.name()
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            RecordBatch::try_new(schema.clone(), columns).map_err(OmniError::arrow_internal)
+        })
+        .collect()
+}
+
 /// Rebuild a matched batch, which lacks the Blobs it assigns, on `full_schema`
 /// with the assigned values, so every update batch shares one pending merge
 /// stream with inserts and earlier updates.
@@ -1484,6 +1594,28 @@ impl Omnigraph {
         txn: &crate::db::WriteTxn,
     ) -> Result<MutationResult> {
         let mut total = MutationResult::default();
+        // The node tables exactly one statement of this mutation writes. Only
+        // there may an `update` stage a column patch: its pending batch omits
+        // the unassigned Blob and vector columns, so no other write to the
+        // table can join it in the one keyed write the table stages.
+        let mut writes_per_node_type: HashMap<&str, usize> = HashMap::new();
+        for op in &ir.ops {
+            if let MutationOpIR::Insert {
+                target: MutationTarget::Node { type_name },
+                ..
+            }
+            | MutationOpIR::Update {
+                target: MutationTarget::Node { type_name },
+                ..
+            }
+            | MutationOpIR::Delete {
+                target: MutationTarget::Node { type_name },
+                ..
+            } = op
+            {
+                *writes_per_node_type.entry(type_name.as_str()).or_default() += 1;
+            }
+        }
         for op in &ir.ops {
             let result = match op {
                 MutationOpIR::Insert {
@@ -1498,6 +1630,11 @@ impl Omnigraph {
                     assignments,
                     predicate,
                 } => {
+                    let sole_write = matches!(
+                        target,
+                        MutationTarget::Node { type_name }
+                            if writes_per_node_type.get(type_name.as_str()) == Some(&1)
+                    );
                     self.execute_update(
                         target,
                         assignments,
@@ -1506,6 +1643,7 @@ impl Omnigraph {
                         branch,
                         staging,
                         txn,
+                        sole_write,
                     )
                     .await?
                 }
@@ -1711,6 +1849,7 @@ impl Omnigraph {
         branch: Option<&str>,
         staging: &mut MutationStaging,
         txn: &crate::db::WriteTxn,
+        sole_write: bool,
     ) -> Result<MutationResult> {
         let catalog = &txn.catalog;
         let type_name = match target {
@@ -1789,6 +1928,86 @@ impl Omnigraph {
         // Update is a STRICT op, so collapse #1 never skips its open — the
         // handle is always `Some` (and it's needed for the committed scan below).
         let ds = handle.expect("strict Update op always opens its dataset");
+
+        if let Some(plan) = sole_write
+            .then(|| column_patch_plan(node_type, &schema, &resolved, catalog.system_columns.id))
+            .transpose()?
+            .flatten()
+        {
+            if !staging.pending_batches(&table_key).is_empty() {
+                return Err(OmniError::manifest_internal(format!(
+                    "the sole update of '{table_key}' found pending rows"
+                )));
+            }
+            let budget = PendingScanBudget::new(
+                &table_key,
+                staging.pending_resource_usage(&table_key)?,
+                staging.write_budget(),
+            );
+            // Boxed: the scan's state would otherwise widen every mutation
+            // future that holds an update.
+            let matches =
+                Box::pin(
+                    self.storage()
+                        .scan_update_matches(&ds, &plan.request, pred_expr, budget),
+                )
+                .await?;
+            let affected_count = matches.batches.iter().map(RecordBatch::num_rows).sum();
+            tracing::debug!(
+                table = %table_key,
+                mode = ?matches.mode,
+                cost = ?matches.cost,
+                patch_bytes = matches.cost.patch_bytes() as u64,
+                rows_bytes = matches.cost.rows_bytes() as u64,
+                "update write mode"
+            );
+            if affected_count == 0 {
+                return Ok(MutationResult {
+                    affected_nodes: 0,
+                    affected_edges: 0,
+                });
+            }
+            match matches.mode {
+                crate::table_store::UpdateWriteMode::ColumnPatch => {
+                    let matched = concat_match_batches_to_schema(
+                        &plan.carried,
+                        rebind_by_name(&plan.carried, matches.batches)?,
+                    )?;
+                    let updated = apply_assignments(
+                        &plan.carried,
+                        &matched,
+                        &resolved,
+                        &blob_props,
+                        staging.write_budget(),
+                    )?;
+                    staging.append_column_patch(&table_key, updated, plan.patch_columns)?;
+                }
+                crate::table_store::UpdateWriteMode::Rows => {
+                    let matched = concat_match_batches_to_schema(
+                        &schema,
+                        rebind_by_name(&schema, matches.batches)?,
+                    )?;
+                    let updated = apply_assignments(
+                        &schema,
+                        &matched,
+                        &resolved,
+                        &blob_props,
+                        staging.write_budget(),
+                    )?;
+                    let updated_schema = updated.schema();
+                    staging.append_batch(
+                        &table_key,
+                        updated_schema,
+                        PendingMode::Upsert,
+                        updated,
+                    )?;
+                }
+            }
+            return Ok(MutationResult {
+                affected_nodes: affected_count,
+                affected_edges: 0,
+            });
+        }
 
         // Scan committed via Lance + apply the same predicate to pending
         // batches via DataFusion `MemTable` (read-your-writes for prior ops in

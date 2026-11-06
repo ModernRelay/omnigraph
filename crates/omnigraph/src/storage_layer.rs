@@ -57,7 +57,8 @@ use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::table_store::{
     ExternalBlobPreflight, ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, OverwriteChunk, RefreshedIndex,
-    StagedTransactionIdentity, StagedWrite, TableState, TableStore,
+    StagedTransactionIdentity, StagedWrite, TableState, TableStore, UpdateMatchRequest,
+    UpdateMatches,
 };
 
 /// One fenced merge chunk is bounded in both rows and materialized Arrow
@@ -272,6 +273,13 @@ pub enum KeyedWriteSemantics {
     /// merge classification. Missing ids are an internal read-set change,
     /// never inserts.
     KnownPresentUpdate,
+    /// Replace only the source's columns of ids already proven present, in
+    /// the fragments that hold them (Lance `RewriteColumns`): the batch is
+    /// `id` plus the patched columns, none a Blob, and every other column
+    /// keeps its stored bytes. An `update` stages it when
+    /// [`TableStorage::scan_update_matches`] selects a column patch. Missing
+    /// ids are an internal read-set change, never inserts.
+    KnownPresentColumnPatch,
 }
 
 /// One exact chunk admitted to the join-free strict-insert adapter by the
@@ -628,6 +636,17 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         omit_blob_columns: &[&str],
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>>;
+
+    /// Select an `update`'s matched rows and its write mode; see
+    /// `TableStore::scan_update_matches`. The caller holds no pending row of
+    /// the table.
+    async fn scan_update_matches(
+        &self,
+        snapshot: &SnapshotHandle,
+        request: &UpdateMatchRequest,
+        filter: Expr,
+        budget: PendingScanBudget,
+    ) -> Result<UpdateMatches>;
 
     async fn first_row_id_for_filter(
         &self,
@@ -1199,6 +1218,16 @@ impl TableStorage for TableStore {
             budget,
         )
         .await
+    }
+
+    async fn scan_update_matches(
+        &self,
+        snapshot: &SnapshotHandle,
+        request: &UpdateMatchRequest,
+        filter: Expr,
+        budget: PendingScanBudget,
+    ) -> Result<UpdateMatches> {
+        TableStore::scan_update_matches(self, snapshot.dataset(), request, filter, budget).await
     }
 
     async fn first_row_id_for_filter(

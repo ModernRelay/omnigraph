@@ -1,6 +1,7 @@
 # issue: none
-# notes: An update carries every Blob it does not assign and counts it as `materialized blob payload bytes`; assigning a Blob (here to null) carries no payload.
+# notes: An update that rewrites whole rows carries every Blob it does not assign and counts it as `materialized blob payload bytes`; assigning a Blob (here to null) carries no payload.
 # notes: The seeded payload is 2,048 bytes: write_max_bytes = 2047 refuses the carry and leaves the title old, 2048 admits it exactly.
+# notes: A second statement on the type keeps the update on whole rows. Alone, the same update patches the title column (issue #1264) and carries nothing, so 2047 admits it; the carry that follows is still refused at 2047, so the Blob kept its 2,048 bytes.
 
 --- runner
 timeout_ms: 10000
@@ -22,6 +23,7 @@ node Doc {
 set write_max_bytes = 2047;
 query retitle_one_byte_short() {
     update Doc set { title: "new" } where slug = "big"
+    update Doc set { title: "none" } where slug = "nobody"
 }
 
 --- expect error: materialized blob payload bytes
@@ -43,6 +45,7 @@ d.title: String
 set write_max_bytes = 2048;
 query retitle_exact() {
     update Doc set { title: "new" } where slug = "big"
+    update Doc set { title: "none" } where slug = "nobody"
 }
 
 --- expect affected: nodes=1 edges=0
@@ -59,6 +62,36 @@ query titles_after_carry() {
 --- expect shape
 d.slug: String
 d.title: String
+
+--- mutate
+set write_max_bytes = 2047;
+query retitle_alone() {
+    update Doc set { title: "patched" } where slug = "big"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query titles_after_patch() {
+    match { $d: Doc }
+    return { $d.slug, $d.title }
+}
+
+--- expect unordered
+{"d.slug": "big", "d.title": "patched"}
+
+--- expect shape
+d.slug: String
+d.title: String
+
+--- mutate
+set write_max_bytes = 2047;
+query carry_after_patch_still_counts_the_payload() {
+    update Doc set { title: "new" } where slug = "big"
+    update Doc set { title: "none" } where slug = "nobody"
+}
+
+--- expect error: materialized blob payload bytes
 
 --- mutate
 set write_max_bytes = 2047;
