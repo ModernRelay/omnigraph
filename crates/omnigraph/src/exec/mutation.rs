@@ -2016,7 +2016,14 @@ impl Omnigraph {
                     let updated_schema = updated.schema();
                     // A refused row rewrite takes the patch, so admission
                     // never depends on the mode (`append_batch` refuses before
-                    // it stages anything).
+                    // it stages anything). This is the one decision over the
+                    // final batch, assignments applied: the scan's descriptor
+                    // check and trial account only stop early, to skip payload
+                    // reads and to bound the rows held while they are built,
+                    // and both start from this staging's usage
+                    // (`pending_resource_usage`) and charge the same
+                    // `write_batch_bytes`. `UpdateRowsOverBudget` in the DST
+                    // storage-cost golden pins this path's cost.
                     match staging.append_batch(
                         &table_key,
                         updated_schema,

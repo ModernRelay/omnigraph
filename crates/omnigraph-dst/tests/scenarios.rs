@@ -2704,15 +2704,21 @@ fn instrument_filtered_update_cost_over_per_commit_fragments() {
 
 /// Issue #1264: one scalar `update` on a node type with a Blob and a vector,
 /// measured on a reopened handle. Alone in its mutation it patches the
-/// assigned column (`UpdatePatchBlob128K`, `UpdatePatchBlob1M`): it reads and
-/// writes no Blob or vector, so its calls do not follow the Blob size and the
-/// two rows are equal. Both sizes sit in Lance 13's packed-sidecar range
-/// (64 KiB to 4 MiB); an inline Blob (64 KiB or less) changes the data
-/// file's layout, which the patch's scan of the other columns then reads
-/// differently. Beside a second statement on the type it rewrites the whole
-/// row (`UpdateRowsBlob1M`), reading the carried Blob.
+/// assigned column (`UpdatePatchBlob16K`, `UpdatePatchBlob128K`,
+/// `UpdatePatchBlob1M`): it reads and writes no Blob or vector, so its calls
+/// do not follow the Blob size within one Blob placement, and the 128 KiB and
+/// 1 MiB rows, both in Lance 13's packed-sidecar range (64 KiB to 4 MiB), are
+/// equal. A 16 KiB Blob is stored inline in the data file (64 KiB or less),
+/// which changes how the patch's scan reads the other columns of that file.
+/// Beside a second statement on the type it rewrites the whole row
+/// (`UpdateRowsBlob1M`), reading the carried Blob. `UpdateRowsOverBudget`
+/// pins the fallback: the estimate prefers rewriting a row that holds a wide
+/// vector, which fits the write budget as matched, but its 8 KiB title
+/// assignment takes it past the budget at staging, so the update reads the
+/// Blob, then stages the patch.
 fn update_patch_cost_rows(replay: &str) -> String {
     const SCHEMA: &str = "node Doc {\n    slug: String @key\n    age: I32\n    score: I32?\n    content: Blob?\n    emb: Vector(8)?\n}\n";
+    const WIDE_SCHEMA: &str = "node Doc {\n    slug: String @key\n    age: I32\n    title: String?\n    content: Blob?\n    emb: Vector(2048)?\n}\n";
     const UPDATES: &str = r#"
 query patch() {
     update Doc set { score: 1 } where slug = "d1"
@@ -2720,6 +2726,9 @@ query patch() {
 query rewrite() {
     update Doc set { score: 2 } where slug = "d1"
     update Doc set { score: 2 } where slug = "nobody"
+}
+query widen($title: String) {
+    update Doc set { title: $title } where slug = "d1"
 }
 "#;
 
@@ -2743,8 +2752,11 @@ query rewrite() {
     }
 
     struct UpdateCost {
+        schema: &'static str,
+        dimensions: u32,
         blob_bytes: usize,
         query: &'static str,
+        write_max_bytes: Option<u64>,
         label: &'static str,
     }
 
@@ -2760,7 +2772,7 @@ query rewrite() {
             let db = session(
                 Omnigraph::init_with_storage(
                     &resources.root,
-                    SCHEMA,
+                    self.schema,
                     resources.adapter.clone(),
                     InitOptions::default(),
                 )
@@ -2769,8 +2781,8 @@ query rewrite() {
             );
             let rows = (0..4u8)
                 .map(|row| {
-                    let emb = (0..8)
-                        .map(|i| format!("{}.0", u32::from(row) * 8 + i))
+                    let emb = (0..self.dimensions)
+                        .map(|i| format!("{}.0", u32::from(row) * self.dimensions + i))
                         .collect::<Vec<_>>()
                         .join(",");
                     format!(
@@ -2781,37 +2793,57 @@ query rewrite() {
                 .collect::<Vec<_>>()
                 .join("\n");
             db.load_jsonl(&rows, LoadMode::Overwrite).await.unwrap();
-            let detached = db.detach();
-            let db = detached.attach(Arc::new(
-                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
-                    .await
-                    .unwrap(),
-            ));
+            drop(db);
+            let mut settings = SessionSettings::default();
+            if let Some(bytes) = self.write_max_bytes {
+                settings = settings
+                    .with("write_max_bytes", &bytes.to_string())
+                    .unwrap();
+            }
+            let db = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                        .await
+                        .unwrap(),
+                ),
+                settings,
+            );
+            let title = "w".repeat(8 * 1024);
+            let params = if self.query == "widen" {
+                mixed_params(&[("$title", &title)], &[])
+            } else {
+                omnigraph_compiler::ir::ParamMap::new()
+            };
             omnigraph_dst::cost::set_label(self.label);
-            let result = db
-                .mutate(
-                    "main",
-                    UPDATES,
-                    self.query,
-                    &omnigraph_compiler::ir::ParamMap::new(),
-                )
-                .await;
+            let result = db.mutate("main", UPDATES, self.query, &params).await;
             omnigraph_dst::cost::set_label("_update_verify");
             assert_eq!(result.unwrap().affected_nodes, 1);
         }
     }
 
     let mut rows = String::new();
-    for (blob_bytes, query, label) in [
-        (128 * 1024, "patch", "UpdatePatchBlob128K"),
-        (1024 * 1024, "patch", "UpdatePatchBlob1M"),
-        (1024 * 1024, "rewrite", "UpdateRowsBlob1M"),
+    for (schema, dimensions, blob_bytes, query, write_max_bytes, label) in [
+        (SCHEMA, 8, 16 * 1024, "patch", None, "UpdatePatchBlob16K"),
+        (SCHEMA, 8, 128 * 1024, "patch", None, "UpdatePatchBlob128K"),
+        (SCHEMA, 8, 1024 * 1024, "patch", None, "UpdatePatchBlob1M"),
+        (SCHEMA, 8, 1024 * 1024, "rewrite", None, "UpdateRowsBlob1M"),
+        (
+            WIDE_SCHEMA,
+            2048,
+            1024,
+            "widen",
+            Some(12 * 1024),
+            "UpdateRowsOverBudget",
+        ),
     ] {
         rows.push_str(&labeled_cost_rows(
             format!("shared-memory://dst-update-cost-{replay}-{label}"),
             &UpdateCost {
+                schema,
+                dimensions,
                 blob_bytes,
                 query,
+                write_max_bytes,
                 label,
             },
             label,

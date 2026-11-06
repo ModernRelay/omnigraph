@@ -6326,6 +6326,12 @@ impl TableStore {
                 continue;
             }
             account.ensure_additional_rows(batch.num_rows())?;
+            // A filtered scan returns the matched rows as a slice of a batch
+            // decoded from their fragment, which pins that batch's buffers.
+            // Copied into their own buffers before they are charged or kept,
+            // the rows hold, and are charged, only their own bytes, whatever
+            // else their fragment stores or the scan's batch size was.
+            let batch = copy_batch_range(&batch, 0, batch.num_rows())?;
             // Admission charges the carried columns alone, what a patch
             // retains, whichever mode the update then takes.
             let rows = predicate_rows_as(&carried, &batch)?;
@@ -6903,7 +6909,11 @@ pub struct UpdateMatchRequest {
     /// Whether the update may rewrite whole rows. A mutation that writes
     /// another table shares one write budget with it, and a row rewrite
     /// charges carried payload a patch does not, so there the update patches
-    /// and its charge does not depend on the mode.
+    /// and its charge does not depend on the mode. The caller sets it only for
+    /// a mutation of one statement (`ir.ops.len() == 1`), so every update in
+    /// a mutation of several statements patches whatever [`UpdateWriteCost`]
+    /// estimates: the estimate chooses the mode for single-statement
+    /// mutations alone, and tuning it changes nothing for the others.
     pub rows_allowed: bool,
 }
 
@@ -8416,7 +8426,7 @@ fn next_proven_insert_batch(
         {
             batch.clone()
         } else {
-            copy_proven_insert_batch_range(batch, offset, rows)?
+            copy_batch_range(batch, offset, rows)?
         };
         let usage = write_batch_bytes(&candidate)?;
         let bytes = usage.rows.max(usage.payload);
@@ -8528,18 +8538,16 @@ fn finish_proven_insert_batch(
     Ok(batch)
 }
 
-fn copy_proven_insert_batch_range(
-    batch: &RecordBatch,
-    offset: usize,
-    rows: usize,
-) -> Result<RecordBatch> {
+/// `rows` rows of `batch` from `offset`, copied into buffers of their own: an
+/// Arrow slice keeps every buffer of its parent alive, a copy only its rows.
+fn copy_batch_range(batch: &RecordBatch, offset: usize, rows: usize) -> Result<RecordBatch> {
     let end = offset
         .checked_add(rows)
-        .ok_or_else(|| OmniError::manifest_internal("proven insert delta range overflow"))?;
+        .ok_or_else(|| OmniError::manifest_internal("batch copy range overflow"))?;
     let offset = u64::try_from(offset)
-        .map_err(|_| OmniError::manifest_internal("proven insert delta offset exceeds u64"))?;
+        .map_err(|_| OmniError::manifest_internal("batch copy offset exceeds u64"))?;
     let end = u64::try_from(end)
-        .map_err(|_| OmniError::manifest_internal("proven insert delta end exceeds u64"))?;
+        .map_err(|_| OmniError::manifest_internal("batch copy end exceeds u64"))?;
     let indices = UInt64Array::from_iter_values(offset..end);
     arrow_select::take::take_record_batch(batch, &indices).map_err(OmniError::arrow_internal)
 }

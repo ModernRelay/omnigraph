@@ -54,7 +54,8 @@ or vectors. A one-row update in a large table of small rows rewrites the row.
 Such an update is never refused for the Blobs it does not assign: when
 rewriting the rows would exceed `write_max_bytes`, or when the mutation also
 writes another type, it writes just the assigned properties. Whether it is
-admitted never depends on an index or on how the rows are stored.
+admitted never depends on an index, and only the matched rows count toward
+`write_max_bytes`, not the other rows stored beside them.
 
 An update that rewrites whole rows carries every Blob cell of a matched row it
 does not assign: it reads the cell and rewrites it as managed bytes, and those

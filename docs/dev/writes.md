@@ -537,17 +537,26 @@ too, so a row rewrite reads exactly what it always did. The pending batch
 keeps the carried columns, which validation reads (key and `@unique` groups,
 value constraints); staging cuts the source from it.
 
-The choice is a physical plan decision and never decides the outcome. For one
-snapshot and one statement, admission is a function of the matched rows and
-the request: the scan charges the carried columns, which both modes hold, and
-a row rewrite that would exceed the write budget (its carried Blob payload, or
-its whole rows at `append_batch`) takes the patch, which then fits. Payload
-lengths come from the descriptors, so that overrun is found before a payload
-is read. A mutation that writes another table shares one write budget with
-the update, and a row rewrite's charge would decide that table's admission,
-so there the update always patches. An index on the assigned column or the
-fragment a row shares therefore changes cost, never whether the write is
-admitted (`write_max_bytes_update_carried_blob.gqt`).
+The choice is a physical plan decision and never decides the outcome. The scan
+charges the carried columns, which both modes hold, and a row rewrite that
+would exceed the write budget (its carried Blob payload, or its whole rows at
+`append_batch`, the one check over the batch with its assignments applied)
+takes the patch, which then fits. Payload lengths come from the descriptors,
+so that overrun is found before a payload is read. A mutation that writes
+another table shares one write budget with the update, and a row rewrite's
+charge would decide that table's admission, so there the update always
+patches. A filtered scan returns matched rows as slices of a batch decoded
+from their fragment, and a slice pins its parent's buffers, so the scan copies
+each batch of matched rows into buffers of its own before charging or keeping
+it: the charge is the matched rows' own bytes, not those of the rows stored
+beside them, and not a function of the scan's batch size, which follows the
+remaining budget. The one physical term left is Arrow's fixed bookkeeping,
+about a hundred bytes per carried column for each batch, and a scan batch
+never spans two fragments. An index on the assigned column or the fragment a
+row shares therefore changes cost, never whether the write is admitted
+(`write_max_bytes_update_carried_blob.gqt`). Other pending-aware scans
+(`scan_with_pending`, which an update that rewrites whole rows uses) still
+charge the slices they keep.
 
 A patch may withdraw touched fragments from an index on an assigned column
 while they stay in the manifest, and the index keeps its old entries for them.
