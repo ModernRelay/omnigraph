@@ -2343,11 +2343,168 @@ async fn complete_graph_deletion(
         &BTreeMap::from([(graph.to_owned(), delete.contract.clone())]),
         &delete.root,
     )?;
+    // Nothing can settle the graph's recorded operations once its history is
+    // gone, so the deletion settles them itself: by the history rule while
+    // the root still answers, and as `graph_deleted` once its absence is
+    // verified. A resume that finds the root already absent takes the second
+    // step alone.
+    settle_graph_operations(
+        store,
+        admission,
+        graph,
+        &delete.contract.schema_identity_domain,
+        true,
+    )
+    .await
+    .map_err(|error| retained_error(error, admission.lock_id()))?;
     store
         .delete_managed_graph_root(graph, &delete.root)
         .await
-        .map_err(|error| retained_error(error, admission.lock_id()))
+        .map_err(|error| retained_error(error, admission.lock_id()))?;
+    settle_graph_operations(
+        store,
+        admission,
+        graph,
+        &delete.contract.schema_identity_domain,
+        false,
+    )
+    .await
+    .map_err(|error| retained_error(error, admission.lock_id()))
 }
+
+/// The recorded operations of the graph lifetime being deleted. With the
+/// root readable, every non-terminal record of the lifetime leaves the active
+/// slot and its publication is judged by the settlement branch's history, the
+/// walk run to its end; once the root is verifiably absent, every record still
+/// non-terminal becomes `unsettled` with reason `graph_deleted`. One
+/// conditional write under the record's gate when anything changed. A record
+/// the server already refuses (unreadable, or naming another ledger) is
+/// logged and left alone: it gates admission, never the deletion.
+async fn settle_graph_operations(
+    store: &ClusterStore,
+    admission: &ClusterAdmission,
+    graph: &str,
+    schema_identity_domain: &str,
+    root_readable: bool,
+) -> Result<(), Diagnostic> {
+    let lock = admission.lock_operations().await;
+    let record = match admission.read_operations(&lock).await {
+        Ok(Some((record, _))) => record,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            tracing::warn!(graph, error = %error.message, "graph deletion leaves an unreadable operation record alone");
+            return Ok(());
+        }
+    };
+    if record
+        .non_terminal_of(graph, schema_identity_domain)
+        .is_empty()
+        && (root_readable || !record.kind_state.optimize.contains_key(graph))
+    {
+        return Ok(());
+    }
+    // The history walks read only, from the record as it stands after the
+    // lifetime's active records are released.
+    let mut resolutions = Vec::new();
+    if root_readable {
+        let mut released = record.clone();
+        released.orphan_lifetime(graph, schema_identity_domain);
+        let uri = store.graph_root(graph);
+        let opened = match store.graph_storage(&uri) {
+            Ok(storage) => Omnigraph::open_read_only_with_storage(&uri, storage)
+                .await
+                .ok(),
+            Err(_) => None,
+        };
+        if let Some(db) = opened {
+            for operation in released.non_terminal_of(graph, schema_identity_domain) {
+                let (Some(nonce), Some(input_version)) =
+                    (&operation.nonce, operation.input_manifest_version)
+                else {
+                    continue;
+                };
+                let mut cursor = operation
+                    .resolution
+                    .as_ref()
+                    .and_then(|progress| progress.cursor.clone());
+                let resolution = loop {
+                    match db
+                        .resolve_publication(
+                            Some(&operation.settlement_branch),
+                            nonce,
+                            operation.input_commit.as_deref(),
+                            input_version,
+                            cursor.as_deref(),
+                            DELETION_RESOLUTION_WALK_LIMIT,
+                        )
+                        .await
+                    {
+                        Ok(omnigraph::db::PublicationLookup::Walking { next, .. }) => {
+                            cursor = Some(next);
+                        }
+                        Ok(omnigraph::db::PublicationLookup::Committed { commit_id }) => {
+                            break crate::Resolution::Committed {
+                                published_commit: commit_id,
+                            };
+                        }
+                        Ok(omnigraph::db::PublicationLookup::NotCommitted) => {
+                            break crate::Resolution::NotCommitted;
+                        }
+                        Ok(omnigraph::db::PublicationLookup::HeadUnchanged) => {
+                            break crate::Resolution::InDoubt {
+                                reason: "the graph head is still the input head at its deletion"
+                                    .to_string(),
+                            };
+                        }
+                        Ok(omnigraph::db::PublicationLookup::Unproven { reason }) => {
+                            break crate::Resolution::InDoubt { reason };
+                        }
+                        Ok(other) => {
+                            break crate::Resolution::InDoubt {
+                                reason: format!("{other:?}"),
+                            };
+                        }
+                        Err(error) => {
+                            break crate::Resolution::InDoubt {
+                                reason: format!(
+                                    "reading the history of {}: {error}",
+                                    operation.settlement_branch
+                                ),
+                            };
+                        }
+                    }
+                };
+                resolutions.push((operation.operation_id.clone(), resolution));
+            }
+        }
+    }
+    let outcome = admission
+        .update_operations(&lock, |record| {
+            let mut changed = false;
+            if root_readable {
+                changed |= record.orphan_lifetime(graph, schema_identity_domain);
+                for (operation_id, resolution) in resolutions {
+                    changed |= record.settle(&operation_id, resolution);
+                }
+            } else {
+                changed |= record.settle_graph_deleted(graph, schema_identity_domain);
+            }
+            Ok((changed, ()))
+        })
+        .await;
+    match outcome {
+        Ok(_) => Ok(()),
+        Err(error) if error.code == "operation_record_foreign" => {
+            tracing::warn!(graph, error = %error.message, "graph deletion leaves a foreign operation record alone");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Commits one page of a deletion's resolution walk reads; the walk runs to
+/// its end, so the page size bounds memory, not the walk.
+const DELETION_RESOLUTION_WALK_LIMIT: usize = 256;
 
 async fn install_catalog_payloads(
     store: &ClusterStore,

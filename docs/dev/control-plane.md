@@ -86,6 +86,7 @@ scope, response validation and refusal tests.
 | `__cluster/recoveries/` | Legacy evidence read only during explicit conversion checks |
 | `__cluster/approvals/` | Preserved legacy audit artifacts; no operational approval writer |
 | `__cluster/lock.json` | Persisted control lock; v2 lifetime cluster admission |
+| `__cluster/operations.json` | The operation record: each admission scope's active operation, unresolved publications, bounded terminal results, the eviction mark and each kind's state per graph |
 | `graphs/<id>.omni/` | Derived graph roots managed through apply |
 
 All stored control objects use the shared storage adapter. Filesystem replacement and object-store PUT/CAS details stay below that boundary; higher layers deal in versioned reads, conditional writes, and normalized roots.
@@ -94,6 +95,44 @@ The engine has no ordinary graph recovery sidecar: schema, table pins and
 lineage publish together in `__manifest`. Ledger v2 stores prepared schema and
 graph-birth and graph-deletion authority in one outstanding record. Legacy control evidence is
 preserved for explicit conversion checks, never executed by a fallback sweep.
+
+## Operation record
+
+`__cluster/operations.json` (`omnigraph_cluster::OperationRecord`) is
+separate from `state.json`, whose `deny_unknown_fields` ledger older binaries
+must keep reading. It names the cluster's ledger id; a record naming another
+ledger is refused with `operation_record_foreign` and never merged. Only the
+lock holder writes it, and in that process every read a write follows and
+every write hold the admission's record gate (`ClusterAdmission::lock_operations`,
+`update_operations`: read, apply, one conditional put), the server's routes,
+the runs' state changes and the graph deletion's settlement alike; the
+server's live-run set changes under the same gate, so a lookup never meets a
+run that ended while its record was still active. Each write is a conditional put against the version read: at
+acceptance, when the run starts, in the optimize run's before-publish hook
+(`publishing`, with the intent nonce, the input head and the per-table
+outcomes), and at the end. The record is generic over `kind`: the header
+keys its active operations by admission scope and each kind's state by graph
+and kind, and each record names its settlement branch; `optimize` is the
+first kind. A write with no definite answer (`OperationWrite::InDoubt`) stops
+the run's writes; the server's next admission or lookup reads the record
+back and re-applies a lost final change to the record as it then stands. An `accepted` or `running` operation no live run holds becomes
+`interrupted`, and a `publishing` one joins at most four unresolved
+operations, settled by `Omnigraph::resolve_publication` once the settlement
+branch's graph head moves: one page of the branch's first-parent chain per
+attempt (`OMNIGRAPH_OPERATION_RESOLUTION_WALK_LIMIT`), the page's unvisited
+parent kept as the record's cursor, until the input head's child answers the
+nonce or proves the run did not commit. A lost terminal write is re-issued
+first. Terminal records are bounded by the deployment receipts' values; the
+newest evicted id's ULID time is the eviction mark, and an id at or before it
+is refused; an id dated more than `MAX_OPERATION_ID_LEAD_MS` ahead of the
+server's clock is refused too, since once evicted it would set the mark for
+everyone. A retained id answers before either check. A graph deletion settles the lifetime's non-terminal records in
+`complete_graph_deletion`: by the history rule while the root answers, and as
+`unsettled` (`graph_deleted`) once its absence is verified. The server side
+is `crates/omnigraph-server/src/recorded_operations.rs`: one admission gate
+per scope, taken by the handler and held by the owned operation that writes
+the acceptance as its first step, and cancellation on shutdown and before a
+deployment's drain of the graph.
 
 ## Deployment ledger
 
@@ -664,6 +703,7 @@ server. Public actor construction cannot grant signed-token permissions.
 on `AuthenticatedActor` exposes only verified claims.
 
 Policy embedders must handle `PolicyAction::ConfigManage`,
+`PolicyAction::Maintain`, `PolicyAction::Reclaim`,
 `PolicyResourceKind::Cluster`, and `PolicyEngineKind::Cluster`. These public
 enums are exhaustive, so an external exhaustive match must add the relevant
 arm when upgrading. Preserving existing constructors and direct storage-holder

@@ -183,6 +183,22 @@ impl GraphIndex {
         edge_types: &HashMap<String, (String, String)>, // edge_name → (from_type, to_type)
         system_columns: SystemColumns,
     ) -> Result<Self> {
+        Self::build_counted(snapshot, edge_types, system_columns, None)
+            .await?
+            .ok_or_else(|| OmniError::manifest_internal("an uncounted graph index build stopped"))
+    }
+
+    /// Build as [`Self::build`] does, reading each edge table one scan batch
+    /// at a time. With `count`, each batch's growth of the persisted artifact
+    /// is added to it, and once the count passes its limit the build drops
+    /// what it holds and returns `None`, before it keeps another batch and
+    /// before the adjacency arrays are allocated.
+    pub(crate) async fn build_counted(
+        snapshot: &Snapshot,
+        edge_types: &HashMap<String, (String, String)>,
+        system_columns: SystemColumns,
+        mut count: Option<&mut persist::ArtifactCount>,
+    ) -> Result<Option<Self>> {
         // Counted here — not at the cache-miss site — so the probe counts
         // actual edge-table scan builds, never persisted-artifact loads.
         crate::instrumentation::record_graph_build(edge_types.len());
@@ -209,14 +225,11 @@ impl GraphIndex {
 
             let ds = snapshot.open_lance_dataset(&table_key).await?;
 
-            let batches: Vec<arrow_array::RecordBatch> = ds
+            let mut batches = ds
                 .scan()
                 .project(&[system_columns.src, system_columns.dst])
                 .map_err(OmniError::storage)?
                 .try_into_stream()
-                .await
-                .map_err(OmniError::storage)?
-                .try_collect()
                 .await
                 .map_err(OmniError::storage)?;
 
@@ -228,9 +241,11 @@ impl GraphIndex {
                 .or_insert_with(TypeIndex::new);
 
             let mut edges: Vec<(u32, u32)> = Vec::new();
-            for batch in &batches {
-                let srcs = string_column(batch, system_columns.src)?;
-                let dsts = string_column(batch, system_columns.dst)?;
+            while let Some(batch) = batches.try_next().await.map_err(OmniError::storage)? {
+                let from_before = type_indices[from_type].len();
+                let to_before = type_indices[to_type].len();
+                let srcs = string_column(&batch, system_columns.src)?;
+                let dsts = string_column(&batch, system_columns.dst)?;
 
                 for i in 0..batch.num_rows() {
                     let src_dense = type_indices
@@ -242,6 +257,17 @@ impl GraphIndex {
                         .unwrap()
                         .get_or_insert(dsts.value(i));
                     edges.push((src_dense, dst_dense));
+                }
+                if let Some(count) = count.as_deref_mut() {
+                    count.add_ids(from_type, &type_indices[from_type].ids()[from_before..]);
+                    // A type on both ends of the edge has one dictionary.
+                    if to_type != from_type {
+                        count.add_ids(to_type, &type_indices[to_type].ids()[to_before..]);
+                    }
+                    count.add_edges(batch.num_rows() as u64);
+                    if count.passed() {
+                        return Ok(None);
+                    }
                 }
             }
             edge_pairs.insert(edge_name.clone(), edges);
@@ -264,11 +290,11 @@ impl GraphIndex {
             csc.insert(edge_name.clone(), CsrIndex::build(dst_count, &reversed));
         }
 
-        Ok(Self {
+        Ok(Some(Self {
             type_indices,
             csr,
             csc,
-        })
+        }))
     }
 
     /// Load the persisted adjacency artifact when one matches this snapshot's

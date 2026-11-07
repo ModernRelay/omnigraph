@@ -1133,6 +1133,64 @@ impl ClusterStore {
         Ok(())
     }
 
+    // ---- operation record ----
+
+    /// The record and its backend version token, or `None` when the root has
+    /// none yet. One bounded GET; a read error stays loud.
+    pub(crate) async fn read_operations(
+        &self,
+    ) -> Result<Option<(crate::operations::OperationRecord, String)>, Diagnostic> {
+        let uri = self.uri(crate::operations::CLUSTER_OPERATIONS_FILE);
+        match self.read_versioned_opt(&uri).await {
+            Ok(Some((text, version))) => Ok(Some((crate::operations::decode(&text)?, version))),
+            Ok(None) => Ok(None),
+            Err(error) => Err(Diagnostic::error(
+                "operation_record_read_error",
+                crate::operations::CLUSTER_OPERATIONS_FILE,
+                format!("could not read the operation record: {error}"),
+            )),
+        }
+    }
+
+    /// One conditional put of the record against the version the writer read
+    /// (`None`: the record must not exist yet). The adapter's conditional
+    /// write resolves an ambiguous answer itself (re-issue and read-back);
+    /// what it still cannot settle is reported in doubt, never as a conflict.
+    pub(crate) async fn write_operations(
+        &self,
+        record: &crate::operations::OperationRecord,
+        expected_version: Option<&str>,
+    ) -> Result<crate::operations::OperationWrite, Diagnostic> {
+        use crate::operations::OperationWrite;
+        let payload = crate::operations::encode(record)?;
+        let uri = self.uri(crate::operations::CLUSTER_OPERATIONS_FILE);
+        let answer = match expected_version {
+            None => self
+                .adapter
+                .write_text_if_absent(&uri, &payload)
+                .await
+                .map(|created| created.then_some(None)),
+            Some(version) => self
+                .adapter
+                .write_text_if_match(&uri, &payload, version)
+                .await
+                .map(|written| written.map(Some)),
+        };
+        Ok(match answer {
+            Ok(Some(Some(version))) => OperationWrite::Written { version },
+            // A create answers no token; the next write reads one back.
+            Ok(Some(None)) => match self.read_versioned_opt(&uri).await {
+                Ok(Some((text, version))) if text == payload => OperationWrite::Written { version },
+                Ok(_) => OperationWrite::Conflict,
+                Err(error) => OperationWrite::InDoubt { error },
+            },
+            Ok(None) => OperationWrite::Conflict,
+            Err(error) => OperationWrite::InDoubt {
+                error: error.to_string(),
+            },
+        })
+    }
+
     // ---- lock ----
 
     pub(crate) async fn acquire_lock(

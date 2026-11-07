@@ -563,6 +563,18 @@ async fn execute(
             }
         }
     }
+    // A recorded run on an affected graph stops at its next safe boundary;
+    // the drain then waits for at most one table's rewrite, the publication,
+    // the configuration clear and an issued artifact write.
+    {
+        let lock = owner.lock_operations().await;
+        state.recorded.cancel_under(
+            &lock,
+            None,
+            Some(&affected),
+            &format!("deployment {}", request.deployment_id),
+        );
+    }
     let transition = state
         .routing
         .registry

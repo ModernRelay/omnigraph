@@ -1369,7 +1369,7 @@ node Thing {
     db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
 
     // Build the key index explicitly before exercising the merge loads.
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
 
     let mut delta = String::new();
     for i in (1..=25).chain(51..=55) {
@@ -1382,7 +1382,7 @@ node Thing {
     db.load_jsonl(&delta, LoadMode::Merge)
         .await
         .expect("first merge after ensure_indices must succeed");
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     db.load_jsonl(&delta, LoadMode::Merge)
         .await
         .expect("second merge after ensure_indices must succeed");
