@@ -2927,6 +2927,17 @@ query nearest_docs($q: Vector(2)) {
             .to_rust_json()
             .unwrap()
         }
+
+        /// The rows, with the ANN partitions the scan searched and ranked.
+        async fn nearest_through_index(db: &Session) -> (serde_json::Value, (u64, u64)) {
+            use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+            use std::sync::atomic::Ordering;
+            let probes = QueryIoProbes::default();
+            let rows = with_query_io_probes(probes.clone(), Self::nearest(db)).await;
+            let searched = probes.ann_partitions_searched.load(Ordering::Relaxed);
+            let ranked = probes.ann_partitions_ranked.load(Ordering::Relaxed);
+            (rows, (searched, ranked))
+        }
     }
 
     impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for NearestCost {
@@ -2973,10 +2984,22 @@ query nearest_docs($q: Vector(2)) {
                 SessionSettings::default(),
             );
             omnigraph_dst::cost::set_label(LABELS[1]);
-            let cold = Self::nearest(&reader).await;
+            let (cold, cold_partitions) = Self::nearest_through_index(&reader).await;
             omnigraph_dst::cost::set_label(LABELS[2]);
-            let warm = Self::nearest(&reader).await;
+            let (warm, warm_partitions) = Self::nearest_through_index(&reader).await;
             omnigraph_dst::cost::set_label("_nearest_verify");
+            // The labels say "Indexed": keep them true. A flat scan reports no
+            // partition counters, so a planner change that made this read flat
+            // would leave the rows green without measuring the details read.
+            for (label, (searched, ranked)) in
+                [(LABELS[1], cold_partitions), (LABELS[2], warm_partitions)]
+            {
+                assert!(
+                    searched > 0 && ranked > 0,
+                    "{label} must scan through the vector index: \
+                     {searched} of {ranked} partitions searched"
+                );
+            }
             assert_eq!(cold, warm);
             assert_eq!(
                 cold.as_array().unwrap().len(),
