@@ -132,10 +132,18 @@ pub fn is_full_text_index(index: &IndexMetadata) -> bool {
 pub struct SegmentCoverage {
     /// Current fragments that a segment reporting its bitmap covers.
     pub covered: BTreeSet<u64>,
-    /// Whether every segment reports its bitmap. Lance refuses the union when
-    /// one does not (`unindexed_fragments` errors, `scalar_index_info` drops
-    /// the entry), so `covered` is then a lower bound and the coverage is
-    /// unknown. Each caller decides what unknown means for its decision.
+    /// Whether every segment reports its bitmap. When one does not, `covered`
+    /// is a lower bound and Omnigraph treats the coverage as unknown. Each
+    /// caller decides what unknown means for its decision.
+    ///
+    /// For scalar search this is more conservative than Lance 13.
+    /// `unindexed_fragments` errors on such a segment, but
+    /// `scalar_index_info` first filters out every segment whose bitmap is
+    /// absent or empty, except a full-text segment, and serves the union of
+    /// the others. So a BTREE with one complete segment and one segment
+    /// without a bitmap is used by Lance but is unknown (and run-time
+    /// `Degraded`) here. Only a full-text segment without a bitmap makes
+    /// Lance's own entry unknown. The difference is cost only.
     pub known: bool,
 }
 
