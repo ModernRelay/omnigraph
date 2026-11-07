@@ -140,10 +140,11 @@ pub struct SegmentCoverage {
     /// `unindexed_fragments` errors on such a segment, but
     /// `scalar_index_info` first filters out every segment whose bitmap is
     /// absent, empty, or holds no current fragment, except a full-text
-    /// segment, and serves the union of the others. So a BTREE with one complete segment and one segment
-    /// without a bitmap is used by Lance but is unknown (and run-time
-    /// `Degraded`) here. Only a full-text segment without a bitmap makes
-    /// Lance's own entry unknown. The difference is cost only.
+    /// segment, and serves the union of the others. So a BTREE with one
+    /// complete segment and one segment without a bitmap is used by Lance
+    /// but is unknown (and run-time `Degraded`) here. Only a full-text
+    /// segment without a bitmap makes Lance's own entry unknown. The
+    /// difference is cost only.
     pub known: bool,
 }
 
