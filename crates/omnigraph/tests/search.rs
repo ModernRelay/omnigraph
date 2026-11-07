@@ -511,6 +511,45 @@ query nearest_all_17000($q: Vector(4)) {
 }
 "#;
 
+/// Replaces the vector index on `column` of `table_key` with one built from
+/// `params` directly on the Lance dataset (an index the engine does not build
+/// itself), on the pin restored onto the linear HEAD, and publishes that head
+/// through the failpoint hook without an index rebuild.
+#[cfg(feature = "failpoints")]
+async fn publish_foreign_vector_index(
+    db: &Session,
+    uri: &str,
+    table_key: &str,
+    column: &str,
+    params: &lance::index::vector::VectorIndexParams,
+) {
+    use lance::index::DatasetIndexExt;
+    helpers::forge_linear_head_from_pin(db, "main", table_key, 0).await;
+    let table_path = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .dataset(table_key)
+        .unwrap()
+        .dataset_path
+        .clone();
+    let table_uri = format!("{}/{}", uri.trim_end_matches('/'), table_path);
+    // forbidden-api-allow: test builds a foreign vector index directly on the Lance dataset.
+    let mut ds = lance::Dataset::open(&table_uri).await.unwrap();
+    ds.create_index(
+        &[column],
+        lance_index::IndexType::Vector,
+        Some(format!("{column}_idx")),
+        params,
+        true,
+    )
+    .await
+    .unwrap();
+    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", table_key, None)
+        .await
+        .unwrap();
+}
+
 /// A four-partition IVF index on fixed centroids (the engine builds one-partition
 /// flat ones), built on the `node:Doc` pin restored onto the linear HEAD and
 /// published through the failpoint hook; a delete then tombstones rows under it.
@@ -562,59 +601,39 @@ query delete_middle() {
     let db = session(Omnigraph::init(uri, schema).await.unwrap());
     db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
     db.ensure_indices().await.unwrap();
-    helpers::forge_linear_head_from_pin(&db, "main", "node:Doc", 0).await;
-    {
-        use lance::index::DatasetIndexExt;
-        let doc_path = db
-            .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
-            .await
-            .unwrap()
-            .dataset("node:Doc")
-            .unwrap()
-            .dataset_path
-            .clone();
-        let doc_uri = format!("{}/{}", uri.trim_end_matches('/'), doc_path);
-        // forbidden-api-allow: test builds a partitioned vector index directly on the Lance dataset.
-        let mut ds = lance::Dataset::open(&doc_uri).await.unwrap();
-        let partitions = 4usize;
-        let step = ISSUE_567_ROWS as f32 / partitions as f32;
-        let mut values = Vec::with_capacity(partitions * 4);
-        for partition in 0..partitions {
-            values.extend([step * (partition as f32 + 0.5), 0.0, 0.0, 0.0]);
-        }
-        let centroids = arrow_array::FixedSizeListArray::try_new(
-            std::sync::Arc::new(arrow_schema::Field::new(
-                "item",
-                arrow_schema::DataType::Float32,
-                true,
-            )),
-            4,
-            std::sync::Arc::new(arrow_array::Float32Array::from(values)),
-            None,
-        )
-        .unwrap();
-        let ivf = lance_index::vector::ivf::IvfBuildParams::try_with_centroids(
-            partitions,
-            std::sync::Arc::new(centroids),
-        )
-        .unwrap();
-        let params = lance::index::vector::VectorIndexParams::with_ivf_flat_params(
+    let partitions = 4usize;
+    let step = ISSUE_567_ROWS as f32 / partitions as f32;
+    let mut values = Vec::with_capacity(partitions * 4);
+    for partition in 0..partitions {
+        values.extend([step * (partition as f32 + 0.5), 0.0, 0.0, 0.0]);
+    }
+    let centroids = arrow_array::FixedSizeListArray::try_new(
+        std::sync::Arc::new(arrow_schema::Field::new(
+            "item",
+            arrow_schema::DataType::Float32,
+            true,
+        )),
+        4,
+        std::sync::Arc::new(arrow_array::Float32Array::from(values)),
+        None,
+    )
+    .unwrap();
+    let ivf = lance_index::vector::ivf::IvfBuildParams::try_with_centroids(
+        partitions,
+        std::sync::Arc::new(centroids),
+    )
+    .unwrap();
+    publish_foreign_vector_index(
+        &db,
+        uri,
+        "node:Doc",
+        "embedding",
+        &lance::index::vector::VectorIndexParams::with_ivf_flat_params(
             lance_linalg::distance::MetricType::L2,
             ivf,
-        );
-        ds.create_index(
-            &["embedding"],
-            lance_index::IndexType::Vector,
-            Some("embedding_idx".to_string()),
-            &params,
-            true,
-        )
-        .await
-        .unwrap();
-    }
-    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Doc", None)
-        .await
-        .unwrap();
+        ),
+    )
+    .await;
     // The delete leaves the partitioned index with tombstoned rows: the
     // underfilled partitions the ladder and rescan cases exercise.
     let deleted = mutate_main(&db, delete_query, "delete_middle", &params(&[]))
@@ -2915,8 +2934,7 @@ query nearest_scored($q: Vector(2)) {
 "#;
 
 /// Issue #1297: a `Doc` graph whose `embedding` index is replaced by one the
-/// engine never builds (`params`), published under the `node:Doc` pin the
-/// same way `issue_567_partitioned_docs` publishes its partitioned index.
+/// engine never builds (`params`), through `publish_foreign_vector_index`.
 #[cfg(feature = "failpoints")]
 async fn issue_1297_docs_under_a_foreign_index(
     uri: &str,
@@ -2939,33 +2957,7 @@ node Doc {
     let db = session(Omnigraph::init(uri, schema).await.unwrap());
     db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
     db.ensure_indices().await.unwrap();
-    helpers::forge_linear_head_from_pin(&db, "main", "node:Doc", 0).await;
-    {
-        use lance::index::DatasetIndexExt;
-        let doc_path = db
-            .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
-            .await
-            .unwrap()
-            .dataset("node:Doc")
-            .unwrap()
-            .dataset_path
-            .clone();
-        let doc_uri = format!("{}/{}", uri.trim_end_matches('/'), doc_path);
-        // forbidden-api-allow: test replaces the engine's vector index with a foreign one directly on the Lance dataset.
-        let mut ds = lance::Dataset::open(&doc_uri).await.unwrap();
-        ds.create_index(
-            &["embedding"],
-            lance_index::IndexType::Vector,
-            Some("embedding_idx".to_string()),
-            &params,
-            true,
-        )
-        .await
-        .unwrap();
-    }
-    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Doc", None)
-        .await
-        .unwrap();
+    publish_foreign_vector_index(&db, uri, "node:Doc", "embedding", &params).await;
     db
 }
 
