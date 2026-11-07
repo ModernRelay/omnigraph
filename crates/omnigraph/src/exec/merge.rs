@@ -4575,9 +4575,12 @@ async fn commit_staged_delete_chunks(
                 ))
             })?;
         // The change record below lists every id of the chunk, so Lance must
-        // have removed exactly the chunk's rows. A `_rowid` that no longer
-        // names its live row (#1295) would otherwise publish a record of a
-        // delete that did not happen.
+        // have removed exactly the chunk's rows. The check compares counts,
+        // not row identity. A count match is enough because stable row ids are
+        // never reused within a lineage and only a target-side read supplies
+        // them, so a stale `_rowid` can only miss its row, never hit another.
+        // Without the check, such a `_rowid` (#1295) would publish a record of
+        // a delete that did not happen.
         let expected_rows = chunk.row_count()?;
         if staged_delete.deleted_rows() != Some(expected_rows) {
             return Err(OmniError::manifest_internal(format!(

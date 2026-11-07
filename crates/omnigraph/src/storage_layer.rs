@@ -436,8 +436,8 @@ impl StagedHandle {
         self.inner.transaction_identity()
     }
 
-    /// Rows a staged delete removes, as Lance counted them; see
-    /// `StagedWrite::deleted_rows`.
+    /// Rows a `stage_delete` removes, as Lance's delete scan counted them;
+    /// see `StagedWrite::deleted_rows`.
     pub(crate) fn deleted_rows(&self) -> Option<u64> {
         self.inner.deleted_rows()
     }
