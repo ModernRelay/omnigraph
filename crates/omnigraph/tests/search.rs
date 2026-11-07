@@ -2903,3 +2903,194 @@ async fn a_full_text_index_with_no_segment_refuses_the_call_issue_747() {
         "the built index folds case"
     );
 }
+
+const ISSUE_1297_QUERIES: &str = r#"
+query nearest_scored($q: Vector(2)) {
+    match { $d: Doc }
+    return { $d.slug, nearest($d.embedding, $q) as distance }
+    order { nearest($d.embedding, $q) }
+    limit 10
+}
+"#;
+
+/// Issue #1297: a `Doc` graph whose `embedding` index is replaced by one the
+/// engine never builds (`params`), published under the `node:Doc` pin the
+/// same way `issue_567_partitioned_docs` publishes its partitioned index.
+#[cfg(feature = "failpoints")]
+async fn issue_1297_docs_under_a_foreign_index(
+    uri: &str,
+    docs: &[(String, [f32; 2])],
+    params: lance::index::vector::VectorIndexParams,
+) -> Session {
+    let schema = r#"
+node Doc {
+    slug: String @key
+    embedding: Vector(2) @index
+}
+"#;
+    let seed = docs
+        .iter()
+        .map(|(slug, [x, y])| {
+            format!(r#"{{"type":"Doc","data":{{"slug":"{slug}","embedding":[{x:?},{y:?}]}}}}"#)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let db = session(Omnigraph::init(uri, schema).await.unwrap());
+    db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
+    db.ensure_indices().await.unwrap();
+    helpers::forge_linear_head_from_pin(&db, "main", "node:Doc", 0).await;
+    {
+        use lance::index::DatasetIndexExt;
+        let doc_path = db
+            .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .dataset("node:Doc")
+            .unwrap()
+            .dataset_path
+            .clone();
+        let doc_uri = format!("{}/{}", uri.trim_end_matches('/'), doc_path);
+        // forbidden-api-allow: test replaces the engine's vector index with a foreign one directly on the Lance dataset.
+        let mut ds = lance::Dataset::open(&doc_uri).await.unwrap();
+        ds.create_index(
+            &["embedding"],
+            lance_index::IndexType::Vector,
+            Some("embedding_idx".to_string()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+    }
+    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Doc", None)
+        .await
+        .unwrap();
+    db
+}
+
+#[cfg(feature = "failpoints")]
+fn issue_1297_distances(result: &QueryResult) -> Vec<f32> {
+    let batch = result.concat_batches().unwrap();
+    let column = batch.column_by_name("distance").unwrap();
+    column
+        .as_any()
+        .downcast_ref::<arrow_array::Float32Array>()
+        .unwrap_or_else(|| panic!("distance is F32, got {:?}", column.data_type()))
+        .values()
+        .to_vec()
+}
+
+/// Issue #1297: `nearest` ranks by squared L2 whatever metric the vector
+/// index on disk was built with. A cosine index ranks `far` (same direction
+/// as the query) first; L2 ranks it last.
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn nearest_ranks_by_l2_over_a_cosine_index_issue_1297() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let docs = [
+        ("near".to_string(), [1.0, 0.2]),
+        ("mid".to_string(), [0.5, 0.5]),
+        ("far".to_string(), [10.0, 0.0]),
+    ];
+    let db = issue_1297_docs_under_a_foreign_index(
+        uri,
+        &docs,
+        lance::index::vector::VectorIndexParams::ivf_flat(
+            1,
+            lance_linalg::distance::MetricType::Cosine,
+        ),
+    )
+    .await;
+
+    let result = query_main(
+        &db,
+        ISSUE_1297_QUERIES,
+        "nearest_scored",
+        &vector_param("$q", &[1.0, 0.0]),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result_slugs(&result),
+        ["near", "mid", "far"],
+        "ranked by L2, not by the index's cosine metric"
+    );
+    let distances = issue_1297_distances(&result);
+    let expected = [0.04_f32, 0.5, 81.0];
+    for (got, want) in distances.iter().zip(expected) {
+        assert!(
+            (got - want).abs() <= want * 1e-5,
+            "squared L2 distances {distances:?}, expected {expected:?}"
+        );
+    }
+    assert!(result.ranking().unwrap().exhaustive);
+}
+
+/// Issue #1297: a compressed (scalar-quantized) L2 index scores
+/// approximations, so searching all of its partitions is not exact. The
+/// engine must return the exact top `k` and squared L2 distances, and report
+/// the ranking exhaustive only when it is.
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn nearest_stays_exact_over_a_quantized_index_issue_1297() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let docs: Vec<(String, [f32; 2])> = (0..300)
+        .map(|row| {
+            let x = (row as f32 * 0.618_034).fract() * 100.0;
+            let y = (row as f32 * 0.414_213_6).fract() * 100.0;
+            (format!("d{row:03}"), [x, y])
+        })
+        .collect();
+    let db = issue_1297_docs_under_a_foreign_index(
+        uri,
+        &docs,
+        lance::index::vector::VectorIndexParams::with_ivf_sq_params(
+            lance_linalg::distance::MetricType::L2,
+            lance_index::vector::ivf::IvfBuildParams::new(1),
+            lance_index::vector::sq::builder::SQBuildParams::default(),
+        ),
+    )
+    .await;
+
+    let query = [37.3_f32, 61.9];
+    let mut exact: Vec<(f32, String)> = docs
+        .iter()
+        .map(|(slug, [x, y])| {
+            let (dx, dy) = (x - query[0], y - query[1]);
+            (dx * dx + dy * dy, slug.clone())
+        })
+        .collect();
+    exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+    exact.truncate(10);
+
+    let result = query_main(
+        &db,
+        ISSUE_1297_QUERIES,
+        "nearest_scored",
+        &vector_param("$q", &query),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result_slugs(&result),
+        exact
+            .iter()
+            .map(|(_, slug)| slug.clone())
+            .collect::<Vec<_>>(),
+        "the exact ten nearest, not the quantized index's approximation"
+    );
+    let distances = issue_1297_distances(&result);
+    for (got, (want, slug)) in distances.iter().zip(&exact) {
+        assert!(
+            (got - want).abs() <= want.max(1.0) * 1e-4,
+            "{slug}: distance {got}, exact squared L2 {want}"
+        );
+    }
+    assert!(result.ranking().unwrap().exhaustive);
+}
