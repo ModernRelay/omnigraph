@@ -3232,6 +3232,7 @@ async fn stage_delete_does_not_advance_head_and_reads_through_staged() {
         .await
         .unwrap()
         .expect("alice matches → Some(StagedWrite)");
+    assert_eq!(staged.deleted_rows(), Some(1));
     assert_eq!(
         ds.version().version,
         pre_version,
@@ -3264,6 +3265,18 @@ async fn stage_delete_does_not_advance_head_and_reads_through_staged() {
         .await
         .unwrap();
     assert!(none.is_none(), "a 0-row delete must stage nothing");
+
+    // A filter that matches only part of what it names reports the rows Lance
+    // actually removed, which a branch merge compares with its chunk (#1295).
+    let partial = store
+        .stage_delete(
+            &committed,
+            ident("id").in_list(vec![lit("bob"), lit("nobody")], false),
+        )
+        .await
+        .unwrap()
+        .expect("bob matches");
+    assert_eq!(partial.deleted_rows(), Some(1));
 }
 
 #[tokio::test]

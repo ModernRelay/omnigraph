@@ -132,36 +132,52 @@ struct StagedMergeResult {
     deleted_ids: DeleteIdChunks,
 }
 
-/// Exact delete chunks retained from the ordered merge walk.
+/// Exact id chunks retained from the ordered merge walk or from lineage
+/// candidate discovery, each chunk holding one `R` per id.
 ///
-/// A delete chunk holds each removed row's logical id, which the change
-/// record keeps, and its `_rowid` as the target-side read saw it, which
-/// selects the rows (#1295). Each chunk is independently bounded by both the
-/// keyed-write row ceiling and the exact UTF-8 byte length of the escaped
-/// `id IN (...)` rendering of its ids, the form the lineage candidate path
-/// filters by. The chunk boundary is therefore also the transaction
-/// boundary: publish commits one detached Lance transaction per chunk.
+/// [`DeleteIdChunks`] (`R = u64`) holds each removed row's logical id, which
+/// the change record keeps, and its `_rowid` as the target-side read saw it,
+/// which selects the rows (#1295). [`CandidateIdChunks`] (`R = ()`) holds ids
+/// only and is rendered as an `id IN (...)` filter. Every chunk has three
+/// bounds:
+///
+/// - Row bound: at most the caller's row ceiling (the keyed-write ceiling for
+///   a delete chunk), because one chunk is one detached Lance transaction and
+///   the chunk boundary is therefore also the transaction boundary.
+/// - Filter-byte bound: the exact UTF-8 byte length of the escaped
+///   `id IN (...)` rendering. A candidate chunk sends that string to Lance. A
+///   delete chunk no longer does; for it the bound caps the ids its change
+///   record keeps, and it keeps the planned chunk count (and so the pre-minted
+///   transaction plan) the same as when deletes filtered by id.
+/// - Retained-byte bound, over the whole plan: a conservative heap estimate
+///   for every owned id and `_rowid` plus chunk bookkeeping, because
+///   per-chunk bounds alone would still permit a 1,024-chunk plan to retain
+///   tens of GiB before the first effect.
 #[derive(Debug)]
-struct DeleteIdChunks {
+struct IdChunks<R> {
     id_col: &'static str,
-    chunks: Vec<DeleteIdChunk>,
-    /// Conservative retained-heap estimate for every owned id plus chunk/Vec
-    /// bookkeeping. Per-chunk bounds alone would still permit a 1,024-chunk
-    /// plan to retain tens of GiB before the first effect.
+    chunks: Vec<IdChunk<R>>,
     retained_bytes: u64,
     write_budget: WriteBudget,
 }
 
+/// Rows a branch merge deletes: ids with the `_rowid` that selects each one.
+type DeleteIdChunks = IdChunks<u64>;
+/// Lineage candidate ids, which only filter by id and can never delete.
+type CandidateIdChunks = IdChunks<()>;
+
 #[derive(Debug)]
-struct DeleteIdChunk {
+struct IdChunk<R> {
     ids: Vec<String>,
-    /// The `_rowid` of each id, in the same order, for a delete chunk; empty
-    /// for a lineage candidate chunk, which only filters by id.
-    row_ids: Vec<u64>,
+    /// One entry per id, in the same order; `push_with_bounds` is the only
+    /// writer and always appends both.
+    row_ids: Vec<R>,
     filter_bytes: u64,
 }
 
-impl DeleteIdChunks {
+type DeleteIdChunk = IdChunk<u64>;
+
+impl<R> IdChunks<R> {
     fn new(id_col: &'static str, write_budget: WriteBudget) -> Self {
         Self {
             id_col,
@@ -171,28 +187,10 @@ impl DeleteIdChunks {
         }
     }
 
-    /// Retain one row to delete: its id and the `_rowid` the target-side
-    /// read returned for it. Only a read of the target's own pinned table
-    /// (or of a base the target still pins) may supply `row_id`: rows another
-    /// lineage added can carry the same `_rowid`.
-    fn push(&mut self, id: String, row_id: u64) -> Result<()> {
-        self.push_with_bounds(
-            id,
-            Some(row_id),
-            KEYED_WRITE_MAX_ROWS,
-            self.write_budget.bytes(),
-            self.write_budget.bytes(),
-        )
-    }
-
-    fn push_bounded(&mut self, id: String, max_rows: usize, max_bytes: u64) -> Result<()> {
-        self.push_with_bounds(id, None, max_rows, max_bytes, self.write_budget.bytes())
-    }
-
     fn push_with_bounds(
         &mut self,
         id: String,
-        row_id: Option<u64>,
+        row_id: R,
         max_rows: usize,
         max_filter_bytes: u64,
         max_retained_bytes: u64,
@@ -232,12 +230,9 @@ impl DeleteIdChunks {
             .ok_or_else(|| {
                 OmniError::manifest_internal("branch merge delete bookkeeping overflow")
             })?;
-        let row_id_storage = if row_id.is_some() {
-            u64::try_from(std::mem::size_of::<u64>())
-                .map_err(|_| OmniError::manifest_internal("u64 size exceeds u64"))?
-        } else {
-            0
-        };
+        // Zero for a candidate chunk's `()`.
+        let row_id_storage = u64::try_from(std::mem::size_of::<R>())
+            .map_err(|_| OmniError::manifest_internal("row id size exceeds u64"))?;
         let id_storage = u64::try_from(id.len())
             .map_err(|_| OmniError::manifest_internal("branch merge delete id exceeds u64"))?
             .checked_add(string_bookkeeping)
@@ -246,7 +241,7 @@ impl DeleteIdChunks {
                 OmniError::manifest_internal("branch merge delete retained bytes overflow")
             })?;
         let chunk_storage = if starts_new_chunk {
-            u64::try_from(std::mem::size_of::<DeleteIdChunk>())
+            u64::try_from(std::mem::size_of::<IdChunk<R>>())
                 .map_err(|_| OmniError::manifest_internal("delete chunk size exceeds u64"))?
                 .checked_mul(2)
                 .ok_or_else(|| {
@@ -270,7 +265,7 @@ impl DeleteIdChunks {
             ));
         }
         if starts_new_chunk {
-            self.chunks.push(DeleteIdChunk {
+            self.chunks.push(IdChunk {
                 ids: Vec::new(),
                 row_ids: Vec::new(),
                 filter_bytes: empty_filter_bytes,
@@ -293,15 +288,8 @@ impl DeleteIdChunks {
             .filter_bytes
             .checked_add(literal_bytes)
             .ok_or_else(|| OmniError::manifest_internal("branch merge delete filter overflow"))?;
-        if !chunk.ids.is_empty() && chunk.row_ids.is_empty() == row_id.is_some() {
-            return Err(OmniError::manifest_internal(
-                "branch merge chunk mixes rows with and without a _rowid",
-            ));
-        }
         chunk.ids.push(id);
-        if let Some(row_id) = row_id {
-            chunk.row_ids.push(row_id);
-        }
+        chunk.row_ids.push(row_id);
         self.retained_bytes = retained_bytes;
         Ok(())
     }
@@ -313,6 +301,22 @@ impl DeleteIdChunks {
     fn iter(&self) -> impl Iterator<Item = &String> {
         self.chunks.iter().flat_map(|chunk| chunk.ids.iter())
     }
+}
+
+impl DeleteIdChunks {
+    /// Retain one row to delete: its id and the `_rowid` the target-side
+    /// read returned for it. Only a read of the target's own pinned table
+    /// (or of a base the target still pins) may supply `row_id`: rows another
+    /// lineage added can carry the same `_rowid`.
+    fn push(&mut self, id: String, row_id: u64) -> Result<()> {
+        self.push_with_bounds(
+            id,
+            row_id,
+            KEYED_WRITE_MAX_ROWS,
+            self.write_budget.bytes(),
+            self.write_budget.bytes(),
+        )
+    }
 
     /// Each retained delete as its id and `_rowid`.
     fn rows(&self) -> impl Iterator<Item = (&String, &u64)> {
@@ -322,7 +326,37 @@ impl DeleteIdChunks {
     }
 }
 
+impl CandidateIdChunks {
+    fn push_bounded(&mut self, id: String, max_rows: usize, max_bytes: u64) -> Result<()> {
+        self.push_with_bounds(id, (), max_rows, max_bytes, self.write_budget.bytes())
+    }
+}
+
 impl DeleteIdChunk {
+    /// `_rowid IN (row_ids)`, the typed expression `stage_delete` takes.
+    /// Lance turns it into a take by row id (`TakeOperation`), so a delete
+    /// chunk reads no data column and its cost does not depend on `id` index
+    /// coverage (#1295). An `id IN (ids)` filter searched the `id` BTREE and
+    /// scanned the `id` column of every fragment the index did not cover.
+    fn delete_expr(&self) -> Result<datafusion::prelude::Expr> {
+        self.check_bounds()?;
+        Ok(datafusion::prelude::col(lance_core::ROW_ID).in_list(
+            self.row_ids
+                .iter()
+                .map(|row_id| datafusion::prelude::lit(*row_id))
+                .collect(),
+            false,
+        ))
+    }
+
+    /// Rows in this chunk, the count its delete must remove exactly.
+    fn row_count(&self) -> Result<u64> {
+        u64::try_from(self.row_ids.len())
+            .map_err(|_| OmniError::manifest_internal("branch merge delete chunk exceeds u64"))
+    }
+}
+
+impl<R> IdChunk<R> {
     /// The chunk's row and byte bounds, checked before it reaches Lance.
     fn check_bounds(&self) -> Result<()> {
         if self.ids.is_empty() || self.ids.len() > KEYED_WRITE_MAX_ROWS {
@@ -339,30 +373,6 @@ impl DeleteIdChunk {
         }
         Ok(())
     }
-
-    /// `_rowid IN (row_ids)`, the typed expression `stage_delete` takes.
-    /// Lance turns it into a take by row id (`TakeOperation`), so a delete
-    /// chunk reads no data column and its cost does not depend on `id` index
-    /// coverage (#1295). An `id IN (ids)` filter searched the `id` BTREE and
-    /// scanned the `id` column of every fragment the index did not cover.
-    fn delete_expr(&self) -> Result<datafusion::prelude::Expr> {
-        self.check_bounds()?;
-        if self.row_ids.len() != self.ids.len() {
-            return Err(OmniError::manifest_internal(format!(
-                "branch merge delete chunk holds {} ids but {} row ids",
-                self.ids.len(),
-                self.row_ids.len()
-            )));
-        }
-        Ok(datafusion::prelude::col(lance_core::ROW_ID).in_list(
-            self.row_ids
-                .iter()
-                .map(|row_id| datafusion::prelude::lit(*row_id))
-                .collect(),
-            false,
-        ))
-    }
-
     fn filter(&self, id_col: &str) -> Result<String> {
         self.check_bounds()?;
         let capacity = usize::try_from(self.filter_bytes).map_err(|_| {
@@ -2186,7 +2196,7 @@ async fn stage_streaming_table_merge_walk(
 /// only; the byte bound reuses the delete-filter budget machinery.
 const LINEAGE_FILTER_MAX_IDS: usize = 512;
 /// Retained-byte budget for the discovered candidate id set, per-id accounting
-/// matching what `DeleteIdChunks` re-applies at chunking time. Crossing it
+/// matching what `CandidateIdChunks` re-applies at chunking time. Crossing it
 /// falls back to the walk: a candidate set approaching the whole table is the
 /// walk's own regime, and the gate's fail-closed contract must hold for
 /// budgets as well as preconditions.
@@ -2201,7 +2211,7 @@ struct LineageMergePlan {
     base: Option<Dataset>,
     source: Option<Dataset>,
     target: Option<Dataset>,
-    candidate_chunks: DeleteIdChunks,
+    candidate_chunks: CandidateIdChunks,
     /// The fragments of the base and of the source that hold a candidate row
     /// of the base-to-source comparison.
     source_scope: LineageSideScope,
@@ -2742,7 +2752,7 @@ async fn plan_lineage_merge(
     );
 
     let mut candidate_chunks =
-        DeleteIdChunks::new(catalog.system_columns.id, WriteBudget::default());
+        CandidateIdChunks::new(catalog.system_columns.id, WriteBudget::default());
     for id in candidate_ids {
         match candidate_chunks.push_bounded(id, LINEAGE_FILTER_MAX_IDS, KEYED_WRITE_MAX_BYTES) {
             Ok(()) => {}
@@ -4279,7 +4289,7 @@ mod chain_limit_tests {
                 write_budget: WriteBudget::default(),
                 id_col: SYSTEM_COLUMNS_LEGACY.id,
                 chunks: (0..chunk_count)
-                    .map(|_| DeleteIdChunk {
+                    .map(|_| IdChunk {
                         ids: vec!["id".to_string()],
                         row_ids: vec![0],
                         filter_bytes,
@@ -4385,7 +4395,7 @@ mod chain_limit_tests {
         // `id IN (` / `)` framing is another eight. The exact 14-byte filter
         // fits; adding a second id starts a new chunk rather than exceeding it.
         let mut byte_bounded =
-            DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id, WriteBudget::default());
+            CandidateIdChunks::new(SYSTEM_COLUMNS_LEGACY.id, WriteBudget::default());
         byte_bounded
             .push_bounded("a'b".to_string(), KEYED_WRITE_MAX_ROWS, 14)
             .unwrap();
@@ -4405,17 +4415,8 @@ mod chain_limit_tests {
                 .unwrap(),
             "id IN ('x')"
         );
-        // A candidate chunk carries no `_rowid`, so it can never delete.
-        assert!(byte_bounded.chunks[1].delete_expr().is_err());
-        let mut mixed = DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id, WriteBudget::default());
-        mixed.push("a".to_string(), 1).unwrap();
-        assert!(
-            mixed
-                .push_bounded("b".to_string(), KEYED_WRITE_MAX_ROWS, 1024)
-                .is_err()
-        );
 
-        let error = DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id, WriteBudget::default())
+        let error = CandidateIdChunks::new(SYSTEM_COLUMNS_LEGACY.id, WriteBudget::default())
             .push_bounded("a''b".to_string(), KEYED_WRITE_MAX_ROWS, 14)
             .unwrap_err();
         assert!(matches!(
@@ -4428,14 +4429,14 @@ mod chain_limit_tests {
         ));
 
         let mut retained_bounded =
-            DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id, WriteBudget::default());
+            CandidateIdChunks::new(SYSTEM_COLUMNS_LEGACY.id, WriteBudget::default());
         retained_bounded
-            .push_with_bounds("a".to_string(), None, KEYED_WRITE_MAX_ROWS, 1024, 256)
+            .push_with_bounds("a".to_string(), (), KEYED_WRITE_MAX_ROWS, 1024, 256)
             .unwrap();
         let retained_error = loop {
             match retained_bounded.push_with_bounds(
                 "b".to_string(),
-                None,
+                (),
                 KEYED_WRITE_MAX_ROWS,
                 1024,
                 256,
@@ -4573,6 +4574,20 @@ async fn commit_staged_delete_chunks(
                     chunk_index + 1
                 ))
             })?;
+        // The change record below lists every id of the chunk, so Lance must
+        // have removed exactly the chunk's rows. A `_rowid` that no longer
+        // names its live row (#1295) would otherwise publish a record of a
+        // delete that did not happen.
+        let expected_rows = chunk.row_count()?;
+        if staged_delete.deleted_rows() != Some(expected_rows) {
+            return Err(OmniError::manifest_internal(format!(
+                "branch merge delete chunk {} for table '{table_key}' removed {} of its {expected_rows} rows",
+                chunk_index + 1,
+                staged_delete
+                    .deleted_rows()
+                    .map_or_else(|| "an unknown number".to_string(), |rows| rows.to_string()),
+            )));
+        }
         staged_delete
             .record_deleted_ids(current.dataset(), &chunk.ids)
             .await?;

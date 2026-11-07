@@ -1052,6 +1052,9 @@ pub struct StagedWrite {
     /// adds without removing anything); populated from
     /// `Operation::Update.removed_fragment_ids` for keyed writes.
     removed_fragment_ids: Vec<u64>,
+    /// Rows a staged delete removes, as Lance counted them while staging.
+    /// `None` for every other effect.
+    deleted_rows: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1178,6 +1181,7 @@ impl StagedWrite {
             commit_metadata: StagedCommitMetadata::default(),
             new_fragments,
             removed_fragment_ids,
+            deleted_rows: None,
         }
     }
 
@@ -1192,7 +1196,19 @@ impl StagedWrite {
             commit_metadata,
             new_fragments,
             removed_fragment_ids,
+            deleted_rows: None,
         }
+    }
+
+    fn with_deleted_rows(mut self, deleted_rows: u64) -> Self {
+        self.deleted_rows = Some(deleted_rows);
+        self
+    }
+
+    /// Rows this staged delete removes, as Lance counted them; `None` when
+    /// the effect is not a delete.
+    pub(crate) fn deleted_rows(&self) -> Option<u64> {
+        self.deleted_rows
     }
 
     pub fn new_fragments(&self) -> &[Fragment] {
@@ -3371,12 +3387,15 @@ impl TableStore {
             }
         };
 
-        Ok(Some(StagedWrite::with_commit_metadata(
-            uncommitted.transaction,
-            StagedCommitMetadata::affected_rows(uncommitted.affected_rows),
-            new_fragments,
-            removed_fragment_ids,
-        )))
+        Ok(Some(
+            StagedWrite::with_commit_metadata(
+                uncommitted.transaction,
+                StagedCommitMetadata::affected_rows(uncommitted.affected_rows),
+                new_fragments,
+                removed_fragment_ids,
+            )
+            .with_deleted_rows(uncommitted.num_deleted_rows),
+        ))
     }
 
     /// Stage the delete of exactly the rows at `row_addrs`, captured by the
@@ -3435,12 +3454,15 @@ impl TableStore {
             },
             None,
         );
-        Ok(Some(StagedWrite::with_commit_metadata(
-            transaction,
-            StagedCommitMetadata::affected_rows(Some(row_addrs.clone())),
-            new_fragments,
-            removed_fragment_ids,
-        )))
+        Ok(Some(
+            StagedWrite::with_commit_metadata(
+                transaction,
+                StagedCommitMetadata::affected_rows(Some(row_addrs.clone())),
+                new_fragments,
+                removed_fragment_ids,
+            )
+            .with_deleted_rows(num_deleted_rows),
+        ))
     }
 
     // ─── Staged-write API ────────────────────────────────────────────────────
