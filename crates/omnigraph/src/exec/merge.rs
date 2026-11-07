@@ -132,12 +132,15 @@ struct StagedMergeResult {
     deleted_ids: DeleteIdChunks,
 }
 
-/// Exact delete-filter chunks retained from the ordered merge walk.
+/// Exact delete chunks retained from the ordered merge walk.
 ///
-/// Each chunk is independently bounded by both the keyed-write row ceiling and
-/// the exact UTF-8 byte length of the escaped `id IN (...)` filter handed to
-/// Lance. The chunk boundary is therefore also the transaction boundary:
-/// publish commits one detached Lance transaction per chunk.
+/// A delete chunk holds each removed row's logical id, which the change
+/// record keeps, and its `_rowid` as the target-side read saw it, which
+/// selects the rows (#1295). Each chunk is independently bounded by both the
+/// keyed-write row ceiling and the exact UTF-8 byte length of the escaped
+/// `id IN (...)` rendering of its ids, the form the lineage candidate path
+/// filters by. The chunk boundary is therefore also the transaction
+/// boundary: publish commits one detached Lance transaction per chunk.
 #[derive(Debug)]
 struct DeleteIdChunks {
     id_col: &'static str,
@@ -152,6 +155,9 @@ struct DeleteIdChunks {
 #[derive(Debug)]
 struct DeleteIdChunk {
     ids: Vec<String>,
+    /// The `_rowid` of each id, in the same order, for a delete chunk; empty
+    /// for a lineage candidate chunk, which only filters by id.
+    row_ids: Vec<u64>,
     filter_bytes: u64,
 }
 
@@ -165,17 +171,28 @@ impl DeleteIdChunks {
         }
     }
 
-    fn push(&mut self, id: String) -> Result<()> {
-        self.push_bounded(id, KEYED_WRITE_MAX_ROWS, self.write_budget.bytes())
+    /// Retain one row to delete: its id and the `_rowid` the target-side
+    /// read returned for it. Only a read of the target's own pinned table
+    /// (or of a base the target still pins) may supply `row_id`: rows another
+    /// lineage added can carry the same `_rowid`.
+    fn push(&mut self, id: String, row_id: u64) -> Result<()> {
+        self.push_with_bounds(
+            id,
+            Some(row_id),
+            KEYED_WRITE_MAX_ROWS,
+            self.write_budget.bytes(),
+            self.write_budget.bytes(),
+        )
     }
 
     fn push_bounded(&mut self, id: String, max_rows: usize, max_bytes: u64) -> Result<()> {
-        self.push_with_bounds(id, max_rows, max_bytes, self.write_budget.bytes())
+        self.push_with_bounds(id, None, max_rows, max_bytes, self.write_budget.bytes())
     }
 
     fn push_with_bounds(
         &mut self,
         id: String,
+        row_id: Option<u64>,
         max_rows: usize,
         max_filter_bytes: u64,
         max_retained_bytes: u64,
@@ -215,9 +232,16 @@ impl DeleteIdChunks {
             .ok_or_else(|| {
                 OmniError::manifest_internal("branch merge delete bookkeeping overflow")
             })?;
+        let row_id_storage = if row_id.is_some() {
+            u64::try_from(std::mem::size_of::<u64>())
+                .map_err(|_| OmniError::manifest_internal("u64 size exceeds u64"))?
+        } else {
+            0
+        };
         let id_storage = u64::try_from(id.len())
             .map_err(|_| OmniError::manifest_internal("branch merge delete id exceeds u64"))?
             .checked_add(string_bookkeeping)
+            .and_then(|bytes| bytes.checked_add(row_id_storage))
             .ok_or_else(|| {
                 OmniError::manifest_internal("branch merge delete retained bytes overflow")
             })?;
@@ -248,6 +272,7 @@ impl DeleteIdChunks {
         if starts_new_chunk {
             self.chunks.push(DeleteIdChunk {
                 ids: Vec::new(),
+                row_ids: Vec::new(),
                 filter_bytes: empty_filter_bytes,
             });
         }
@@ -268,7 +293,15 @@ impl DeleteIdChunks {
             .filter_bytes
             .checked_add(literal_bytes)
             .ok_or_else(|| OmniError::manifest_internal("branch merge delete filter overflow"))?;
+        if !chunk.ids.is_empty() && chunk.row_ids.is_empty() == row_id.is_some() {
+            return Err(OmniError::manifest_internal(
+                "branch merge chunk mixes rows with and without a _rowid",
+            ));
+        }
         chunk.ids.push(id);
+        if let Some(row_id) = row_id {
+            chunk.row_ids.push(row_id);
+        }
         self.retained_bytes = retained_bytes;
         Ok(())
     }
@@ -279,6 +312,13 @@ impl DeleteIdChunks {
 
     fn iter(&self) -> impl Iterator<Item = &String> {
         self.chunks.iter().flat_map(|chunk| chunk.ids.iter())
+    }
+
+    /// Each retained delete as its id and `_rowid`.
+    fn rows(&self) -> impl Iterator<Item = (&String, &u64)> {
+        self.chunks
+            .iter()
+            .flat_map(|chunk| chunk.ids.iter().zip(chunk.row_ids.iter()))
     }
 }
 
@@ -300,12 +340,27 @@ impl DeleteIdChunk {
         Ok(())
     }
 
-    /// `id_col IN (ids)` as the typed expression `stage_delete` takes. The
-    /// byte plan (`filter_bytes`) bounds the chunk as the SQL rendering of
-    /// this list (`filter`, the candidate cursor's form) measures it.
-    fn expr(&self, id_col: &str) -> Result<datafusion::prelude::Expr> {
+    /// `_rowid IN (row_ids)`, the typed expression `stage_delete` takes.
+    /// Lance turns it into a take by row id (`TakeOperation`), so a delete
+    /// chunk reads no data column and its cost does not depend on `id` index
+    /// coverage (#1295). An `id IN (ids)` filter searched the `id` BTREE and
+    /// scanned the `id` column of every fragment the index did not cover.
+    fn delete_expr(&self) -> Result<datafusion::prelude::Expr> {
         self.check_bounds()?;
-        Ok(crate::engine::id_in_list_expr(&self.ids, id_col))
+        if self.row_ids.len() != self.ids.len() {
+            return Err(OmniError::manifest_internal(format!(
+                "branch merge delete chunk holds {} ids but {} row ids",
+                self.ids.len(),
+                self.row_ids.len()
+            )));
+        }
+        Ok(datafusion::prelude::col(lance_core::ROW_ID).in_list(
+            self.row_ids
+                .iter()
+                .map(|row_id| datafusion::prelude::lit(*row_id))
+                .collect(),
+            false,
+        ))
     }
 
     fn filter(&self, id_col: &str) -> Result<String> {
@@ -436,6 +491,21 @@ struct CursorRow {
 }
 
 impl CursorRow {
+    /// The `_rowid` this row has in the pinned table its cursor reads.
+    fn row_id(&self) -> Result<u64> {
+        self.batch
+            .column_by_name(lance_core::ROW_ID)
+            .and_then(|column| column.as_any().downcast_ref::<arrow_array::UInt64Array>())
+            .filter(|column| !column.is_null(self.row_index))
+            .map(|column| column.value(self.row_index))
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "branch merge row '{}' was read without its _rowid",
+                    self.id
+                ))
+            })
+    }
+
     /// The typed comparison unit — cloned when eager, built on demand when lazy.
     fn typed(&self) -> Result<RawRow> {
         match &self.typed {
@@ -1680,9 +1750,11 @@ impl AdoptClassification<'_> {
             };
 
             let outcome = match (&base_row, &source_row) {
-                (Some(_), None) => {
-                    // Deleted on source
-                    self.deleted_ids.push(next_id.clone())?;
+                (Some(base), None) => {
+                    // Deleted on source. Adopt runs only while the target pins
+                    // the base table, so the base row's `_rowid` is the
+                    // target's.
+                    self.deleted_ids.push(next_id.clone(), base.row_id()?)?;
                     Some(AdoptOutcome::Deleted)
                 }
                 (None, Some(src)) => {
@@ -1984,8 +2056,8 @@ async fn run_three_way_classification(
         }
 
         // Row existed in target but not in merge result → delete
-        if selection.is_none() && target_row.is_some() {
-            deleted_ids.push(next_id.clone())?;
+        if let (None, Some(target)) = (selection, target_row.as_ref()) {
+            deleted_ids.push(next_id.clone(), target.row_id()?)?;
             *needs_update = true;
             if let Some(log) = outcome_log.as_deref_mut() {
                 log.push((next_id.clone(), RowOutcomeKind::Deleted));
@@ -2803,7 +2875,7 @@ async fn stage_lineage_table_merge(
 }
 
 /// Verify-mode comparison: the two paths must produce identical non-skip row
-/// classifications, identical deleted-id sequences, and identical staged delta
+/// classifications, identical deleted (id, `_rowid`) sequences, and identical staged delta
 /// row counts. A divergence is a correctness bug in the lineage path; the
 /// merge fails loudly.
 fn verify_lineage_agreement(
@@ -2835,11 +2907,11 @@ fn verify_lineage_agreement(
              merge_lineage = off to run the walk only"
         )));
     }
-    let walk_deleted: Vec<&String> = walk_result
-        .map(|result| result.deleted_ids.iter().collect())
+    let walk_deleted: Vec<(&String, &u64)> = walk_result
+        .map(|result| result.deleted_ids.rows().collect())
         .unwrap_or_default();
-    let lineage_deleted: Vec<&String> = lineage_result
-        .map(|result| result.deleted_ids.iter().collect())
+    let lineage_deleted: Vec<(&String, &u64)> = lineage_result
+        .map(|result| result.deleted_ids.rows().collect())
         .unwrap_or_default();
     if walk_deleted != lineage_deleted {
         // Counts can be equal while contents differ; name the first
@@ -2848,8 +2920,11 @@ fn verify_lineage_agreement(
             .iter()
             .zip(lineage_deleted.iter())
             .find(|(walk, lineage)| walk != lineage)
-            .map(|(walk, lineage)| {
-                format!("first differing id: walk '{walk}' vs lineage '{lineage}'")
+            .map(|((walk, walk_row), (lineage, lineage_row))| {
+                format!(
+                    "first differing row: walk '{walk}' (_rowid {walk_row}) vs lineage \
+                     '{lineage}' (_rowid {lineage_row})"
+                )
             })
             .unwrap_or_else(|| {
                 format!(
@@ -4206,6 +4281,7 @@ mod chain_limit_tests {
                 chunks: (0..chunk_count)
                     .map(|_| DeleteIdChunk {
                         ids: vec!["id".to_string()],
+                        row_ids: vec![0],
                         filter_bytes,
                     })
                     .collect(),
@@ -4277,7 +4353,9 @@ mod chain_limit_tests {
     fn branch_merge_delete_ids_split_on_row_and_escaped_byte_bounds() {
         let mut row_bounded = DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id, WriteBudget::default());
         for row in 0..=KEYED_WRITE_MAX_ROWS {
-            row_bounded.push(format!("id-{row}")).unwrap();
+            row_bounded
+                .push(format!("id-{row}"), 1_000 + row as u64)
+                .unwrap();
         }
         assert_eq!(row_bounded.chunk_count(), 2);
         assert_eq!(row_bounded.chunks[0].ids.len(), KEYED_WRITE_MAX_ROWS);
@@ -4287,6 +4365,21 @@ mod chain_limit_tests {
             assert_eq!(filter.len() as u64, chunk.filter_bytes);
             assert!(filter.len() as u64 <= KEYED_WRITE_MAX_BYTES);
         }
+        // #1295: a delete chunk selects its rows by the `_rowid` each id was
+        // read with, the form Lance turns into a take.
+        assert_eq!(
+            row_bounded.chunks[1].delete_expr().unwrap(),
+            datafusion::prelude::col(lance_core::ROW_ID).in_list(
+                vec![datafusion::prelude::lit(
+                    1_000 + KEYED_WRITE_MAX_ROWS as u64
+                )],
+                false
+            )
+        );
+        assert_eq!(
+            row_bounded.rows().nth(7),
+            Some((&"id-7".to_string(), &1_007))
+        );
 
         // `a'b` is six bytes as an escaped SQL literal (`'a''b'`) and the
         // `id IN (` / `)` framing is another eight. The exact 14-byte filter
@@ -4312,6 +4405,15 @@ mod chain_limit_tests {
                 .unwrap(),
             "id IN ('x')"
         );
+        // A candidate chunk carries no `_rowid`, so it can never delete.
+        assert!(byte_bounded.chunks[1].delete_expr().is_err());
+        let mut mixed = DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id, WriteBudget::default());
+        mixed.push("a".to_string(), 1).unwrap();
+        assert!(
+            mixed
+                .push_bounded("b".to_string(), KEYED_WRITE_MAX_ROWS, 1024)
+                .is_err()
+        );
 
         let error = DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id, WriteBudget::default())
             .push_bounded("a''b".to_string(), KEYED_WRITE_MAX_ROWS, 14)
@@ -4328,11 +4430,12 @@ mod chain_limit_tests {
         let mut retained_bounded =
             DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id, WriteBudget::default());
         retained_bounded
-            .push_with_bounds("a".to_string(), KEYED_WRITE_MAX_ROWS, 1024, 256)
+            .push_with_bounds("a".to_string(), None, KEYED_WRITE_MAX_ROWS, 1024, 256)
             .unwrap();
         let retained_error = loop {
             match retained_bounded.push_with_bounds(
                 "b".to_string(),
+                None,
                 KEYED_WRITE_MAX_ROWS,
                 1024,
                 256,
@@ -4355,7 +4458,7 @@ mod chain_limit_tests {
     fn branch_merge_delete_chunks_chain_one_link_each() {
         let mut deleted_ids = DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id, WriteBudget::default());
         for row in 0..=KEYED_WRITE_MAX_ROWS {
-            deleted_ids.push(format!("id-{row}")).unwrap();
+            deleted_ids.push(format!("id-{row}"), row as u64).unwrap();
         }
         let candidate = CandidateTableState::RewriteMerged(StagedMergeResult {
             inserts: None,
@@ -4459,7 +4562,7 @@ async fn commit_staged_delete_chunks(
     chain: &mut MergeChain,
 ) -> Result<SnapshotHandle> {
     for (chunk_index, chunk) in deleted_ids.chunks.iter().enumerate() {
-        let filter = chunk.expr(deleted_ids.id_col)?;
+        let filter = chunk.delete_expr()?;
         let mut staged_delete = target_db
             .storage()
             .stage_delete(&current, filter)

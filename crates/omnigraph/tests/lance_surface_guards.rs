@@ -9091,3 +9091,149 @@ async fn row_identity_discovery_stamps_row_ids_and_rewrites_lance_13() {
         "compaction carries every live row's id and stamp into the rewritten fragments"
     );
 }
+
+/// Issue #1295: a branch merge stages each delete chunk as `_rowid IN (...)`
+/// (`exec/merge.rs`, `DeleteIdChunk::delete_expr`), relying on Lance's
+/// `TakeOperation::try_from_expr` turning it into a take inside `DeleteJob`:
+/// one row read, no data column, no index. The `id IN (...)` form it replaced
+/// searches the `id` BTREE and scans the `id` column of every fragment the
+/// index does not cover. Measured with Lance's own `analyze_plan` on the scan
+/// `DeleteJob::execute_impl` builds (an object-store `IOTracker` does not see
+/// the scan scheduler's data reads). Paired with
+/// `merge_cost::merge_delete_selects_rows_by_rowid_issue_1295`.
+#[tokio::test]
+async fn delete_chunk_reads_by_filter_form_issue_1295() {
+    use datafusion::prelude::{col, lit};
+    use lance::dataset::DeleteBuilder;
+
+    const ROWS: usize = 2000;
+    fn batch(prefix: &str) -> (Arc<Schema>, RecordBatch) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+        let ids = (0..ROWS)
+            .map(|i| format!("{prefix}-{i}"))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(Int32Array::from((0..ROWS as i32).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap();
+        (schema, batch)
+    }
+    let params = |mode| WriteParams {
+        mode,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    for uncovered in [4usize, 16] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("t.lance");
+        let uri = uri.to_str().unwrap();
+        let (schema, first) = batch("covered");
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(first)], schema),
+            uri,
+            Some(params(WriteMode::Create)),
+        )
+        .await
+        .unwrap();
+        ds.create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+        for f in 0..uncovered {
+            let (schema, rows) = batch(&format!("tail{f}"));
+            ds.append(
+                RecordBatchIterator::new(vec![Ok(rows)], schema),
+                Some(params(WriteMode::Append)),
+            )
+            .await
+            .unwrap();
+        }
+        for target in ["covered-5", "tail0-5"] {
+            let row_id = ds
+                .scan()
+                .with_row_id()
+                .project(&["id"])
+                .unwrap()
+                .filter(&format!("id = '{target}'"))
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap()
+                .column_by_name(lance_core::ROW_ID)
+                .unwrap()
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .value(0);
+            for (form, filter) in [
+                ("id IN", col("id").in_list(vec![lit(target)], false)),
+                (
+                    "_rowid IN",
+                    col(lance_core::ROW_ID).in_list(vec![lit(row_id)], false),
+                ),
+            ] {
+                let cold = DatasetBuilder::from_uri(uri)
+                    .with_session(Arc::new(Session::default()))
+                    .load()
+                    .await
+                    .unwrap();
+                // The scan `DeleteJob::execute_impl` runs, measured by Lance.
+                let mut scan = cold.scan();
+                scan.with_row_id()
+                    .project(&[lance_core::ROW_ID])
+                    .unwrap()
+                    .filter_expr(filter.clone());
+                let analyzed = scan.analyze_plan().await.unwrap();
+                let deleted = DeleteBuilder::from_expr(Arc::new(cold), filter)
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+                assert_eq!(deleted.num_deleted_rows, 1, "{form}");
+                let read = analyzed
+                    .lines()
+                    .find(|line| line.trim_start().starts_with("LanceRead:"))
+                    .unwrap_or_else(|| panic!("no LanceRead node: {analyzed}"));
+                eprintln!(
+                    "DELETE   uncovered_fragments={uncovered} target={target:<9} form={form:<9} {read}"
+                );
+                if form == "_rowid IN" {
+                    for metric in [
+                        "full_filter=--,",
+                        "rows_scanned=1,",
+                        "bytes_read=0,",
+                        "iops=0,",
+                    ] {
+                        assert!(
+                            read.contains(metric),
+                            "Lance no longer takes `_rowid IN` without reading data \
+                         ({metric} missing); branch-merge deletes rely on it: {analyzed}"
+                        );
+                    }
+                } else {
+                    let fragments_scanned = read
+                        .split("fragments_scanned=")
+                        .nth(1)
+                        .and_then(|rest| rest.split(',').next())
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or_else(|| panic!("no fragments_scanned metric: {analyzed}"));
+                    assert!(
+                        fragments_scanned >= uncovered,
+                        "an `id IN` delete scanned {fragments_scanned} fragments with {uncovered} \
+                     uncovered by the index: {analyzed}"
+                    );
+                }
+            }
+        }
+    }
+}
