@@ -2,7 +2,7 @@
 //! behind `PlanSource`, the parameters behind the scanner's pushability
 //! verdict, and the physical plan the engine's runner executes.
 
-mod indexes;
+pub(super) mod indexes;
 mod scan_access;
 
 use std::collections::{BTreeMap, HashMap};
