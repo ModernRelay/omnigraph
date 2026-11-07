@@ -343,6 +343,10 @@ impl ScanTuning<'_> {
         Ok(self)
     }
 
+    /// A kNN over `column` by squared L2, the metric `nearest` promises.
+    /// Without an explicit metric Lance ranks by the metric of whatever
+    /// vector index covers the column; with one it searches an index of
+    /// another metric flat instead (Lance 13 `Scanner::create_plan`).
     pub(crate) fn nearest(
         &mut self,
         column: &str,
@@ -350,6 +354,7 @@ impl ScanTuning<'_> {
         limit: usize,
     ) -> std::result::Result<&mut Self, lance::Error> {
         self.scanner.nearest(column, query, limit)?;
+        self.scanner.distance_metric(MetricType::L2);
         Ok(self)
     }
 
@@ -3047,27 +3052,33 @@ impl TableStore {
         Ok(!Self::foldable_index_lag(ds).await?.is_empty())
     }
 
-    /// The partition count Lance reports for a vector index, or one when the
-    /// statistics do not name it.
-    async fn vector_partition_count(ds: &Dataset, name: &str) -> usize {
-        fn first_num_partitions(value: &serde_json::Value) -> Option<usize> {
+    /// The partition count Lance reports for a vector index. A fold keeps
+    /// it, so a statistics read that fails or names no positive count is an
+    /// error, not a silent rebuild with one partition.
+    async fn vector_partition_count(ds: &Dataset, name: &str) -> Result<usize> {
+        fn first_num_partitions(value: &serde_json::Value) -> Option<u64> {
             match value {
                 serde_json::Value::Object(map) => map
                     .get("num_partitions")
                     .and_then(|v| v.as_u64())
-                    .map(|v| v as usize)
                     .or_else(|| map.values().find_map(first_num_partitions)),
                 serde_json::Value::Array(items) => items.iter().find_map(first_num_partitions),
                 _ => None,
             }
         }
-        ds.index_statistics(name)
-            .await
+        let stats = ds.index_statistics(name).await.map_err(|error| {
+            OmniError::storage_context(format!("index statistics of '{name}'"), error)
+        })?;
+        serde_json::from_str::<serde_json::Value>(&stats)
             .ok()
-            .and_then(|stats| serde_json::from_str::<serde_json::Value>(&stats).ok())
             .and_then(|stats| first_num_partitions(&stats))
             .filter(|partitions| *partitions >= 1)
-            .unwrap_or(1)
+            .and_then(|partitions| usize::try_from(partitions).ok())
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "the statistics of vector index '{name}' name no partition count"
+                ))
+            })
     }
 
     async fn foldable_index_lag(ds: &Dataset) -> Result<Vec<IndexLag>> {
@@ -3179,7 +3190,7 @@ impl TableStore {
                 // Keep the index's partition count: the engine builds one
                 // partition, but a partitioned index (Lance's split, or an
                 // explicit build) keeps its shape across folds.
-                let partitions = Self::vector_partition_count(ds, &item.name).await;
+                let partitions = Self::vector_partition_count(ds, &item.name).await?;
                 let params =
                     lance::index::vector::VectorIndexParams::ivf_flat(partitions, MetricType::L2);
                 ds_clone
@@ -7906,6 +7917,49 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
         let col = Arc::new(StringArray::from(ids.to_vec())) as ArrayRef;
         RecordBatch::try_new(schema, vec![col]).unwrap()
+    }
+
+    /// Issue #1297: a fold keeps a vector index's partition count, and a
+    /// statistics read that names none is an error, not one partition.
+    #[tokio::test]
+    async fn vector_partition_count_reads_the_index_or_refuses_issue_1297() {
+        use arrow_array::{FixedSizeListArray, Float32Array};
+        use lance::index::DatasetIndexExt;
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!("{}/vectors", dir.path().to_str().unwrap());
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let values = Float32Array::from((0..64).map(|value| value as f32).collect::<Vec<_>>());
+        let vectors = FixedSizeListArray::try_new(item, 2, Arc::new(values), None).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "embedding",
+            vectors.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
+        // forbidden-api-allow: test writes a scratch Lance dataset, not a graph table.
+        let mut ds = Dataset::write(reader, &uri, None).await.unwrap();
+        ds.create_index(
+            &["embedding"],
+            IndexType::Vector,
+            Some("embedding_idx".to_string()),
+            &lance::index::vector::VectorIndexParams::ivf_flat(2, MetricType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            TableStore::vector_partition_count(&ds, "embedding_idx")
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(
+            TableStore::vector_partition_count(&ds, "missing_idx")
+                .await
+                .is_err(),
+            "a failed statistics read must not fold the index with one partition"
+        );
     }
 
     #[tokio::test]

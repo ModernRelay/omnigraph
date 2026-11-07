@@ -70,11 +70,69 @@ fn kind(index: &IndexMetadata) -> IndexKind {
         IndexKind::Btree { usable: false }
     } else if details.supports_fts() {
         IndexKind::Inverted
-    } else if details.is_vector() {
+    } else if details.is_vector() && vector_index_ranks_exactly_by_l2(index) {
         IndexKind::Vector
     } else {
         IndexKind::Unknown
     }
+}
+
+/// Whether a vector index segment scores every row of each partition it
+/// searches exactly by squared L2, the metric `nearest` promises: IVF with
+/// unquantized vectors (IVF_FLAT) and the L2 metric, the only vector index
+/// the engine builds. A segment with quantized vectors (PQ, SQ, RQ), an HNSW
+/// graph or another metric approximates or ranks differently, and so does
+/// one whose details are empty: Lance infers missing details when it loads
+/// indices, and an empty value left after that is unknown, not the proto
+/// defaults (L2, no compression) it would decode to. Details carrying a
+/// field this Lance does not know are not exact either: the decoder drops
+/// the field, which may be a newer sub-index (an IVF_VAMANA_FLAT index adds
+/// `vamana_index_config`, lance#10318), so the re-encoded details must be as
+/// long as the stored ones.
+pub(crate) fn vector_index_ranks_exactly_by_l2(index: &IndexMetadata) -> bool {
+    use lance_index::pb::{
+        VectorIndexDetails, VectorMetricType, vector_index_details::Compression,
+    };
+    let Some(details) = &index.index_details else {
+        return false;
+    };
+    if details.value.is_empty() || !IndexDetails(details.clone()).is_vector() {
+        return false;
+    }
+    let Ok(decoded) = details.to_msg::<VectorIndexDetails>() else {
+        return false;
+    };
+    if prost::Message::encoded_len(&decoded) != details.value.len() {
+        return false;
+    }
+    let details = decoded;
+    VectorMetricType::try_from(details.metric_type) == Ok(VectorMetricType::L2)
+        && details.hnsw_index_config.is_none()
+        && matches!(details.compression, None | Some(Compression::Flat(_)))
+}
+
+/// Whether every vector index segment keyed on `column` of `dataset` ranks
+/// exactly by squared L2 ([`vector_index_ranks_exactly_by_l2`]); true when no
+/// vector index covers the column, since Lance then scores every row flat.
+pub(crate) async fn vector_indexes_rank_exactly_by_l2(
+    dataset: &Dataset,
+    column: &str,
+) -> Result<bool> {
+    let Some(field) = dataset.schema().field(column) else {
+        return Ok(true);
+    };
+    let indices = dataset.load_indices().await.map_err(OmniError::storage)?;
+    Ok(indices
+        .iter()
+        .filter(|index| !is_system_index(index))
+        .filter(|index| index.fields.first() == Some(&field.id))
+        .filter(|index| {
+            index
+                .index_details
+                .as_ref()
+                .is_none_or(|details| IndexDetails(details.clone()).is_vector())
+        })
+        .all(vector_index_ranks_exactly_by_l2))
 }
 
 fn fact(
@@ -191,10 +249,94 @@ mod tests {
         }
         for (family, expected) in [
             ("InvertedIndexDetails", IndexKind::Inverted),
-            ("VectorIndexDetails", IndexKind::Vector),
+            // Empty vector details are unknown: Lance infers missing details
+            // when it loads indices, so empty ones are details it could not.
+            ("VectorIndexDetails", IndexKind::Unknown),
         ] {
             assert_eq!(kind(&segment("key", 0, Some(&[1]), Some(family))), expected);
         }
+    }
+
+    /// Issue #1297: only an IVF_FLAT, L2 vector index is a vector index fact;
+    /// another metric, quantized vectors or an HNSW graph rank otherwise.
+    #[test]
+    fn only_flat_l2_vector_details_claim_a_vector_index_issue_1297() {
+        use lance_index::pb::{
+            HnswParameters, VectorIndexDetails, VectorMetricType,
+            vector_index_details::{
+                Compression, FlatCompression, ProductQuantization, ScalarQuantization,
+            },
+        };
+        let flat = || Some(Compression::Flat(FlatCompression {}));
+        let vector = |details: VectorIndexDetails| {
+            let mut proto = pb::IndexMetadata {
+                uuid: Some(pb::Uuid { uuid: vec![0; 16] }),
+                name: "key".into(),
+                fields: vec![0],
+                ..Default::default()
+            };
+            let any = proto.index_details.get_or_insert_default();
+            any.type_url = "type.googleapis.com/lance.index.pb.VectorIndexDetails".into();
+            any.value = prost::Message::encode_to_vec(&details);
+            IndexMetadata::try_from(proto).unwrap()
+        };
+        let l2 = VectorMetricType::L2 as i32;
+        let cases = [
+            (l2, flat(), None, true),
+            (l2, None, None, true),
+            (VectorMetricType::Cosine as i32, flat(), None, false),
+            (VectorMetricType::Dot as i32, flat(), None, false),
+            (
+                l2,
+                Some(Compression::Pq(ProductQuantization {
+                    num_bits: 8,
+                    num_sub_vectors: 2,
+                })),
+                None,
+                false,
+            ),
+            (
+                l2,
+                Some(Compression::Sq(ScalarQuantization { num_bits: 8 })),
+                None,
+                false,
+            ),
+            (l2, flat(), Some(HnswParameters::default()), false),
+        ];
+        for (metric_type, compression, hnsw_index_config, exact) in cases {
+            let index = vector(VectorIndexDetails {
+                metric_type,
+                compression,
+                hnsw_index_config,
+                target_partition_size: 1,
+                ..Default::default()
+            });
+            assert_eq!(
+                vector_index_ranks_exactly_by_l2(&index),
+                exact,
+                "{metric_type} {compression:?}"
+            );
+            let expected = if exact {
+                IndexKind::Vector
+            } else {
+                IndexKind::Unknown
+            };
+            assert_eq!(kind(&index), expected, "{metric_type} {compression:?}");
+        }
+
+        // An IVF_FLAT, L2 index whose details carry a field this Lance does
+        // not know (field 10, a newer sub-index's configuration) is not exact.
+        let mut index = vector(VectorIndexDetails {
+            metric_type: l2,
+            compression: flat(),
+            target_partition_size: 1,
+            ..Default::default()
+        });
+        let mut details = (**index.index_details.as_ref().unwrap()).clone();
+        details.value.extend([(10 << 3) | 2, 0]);
+        index.index_details = Some(std::sync::Arc::new(details));
+        assert!(!vector_index_ranks_exactly_by_l2(&index));
+        assert_eq!(kind(&index), IndexKind::Unknown);
     }
 
     #[test]
