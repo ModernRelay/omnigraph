@@ -9091,3 +9091,72 @@ async fn row_identity_discovery_stamps_row_ids_and_rewrites_lance_13() {
         "compaction carries every live row's id and stamp into the rewritten fragments"
     );
 }
+
+/// Copy a dataset directory, every file.
+fn copy_dataset_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dataset_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// Stock Lance 13 `create_branch` records the source branch's absolute URI as
+/// a dataset-root base named for that branch, so a copy of the whole dataset
+/// opened at a new path reads the branch's inherited files at the original
+/// path, and fails once that path is gone, although the copy holds them.
+/// Omnigraph rebinds such a base to the opened location in memory
+/// (`omnigraph_core::branch_base`, the relocated graph roots RFC). This goes
+/// red at the bump whose clone records a location relative to the dataset;
+/// drop the in-memory rebinding for new bytes then, and keep it for old ones.
+#[tokio::test]
+async fn stock_branch_base_records_the_absolute_source_uri_issue_1233() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("original.lance");
+    let mut root = fresh_dataset(original.to_str().unwrap()).await;
+    let version = root.version().version;
+    let branch = root.create_branch("feature", version, None).await.unwrap();
+    let bases: Vec<_> = branch.manifest().base_paths.values().cloned().collect();
+    assert_eq!(bases.len(), 1);
+    assert!(bases[0].is_dataset_root);
+    assert_eq!(
+        bases[0].name, None,
+        "a branch of main names no source branch"
+    );
+    assert_eq!(bases[0].path, root.uri(), "the absolute source URI");
+
+    let copy = dir.path().join("copy.lance");
+    copy_dataset_tree(&original, &copy);
+    let open_copy = || async {
+        DatasetBuilder::from_uri(copy.to_str().unwrap())
+            .with_branch("feature", None)
+            .with_session(Arc::new(Session::default()))
+            .load()
+            .await
+            .unwrap()
+    };
+    let copied = open_copy().await;
+    assert_eq!(
+        copied.manifest().base_paths.values().next().unwrap().path,
+        root.uri(),
+        "the copy still names the original"
+    );
+    assert_eq!(copied.count_rows(None).await.unwrap(), 2);
+
+    std::fs::remove_dir_all(&original).unwrap();
+    let error = open_copy()
+        .await
+        .scan()
+        .try_into_batch()
+        .await
+        .expect_err("the copy reads its inherited file at the original path");
+    assert!(
+        error.to_string().contains("original.lance"),
+        "names the original: {error}"
+    );
+}

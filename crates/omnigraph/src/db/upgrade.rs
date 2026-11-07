@@ -575,7 +575,7 @@ async fn run(
     let pinned_main = match &pending {
         Some(intent) => {
             let version = intent.branches.last().map_or(0, |main| main.version);
-            main.checkout_version(version)
+            crate::db::manifest::layout::checkout_manifest(&main, version)
                 .await
                 .map_err(OmniError::storage)?
         }
@@ -857,8 +857,7 @@ async fn run(
                 named(native)
             )));
         }
-        let pinned = current
-            .checkout_version(branch.version)
+        let pinned = crate::db::manifest::layout::checkout_manifest(&current, branch.version)
             .await
             .map_err(OmniError::storage)?;
         let head = converted_head(root, &session, branch, None).await?;
@@ -1315,8 +1314,7 @@ async fn inventory(main: &Dataset) -> Result<Vec<SourceBranch>> {
     live.sort_by(|a, b| a.0.cmp(&b.0));
     let mut branches = Vec::with_capacity(live.len() + 1);
     for (native, contents) in live {
-        let head = main
-            .checkout_branch(&native)
+        let head = crate::db::manifest::layout::checkout_manifest_branch(main, &native)
             .await
             .map_err(OmniError::storage)?;
         branches.push(SourceBranch {
@@ -1389,10 +1387,12 @@ async fn census_input(
     }
     let mut retired = Vec::new();
     for (native, contents) in retired_refs {
-        let head = main
-            .checkout_version(Ref::Version(Some(native.clone()), None))
-            .await
-            .map_err(OmniError::storage)?;
+        let head = crate::db::manifest::layout::checkout_manifest(
+            main,
+            Ref::Version(Some(native.clone()), None),
+        )
+        .await
+        .map_err(OmniError::storage)?;
         retired.push(CensusRef {
             native: Some(native),
             version: head.version().version,
@@ -1525,11 +1525,12 @@ async fn preflight_refs(
                 )));
             }
         }
-        let head = open_with_session(root, native, session)
-            .await?
-            .checkout_version(branch.version)
-            .await
-            .map_err(OmniError::storage)?;
+        let head = crate::db::manifest::layout::checkout_manifest(
+            &open_with_session(root, native, session).await?,
+            branch.version,
+        )
+        .await
+        .map_err(OmniError::storage)?;
         let key: Vec<&str> = head
             .schema()
             .unenforced_primary_key()
@@ -1577,10 +1578,12 @@ async fn bounded_input(
         .map(|source| (source, "retired ", remedy));
     let mut over = Vec::new();
     for (source, role, remedy) in live.chain(retired) {
-        let head = main
-            .checkout_version(Ref::Version(source.native.clone(), Some(source.version)))
-            .await
-            .map_err(OmniError::storage)?;
+        let head = crate::db::manifest::layout::checkout_manifest(
+            main,
+            Ref::Version(source.native.clone(), Some(source.version)),
+        )
+        .await
+        .map_err(OmniError::storage)?;
         if let Some(held) = metadata_over_budget(&head, bounds).await? {
             over.push(format!(
                 "{role}{} holds {held}, above the budget of {} rows or {} bytes per head{remedy}",
@@ -1946,8 +1949,7 @@ async fn publish_conversion(
     head: &HistoryRecord,
 ) -> Result<()> {
     let native = branch.native.as_deref();
-    let source = current
-        .checkout_version(branch.version)
+    let source = crate::db::manifest::layout::checkout_manifest(&current, branch.version)
         .await
         .map_err(OmniError::storage)?;
     let mut metadata = source.schema().metadata.clone();

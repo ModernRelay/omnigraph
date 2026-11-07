@@ -608,11 +608,7 @@ fn resolved_data_file_key<'a>(
 ) -> Option<(&'a str, &'a str)> {
     let root = match base_id {
         None => dataset.uri(),
-        Some(base_id) => dataset
-            .manifest
-            .base_paths
-            .get(&base_id)
-            .map(|base_path| base_path.path.as_str())?,
+        Some(base_id) => omnigraph_core::branch_base::base(dataset, base_id).map(|(uri, _)| uri)?,
     };
     Some((scheme_free_root(root), path))
 }
@@ -2178,7 +2174,9 @@ impl TableStore {
         .await?;
         match branch {
             Some(branch) if branch != "main" => {
-                ds.checkout_branch(branch).await.map_err(OmniError::storage)
+                omnigraph_core::branch_base::checkout_native_branch(&ds, branch)
+                    .await
+                    .map_err(OmniError::storage)
             }
             _ => Ok(ds),
         }

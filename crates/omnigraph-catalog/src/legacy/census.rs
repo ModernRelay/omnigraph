@@ -456,9 +456,12 @@ fn ordered_refs(input: &CensusInput) -> Result<Vec<(LegacyWriterKind, &CensusRef
 }
 
 async fn checkout(main: &Dataset, native: Option<&str>, version: u64) -> Result<Dataset> {
-    main.checkout_version(Ref::Version(native.map(str::to_string), Some(version)))
-        .await
-        .map_err(OmniError::storage)
+    crate::layout::checkout_manifest(
+        main,
+        Ref::Version(native.map(str::to_string), Some(version)),
+    )
+    .await
+    .map_err(OmniError::storage)
 }
 
 pub(super) fn named(native: Option<&str>) -> String {

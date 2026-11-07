@@ -30,7 +30,9 @@ The explicit `omnigraph upgrade` command is offline, and it cannot verify that i
    `completed`. An old process opened earlier can still write to a branch; the
    upgrade then stops and the root is restored from the backup.
 2. Take and verify a backup of the whole graph root. There is no reverse
-   conversion: rollback is restoring that backup with the old binary.
+   conversion: rollback is restoring that backup with the old binary, at the
+   path the graph had, since 0.14.0 and earlier binaries read some branch
+   files at that path (see [copying a graph root](../concepts/storage.md#copying-a-graph-root)).
 3. Check, then convert, then verify with the new binary:
 
 ```bash

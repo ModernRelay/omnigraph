@@ -57,7 +57,7 @@ pub async fn manifest_scan_dataset(dataset: &Dataset) -> Result<Dataset> {
 
 fn small_files(dataset: &Dataset) -> Option<HashMap<String, u64>> {
     if url::Url::parse(dataset.uri()).is_ok_and(|uri| uri.scheme() == "memory")
-        || !dataset.manifest().base_paths.is_empty()
+        || crate::branch_base::has_bases(dataset)
     {
         return None;
     }

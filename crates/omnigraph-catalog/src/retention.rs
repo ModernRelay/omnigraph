@@ -269,11 +269,12 @@ impl ManifestTagInventory {
     }
 
     pub async fn snapshot(&self, tag: &TagContents, root_uri: &str) -> Result<PinnedGraphManifest> {
-        let dataset = self
-            .dataset
-            .checkout_version(Ref::Version(tag.branch.clone(), Some(tag.version)))
-            .await
-            .map_err(OmniError::storage)?;
+        let dataset = crate::layout::checkout_manifest(
+            &self.dataset,
+            Ref::Version(tag.branch.clone(), Some(tag.version)),
+        )
+        .await
+        .map_err(OmniError::storage)?;
         PinnedGraphManifest::from_dataset(root_uri, dataset).await
     }
 
@@ -358,9 +359,11 @@ impl ManifestCoordinator {
             }
         }
         for native in candidates {
-            let dataset = match main
-                .checkout_version(Ref::Version(native, Some(commit.graph_manifest_version)))
-                .await
+            let dataset = match crate::layout::checkout_manifest(
+                &main,
+                Ref::Version(native, Some(commit.graph_manifest_version)),
+            )
+            .await
             {
                 Ok(dataset) => dataset,
                 Err(lance::Error::DatasetNotFound { .. }) => continue,
@@ -424,10 +427,10 @@ impl ManifestCoordinator {
         names.sort();
         let mut graphs = Vec::new();
         for native in names.into_iter().rev() {
-            let dataset = main
-                .checkout_version(Ref::Version(Some(native.clone()), None))
-                .await
-                .map_err(OmniError::storage)?;
+            let dataset =
+                crate::layout::checkout_manifest(&main, Ref::Version(Some(native.clone()), None))
+                    .await
+                    .map_err(OmniError::storage)?;
             let session = dataset.session();
             let (head, buffer, registry) =
                 match crate::legacy::retired_head(root_uri, &session, history.objects(), &dataset)

@@ -4758,3 +4758,108 @@ async fn collector_reclaims_blob_sidecars_after_the_last_retained_pin() {
         current_payload,
     );
 }
+
+/// Copy a whole graph root, every file, as a backup tool would.
+fn copy_graph_root(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_graph_root(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// `node:Person` rows on `target` of the graph at `root`, opened fresh.
+async fn person_rows_on(root: &std::path::Path, target: ReadTarget) -> usize {
+    let db = Omnigraph::open(root.to_str().unwrap()).await.unwrap();
+    let snapshot = db.snapshot_of(target).await.unwrap();
+    let dataset = snapshot.open_dataset("node:Person").await.unwrap();
+    dataset.count_rows(None).await.unwrap()
+}
+
+/// Cleanup on a whole-root copy whose original is gone keeps everything a
+/// retained branch and a tagged snapshot of it inherit through their
+/// `__manifest` bases, and reclaims only unretained history (issue 1233).
+#[tokio::test]
+async fn cleanup_on_a_relocated_root_keeps_retained_branches_and_tagged_snapshots_issue_1233() {
+    let work = tempfile::tempdir().unwrap();
+    let original = work.path().join("original.omni");
+    let original_uri = original.to_str().unwrap();
+    let db = crate::helpers::init_and_load_at(original_uri, TEST_SCHEMA).await;
+    let person = |name: &str, age: i64| mixed_params(&[("$name", name)], &[("$age", age)]);
+
+    db.branch_create("retained").await.unwrap();
+    crate::helpers::mutate_branch(
+        &db,
+        "retained",
+        MUTATION_QUERIES,
+        "insert_person",
+        &person("Eve", 22),
+    )
+    .await
+    .unwrap();
+    // Tag the retained branch at this commit, then move the branch on.
+    let tagged = db.list_commits(Some("retained")).await.unwrap().remove(0);
+    let native = crate::helpers::graph_native_ref(original_uri, "retained").await;
+    let manifest_uri = format!("{original_uri}/__manifest");
+    let manifest = crate::helpers::open_dataset_head(&manifest_uri, None).await;
+    let tagged_version = crate::helpers::open_dataset_head(&manifest_uri, Some("retained"))
+        .await
+        .version()
+        .version;
+    manifest
+        .tags()
+        .create("keep", (native.as_str(), tagged_version))
+        .await
+        .unwrap();
+    crate::helpers::mutate_branch(
+        &db,
+        "retained",
+        MUTATION_QUERIES,
+        "insert_person",
+        &person("Frank", 33),
+    )
+    .await
+    .unwrap();
+    for (name, age) in [("Yan", 40), ("Zed", 41)] {
+        mutate_main(&db, MUTATION_QUERIES, "insert_person", &person(name, age))
+            .await
+            .unwrap();
+    }
+    drop((db, manifest));
+
+    let moved = work.path().join("moved.omni");
+    copy_graph_root(&original, &moved);
+    std::fs::remove_dir_all(&original).unwrap();
+
+    let db = Omnigraph::open(moved.to_str().unwrap()).await.unwrap();
+    let rows = db.cleanup(keep_one()).await.unwrap();
+    assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
+    drop(db);
+
+    assert!(
+        !original.exists(),
+        "cleanup wrote nothing at the original path"
+    );
+    assert_eq!(person_rows_on(&moved, ReadTarget::branch("main")).await, 6);
+    assert_eq!(
+        person_rows_on(&moved, ReadTarget::branch("retained")).await,
+        6
+    );
+    assert_eq!(
+        person_rows_on(
+            &moved,
+            ReadTarget::snapshot(SnapshotId::new(tagged.graph_commit_id.clone()))
+        )
+        .await,
+        5,
+        "the tagged snapshot reads its inherited files from the copy"
+    );
+    let manifest =
+        crate::helpers::open_dataset_head(moved.join("__manifest").to_str().unwrap(), None).await;
+    assert!(manifest.tags().list().await.unwrap().contains_key("keep"));
+}

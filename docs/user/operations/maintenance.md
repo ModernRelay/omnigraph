@@ -217,7 +217,7 @@ files shared with retained attached versions remain protected. The same risk
 applies to the graph's catalog dataset, whose unpublished proposals and
 unattached snapshots are detached versions. If an external cleanup has run,
 stop writes and check for missing files; restore the whole root from a verified
-backup if data was deleted.
+backup if data was deleted, at its location or a [new one](../concepts/storage.md#copying-a-graph-root).
 
 A table version no graph commit ever named is unpublished staging: a write
 in flight, or one that failed before its publication. Unless a native tag

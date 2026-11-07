@@ -706,10 +706,12 @@ impl ManifestCoordinator {
         let (expected_root, expected_id) = unattached_tag_parts(name)?.ok_or_else(|| {
             OmniError::manifest_internal(format!("native tag '{name}' is not a candidate tag"))
         })?;
-        let detached = main
-            .checkout_version(Ref::Version(tag.branch.clone(), Some(tag.version)))
-            .await
-            .map_err(OmniError::storage)?;
+        let detached = crate::layout::checkout_manifest(
+            main,
+            Ref::Version(tag.branch.clone(), Some(tag.version)),
+        )
+        .await
+        .map_err(OmniError::storage)?;
         let stamp = read_stamp(&detached).ok_or_else(|| {
             OmniError::manifest_internal(format!("the version tag '{name}' names carries no stamp"))
         })?;

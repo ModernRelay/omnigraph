@@ -10,6 +10,7 @@
 // future Lance bumps stop needing this.
 #![recursion_limit = "256"]
 
+pub mod branch_base;
 pub mod branch_control;
 pub mod branch_names;
 pub mod dataset_index;

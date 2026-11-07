@@ -145,7 +145,7 @@ pub fn validate_real_graph_reference(
     )?;
     if !observed.relocation_self_contained {
         return Err(RealGraphError::new(
-            "copied graph retains external Lance base paths and is not relocation self-contained",
+            "copied graph names a Lance base outside its root and is not relocation self-contained",
         ));
     }
     Ok(())

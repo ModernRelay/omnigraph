@@ -2139,6 +2139,9 @@ pub async fn open_dataset(
         }
         error => OmniError::storage(error),
     })?;
+    let dataset = crate::branch_base::follow_opened_root(dataset)
+        .await
+        .map_err(OmniError::storage)?;
     if let Some(wrapper) = &wrapper {
         let store = dataset
             .object_store(None)
@@ -2162,6 +2165,9 @@ pub async fn open_dataset_if_present(
         Err(lance::Error::DatasetNotFound { .. }) => return Ok(None),
         Err(error) => return Err(OmniError::storage(error)),
     };
+    let dataset = crate::branch_base::follow_opened_root(dataset)
+        .await
+        .map_err(OmniError::storage)?;
     if let Some(wrapper) = &wrapper {
         let store = dataset
             .object_store(None)

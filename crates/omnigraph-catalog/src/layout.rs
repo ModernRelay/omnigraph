@@ -36,6 +36,23 @@ pub fn history_uri(root: &str) -> String {
     format!("{}/{}", root.trim_end_matches('/'), HISTORY_DIR)
 }
 
+/// The one checkout of a `__manifest` handle: `target` of `dataset`, its
+/// graph-internal branch bases rebound to the opened root and any other base
+/// refused (`omnigraph_core::branch_base`, the relocated graph roots RFC).
+/// `forbidden_apis.rs` refuses a bare Lance checkout in catalog and engine
+/// sources.
+pub async fn checkout_manifest(
+    dataset: &Dataset,
+    target: impl Into<lance::dataset::refs::Ref>,
+) -> lance::Result<Dataset> {
+    crate::branch_base::checkout(dataset, target).await
+}
+
+/// [`checkout_manifest`] at the latest version of native `branch`.
+pub async fn checkout_manifest_branch(dataset: &Dataset, branch: &str) -> lance::Result<Dataset> {
+    crate::branch_base::checkout_native_branch(dataset, branch).await
+}
+
 /// Resolve a logical graph branch to its live native manifest ref.
 ///
 /// The manifest dataset's ref list is the branch registry: a logical branch is
@@ -76,8 +93,7 @@ pub async fn open_manifest_dataset_with_session(
     match branch {
         Some(branch) if branch != "main" => {
             let native = resolve_native_manifest_branch(&dataset, branch).await?;
-            dataset
-                .checkout_branch(&native)
+            crate::layout::checkout_manifest_branch(&dataset, &native)
                 .await
                 .map_err(|error| branch_ref_error(error, branch))
         }
@@ -103,9 +119,11 @@ pub async fn open_manifest_dataset_native_with_session(
     .await?;
     match native {
         Some(native) if native != "main" => {
-            dataset.checkout_branch(native).await.map_err(|error| {
-                branch_ref_error(error, crate::branch_names::logical_branch_name(native))
-            })
+            crate::layout::checkout_manifest_branch(&dataset, native)
+                .await
+                .map_err(|error| {
+                    branch_ref_error(error, crate::branch_names::logical_branch_name(native))
+                })
         }
         _ => Ok(dataset),
     }
@@ -143,8 +161,7 @@ pub(crate) async fn open_manifest_branch_with_identifier(
         let before = crate::branch_control::get_branch_identifier(&dataset, &native)
             .await
             .map_err(|error| branch_ref_error(error, branch))?;
-        let branch_dataset = dataset
-            .checkout_branch(&native)
+        let branch_dataset = crate::layout::checkout_manifest_branch(&dataset, &native)
             .await
             .map_err(|error| branch_ref_error(error, branch))?;
         let after = crate::branch_control::get_branch_identifier(&dataset, &native)
