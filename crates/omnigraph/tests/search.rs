@@ -2904,6 +2904,7 @@ async fn a_full_text_index_with_no_segment_refuses_the_call_issue_747() {
     );
 }
 
+#[cfg(feature = "failpoints")]
 const ISSUE_1297_QUERIES: &str = r#"
 query nearest_scored($q: Vector(2)) {
     match { $d: Doc }
