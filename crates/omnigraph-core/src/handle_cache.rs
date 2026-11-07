@@ -314,6 +314,31 @@ impl TableHandleCache {
         let inner = self.inner.lock().await;
         inner.entries.keys_by_recency()
     }
+
+    /// Hold `dataset` for the pin a writer just committed, under the key the
+    /// published registration will carry, so the next open of that pin on
+    /// this handle costs no request (RFC 0067: the writer holds the handle it
+    /// needs; the pin is immutable, so a lost publish leaves a harmless entry).
+    pub async fn insert(
+        &self,
+        dataset_path: &str,
+        table_branch: Option<&str>,
+        version: u64,
+        staged_version: Option<u64>,
+        e_tag: Option<&str>,
+        dataset: Dataset,
+    ) {
+        let key = TableHandleKey::new(dataset_path, table_branch, version, staged_version, e_tag);
+        let manifest_bytes = dataset.manifest().deep_size_of();
+        let mut inner = self.inner.lock().await;
+        inner.insert(
+            key,
+            HeldHandle {
+                dataset,
+                manifest_bytes,
+            },
+        );
+    }
 }
 
 impl TableHandleCacheInner {
