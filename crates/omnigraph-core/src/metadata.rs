@@ -438,14 +438,12 @@ pub async fn table_version_metadata_for_state(
     )
     .await?;
     let ds = match branch {
-        Some(branch) => ds
-            .checkout_branch(branch)
+        Some(branch) => crate::branch_base::checkout_native_branch(&ds, branch)
             .await
             .map_err(OmniError::storage)?,
         None => ds,
     };
-    let ds = ds
-        .checkout_version(version)
+    let ds = crate::branch_base::checkout(&ds, version)
         .await
         .map_err(OmniError::storage)?;
     TableVersionMetadata::from_dataset(root_uri, table_path, &ds)

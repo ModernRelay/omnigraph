@@ -207,12 +207,14 @@ pub async fn create_branch(
         params
     });
     let context = CloneContext::capture(source, source_version)?;
-    CLONE_CONTEXT
+    let created = CLONE_CONTEXT
         .scope(
             context,
             source.create_branch(branch, source_version, store_params),
         )
-        .await
+        .await?;
+    // Lance builds the branch manifest from the source's persisted bases.
+    crate::branch_base::follow_opened_root(created).await
 }
 
 impl ManifestLocationCommitHandler {

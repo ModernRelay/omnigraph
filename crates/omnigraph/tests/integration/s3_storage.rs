@@ -405,3 +405,54 @@ async fn s3_fresh_branch_traversal_reuses_main_graph_index_with_etags() {
         "with real e_tags, a fresh lazy-fork branch must reuse main's cached CSR index, not rebuild"
     );
 }
+
+/// A whole-root copy into another prefix of the same bucket, then into another
+/// bucket, serves every branch from its own objects once the previous
+/// location is gone (the relocated graph roots RFC, issue 1233).
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_relocated_root_serves_every_branch_from_its_own_objects_issue_1233() {
+    let Some(source) = s3_test_graph_uri("relocation-source") else {
+        eprintln!("skipping s3 relocation test: OMNIGRAPH_S3_TEST_BUCKET is not set");
+        return;
+    };
+    let mut copies = vec![s3_test_graph_uri("relocation-prefix").unwrap()];
+    match std::env::var("OMNIGRAPH_S3_TEST_RELOCATION_BUCKET") {
+        Ok(bucket) if !bucket.trim().is_empty() => copies.push(format!(
+            "s3://{bucket}/relocation-bucket/{}",
+            ulid::Ulid::new()
+        )),
+        // Reported, not skipped: the copy into another prefix still runs.
+        _ => eprintln!(
+            "relocation into another bucket not run: \
+             OMNIGRAPH_S3_TEST_RELOCATION_BUCKET is not set"
+        ),
+    }
+    assert_relocated_root_serves_every_branch(&source, &copies).await;
+}
+
+/// The same journey on Azure: another prefix of the container, then another
+/// container.
+#[tokio::test(flavor = "multi_thread")]
+async fn azure_relocated_root_serves_every_branch_from_its_own_objects_issue_1233() {
+    let Ok(container) = std::env::var("OMNIGRAPH_AZURE_TEST_CONTAINER") else {
+        eprintln!("skipping azure relocation test: OMNIGRAPH_AZURE_TEST_CONTAINER is not set");
+        return;
+    };
+    let uri = |container: &str, name: &str| {
+        format!(
+            "az://{container}/engine-relocation/{name}-{}",
+            ulid::Ulid::new()
+        )
+    };
+    let source = uri(&container, "source");
+    let mut copies = vec![uri(&container, "prefix")];
+    match std::env::var("OMNIGRAPH_AZURE_TEST_RELOCATION_CONTAINER") {
+        Ok(other) if !other.trim().is_empty() => copies.push(uri(&other, "container")),
+        // Reported, not skipped: the copy into another prefix still runs.
+        _ => eprintln!(
+            "relocation into another container not run: \
+             OMNIGRAPH_AZURE_TEST_RELOCATION_CONTAINER is not set"
+        ),
+    }
+    assert_relocated_root_serves_every_branch(&source, &copies).await;
+}

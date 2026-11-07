@@ -354,8 +354,7 @@ pub(crate) async fn snapshot_state_at(
 ) -> Result<(Dataset, VersionState)> {
     let root = root_uri.trim_end_matches('/');
     let dataset = open_manifest_dataset_with_session(root, branch, control_session).await?;
-    let dataset = dataset
-        .checkout_version(version)
+    let dataset = crate::layout::checkout_manifest(&dataset, version)
         .await
         .map_err(OmniError::storage)?;
     let state = match crate::legacy::at_version(root, control_session, history, &dataset).await? {

@@ -517,18 +517,17 @@ fn probe_directory(
             base.clone().join(directory)
         });
     };
-    let base = dataset.manifest().base_paths.get(&base_id).ok_or_else(|| {
-        OmniError::manifest(format!("retained root has unknown base path {base_id}"))
-    })?;
-    if directory.is_empty() && !base.is_dataset_root {
+    let (path, is_dataset_root) = omnigraph_core::branch_base::base_object_path(dataset, base_id)
+        .map_err(OmniError::storage)?
+        .ok_or_else(|| {
+            OmniError::manifest(format!("retained root has unknown base path {base_id}"))
+        })?;
+    if directory.is_empty() && !is_dataset_root {
         return Err(OmniError::manifest(format!(
             "deletion base {base_id} is not a dataset root"
         )));
     }
-    let path = base
-        .extract_path(dataset.session().store_registry())
-        .map_err(OmniError::storage)?;
-    Ok(if base.is_dataset_root && !directory.is_empty() {
+    Ok(if is_dataset_root && !directory.is_empty() {
         path.join(directory)
     } else {
         path
@@ -1737,13 +1736,14 @@ async fn borrowed_origins(
     ids.extend(indices.iter().filter_map(|index| index.base_id));
     ids.into_iter()
         .map(|id| {
-            let base = manifest.base_paths.get(&id).ok_or_else(|| {
-                OmniError::manifest_conflict(format!("retained snapshot lacks borrowed base {id}"))
-            })?;
-            Ok(base
-                .extract_path(dataset.session().store_registry())
+            let (path, _) = omnigraph_core::branch_base::base_object_path(dataset, id)
                 .map_err(OmniError::storage)?
-                .to_string())
+                .ok_or_else(|| {
+                    OmniError::manifest_conflict(format!(
+                        "retained snapshot lacks borrowed base {id}"
+                    ))
+                })?;
+            Ok(path.to_string())
         })
         .collect()
 }
@@ -2317,9 +2317,22 @@ mod borrowed_origin_tests {
     /// its graph fork point. Reclaim main's history while keeping its files.
     #[tokio::test]
     async fn cleanup_keeps_legacy_native_origins_and_reclaims_unrelated_payloads() {
+        legacy_native_origins_survive_cleanup(false).await;
+    }
+
+    /// The same pre-v11 fork on a whole-root copy whose original is gone: its
+    /// bases follow the copy, so cleanup keeps the copy's borrowed files and
+    /// the fork still reads them, its inherited index included (issue 1233).
+    #[tokio::test]
+    async fn cleanup_keeps_legacy_native_origins_on_a_relocated_root_issue_1233() {
+        legacy_native_origins_survive_cleanup(true).await;
+    }
+
+    async fn legacy_native_origins_survive_cleanup(relocated: bool) {
         #[cfg(feature = "failpoints")]
         let _scenario = crate::seams::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
+        let copy = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let schema = "node Person {\n    name: String @key\n    age: I32 @index\n}\nnode Company {\n    name: String @key\n}";
         let db = Session::from_defaults(
@@ -2445,6 +2458,52 @@ mod borrowed_origin_tests {
         load_company(&db, "unrelated-current").await;
         load_person(&db, "main-current", 99).await;
         db.ensure_indices().await.unwrap();
+        // Relocated: the whole root is copied, the original removed, and every
+        // expected path moves to the copy.
+        let (db, uri, source_data, source_indices, company_old) = if relocated {
+            drop(db);
+            let moved = copy.path().join("moved.omni");
+            copy_root(dir.path(), &moved);
+            std::fs::remove_dir_all(dir.path()).unwrap();
+            let from = location_base(&source).to_string();
+            let from = from
+                .strip_suffix(&entry.dataset_path)
+                .unwrap()
+                .trim_end_matches('/')
+                .to_string();
+            let to = object_store::path::Path::from_absolute_path(&moved)
+                .unwrap()
+                .to_string();
+            let rebase = |paths: Vec<object_store::path::Path>| -> Vec<_> {
+                paths
+                    .into_iter()
+                    .map(|path| {
+                        let rest = path.as_ref().strip_prefix(from.as_str()).unwrap();
+                        object_store::path::Path::from(format!("{to}{rest}"))
+                    })
+                    .collect()
+            };
+            let uri = moved.to_str().unwrap().to_string();
+            let db = Session::from_defaults(
+                Arc::new(Omnigraph::open(&uri).await.unwrap()),
+                SessionSettings::default(),
+            );
+            (
+                db,
+                uri,
+                rebase(source_data),
+                rebase(source_indices),
+                rebase(company_old),
+            )
+        } else {
+            (
+                db,
+                uri.to_string(),
+                source_data,
+                source_indices,
+                company_old,
+            )
+        };
         let options = super::super::optimize::CleanupPolicyOptions {
             keep_versions: Some(1),
             older_than: None,
@@ -2476,7 +2535,7 @@ mod borrowed_origin_tests {
             );
         }
         drop((db, source, company, company_snapshot));
-        let reopened = Omnigraph::open(uri).await.unwrap();
+        let reopened = Omnigraph::open(&uri).await.unwrap();
         let snapshot = reopened
             .snapshot_of(ReadTarget::branch("legacy"))
             .await
@@ -2518,6 +2577,20 @@ mod borrowed_origin_tests {
             41
         );
     }
+    /// Copy a whole graph root, every file, as a backup tool would.
+    fn copy_root(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_root(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn cleanup_keeps_files_borrowed_by_unregistered_tagged_native_fork() {
         #[cfg(feature = "failpoints")]

@@ -215,13 +215,12 @@ pub fn certificate_path(dataset: &Dataset, index: &IndexMetadata) -> Result<Path
     let indices_dir = match index.base_id {
         None => dataset.indices_dir(),
         Some(base_id) => {
-            let base = dataset.manifest.base_paths.get(&base_id).ok_or_else(|| {
-                rebuild_required(index, "index references an unknown storage base")
-            })?;
-            let path = base
-                .extract_path(dataset.session().store_registry())
-                .map_err(OmniError::storage)?;
-            if base.is_dataset_root {
+            let (path, is_dataset_root) = crate::branch_base::base_object_path(dataset, base_id)
+                .map_err(OmniError::storage)?
+                .ok_or_else(|| {
+                    rebuild_required(index, "index references an unknown storage base")
+                })?;
+            if is_dataset_root {
                 path.join("_indices")
             } else {
                 path
