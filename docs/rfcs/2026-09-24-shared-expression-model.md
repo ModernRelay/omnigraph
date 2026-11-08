@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-09-24
-updated: 2026-10-02
+updated: 2026-11-08
 discussion: null
 supersedes: []
 superseded_by: []
@@ -418,16 +418,22 @@ Four rules follow.
 1. **The reserved set is closed.** It holds what applies to values of every
    type: truth values, null, membership and quantification. An operation
    joins it only by amending this RFC; every other operation is a call, so
-   a new capability adds a function to the type checker and no grammar.
+   a new capability adds a function to the type checker and a call rule to
+   the grammar, never a reserved word.
    An infix word outside the reserved set collides with a traversal, whose
    edge verb is any lowercase identifier (`edge_ident`, `query.pest:187`):
    `$ms contains $m.number` parses as the traversal `$ms contains $m` and
    fails at `.number` with `expected clause`. Reserving the word would fix
    that parse, and since PR [803](https://github.com/ModernRelay/omnigraph/pull/803) it no longer costs an edge its
    name, but it grows the grammar with each new operation: `ends_with`, a
-   regular expression match, list overlap. A call needs no grammar and is
+   regular expression match, list overlap. A call reserves no word and is
    never ambiguous, because its name is followed by `(`, which no traversal
-   is.
+   is. It still needs a parse rule: today's parser has one rule per call
+   (`now_call`, `search_call`, the ranking calls), and phase 5 adds one for
+   `starts_with()` and one for `contains()`. One shared call production,
+   whose name the type checker resolves, would remove the per-call rule; it
+   changes how every existing call parses, and this amendment does not
+   specify it.
 2. **One spelling, one operation.** An operand's type decides whether an
    expression is valid, never which operation it runs. `in` keeps to this:
    a String on its right is refused (``T7: `in` needs a list on the right``,
@@ -456,8 +462,13 @@ Four rules follow.
 of its behavior. `x in S` is the converse of list `contains`: it needs a
 list on the right, a literal or a parameter list is pushed into the scan as
 DataFusion's structured `InList` (`engine/scan.rs:942`), a key or unique
-property gets a bounded row estimate, a null `x` reads null, and an empty
-`S` matches nothing, under `not` too. The user guide states it
+property gets a bounded row estimate, and a null `x` reads null. An empty `S`
+makes `x in S` false for a non-null `x` and null for a null `x`: the scan
+lowers it to `x IS NULL AND NULL` (`engine/scan.rs:1372` at `main`
+`ea4a16d5`). Negation flips only the false: `not (x in [])` is true for every
+non-null `x` and null for a null `x`, so it selects every row whose `x` is
+not null, in a read and in a mutation `where`. A null list parameter reads
+null for every `x`. The user guide states it
 (`docs/user/queries/index.md:166`); `issue_801_in_predicate_over_a_list.gqt`
 and `list_membership_over_indexed_columns_across_writes_and_restart.gqt`
 own it.
@@ -1150,7 +1161,7 @@ downgrade must stay compatible with.
 | Extend `predicate_to_sql` to print `and`/`or` | smallest mutation diff | keeps the deny-listed string generation and a mutation-only evaluator; the read and write paths still disagree on null and type rules by construction |
 | Render the DataFusion `Expr` to SQL at the Lance boundary with `datafusion-sql`'s `Unparser` | one shared lowering, small change at the call site | unnecessary: Lance 11.0.0 accepts the `Expr` itself through `DeleteBuilder::from_expr` and `Scanner::filter_expr`; a renderer would reintroduce quoting and dialect rules (the camelCase case `exec/mutation.rs:1763` guards today) for nothing |
 | Hidden `order` items appended for any order key and pruned, as some SQL engines do | `order { max($d.amount) }` works without a return item | a hidden aggregate on a non-aggregated `return` changes the grouping and the rows; the explicit rule costs one typed error with an obvious fix |
-| Keep `contains` and `starts_with` infix and reserve them (phase 5 alternative) | fixes the parse collision without rewriting a query; since PR [803](https://github.com/ModernRelay/omnigraph/pull/803) an edge named by a reserved word stays reachable quoted | `contains` keeps two operations chosen by operand type, and every later string or list test grows the reserved set and the grammar, where a call needs neither |
+| Keep `contains` and `starts_with` infix and reserve them (phase 5 alternative) | fixes the parse collision without rewriting a query; since PR [803](https://github.com/ModernRelay/omnigraph/pull/803) an edge named by a reserved word stays reachable quoted | `contains` keeps two operations chosen by operand type, and every later string or list test grows the reserved set and the grammar, where a call adds a call rule and reserves nothing |
 | `in` alone, as PR [803](https://github.com/ModernRelay/omnigraph/pull/803) shipped it | membership is correct and pushed into the scan | `$ms contains $m.number` still reads as a traversal, and a `String` parameter still switches infix `contains` to substring without an error |
 | Membership through the inline match with a list parameter, `{ number: $ms }` | no new word | equality or membership would be chosen by the parameter's declared type, the defect rule 2 removes |
 | A call, `in_list(x, S)`, instead of `in` | no reserved word | membership applies to values of every type, the defining property of the reserved set, and callers write `in`: the agent behind issue [801](https://github.com/ModernRelay/omnigraph/issues/801) wrote `$m.number in $ms` |
@@ -1452,3 +1463,13 @@ None.
   copy-the-old-value branch of `apply_assignments` (`exec/mutation.rs:458-477`)
   and keeps the old value instead of clearing it, a pre-existing defect
   tracked separately."
+- 2026-11-08, review of the 2026-09-29 amendment: membership over an empty
+  list states each case, and the claim about calls is narrowed. Superseded
+  sentences: in Operators and calls, "a null `x` reads null, and an empty `S`
+  matches nothing, under `not` too", which contradicted the behavior
+  `issue_801_in_predicate_over_a_list.gqt` owns (`not ($m.code in $cs)` with
+  an empty `$cs` returns every Matter whose code is not null, and the
+  mutation `recode_outside_the_empty_set` updates three rows); in rule 1, "a
+  new capability adds a function to the type checker and no grammar" and "A
+  call needs no grammar and is never ambiguous"; in Alternatives, "where a
+  call needs neither".
