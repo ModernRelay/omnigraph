@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-28
-updated: 2026-10-01
+updated: 2026-11-08
 discussion: "https://github.com/ModernRelay/omnigraph/pull/792"
 supersedes: []
 superseded_by: []
@@ -372,9 +372,14 @@ results.
 - **Schema:** `@analyzed` is an additive SchemaIR feature applied in place;
   incompatible binaries refuse rather than reinterpret. Adopting fields
   rebuild their full-text index once.
-- **Results:** rows change only where today's answer depended on index state
-  or letter case, and scores change on adopting fields; that is the correction
-  this RFC exists for.
+- **Results:** adopting `@analyzed` changes rows in the two places
+  [Migration](#migration) names: where today's answer depended on index state
+  or letter case, the correction this RFC exists for, and where today's index
+  analysis differs from the declared profile. Today's English stemming, stop
+  words, ASCII folding and 40-byte token filter are not part of bare
+  `@analyzed` (`standard_v1`), so an indexed `running` that matches a query for
+  `run` today stops matching it, with complete coverage and the same letter
+  case. Scores change on adopting fields.
 - **Reverting:** before implementation, delete this document. After the
   removal release, reverting restores the legacy spellings and their
   index-dependent semantics behind another language boundary.
@@ -491,3 +496,8 @@ step 6 is performance work.
   extension; the feature name instead of a SchemaIR version. Corrected the
   #749 mechanism, the flat scanner's fuzzy behavior, the evidence citations
   and the named guards.
+- 2026-11-08 — the compatibility summary names both row changes Migration
+  describes, the analyzer-profile change included. Superseded sentence:
+  "rows change only where today's answer depended on index state or letter
+  case, and scores change on adopting fields; that is the correction this RFC
+  exists for."
