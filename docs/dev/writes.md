@@ -549,11 +549,11 @@ patches. A filtered scan returns matched rows as slices of a batch decoded
 from their fragment, and a slice pins its parent's buffers, so the scan copies
 each batch of matched rows into buffers of its own before charging or keeping
 it: the charge is the matched rows' own bytes, not those of the rows stored
-beside them, and not a function of the scan's batch size, which follows the
-remaining budget. The one physical term left is Arrow's fixed bookkeeping,
-about a hundred bytes per carried column for each batch, and a scan batch
-never spans two fragments. An index on the assigned column or the fragment a
-row shares therefore changes cost, never whether the write is admitted
+beside them. What remains is Arrow's fixed bookkeeping for each scan batch,
+about a hundred bytes per carried column. The number of batches follows the
+remaining budget and Lance's batching, not the rows stored beside the match.
+An index on the assigned column or the fragment a row shares therefore changes
+cost, never whether the write is admitted
 (`write_max_bytes_update_carried_blob.gqt`). Other pending-aware scans
 (`scan_with_pending`, which an update that rewrites whole rows uses) still
 charge the slices they keep.
