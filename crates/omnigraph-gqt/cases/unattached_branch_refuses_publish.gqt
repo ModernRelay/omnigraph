@@ -1,0 +1,94 @@
+# issue: none
+# notes: Neither a root nor a child unattached snapshot publishes, before and after it expires, while a
+# notes: sibling `as commit` proposal still publishes onto the recorded target as before.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+query root_bob() as unattached branch {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $r
+
+--- mutate
+query child_carol() as unattached branch on "${r}" {
+    insert Person { name: "carol", age: 52 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $c1
+
+--- mutate
+commit publish "${r}"
+
+--- expect error: is unattached and cannot publish
+
+--- mutate
+commit publish "${c1}"
+
+--- expect error: is unattached and cannot publish
+
+--- query snapshot: $c1
+query names_at_child_after_refusals() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+{"p.name": "carol"}
+
+--- expect shape
+p.name: String
+
+--- mutate
+query propose_erin() as commit {
+    insert Person { name: "erin", age: 27 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $p
+
+--- mutate
+commit publish "${p}"
+
+--- expect ok
+
+--- mutate
+commit publish "${r}"
+
+--- expect error: is unattached and cannot publish
+
+--- query
+query names_on_main() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "erin"}
+
+--- expect shape
+p.name: String

@@ -27,8 +27,11 @@ All members must connect the same source and destination node types, with
 direction resolved separately for each member. Wildcards require explicit node
 declarations for both endpoint variables in the same lexical block or a visible
 outer scope. A declaration in the same block may follow the traversal. Later
-outer declarations are not visible inside an earlier nested block. Recursive
-selections and undirected traversal require the same node type at both ends.
+outer declarations are not visible inside an earlier nested block. Undirected
+traversal and any hop bound above one, on a named edge or a selection, require
+the same node type at both ends: a hop ends on the destination type and the
+next one must start on the source type, so `$p worksAt{1,2} $c` over
+`WorksAt: Person -> Company` is refused with `T5` rather than run as one hop.
 Every connected traversal pattern needs an executable endpoint binding; an
 unrelated node declaration does not anchor it. Mixed-orientation alternatives
 need a declared endpoint type when their orientation would otherwise be ambiguous.

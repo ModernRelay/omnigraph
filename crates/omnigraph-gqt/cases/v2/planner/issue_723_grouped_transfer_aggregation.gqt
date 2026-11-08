@@ -1,7 +1,7 @@
 # issue: 723
 # red_on: none; small-result correctness guard, memory reproduction in engine_v2_memory.rs
 # notes: Bound transfer edges retain parallel rows and nullable amounts through grouping.
-# notes: Fixed-pool and scale acceptance: omnigraph/tests/engine_v2_memory.rs and repro_issue_723.rs.
+# notes: Fixed-pool and scale acceptance: omnigraph/tests/integration/engine_v2_memory.rs and repro_issue_723.rs.
 
 --- runner
 timeout_ms: 10000

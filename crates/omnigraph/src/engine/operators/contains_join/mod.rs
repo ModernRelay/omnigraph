@@ -8,24 +8,27 @@ mod pairing;
 use std::fmt;
 use std::sync::Arc;
 
+use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use datafusion::common::Result as DfResult;
+use datafusion::common::{DataFusionError, Result as DfResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
-use futures::StreamExt;
+use futures::future::BoxFuture;
 use omnigraph_compiler::ir::{IRExpr, ParamMap};
+use omnigraph_compiler::query::ast::{BinaryOp, CompOp};
+use omnigraph_compiler::types::{ExprType, ScalarType};
 use omnigraph_planner::ContainsJoinFields;
 
 use self::needle_rows::ContainsColumns;
 use self::pairing::Pairing;
 use super::memory::WorkMemory;
-use super::pair_buffer::{PairBuffer, collect_left};
-use super::producer::producer_stream;
-use super::{Filled, RuntimeFilterSlot, external, joined_schema, polled, streaming_properties};
-use crate::error::Result;
+use super::pair_buffer::PairBuffer;
+use super::shape::{BatchSender, CollectedSide, Flow, Streamed, Streaming, work};
+use super::{Filled, Needles, RuntimeFilterSlot, external, joined_schema};
+use crate::error::{OmniError, Result};
 
 /// The distinct needles the join's fill left for the right scan's filter.
 const NEEDLES_METRIC: &str = "runtime_filter_needles";
@@ -45,7 +48,7 @@ pub(crate) struct ContainsJoinExec {
     filters: Vec<IRExpr>,
     params: Arc<ParamMap>,
     runtime_filter: Arc<RuntimeFilterSlot>,
-    properties: Arc<PlanProperties>,
+    shape: Streaming,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -59,6 +62,20 @@ impl ContainsJoinExec {
         params: Arc<ParamMap>,
         runtime_filter: Arc<RuntimeFilterSlot>,
     ) -> Result<Self> {
+        let operand = |expr: &IRExpr, pair: (&str, &str)| {
+            matches!(expr, IRExpr::PropAccess {
+                variable, property,
+                ty: ExprType::Value { scalar: ScalarType::String, list: false, .. },
+            } if (variable.as_str(), property.as_str()) == pair)
+        };
+        let valid = matches!(fields.conjunct,
+            IRExpr::Binary { left, op: BinaryOp::Compare(CompOp::StringContains), right, ty: _ }
+            if operand(left, fields.haystack) && operand(right, fields.needle));
+        if !valid {
+            return Err(OmniError::manifest_internal(
+                "contains join conjunct disagrees with its matcher columns",
+            ));
+        }
         let schema = joined_schema(&left.schema(), &right.schema())?;
         let column = |(binding, property): (&str, &str)| format!("{binding}.{property}");
         let columns = ContainsColumns::checked(
@@ -79,7 +96,7 @@ impl ContainsJoinExec {
             filters,
             params,
             runtime_filter,
-            properties: streaming_properties(schema),
+            shape: Streaming::new(schema),
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
@@ -88,6 +105,7 @@ impl ContainsJoinExec {
         ContainsJoinFields {
             haystack: (&self.haystack.0, &self.haystack.1),
             needle: (&self.needle.0, &self.needle.1),
+            conjunct: &self.filters[0],
             residual: self.residual(),
         }
     }
@@ -120,7 +138,7 @@ impl ExecutionPlan for ContainsJoinExec {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
+        self.shape.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -152,70 +170,139 @@ impl ExecutionPlan for ContainsJoinExec {
         ctx: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
         assert_eq!(partition, 0, "ContainsJoinExec has one partition");
-        let schema: SchemaRef = self.schema();
-        let declared = Arc::clone(&schema);
-        let left_schema = self.left.schema();
-        let left = self.left.execute(0, Arc::clone(&ctx))?;
+        let memory = work(Arc::clone(&ctx), "ContainsJoinExec", &self.metrics)?;
+        memory.metric("input_rows", 0);
+        memory.metric("input_batches", 0);
+        memory.metric(NEEDLES_METRIC, 0);
         let right = Arc::clone(&self.right);
-        let filters = self.filters.clone();
-        let residual = self.residual().to_vec();
-        let params = Arc::clone(&self.params);
-        let runtime = Arc::clone(&self.runtime_filter);
-        let columns = self.columns.clone();
-        let mut work = WorkMemory::new(ctx, "ContainsJoinExec")?;
-        work.set_metrics(self.metrics.clone());
-        work.metric("input_rows", 0);
-        work.metric("input_batches", 0);
-        work.metric(NEEDLES_METRIC, 0);
-        let memory = Arc::new(work);
-        let stream = producer_stream(
-            schema,
-            memory,
-            Some(&self.metrics),
-            move |memory, sender| async move {
-                let left = collect_left(left, &left_schema, &memory, "contains join left").await?;
-                if left.num_rows() == 0 {
-                    return Ok(());
+        let body = Matches {
+            left: Arc::clone(&self.left),
+            declared: self.schema(),
+            filters: self.filters.clone(),
+            residual: self.residual().to_vec(),
+            params: Arc::clone(&self.params),
+            runtime: Arc::clone(&self.runtime_filter),
+            columns: self.columns.clone(),
+            opened: None,
+        };
+        Ok(self
+            .shape
+            .produce(memory, &self.metrics, move || right.execute(0, ctx), body))
+    }
+}
+
+/// The per-batch body over the right side: the left collected and the right
+/// scan's runtime filter filled before the right executes, each right batch
+/// paired through the buffer the way the first non-empty one decides.
+struct Matches {
+    left: Arc<dyn ExecutionPlan>,
+    declared: SchemaRef,
+    filters: Vec<IRExpr>,
+    residual: Vec<IRExpr>,
+    params: Arc<ParamMap>,
+    runtime: Arc<RuntimeFilterSlot>,
+    columns: ContainsColumns,
+    opened: Option<Opened>,
+}
+
+/// What the open left the body: the collected left under its reservation,
+/// the buffer over it, the needles the fill left for the pairing decision,
+/// and the pairing once decided.
+struct Opened {
+    left: RecordBatch,
+    _held: WorkMemory,
+    buffer: PairBuffer,
+    needles: Option<Arc<Needles>>,
+    pairing: Option<Pairing>,
+}
+
+impl Streamed for Matches {
+    fn open<'a>(&'a mut self, memory: &'a Arc<WorkMemory>) -> BoxFuture<'a, DfResult<bool>> {
+        Box::pin(async move {
+            let side = CollectedSide::collect(&self.left, memory, "contains join left").await?;
+            if side.batch.num_rows() == 0 {
+                return Ok(false);
+            }
+            let size = memory.ctx.session_config().batch_size();
+            let buffer = PairBuffer::new(
+                side.batch.clone(),
+                Arc::clone(&self.declared),
+                self.filters.clone(),
+                Arc::clone(&self.params),
+                size,
+                memory,
+            )?;
+            let needles = match self.runtime.fill(&side.batch, memory)? {
+                Filled::Needles(needles) => {
+                    memory.metric(NEEDLES_METRIC, needles.len());
+                    Some(needles)
                 }
-                let size = memory.ctx.session_config().batch_size();
-                let mut buffer =
-                    PairBuffer::new(left.clone(), declared, filters, params, size, &memory)?;
-                let mut needles = match runtime.fill(&left, &memory)? {
-                    Filled::Needles(needles) => {
-                        memory.metric(NEEDLES_METRIC, needles.len());
-                        Some(needles)
+                Filled::NoNeedles => return Ok(false),
+                Filled::Inert(needles) => needles,
+            };
+            self.opened = Some(Opened {
+                left: side.batch,
+                _held: side.held,
+                buffer,
+                needles,
+                pairing: None,
+            });
+            Ok(true)
+        })
+    }
+
+    fn batch<'a>(
+        &'a mut self,
+        batch: RecordBatch,
+        memory: &'a Arc<WorkMemory>,
+        sender: &'a BatchSender,
+    ) -> BoxFuture<'a, DfResult<Flow>> {
+        Box::pin(async move {
+            memory.metric("input_rows", batch.num_rows());
+            memory.metric("input_batches", 1);
+            if batch.num_rows() == 0 {
+                return Ok(Flow::Continue);
+            }
+            let opened = self.opened.as_mut().ok_or_else(|| {
+                DataFusionError::Internal(
+                    "contains join paired before its left was collected".into(),
+                )
+            })?;
+            let pairing = match &mut opened.pairing {
+                Some(pairing) => pairing,
+                slot @ None => {
+                    let decided = Pairing::decide(
+                        &opened.left,
+                        &self.columns,
+                        opened.needles.take(),
+                        memory,
+                    )?;
+                    if matches!(decided, Pairing::NeedleRows(_)) {
+                        opened.buffer.set_filters(self.residual.clone());
                     }
-                    Filled::NoNeedles => return Ok(()),
-                    Filled::Inert(needles) => needles,
-                };
-                let mut pairing = None;
-                let mut right = right.execute(0, Arc::clone(&memory.ctx))?;
-                while let Some(batch) = right.next().await {
-                    let batch = batch?;
-                    memory.metric("input_rows", batch.num_rows());
-                    memory.metric("input_batches", 1);
-                    if batch.num_rows() == 0 {
-                        continue;
-                    }
-                    let pairing = match &mut pairing {
-                        Some(pairing) => pairing,
-                        slot @ None => {
-                            let decided =
-                                Pairing::decide(&left, &columns, needles.take(), &memory)?;
-                            if matches!(decided, Pairing::NeedleRows(_)) {
-                                buffer.set_filters(residual.clone());
-                            }
-                            slot.insert(decided)
-                        }
-                    };
-                    buffer.start(&batch)?;
-                    pairing.pair(&batch, &mut buffer, &memory, &sender).await?;
-                    buffer.flush(&sender).await?;
+                    slot.insert(decided)
                 }
-                buffer.finish(&sender).await
-            },
-        );
-        Ok(polled(&self.metrics, stream))
+            };
+            opened.buffer.start(&batch)?;
+            pairing
+                .pair(&batch, &mut opened.buffer, memory, sender)
+                .await?;
+            opened.buffer.flush(sender).await?;
+            Ok(Flow::Continue)
+        })
+    }
+
+    fn finish<'a>(
+        &'a mut self,
+        _memory: &'a Arc<WorkMemory>,
+        sender: &'a BatchSender,
+    ) -> BoxFuture<'a, DfResult<()>> {
+        Box::pin(async move {
+            match self.opened.as_mut() {
+                Some(opened) => opened.buffer.finish(sender).await,
+                None => Ok(()),
+            }
+        })
     }
 }
 
@@ -234,6 +321,29 @@ mod tests {
             ContainsJoinFields {
                 haystack: ("p", "text"),
                 needle: ("m", "number"),
+                conjunct: &IRExpr::comparison(
+                    IRExpr::PropAccess {
+                        variable: "p".into(),
+                        property: "text".into(),
+                        ty: omnigraph_compiler::types::ExprType::from_prop(
+                            &omnigraph_compiler::types::PropType::scalar(
+                                omnigraph_compiler::types::ScalarType::String,
+                                false,
+                            ),
+                        ),
+                    },
+                    omnigraph_compiler::query::ast::CompOp::StringContains,
+                    IRExpr::PropAccess {
+                        variable: "m".into(),
+                        property: "number".into(),
+                        ty: omnigraph_compiler::types::ExprType::from_prop(
+                            &omnigraph_compiler::types::PropType::scalar(
+                                omnigraph_compiler::types::ScalarType::String,
+                                false,
+                            ),
+                        ),
+                    },
+                ),
                 residual: &[],
             },
             Arc::new(ParamMap::new()),

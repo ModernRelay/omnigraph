@@ -14,6 +14,7 @@
 //! iff exactly one native ref splits back to it.
 
 use crate::error::{OmniError, Result};
+use crate::graph_commit_id::{canonical_ulid, is_valid_graph_commit_id, parse_history_block_id};
 
 /// Length of a Crockford-base32 ULID string.
 pub const INCARNATION_LEN: usize = 26;
@@ -110,9 +111,15 @@ pub struct MergeInputOwner {
     pub graph_head: Option<String>,
 }
 
+/// `n` for no head, `b` plus a canonical block id as it is (delimiter-safe
+/// ASCII; hex would double it past local filename limits when the tag is
+/// created), `s` plus the hex of any other head.
 pub fn encode_head(head: Option<&str>) -> String {
     match head {
         None => "n".to_string(),
+        Some(head) if parse_history_block_id(head).is_ok_and(|id| id.is_some()) => {
+            format!("b{head}")
+        }
         Some(head) => {
             let mut encoded = String::from("s");
             for byte in head.as_bytes() {
@@ -124,12 +131,26 @@ pub fn encode_head(head: Option<&str>) -> String {
     }
 }
 
+/// The inverse of [`encode_head`]. The hex form is checked on its own terms,
+/// not through the current encoder, so hex block ids persisted before the `b`
+/// form stay valid ownership witnesses.
 pub fn decode_head(encoded: &str) -> Option<Option<String>> {
     if encoded == "n" {
         return Some(None);
     }
+    if let Some(head) = encoded.strip_prefix('b') {
+        return parse_history_block_id(head)
+            .ok()
+            .flatten()
+            .map(|_| Some(head.to_string()));
+    }
     let encoded = encoded.strip_prefix('s')?;
-    if encoded.is_empty() || encoded.len() % 2 != 0 || !encoded.is_ascii() {
+    if encoded.is_empty()
+        || encoded.len() % 2 != 0
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         return None;
     }
     let bytes = (0..encoded.len())
@@ -137,8 +158,7 @@ pub fn decode_head(encoded: &str) -> Option<Option<String>> {
         .map(|index| u8::from_str_radix(&encoded[index..index + 2], 16).ok())
         .collect::<Option<Vec<_>>>()?;
     let head = String::from_utf8(bytes).ok()?;
-    let id = head.parse::<ulid::Ulid>().ok()?;
-    if id.to_string() != head || encode_head(Some(&head)).strip_prefix('s') != Some(encoded) {
+    if !is_valid_graph_commit_id(&head) {
         return None;
     }
     Some(Some(head))
@@ -177,6 +197,72 @@ pub fn is_merge_input_tag(name: &str) -> bool {
     matches!(merge_input_owner(name), Ok(Some(_)))
 }
 
+/// The reserved prefix of an unpublished graph commit's tag (RFC
+/// "Unpublished graph commits"); the rest is the full `hb1` id it names.
+pub const UNPUBLISHED_TAG_PREFIX: &str = "unpublished_";
+
+/// The graph commit id a reserved proposal tag names: `None` for a tag of
+/// another kind, an error for a reserved name that is not a commit id.
+pub fn unpublished_tag_commit_id(name: &str) -> Result<Option<String>> {
+    let Some(id) = name.strip_prefix(UNPUBLISHED_TAG_PREFIX) else {
+        return Ok(None);
+    };
+    if !is_valid_graph_commit_id(id) {
+        return Err(OmniError::manifest_internal(format!(
+            "native tag '{name}' carries the reserved unpublished-commit prefix and names no \
+             graph commit id"
+        )));
+    }
+    Ok(Some(id.to_string()))
+}
+
+/// A valid proposal tag exempts logical retirement the way a merge-input
+/// tag does: the proposal expires with the incarnation it targets.
+pub fn is_unpublished_tag(name: &str) -> bool {
+    matches!(unpublished_tag_commit_id(name), Ok(Some(_)))
+}
+
+/// The reserved prefix of an unattached graph branch's tag (RFC "Unattached
+/// graph branches"); the rest is `<root>_<commit id>`, two canonical ULIDs.
+pub const UNATTACHED_TAG_PREFIX: &str = "unattached_";
+
+/// The candidate tag of the unattached snapshot `graph_commit_id` under `root`.
+pub fn unattached_tag_name(root: &str, graph_commit_id: &str) -> String {
+    format!("{UNATTACHED_TAG_PREFIX}{root}_{graph_commit_id}")
+}
+
+/// The prefix every candidate tag under `root` carries: descendant discovery
+/// lists tags by this name prefix without decoding them.
+pub fn unattached_tag_root_prefix(root: &str) -> String {
+    format!("{UNATTACHED_TAG_PREFIX}{root}_")
+}
+
+/// The `(root, graph commit id)` a reserved candidate tag names: `None` for a
+/// tag of another kind, an error for a reserved name whose two parts are not
+/// both canonical ULIDs.
+pub fn unattached_tag_parts(name: &str) -> Result<Option<(String, String)>> {
+    let Some(rest) = name.strip_prefix(UNATTACHED_TAG_PREFIX) else {
+        return Ok(None);
+    };
+    let invalid = || {
+        OmniError::manifest_internal(format!(
+            "native tag '{name}' carries the reserved unattached-branch prefix and names no \
+             root and graph commit id"
+        ))
+    };
+    let (root, graph_commit_id) = rest.split_once('_').ok_or_else(invalid)?;
+    if canonical_ulid(root).is_none() || canonical_ulid(graph_commit_id).is_none() {
+        return Err(invalid());
+    }
+    Ok(Some((root.to_string(), graph_commit_id.to_string())))
+}
+
+/// A valid candidate tag exempts logical retirement the way a proposal tag
+/// does: the snapshot expires with the incarnation it targets.
+pub fn is_unattached_tag(name: &str) -> bool {
+    matches!(unattached_tag_parts(name), Ok(Some(_)))
+}
+
 /// Resolve a logical branch to its single live native ref.
 ///
 /// `Ok(None)` means no incarnation exists. More than one live incarnation is a
@@ -207,6 +293,124 @@ pub fn resolve_native_branch<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_merge_input_heads_preserve_legacy_tags_and_fit_local_filenames() {
+        fn legacy_hex(head: &str) -> String {
+            let mut encoded = String::from("s");
+            for byte in head.as_bytes() {
+                use std::fmt::Write;
+                write!(&mut encoded, "{byte:02x}").unwrap();
+            }
+            encoded
+        }
+
+        let head = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let nonce = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+        let digest = "ab".repeat(32);
+        let owner_of = |encoded: &str| {
+            merge_input_owner(&format!("{MERGE_INPUT_PREFIX}{digest}_{encoded}_{nonce}"))
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(encode_head(None), "n");
+        assert_eq!(owner_of("n").graph_head, None);
+        assert_eq!(encode_head(Some(head)), legacy_hex(head));
+        assert_eq!(
+            owner_of(&legacy_hex(head)).graph_head.as_deref(),
+            Some(head)
+        );
+        for slot in [0, 9, 10, 15] {
+            let block_head = format!("hb1.{head}.{slot}.{nonce}");
+            let encoded = encode_head(Some(&block_head));
+            assert_eq!(encoded, format!("b{block_head}"));
+            for encoded in [&encoded, &legacy_hex(&block_head)] {
+                assert_eq!(
+                    owner_of(encoded).graph_head.as_deref(),
+                    Some(block_head.as_str())
+                );
+            }
+        }
+        let last_slot = crate::graph_commit_id::HISTORY_BLOCK_SLOTS - 1;
+        let slot_digits = last_slot.to_string().len();
+        let longest_block_head = format!("hb1.{head}.{last_slot}.{nonce}");
+        let tag = format!(
+            "{MERGE_INPUT_PREFIX}{digest}_{}_{nonce}",
+            encode_head(Some(&longest_block_head))
+        );
+        assert_eq!(tag.len(), 178 + slot_digits);
+        let staged = format!("{tag}.json.tmp.{}#1", "0".repeat(32));
+        assert_eq!(staged.len(), 222 + slot_digits);
+        let longest_counter = format!("{tag}.json.tmp.{}#{}", "0".repeat(32), u64::MAX);
+        assert_eq!(longest_counter.len(), 241 + slot_digits);
+        assert!(
+            longest_counter.len() <= 255,
+            "the tag's real staging path (Lance's `.json.tmp.<uuid>` plus the local object \
+             store's `#<counter>`) fits a local filename"
+        );
+
+        for malformed in [
+            "b".to_string(),
+            "bn".to_string(),
+            format!("b{head}"),
+            format!(
+                "bhb1.{head}.{}.{nonce}",
+                crate::graph_commit_id::HISTORY_BLOCK_SLOTS
+            ),
+            format!("bhb1.{head}.015.{nonce}"),
+            format!("bhb1.{}.15.{nonce}", head.to_lowercase()),
+            format!("bhb1.{head}.15.{nonce}/child"),
+            format!("bhb1.{head}.15.{nonce}_extra"),
+            legacy_hex(head).replacen("5a", "5A", 1),
+            legacy_hex(&longest_block_head).replacen("5a", "5A", 1),
+        ] {
+            assert_eq!(
+                decode_head(&malformed),
+                None,
+                "malformed, or noncanonical like uppercase hex of a valid head: {malformed}"
+            );
+            let tag = format!("{MERGE_INPUT_PREFIX}{digest}_{malformed}_{nonce}");
+            assert!(merge_input_owner(&tag).is_err(), "{tag}");
+            assert!(!is_merge_input_tag(&tag));
+        }
+    }
+
+    #[test]
+    fn unattached_tag_names_carry_a_root_and_a_graph_commit_id() {
+        let root = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let child = "01BX5ZZKBKACTAV9WEVGEMMVRZ";
+        let name = unattached_tag_name(root, child);
+        assert_eq!(
+            name,
+            "unattached_01ARZ3NDEKTSV4RRFFQ69G5FAV_01BX5ZZKBKACTAV9WEVGEMMVRZ"
+        );
+        assert_eq!(
+            unattached_tag_parts(&name).unwrap(),
+            Some((root.to_string(), child.to_string()))
+        );
+        assert!(name.starts_with(&unattached_tag_root_prefix(root)));
+        assert!(is_unattached_tag(&name));
+        assert!(!is_unpublished_tag(&name));
+        assert_eq!(unpublished_tag_commit_id(&name).unwrap(), None);
+        assert_eq!(unattached_tag_parts("user_tag").unwrap(), None);
+        assert_eq!(
+            unattached_tag_parts(&format!("{UNPUBLISHED_TAG_PREFIX}{child}")).unwrap(),
+            None
+        );
+        for malformed in [
+            "unattached_".to_string(),
+            format!("unattached_{root}"),
+            format!("unattached_{root}_"),
+            format!("unattached__{child}"),
+            format!("unattached_{root}_{child}_extra"),
+            format!("unattached_{root}_hb1.{root}.3.{child}"),
+            format!("unattached_{}_{child}", root.to_lowercase()),
+            format!("unattached_{root}_{child}/child"),
+        ] {
+            assert!(unattached_tag_parts(&malformed).is_err(), "{malformed}");
+            assert!(!is_unattached_tag(&malformed), "{malformed}");
+        }
+    }
 
     #[test]
     fn unpublished_fork_retention_tracks_incarnations_not_logical_names() {

@@ -289,7 +289,7 @@ impl RealGraphTemplate {
                 sync_plain_copy_filesystem(frozen.template_root())?;
                 Ok(Self::PlainCopy(frozen))
             }
-            ResetMode::S3Versioning => Err(std::io::Error::new(
+            ResetMode::None | ResetMode::S3Versioning => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "real-graph execution supports only local reset modes",
             )),

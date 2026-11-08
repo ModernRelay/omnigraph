@@ -1,0 +1,208 @@
+# issue: none
+# notes: A parameter projected in `return` is a column of its declared type, the one the result schema names:
+# notes: I32, U32, F32 (rounded to 32 bits), U64, Vector(2) (Float32 elements), [U32], min/max over one, a null
+# notes: I64? and an omitted DateTime?, never the bound value's type (Int64, Float64, List<Float64>, a Utf8 null).
+# notes: A value beyond the F32 range is refused, projected or not; the largest F32 is kept. The case pins column
+# notes: types, which `expect same as v1` does not compare, and the reference engine keeps the bound value's type.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"a"}}
+
+--- query
+set engine = v2;
+query scalar_params($i: I32, $w: U32, $f: F32, $u: U64) {
+    match { $p: Person }
+    return { $i as i, $w as w, $f as f, $u as u }
+}
+
+--- params
+{"i": 7, "w": 4294967295, "f": 0.1234567891, "u": 5}
+
+--- expect unordered
+{"i":7,"w":4294967295,"f":0.12345679,"u":5}
+
+--- expect shape
+i: I32
+w: U32
+f: F32
+u: U64
+
+--- expect plan
+result columns [i: I32, w: U32, f: F32, u: U64]
+
+--- query
+set engine = v2;
+query aggregated_params($i: I32, $u: U32, $f: F32) {
+    match { $p: Person }
+    return { min($i) as mn, max($u) as mx, min($f) as mf }
+}
+
+--- params
+{"i": 7, "u": 3, "f": 0.5}
+
+--- expect unordered
+{"mn":7,"mx":3,"mf":0.5}
+
+--- expect shape
+mn: I32
+mx: U32
+mf: F32
+
+--- expect plan
+result columns [mn: I32?, mx: U32?, mf: F32?]
+
+--- query
+set engine = v2;
+query f32_overflow($f: F32) {
+    match { $p: Person }
+    return { $f as f }
+}
+
+--- params
+{"f": 1e39}
+
+--- expect error: exceeds F32 range
+
+--- query
+set engine = v2;
+query f32_max($f: F32) {
+    match { $p: Person }
+    return { $f as f }
+}
+
+--- params
+{"f": 3.4028235e38}
+
+--- expect unordered
+{"f":3.4028235e38}
+
+--- expect shape
+f: F32
+
+--- expect plan
+result columns [f: F32]
+
+--- query
+set engine = v2;
+query unprojected_vector_overflow($x: Vector(2)) {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- params
+{"x": [1e39, 1]}
+
+--- expect error: exceeds F32 range
+
+--- query
+set engine = v2;
+query list_params($x: Vector(2), $l: [U32], $f: [F32]) {
+    match { $p: Person }
+    return { $x as x, $l as l, $f as f }
+}
+
+--- params
+{"x": [16777217, 0.5], "l": [1, 2], "f": [0.1234567891, 16777217]}
+
+--- expect unordered
+{"x":[16777216.0,0.5],"l":[1,2],"f":[0.12345679,16777216.0]}
+
+--- expect shape
+x: Vector(2)
+l: [U32]
+f: [F32]
+
+--- expect plan
+result columns [x: Vector(2), l: [U32], f: [F32]]
+
+--- query
+set engine = v2;
+query null_param($n: I64?) {
+    match { $p: Person }
+    return { $p.name, $n as n }
+}
+
+--- params
+{"n": null}
+
+--- expect unordered
+{"p.name":"a"}
+
+--- expect shape
+p.name: String
+n: I64?
+
+--- expect plan
+result columns [p.name: String, n: I64?]
+
+--- query
+set engine = v2;
+query omitted_datetime_param($d: DateTime?) {
+    match { $p: Person }
+    return { $p.name, $d as t }
+}
+
+--- expect unordered
+{"p.name":"a"}
+
+--- expect shape
+p.name: String
+t: DateTime?
+
+--- expect plan
+result columns [p.name: String, t: DateTime?]
+
+--- query
+query unprojected_f32_overflow($x: F32) {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- params
+{"x": 1e39}
+
+--- expect error: exceeds F32 range
+
+--- query
+query unprojected_f32_list_overflow($x: [F32]) {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- params
+{"x": [1, 1e39]}
+
+--- expect error: exceeds F32 range
+
+--- query
+query unprojected_i32_overflow($x: I32) {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- params
+{"x": 2147483648}
+
+--- expect error: exceeds I32
+
+--- query
+query unprojected_u32_overflow($x: U32) {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- params
+{"x": 4294967296}
+
+--- expect error: exceeds U32

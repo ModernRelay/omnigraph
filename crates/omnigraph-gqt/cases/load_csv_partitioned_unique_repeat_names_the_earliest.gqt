@@ -1,0 +1,153 @@
+# issue: none
+# csv_slice_bytes: 4096
+# notes: Two parse partitions of 4096 bytes (the pin above; 8 MiB without it). Key KB repeats
+# notes: wholly inside partition 0 (records 28 and 51); key KA repeats across the boundary
+# notes: (record 7 in partition 0, record 101 in partition 1). The earlier second holder is
+# notes: KB's, so the refusal names KB whichever partition's batch arrives first: the earliest
+# notes: repeat is the same whatever the arrival order. Retains a row position that dropped the
+# notes: partition bits and ranked KA's repeat in partition 1 before KB's.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Item {
+    id: String @key
+    name: String
+    email: String? @unique
+    n: I64
+}
+
+--- seed
+{"type":"Item","data":{"id":"seed","name":"s","email":"seed@x","n":0}}
+
+--- csv s.csv
+id,name,email,n
+f0000000,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000000,0
+f0000001,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000001,1
+f0000002,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000002,2
+f0000003,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000003,3
+f0000004,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000004,4
+f0000005,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000005,5
+KA,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000006,6
+f0000007,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000007,7
+f0000008,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000008,8
+f0000009,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000009,9
+f0000010,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000010,10
+f0000011,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000011,11
+f0000012,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000012,12
+f0000013,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000013,13
+f0000014,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000014,14
+f0000015,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000015,15
+f0000016,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000016,16
+f0000017,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000017,17
+f0000018,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000018,18
+f0000019,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000019,19
+f0000020,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000020,20
+f0000021,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000021,21
+f0000022,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000022,22
+f0000023,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000023,23
+f0000024,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000024,24
+f0000025,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000025,25
+f0000026,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000026,26
+KB,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000027,27
+f0000028,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000028,28
+f0000029,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000029,29
+f0000030,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000030,30
+f0000031,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000031,31
+f0000032,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000032,32
+f0000033,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000033,33
+f0000034,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000034,34
+f0000035,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000035,35
+f0000036,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000036,36
+f0000037,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000037,37
+f0000038,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000038,38
+f0000039,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000039,39
+f0000040,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000040,40
+f0000041,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000041,41
+f0000042,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000042,42
+f0000043,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000043,43
+f0000044,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000044,44
+f0000045,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000045,45
+f0000046,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000046,46
+f0000047,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000047,47
+f0000048,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000048,48
+f0000049,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000049,49
+KB,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000050,50
+f0000051,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000051,51
+f0000052,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000052,52
+f0000053,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000053,53
+f0000054,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000054,54
+f0000055,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000055,55
+f0000056,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000056,56
+f0000057,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000057,57
+f0000058,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000058,58
+f0000059,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000059,59
+f0000060,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000060,60
+f0000061,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000061,61
+f0000062,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000062,62
+f0000063,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000063,63
+f0000064,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000064,64
+f0000065,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000065,65
+f0000066,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000066,66
+f0000067,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000067,67
+f0000068,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000068,68
+f0000069,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000069,69
+f0000070,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000070,70
+f0000071,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000071,71
+f0000072,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000072,72
+f0000073,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000073,73
+f0000074,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000074,74
+f0000075,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000075,75
+f0000076,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000076,76
+f0000077,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000077,77
+f0000078,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000078,78
+f0000079,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000079,79
+f0000080,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000080,80
+f0000081,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000081,81
+f0000082,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000082,82
+f0000083,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000083,83
+f0000084,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000084,84
+f0000085,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000085,85
+f0000086,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000086,86
+f0000087,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000087,87
+f0000088,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000088,88
+f0000089,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000089,89
+f0000090,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000090,90
+f0000091,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000091,91
+f0000092,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000092,92
+f0000093,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000093,93
+f0000094,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000094,94
+f0000095,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000095,95
+f0000096,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000096,96
+f0000097,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000097,97
+f0000098,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000098,98
+f0000099,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000099,99
+KA,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000100,100
+f0000101,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000101,101
+f0000102,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000102,102
+f0000103,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000103,103
+f0000104,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000104,104
+f0000105,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000105,105
+f0000106,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000106,106
+f0000107,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000107,107
+f0000108,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000108,108
+f0000109,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000109,109
+f0000110,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000110,110
+f0000111,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000111,111
+f0000112,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000112,112
+f0000113,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000113,113
+f0000114,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000114,114
+f0000115,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000115,115
+f0000116,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000116,116
+f0000117,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000117,117
+f0000118,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000118,118
+f0000119,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,m0000119,119
+
+--- mutate
+load csv "s.csv" into node:Item mode overwrite header
+
+--- expect error: @unique violation on Item.id: value 'KB' held by 'KB' and 'KB'

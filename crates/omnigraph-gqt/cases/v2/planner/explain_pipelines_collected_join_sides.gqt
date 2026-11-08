@@ -1,0 +1,63 @@
+# issue: none
+# notes: A contains join and a cross join collect their whole left side before the right side runs, so explain prints that side as a build pipeline that drains into the join, and the right side streams through the join's probe occurrence to the consumer.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Paper {
+    slug: String @key
+    text: String
+}
+node Matter {
+    number: String @key
+}
+
+--- seed
+{"type":"Paper","data":{"slug":"p1","text":"see case 12 here"}}
+{"type":"Paper","data":{"slug":"p2","text":"nothing cited"}}
+{"type":"Matter","data":{"number":"12"}}
+{"type":"Matter","data":{"number":"99"}}
+
+--- query
+set engine = v2;
+query cites() {
+    match {
+        $p: Paper
+        $m: Matter
+        $p.text contains $m.number
+    }
+    return { $p.slug, $m.number }
+}
+--- expect unordered
+{"p.slug":"p1","m.number":"12"}
+--- expect shape
+p.slug: String
+m.number: String
+--- expect plan
+pipeline 0: Scan => ContainsJoin(build)
+pipeline 1: Scan -> ContainsJoin(probe) -> Projection => consumer after 0
+
+--- query
+set engine = v2;
+query pairs() {
+    match {
+        $p: Paper
+        $m: Matter
+    }
+    return { $p.slug, $m.number }
+}
+--- expect unordered
+{"p.slug":"p1","m.number":"12"}
+{"p.slug":"p1","m.number":"99"}
+{"p.slug":"p2","m.number":"12"}
+{"p.slug":"p2","m.number":"99"}
+--- expect shape
+p.slug: String
+m.number: String
+--- expect plan
+pipeline 0: Scan => CrossJoin(build)
+pipeline 1: Scan -> CrossJoin(probe) -> Projection => consumer after 0

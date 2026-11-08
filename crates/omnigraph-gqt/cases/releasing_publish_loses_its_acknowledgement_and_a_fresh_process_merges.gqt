@@ -1,0 +1,82 @@
+# issue: none
+# notes: Under set history_release_bytes = 2048; the releasing insert (loop end as rows_survive_history_release_and_reopen)
+# notes: loses its acknowledgement at publish.post_merge_pre_ack, the read-back accepts it, and a fresh process merges s on the block.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":0}}
+{"type":"Person","data":{"name":"bob","age":0}}
+
+--- mutate
+set history_release_bytes = 2048;
+
+--- expect ok
+
+--- mutate
+branch create b
+
+--- expect ok
+
+--- mutate
+branch create s from b
+
+--- expect ok
+
+--- mutate branch: s
+query set_bob_on_s() {
+    update Person set { age: 7 } where name = "bob"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- loop $i 1 4
+--- mutate branch: b
+query bump_alice($n: I32) {
+    update Person set { age: $n } where name = "alice"
+}
+--- params
+{"n": ${i}}
+--- expect affected: nodes=1 edges=0
+--- endloop
+
+--- seam
+at: publish.post_merge_pre_ack
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate branch: b
+query releasing_publish_with_lost_ack() { insert Person { name: "carol", age: 1 } }
+
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- mutate
+branch merge s into b
+
+--- expect outcome: merged
+
+--- query branch: b
+query rows_after_cold_merge() { match { $p: Person } return { $p.name, $p.age } }
+
+--- expect unordered
+{"p.name":"alice","p.age":3}
+{"p.name":"bob","p.age":7}
+{"p.name":"carol","p.age":1}
+
+--- expect shape
+p.name: String
+p.age: I32

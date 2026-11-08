@@ -15,7 +15,8 @@ use omnigraph_compiler::traversal::{EdgeMember, EdgeSelection};
 use omnigraph_compiler::types::Direction;
 use omnigraph_planner::{ExpandMode, ExpandPolicy};
 
-use super::{breaker_properties, external, joined_schema, polled, streaming_properties};
+use super::shape::{Breaker, Streaming};
+use super::{external, joined_schema};
 use crate::db::Snapshot;
 use crate::engine::graph::{GraphIndexHandle, ModeOrigin, bound_edge_pair_schema};
 use crate::error::{OmniError, Result};
@@ -103,7 +104,6 @@ impl ExpandStep {
     }
 
     /// A one-hop bound; Budgeted multi-hop also streams fixed source windows.
-    /// Legacy cross-type wider bounds use the BFS breaker, capped at one hop.
     pub(crate) fn single_hop(&self) -> bool {
         self.max_hops == 1
     }
@@ -119,7 +119,7 @@ impl ExpandStep {
                 &self.execution,
                 ExpandExecution::Budgeted(EdgeSelection::Alternation(_))
             ),
-            self.has_type_column() && self.src_type != self.dst_type,
+            self.src_type != self.dst_type,
             self.min_hops,
             Some(self.max_hops),
             self.edge_binding.is_some(),
@@ -153,7 +153,7 @@ impl ExpandStep {
 pub(crate) fn validate_expand_structure(
     members: &[EdgeMember],
     alternation: bool,
-    selected_cross_type: bool,
+    cross_type: bool,
     min_hops: u32,
     max_hops: Option<u32>,
     bound_edge: bool,
@@ -175,9 +175,11 @@ pub(crate) fn validate_expand_structure(
             "bound edge traversal requires exactly one hop",
         ));
     }
-    if selected_cross_type && max_hops > 1 {
+    // A hop ends on the destination type and the next must start on the
+    // source type, so a cross-type path never reaches a second hop.
+    if cross_type && max_hops > 1 {
         return Err(OmniError::manifest_internal(
-            "recursive edge selection requires the same endpoint type",
+            "a multi-hop traversal requires the same endpoint type",
         ));
     }
     if alternation && members.is_empty() {
@@ -234,11 +236,28 @@ impl fmt::Display for ExpandExecution {
     }
 }
 
+/// The shape a traversal holds, the same fact the planner's `PipelineShape`
+/// reads off the node: one hop streams its pairs and a budgeted traversal
+/// streams its frontier; a costed multi-hop traversal holds its paths.
+pub(super) enum ExpandShape {
+    Streaming(Streaming),
+    Breaker(Breaker),
+}
+
+impl ExpandShape {
+    pub(super) fn properties(&self) -> &Arc<PlanProperties> {
+        match self {
+            Self::Streaming(shape) => shape.properties(),
+            Self::Breaker(shape) => shape.properties(),
+        }
+    }
+}
+
 pub(crate) struct ExpandExec {
     input: Arc<dyn ExecutionPlan>,
     step: ExpandStep,
     env: Arc<GraphEnv>,
-    properties: Arc<PlanProperties>,
+    shape: ExpandShape,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -250,16 +269,16 @@ impl ExpandExec {
     ) -> Result<Self> {
         step.validate(&env.catalog)?;
         let schema = expand_output_schema(&input.schema(), &env.catalog, &step)?;
-        let properties = if step.single_hop() || step.budgeted() {
-            streaming_properties(schema)
+        let shape = if step.single_hop() || step.budgeted() {
+            ExpandShape::Streaming(Streaming::new(schema))
         } else {
-            breaker_properties(schema)
+            ExpandShape::Breaker(Breaker::new(schema))
         };
         Ok(Self {
             input,
             step,
             env,
-            properties,
+            shape,
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
@@ -341,7 +360,7 @@ impl ExecutionPlan for ExpandExec {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
+        self.shape.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -368,13 +387,14 @@ impl ExecutionPlan for ExpandExec {
         if partition != 0 {
             return internal_err!("ExpandExec has one partition, asked for {}", partition);
         }
-        let schema: SchemaRef = self.schema();
-        let input_schema = self.input.schema();
-        let input = self.input.execute(0, Arc::clone(&ctx))?;
-        let step = self.step.clone();
-        let env = Arc::clone(&self.env);
-        super::expand_stream::execute(input, input_schema, schema, step, env, ctx, &self.metrics)
-            .map(|stream| polled(&self.metrics, stream))
+        super::expand_stream::execute(
+            &self.shape,
+            Arc::clone(&self.input),
+            self.step.clone(),
+            Arc::clone(&self.env),
+            ctx,
+            &self.metrics,
+        )
     }
 }
 
@@ -390,8 +410,10 @@ mod tests {
             &parse_schema(
                 r#"
             node Person { name: String }
+            node Company { name: String }
             edge Knows: Person -> Person { label: String count: I64 only_knows: String }
             edge Likes: Person -> Person { label: String? count: I64 }
+            edge WorksAt: Person -> Company
         "#,
             )
             .unwrap(),
@@ -566,5 +588,28 @@ mod tests {
         step.dst_type = "Person".into();
         step.max_hops = 2;
         assert!(step.validate(&catalog).is_err());
+    }
+
+    #[test]
+    fn replayed_named_cross_type_step_refuses_a_second_hop() {
+        let catalog = catalog();
+        for policy in [ExpandPolicy::Pinned, ExpandPolicy::Budgeted] {
+            let mut step = step(EdgeSelection::Named(member("WorksAt")));
+            step.execution = ExpandExecution::new(
+                EdgeSelection::Named(member("WorksAt")),
+                ExpandMode::IndexedScan,
+                &policy,
+            )
+            .unwrap();
+            step.dst_type = "Company".into();
+            step.edge_binding = None;
+            step.validate(&catalog).unwrap();
+            step.max_hops = 2;
+            let error = step.validate(&catalog).unwrap_err();
+            assert!(
+                error.to_string().contains("same endpoint type"),
+                "{policy:?}: {error}"
+            );
+        }
     }
 }

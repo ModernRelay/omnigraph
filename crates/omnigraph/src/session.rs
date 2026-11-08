@@ -7,7 +7,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use omnigraph_compiler::error::CompilerError;
-use omnigraph_compiler::query::ast::SettingStmt;
+use omnigraph_compiler::query::ast::{BranchDiffSides, BranchRead, SettingStmt};
 use omnigraph_compiler::query::codes::Q003;
 use omnigraph_compiler::query::diagnostic::QueryDiagnostic;
 use omnigraph_compiler::query::parser::{has_settings_prefix, parse_query};
@@ -173,6 +173,112 @@ impl Session {
             .collect()
     }
 
+    /// [`Omnigraph::commit_changes_page`] under this session's
+    /// `change_lineage`.
+    pub async fn commit_changes_page(
+        &self,
+        commit_id: &str,
+        scope: &crate::changes::ChangeFeedScope,
+        page_token: Option<&str>,
+        max_changes: Option<usize>,
+        max_bytes: Option<u64>,
+    ) -> Result<crate::changes::CommitChangesPage> {
+        self.db
+            .commit_changes_page_under(
+                commit_id,
+                scope,
+                page_token,
+                max_changes,
+                max_bytes,
+                self.settings.change_lineage(),
+            )
+            .await
+    }
+
+    /// [`Omnigraph::poll_change_feed`] under this session's `change_lineage`.
+    pub async fn poll_change_feed(
+        &self,
+        request: crate::changes::ChangeFeedRequest,
+    ) -> Result<crate::changes::ChangeFeedPage> {
+        self.db
+            .poll_change_feed_under(request, self.settings.change_lineage())
+            .await
+    }
+
+    /// [`Omnigraph::diff_page`] under this session's `change_lineage`.
+    pub async fn diff_page(
+        &self,
+        request: &crate::changes::GraphDiffRequest,
+    ) -> Result<crate::changes::GraphDiffPage> {
+        self.db
+            .diff_page_under(request, self.settings.change_lineage())
+            .await
+    }
+
+    /// [`Omnigraph::diff_page_readable`] under this session's
+    /// `change_lineage`.
+    pub async fn diff_page_readable(
+        &self,
+        request: &crate::changes::GraphDiffRequest,
+        can_read: &mut crate::db::ReadCheck<'_>,
+    ) -> Result<crate::changes::GraphDiffPage> {
+        self.db
+            .diff_page_readable_under(request, can_read, self.settings.change_lineage())
+            .await
+    }
+
+    /// Answer a branch control read (`branch diff`, `branch merge-base`,
+    /// `branch merge … dry run`) with the engine call it names, an unspelled
+    /// `into` meaning `main`. It reads lineage and tables and writes nothing;
+    /// a transport authorizes the branches it names before calling it.
+    pub async fn branch_read(&self, read: &BranchRead) -> Result<crate::changes::BranchReadAnswer> {
+        use crate::changes::{BranchReadAnswer, ChangeFeedScope, GraphDiffRequest, GraphDiffSides};
+
+        let target = |into: &Option<String>| into.clone().unwrap_or_else(|| "main".to_string());
+        Ok(match read {
+            BranchRead::Diff { sides, page } => {
+                let sides = match sides {
+                    BranchDiffSides::Branch { source, into } => GraphDiffSides::Branch {
+                        source: source.clone(),
+                        target: target(into),
+                    },
+                    BranchDiffSides::Between { from, to } => GraphDiffSides::Between {
+                        from: from.clone(),
+                        to: to.clone(),
+                    },
+                };
+                BranchReadAnswer::Diff(
+                    self.diff_page(&GraphDiffRequest {
+                        sides,
+                        scope: ChangeFeedScope::default(),
+                        page_token: page.after_page.clone(),
+                        max_changes: page.limit,
+                        max_bytes: None,
+                    })
+                    .await?,
+                )
+            }
+            BranchRead::MergeBase { source, into } => {
+                let target = target(into);
+                let base = self.merge_base(source, &target).await?;
+                BranchReadAnswer::MergeBase {
+                    source: source.clone(),
+                    target,
+                    base,
+                }
+            }
+            BranchRead::MergeDryRun { source, into } => {
+                let target = target(into);
+                let result = self.branch_merge_dry_run(source, &target).await?;
+                BranchReadAnswer::MergeDryRun {
+                    source: source.clone(),
+                    target,
+                    outcome: result.outcome,
+                }
+            }
+        })
+    }
+
     /// The settings one call runs under: the session's, with the settings
     /// prefix of `source` applied in file order on a copy. The session is
     /// unchanged. A source without a prefix (`has_settings_prefix`) is not
@@ -275,6 +381,44 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, id.name());
         (rows[0].value.clone(), rows[0].source)
+    }
+
+    #[test]
+    fn write_max_bytes_default_is_the_keyed_write_constant() {
+        assert_eq!(
+            SessionSettings::default().write_max_bytes(),
+            crate::storage_layer::KEYED_WRITE_MAX_BYTES
+        );
+        assert_eq!(
+            SettingId::WriteMaxBytes.spec().default,
+            crate::storage_layer::KEYED_WRITE_MAX_BYTES.to_string()
+        );
+        assert!(matches!(
+            SettingId::WriteMaxBytes.spec().kind,
+            omnigraph_compiler::settings::SettingKind::Integer { min: 1, max: None }
+        ));
+    }
+
+    #[test]
+    fn history_release_bytes_default_is_the_catalog_constant() {
+        assert_eq!(
+            SessionSettings::default().history_release_bytes(),
+            omnigraph_catalog::HISTORY_RELEASE_BYTES
+        );
+        assert_eq!(
+            SettingId::HistoryReleaseBytes.spec().default,
+            omnigraph_catalog::HISTORY_RELEASE_BYTES.to_string()
+        );
+        let omnigraph_compiler::settings::SettingKind::Integer { max, .. } =
+            SettingId::HistoryReleaseBytes.spec().kind
+        else {
+            panic!("history_release_bytes is an integer setting");
+        };
+        assert_eq!(
+            max,
+            Some(omnigraph_catalog::HISTORY_RELEASE_BYTES as i64),
+            "a session may only lower the budget: the row's maximum is the production constant"
+        );
     }
 
     fn assert_at_baseline(session: &Session) {

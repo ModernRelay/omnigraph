@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - OmniGraph maintainers
 created: 2026-07-12
-updated: 2026-08-23
+updated: 2026-10-04
 discussion: null
 supersedes: []
 superseded_by: []
@@ -15,6 +15,20 @@ blocked_on: []
 ---
 
 # RFC 0022: Unified graph-write protocol
+
+> **Later-RFC disposition:** [RFC 0067](0067-detached-table-commits.md) removed
+> the `__recovery/` sidecar, the recovery barrier, and rollback. Each effect on
+> an existing table is a detached Lance commit published by the one `__manifest`
+> CAS, and mutation and load no longer check the live Lance `HEAD` against the
+> pin. Historical: §2.5, §4.1, §4.5, §5, §11.3, §4.6 and §4.8 as written, the
+> `HEAD` check in §4.4, and the sidecar and rollback rules in §6 and §7.
+> [Engine settlement and resource bounds](2026-10-01-engine-settlement-and-resource-bounds.md)
+> publishes the schema contract atomically in `__manifest`, so the schema
+> staging and promotion rules of §6.3, §10, and §11.4 are historical.
+> Current: one `__manifest` publication per graph commit, `BaseView` / `ReadSet`
+> capture and revalidation, the coarse token (§10), and graph-branch create and
+> delete as a control outside the manifest-CAS protocol (§7), as amended by
+> [RFC 0042](0042-incarnation-suffixed-branch-refs.md).
 
 **Surveyed:** OmniGraph 0.8.1 (`main`); Lance 9.0.0-rc.1, git rev `cec0b7df`
 **Audience:** engine and storage maintainers

@@ -1,0 +1,71 @@
+# issue: none
+# notes: A node overwrite onto a table with no committed rows removes nothing, so its plan carries no retained-edges check and no removal scan;
+# notes: the next overwrite of the now populated table plans both, and an edge overwrite never scans, since no check reads what it removes.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    id: String @key
+}
+edge Knows: Person -> Person {
+    w: I64
+}
+
+--- seed
+
+--- csv people.csv
+id
+p1
+p2
+
+--- mutate
+load csv "people.csv" into node:Person mode overwrite header
+
+--- expect ok
+
+--- expect plan
+load route: plan
+load validate removal node:Person: none
+load write: overwrite fragments
+load executed: partitions 1 rows 2
+
+--- csv people_again.csv
+id
+p1
+p3
+
+--- mutate
+load csv "people_again.csv" into node:Person mode overwrite header
+
+--- expect ok
+
+--- expect plan
+load route: plan
+load validate retained_edges node:Person edge:Knows from: access probe
+load validate retained_edges node:Person edge:Knows to: access probe
+load validate removal node:Person: scan
+load write: overwrite fragments
+load executed: partitions 1 rows 2
+
+--- csv knows.csv
+from,to,w
+p1,p3,7
+
+--- mutate
+load csv "knows.csv" into edge:Knows mode overwrite header
+
+--- expect ok
+
+--- expect plan
+load route: plan
+load validate removal edge:Knows: none
+load write: overwrite fragments
+load executed: partitions 1 rows 1

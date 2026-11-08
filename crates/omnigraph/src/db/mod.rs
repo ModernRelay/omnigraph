@@ -2,6 +2,7 @@
 mod catalog_tests;
 pub mod commit_graph;
 pub(crate) mod graph_coordinator;
+pub(crate) mod legacy_sidecars;
 pub mod manifest;
 pub(crate) mod omnigraph;
 mod schema_state;
@@ -11,34 +12,34 @@ mod system_roles_tests;
 pub(crate) mod upgrade;
 pub(crate) mod write_queue;
 
-pub use commit_graph::GraphCommit;
+pub use commit_graph::{GraphCommit, GraphCommitKind};
 pub use graph_coordinator::{ReadTarget, ResolvedTarget, SnapshotId};
 pub use manifest::{DatasetEntry, DatasetUpdate};
 pub use omnigraph::{
-    CleanupPolicyOptions, CollectorCost, CollectorPathSnapshot, CollectorReport,
-    CollectorRowSummary, DatasetCleanupStats, DatasetOptimizeStats, DatasetRepairStats,
-    EXPORT_CHUNK_MAX_BYTES, ExportCut, FullTextIndexRebuildResult, InitOptions, MergeOutcome,
-    MergeResult, Omnigraph, OpenMode, PendingIndex, PreparedSchemaApply, PreparedSchemaSettlement,
-    RebuiltFullTextIndex, RepairAction, RepairClassification, RepairOptions, RepairStats,
-    RetainedManifestVersions, SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyReconciliation,
-    SchemaApplyResult, SchemaApplySettlement, SchemaContractDigest, SchemaNonPublicationProof,
-    SkipReason, StagingVerdict, SystemColumnUpgradeFinding, SystemColumnUpgradeOptions,
-    SystemColumnUpgradeOutcome, SystemColumnUpgradeReport, TableCollectionPlan,
-    UnpublishedManifest,
+    BranchCreated, BranchDetail, BranchListing, BuiltIndex, BuiltIndexAction, BuiltIndexKind,
+    COMMIT_LIST_DEFAULT_PAGE_COMMITS, COMMIT_LIST_MAX_PAGE_COMMITS, CleanupPolicyOptions,
+    CollectorCost, CollectorPathSnapshot, CollectorReport, CollectorRowSummary, CommitListPage,
+    DatasetCleanupStats, DatasetOptimizeStats, DatasetRepairStats, EXPORT_CHUNK_MAX_BYTES,
+    ExportCut, FullTextIndexRebuildResult, GraphCreateReconciliation, IndexBuildResult,
+    InitOptions, MergeOutcome, MergeResult, Omnigraph, OpenMode, PendingIndex, PreparedGraphCreate,
+    PreparedSchemaApply, PreparedSchemaSettlement, ReadCheck, RebuiltFullTextIndex, RepairAction,
+    RepairClassification, RepairOptions, RepairStats, RetainedManifestVersions,
+    SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyReconciliation, SchemaApplyResult, SchemaApplySettlement,
+    SchemaContractDigest, SchemaNonPublicationProof, SkipReason, StagingVerdict,
+    SystemColumnUpgradeFinding, SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome,
+    SystemColumnUpgradeReport, TableCollectionPlan, UnattachedTagRecord, UnpublishedManifest,
+    unattached_release_order,
 };
 pub(crate) use omnigraph::{
-    LogicalBlobValue, RangedExternalBlobs, export_blob_values, logical_row_image,
+    LogicalBlobValue, RangedExternalBlobs, logical_row_image, row_blob_values,
 };
 pub(crate) use omnigraph::{WriteAuthorityToken, WriteTxn};
 pub(crate) use omnigraph_core::metadata::now_micros;
 pub(crate) use schema_state::SchemaContractIdentity;
 pub use snapshot::{Snapshot, SnapshotDataset, SnapshotScanner};
-#[cfg(feature = "dst")]
-#[doc(hidden)]
-pub use upgrade::dst_prepare_legacy_upgrade_fixture;
 pub use upgrade::{
     UpgradeFinding, UpgradeMode, UpgradeOptions, UpgradeOutcome, UpgradeRecovery, UpgradeReport,
-    UpgradeWork, upgrade_storage, upgrade_storage_as,
+    UpgradeWork, upgrade_storage, upgrade_storage_as, upgrade_storage_as_with_storage,
 };
 
 use crate::error::{OmniError, Result};

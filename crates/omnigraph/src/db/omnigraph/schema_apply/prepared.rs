@@ -70,6 +70,11 @@ impl PreparedSchemaApply {
         self.actor.as_deref()
     }
 
+    /// The exact accepted contract against which this intent was prepared.
+    pub fn base_contract(&self) -> &SchemaContractDigest {
+        &self.base_contract
+    }
+
     pub fn desired_contract(&self) -> &SchemaContractDigest {
         &self.desired_contract
     }
@@ -104,7 +109,7 @@ impl PreparedSchemaApply {
         }
         if let Some(lineage) = &self.lineage
             && (lineage.branch.is_some()
-                || lineage.merged_parent_commit_id.is_some()
+                || lineage.merged_parent.is_some()
                 || lineage.actor_id != self.actor
                 || !lineage
                     .graph_commit_id
@@ -182,7 +187,10 @@ impl CapturedSchemaApply {
             None
         } else {
             Some(GraphCoordinator::new_lineage_intent_for_branch(
-                None, actor, None,
+                None,
+                actor,
+                None,
+                HistoryReleaseBytes::PRODUCTION,
             )?)
         };
         Ok(PreparedSchemaApply {
@@ -218,7 +226,7 @@ pub(super) async fn capture(
 ) -> Result<CapturedSchemaApply> {
     db.refresh_coordinator_only().await?;
     let (snapshot, branch_identifier, graph_head) = {
-        let coordinator = db.coordinator.read().await;
+        let coordinator = db.coordinator.load_full();
         (
             coordinator.snapshot(),
             coordinator.branch_identifier().await?,
@@ -269,13 +277,14 @@ pub(in crate::db::omnigraph) async fn prepare_schema_apply(
     db: &Omnigraph,
     source: &str,
     actor: Option<&str>,
-) -> Result<PreparedSchemaApply> {
+) -> Result<(PreparedSchemaApply, SchemaMigrationPlan)> {
     authorize(db, actor)?;
     let _schema_gate = db.write_queue().acquire_schema_exclusive().await;
     let captured = capture(db, source, None)
         .await
         .map_err(OmniError::before_effect)?;
-    captured.issue(db, source, actor)
+    let intent = captured.issue(db, source, actor)?;
+    Ok((intent, captured.planned.plan))
 }
 
 pub(in crate::db::omnigraph) async fn reconcile_schema_apply(
@@ -289,7 +298,7 @@ pub(in crate::db::omnigraph) async fn reconcile_schema_apply(
         let _schema_gate = db.write_queue().acquire_schema_exclusive().await;
         db.refresh_coordinator_only().await?;
         let (snapshot, branch_identifier, graph_head) = {
-            let coordinator = db.coordinator.read().await;
+            let coordinator = db.coordinator.load_full();
             (
                 coordinator.snapshot(),
                 coordinator.branch_identifier().await?,
@@ -300,8 +309,7 @@ pub(in crate::db::omnigraph) async fn reconcile_schema_apply(
         validate_schema_contract_row(&row)?;
         let only_main = db
             .coordinator
-            .read()
-            .await
+            .load_full()
             .all_branches()
             .await?
             .iter()

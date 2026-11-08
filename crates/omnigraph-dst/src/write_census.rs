@@ -262,6 +262,9 @@ pub fn classify(uri: &str) -> &'static str {
     if uri.contains("__create_if_absent_probe") {
         return "capability-probe";
     }
+    if uri.contains("__history/") {
+        return "history-file-untriaged";
+    }
     // INTENDED COLLAPSE: __manifest is itself a Lance dataset, so its
     // sub-artifacts (its _transactions/, _versions/, data files) all
     // classify as the coarse manifest-realm class by this early match —

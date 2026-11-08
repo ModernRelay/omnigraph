@@ -4,9 +4,11 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::io::Write;
 
 use arrow_schema::SchemaRef;
 use omnigraph_compiler::ir::{IRExpr, QueryIR};
+use omnigraph_compiler::query::ast::LoadStmtMode;
 use omnigraph_compiler::settings::{SettingId, Traversal};
 use omnigraph_compiler::types::Direction;
 use serde_json::{Value, json};
@@ -14,15 +16,21 @@ use serde_json::{Value, json};
 use crate::error::PlanError;
 use crate::explain::{EntrySummary, Explain, OperationSummary};
 use crate::logical::{Census, LogicalPlan};
-use crate::operation::Operation;
-use crate::optimizer::{Bounds, Optimized, physical_plan, resolve, rewrite};
-use crate::physical::{Assumptions, DatasetPin, GatePolicy, NodeId, PhysicalNode, PhysicalPlan};
+use crate::operation::{Operation, TableSource};
+use crate::optimizer::{
+    Bounds, Optimized, physical_plan, physical_plan_with, resolve, rewrite, rewrite_with,
+};
+use crate::physical::{
+    Assumptions, DatasetPin, GatePolicy, NodeId, PhysicalNode, PhysicalPlan, StatisticSource,
+};
 use crate::registry::{Coverage, Entry, Route, coverage, lookup};
 use crate::route::RouteOverride;
 use crate::source::{
     AdjacencyProof, EXPAND_INDEXED_MAX_FRONTIER_ENV, EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics,
-    FragmentStat, NodeTypeSpec, PlanSource, SideId,
+    FragmentStat, FullTextCoverage, IndexFact, NodeTypeSpec, PlanSource, SideId,
 };
+use crate::validate::subset::{Role, Rule, Tracer};
+use crate::validate::{self, AcceptInput, AcceptedPlan, ValidationError};
 
 /// A `PlanSource` that records what the planner read through it: the
 /// parameter names of every filter it asked about and every setting, so the
@@ -52,9 +60,29 @@ impl<'s> Recorded<'s> {
         assumptions.memory_limit = bounds.query_memory_pool_bytes;
         assumptions
     }
+
+    fn index_statistics(&self) -> Vec<StatisticSource> {
+        self.read
+            .borrow()
+            .datasets
+            .iter()
+            .map(|(key, pin)| StatisticSource {
+                statistic: format!("index_facts({key})"),
+                value: json!(self.source.index_facts(key)).to_string(),
+                origin: match pin {
+                    Some(pin) => format!("{} at version {}", pin.dataset_path, pin.version),
+                    None => "table absent at the pinned snapshot".to_string(),
+                },
+            })
+            .collect()
+    }
 }
 
 impl PlanSource for Recorded<'_> {
+    fn index_facts(&self, dataset_key: &str) -> Vec<IndexFact> {
+        self.source.index_facts(dataset_key)
+    }
+
     fn is_unique_property(&self, type_key: &str, property: &str) -> bool {
         self.source.is_unique_property(type_key, property)
     }
@@ -90,15 +118,40 @@ impl PlanSource for Recorded<'_> {
 
     fn node_type(&self, type_name: &str) -> Result<NodeTypeSpec, PlanError> {
         let spec = self.source.node_type(type_name)?;
-        self.read.borrow_mut().datasets.insert(
-            spec.table.type_key.clone(),
-            spec.version.map(|version| DatasetPin {
-                dataset_path: spec.table.dataset_path.clone(),
-                native_branch: spec.table.native_branch.clone(),
-                version,
-            }),
-        );
+        let mut read = self.read.borrow_mut();
+        match &spec.table.source {
+            TableSource::Dataset {
+                dataset_path,
+                native_branch,
+            } => {
+                read.datasets.insert(
+                    spec.table.type_key.clone(),
+                    spec.version.map(|version| DatasetPin {
+                        dataset_path: dataset_path.clone(),
+                        native_branch: native_branch.clone(),
+                        version,
+                    }),
+                );
+            }
+            TableSource::Catalogue => {
+                let fingerprint = self
+                    .source
+                    .catalogue_fingerprint(&spec.table.type_key)
+                    .ok_or_else(|| PlanError::Unresolved {
+                        detail: format!(
+                            "catalogue table `{}` has no fingerprint at this source",
+                            spec.table.type_key
+                        ),
+                    })?;
+                read.catalogue
+                    .insert(spec.table.type_key.clone(), fingerprint);
+            }
+        }
         Ok(spec)
+    }
+
+    fn catalogue_fingerprint(&self, type_key: &str) -> Option<String> {
+        self.source.catalogue_fingerprint(type_key)
     }
 
     fn filter_pushable(&self, filter: &IRExpr) -> bool {
@@ -159,18 +212,27 @@ impl PlanSource for Recorded<'_> {
     fn gate_policy(&self) -> GatePolicy {
         self.source.gate_policy()
     }
+
+    fn full_text_coverage(&self, type_key: &str, property: &str) -> FullTextCoverage {
+        let coverage = self.source.full_text_coverage(type_key, property);
+        self.read
+            .borrow_mut()
+            .full_text
+            .insert(Assumptions::full_text_key(type_key, property), coverage);
+        coverage
+    }
 }
 
 /// Every parameter name `expr` names.
 fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
     match expr {
-        IRExpr::Param(name) => {
+        IRExpr::Param(name, _) => {
             out.insert(name.clone());
         }
         IRExpr::Nearest { query, .. } => params_of_expr(query, out),
-        IRExpr::Search { field, query }
-        | IRExpr::MatchText { field, query }
-        | IRExpr::Bm25 { field, query } => {
+        IRExpr::Search { field, query, .. }
+        | IRExpr::MatchText { field, query, .. }
+        | IRExpr::Bm25 { field, query, .. } => {
             params_of_expr(field, out);
             params_of_expr(query, out);
         }
@@ -178,6 +240,7 @@ fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
             field,
             query,
             max_edits,
+            ..
         } => {
             params_of_expr(field, out);
             params_of_expr(query, out);
@@ -189,6 +252,7 @@ fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
             primary,
             secondary,
             k,
+            ..
         } => {
             params_of_expr(primary, out);
             params_of_expr(secondary, out);
@@ -201,11 +265,13 @@ fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
             params_of_expr(left, out);
             params_of_expr(right, out);
         }
-        IRExpr::Not(inner) | IRExpr::IsNull { expr: inner, .. } => params_of_expr(inner, out),
+        IRExpr::Not(inner, _)
+        | IRExpr::IsNull { expr: inner, .. }
+        | IRExpr::Cast { expr: inner, .. } => params_of_expr(inner, out),
         IRExpr::PropAccess { .. }
-        | IRExpr::Variable(_)
-        | IRExpr::Literal(_)
-        | IRExpr::AliasRef(_) => {}
+        | IRExpr::Variable(_, _)
+        | IRExpr::Literal(_, _)
+        | IRExpr::AliasRef(_, _) => {}
     }
 }
 
@@ -229,8 +295,28 @@ pub enum Unrouted {
     /// planner defect. A read query fails with this message.
     PlannerError { message: String },
     /// A well-formed query shape the planner refuses by design
-    /// (`PlanError::Unsupported`); the caller's error, not a planner defect.
-    UnsupportedQuery { message: String },
+    /// (`PlanError::Unsupported`); the caller's error, not a planner defect,
+    /// with the diagnostic the caller answers with.
+    UnsupportedQuery {
+        diagnostic: Box<omnigraph_compiler::QueryDiagnostic>,
+    },
+    /// Plan acceptance ran out of a configured validation limit before it
+    /// finished: a resource outcome, not evidence the plan is invalid.
+    ValidationExhausted { limit: &'static str, value: u64 },
+    /// The plan source failed while answering a lookup
+    /// (`PlanError::Source`); the engine returns the source's own error.
+    SourceError { message: String },
+    /// A load mode the executor's keyed adapters still own: the plan is
+    /// built and explained, the executor runs the statement.
+    ModeOnExecutor { mode: &'static str },
+    /// A write the executor stages (a JSONL load, a mutation, a blob cell, a
+    /// branch merge): the plan's `Validate` is built and decided here and run
+    /// by the executor's judge; the write itself never enters a plan.
+    WriteOnExecutor { kind: &'static str },
+    /// A full-text call reads a declared index with no segment at the
+    /// pinned snapshot (`PlanError::FullTextIndexRequired`): a conflict the
+    /// engine returns with its typed detail.
+    FullTextIndexRequired { index: String },
 }
 
 impl Unrouted {
@@ -238,7 +324,9 @@ impl Unrouted {
     /// everything else is a planner error.
     fn of(error: PlanError) -> Self {
         match error {
-            PlanError::Unsupported { detail } => Self::UnsupportedQuery { message: detail },
+            PlanError::Unsupported(diagnostic) => Self::UnsupportedQuery { diagnostic },
+            PlanError::Source { detail } => Self::SourceError { message: detail },
+            PlanError::FullTextIndexRequired { index } => Self::FullTextIndexRequired { index },
             other => Self::PlannerError {
                 message: other.to_string(),
             },
@@ -254,6 +342,11 @@ impl Unrouted {
             Self::Override => "override",
             Self::PlannerError { .. } => "planner_error",
             Self::UnsupportedQuery { .. } => "unsupported_query",
+            Self::ValidationExhausted { .. } => "validation_exhausted",
+            Self::SourceError { .. } => "source_error",
+            Self::ModeOnExecutor { .. } => "mode_on_executor",
+            Self::WriteOnExecutor { .. } => "write_on_executor",
+            Self::FullTextIndexRequired { .. } => "full_text_index_required",
         }
     }
 
@@ -266,8 +359,21 @@ impl Unrouted {
             Self::RegistryRouteExecutor { entry } => json!({ "kind": self.kind(), "entry": entry }),
             Self::DeclaredBytesOverBound { node } => json!({ "kind": self.kind(), "node": node }),
             Self::Override => json!({ "kind": self.kind() }),
-            Self::PlannerError { message } | Self::UnsupportedQuery { message } => {
+            Self::PlannerError { message } | Self::SourceError { message } => {
                 json!({ "kind": self.kind(), "message": message })
+            }
+            Self::UnsupportedQuery { diagnostic } => json!({
+                "kind": self.kind(),
+                "code": diagnostic.code.as_str(),
+                "message": diagnostic.message,
+            }),
+            Self::ValidationExhausted { limit, value } => {
+                json!({ "kind": self.kind(), "limit": limit, "value": value })
+            }
+            Self::ModeOnExecutor { mode } => json!({ "kind": self.kind(), "mode": mode }),
+            Self::WriteOnExecutor { kind } => json!({ "kind": self.kind(), "write": kind }),
+            Self::FullTextIndexRequired { index } => {
+                json!({ "kind": self.kind(), "index": index })
             }
         }
     }
@@ -275,6 +381,7 @@ impl Unrouted {
 
 #[derive(Debug, Clone)]
 pub enum Decision {
+    PendingQuery(Box<PreparedQuery>),
     /// A registered change-feed or merge shape: the engine's push operators
     /// (`engine/push/`) run `plan`.
     Routed {
@@ -282,8 +389,9 @@ pub enum Decision {
         entry: &'static Entry,
         explain: Explain,
     },
-    /// A GQ query: the engine's `engine/lower.rs` executes `plan`, lowered
-    /// one-to-one from `logical`. Never consults the registry.
+    /// A GQ query or an overwrite load: the engine's `engine/lower.rs`
+    /// executes `plan`, lowered one-to-one from `logical`. Never consults
+    /// the registry.
     Engine {
         plan: PhysicalPlan,
         logical: LogicalPlan,
@@ -295,36 +403,222 @@ pub enum Decision {
         /// The rewritten logical plan, when one was built before the miss;
         /// empty when the operation was refused before a plan existed.
         logical: LogicalPlan,
+        /// The physical plan the executor runs by hand: a write's `Validate`
+        /// node with its decided access, executed by the executor's judge
+        /// while the keyed adapters write; `None` when none was built.
+        physical: Option<PhysicalPlan>,
     },
 }
 
 impl Decision {
-    pub fn explain(&self) -> &Explain {
+    pub fn explain(&self) -> Option<&Explain> {
         match self {
+            Self::PendingQuery(_) => None,
             Self::Routed { explain, .. }
             | Self::Engine { explain, .. }
-            | Self::Executor { explain, .. } => explain,
+            | Self::Executor { explain, .. } => Some(explain),
         }
+    }
+
+    pub async fn finalize(self, source: &(dyn PlanSource + Sync)) -> Self {
+        let Self::PendingQuery(query) = self else {
+            return self;
+        };
+        let PreparedQuery {
+            logical,
+            mut optimized,
+            operation,
+            override_,
+            initial,
+        } = *query;
+        let decision = match crate::scan_access::finalize_scan_access(&mut optimized, source).await
+        {
+            Err(error) => executor(
+                Unrouted::of(error),
+                Explain::without_plan(operation, override_),
+                logical,
+            ),
+            Ok(_) => {
+                let explain = LogicalView::of(&logical)
+                    .explain(
+                        operation,
+                        override_,
+                        None,
+                        Some(&optimized),
+                        &optimized.fired,
+                        Some(&initial),
+                    )
+                    .engine();
+                Self::Engine {
+                    plan: optimized.physical,
+                    logical,
+                    explain,
+                }
+            }
+        };
+        if let Some(explain) = decision.explain() {
+            dump_explain(source, explain);
+        }
+        decision
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedQuery {
+    logical: LogicalPlan,
+    optimized: Optimized,
+    operation: OperationSummary,
+    override_: RouteOverride,
+    /// `logical`'s pre-rewrite JSON, for the explain the finalize renders.
+    initial: Value,
+}
+
 /// Build an executable read plan without rendering explain diagnostics.
-pub fn plan_query(
+pub async fn plan_query(
+    query: &QueryIR,
+    source: &(dyn PlanSource + Sync),
+    bounds: &Bounds,
+) -> Result<PhysicalPlan, Unrouted> {
+    let mut optimized = {
+        let operation = Operation::Query(Box::new(query.clone()));
+        let recorded = Recorded::new(source, query.has_wildcard_traversal());
+        let mut logical = resolve(&operation, &recorded).map_err(Unrouted::of)?;
+        let mut optimized =
+            crate::optimizer::optimize(&mut logical, &recorded, bounds).map_err(Unrouted::of)?;
+        optimized
+            .physical
+            .set_assumptions(recorded.assumptions(bounds));
+        optimized
+    };
+    crate::scan_access::finalize_scan_access(&mut optimized, source)
+        .await
+        .map_err(Unrouted::of)?;
+    Ok(optimized.physical)
+}
+
+/// Plan a read query and accept the plan: the one path from a query to an
+/// executable plan, shared by ordinary execution and every explain.
+pub async fn accept_query(
+    input: &AcceptInput<'_>,
+    source: &(dyn PlanSource + Sync),
+    bounds: &Bounds,
+) -> Result<AcceptedPlan, Unrouted> {
+    plan_and_accept(input, source, bounds, false)
+        .await
+        .map(|(accepted, _)| accepted)
+}
+
+/// [`accept_query`] with the explain document of the accepted plan, rendered
+/// from the same planning run.
+pub async fn accept_query_explained(
+    input: &AcceptInput<'_>,
+    source: &(dyn PlanSource + Sync),
+    bounds: &Bounds,
+) -> Result<(AcceptedPlan, Explain), Unrouted> {
+    let (accepted, explain) = plan_and_accept(input, source, bounds, true).await?;
+    let explain = explain.ok_or_else(|| Unrouted::PlannerError {
+        message: "an explained acceptance rendered no document".to_string(),
+    })?;
+    Ok((accepted, explain))
+}
+
+/// One traced planning run of a read query: the rewritten logical plan, the
+/// optimized physical plan with its assumptions and the passes that fired,
+/// and the derivation the optimizer recorded for an exact-fragment chain.
+pub(crate) struct Traced {
+    pub logical: LogicalPlan,
+    pub optimized: Optimized,
+    pub tracer: Tracer,
+    /// `logical`'s pre-rewrite JSON, captured only when a render was asked.
+    pub initial: Option<Value>,
+}
+
+impl Traced {
+    /// The derivation recorded so far.
+    #[cfg(test)]
+    pub(crate) fn derivation(&self) -> Option<crate::validate::subset::Derivation> {
+        self.tracer.derivation()
+    }
+}
+
+pub(crate) fn plan_traced(
     query: &QueryIR,
     source: &dyn PlanSource,
     bounds: &Bounds,
-) -> Result<PhysicalPlan, Unrouted> {
+    explain: bool,
+) -> Result<Traced, Unrouted> {
     let operation = Operation::Query(Box::new(query.clone()));
     let recorded = Recorded::new(source, query.has_wildcard_traversal());
     let mut logical = resolve(&operation, &recorded).map_err(Unrouted::of)?;
-    crate::optimizer::optimize(&mut logical, &recorded, bounds)
-        .map(|mut optimized| {
-            optimized
-                .physical
-                .set_assumptions(recorded.assumptions(bounds));
-            optimized.physical
-        })
-        .map_err(Unrouted::of)
+    let initial = explain.then(|| logical.to_json());
+    let mut tracer = Tracer::for_plan(&logical);
+    let fired = rewrite_with(&mut logical, &recorded, &mut tracer).map_err(Unrouted::of)?;
+    let mut optimized =
+        physical_plan_with(&mut logical, &recorded, bounds, fired.clone(), &mut tracer)
+            .map_err(Unrouted::of)?;
+    optimized
+        .physical
+        .set_assumptions(recorded.assumptions(bounds));
+    optimized.statistics.extend(recorded.index_statistics());
+    Ok(Traced {
+        logical,
+        optimized,
+        tracer,
+        initial,
+    })
+}
+
+async fn plan_and_accept(
+    input: &AcceptInput<'_>,
+    source: &(dyn PlanSource + Sync),
+    bounds: &Bounds,
+    explain: bool,
+) -> Result<(AcceptedPlan, Option<Explain>), Unrouted> {
+    let operation = Operation::Query(Box::new(input.ir.clone()));
+    let Traced {
+        logical,
+        mut optimized,
+        mut tracer,
+        initial,
+    } = plan_traced(input.ir, source, bounds, explain)?;
+    // Scan access is part of the plan acceptance checks: a key narrowing it
+    // adds is a recorded rule of an exact-fragment chain, and a predicate
+    // the invariants re-derive.
+    let narrowed = crate::scan_access::finalize_scan_access(&mut optimized, source)
+        .await
+        .map_err(Unrouted::of)?;
+    if let [conjunct] = narrowed.as_slice() {
+        tracer.record(
+            &[Role::Scan],
+            Rule::NarrowKey {
+                conjunct: crate::mirror::ExprMirror::from(conjunct),
+            },
+            &[],
+        );
+    }
+    let derivation = tracer.finish();
+    let rendered = explain.then(|| {
+        LogicalView::of(&logical)
+            .explain(
+                OperationSummary::of(&operation),
+                RouteOverride::Registry,
+                None,
+                Some(&optimized),
+                &optimized.fired,
+                initial.as_ref(),
+            )
+            .engine()
+    });
+    let accepted = validate::accept(optimized.physical, input, derivation)
+        .map_err(ValidationError::into_unrouted)?;
+    let rendered = rendered.map(|mut explain| {
+        explain.validation = Some(accepted.summary());
+        explain
+    });
+    if let Some(explain) = &rendered {
+        dump_explain(source, explain);
+    }
+    Ok((accepted, rendered))
 }
 
 /// Decide the route of one operation. The census is computed from the
@@ -333,6 +627,19 @@ pub fn plan_query(
 /// optimizer runs whenever the registry names the shape, whatever its route,
 /// so explain shows the candidate plan even for an executor run.
 pub fn route(
+    op: &Operation,
+    source: &dyn PlanSource,
+    override_: RouteOverride,
+    bounds: &Bounds,
+) -> Decision {
+    let decision = route_decision(op, source, override_, bounds);
+    if let Some(explain) = decision.explain() {
+        dump_explain(source, explain);
+    }
+    decision
+}
+
+fn route_decision(
     op: &Operation,
     source: &dyn PlanSource,
     override_: RouteOverride,
@@ -353,14 +660,52 @@ pub fn route(
         }
     };
     let census = plan.census();
+    let initial = plan.to_json();
     let fired = match rewrite(&mut plan, source) {
         Ok(fired) => fired,
         Err(error) => {
-            let explain = LogicalView::of(&plan).explain(operation, override_, None, None, &[]);
+            let explain = LogicalView::of(&plan).explain(
+                operation,
+                override_,
+                None,
+                None,
+                &[],
+                Some(&initial),
+            );
             return executor(Unrouted::of(error), explain, plan);
         }
     };
     if matches!(op, Operation::Query(_)) {
+        let lowered = physical_plan(&mut plan, source, bounds, fired.clone());
+        return match lowered {
+            Ok(mut optimized) => {
+                optimized
+                    .physical
+                    .set_assumptions(recorded.assumptions(bounds));
+                optimized.statistics.extend(recorded.index_statistics());
+                Decision::PendingQuery(Box::new(PreparedQuery {
+                    logical: plan,
+                    optimized,
+                    operation,
+                    override_,
+                    initial,
+                }))
+            }
+            Err(error) => executor(
+                Unrouted::of(error),
+                LogicalView::of(&plan).explain(
+                    operation,
+                    override_,
+                    None,
+                    None,
+                    &fired,
+                    Some(&initial),
+                ),
+                plan,
+            ),
+        };
+    }
+    if let Operation::Write { kind, .. } = op {
         let lowered = physical_plan(&mut plan, source, bounds, fired.clone());
         let logical = LogicalView::of(&plan);
         return match lowered {
@@ -368,19 +713,65 @@ pub fn route(
                 optimized
                     .physical
                     .set_assumptions(recorded.assumptions(bounds));
-                let mut explain = logical
-                    .explain(operation, override_, None, Some(&optimized), &fired)
-                    .engine();
-                explain.pipelines = None;
-                Decision::Engine {
-                    plan: optimized.physical,
-                    logical: plan,
+                let explain = logical.explain(
+                    operation,
+                    override_,
+                    None,
+                    Some(&optimized),
+                    &fired,
+                    Some(&initial),
+                );
+                executor_planned(
+                    Unrouted::WriteOnExecutor {
+                        kind: kind.as_str(),
+                    },
                     explain,
+                    plan,
+                    optimized.physical,
+                )
+            }
+            Err(error) => executor(
+                Unrouted::of(error),
+                logical.explain(operation, override_, None, None, &fired, Some(&initial)),
+                plan,
+            ),
+        };
+    }
+    if let Operation::Load { ir, .. } = op {
+        let lowered = physical_plan(&mut plan, source, bounds, fired.clone());
+        let logical = LogicalView::of(&plan);
+        return match lowered {
+            Ok(mut optimized) => {
+                optimized
+                    .physical
+                    .set_assumptions(recorded.assumptions(bounds));
+                let explain = logical.explain(
+                    operation,
+                    override_,
+                    None,
+                    Some(&optimized),
+                    &fired,
+                    Some(&initial),
+                );
+                match ir.mode {
+                    LoadStmtMode::Overwrite => Decision::Engine {
+                        plan: optimized.physical,
+                        logical: plan,
+                        explain: explain.engine(),
+                    },
+                    LoadStmtMode::Append | LoadStmtMode::Merge => executor_planned(
+                        Unrouted::ModeOnExecutor {
+                            mode: ir.mode.as_str(),
+                        },
+                        explain,
+                        plan,
+                        optimized.physical,
+                    ),
                 }
             }
             Err(error) => executor(
                 Unrouted::of(error),
-                logical.explain(operation, override_, None, None, &fired),
+                logical.explain(operation, override_, None, None, &fired, Some(&initial)),
                 plan,
             ),
         };
@@ -394,14 +785,28 @@ pub fn route(
             Unrouted::UnregisteredNode {
                 kind: kind.name().to_string(),
             },
-            LogicalView::of(&plan).explain(operation, override_, None, None, &fired),
+            LogicalView::of(&plan).explain(
+                operation,
+                override_,
+                None,
+                None,
+                &fired,
+                Some(&initial),
+            ),
             plan,
         );
     }
     let Some(entry) = lookup(&census) else {
         return executor(
             Unrouted::NoMatchingEntry { census },
-            LogicalView::of(&plan).explain(operation, override_, None, None, &fired),
+            LogicalView::of(&plan).explain(
+                operation,
+                override_,
+                None,
+                None,
+                &fired,
+                Some(&initial),
+            ),
             plan,
         );
     };
@@ -412,7 +817,14 @@ pub fn route(
         Err(error) => {
             return executor(
                 Unrouted::of(error),
-                logical.explain(operation, override_, Some(entry), None, &fired),
+                logical.explain(
+                    operation,
+                    override_,
+                    Some(entry),
+                    None,
+                    &fired,
+                    Some(&initial),
+                ),
                 plan,
             );
         }
@@ -420,11 +832,25 @@ pub fn route(
     if let Some(node) = over_bound(&optimized.physical, bounds) {
         return executor(
             Unrouted::DeclaredBytesOverBound { node },
-            logical.explain(operation, override_, Some(entry), Some(&optimized), &fired),
+            logical.explain(
+                operation,
+                override_,
+                Some(entry),
+                Some(&optimized),
+                &fired,
+                Some(&initial),
+            ),
             plan,
         );
     }
-    let explain = logical.explain(operation, override_, Some(entry), Some(&optimized), &fired);
+    let explain = logical.explain(
+        operation,
+        override_,
+        Some(entry),
+        Some(&optimized),
+        &fired,
+        Some(&initial),
+    );
     match (entry.route, override_) {
         (Route::Executor, _) => executor(
             Unrouted::RegistryRouteExecutor { entry: entry.name },
@@ -456,6 +882,50 @@ fn executor(reason: Unrouted, explain: Explain, logical: LogicalPlan) -> Decisio
         reason,
         explain,
         logical,
+        physical: None,
+    }
+}
+
+/// An executor decision that hands the executor the physical plan it runs by
+/// hand: a write's decided `Validate` node.
+fn executor_planned(
+    reason: Unrouted,
+    explain: Explain,
+    logical: LogicalPlan,
+    physical: PhysicalPlan,
+) -> Decision {
+    let explain = explain.with_reason(&reason);
+    Decision::Executor {
+        reason,
+        explain,
+        logical,
+        physical: Some(physical),
+    }
+}
+
+/// Write one finished explain document into the source's dump directory,
+/// named `<operation>_<logical_hash>.explain.json`. The write is a
+/// diagnostic: a failure is reported on stderr and never fails the operation.
+fn dump_explain(source: &dyn PlanSource, explain: &Explain) {
+    let Some(dir) = source.explain_dump_dir() else {
+        return;
+    };
+    let hash = explain.logical_hash.as_deref().unwrap_or("none");
+    let path = dir.join(format!("{}_{hash}.explain.json", explain.operation.kind));
+    let document = serde_json::to_string_pretty(&explain.to_value()).expect("a JSON value prints");
+    let written = (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(&dir)?;
+        let mut file = tempfile::NamedTempFile::new_in(&dir)?;
+        file.write_all(document.as_bytes())?;
+        file.persist(&path).map_err(|error| error.error)?;
+        Ok(())
+    })();
+    if let Err(error) = written {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "explain dump to {} failed: {error}",
+            path.display()
+        );
     }
 }
 
@@ -500,6 +970,7 @@ impl LogicalView {
         entry: Option<&'static Entry>,
         optimized: Option<&Optimized>,
         rewritten: &[&'static str],
+        initial: Option<&Value>,
     ) -> Explain {
         Explain {
             route: "executor",
@@ -507,6 +978,7 @@ impl LogicalView {
             reason: None,
             entry: entry.map(EntrySummary::of),
             operation,
+            logical_plan_initial: initial.cloned(),
             logical_plan: Some(self.json.clone()),
             logical_hash: Some(format!("{:016x}", self.hash)),
             physical_plan: optimized.map(|optimized| optimized.physical.to_json()),
@@ -539,19 +1011,17 @@ mod tests {
     /// GQT can inspect explain output but cannot count diagnostic rendering.
     #[test]
     fn execution_planning_does_not_render_explain() {
+        let dir = tempfile::tempdir().unwrap();
         let source = MemorySource::default().with_node_type(
             "Doc",
             NodeTypeSpec {
-                table: TableRef {
-                    type_key: "node:Doc".into(),
-                    dataset_path: "node/Doc".into(),
-                    native_branch: None,
-                },
+                table: TableRef::dataset("node:Doc", "node/Doc", None),
                 version: Some(1),
                 columns: SYSTEM_COLUMNS_V3,
                 schema: Arc::new(Schema::new(vec![Field::new("__id", DataType::Utf8, false)])),
                 key: vec![],
                 object_columns: vec!["__id".into()],
+                object_fields: vec![Field::new("@id", DataType::Utf8, false)].into(),
                 row_count: None,
             },
         );
@@ -564,14 +1034,26 @@ mod tests {
                 filters: vec![],
             }],
             return_exprs: vec![IRProjection {
-                expr: IRExpr::Variable("d".into()),
+                expr: IRExpr::Variable(
+                    "d".into(),
+                    omnigraph_compiler::ExprType::Node {
+                        type_name: "Doc".into(),
+                    },
+                ),
                 alias: None,
+                column: "d".into(),
+                ty: omnigraph_compiler::ExprType::Node {
+                    type_name: "Doc".into(),
+                },
             }],
+            distinct: false,
             order_by: vec![],
             limit: None,
         };
+        let source = source.with_explain_dump_dir(dir.path().to_path_buf());
         EXPLAIN_RENDERS.with(|count| count.set(0));
-        let physical = plan_query(&query, &source, &BOUNDS).expect("read plan");
+        let physical =
+            futures::executor::block_on(plan_query(&query, &source, &BOUNDS)).expect("read plan");
         assert_eq!(
             EXPLAIN_RENDERS.with(|count| count.get()),
             0,
@@ -583,13 +1065,18 @@ mod tests {
             RouteOverride::Registry,
             &BOUNDS,
         );
+        assert!(decision.explain().is_none());
+        assert_eq!(EXPLAIN_RENDERS.with(|count| count.get()), 0);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let decision = futures::executor::block_on(decision.finalize(&source));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         assert_eq!(
             EXPLAIN_RENDERS.with(|count| count.get()),
             1,
             "explicit explain must render diagnostics"
         );
         assert_eq!(
-            decision.explain().physical_plan.as_ref(),
+            decision.explain().unwrap().physical_plan.as_ref(),
             Some(&physical.to_json())
         );
         let missing = MemorySource::default();
@@ -602,6 +1089,29 @@ mod tests {
         let Decision::Executor { reason, .. } = expected else {
             panic!("missing type must fail planning")
         };
-        assert_eq!(plan_query(&query, &missing, &BOUNDS).unwrap_err(), reason);
+        assert_eq!(
+            futures::executor::block_on(plan_query(&query, &missing, &BOUNDS)).unwrap_err(),
+            reason
+        );
+    }
+}
+
+#[cfg(test)]
+mod cast_parameter_tests {
+    use super::*;
+    use omnigraph_compiler::{ExprType, PropType, ScalarType};
+
+    #[test]
+    fn a_cast_keeps_its_parameter_dependency() {
+        let expr = IRExpr::Cast {
+            expr: Box::new(IRExpr::Param(
+                "age".into(),
+                ExprType::from_prop(&PropType::scalar(ScalarType::I64, true)),
+            )),
+            ty: ExprType::from_prop(&PropType::scalar(ScalarType::F64, true)),
+        };
+        let mut names = BTreeSet::new();
+        params_of_expr(&expr, &mut names);
+        assert_eq!(names, BTreeSet::from(["age".to_string()]));
     }
 }

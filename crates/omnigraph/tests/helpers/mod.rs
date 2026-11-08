@@ -15,7 +15,7 @@ use arrow_array::{Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 
 pub use omnigraph::Session;
-use omnigraph::changes::{ChangeFilter, ChangeSet};
+use omnigraph::changes::{ChangeEntityKind, ChangeFeedScope, ChangeOpKind};
 use omnigraph::db::{Omnigraph, ReadTarget, Snapshot, SnapshotId};
 use omnigraph::error::Result;
 use omnigraph::loader::LoadMode;
@@ -56,47 +56,6 @@ query insert_person_and_friend($name: String, $age: I32, $friend: String) {
     insert Knows { from: $name, to: $friend }
 }
 "#;
-
-/// Materialize main's accepted contract as legacy files before removing its row.
-pub async fn make_legacy_flat_manifest_fixture(root: &std::path::Path, stamp: u32) {
-    assert!((5..=11).contains(&stamp));
-    let uri = root.to_str().unwrap();
-    let mut manifest = lance::Dataset::open(&format!("{uri}/__manifest"))
-        .await
-        .unwrap();
-    let contract = omnigraph_catalog::ManifestCoordinator::read_schema_contract_at(
-        uri,
-        None,
-        manifest.version().version,
-    )
-    .await
-    .unwrap();
-    let ir: omnigraph_compiler::SchemaIR = serde_json::from_str(&contract.ir).unwrap();
-    let state = serde_json::json!({
-        "format_version": 2,
-        "schema_shape_hash": omnigraph_compiler::schema_shape_hash_from_ir(&ir).unwrap(),
-        "schema_ir_hash": contract.head.schema_ir_hash,
-        "schema_identity_version": contract.head.schema_identity_version,
-        "schema_identity_domain": contract.head.schema_identity_domain,
-    });
-    std::fs::write(root.join("_schema.pg"), &contract.source).unwrap();
-    std::fs::write(root.join("_schema.ir.json"), &contract.ir).unwrap();
-    std::fs::write(
-        root.join("__schema_state.json"),
-        serde_json::to_vec_pretty(&state).unwrap(),
-    )
-    .unwrap();
-    omnigraph_catalog::migrations::restamp_flat_for_test(&mut manifest, stamp)
-        .await
-        .unwrap();
-    assert_eq!(
-        omnigraph_catalog::migrations::read_stamp(&manifest),
-        Some(stamp)
-    );
-    assert!(manifest.schema().field("record").is_none());
-    assert!(manifest.schema().field("schema_source").is_none());
-    assert!(manifest.schema().field("schema_ir").is_none());
-}
 
 /// Build the graph-level selector used by the dedicated Blob read facade.
 pub fn node_blob_cell(
@@ -379,7 +338,11 @@ pub async fn init_and_load(dir: &tempfile::TempDir) -> Session {
 
 /// The standard rows under a compatible schema, for schema-size instruments.
 pub async fn init_and_load_with_schema(dir: &tempfile::TempDir, schema: &str) -> Session {
-    let uri = dir.path().to_str().unwrap();
+    init_and_load_at(dir.path().to_str().unwrap(), schema).await
+}
+
+/// [`init_and_load_with_schema`] at a graph uri on any backend.
+pub async fn init_and_load_at(uri: &str, schema: &str) -> Session {
     let db = session(Omnigraph::init(uri, schema).await.unwrap());
     db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
     // Mutation/load publish only exact data effects; physical indexes are
@@ -609,18 +572,116 @@ pub async fn snapshot_id(db: &Omnigraph, branch: &str) -> Result<SnapshotId> {
     db.resolve_snapshot(branch).await
 }
 
+/// One change of a graph diff flattened for assertions: the entity's kind,
+/// type, id and operation, and an edge's endpoints from its newest image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetChange {
+    pub kind: ChangeEntityKind,
+    pub type_name: String,
+    pub id: String,
+    pub op: ChangeOpKind,
+    pub endpoints: Option<NetEndpoints>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetEndpoints {
+    pub src: String,
+    pub dst: String,
+}
+
+impl NetChange {
+    /// `node:<Type>` or `edge:<Type>`.
+    pub fn type_key(&self) -> String {
+        let prefix = match self.kind {
+            ChangeEntityKind::Node => "node",
+            ChangeEntityKind::Edge => "edge",
+        };
+        format!("{prefix}:{}", self.type_name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NetStats {
+    pub inserts: usize,
+    pub updates: usize,
+    pub deletes: usize,
+}
+
+/// A whole graph diff: its resolved endpoints and every change of every page.
+#[derive(Debug, Clone)]
+pub struct NetDiff {
+    pub from_commit_id: String,
+    pub to_commit_id: String,
+    pub changes: Vec<NetChange>,
+    pub stats: NetStats,
+}
+
+/// The graph diff `from` → `to` (branch names or commit ids) within `scope`,
+/// every page.
+pub async fn graph_diff(
+    db: &Omnigraph,
+    from: &str,
+    to: &str,
+    scope: &ChangeFeedScope,
+) -> Result<NetDiff> {
+    let mut request = omnigraph::changes::GraphDiffRequest {
+        sides: omnigraph::changes::GraphDiffSides::Between {
+            from: from.to_string(),
+            to: to.to_string(),
+        },
+        scope: scope.clone(),
+        page_token: None,
+        max_changes: None,
+        max_bytes: None,
+    };
+    let mut diff = NetDiff {
+        from_commit_id: String::new(),
+        to_commit_id: String::new(),
+        changes: Vec::new(),
+        stats: NetStats::default(),
+    };
+    loop {
+        let page = db.diff_page(&request).await?;
+        diff.from_commit_id = page.from_commit_id;
+        diff.to_commit_id = page.to_commit_id;
+        for change in page.changes {
+            match change.op {
+                ChangeOpKind::Insert => diff.stats.inserts += 1,
+                ChangeOpKind::Update => diff.stats.updates += 1,
+                ChangeOpKind::Delete => diff.stats.deletes += 1,
+            }
+            let endpoints = change
+                .after
+                .as_ref()
+                .or(change.before.as_ref())
+                .and_then(|image| image.endpoints.as_ref())
+                .map(|endpoints| NetEndpoints {
+                    src: endpoints.from.clone(),
+                    dst: endpoints.to.clone(),
+                });
+            diff.changes.push(NetChange {
+                kind: change.kind,
+                type_name: change.entity_type.name,
+                id: change.id,
+                op: change.op,
+                endpoints,
+            });
+        }
+        match page.next_page_token {
+            Some(token) => request.page_token = Some(token),
+            None => return Ok(diff),
+        }
+    }
+}
+
+/// The graph diff from `from_snapshot` to the head of `branch`.
 pub async fn diff_since_branch(
     db: &Omnigraph,
     branch: &str,
     from_snapshot: SnapshotId,
-    filter: &ChangeFilter,
-) -> Result<ChangeSet> {
-    db.diff_between(
-        ReadTarget::Snapshot(from_snapshot),
-        ReadTarget::branch(branch),
-        filter,
-    )
-    .await
+    scope: &ChangeFeedScope,
+) -> Result<NetDiff> {
+    graph_diff(db, from_snapshot.as_str(), branch, scope).await
 }
 
 /// Advance a Lance dataset HEAD directly from tests without going through
@@ -648,7 +709,7 @@ pub fn int_params(pairs: &[(&str, i64)]) -> ParamMap {
         .iter()
         .map(|(k, v)| {
             let key = k.strip_prefix('$').unwrap_or(k);
-            (key.to_string(), Literal::Integer(*v))
+            (key.to_string(), Literal::Integer(i128::from(*v)))
         })
         .collect()
 }
@@ -658,7 +719,7 @@ pub fn mixed_params(str_pairs: &[(&str, &str)], int_pairs: &[(&str, i64)]) -> Pa
     let mut map = params(str_pairs);
     for (k, v) in int_pairs {
         let key = k.strip_prefix('$').unwrap_or(k);
-        map.insert(key.to_string(), Literal::Integer(*v));
+        map.insert(key.to_string(), Literal::Integer(i128::from(*v)));
     }
     map
 }
@@ -823,4 +884,20 @@ async fn write_ranged_external_blob_row(
         .await
         .unwrap();
     table_uri
+}
+
+/// `token` with its payload edited and its checksum recomputed, as any caller
+/// can: a continuation's envelope is `base64url(json ‖ sha256(json))`.
+pub fn resign_change_token(token: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String {
+    use base64::Engine;
+    use sha2::Digest;
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let bytes = engine.decode(token).unwrap();
+    let (payload, _) = bytes.split_at(bytes.len() - 32);
+    let mut payload: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    edit(&mut payload);
+    let mut encoded = serde_json::to_vec(&payload).unwrap();
+    let checksum = sha2::Sha256::digest(&encoded);
+    encoded.extend_from_slice(&checksum);
+    engine.encode(encoded)
 }

@@ -1,13 +1,14 @@
 //! `ScanExec`: a binding's scan under its `SearchMode`, columns prefixed, its
-//! `ScanReport` recorded for the search retry ladders; a breaker, except the
-//! marked plain table read (`pipelined`).
+//! `ScanReport` recorded for the search retry ladders. Every unranked table
+//! read streams (`pipelined`); a ranked scan is a breaker, since its ladder
+//! reruns it whole.
 
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use arrow_schema::SchemaRef;
-use datafusion::common::Result as DfResult;
+use datafusion::common::{Result as DfResult, internal_err};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
@@ -15,24 +16,46 @@ use datafusion::physical_plan::{
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::ir::{IRExpr, ParamMap};
 
-use super::{breaker_properties, breaker_stream, conform, external, polled, streaming_properties};
+use super::shape::{Breaker, Source, Streaming, work};
+use super::{conform, external};
 use crate::db::Snapshot;
 use crate::engine::scan::{execute_node_scan, prefix_batch, scan_output_schema};
-use crate::engine::search::{NeededColumns, ScanReport, SearchMode};
+use crate::engine::search::{NeededColumns, ScanReport, ScanReports, SearchMode};
 use crate::error::Result;
 
 mod input;
 mod pipelined;
 mod runtime_filter;
 
-pub(super) use input::lookup_candidates;
+pub(super) use input::Lookup;
 pub(in crate::engine) use runtime_filter::RuntimeFilterSlot;
 pub(super) use runtime_filter::{Filled, Needles};
+
+/// The shape a scan holds, decided with its source: a dependent scan streams
+/// its input through the id lookup, an unranked table read sends each Lance
+/// batch as read, and a ranked read is a breaker (its ladder reruns it whole).
+enum ScanShape {
+    Dependent(Streaming),
+    Pipelined(Source),
+    Ranked(Breaker),
+}
+
+impl ScanShape {
+    fn properties(&self) -> &Arc<PlanProperties> {
+        match self {
+            Self::Dependent(shape) => shape.properties(),
+            Self::Pipelined(shape) => shape.properties(),
+            Self::Ranked(shape) => shape.properties(),
+        }
+    }
+}
 
 pub(crate) enum ScanSource {
     Table {
         mode: Box<SearchMode>,
-        report: Arc<Mutex<ScanReport>>,
+        /// Where a nearest scan reports its ladder, under `node`.
+        report: Arc<Mutex<ScanReports>>,
+        node: omnigraph_planner::NodeId,
     },
     Dependent {
         input: Arc<dyn ExecutionPlan>,
@@ -49,23 +72,24 @@ pub(crate) struct ScanExec {
     snapshot: Snapshot,
     catalog: Arc<Catalog>,
     runtime_filter: Option<Arc<RuntimeFilterSlot>>,
-    properties: Arc<PlanProperties>,
+    /// The rows after which a streamed read sends what it gathered, below the
+    /// session's batch rows when a `Limit` sits over the scan's projection.
+    gather_rows: Option<usize>,
+    shape: ScanShape,
     metrics: ExecutionPlanMetricsSet,
 }
 
 impl ScanExec {
     /// This scan under the runtime filter its parent fills, when the plan
-    /// marked one; a marked table read that ranks nothing then streams.
+    /// marked one.
     pub(crate) fn with_runtime_filter(mut self, filter: Option<Arc<RuntimeFilterSlot>>) -> Self {
         self.runtime_filter = filter;
-        if let ScanSource::Table { .. } = &self.source {
-            let schema = self.schema();
-            self.properties = if self.pipelines() {
-                streaming_properties(schema)
-            } else {
-                breaker_properties(schema)
-            };
-        }
+        self
+    }
+
+    /// This scan sending its gathered rows once it holds `rows` of them.
+    pub(crate) fn with_gather_rows(mut self, rows: usize) -> Self {
+        self.gather_rows = Some(rows.max(1));
         self
     }
 
@@ -80,14 +104,16 @@ impl ScanExec {
         snapshot: Snapshot,
         catalog: Arc<Catalog>,
     ) -> Result<Self> {
-        let properties = match &source {
-            ScanSource::Dependent { input } => Self::input_properties(Self::input_schema(
-                &input.schema(),
-                &type_name,
-                &binding,
-                projection.as_ref(),
-                &catalog,
-            )?),
+        let shape = match &source {
+            ScanSource::Dependent { input } => {
+                ScanShape::Dependent(Streaming::new(Self::input_schema(
+                    &input.schema(),
+                    &type_name,
+                    &binding,
+                    projection.as_ref(),
+                    &catalog,
+                )?))
+            }
             ScanSource::Table { mode, .. } => {
                 let schema = scan_output_schema(
                     &type_name,
@@ -98,7 +124,11 @@ impl ScanExec {
                     mode,
                     projection.as_ref(),
                 )?;
-                breaker_properties(schema)
+                if pipelined::streams(mode) {
+                    ScanShape::Pipelined(Source::new(schema))
+                } else {
+                    ScanShape::Ranked(Breaker::new(schema))
+                }
             }
         };
         Ok(Self {
@@ -111,7 +141,8 @@ impl ScanExec {
             snapshot,
             catalog,
             runtime_filter: None,
-            properties,
+            gather_rows: None,
+            shape,
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
@@ -159,7 +190,7 @@ impl ExecutionPlan for ScanExec {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
+        self.shape.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -207,17 +238,22 @@ impl ExecutionPlan for ScanExec {
         ctx: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
         assert_eq!(partition, 0, "ScanExec has one partition");
-        let (mode, report) = match &self.source {
-            ScanSource::Dependent { input } => {
-                return self
-                    .execute_input(input.execute(0, Arc::clone(&ctx))?, ctx)
-                    .map(|stream| polled(&self.metrics, stream));
+        let (mode, report, node, shape) = match (&self.source, &self.shape) {
+            (ScanSource::Dependent { input }, ScanShape::Dependent(shape)) => {
+                return self.execute_input(input, ctx, shape);
             }
-            ScanSource::Table { mode, report } => (mode.as_ref().clone(), Arc::clone(report)),
+            (ScanSource::Table { mode, .. }, ScanShape::Pipelined(shape)) => {
+                let filter = self.runtime_filter.as_ref().and_then(|slot| slot.take());
+                return self.execute_pipelined(mode.as_ref().clone(), filter, ctx, shape);
+            }
+            (ScanSource::Table { mode, report, node }, ScanShape::Ranked(shape)) => {
+                (mode.as_ref().clone(), Arc::clone(report), *node, shape)
+            }
+            (ScanSource::Dependent { .. }, ScanShape::Pipelined(_) | ScanShape::Ranked(_))
+            | (ScanSource::Table { .. }, ScanShape::Dependent(_)) => {
+                return internal_err!("ScanExec holds a shape its source did not decide");
+            }
         };
-        if let Some(slot) = self.runtime_filter.as_ref().filter(|_| self.pipelines()) {
-            return self.execute_pipelined(mode, slot.take(), ctx);
-        }
         let schema: SchemaRef = self.schema();
         let type_name = self.type_name.clone();
         let binding = self.binding.clone();
@@ -227,12 +263,9 @@ impl ExecutionPlan for ScanExec {
         let snapshot = self.snapshot.clone();
         let catalog = Arc::clone(&self.catalog);
         let declared = Arc::clone(&schema);
-        let stream = breaker_stream(
-            "ScanExec",
-            schema,
-            &ctx,
-            &self.metrics,
-            move |reservation| async move {
+        let memory = work(ctx, "ScanExec", &self.metrics)?;
+        Ok(
+            shape.stream(memory, &self.metrics, move |reservation| async move {
                 let mut scan_report = ScanReport::default();
                 let batch = execute_node_scan(
                     &type_name,
@@ -261,15 +294,15 @@ impl ExecutionPlan for ScanExec {
                     reservation.metric("nearest_exhausted", usize::from(nearest.exhausted));
                     reservation.metric("nearest_dataset_rows", nearest.dataset_rows as usize);
                 }
-                if scan_report.nearest_scan.is_some() {
-                    *report
+                if mode.nearest.is_some() {
+                    report
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = scan_report;
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(node, scan_report);
                 }
                 let prefixed = prefix_batch(&batch, &binding).map_err(external)?;
                 conform(prefixed, &declared).map_err(external)
-            },
-        );
-        Ok(polled(&self.metrics, stream))
+            }),
+        )
     }
 }

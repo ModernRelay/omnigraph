@@ -1,0 +1,90 @@
+# issue: none
+# notes: A one-hop traversal's hash join drains its build side at the first non-empty probe batch. A build side that holds no row ends the probe with no output; an empty probe never drains the build; a build holding some of the probed ids joins exactly those; a source with no out-edge contributes nothing. Every step matches the reference engine.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    name: String
+}
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"slug":"p1","name":"alice"}}
+{"type":"Person","data":{"slug":"p2","name":"bob"}}
+{"type":"Person","data":{"slug":"p3","name":"carol"}}
+{"type":"Person","data":{"slug":"p4","name":"dave"}}
+{"edge":"Knows","from":"p1","to":"p2"}
+{"edge":"Knows","from":"p3","to":"p2"}
+{"edge":"Knows","from":"p2","to":"p4"}
+
+--- query
+set engine = v2;
+query empty_build() {
+    match {
+        $p: Person
+        $p knows $q
+        $q.name = "nobody"
+    }
+    return { $p.name, $q.name }
+}
+--- expect unordered
+--- expect shape
+p.name: String
+q.name: String
+--- expect same as v1
+
+--- query
+set engine = v2;
+query empty_probe() {
+    match {
+        $p: Person { name: "nobody" }
+        $p knows $q
+    }
+    return { $q.name }
+}
+--- expect unordered
+--- expect shape
+q.name: String
+--- expect same as v1
+
+--- query
+set engine = v2;
+query partial_build() {
+    match {
+        $p: Person
+        $p knows $q
+        $q.name = "bob"
+    }
+    return { $p.name, $q.name }
+}
+--- expect unordered
+{"p.name":"alice","q.name":"bob"}
+{"p.name":"carol","q.name":"bob"}
+--- expect shape
+p.name: String
+q.name: String
+--- expect same as v1
+
+--- query
+set engine = v2;
+query every_hop() {
+    match {
+        $p: Person
+        $p knows $q
+    }
+    return { $p.name, $q.name }
+}
+--- expect unordered
+{"p.name":"alice","q.name":"bob"}
+{"p.name":"carol","q.name":"bob"}
+{"p.name":"bob","q.name":"dave"}
+--- expect shape
+p.name: String
+q.name: String
+--- expect same as v1

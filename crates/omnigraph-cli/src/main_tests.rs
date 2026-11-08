@@ -1,10 +1,8 @@
-//! In-source test suite for the CLI binary (moved verbatim from
-//! main.rs; `use super::*` resolves through the #[path] declaration).
+//! Shared CLI contract tests, compiled once in the application library.
 
 use super::{
-    DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, branch_statement_change_request,
-    branch_statement_query_request, legacy_change_request_body, normalize_bearer_token,
-    resolve_remote_bearer_token, sync_dir,
+    apply_bearer_token, branch_statement_change_request, branch_statement_query_request,
+    normalize_bearer_token, sync_dir,
 };
 use reqwest::header::AUTHORIZATION;
 use serde_json::json;
@@ -20,47 +18,6 @@ fn embedded_cli_preserves_complete_storage_diagnostic_without_reprefixing() {
 
     assert_eq!(report.to_string(), diagnostic);
     assert!(!report.to_string().contains("storage: storage"));
-}
-
-#[test]
-fn legacy_change_request_body_uses_legacy_field_names() {
-    // `mutate`'s `POST /change` arm uses the current route DTO spelling:
-    // required `query_source` and optional `query_name`.
-    let body = legacy_change_request_body(
-        "query insert_person($n: String) { insert Person { name: $n } }",
-        Some("insert_person"),
-        "main",
-        Some(&json!({ "n": "Alice" })),
-    );
-    assert_eq!(
-        body["query_source"].as_str(),
-        Some("query insert_person($n: String) { insert Person { name: $n } }"),
-    );
-    assert_eq!(body["query_name"].as_str(), Some("insert_person"));
-    assert_eq!(body["branch"].as_str(), Some("main"));
-    assert_eq!(body["params"]["n"].as_str(), Some("Alice"));
-    // Keep this route's exact DTO keys on the wire.
-    assert!(
-        body.get("query").is_none(),
-        "legacy /change body must not carry the renamed `query` key; got {body}"
-    );
-    assert!(
-        body.get("name").is_none(),
-        "legacy /change body must not carry the renamed `name` key; got {body}"
-    );
-}
-
-#[test]
-fn legacy_change_request_body_omits_optional_fields_when_unset() {
-    let body = legacy_change_request_body(
-        "query find() { match { $p: Person } return { $p.name } }",
-        None,
-        "main",
-        None,
-    );
-    assert_eq!(body["branch"].as_str(), Some("main"));
-    assert!(body.get("query_name").is_none());
-    assert!(body.get("params").is_none());
 }
 
 #[test]
@@ -83,6 +40,74 @@ fn branch_statement_requests_carry_the_source_alone() {
             "params": null,
             "branch": null,
         })
+    );
+}
+
+#[test]
+fn branch_merge_as_commit_excludes_delete_branch() {
+    use clap::Parser;
+    let error = crate::cli::Cli::try_parse_from([
+        "omnigraph",
+        "branch",
+        "merge",
+        "feature",
+        "--as-commit",
+        "--delete-branch",
+    ])
+    .unwrap_err();
+    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    assert!(
+        crate::cli::Cli::try_parse_from(["omnigraph", "branch", "merge", "feature", "--as-commit"])
+            .is_ok()
+    );
+}
+
+#[test]
+fn commit_list_unattached_excludes_unpublished() {
+    use clap::Parser;
+    let error = crate::cli::Cli::try_parse_from([
+        "omnigraph",
+        "commit",
+        "list",
+        "--unattached",
+        "--unpublished",
+    ])
+    .unwrap_err();
+    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    assert!(
+        crate::cli::Cli::try_parse_from(["omnigraph", "commit", "list", "--unattached"]).is_ok()
+    );
+}
+
+#[test]
+fn commit_list_pages_only_a_branch_history() {
+    use clap::Parser;
+    for listing in ["--unattached", "--unpublished"] {
+        for page in [["--limit", "2"], ["--page-token", "token"]] {
+            let error = crate::cli::Cli::try_parse_from(
+                ["omnigraph", "commit", "list", listing]
+                    .into_iter()
+                    .chain(page),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{listing} {page:?}"
+            );
+        }
+    }
+    assert!(
+        crate::cli::Cli::try_parse_from([
+            "omnigraph",
+            "commit",
+            "list",
+            "--limit",
+            "2",
+            "--page-token",
+            "token",
+        ])
+        .is_ok()
     );
 }
 
@@ -120,38 +145,86 @@ fn normalize_bearer_token_trims_and_filters_blank_values() {
     );
 }
 
+/// Sets process environment variables for one test and restores the previous
+/// values when dropped, including on a failed assertion.
+struct ScopedEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl ScopedEnv {
+    fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+        let saved = vars
+            .iter()
+            .map(|(name, _)| (*name, std::env::var_os(name)))
+            .collect();
+        for (name, value) in vars {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        Self(saved)
+    }
+}
+
+impl Drop for ScopedEnv {
+    fn drop(&mut self) {
+        for (name, value) in &self.0 {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+}
+
 #[test]
-fn resolve_remote_bearer_token_falls_back_to_default_env() {
-    // RFC-011: with no operator server matching the URL, the only chain
-    // left is the default `OMNIGRAPH_BEARER_TOKEN` env (no omnigraph.yaml
-    // scoped chain). Hermetic: no operator config is read for a literal URL
-    // that matches no `servers:` entry.
-    let previous = std::env::var_os(DEFAULT_BEARER_TOKEN_ENV);
-    let previous_home = std::env::var_os("OMNIGRAPH_HOME");
-    unsafe {
-        std::env::set_var(DEFAULT_BEARER_TOKEN_ENV, "global-token");
-        std::env::set_var("OMNIGRAPH_HOME", "/nonexistent/omnigraph-test-home");
-    }
-
+fn resolve_remote_credential_sends_no_unkeyed_token_issue_1022() {
+    use crate::targets::{ServerAuth, resolve_server_token};
+    let home = tempfile::tempdir().unwrap();
+    let _env = ScopedEnv::set(&[
+        ("OMNIGRAPH_BEARER_TOKEN", Some("global-token")),
+        ("OMNIGRAPH_TOKEN_KEYED", Some("keyed-token")),
+        ("OMNIGRAPH_TOKEN_UNKEYED", None),
+    ]);
+    let input = crate::operator::InvocationConfig::at(Some(home.path().to_path_buf()), None);
     assert_eq!(
-        resolve_remote_bearer_token(Some("https://override.example.com"))
-            .unwrap()
-            .as_deref(),
-        Some("global-token")
+        resolve_server_token(
+            &input,
+            &ServerAuth::Anonymous,
+            "https://override.example.com"
+        )
+        .unwrap(),
+        None
     );
-
-    unsafe {
-        if let Some(value) = previous {
-            std::env::set_var(DEFAULT_BEARER_TOKEN_ENV, value);
-        } else {
-            std::env::remove_var(DEFAULT_BEARER_TOKEN_ENV);
-        }
-        if let Some(value) = previous_home {
-            std::env::set_var("OMNIGRAPH_HOME", value);
-        } else {
-            std::env::remove_var("OMNIGRAPH_HOME");
-        }
-    }
+    let keyed = ServerAuth::Token {
+        owner: "keyed".into(),
+    };
+    assert!(
+        resolve_server_token(
+            &input,
+            &keyed,
+            "https://keyed.example.com-evil/graphs/knowledge"
+        )
+        .is_err()
+    );
+    assert!(
+        resolve_server_token(&input, &keyed, "https://keyed.example.com/graphs/knowledge").is_err()
+    );
+    assert!(
+        resolve_server_token(
+            &input,
+            &ServerAuth::Token {
+                owner: "unkeyed".into()
+            },
+            "https://unkeyed.example.com"
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("credential_missing")
+    );
 }
 
 #[cfg(unix)]

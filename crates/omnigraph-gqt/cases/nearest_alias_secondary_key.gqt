@@ -1,0 +1,47 @@
+# issue: none
+# red_on: d6604a19
+# notes: A return alias is a secondary order key after the leading `nearest`,
+# notes: as it already was after `bm25` and `rrf`. Two docs at distance 1 are
+# notes: ordered by `name desc`, the reverse of their id tie-break order, so a
+# notes: sort that ignores the alias cannot pass. Replaces the Rust test
+# notes: test_standalone_nearest_with_alias_ordering_still_rejected (T18, withdrawn).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    name: String @index
+    embedding: Vector(4) @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d000","name":"zed","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d001","name":"amy","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d002","name":"bob","embedding":[-1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d003","name":"cat","embedding":[2.0,0.0,0.0,0.0]}}
+
+--- query
+query nearest_then_alias($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug, $d.name as name }
+    order { nearest($d.embedding, $q), name desc }
+    limit 10
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug":"d000","name":"zed"}
+{"d.slug":"d002","name":"bob"}
+{"d.slug":"d001","name":"amy"}
+{"d.slug":"d003","name":"cat"}
+
+--- expect shape
+d.slug: String
+name: String

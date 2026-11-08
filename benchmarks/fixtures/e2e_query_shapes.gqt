@@ -1,0 +1,162 @@
+# issue: none
+# notes: Bounded query-shape representative: 100 people and 50 disjoint directed edges. Names start at p000500; generated vectors use the existing GQT seed recipe. Scale, vectors and publication batches differ from the former Rust workload; this has a new timing identity.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I64
+    team: String
+    bio: String
+    embedding: Vector(32)
+}
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 100
+    commits: 1
+    batch_rows: 100
+    start: 500
+    columns:
+      name: {kind: key, prefix: p, width: 6}
+      age: {kind: modulo, modulus: 100}
+      team: {kind: key, prefix: g, width: 0, modulo: 10}
+      bio: {kind: repeat, text: "synthetic person biography ", count: 40}
+      embedding: {kind: vector, dimensions: 32}
+  - kind: edge
+    name: Knows
+    rows: 50
+    commits: 1
+    batch_rows: 50
+    id: {kind: key, prefix: e, width: 3}
+    from:
+      kind: ranges
+      ranges:
+        - {end: 1, value: "p000500"}
+        - {end: 2, value: "p000502"}
+        - {end: 3, value: "p000504"}
+        - {end: 4, value: "p000506"}
+        - {end: 5, value: "p000508"}
+        - {end: 6, value: "p000510"}
+        - {end: 7, value: "p000512"}
+        - {end: 8, value: "p000514"}
+        - {end: 9, value: "p000516"}
+        - {end: 10, value: "p000518"}
+        - {end: 11, value: "p000520"}
+        - {end: 12, value: "p000522"}
+        - {end: 13, value: "p000524"}
+        - {end: 14, value: "p000526"}
+        - {end: 15, value: "p000528"}
+        - {end: 16, value: "p000530"}
+        - {end: 17, value: "p000532"}
+        - {end: 18, value: "p000534"}
+        - {end: 19, value: "p000536"}
+        - {end: 20, value: "p000538"}
+        - {end: 21, value: "p000540"}
+        - {end: 22, value: "p000542"}
+        - {end: 23, value: "p000544"}
+        - {end: 24, value: "p000546"}
+        - {end: 25, value: "p000548"}
+        - {end: 26, value: "p000550"}
+        - {end: 27, value: "p000552"}
+        - {end: 28, value: "p000554"}
+        - {end: 29, value: "p000556"}
+        - {end: 30, value: "p000558"}
+        - {end: 31, value: "p000560"}
+        - {end: 32, value: "p000562"}
+        - {end: 33, value: "p000564"}
+        - {end: 34, value: "p000566"}
+        - {end: 35, value: "p000568"}
+        - {end: 36, value: "p000570"}
+        - {end: 37, value: "p000572"}
+        - {end: 38, value: "p000574"}
+        - {end: 39, value: "p000576"}
+        - {end: 40, value: "p000578"}
+        - {end: 41, value: "p000580"}
+        - {end: 42, value: "p000582"}
+        - {end: 43, value: "p000584"}
+        - {end: 44, value: "p000586"}
+        - {end: 45, value: "p000588"}
+        - {end: 46, value: "p000590"}
+        - {end: 47, value: "p000592"}
+        - {end: 48, value: "p000594"}
+        - {end: 49, value: "p000596"}
+        - {end: 50, value: "p000598"}
+      fallback: "p000598"
+    to:
+      kind: ranges
+      ranges:
+        - {end: 1, value: "p000501"}
+        - {end: 2, value: "p000503"}
+        - {end: 3, value: "p000505"}
+        - {end: 4, value: "p000507"}
+        - {end: 5, value: "p000509"}
+        - {end: 6, value: "p000511"}
+        - {end: 7, value: "p000513"}
+        - {end: 8, value: "p000515"}
+        - {end: 9, value: "p000517"}
+        - {end: 10, value: "p000519"}
+        - {end: 11, value: "p000521"}
+        - {end: 12, value: "p000523"}
+        - {end: 13, value: "p000525"}
+        - {end: 14, value: "p000527"}
+        - {end: 15, value: "p000529"}
+        - {end: 16, value: "p000531"}
+        - {end: 17, value: "p000533"}
+        - {end: 18, value: "p000535"}
+        - {end: 19, value: "p000537"}
+        - {end: 20, value: "p000539"}
+        - {end: 21, value: "p000541"}
+        - {end: 22, value: "p000543"}
+        - {end: 23, value: "p000545"}
+        - {end: 24, value: "p000547"}
+        - {end: 25, value: "p000549"}
+        - {end: 26, value: "p000551"}
+        - {end: 27, value: "p000553"}
+        - {end: 28, value: "p000555"}
+        - {end: 29, value: "p000557"}
+        - {end: 30, value: "p000559"}
+        - {end: 31, value: "p000561"}
+        - {end: 32, value: "p000563"}
+        - {end: 33, value: "p000565"}
+        - {end: 34, value: "p000567"}
+        - {end: 35, value: "p000569"}
+        - {end: 36, value: "p000571"}
+        - {end: 37, value: "p000573"}
+        - {end: 38, value: "p000575"}
+        - {end: 39, value: "p000577"}
+        - {end: 40, value: "p000579"}
+        - {end: 41, value: "p000581"}
+        - {end: 42, value: "p000583"}
+        - {end: 43, value: "p000585"}
+        - {end: 44, value: "p000587"}
+        - {end: 45, value: "p000589"}
+        - {end: 46, value: "p000591"}
+        - {end: 47, value: "p000593"}
+        - {end: 48, value: "p000595"}
+        - {end: 49, value: "p000597"}
+        - {end: 50, value: "p000599"}
+      fallback: "p000599"
+    columns: {}
+
+--- query
+query fixture_people() { match { $p: Person } return { count($p) as n } }
+--- expect unordered
+{"n":100}
+--- expect shape
+n: I64
+
+--- query
+query fixture_edges() { match { $p: Person $p knows $q } return { count($q) as n } }
+--- expect unordered
+{"n":50}
+--- expect shape
+n: I64

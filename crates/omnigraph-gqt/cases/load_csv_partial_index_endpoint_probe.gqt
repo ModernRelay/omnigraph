@@ -1,0 +1,72 @@
+# issue: none
+# traversal: auto
+# notes: A small endpoint lookup should retain useful partial index coverage.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person { id: String @key }
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 64
+    commits: 1
+    columns:
+      id: {kind: key, prefix: p, width: 6}
+
+--- mutate
+load csv "edge.csv" into edge:Knows mode overwrite header
+--- expect ok
+--- expect plan
+load validate edge_ri edge:Knows from Person: access probe
+load validate edge_ri edge:Knows to Person: access probe
+load executed: partitions 1 rows 1
+
+--- load generate: v1 seed: 43 mode: append
+tables:
+  - kind: node
+    name: Person
+    rows: 1
+    commits: 1
+    columns:
+      id: {kind: key, prefix: extra, width: 6}
+--- expect ok
+
+--- csv edge.csv
+from,to
+p000000,p000063
+
+--- mutate
+load csv "edge.csv" into edge:Knows mode overwrite header
+--- expect ok
+--- expect plan
+load validate edge_ri edge:Knows from Person: access probe
+load validate edge_ri edge:Knows to Person: access probe
+load executed: partitions 1 rows 1
+
+--- csv partial.csv
+from,to
+p000063,extra000000
+
+--- mutate
+load csv "partial.csv" into edge:Knows mode overwrite header
+--- expect ok
+--- expect plan
+load validate edge_ri edge:Knows from Person: access probe
+load validate edge_ri edge:Knows to Person: access probe
+load executed: partitions 1 rows 1
+
+--- query
+query across_fragments() { match { $a: Person $a knows $b } return { $a.id, $b.id } }
+--- expect unordered
+{"a.id": "p000063", "b.id": "extra000000"}
+--- expect shape
+a.id: String
+b.id: String

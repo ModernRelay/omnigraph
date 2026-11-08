@@ -1,0 +1,166 @@
+# issue: none
+# notes: The plan route (overwrite) and the pipeline route (append, merge) share one
+# notes: judgment: a duplicated key, an enum value outside its domain and an edge to a
+# notes: missing node refuse with the same message in all three modes, and two rows with
+# notes: a null unique tuple are exempt in all three. Cardinality is judged on each mode's
+# notes: own final image: appending a second edge from a source at its maximum refuses,
+# notes: while an overwrite that replaces every edge of the table counts only the new ones.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    id: String @key
+    email: String? @unique
+    kind: enum(a, b)
+}
+edge Knows: Person -> Person @card(0..1) {
+    w: I64
+}
+
+--- seed
+{"type":"Person","data":{"id":"p1","email":"p1@x","kind":"a"}}
+{"type":"Person","data":{"id":"p2","email":"p2@x","kind":"a"}}
+{"type":"Person","data":{"id":"p3","email":"p3@x","kind":"b"}}
+{"edge":"Knows","from":"p1","to":"p2","data":{"w":1}}
+
+--- csv dup_key.csv
+id,email,kind
+p9,x@x,a
+p9,y@x,a
+
+--- mutate
+load csv "dup_key.csv" into node:Person mode overwrite header
+
+--- expect error: @unique violation on Person.id: value 'p9'
+
+--- mutate
+load csv "dup_key.csv" into node:Person mode append header
+
+--- expect error: @unique violation on Person.id: value 'p9'
+
+--- mutate
+load csv "dup_key.csv" into node:Person mode merge header
+
+--- expect error: @unique violation on Person.id: value 'p9'
+
+--- csv bad_enum.csv
+id,email,kind
+p9,z@x,zzz
+
+--- mutate
+load csv "bad_enum.csv" into node:Person mode overwrite header
+
+--- expect error: invalid enum value 'zzz' for Person.kind
+
+--- mutate
+load csv "bad_enum.csv" into node:Person mode append header
+
+--- expect error: invalid enum value 'zzz' for Person.kind
+
+--- mutate
+load csv "bad_enum.csv" into node:Person mode merge header
+
+--- expect error: invalid enum value 'zzz' for Person.kind
+
+--- csv orphan.csv
+from,to,w
+p1,p9,1
+
+--- mutate
+load csv "orphan.csv" into edge:Knows mode overwrite header
+
+--- expect error: 'p9' not found in Person
+
+--- mutate
+load csv "orphan.csv" into edge:Knows mode append header
+
+--- expect error: 'p9' not found in Person
+
+--- mutate
+load csv "orphan.csv" into edge:Knows mode merge header
+
+--- expect error: 'p9' not found in Person
+
+--- csv null_unique.csv
+id,email,kind
+p8,,a
+p9,,b
+
+--- mutate
+load csv "null_unique.csv" into node:Person mode append header
+
+--- expect ok
+
+--- mutate
+load csv "null_unique.csv" into node:Person mode merge header
+
+--- expect ok
+
+--- csv everyone_null_unique.csv
+id,email,kind
+p1,p1@x,a
+p2,p2@x,a
+p3,p3@x,b
+p8,,a
+p9,,b
+
+--- mutate
+load csv "everyone_null_unique.csv" into node:Person mode overwrite header
+
+--- expect ok
+
+--- query
+query unchanged() {
+    match { $p: Person }
+    return { count($p) as n }
+}
+
+--- expect unordered
+{"n": 5}
+
+--- expect shape
+n: I64
+
+--- csv second_edge.csv
+from,to,w
+p1,p3,2
+
+--- mutate
+load csv "second_edge.csv" into edge:Knows mode append header
+
+--- expect error: @card violation on edge Knows: source 'p1' has 2 edges (max 1)
+
+--- mutate
+load csv "second_edge.csv" into edge:Knows mode merge header
+
+--- expect error: @card violation on edge Knows: source 'p1' has 2 edges (max 1)
+
+--- mutate
+load csv "second_edge.csv" into edge:Knows mode overwrite header
+
+--- expect ok
+
+--- query
+query replaced_edges() {
+    match {
+        $a: Person
+        $b: Person
+        $a knows $b
+    }
+    return { $a.id, $b.id }
+}
+
+--- expect unordered
+{"a.id": "p1", "b.id": "p3"}
+
+--- expect shape
+a.id: String
+b.id: String

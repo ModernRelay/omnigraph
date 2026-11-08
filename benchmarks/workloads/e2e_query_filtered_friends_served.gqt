@@ -1,0 +1,53 @@
+# issue: none
+# notes: One checked warmup precedes one measured query against a long-running server; an exact result check follows.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- query
+query filtered_friends() {
+    match { $p: Person $p.age >= 90 $p knows $q }
+    return { $p.name, $q.name }
+}
+--- expect unordered
+{"p.name":"p000590","q.name":"p000591"}
+{"p.name":"p000592","q.name":"p000593"}
+{"p.name":"p000594","q.name":"p000595"}
+{"p.name":"p000596","q.name":"p000597"}
+{"p.name":"p000598","q.name":"p000599"}
+--- expect shape
+p.name: String
+q.name: String
+
+--- query
+query filtered_friends() {
+    match { $p: Person $p.age >= 90 $p knows $q }
+    return { $p.name, $q.name }
+}
+--- expect unordered
+{"p.name":"p000590","q.name":"p000591"}
+{"p.name":"p000592","q.name":"p000593"}
+{"p.name":"p000594","q.name":"p000595"}
+{"p.name":"p000596","q.name":"p000597"}
+{"p.name":"p000598","q.name":"p000599"}
+--- expect shape
+p.name: String
+q.name: String
+
+--- query
+query filtered_friends() {
+    match { $p: Person $p.age >= 90 $p knows $q }
+    return { $p.name, $q.name }
+}
+--- expect unordered
+{"p.name":"p000590","q.name":"p000591"}
+{"p.name":"p000592","q.name":"p000593"}
+{"p.name":"p000594","q.name":"p000595"}
+{"p.name":"p000596","q.name":"p000597"}
+{"p.name":"p000598","q.name":"p000599"}
+--- expect shape
+p.name: String
+q.name: String

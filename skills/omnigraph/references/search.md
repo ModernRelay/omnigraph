@@ -39,6 +39,20 @@ remain null even when its source text is supplied.
 omnigraph embed --input raw.jsonl --output embedded.jsonl --spec embeddings.json
 ```
 
+The spec maps each type to its vector and the one source property its
+`@embed` names; `fields` must hold exactly that property:
+
+```json
+{ "dimension": 1536, "types": { "Chunk": { "target": "embedding", "fields": ["text"] } } }
+```
+
+The source value is embedded exactly as stored, with no type or field-name
+template, which is also how a text `nearest($c.embedding, $q)` embeds `$q`; a
+chunk whose text equals the query lies at distance zero under a
+role-independent model. A record with an absent, null or blank source gets no
+vector. Vectors from older `omnigraph embed` builds embedded a
+`type: <T>\n<field>: <value>` template; regenerate them with `--reembed-all`.
+
 By default it fills missing vectors. Load the output explicitly afterward.
 
 Use the same file/spec form with `--reembed-all` to replace selected vectors,
@@ -60,14 +74,15 @@ Ranking functions lead the `order` clause. `nearest` and `rrf` require `limit N`
 BM25 alone does not, though a limit keeps output bounded. `nearest` sorts by
 ascending distance and `bm25` by descending relevance; secondary keys follow
 the score, then entity IDs break ties. This order also holds through traversals.
-A bounded BM25 scan with no secondary keys may select equal-score rows at its
-cutoff by scan order before the final sort.
+A `bm25` ordering reads every text match before the final sort, so equal-score
+rows at a `limit` cutoff are chosen by the secondary keys and then entity ID,
+not by scan order.
 
-Omit a direction on a search key: `bm25(...)` always ranks by descending score
-(`asc`/`desc` are ignored), and a direction after `nearest(...)` is a parse
-error. Only one search function may lead `order`; a second one fails when the
-query runs ("search functions must lead the order clause"), even though `lint`
-passes.
+Omit a direction on a search key: a relevance ranking orders most relevant
+first, so `asc` on a `bm25(...)` or `rrf(...)` key is refused at type checking
+(`T54`; a redundant `desc` is accepted), and any direction after
+`nearest(...)` is a parse error. Only one search function may lead `order`; one in a later position is
+refused at type checking (`T42`), so `lint` reports it.
 
 ### Vector similarity
 
@@ -119,17 +134,37 @@ query scored_titles($q: String) {
 }
 ```
 
-`nearest(...) as distance` works the same way and returns squared L2 distance.
-Without an alias, the result column is `d._score` or `d._distance`. A different
-expression or one without the matching leading order key is refused (`T33`).
-Ranks under aggregates (`T32`), `rrf(...)` (`T37`), and full-text predicates
-(`T35`) cannot be projected; an expression used only as an `rrf` arm is not a
-projectable score either.
+`nearest(...) as distance` works the same way and returns squared L2
+distance, and `rrf(...) as score` returns the fused score as `F64`. Without an
+alias, the result column is `d._score`, `d._distance`, or `d._rrf` (named after
+the first arm's binding). A different expression, or one without the matching
+leading order key, is refused (`T33`), including a `nearest`/`bm25` that
+appears only as an `rrf` arm. Ranks under aggregates (`T32`) and full-text
+predicates (`T35`) cannot be projected.
 
 A search ordering may accompany aggregates, but it only selects the rows that
 are aggregated: the top-`limit` window under `nearest`, every text match under
-`bm25`. Groups are not score-ranked, and projecting a score beside an aggregate
-is refused (`T9`).
+`bm25`. Groups are not score-ranked: keys written after the search function
+order the groups (or `return distinct` rows), then every group key ascending;
+with none, output is unordered. Projecting a score beside an aggregate is
+refused (`T9`).
+
+### What a ranked read reports
+
+A read ordered by `nearest`, `bm25` or `rrf` carries a `ranking` object in its
+JSON envelope (`query --json`, `--format toon`, the `--format jsonl` metadata
+line, `POST /query`, stored-query calls):
+
+```json
+"ranking": { "by": "rrf", "order": "descending", "exhaustive": true, "score_columns": ["score"] }
+```
+
+`order` is `ascending` for a `nearest` distance and `descending` for a `bm25`
+or fused score. `exhaustive: false` means the `ann_nprobes` cap left
+partitions unsearched, so a nearer row may exist (raise `ann_nprobes`); `bm25`
+is always exhaustive, and `rrf` is when every `nearest` arm is. `score_columns`
+lists the returned columns that hold the ranking's own score. A read whose
+order is no search has no `ranking`.
 
 ### Text filter (not ranking — no `limit` required)
 
@@ -142,15 +177,25 @@ match {
 }
 ```
 
+A full-text call (`search`, `fuzzy`, `match_text`, `bm25`) needs a full-text
+index on its property: a one-column `@index` or `@key` on a free-text String
+node property. A call on any other property, an enum included, is refused at
+type checking (`T27`); compare enums with `=`. The analyzer folds case and
+stems, so `"deep"` matches `"Deep Learning"`. `search`, `fuzzy` and
+`match_text` must stand alone or be compared `= true`, joined only by `and`;
+`= false`, `not search(...)` and `or` are refused (`T38`). Negate with a
+block: `not { search($d.title, $q) }`.
+
 ## The Key Pattern: Scope First, Rank Second
 
-Filter with graph traversal before invoking vector or text ranking. Ranking over a narrow set is both cheaper and more relevant.
+Filter with graph traversal before invoking vector or text ranking. Constrain the ranked binding with a traversal or filter so the ranking answers within that scope: `limit 10` then means the top ten that satisfy the pattern.
 
 ```gq
 query related_chunks($artifact_slug: String, $q: Vector(1536)) {
     match {
-        $a: InformationArtifact { slug: $artifact_slug }
+        $c: Chunk                                 // the ranked binding
         $c partOfArtifact $a                      // scope: only this artifact's chunks
+        $a.slug = $artifact_slug
     }
     return { $c.text }
     order { nearest($c.embedding, $q) }           // rank: vector similarity within scope
@@ -158,7 +203,18 @@ query related_chunks($artifact_slug: String, $q: Vector(1536)) {
 }
 ```
 
-Don't rank over the entire chunk set if you know a traversal can narrow it first.
+Scoping fixes the answer, not always the cost: a `nearest` or `rrf` scan
+prefilters to the traversal's eligible entities only when they are few:
+within `OMNIGRAPH_RRF_GATE_RATIO` of the ranked type (default 10%) and at most
+`OMNIGRAPH_RRF_GATE_MAX_IDS` (default 100000). Otherwise, and
+always for a standalone `bm25`, the ranked type is scanned and the traversal
+keeps the rows it reaches.
+
+The ranked binding starts the traversal whichever binding `match` declares
+first, and whether or not it is declared: with `$a: InformationArtifact { … }`
+first, then `$c partOfArtifact $a`, ranked on `$c`, the query ranks `Chunk`
+and keeps the chunks the traversal reaches. An `rrf` whose two arms rank two
+bindings one traversal connects is refused at type checking (`T59`).
 
 A standalone `nearest` ordering widens an underfilled candidate set, finally
 using an exact scan if needed to fill the limit with available survivors.
@@ -166,6 +222,10 @@ An `rrf` vector arm retains a top-k window: an entity outside that window has
 no vector contribution, so filtering through a traversal can shorten or change
 the fused answer. Full-text arms in `rrf` remain unbounded over their eligible
 matches.
+
+A `nearest` scan uses only the IVF_FLAT, L2 vector index Omnigraph builds; an
+index written another way (another metric, quantized vectors, HNSW) is
+skipped and every row is ranked flat.
 
 An indexed `nearest` scan reads a bounded number of partitions per index delta
 (`OMNIGRAPH_ANN_NPROBES`, default 20; `0` removes the cap) and widens only to
@@ -176,10 +236,13 @@ whole-type pass on every execution. `OMNIGRAPH_RRF_GATE_RATIO` and
 pushes into a `nearest` or `rrf` scan; leave them unset in normal operation.
 
 `OMNIGRAPH_ANN_NPROBES` and `OMNIGRAPH_RRF_PLAN` are not free tunables. Each is
-the process default of a `process`-scope session setting (`ann_nprobes`,
-`rrf_plan`): the server reads it once at startup and the CLI once per run, a
+the process default of a session setting (`ann_nprobes`, `request` scope;
+`rrf_plan`, `process` scope): the server reads it once at startup and the CLI once per run, a
 value outside the setting's row refuses that start instead of running a
-default, and `show all;` reports the setting with its value and source.
+default, and `show all;` reports the setting with its value and source. An
+ad-hoc query may set `ann_nprobes` for itself (`set ann_nprobes = 40;` before
+the declaration, `--set ann_nprobes=40`, or the `settings` field of
+`POST /query`); `rrf_plan` is refused in a served request.
 
 ## Model / Config
 
@@ -206,6 +269,13 @@ For a served graph, declare a named provider under `providers.embedding` in
 be `${ENV_VAR}` references and are resolved by the server at startup. Generated
 vectors are finite, nonzero, and L2-normalized.
 
-After upgrading a Lance 9/10 store, full-text queries can require
-`rebuild-full-text-indexes` on each live branch. Ordinary reads and vector
-search do not depend on that rebuild; see [`commands.md`](commands.md#rebuild-full-text-indexes--explicit-analyzer-upgrade).
+A full-text call can fail with HTTP `409` before any scan.
+`full_text_index_required` (a table version holds rows but no part of the
+index) clears with
+`omnigraph index build --target <target> --branch <branch>`.
+`full_text_index_rebuild_required` (an index without a certified analyzer,
+such as one built before Lance 11) clears with `index rebuild --kind full-text`
+on each live branch that needs search; see
+[`commands.md`](commands.md#index-rebuild--explicit-analyzer-upgrade). Retrying
+clears neither, and historical snapshots of the old version stay refused.
+Ordinary reads and vector search depend on neither.

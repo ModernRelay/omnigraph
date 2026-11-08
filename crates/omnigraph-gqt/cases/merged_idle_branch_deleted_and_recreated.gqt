@@ -1,0 +1,142 @@
+# issue: none
+# notes: s is merged and writes nothing more, so its head is the merge base of every
+# notes: later merge of s while main moves on. After s is deleted, a branch forked
+# notes: before the delete still merges on the base it shares with main through s,
+# notes: and a branch created again under the name s starts from main. Each restart
+# notes: makes the next merge read its ancestry from storage.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"a","age":0}}
+{"type":"Person","data":{"name":"b","age":0}}
+{"type":"Person","data":{"name":"c","age":0}}
+
+--- mutate
+branch create s
+
+--- expect ok
+
+--- mutate branch: s
+query set_a_on_s() {
+    update Person set { age: 1 } where name = "a"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query set_b_on_main() {
+    update Person set { age: 1 } where name = "b"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge s
+
+--- expect outcome: merged
+
+--- restart
+
+--- mutate
+branch merge s
+
+--- expect outcome: already_up_to_date
+
+--- mutate
+query set_b_again_on_main() {
+    update Person set { age: 2 } where name = "b"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge s
+
+--- expect outcome: already_up_to_date
+
+--- mutate
+branch create t from s
+
+--- expect ok
+
+--- mutate branch: t
+query set_c_on_t() {
+    update Person set { age: 1 } where name = "c"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch delete s
+
+--- expect ok
+
+--- restart
+
+--- mutate
+branch merge t
+
+--- expect outcome: merged
+
+--- query
+query values_after_t() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name": "a", "p.age": 1}
+{"p.name": "b", "p.age": 2}
+{"p.name": "c", "p.age": 1}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- mutate
+branch create s
+
+--- expect ok
+
+--- mutate
+branch merge s
+
+--- expect outcome: already_up_to_date
+
+--- mutate branch: s
+query set_a_on_recreated_s() {
+    update Person set { age: 5 } where name = "a"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge s
+
+--- expect outcome: fast_forward
+
+--- query
+query values_after_recreated_s() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name": "a", "p.age": 5}
+{"p.name": "b", "p.age": 2}
+{"p.name": "c", "p.age": 1}
+
+--- expect shape
+p.name: String
+p.age: I32

@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - Andrew
 created: 2026-08-31
-updated: 2026-08-31
+updated: 2026-10-18
 discussion: null
 supersedes: []
 superseded_by: []
@@ -207,3 +207,24 @@ None for this slice. Incremental full-text proof propagation is out of scope.
   refusal, and a controlled v11-only cutover, and authorized implementation.
   Artifact-scoped proof and reuse of the existing writer keep that boundary
   enforceable without a Lance fork or migration framework.
+- 2026-10-09: An untrained segment, built from no rows by the same builder
+  with `train(false)`, carries the analyzer and the same proof. Lance applies
+  an analyzer only through a segment, so a declared column with no segment
+  searched with a bare tokenizer after a table's first rows, an overwrite or
+  the addition of a full-text property. Every writer now declares such a segment in the commit that
+  leaves a version without one, and ensure builds postings where no segment
+  covers a fragment. The certificate still vouches only for segments the
+  engine's builder wrote from rows, all of them or none; merged or remapped
+  postings remain out of scope.
+- 2026-10-18: The Lance 13.0.0 dependency audit retains analyzer generation
+  `lance11.0.0-frostem1.20260821.3-v1`: the generation identifies compatible
+  immutable artifacts, not the running Lance release. Against 11.0.0, the
+  default simple/English tokenizer construction and filter order are unchanged;
+  `lance-tokenizer` adds deferred stream-error handling, while frostem,
+  stop-words and Unicode normalization retain their audited versions. The FTS
+  posting-format source is unchanged. The resolved-package guard now binds
+  that generation to the 13.0.0 Lance family. Genuine predecessor qualification
+  must cold-read certified Lance 11 artifacts before any rebuild, retain their
+  UUIDs and certificate bytes, and verify indexed and uncovered rows. This
+  does not relax refusal of uncertified Lance 10 artifacts or qualify arbitrary
+  rollback across a different analyzer generation.

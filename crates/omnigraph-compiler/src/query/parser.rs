@@ -99,16 +99,26 @@ pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, Que
                     Rule::branch_stmt => {
                         statement = Some(FileBody::Branch(parse_branch_stmt(inner)?));
                     }
+                    Rule::commit_stmt => {
+                        statement = Some(FileBody::Commit(parse_commit_stmt(inner)?));
+                    }
+                    Rule::load_stmt => {
+                        statement = Some(FileBody::Load(parse_load_stmt(inner)?));
+                    }
                     Rule::show_stmt => {
                         statement = Some(FileBody::Show(parse_setting_target(inner)?));
                     }
                     Rule::explain_stmt => {
-                        statement = Some(FileBody::Explain(parse_explain_stmt(inner)?));
+                        statement = Some(parse_explain_stmt(inner)?);
                     }
                     Rule::statement_trailer => {
                         let subject = match statement {
                             Some(FileBody::Show(_)) => "a show statement",
-                            Some(FileBody::Explain(_)) => "an `explain` statement",
+                            Some(FileBody::Explain(_) | FileBody::ExplainLoad(_)) => {
+                                "an `explain` statement"
+                            }
+                            Some(FileBody::Commit(_)) => "a commit statement",
+                            Some(FileBody::Load(_)) => "a load statement",
                             _ => "a branch statement",
                         };
                         return Err(diagnostic_at(
@@ -166,15 +176,25 @@ pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, Que
     })
 }
 
+/// `explain` wraps one query declaration or one load statement; the wrapped
+/// statement parses exactly as it does bare.
 fn parse_explain_stmt(
     pair: pest::iterators::Pair<Rule>,
-) -> std::result::Result<QueryDecl, QueryDiagnostic> {
-    let decl = pair
+) -> std::result::Result<FileBody, QueryDiagnostic> {
+    let wrapped = pair
         .into_inner()
-        .find(|inner| inner.as_rule() == Rule::query_decl)
-        .expect("grammar: explain_stmt holds one query_decl after kw_explain");
-    let position = position_of(&decl);
-    parse_query_decl(decl).map_err(|error| compiler_error_to_diagnostic(error, position))
+        .find(|inner| matches!(inner.as_rule(), Rule::query_decl | Rule::load_stmt))
+        .expect("grammar: explain_stmt holds one query_decl or load_stmt after kw_explain");
+    match wrapped.as_rule() {
+        Rule::load_stmt => Ok(FileBody::ExplainLoad(parse_load_stmt(wrapped)?)),
+        Rule::query_decl => {
+            let position = position_of(&wrapped);
+            parse_query_decl(wrapped)
+                .map(FileBody::Explain)
+                .map_err(|error| compiler_error_to_diagnostic(error, position))
+        }
+        other => unreachable!("grammar: explain_stmt wraps no {other:?}"),
+    }
 }
 
 /// The position of `pair`'s start in the source it was parsed from.
@@ -294,6 +314,27 @@ fn parse_branch_stmt(
         .find(|inner| inner.as_rule() != Rule::kw_branch)
         .expect("grammar: branch_stmt holds one form after kw_branch");
     let rule = form.as_rule();
+    let has = |wanted: Rule| {
+        form.clone()
+            .into_inner()
+            .any(|inner| inner.as_rule() == wanted)
+    };
+    let as_commit = has(Rule::as_commit_clause);
+    let dry_run = has(Rule::dry_run_clause);
+    let between = has(Rule::kw_to);
+    let page = parse_diff_page_clause(&form)?;
+    let from_commit = form
+        .clone()
+        .into_inner()
+        .find(|inner| inner.as_rule() == Rule::create_from_commit)
+        .map(|pair| {
+            let literal = pair
+                .into_inner()
+                .find(|inner| inner.as_rule() == Rule::string_lit)
+                .expect("grammar: create_from_commit names one string literal");
+            decode_graph_commit_id(&literal)
+        })
+        .transpose()?;
     let names = form
         .into_inner()
         .filter(|inner| inner.as_rule() == Rule::branch_name)
@@ -301,20 +342,271 @@ fn parse_branch_stmt(
         .collect::<std::result::Result<Vec<_>, QueryDiagnostic>>()?;
     let mut names = names.into_iter();
     match (rule, names.next(), names.next()) {
-        (Rule::branch_create, Some(name), from) => {
-            Ok(BranchStmt::Write(BranchWrite::Create { name, from }))
-        }
+        (Rule::branch_create, Some(name), from) => Ok(BranchStmt::Write(BranchWrite::Create {
+            name,
+            from: from_commit
+                .map(BranchCreateFrom::Commit)
+                .or(from.map(BranchCreateFrom::Branch)),
+        })),
         (Rule::branch_delete, Some(name), None) => {
             Ok(BranchStmt::Write(BranchWrite::Delete { name }))
         }
-        (Rule::branch_merge, Some(source), into) => {
-            Ok(BranchStmt::Write(BranchWrite::Merge { source, into }))
+        (Rule::branch_merge, Some(source), into) if dry_run => {
+            Ok(BranchStmt::Read(BranchRead::MergeDryRun { source, into }))
         }
+        (Rule::branch_merge, Some(source), into) => Ok(BranchStmt::Write(BranchWrite::Merge {
+            source,
+            into,
+            as_commit,
+        })),
         (Rule::branch_list, None, None) => Ok(BranchStmt::List),
+        (Rule::branch_merge_base, Some(source), into) => {
+            Ok(BranchStmt::Read(BranchRead::MergeBase { source, into }))
+        }
+        (Rule::branch_diff, Some(from), Some(to)) if between => {
+            Ok(BranchStmt::Read(BranchRead::Diff {
+                sides: BranchDiffSides::Between { from, to },
+                page,
+            }))
+        }
+        (Rule::branch_diff, Some(source), into) => Ok(BranchStmt::Read(BranchRead::Diff {
+            sides: BranchDiffSides::Branch { source, into },
+            page,
+        })),
         (other, _, _) => {
             unreachable!("grammar: every branch form fixes its name arity, got {other:?}")
         }
     }
+}
+
+/// The `after page "<token>"` and `limit <n>` clauses of `branch diff`; both
+/// absent on every other form. A limit is at least one (`Q004` otherwise).
+fn parse_diff_page_clause(
+    form: &pest::iterators::Pair<Rule>,
+) -> std::result::Result<DiffPageClause, QueryDiagnostic> {
+    let mut page = DiffPageClause::default();
+    for clause in form.clone().into_inner() {
+        match clause.as_rule() {
+            Rule::diff_after_page => {
+                let literal = clause
+                    .into_inner()
+                    .find(|inner| inner.as_rule() == Rule::string_lit)
+                    .expect("grammar: `after page` names one string literal");
+                let token = decode_string_literal(literal.as_str())
+                    .map_err(|error| diagnostic_at(Q004, parse_error_message(error), &literal))?;
+                page.after_page = Some(token);
+            }
+            Rule::diff_limit => {
+                let integer = clause
+                    .into_inner()
+                    .find(|inner| inner.as_rule() == Rule::integer)
+                    .expect("grammar: `limit` names one integer");
+                let limit = integer
+                    .as_str()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|limit| *limit > 0)
+                    .ok_or_else(|| {
+                        diagnostic_at(
+                            Q004,
+                            format!("diff limit {} must be a positive integer", integer.as_str()),
+                            &integer,
+                        )
+                    })?;
+                page.limit = Some(limit);
+            }
+            _ => {}
+        }
+    }
+    Ok(page)
+}
+
+fn parse_commit_stmt(
+    pair: pest::iterators::Pair<Rule>,
+) -> std::result::Result<CommitWrite, QueryDiagnostic> {
+    let form = pair
+        .into_inner()
+        .find(|inner| inner.as_rule() != Rule::kw_commit)
+        .expect("grammar: commit_stmt holds one form after kw_commit");
+    let rule = form.as_rule();
+    let literal = form
+        .into_inner()
+        .find(|inner| inner.as_rule() == Rule::string_lit)
+        .expect("grammar: every commit form names one string literal");
+    let graph_commit_id = decode_graph_commit_id(&literal)?;
+    match rule {
+        Rule::commit_publish => Ok(CommitWrite::Publish { graph_commit_id }),
+        Rule::commit_drop => Ok(CommitWrite::Drop { graph_commit_id }),
+        other => unreachable!("grammar: commit_stmt admits no {other:?}"),
+    }
+}
+
+fn parse_load_stmt(
+    pair: pest::iterators::Pair<Rule>,
+) -> std::result::Result<LoadStmt, QueryDiagnostic> {
+    let at = pair.clone();
+    let mut source = None;
+    let mut target = None;
+    let mut mode = None;
+    let mut delimiter = None;
+    let mut header = None;
+    let mut columns = None;
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::string_lit => {
+                let decoded = decode_string_literal(inner.as_str())
+                    .map_err(|error| diagnostic_at(Q004, parse_error_message(error), &inner))?;
+                if decoded.is_empty() || decoded.chars().any(char::is_control) {
+                    return Err(diagnostic_at(
+                        Q004,
+                        "a load source is a non-empty URI without control characters",
+                        &inner,
+                    ));
+                }
+                source = Some(decoded);
+            }
+            Rule::load_target => {
+                let mut parts = inner.clone().into_inner();
+                let kind = parts
+                    .next()
+                    .expect("grammar: load_target opens with load_kind");
+                let name = parts
+                    .next()
+                    .expect("grammar: load_target closes with type_name")
+                    .as_str()
+                    .to_string();
+                target = Some(match kind.as_str() {
+                    "node" => LoadTarget::Node(name),
+                    "edge" => LoadTarget::Edge(name),
+                    other => unreachable!("grammar: load_kind admits no {other}"),
+                });
+            }
+            Rule::load_option => {
+                let option = inner
+                    .clone()
+                    .into_inner()
+                    .next()
+                    .expect("grammar: load_option holds one form");
+                match option.as_rule() {
+                    Rule::load_mode => {
+                        refuse_repeated_load_option(mode.is_some(), "mode", &option)?;
+                        let name = option
+                            .into_inner()
+                            .find(|part| part.as_rule() == Rule::load_mode_name)
+                            .expect("grammar: load_mode names its mode");
+                        mode = Some(match name.as_str() {
+                            "overwrite" => LoadStmtMode::Overwrite,
+                            "append" => LoadStmtMode::Append,
+                            "merge" => LoadStmtMode::Merge,
+                            other => unreachable!("grammar: load_mode_name admits no {other}"),
+                        });
+                    }
+                    Rule::load_delimiter => {
+                        refuse_repeated_load_option(delimiter.is_some(), "delimiter", &option)?;
+                        let literal = option
+                            .into_inner()
+                            .find(|part| part.as_rule() == Rule::string_lit)
+                            .expect("grammar: load_delimiter holds one string literal");
+                        let decoded = decode_string_literal(literal.as_str()).map_err(|error| {
+                            diagnostic_at(Q004, parse_error_message(error), &literal)
+                        })?;
+                        let bytes = decoded.as_bytes();
+                        if bytes.len() != 1 || !bytes[0].is_ascii() || bytes[0].is_ascii_control() {
+                            return Err(diagnostic_at(
+                                Q004,
+                                "a load delimiter is one printable ASCII character",
+                                &literal,
+                            ));
+                        }
+                        delimiter = Some(bytes[0]);
+                    }
+                    Rule::load_header => {
+                        refuse_repeated_load_option(header.is_some(), "header", &option)?;
+                        header = Some(true);
+                    }
+                    Rule::load_columns => {
+                        refuse_repeated_load_option(columns.is_some(), "columns", &option)?;
+                        let mut names: Vec<String> = Vec::new();
+                        for part in option
+                            .into_inner()
+                            .filter(|part| part.as_rule() == Rule::ident)
+                        {
+                            let name = part.as_str().to_string();
+                            if names.contains(&name) {
+                                return Err(diagnostic_at(
+                                    Q004,
+                                    format!("column `{name}` is named twice"),
+                                    &part,
+                                ));
+                            }
+                            names.push(name);
+                        }
+                        columns = Some(names);
+                    }
+                    other => unreachable!("grammar: load_option admits no {other:?}"),
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(mode) = mode else {
+        return Err(diagnostic_at(
+            Q004,
+            "a load statement names its mode: `mode overwrite`, `mode append` or `mode merge`",
+            &at,
+        ));
+    };
+    let header = header.unwrap_or(false);
+    if !header && columns.is_none() {
+        return Err(diagnostic_at(
+            Q004,
+            "a load without `header` names its columns: `columns (a, b, …)`",
+            &at,
+        ));
+    }
+    Ok(LoadStmt {
+        source: source.expect("grammar: load_stmt names one source literal"),
+        target: target.expect("grammar: load_stmt names one target"),
+        mode,
+        delimiter: delimiter.unwrap_or(b','),
+        header,
+        columns,
+    })
+}
+
+fn refuse_repeated_load_option(
+    seen: bool,
+    option: &str,
+    at: &pest::iterators::Pair<Rule>,
+) -> std::result::Result<(), QueryDiagnostic> {
+    if seen {
+        return Err(diagnostic_at(
+            Q004,
+            format!("`{option}` is given twice in one load statement"),
+            at,
+        ));
+    }
+    Ok(())
+}
+
+/// A quoted graph commit id operand: decoded, non-empty, untrimmed-equal
+/// and free of control characters (`Q004` otherwise).
+fn decode_graph_commit_id(
+    literal: &pest::iterators::Pair<Rule>,
+) -> std::result::Result<String, QueryDiagnostic> {
+    let graph_commit_id = decode_string_literal(literal.as_str())
+        .map_err(|error| diagnostic_at(Q004, parse_error_message(error), literal))?;
+    if graph_commit_id.is_empty()
+        || graph_commit_id.trim() != graph_commit_id
+        || graph_commit_id.chars().any(char::is_control)
+    {
+        return Err(diagnostic_at(
+            Q004,
+            format!("graph commit id {graph_commit_id:?} is not a commit id"),
+            literal,
+        ));
+    }
+    Ok(graph_commit_id)
 }
 
 fn parse_branch_name(
@@ -412,12 +704,15 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
     let mut params = Vec::new();
     let mut match_clause = Vec::new();
     let mut return_clause = Vec::new();
+    let mut distinct = false;
     let mut order_clause = Vec::new();
     let mut limit = None;
     let mut mutations = Vec::new();
+    let mut write_clause = None;
 
     for item in inner {
         match item.as_rule() {
+            Rule::as_commit_clause | Rule::as_unattached_clause => write_clause = Some(item),
             Rule::param_list => {
                 for p in item.into_inner() {
                     if let Rule::param = p.as_rule() {
@@ -476,8 +771,12 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
                                 }
                                 Rule::return_clause => {
                                     for proj in section.into_inner() {
-                                        if let Rule::projection = proj.as_rule() {
-                                            return_clause.push(parse_projection(proj)?);
+                                        match proj.as_rule() {
+                                            Rule::kw_distinct => distinct = true,
+                                            Rule::projection => {
+                                                return_clause.push(parse_projection(proj)?);
+                                            }
+                                            _ => {}
                                         }
                                     }
                                 }
@@ -520,6 +819,28 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
             _ => {}
         }
     }
+    let write_mode = match write_clause {
+        None => MutationWriteMode::Publish,
+        Some(clause) => {
+            if mutations.is_empty() {
+                let spelled = match clause.as_rule() {
+                    Rule::as_commit_clause => "as commit",
+                    _ => "as unattached branch",
+                };
+                return Err(query_error_at(
+                    format!("`{spelled}` applies to a mutation; query `{name}` is read-only"),
+                    &clause,
+                ));
+            }
+            match clause.as_rule() {
+                Rule::as_commit_clause => MutationWriteMode::AsCommit,
+                Rule::as_unattached_clause => MutationWriteMode::Unattached {
+                    base: parse_unattached_base(clause).map_err(CompilerError::query)?,
+                },
+                other => unreachable!("grammar: query_decl admits no write clause {other:?}"),
+            }
+        }
+    };
 
     Ok(QueryDecl {
         name,
@@ -528,10 +849,35 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
         params,
         match_clause,
         return_clause,
+        distinct,
         order_clause,
         limit,
         mutations,
+        write_mode,
     })
+}
+
+/// The `on` operand of an `as_unattached_clause`, `None` when unspelled. A
+/// literal passes the commit-id checks of a commit statement; a variable
+/// records its name for the typechecker to resolve against the parameters.
+fn parse_unattached_base(
+    clause: pest::iterators::Pair<Rule>,
+) -> std::result::Result<Option<UnattachedBase>, QueryDiagnostic> {
+    let Some(operand) = clause
+        .into_inner()
+        .find(|inner| matches!(inner.as_rule(), Rule::string_lit | Rule::variable))
+    else {
+        return Ok(None);
+    };
+    match operand.as_rule() {
+        Rule::variable => Ok(Some(UnattachedBase::Param(
+            operand.as_str()[1..].to_string(),
+        ))),
+        Rule::string_lit => Ok(Some(UnattachedBase::Literal(decode_graph_commit_id(
+            &operand,
+        )?))),
+        other => unreachable!("grammar: as_unattached_clause admits no operand {other:?}"),
+    }
 }
 
 fn parse_query_annotation(pair: pest::iterators::Pair<Rule>) -> Result<(&'static str, String)> {
@@ -1036,9 +1382,19 @@ fn parse_operand(pair: pest::iterators::Pair<Rule>, scope: NameScope<'_>) -> Res
         Rule::agg_call => {
             let mut parts = inner.into_inner();
             let func = parse_agg_func(parts.next().unwrap().as_str())?;
-            let arg = parse_expr(parts.next().unwrap(), scope)?;
+            let mut distinct = false;
+            let mut arg = None;
+            for part in parts {
+                match part.as_rule() {
+                    Rule::kw_distinct => distinct = true,
+                    _ => arg = Some(parse_expr(part, scope)?),
+                }
+            }
+            let arg =
+                arg.ok_or_else(|| CompilerError::Parse(format!("{func} needs an argument")))?;
             Ok(Expr::Aggregate {
                 func,
+                distinct,
                 arg: Box::new(arg),
             })
         }
@@ -1211,7 +1567,7 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
                 .as_str()
                 .parse()
                 .map_err(|e| query_error_at(format!("invalid integer: {}", e), &inner))?;
-            Ok(Literal::Integer(n))
+            Ok(Literal::Integer(i128::from(n)))
         }
         Rule::float_lit => {
             let f: f64 = inner
@@ -1293,8 +1649,12 @@ fn parse_ordering(pair: pest::iterators::Pair<Rule>) -> Result<Ordering> {
     let first = inner
         .next()
         .ok_or_else(|| CompilerError::Parse("ordering cannot be empty".to_string()))?;
-    let (expr, descending) = match first.as_rule() {
-        Rule::nearest_ordering => (parse_nearest_ordering(first, NameScope::Alias)?, false),
+    let (expr, descending, explicit) = match first.as_rule() {
+        Rule::nearest_ordering => (
+            parse_nearest_ordering(first, NameScope::Alias)?,
+            false,
+            false,
+        ),
         Rule::expr => {
             let expr = parse_expr(first, NameScope::Alias)?;
             let direction = inner.next();
@@ -1306,8 +1666,9 @@ fn parse_ordering(pair: pest::iterators::Pair<Rule>) -> Result<Ordering> {
                     direction,
                 ));
             }
+            let explicit = direction.is_some();
             let descending = direction.is_some_and(|p| p.as_str() == "desc");
-            (expr, descending)
+            (expr, descending, explicit)
         }
         other => {
             return Err(CompilerError::Parse(format!(
@@ -1317,7 +1678,11 @@ fn parse_ordering(pair: pest::iterators::Pair<Rule>) -> Result<Ordering> {
         }
     };
 
-    Ok(Ordering { expr, descending })
+    Ok(Ordering {
+        expr,
+        descending,
+        explicit,
+    })
 }
 
 fn parse_nearest_ordering(pair: pest::iterators::Pair<Rule>, scope: NameScope<'_>) -> Result<Expr> {

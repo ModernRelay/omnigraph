@@ -42,6 +42,31 @@
 //! finalize, branch merge, schema apply, and maintenance) MUST go through
 //! `acquire_many` so all callers agree on acquisition order — this is
 //! how lock-order inversion deadlock is prevented.
+//!
+//! ## Gates
+//!
+//! Every place where one operation waits for another in this process is one
+//! of six gates, and this module is where they live: `table` (a
+//! [`QueueSlot`] per `(table_key, branch)`), `branch` (a slot per branch),
+//! `schema_shared` and `schema_exclusive` (the two sides of
+//! [`SchemaGateSlot`]), `export` (the export cut against destructive
+//! controls) and `coordinator_cas` (the handle's coordinator pointer swap,
+//! `Omnigraph::install_coordinator`). A gate acquisition crosses three
+//! decision seams, `gate.<name>.acquire` on entering the wait,
+//! `gate.<name>.hold` once the primitive is owned and `gate.<name>.release`
+//! when the guard drops, each outside any arbiter turn and each an
+//! observation site: the decision is read and passed, so an installed
+//! observer (GQT measure, the trace, a DST probe) sees every wait without the
+//! engine changing behavior. The `export` gate never waits: its two `try_*`
+//! acquisitions refuse instead, so it crosses `hold` and `release` only. A
+//! lost coordinator CAS round is a wait of the CAS kind: every round crosses
+//! `acquire`, the winning swap `hold`, and a refused install `refused`, the
+//! one `acquire` that ends with no hold. Not gates, and so outside this
+//! module: `Omnigraph::feed_cut_cache` and `Omnigraph::merge_authority_cache`,
+//! caches held across no round trip, and the operator-local locks under
+//! `engine/`, intra-query state. The `forbidden_apis` guard refuses a new
+//! blocking primitive elsewhere in `db/` and `exec/` without a sentinel
+//! saying why it is not a gate.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -50,6 +75,8 @@ use tokio::sync::{
     Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard,
     RwLock as AsyncRwLock,
 };
+
+use crate::seams::{DecideSeam, decide_seam};
 
 /// DST seam: one write-queue slot — the lock plus its RELEASE EPOCH.
 /// The epoch closes an arrival-order leak: without it the mutex RELEASE
@@ -61,16 +88,109 @@ use tokio::sync::{
 pub(crate) struct QueueSlot {
     lock: Arc<AsyncMutex<()>>,
     releases: std::sync::atomic::AtomicU64,
+    gate: &'static GateSeams,
 }
 
 impl QueueSlot {
-    fn new() -> Arc<Self> {
+    fn new(gate: &'static GateSeams) -> Arc<Self> {
         Arc::new(Self {
             lock: Arc::new(AsyncMutex::new(())),
             releases: std::sync::atomic::AtomicU64::new(0),
+            gate,
         })
     }
 }
+
+/// The three seams one gate crosses (module doc §Gates).
+pub(crate) struct GateSeams {
+    acquire: &'static DecideSeam,
+    hold: &'static DecideSeam,
+    release: &'static DecideSeam,
+}
+
+decide_seam! {
+    /// A writer enters the wait for its `(table_key, branch)` slot.
+    pub static GATE_TABLE_ACQUIRE = ("gate.table.acquire", Unreachable, [Fail]);
+}
+decide_seam! {
+    /// The `(table_key, branch)` slot is owned.
+    pub static GATE_TABLE_HOLD = ("gate.table.hold", Unreachable, [Fail]);
+}
+decide_seam! {
+    /// The `(table_key, branch)` slot's guard drops.
+    pub static GATE_TABLE_RELEASE = ("gate.table.release", Unreachable, [Fail]);
+}
+decide_seam! {
+    /// A writer enters the wait for its branch's effect gate.
+    pub static GATE_BRANCH_ACQUIRE = ("gate.branch.acquire", Unreachable, [Fail]);
+}
+decide_seam! {
+    /// The branch effect gate is owned.
+    pub static GATE_BRANCH_HOLD = ("gate.branch.hold", Unreachable, [Fail]);
+}
+decide_seam! {
+    /// The branch effect gate's guard drops.
+    pub static GATE_BRANCH_RELEASE = ("gate.branch.release", Unreachable, [Fail]);
+}
+decide_seam! {
+    /// A reader of the accepted schema view enters the wait for the shared
+    /// side of the schema gate.
+    pub static GATE_SCHEMA_SHARED_ACQUIRE = ("gate.schema_shared.acquire", Unreachable, [Fail]);
+}
+decide_seam! {
+    /// The shared schema permit is owned.
+    pub static GATE_SCHEMA_SHARED_HOLD = ("gate.schema_shared.hold", Unreachable, [Fail]);
+}
+decide_seam! {
+    /// The shared schema permit drops.
+    pub static GATE_SCHEMA_SHARED_RELEASE = ("gate.schema_shared.release", Unreachable, [Fail]);
+}
+decide_seam! {
+    /// A pass that changes the accepted schema view enters the wait for the
+    /// exclusive side of the schema gate.
+    pub static GATE_SCHEMA_EXCLUSIVE_ACQUIRE = ("gate.schema_exclusive.acquire", Unreachable, [Fail]);
+}
+decide_seam! {
+    /// The exclusive schema permit is owned.
+    pub static GATE_SCHEMA_EXCLUSIVE_HOLD = ("gate.schema_exclusive.hold", Unreachable, [Fail]);
+}
+decide_seam! {
+    /// The exclusive schema permit drops.
+    pub static GATE_SCHEMA_EXCLUSIVE_RELEASE = ("gate.schema_exclusive.release", Unreachable, [Fail]);
+}
+decide_seam! {
+    /// An export cut or a destructive control owns its side of the export
+    /// gate; the gate refuses instead of waiting, so it has no `acquire`.
+    pub static GATE_EXPORT_HOLD = ("gate.export.hold", Unreachable, [Fail]);
+}
+decide_seam! {
+    /// An export cut or destructive control permit drops.
+    pub static GATE_EXPORT_RELEASE = ("gate.export.release", Unreachable, [Fail]);
+}
+
+static TABLE_GATE: GateSeams = GateSeams {
+    acquire: &GATE_TABLE_ACQUIRE,
+    hold: &GATE_TABLE_HOLD,
+    release: &GATE_TABLE_RELEASE,
+};
+
+static BRANCH_GATE: GateSeams = GateSeams {
+    acquire: &GATE_BRANCH_ACQUIRE,
+    hold: &GATE_BRANCH_HOLD,
+    release: &GATE_BRANCH_RELEASE,
+};
+
+static SCHEMA_SHARED_GATE: GateSeams = GateSeams {
+    acquire: &GATE_SCHEMA_SHARED_ACQUIRE,
+    hold: &GATE_SCHEMA_SHARED_HOLD,
+    release: &GATE_SCHEMA_SHARED_RELEASE,
+};
+
+static SCHEMA_EXCLUSIVE_GATE: GateSeams = GateSeams {
+    acquire: &GATE_SCHEMA_EXCLUSIVE_ACQUIRE,
+    hold: &GATE_SCHEMA_EXCLUSIVE_HOLD,
+    release: &GATE_SCHEMA_EXCLUSIVE_RELEASE,
+};
 
 /// A held write-queue lock whose RELEASE is visible to the harness arbiter:
 /// dropping it takes a turn (when the gate hook is installed), unlocks
@@ -84,6 +204,7 @@ pub(crate) struct QueueGuard {
 
 impl Drop for QueueGuard {
     fn drop(&mut self) {
+        observed(self.slot.gate.release);
         // Turn first (None when uninstalled/unarmed — plain path), unlock
         // under it, bump the epoch last: a waiter that observes the bump
         // sees a lock that is genuinely free.
@@ -107,26 +228,25 @@ impl Drop for QueueGuard {
 /// and every event — attempt, no-op, release — has a seeded position in
 /// the grant sequence.
 async fn scheduled_lock(slot: Arc<QueueSlot>) -> QueueGuard {
+    observed(slot.gate.acquire);
+    let inner = scheduled_lock_wait(&slot).await;
+    observed(slot.gate.hold);
+    QueueGuard {
+        inner: Some(inner),
+        slot,
+    }
+}
+
+async fn scheduled_lock_wait(slot: &QueueSlot) -> OwnedMutexGuard<()> {
     let mut wait_epoch: Option<u64> = None;
     loop {
         match crate::dst_gate::turn() {
-            None => {
-                let guard = Arc::clone(&slot.lock).lock_owned().await;
-                return QueueGuard {
-                    inner: Some(guard),
-                    slot,
-                };
-            }
+            None => return Arc::clone(&slot.lock).lock_owned().await,
             Some(_turn) => {
                 let epoch_now = slot.releases.load(std::sync::atomic::Ordering::SeqCst);
                 if wait_epoch.is_none_or(|e| epoch_now != e) {
                     match Arc::clone(&slot.lock).try_lock_owned() {
-                        Ok(guard) => {
-                            return QueueGuard {
-                                inner: Some(guard),
-                                slot: Arc::clone(&slot),
-                            };
-                        }
+                        Ok(guard) => return guard,
                         Err(_) => wait_epoch = Some(epoch_now),
                     }
                 }
@@ -186,7 +306,8 @@ impl SchemaGateSlot {
     /// The release protocol shared by both permits, the same as
     /// `QueueGuard`'s: turn first, release inside it, bump the epoch last so
     /// an observed bump implies a genuinely released slot.
-    fn release<G>(&self, guard: Option<G>) {
+    fn release<G>(&self, guard: Option<G>, gate: &GateSeams) {
+        observed(gate.release);
         let _turn = crate::dst_gate::turn();
         drop(guard);
         self.releases
@@ -215,28 +336,67 @@ pub(crate) struct SchemaExclusivePermit {
 
 impl Drop for SchemaSharedPermit {
     fn drop(&mut self) {
-        self.slot.release(self.inner.take());
+        self.slot.release(self.inner.take(), &SCHEMA_SHARED_GATE);
     }
 }
 
 impl Drop for SchemaExclusivePermit {
     fn drop(&mut self) {
-        self.slot.release(self.inner.take());
+        self.slot.release(self.inner.take(), &SCHEMA_EXCLUSIVE_GATE);
     }
 }
 
+decide_seam! {
+    /// An exclusive acquisition whose first attempt found the gate held, so
+    /// the caller is about to queue behind the holder; crossed once per
+    /// acquisition, outside any turn. An observation site: the acquire has
+    /// no outcome to give a fired effect, so a test arms `observe` or `hold`
+    /// here to see a queued writer instead of timing its absence.
+    pub static SCHEMA_GATE_EXCLUSIVE_QUEUED = ("write_queue.schema_gate_exclusive_queued", Unreachable, [Fail]);
+}
+
+/// Cross an observation seam; the decision is read and passed.
+pub(crate) fn observed(seam: &'static DecideSeam) {
+    #[cfg(feature = "failpoints")]
+    let _ = seam.crossed();
+    #[cfg(not(feature = "failpoints"))]
+    let _ = seam;
+}
+
 /// One side of the schema gate on the [`scheduled_lock`] protocol: plain
-/// blocking acquire uninstalled; installed, try only when the release
-/// epoch moved, yielding every turn.
+/// blocking acquire uninstalled; installed, try only when the release epoch
+/// moved, yielding every turn. `queued` is crossed once the first try fails.
 async fn scheduled_schema_permit<G>(
+    slot: &SchemaGateSlot,
+    gate: &GateSeams,
+    acquire: impl AsyncFnOnce(Arc<AsyncRwLock<()>>) -> G,
+    try_acquire: impl Fn(Arc<AsyncRwLock<()>>) -> Option<G>,
+    queued: Option<&'static DecideSeam>,
+) -> G {
+    observed(gate.acquire);
+    let permit = scheduled_schema_wait(slot, acquire, try_acquire, queued).await;
+    observed(gate.hold);
+    permit
+}
+
+async fn scheduled_schema_wait<G>(
     slot: &SchemaGateSlot,
     acquire: impl AsyncFnOnce(Arc<AsyncRwLock<()>>) -> G,
     try_acquire: impl Fn(Arc<AsyncRwLock<()>>) -> Option<G>,
+    mut queued: Option<&'static DecideSeam>,
 ) -> G {
     let mut wait_epoch: Option<u64> = None;
     loop {
         match crate::dst_gate::turn() {
-            None => return acquire(Arc::clone(&slot.lock)).await,
+            None => {
+                if let Some(guard) = try_acquire(Arc::clone(&slot.lock)) {
+                    return guard;
+                }
+                if let Some(seam) = queued.take() {
+                    observed(seam);
+                }
+                return acquire(Arc::clone(&slot.lock)).await;
+            }
             Some(_turn) => {
                 let epoch_now = slot.releases.load(std::sync::atomic::Ordering::SeqCst);
                 if wait_epoch.is_none_or(|e| epoch_now != e) {
@@ -248,6 +408,11 @@ async fn scheduled_schema_permit<G>(
                 // else: no release since the failed attempt — a no-op turn.
             }
         }
+        if wait_epoch.is_some()
+            && let Some(seam) = queued.take()
+        {
+            observed(seam);
+        }
         tokio::task::yield_now().await;
     }
 }
@@ -255,8 +420,10 @@ async fn scheduled_schema_permit<G>(
 async fn scheduled_schema_shared(slot: Arc<SchemaGateSlot>) -> SchemaSharedPermit {
     let guard = scheduled_schema_permit(
         &slot,
+        &SCHEMA_SHARED_GATE,
         async |lock| lock.read_owned().await,
         |lock| lock.try_read_owned().ok(),
+        None,
     )
     .await;
     SchemaSharedPermit {
@@ -268,8 +435,10 @@ async fn scheduled_schema_shared(slot: Arc<SchemaGateSlot>) -> SchemaSharedPermi
 async fn scheduled_schema_exclusive(slot: Arc<SchemaGateSlot>) -> SchemaExclusivePermit {
     let guard = scheduled_schema_permit(
         &slot,
+        &SCHEMA_EXCLUSIVE_GATE,
         async |lock| lock.write_owned().await,
         |lock| lock.try_write_owned().ok(),
+        Some(&SCHEMA_GATE_EXCLUSIVE_QUEUED),
     )
     .await;
     SchemaExclusivePermit {
@@ -327,6 +496,18 @@ pub(crate) struct ExportCutPermit {
 pub(crate) struct ExportDestructivePermit {
     _manager: Arc<WriteQueueManager>,
     _permit: OwnedRwLockReadGuard<()>,
+}
+
+impl Drop for ExportCutPermit {
+    fn drop(&mut self) {
+        observed(&GATE_EXPORT_RELEASE);
+    }
+}
+
+impl Drop for ExportDestructivePermit {
+    fn drop(&mut self) {
+        observed(&GATE_EXPORT_RELEASE);
+    }
 }
 
 /// Per-`(table_key, branch)` writer queue manager.
@@ -389,7 +570,7 @@ impl WriteQueueManager {
         if let Some(existing) = map.get(key) {
             return Arc::clone(existing);
         }
-        let fresh = QueueSlot::new();
+        let fresh = QueueSlot::new(&TABLE_GATE);
         map.insert(key.clone(), Arc::clone(&fresh));
         fresh
     }
@@ -402,7 +583,7 @@ impl WriteQueueManager {
         if let Some(existing) = map.get(branch) {
             return Arc::clone(existing);
         }
-        let fresh = QueueSlot::new();
+        let fresh = QueueSlot::new(&BRANCH_GATE);
         map.insert(branch.clone(), Arc::clone(&fresh));
         fresh
     }
@@ -437,6 +618,7 @@ impl WriteQueueManager {
     /// Reserve the sole immutable export cut without waiting.
     pub(crate) fn try_acquire_export_cut(self: &Arc<Self>) -> Option<ExportCutPermit> {
         let permit = Arc::clone(&self.export_gate).try_write_owned().ok()?;
+        observed(&GATE_EXPORT_HOLD);
         Some(ExportCutPermit {
             _manager: Arc::clone(self),
             _permit: permit,
@@ -451,6 +633,7 @@ impl WriteQueueManager {
         self: &Arc<Self>,
     ) -> Option<ExportDestructivePermit> {
         let permit = Arc::clone(&self.export_gate).try_read_owned().ok()?;
+        observed(&GATE_EXPORT_HOLD);
         Some(ExportDestructivePermit {
             _manager: Arc::clone(self),
             _permit: permit,
@@ -518,6 +701,105 @@ mod tests {
 
     fn key(table: &str, branch: Option<&str>) -> TableQueueKey {
         (table.to_string(), branch.map(str::to_string))
+    }
+
+    /// A table gate crosses `acquire`, `hold`, `release` in that order, the
+    /// uncontended holder and the contender alike; the contender's `hold`
+    /// follows the holder's `release`.
+    #[cfg(feature = "failpoints")]
+    #[tokio::test]
+    async fn a_table_gate_crosses_acquire_hold_release_in_order() {
+        let _scenario = crate::seams::FailScenario::setup();
+        let events: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let note = |name: &'static str| {
+            let events = Arc::clone(&events);
+            move || events.lock().unwrap().push(name)
+        };
+        let _acquire = GATE_TABLE_ACQUIRE.observe(note("acquire"));
+        let _hold = GATE_TABLE_HOLD.observe(note("hold"));
+        let _release = GATE_TABLE_RELEASE.observe(note("release"));
+        let crossed = || events.lock().unwrap().clone();
+
+        let qm = Arc::new(WriteQueueManager::new());
+        let k = key("t1", None);
+        let holder = qm.acquire(&k).await;
+        assert_eq!(crossed(), ["acquire", "hold"]);
+
+        let qm2 = Arc::clone(&qm);
+        let k2 = k.clone();
+        let contender = tokio::spawn(async move { qm2.acquire(&k2).await });
+        timeout(Duration::from_secs(2), async {
+            while crossed().len() < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the contender must cross acquire while the holder holds");
+        assert_eq!(crossed(), ["acquire", "hold", "acquire"]);
+
+        drop(holder);
+        let contended = timeout(Duration::from_secs(2), contender)
+            .await
+            .expect("the contender must hold once the holder releases")
+            .unwrap();
+        assert_eq!(crossed(), ["acquire", "hold", "acquire", "release", "hold"]);
+        drop(contended);
+        assert_eq!(
+            crossed(),
+            ["acquire", "hold", "acquire", "release", "hold", "release"]
+        );
+    }
+
+    /// The other gates cross the same way: branch and both schema sides
+    /// `acquire, hold, release`; export, which refuses instead of waiting,
+    /// `hold, release` for the cut and for a destructive control alike.
+    #[cfg(feature = "failpoints")]
+    #[tokio::test]
+    async fn branch_schema_and_export_gates_cross_their_seams() {
+        let _scenario = crate::seams::FailScenario::setup();
+        let events: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let note = |name: &'static str| {
+            let events = Arc::clone(&events);
+            move || events.lock().unwrap().push(name)
+        };
+        let _observers = [
+            GATE_BRANCH_ACQUIRE.observe(note("branch.acquire")),
+            GATE_BRANCH_HOLD.observe(note("branch.hold")),
+            GATE_BRANCH_RELEASE.observe(note("branch.release")),
+            GATE_SCHEMA_SHARED_ACQUIRE.observe(note("schema_shared.acquire")),
+            GATE_SCHEMA_SHARED_HOLD.observe(note("schema_shared.hold")),
+            GATE_SCHEMA_SHARED_RELEASE.observe(note("schema_shared.release")),
+            GATE_SCHEMA_EXCLUSIVE_ACQUIRE.observe(note("schema_exclusive.acquire")),
+            GATE_SCHEMA_EXCLUSIVE_HOLD.observe(note("schema_exclusive.hold")),
+            GATE_SCHEMA_EXCLUSIVE_RELEASE.observe(note("schema_exclusive.release")),
+            GATE_EXPORT_HOLD.observe(note("export.hold")),
+            GATE_EXPORT_RELEASE.observe(note("export.release")),
+        ];
+
+        let qm = Arc::new(WriteQueueManager::new());
+        drop(qm.acquire_branch(Some("feature")).await);
+        drop(qm.acquire_schema_shared().await);
+        drop(qm.acquire_schema_exclusive().await);
+        drop(qm.try_acquire_export_cut().unwrap());
+        drop(qm.try_acquire_export_destructive().unwrap());
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "branch.acquire",
+                "branch.hold",
+                "branch.release",
+                "schema_shared.acquire",
+                "schema_shared.hold",
+                "schema_shared.release",
+                "schema_exclusive.acquire",
+                "schema_exclusive.hold",
+                "schema_exclusive.release",
+                "export.hold",
+                "export.release",
+                "export.hold",
+                "export.release",
+            ]
+        );
     }
 
     #[tokio::test]

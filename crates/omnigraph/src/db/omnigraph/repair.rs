@@ -326,12 +326,14 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
         let PublishedSnapshot {
             graph_manifest_version: manifest_version,
             ..
-        } = db
-            .coordinator
-            .write()
-            .await
-            .commit_updates_with_actor_with_expected(&updates, &expected, actor)
-            .await?;
+        } = {
+            let (installed, mut next) = db.installed_coordinator_copy();
+            let outcome = next
+                .commit_updates_with_actor_with_expected(&updates, &expected, actor)
+                .await;
+            db.install_coordinator(next, &installed);
+            outcome?
+        };
         db.runtime_cache.invalidate_all().await;
         if updates
             .iter()

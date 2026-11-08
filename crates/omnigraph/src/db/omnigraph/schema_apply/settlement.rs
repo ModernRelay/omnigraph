@@ -5,6 +5,7 @@
 use super::*;
 use crate::db::manifest::{LineageIntent, PublishPrecondition};
 use omnigraph_catalog::SchemaPublicationCandidate;
+use omnigraph_core::graph_commit_id::commit_id_answers;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -35,19 +36,24 @@ impl PreparedSchemaSettlement {
                 "invalid schema settlement binding",
             ));
         }
-        if let Some(intent) = &self.lineage
-            && (intent.branch.is_some()
-                || intent.merged_parent_commit_id.is_some()
+        if let Some(intent) = &self.lineage {
+            let head_answers_settlement_nonce = match original.authority.head_commit_id.as_deref() {
+                Some(head) => commit_id_answers(head, &intent.graph_commit_id)?,
+                None => false,
+            };
+            if intent.branch.is_some()
+                || intent.merged_parent.is_some()
                 || !intent
                     .graph_commit_id
                     .parse::<ulid::Ulid>()
                     .is_ok_and(|id| id.to_string() == intent.graph_commit_id)
                 || Some(intent.graph_commit_id.as_str()) == original.graph_commit_id()
-                || original.authority.head_commit_id.as_ref() == Some(&intent.graph_commit_id))
-        {
-            return Err(OmniError::manifest_conflict(
-                "invalid schema settlement lineage",
-            ));
+                || head_answers_settlement_nonce
+            {
+                return Err(OmniError::manifest_conflict(
+                    "invalid schema settlement lineage",
+                ));
+            }
         }
         Ok(())
     }
@@ -110,7 +116,10 @@ pub(in crate::db::omnigraph) async fn prepare_schema_settlement(
             None
         } else {
             Some(GraphCoordinator::new_lineage_intent_for_branch(
-                None, actor, None,
+                None,
+                actor,
+                None,
+                HistoryReleaseBytes::PRODUCTION,
             )?)
         },
     })
@@ -123,7 +132,7 @@ fn verify_intended_commit(
     expected_contract: &SchemaContractDigest,
 ) -> Result<GraphCommit> {
     let commit = &candidate.head;
-    if commit.graph_commit_id != intent.graph_commit_id
+    if !commit_id_answers(&commit.graph_commit_id, &intent.graph_commit_id)?
         || commit.graph_manifest_version != original.base_manifest_version + 1
         || commit.parent_commit_id != original.authority.head_commit_id
         || commit.actor_id != intent.actor_id
@@ -235,7 +244,7 @@ async fn retained_outcome(
 /// branch/table gates and repeat this check after their waits.
 async fn live_base(db: &Omnigraph, original: &PreparedSchemaApply) -> Result<Option<Snapshot>> {
     db.refresh_coordinator_only().await?;
-    let coordinator = db.coordinator.read().await;
+    let coordinator = db.coordinator.load_full();
     let snapshot = coordinator.snapshot();
     if snapshot.graph_branch().is_some()
         || snapshot.graph_manifest_version() != original.base_manifest_version
@@ -318,13 +327,16 @@ pub(in crate::db::omnigraph) async fn settle_prepared_schema(
         return retained_outcome(db, original, settlement).await;
     }
     {
-        let coordinator = db.coordinator.read().await;
-        if original
+        let coordinator = db.coordinator.load_full();
+        let mut captured = false;
+        for id in original
             .graph_commit_id()
             .into_iter()
             .chain(settlement.graph_commit_id())
-            .any(|id| coordinator.captured_commit(id).is_some())
         {
+            captured |= coordinator.captured_commit(id)?.is_some();
+        }
+        if captured {
             return Err(OmniError::manifest_conflict(
                 "schema settlement publication identity already exists",
             ));
@@ -338,10 +350,8 @@ pub(in crate::db::omnigraph) async fn settle_prepared_schema(
         authority: original.authority.clone(),
         version: original.base_manifest_version,
     };
-    let published = db
-        .coordinator
-        .write()
-        .await
+    let (installed, mut next) = db.installed_coordinator_copy();
+    let published = next
         .commit_changes_with_intent_and_expected(
             &[],
             &crate::db::manifest::ExpectedTableVersions::new(),
@@ -349,6 +359,7 @@ pub(in crate::db::omnigraph) async fn settle_prepared_schema(
             &precondition,
         )
         .await;
+    db.install_coordinator(next, &installed);
     match published {
         Ok(published) => Ok(SchemaApplySettlement::NotPublished {
             proof: SchemaNonPublicationProof::Fence {

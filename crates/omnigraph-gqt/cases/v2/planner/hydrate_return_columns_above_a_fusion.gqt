@@ -1,0 +1,86 @@
+# issue: none
+# red_on: 2026-10-10, upstream 58f1fcc6: pass 6 skipped every plan with a RankFuse and every ranked scan, so both arms read `body` and `title` for all twelve docs and no `HydrateColumns` was placed.
+# notes: Twelve docs, query vector [0,0], needle count falling from d00 to d03. The nearest arm's window is the limit (d00, d01); bm25 ranks d00 > d01 > d02 > d03 on term frequency at equal length. Fused: d00 1/61 + 1/61, d01 1/62 + 1/62, d02 1/63, d03 1/64, so the limit keeps d00 and d01 in that order.
+# notes: Pass 6 rewrites both arm scans together (12 rows > 4 x 2): the arms carry ids, scores and the row address into the fusion, the Sort above cuts, and `HydrateColumns` fetches `body` and `title` for the two kept rows (RFC 0047 §Total order).
+# notes: Step 2 keeps a standalone BM25 scan unhydrated.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    title: String
+    body: String?
+    text: String @index
+    embedding: Vector(2) @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d00","title":"t-00","body":"body 00","text":"needle needle needle needle","embedding":[0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d01","title":"t-01","body":"body 01","text":"needle needle needle filler","embedding":[1.0,0.0]}}
+{"type":"Doc","data":{"slug":"d02","title":"t-02","body":"body 02","text":"needle needle filler filler","embedding":[2.0,0.0]}}
+{"type":"Doc","data":{"slug":"d03","title":"t-03","body":"body 03","text":"needle filler filler filler","embedding":[3.0,0.0]}}
+{"type":"Doc","data":{"slug":"d04","title":"t-04","body":"body 04","text":"filler filler filler filler","embedding":[4.0,0.0]}}
+{"type":"Doc","data":{"slug":"d05","title":"t-05","body":"body 05","text":"filler filler filler filler","embedding":[5.0,0.0]}}
+{"type":"Doc","data":{"slug":"d06","title":"t-06","body":"body 06","text":"filler filler filler filler","embedding":[6.0,0.0]}}
+{"type":"Doc","data":{"slug":"d07","title":"t-07","text":"filler filler filler filler","embedding":[7.0,0.0]}}
+{"type":"Doc","data":{"slug":"d08","title":"t-08","body":"body 08","text":"filler filler filler filler","embedding":[8.0,0.0]}}
+{"type":"Doc","data":{"slug":"d09","title":"t-09","body":"body 09","text":"filler filler filler filler","embedding":[9.0,0.0]}}
+{"type":"Doc","data":{"slug":"d10","title":"t-10","text":"filler filler filler filler","embedding":[10.0,0.0]}}
+{"type":"Doc","data":{"slug":"d11","title":"t-11","body":"body 11","text":"filler filler filler filler","embedding":[11.0,0.0]}}
+
+--- query
+set engine = v2;
+query fused_top_two($q: Vector(2), $t: String) {
+    match { $d: Doc }
+    return { $d.slug, $d.body, $d.title }
+    order { rrf(nearest($d.embedding, $q), bm25($d.text, $t)) }
+    limit 2
+}
+
+--- params
+{"q": [0.0, 0.0], "t": "needle"}
+
+--- expect ordered
+{"d.body":"body 00","d.slug":"d00","d.title":"t-00"}
+{"d.body":"body 01","d.slug":"d01","d.title":"t-01"}
+
+--- expect shape
+d.slug: String
+d.body: String?
+d.title: String
+
+--- expect plan
+pass late_materialization
+hydrate $d: columns [body, title]
+scan Doc as $d: ranked nearest fetch 2
+scan Doc as $d: ranked bm25
+
+--- query
+set engine = v2;
+query ranked_top_two($t: String) {
+    match { $d: Doc }
+    return { $d.slug, $d.body, $d.title }
+    order { bm25($d.text, $t) }
+    limit 2
+}
+
+--- params
+{"t": "needle"}
+
+--- expect ordered
+{"d.body":"body 00","d.slug":"d00","d.title":"t-00"}
+{"d.body":"body 01","d.slug":"d01","d.title":"t-01"}
+
+--- expect shape
+d.slug: String
+d.body: String?
+d.title: String
+
+--- expect plan
+not pass late_materialization
+scan Doc as $d: ranked bm25

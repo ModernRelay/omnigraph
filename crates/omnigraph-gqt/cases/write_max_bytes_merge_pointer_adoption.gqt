@@ -1,0 +1,58 @@
+# issue: none
+# notes: Merging main into feature adopts main's node:Doc table by pointer and writes no row, so write_max_bytes does not bound it.
+# notes: Under write_max_bytes = 128, below one row's Arrow size, the merge still fast-forwards and feature reads main's update.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Doc {
+    slug: String @key
+    note: String
+}
+
+--- seed
+
+--- mutate
+query seed_doc() {
+    insert Doc { slug: "w", note: "short" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch create feature;
+
+--- expect ok
+
+--- mutate
+query lengthen() {
+    update Doc set { note: "long" } where slug = "w"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+set write_max_bytes = 128;
+branch merge main into feature;
+
+--- expect outcome: fast_forward
+
+--- query branch: feature
+query feature_rows() {
+    match { $d: Doc }
+    return { $d.slug, $d.note }
+}
+
+--- expect unordered
+{"d.slug":"w","d.note":"long"}
+
+--- expect shape
+d.slug: String
+d.note: String

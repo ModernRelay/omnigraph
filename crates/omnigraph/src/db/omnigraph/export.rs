@@ -164,8 +164,7 @@ pub(super) async fn entity_at(
 ) -> Result<Option<serde_json::Value>> {
     let snap = db
         .coordinator
-        .read()
-        .await
+        .load_full()
         .snapshot_at_graph_manifest_version(graph_manifest_version)
         .await?;
     entity_from_snapshot(db, &snap, type_key, id).await
@@ -281,8 +280,7 @@ async fn capture_baseline_parts(
     let normalized_branch = Some(branch).filter(|branch| *branch != "main");
     let cut = db
         .coordinator
-        .read()
-        .await
+        .load_full()
         .capture_change_cut(normalized_branch)
         .await?;
 
@@ -441,10 +439,23 @@ where
     Emit: FnMut(Vec<u8>) -> EmitFuture,
     EmitFuture: Future<Output = Result<()>>,
 {
+    let mut chunks = ExportChunks {
+        emit,
+        pending: Vec::new(),
+    };
     for table_key in selected_tables {
-        export_table(db, snapshot, catalog, table_key, row_order, ranged, emit).await?;
+        export_table(
+            db,
+            snapshot,
+            catalog,
+            table_key,
+            row_order,
+            ranged,
+            &mut chunks,
+        )
+        .await?;
     }
-    Ok(())
+    chunks.flush().await
 }
 
 fn export_type_keys(snapshot: &Snapshot, type_names: &[String]) -> Result<Vec<String>> {
@@ -488,7 +499,7 @@ async fn export_table<Emit, EmitFuture>(
     table_key: &str,
     row_order: ExportRowOrder,
     ranged: RangedExternalBlobs,
-    emit: &mut Emit,
+    emit: &mut ExportChunks<'_, Emit>,
 ) -> Result<()>
 where
     Emit: FnMut(Vec<u8>) -> EmitFuture,
@@ -499,10 +510,10 @@ where
         .open_snapshot_at_table(snapshot, table_key)
         .await?;
     // Blob materialization reaches through to the inner Lance `Dataset`
-    // because `take_blobs` is a Lance-only API not lifted onto the
-    // `TableStorage` trait surface (the trait covers staged-write and
-    // snapshot-scan primitives; blob descriptor materialization sits outside
-    // that surface). The ordered walk reads the same pinned dataset.
+    // because the batched managed read (`TableStore::managed_blob_payloads`)
+    // takes a pinned dataset, not a `TableStorage` handle (the trait covers
+    // staged-write and snapshot-scan primitives; blob payload reads sit
+    // outside that surface). The ordered walk reads the same pinned dataset.
     let source_ds = ds.dataset();
     let blob_properties = blob_properties_for_table_key(catalog, table_key)?;
 
@@ -529,23 +540,16 @@ where
         )
         .await?;
         while let Some(batch) = rows.next_ordered_batch().await? {
-            if blob_properties.is_empty() {
-                emit_export_rows_from_batch(catalog, table_key, &batch, None, emit).await?;
-                continue;
-            }
-            for row_index in 0..batch.num_rows() {
-                let row = batch.slice(row_index, 1);
-                emit_export_row(
-                    source_ds,
-                    catalog,
-                    table_key,
-                    &row,
-                    blob_properties,
-                    ranged,
-                    emit,
-                )
-                .await?;
-            }
+            emit_export_batch(
+                source_ds,
+                catalog,
+                table_key,
+                &batch,
+                blob_properties,
+                ranged,
+                emit,
+            )
+            .await?;
         }
         return Ok(());
     }
@@ -574,10 +578,9 @@ where
     }
 
     // Lance's byte target is approximate and overrides its row estimate, so a
-    // scanner batch is not a hard memory bound. Slice each returned descriptor
-    // batch explicitly and materialize only one logical row's complete Blob
-    // property set before observing transport backpressure. One Blob value and
-    // one row's encoded JSON remain indivisible scratch allocations.
+    // scanner batch is not a hard memory bound. It holds Blob descriptors
+    // only: `emit_export_batch` takes one row's Blob values at a time from the
+    // batch's batched reads.
     let mut batches = db
         .storage()
         .scan_stream_bounded(
@@ -595,42 +598,43 @@ where
         .await
         .map_err(crate::table_store::TableStore::ordered_scan_error)?
     {
-        for row_index in 0..batch.num_rows() {
-            let row = batch.slice(row_index, 1);
-            emit_export_row(
-                source_ds,
-                catalog,
-                table_key,
-                &row,
-                blob_properties,
-                ranged,
-                emit,
-            )
-            .await?;
-        }
+        emit_export_batch(
+            source_ds,
+            catalog,
+            table_key,
+            &batch,
+            blob_properties,
+            ranged,
+            emit,
+        )
+        .await?;
     }
     Ok(())
 }
 
-/// Emit one scanned row, materializing at most that row's Blob values. The
-/// row must carry `_rowid` when the table has Blob properties.
-async fn emit_export_row<Emit, EmitFuture>(
+/// Emit one scanned batch. A table with Blob properties reads each Blob
+/// column's managed cells through one batched read ([`BlobRowReader`]) and
+/// emits row by row, so one row's Blob values are materialized before
+/// observing transport backpressure; one Blob value and one row's encoded JSON
+/// remain indivisible scratch allocations. The batch must carry `_rowid` when
+/// the table has Blob properties.
+async fn emit_export_batch<Emit, EmitFuture>(
     source_ds: &Dataset,
     catalog: &Catalog,
     table_key: &str,
-    row: &RecordBatch,
+    batch: &RecordBatch,
     blob_properties: &std::collections::HashSet<String>,
     ranged: RangedExternalBlobs,
-    emit: &mut Emit,
+    emit: &mut ExportChunks<'_, Emit>,
 ) -> Result<()>
 where
     Emit: FnMut(Vec<u8>) -> EmitFuture,
     EmitFuture: Future<Output = Result<()>>,
 {
     if blob_properties.is_empty() {
-        return emit_export_rows_from_batch(catalog, table_key, row, None, emit).await;
+        return emit_export_rows_from_batch(catalog, table_key, batch, None, emit).await;
     }
-    let row_id = row
+    let row_ids = batch
         .column_by_name("_rowid")
         .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
         .ok_or_else(|| {
@@ -638,11 +642,21 @@ where
                 "expected _rowid column when exporting '{}'",
                 table_key
             ))
-        })?
-        .value(0);
-    let blob_values =
-        export_blob_values(source_ds, row, &[row_id], blob_properties, ranged).await?;
-    emit_export_rows_from_batch(catalog, table_key, row, Some(&blob_values), emit).await
+        })?;
+    let mut blobs =
+        BlobRowReader::open(source_ds, batch, row_ids.values(), blob_properties, ranged).await?;
+    for row_index in 0..batch.num_rows() {
+        let blob_values = blobs.next_row().await?;
+        emit_export_rows_from_batch(
+            catalog,
+            table_key,
+            &batch.slice(row_index, 1),
+            Some(&blob_values),
+            emit,
+        )
+        .await?;
+    }
+    blobs.finish().await
 }
 
 /// One logical Blob cell value.
@@ -709,31 +723,127 @@ fn describe_ranged_blob_cells(
     Ok(())
 }
 
-pub(crate) async fn export_blob_values(
-    source_ds: &Dataset,
-    batch: &RecordBatch,
-    row_ids: &[u64],
-    blob_properties: &std::collections::HashSet<String>,
-    ranged: RangedExternalBlobs,
-) -> Result<HashMap<String, Vec<Option<LogicalBlobValue>>>> {
-    let mut values = HashMap::with_capacity(blob_properties.len());
-    let mut __dst_props: Vec<_> = blob_properties.iter().collect();
-    __dst_props.sort();
-    for property in __dst_props {
-        let descriptions = batch
-            .column_by_name(property)
-            .and_then(|col| col.as_any().downcast_ref::<StructArray>())
-            .ok_or_else(|| {
-                OmniError::blob_integrity(format!(
-                    "expected blob descriptions for export column '{}'",
-                    property
+/// One Blob cell classified from its descriptor: decided without payload I/O,
+/// or managed and read from its column's batched read.
+enum ClassifiedBlobCell {
+    Decided(Option<LogicalBlobValue>),
+    Managed { length: u64 },
+}
+
+/// One Blob column of a [`BlobRowReader`]: its classified cells in row order
+/// and the batched read of its managed cells, in the same order.
+struct BlobColumnRows<'a> {
+    name: &'a str,
+    cells: std::vec::IntoIter<ClassifiedBlobCell>,
+    payloads: crate::table_store::ManagedBlobPayloads<'a>,
+}
+
+/// The Blob values of one batch, produced row by row. Every cell of every
+/// column is classified from its descriptor before any payload read: an
+/// external reference is never opened, and a ranged one is refused or
+/// described here. A column holding a managed cell then reads all of the
+/// batch's managed payloads through one batched read
+/// ([`TableStore::managed_blob_payloads`]), consumed as rows are taken, so one
+/// row's values plus each column read's bounded I/O buffer are resident,
+/// however many rows the batch holds.
+///
+/// [`TableStore::managed_blob_payloads`]: crate::table_store::TableStore::managed_blob_payloads
+pub(crate) struct BlobRowReader<'a> {
+    columns: Vec<BlobColumnRows<'a>>,
+}
+
+impl<'a> BlobRowReader<'a> {
+    /// Classify the `properties` cells of `batch`, whose row `i` has stable row
+    /// id `row_ids[i]`, then open each column's batched managed read.
+    pub(crate) async fn open(
+        source_ds: &Dataset,
+        batch: &RecordBatch,
+        row_ids: &[u64],
+        properties: &'a std::collections::HashSet<String>,
+        ranged: RangedExternalBlobs,
+    ) -> Result<Self> {
+        let mut names = properties.iter().map(String::as_str).collect::<Vec<_>>();
+        names.sort_unstable();
+        let mut classified = Vec::with_capacity(names.len());
+        for name in names {
+            let descriptions = batch
+                .column_by_name(name)
+                .and_then(|col| col.as_any().downcast_ref::<StructArray>())
+                .ok_or_else(|| {
+                    OmniError::blob_integrity(format!(
+                        "expected blob descriptions for export column '{name}'"
+                    ))
+                })?;
+            classified.push((
+                name,
+                classify_blob_cells(name, descriptions, row_ids, ranged)?,
+            ));
+        }
+        let mut columns = Vec::with_capacity(classified.len());
+        for (name, (cells, managed_row_ids)) in classified {
+            columns.push(BlobColumnRows {
+                name,
+                cells: cells.into_iter(),
+                payloads: crate::table_store::TableStore::managed_blob_payloads(
+                    source_ds,
+                    name,
+                    managed_row_ids,
+                )
+                .await?,
+            });
+        }
+        Ok(Self { columns })
+    }
+
+    /// The next row's Blob values by property, each a one-row column.
+    pub(crate) async fn next_row(
+        &mut self,
+    ) -> Result<HashMap<String, Vec<Option<LogicalBlobValue>>>> {
+        let mut values = HashMap::with_capacity(self.columns.len());
+        for column in &mut self.columns {
+            let cell = column.cells.next().ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "Blob column '{}' has no row left in its batch",
+                    column.name
                 ))
             })?;
-        values.insert(
-            property.clone(),
-            export_blob_column_values(source_ds, property, descriptions, row_ids, ranged).await?,
-        );
+            let value = match cell {
+                ClassifiedBlobCell::Decided(value) => value,
+                ClassifiedBlobCell::Managed { length } => {
+                    let bytes = column.payloads.next(length).await?;
+                    Some(LogicalBlobValue::Text(format!(
+                        "base64:{}",
+                        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+                    )))
+                }
+            };
+            values.insert(column.name.to_string(), vec![value]);
+        }
+        Ok(values)
     }
+
+    /// Refuse a read that returned more payloads than the batch's managed
+    /// cells.
+    pub(crate) async fn finish(self) -> Result<()> {
+        for column in self.columns {
+            column.payloads.finish().await?;
+        }
+        Ok(())
+    }
+}
+
+/// The Blob values of the one-row batch `row`, whose stable row id is
+/// `row_id`, by property.
+pub(crate) async fn row_blob_values(
+    source_ds: &Dataset,
+    row: &RecordBatch,
+    row_id: u64,
+    properties: &std::collections::HashSet<String>,
+    ranged: RangedExternalBlobs,
+) -> Result<HashMap<String, Vec<Option<LogicalBlobValue>>>> {
+    let mut reader = BlobRowReader::open(source_ds, row, &[row_id], properties, ranged).await?;
+    let values = reader.next_row().await?;
+    reader.finish().await?;
     Ok(values)
 }
 
@@ -777,10 +887,10 @@ pub(crate) async fn logical_row_image(
             .ok_or_else(|| OmniError::manifest_internal("change row is missing _rowid"))?
             .value(0);
         Some(
-            export_blob_values(
+            row_blob_values(
                 source_ds,
                 &row_batch,
-                &[row_id],
+                row_id,
                 &blob_properties,
                 RangedExternalBlobs::Describe,
             )
@@ -839,7 +949,7 @@ async fn emit_export_rows_from_batch<Emit, EmitFuture>(
     table_key: &str,
     batch: &RecordBatch,
     blob_values: Option<&HashMap<String, Vec<Option<LogicalBlobValue>>>>,
-    emit: &mut Emit,
+    emit: &mut ExportChunks<'_, Emit>,
 ) -> Result<()>
 where
     Emit: FnMut(Vec<u8>) -> EmitFuture,
@@ -878,7 +988,7 @@ where
                 line.extend_from_slice(b",\"data\":");
                 line.extend_from_slice(&data);
                 line.extend_from_slice(b"}\n");
-                emit_export_line(emit, line).await?;
+                emit.line(line).await?;
             }
         }
         return Ok(());
@@ -920,7 +1030,7 @@ where
                 line.extend_from_slice(b",\"data\":");
                 line.extend_from_slice(&data);
                 line.extend_from_slice(b"}\n");
-                emit_export_line(emit, line).await?;
+                emit.line(line).await?;
             }
         }
         return Ok(());
@@ -938,19 +1048,51 @@ fn json_string_into(out: &mut Vec<u8>, value: &str) -> Result<()> {
     })
 }
 
-async fn emit_export_line<Emit, EmitFuture>(emit: &mut Emit, line: Vec<u8>) -> Result<()>
-where
-    Emit: FnMut(Vec<u8>) -> EmitFuture,
-    EmitFuture: Future<Output = Result<()>>,
-{
-    for chunk in line.chunks(EXPORT_CHUNK_MAX_BYTES) {
-        emit(chunk.to_vec()).await?;
-    }
-    Ok(())
+/// One pending transport allocation, shared by consecutive JSON lines and
+/// tables. A full chunk moves into the callback before another buffer is
+/// allocated, so an awaited send never retains a second pending chunk here.
+struct ExportChunks<'a, Emit> {
+    emit: &'a mut Emit,
+    pending: Vec<u8>,
 }
 
-/// Rows rendered per writer call on export, so the first line leaves before a
-/// whole scanner batch is rendered.
+impl<Emit> ExportChunks<'_, Emit> {
+    async fn line<EmitFuture>(&mut self, line: Vec<u8>) -> Result<()>
+    where
+        Emit: FnMut(Vec<u8>) -> EmitFuture,
+        EmitFuture: Future<Output = Result<()>>,
+    {
+        let mut remaining = line.as_slice();
+        while !remaining.is_empty() {
+            if self.pending.capacity() == 0 {
+                self.pending = Vec::with_capacity(EXPORT_CHUNK_MAX_BYTES);
+            }
+            let count = remaining
+                .len()
+                .min(EXPORT_CHUNK_MAX_BYTES - self.pending.len());
+            self.pending.extend_from_slice(&remaining[..count]);
+            remaining = &remaining[count..];
+            if self.pending.len() == EXPORT_CHUNK_MAX_BYTES {
+                self.flush().await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn flush<EmitFuture>(&mut self) -> Result<()>
+    where
+        Emit: FnMut(Vec<u8>) -> EmitFuture,
+        EmitFuture: Future<Output = Result<()>>,
+    {
+        if !self.pending.is_empty() {
+            (self.emit)(std::mem::take(&mut self.pending)).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Rows rendered per JSON writer call before filling transport chunks, rather
+/// than rendering a whole scanner batch into one scratch allocation.
 const EXPORT_RENDER_ROWS: usize = 256;
 
 fn render_windows(rows: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
@@ -1037,24 +1179,25 @@ fn json_rows(lines: &[u8]) -> impl Iterator<Item = &[u8]> {
         .filter(|line| !line.is_empty())
 }
 
-async fn export_blob_column_values(
-    source_ds: &Dataset,
+/// Classify one column's cells from their descriptors, with no payload I/O:
+/// the cells in row order, and the stable row ids of its managed cells in the
+/// same order.
+fn classify_blob_cells(
     column_name: &str,
     descriptions: &StructArray,
     row_ids: &[u64],
     ranged: RangedExternalBlobs,
-) -> Result<Vec<Option<LogicalBlobValue>>> {
+) -> Result<(Vec<ClassifiedBlobCell>, Vec<u64>)> {
     let decoder = crate::blob::BlobDescriptorDecoder::try_new(descriptions)?;
+    let mut cells = Vec::with_capacity(row_ids.len());
     let mut managed_row_ids = Vec::new();
-    let mut managed_positions = Vec::new();
-    let mut values = vec![None; row_ids.len()];
 
     for (row, row_id) in row_ids.iter().enumerate() {
-        match decoder.classify(row)? {
-            crate::blob::BlobDescriptor::Null => {}
-            crate::blob::BlobDescriptor::Managed { .. } => {
+        cells.push(match decoder.classify(row)? {
+            crate::blob::BlobDescriptor::Null => ClassifiedBlobCell::Decided(None),
+            crate::blob::BlobDescriptor::Managed { length } => {
                 managed_row_ids.push(*row_id);
-                managed_positions.push(row);
+                ClassifiedBlobCell::Managed { length }
             }
             crate::blob::BlobDescriptor::External {
                 uri,
@@ -1070,7 +1213,7 @@ async fn export_blob_column_values(
                     offset,
                     length,
                 };
-                values[row] = Some(match (reference.whole_object_uri(), ranged) {
+                ClassifiedBlobCell::Decided(Some(match (reference.whole_object_uri(), ranged) {
                     (Ok(_), _) => LogicalBlobValue::Text(reference.uri),
                     (Err(_), RangedExternalBlobs::Describe) => {
                         LogicalBlobValue::RangedExternal(reference)
@@ -1080,58 +1223,12 @@ async fn export_blob_column_values(
                             "export cannot represent {refused} in '{column_name}': export writes an external Blob as a bare URI, which reloads as the whole object"
                         )));
                     }
-                });
+                }))
             }
-        }
+        });
     }
 
-    if managed_row_ids.is_empty() {
-        return Ok(values);
-    }
-
-    let mut perm: Vec<usize> = (0..managed_row_ids.len()).collect();
-    perm.sort_by_key(|&i| managed_row_ids[i]);
-    let sorted_ids: Vec<u64> = perm.iter().map(|&i| managed_row_ids[i]).collect();
-
-    let sorted_blobs = Arc::new(source_ds.clone())
-        .take_blobs(&sorted_ids, column_name)
-        .await
-        .map_err(OmniError::storage)?;
-
-    if sorted_blobs.len() != managed_positions.len() {
-        return Err(OmniError::blob_integrity(format!(
-            "blob export for '{}' lost alignment with selected rows",
-            column_name
-        )));
-    }
-
-    let mut inverse_perm = vec![0usize; perm.len()];
-    for (sorted_pos, &orig_pos) in perm.iter().enumerate() {
-        inverse_perm[orig_pos] = sorted_pos;
-    }
-
-    for (idx, position) in managed_positions.into_iter().enumerate() {
-        let blob = sorted_blobs[inverse_perm[idx]].as_ref().ok_or_else(|| {
-            OmniError::blob_integrity(format!(
-                "blob export for '{}' returned a null accessor for a managed description",
-                column_name
-            ))
-        })?;
-        if blob.uri().is_some() {
-            return Err(OmniError::blob_integrity(format!(
-                "blob export for '{}' resolved a managed description as external",
-                column_name
-            )));
-        }
-        let bytes = blob.read().await.map_err(OmniError::storage)?;
-        let value = format!(
-            "base64:{}",
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
-        );
-        values[position] = Some(LogicalBlobValue::Text(value));
-    }
-
-    Ok(values)
+    Ok((cells, managed_row_ids))
 }
 
 fn named_string_column<'a>(batch: &'a RecordBatch, field_name: &str) -> Result<&'a StringArray> {

@@ -170,13 +170,17 @@ pub(super) async fn upgrade_system_columns(
         )
     };
     db.refresh_coordinator_only().await?;
-    let stamp = crate::db::manifest::internal_schema_stamp_at(db.uri(), None)
-        .await?
-        .ok_or_else(|| OmniError::manifest_internal("opened graph has no internal-schema stamp"))?;
+    let stamp = crate::db::manifest::internal_schema_stamp_at_with_session(
+        db.uri(),
+        None,
+        &db.control_session(),
+    )
+    .await?
+    .ok_or_else(|| OmniError::manifest_internal("opened graph has no internal-schema stamp"))?;
     report.stamp_before = stamp;
     report.stamp_after = stamp;
     let (accepted, accepted_identity) = {
-        let snapshot = db.coordinator.read().await.snapshot();
+        let snapshot = db.coordinator.load_full().snapshot();
         (
             db.read_schema_contract_row_for(&snapshot).await?,
             snapshot_contract_identity(&snapshot)?,
@@ -207,9 +211,13 @@ pub(super) async fn upgrade_system_columns(
     )
     .await?;
     report.outcome = SystemColumnUpgradeOutcome::Completed;
-    report.stamp_after = crate::db::manifest::internal_schema_stamp_at(db.uri(), None)
-        .await?
-        .unwrap_or(stamp);
+    report.stamp_after = crate::db::manifest::internal_schema_stamp_at_with_session(
+        db.uri(),
+        None,
+        &db.control_session(),
+    )
+    .await?
+    .unwrap_or(stamp);
     report.graph_manifest_version = Some(graph_manifest_version);
     Ok(report)
 }
@@ -221,7 +229,7 @@ async fn preflight(
     stamp: u32,
     report: &mut SystemColumnUpgradeReport,
 ) -> Result<()> {
-    let coordinator = db.coordinator.read().await;
+    let coordinator = db.coordinator.load_full();
     let blocking_branches = coordinator
         .all_branches()
         .await?
@@ -251,7 +259,7 @@ async fn preflight(
     }
     if !crate::db::manifest::is_served_stamp(stamp) {
         report.refuse(format!(
-            "__manifest is stamped at v{stamp}; the system-column upgrade respells a served graph (v{} to v{}), so run `omnigraph upgrade` for the storage conversions first",
+            "__manifest is stamped at v{stamp}; the system-column upgrade respells a served graph (v{} to v{}), and this binary does not serve that storage format",
             crate::db::manifest::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
             crate::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
         ));
@@ -282,7 +290,7 @@ async fn execute_with_lock(
     fixup_physical_schemas(&mut desired_catalog)?;
 
     let (snapshot, base_branch_identifier, base_graph_head, lineage_intent) = {
-        let coordinator = db.coordinator.read().await;
+        let coordinator = db.coordinator.load_full();
         (
             coordinator.snapshot(),
             coordinator.branch_identifier().await?,
@@ -300,7 +308,7 @@ async fn execute_with_lock(
 
     db.refresh_coordinator_only().await?;
     let (current_branch_identifier, current_graph_head) = {
-        let coordinator = db.coordinator.read().await;
+        let coordinator = db.coordinator.load_full();
         (
             coordinator.branch_identifier().await?,
             coordinator.exact_graph_head(),
@@ -332,7 +340,7 @@ async fn execute_with_lock(
             current_graph_head,
         ));
     }
-    let current_snapshot = db.coordinator.read().await.snapshot();
+    let current_snapshot = db.coordinator.load_full().snapshot();
     let (current_catalog, current_identity) =
         db.accepted_catalog_for_snapshot(&current_snapshot).await?;
     validate_bound_catalog_against_snapshot(&current_catalog, &current_snapshot)?;
@@ -364,8 +372,6 @@ async fn execute_with_lock(
         existing_heads.insert(entry.type_key.clone(), head);
     }
 
-    let graph_commit_id = lineage_intent.graph_commit_id.clone();
-
     let mut published_commit: Option<String> = None;
     let effects = async {
         fail(&catalog::SCHEMA_APPLY_POST_LOCK_PRE_EFFECT)?;
@@ -385,9 +391,11 @@ async fn execute_with_lock(
                 &base_branch_identifier,
                 base_graph_head.as_deref(),
             )?;
+            // One rename-only `Project` commit per table: it keeps every
+            // index attachment, and declares no full-text index.
             let (detached, transaction) = db
                 .storage()
-                .commit_staged_detached(head, staged, &witness)
+                .commit_staged_detached(head, staged, &witness, &[])
                 .await?;
             let state = db.storage().table_state(&dataset_uri, &detached).await?;
             let published_dataset_version = entry.published_dataset_version + 1;
@@ -430,19 +438,22 @@ async fn execute_with_lock(
         );
         let PublishedSnapshot {
             graph_manifest_version,
+            commit,
             ..
-        } = db
-            .coordinator
-            .write()
-            .await
-            .commit_changes_with_intent_and_expected(
-                &manifest_changes,
-                &expected_versions,
-                lineage_intent,
-                &precondition,
-            )
-            .await?;
-        published_commit = Some(graph_commit_id);
+        } = {
+            let (installed, mut next) = db.installed_coordinator_copy();
+            let outcome = next
+                .commit_changes_with_intent_and_expected(
+                    &manifest_changes,
+                    &expected_versions,
+                    lineage_intent,
+                    &precondition,
+                )
+                .await;
+            db.install_coordinator(next, &installed);
+            outcome?
+        };
+        published_commit = Some(commit.graph_commit_id);
 
         db.store_schema_view(desired_catalog, desired_source, &desired_ir)?;
         db.runtime_cache.invalidate_all().await;

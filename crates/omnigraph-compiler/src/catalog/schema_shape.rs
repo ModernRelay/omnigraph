@@ -28,6 +28,29 @@ pub struct SchemaShape {
 }
 
 impl SchemaShape {
+    /// Reconstruct the historical parser's interpretation of upper-only
+    /// ranges. This is only a candidate for matching an already accepted IR;
+    /// it must never be used to admit or rewrite a schema.
+    #[doc(hidden)]
+    pub fn with_historical_range_endpoints(&self) -> Option<Self> {
+        let mut shape = self.clone();
+        let mut changed = false;
+        // Range constraints are node-only, including persisted admission.
+        for node in &mut shape.nodes {
+            for constraint in &mut node.constraints {
+                if let Constraint::Range { min, max, .. } = constraint
+                    && min.is_none()
+                    && max.is_some()
+                {
+                    *min = max.take();
+                    changed = true;
+                }
+            }
+            node.constraints = canonical_constraints(&node.constraints);
+        }
+        changed.then_some(shape)
+    }
+
     /// Canonicalize role spellings using the accepted graph's source dialect.
     pub fn canonicalized_for_system_columns(&self, system_columns: SystemColumns) -> Cow<'_, Self> {
         if system_columns != SYSTEM_COLUMNS_LEGACY {

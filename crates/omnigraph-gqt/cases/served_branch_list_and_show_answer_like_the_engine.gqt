@@ -1,0 +1,40 @@
+# issue: none
+# notes: 0322.2 P3: every served step must be read-only (Query | BranchList | Show); branch list and show
+# notes: travel to POST /query and answer the same rows as the in-process engine.
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person { name: String @key }
+
+--- seed
+{"type":"Person","data":{"name":"Alice"}}
+
+--- query
+branch list
+
+--- expect unordered
+{"name": "main"}
+
+--- expect shape
+name: String
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "verify", "default": "on", "source": "default", "scope": "request"}
+
+--- query
+query names() { match { $p: Person } return { $p.name as name } }
+
+--- expect unordered
+{"name": "Alice"}
+
+--- expect shape
+name: String

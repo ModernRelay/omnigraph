@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - ragnorc
 created: 2026-09-14
-updated: 2026-09-30
+updated: 2026-10-04
 discussion: null
 supersedes:
   - "0065"
@@ -16,6 +16,16 @@ blocked_on: []
 ---
 
 # RFC 0067: Detached table commits
+
+> **Engine settlement disposition:**
+> [Engine settlement and resource bounds](2026-10-01-engine-settlement-and-resource-bounds.md)
+> publishes the schema contract atomically in `__manifest`, with no contract
+> file or schema sentinel. Historical: "schema contract file promotion after the
+> schema-apply publication" in the residual recovery surface (User and
+> operational behavior), and in the Content writers table the sentinel, the
+> staged contract, and its promotion, discard, or install in the Schema apply
+> and System-column upgrade rows. Current: detached staging of table effects,
+> the three-field pin, and the one `__manifest` publication.
 
 **Surveyed:** OmniGraph 0.11.0 on `main` at `d1dd8b97`; unmodified Lance
 11.0.0 from crates.io and Lance `main` at v12.0.0-rc.1 (2026-09-14); RFCs
@@ -1249,9 +1259,8 @@ Commits per second per branch on RustFS with a compact and with a
 fragmented manifest, before and after each step, with the whole-run tracker
 rather than the per-operation harness that cannot see held handles. The
 prototype carries the instruments; the figures above are a cost model, not
-a benchmark. The `concurrent-writes` scenario in the engine's benchmark
-harness is that instrument
-([concurrent-writes throughput diagnostics](../../benchmarks/README.md#concurrent-writes-throughput-diagnostics)):
+a benchmark. The former `concurrent-writes` scenario in the engine's benchmark
+harness provided that instrument; its [source is now deferred](../../benchmarks/deferred/README.md):
 a closed-loop, self-labeled diagnostic whose numbers are decision evidence
 for this path, not claims (RFC 0039 Rule 1 requires open-loop driving for
 claims).

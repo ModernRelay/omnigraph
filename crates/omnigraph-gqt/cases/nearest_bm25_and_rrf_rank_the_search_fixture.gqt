@@ -4,8 +4,10 @@
 # notes: "Learning" matches tie on score, so their order is the id tie-break; a secondary
 # notes: `$d.slug desc` key decides before it (the distinct-score order is pinned by
 # notes: bm25_distinct_scores_rank_descending.gqt; a Lance scoring change that breaks the tie
-# notes: changes what these steps mean, re-probe before updating). `rrf` of both arms keeps
-# notes: limit 3. Replaces the Rust tests nearest_returns_k_closest, nearest_full_rank_order,
+# notes: changes what these steps mean, re-probe before updating). `rrf` of both arms (k 60,
+# notes: one-based ranks): ml-intro 1/61 + 1/62 leads, rl-intro 1/63 + 1/63 is second, dl-basics
+# notes: 1/61 third, nlp-guide 1/62 is cut by limit 3 (RFC 0047 §One total order).
+# notes: Replaces the Rust tests nearest_returns_k_closest, nearest_full_rank_order,
 # notes: bm25_returns_ranked_results, bm25_full_rank_order, search_order_secondary_keys_are_honored
 # notes: and rrf_fuses_vector_and_text (search.rs).
 
@@ -100,10 +102,10 @@ query hybrid_search($vq: Vector(4), $tq: String) {
 --- params
 {"vq": [0.1, 0.2, 0.3, 0.4], "tq": "Learning"}
 
---- expect unordered
+--- expect ordered
 {"d.slug": "ml-intro", "d.title": "Introduction to Machine Learning"}
-{"d.slug": "dl-basics", "d.title": "Deep Learning Basics"}
 {"d.slug": "rl-intro", "d.title": "Reinforcement Learning Introduction"}
+{"d.slug": "dl-basics", "d.title": "Deep Learning Basics"}
 
 --- expect shape
 d.slug: String

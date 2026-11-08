@@ -4,9 +4,9 @@ A `.gq` file contains named, typed queries. Read queries match graph patterns
 and return columns; mutation queries use the same declaration form and are
 covered in [Mutations](../mutations/index.md). A file may instead hold exactly
 one statement, never beside a query declaration: a branch statement (`branch
-create`, `branch delete`, `branch merge`, or `branch list`; see
-[Branches, Commits, and History](../branching/index.md)), a `show` statement
-(see [session settings](#session-settings)), or an `explain` statement, which
+create`, `delete`, `merge`, `list`, `diff`, or `merge-base`; see [Branches,
+Commits, and History](../branching/index.md)), a `show` statement (see
+[session settings](#session-settings)), or an `explain` statement, which
 answers the plan a read query would run under instead of its rows (see
 [Explain](explain.md)). Any of them may open with
 [session settings](#session-settings) lines.
@@ -27,7 +27,7 @@ Run an ad-hoc query with:
 
 ```bash
 omnigraph query engineers --query queries.gq \
-  --params '{"title":"Engineer"}' --store graph.omni
+  --params '{"title":"Engineer"}' --target ./graph.omni
 ```
 
 ## Declarations and parameters
@@ -40,7 +40,8 @@ Parameter types use the schema scalar types. Every non-nullable declared
 parameter must be supplied; omission fails before query execution. A trailing
 `?` accepts `null` or an omitted value. `@description("...")` and
 `@instruction("...")` attach metadata for clients that expose stored queries
-as tools.
+as tools. An integer parameter carries the whole range of its declared type,
+so a `U64` parameter takes every value from `0` to `18446744073709551615`.
 
 ## Match patterns
 
@@ -62,6 +63,15 @@ A comparison (`contains` and `starts_with` included) with a null operand is
 null, and `not null` is null. A filter or mutation `where` keeps only rows
 whose expression is true, so `not ($p.age > 30)` skips rows whose `age` is
 null.
+
+Numeric comparisons choose their types before execution. A literal may use a
+property's type when its value is exactly representable in that type; otherwise
+both operands use a common numeric type. Parameters use their declared type,
+regardless of the supplied value. An `F32` property storing `0.1` therefore
+differs from the `F64` literal `0.1`, while `0.5` compares exactly. These rules
+also apply to list membership and mutation predicates, whether a filter runs
+in a scan or in memory. Mixed signed and `U64` values compare without losing
+integer precision.
 
 | `x` | `y` | `x and y` | `x or y` |
 |---|---|---|---|
@@ -93,25 +103,37 @@ matches take constants evaluated once per invocation, such as
 ### Correlated blocks
 
 `not { ... }`, `exists { ... }`, `count { ... } op value` and
-`sum(expr) { ... } op value` (also `min`, `max`, `avg`) each hold a pattern
-that is matched once per outer row. The block must read at least one variable
-bound outside it; that variable correlates the block with the row. The row is
-kept when the aggregate over the block's matches satisfies the comparison:
-`not` is `count = 0`, `exists` is `count > 0`. The comparison's right side is a
-literal, `now()` or a parameter of the aggregate's type. The aggregate's
-argument is a scalar expression over the block's scope, usually a property of
-a variable bound inside it: numeric for `sum` and `avg`;
-numeric, `String`, `Bool`, `Date` or `DateTime` for `min` and `max`, as in a
-`return`. A row with no match has no `sum`, `min`, `max` or `avg`, so it
-satisfies no comparison on them; its `count` is `0`.
+`sum(expr) { ... } op value` (also `min`, `max`, `avg`) match a pattern once per
+outer row. Each block must read a variable bound outside it. The row is kept
+when the aggregate comparison is true: `not` means `count = 0`, and `exists`
+means `count > 0`. The right side is a literal, `now()` or typed parameter;
+numeric bounds follow the [comparison rules](#boolean-expressions-and-nulls)
+for the aggregate's result type. Its argument is a scalar expression in the
+block's scope: numeric for `sum` and `avg`; numeric, `String`, `Bool`, `Date`
+or `DateTime` for `min` and `max`, as in `return`. With no matches, `sum`,
+`min`, `max` and `avg` satisfy no comparison; `count` is `0`.
+
+Integer block `sum` accumulates exactly in 128 bits, refuses overflow of that
+range, and rounds the total once to `F64` before comparison. For example,
+`9007199254740993` and `-9007199254740992` sum to `1`, while a single value
+`9007199254740993` rounds to `9007199254740992` and does not satisfy
+`sum(...) { ... } > 9007199254740992`.
+
+As in `return`, `avg` converts each non-null input to `F64` before summing
+and dividing by the count. For those same two values, the average is `0`,
+because the first value rounds before accumulation. `min` and `max` retain
+the column's declared type, including the full `U64` range; comparing a `U64`
+extremum with an `I64` parameter preserves both integer ranges. Row count and
+column `count` use `I64` and refuse a count beyond its range; column `count`
+skips null values.
 
 The block narrows the rows before `order` and `limit`, so a paged listing
 filtered by a relationship count is exact. A binding the block's traversal
-connects to the outer row is reached through that traversal, never scanned as
-a whole table, however many rows the outer pattern has; a binding correlated
-only through a filter, or read by a text search, is scanned. A
-single-hop, filter-free `count { ... }` over a directed, unbound edge is
-answered from the graph index's degree. A bare aggregate in `match`,
+connects to the outer row is reached through it, or the block runs once from a
+node it binds by key if that is cheaper (`strategy` in [explain](explain.md));
+a binding correlated only through a filter, or read by a text search, is
+scanned. A single-hop, filter-free `count { ... }` over a directed, unbound
+edge is answered from the graph index's degree. A bare aggregate in `match`,
 `count($d) > 2` without a block, is refused: it names no row to group by.
 
 ```
@@ -143,9 +165,8 @@ query prolific($least: I64) {
 
 `NULL` never matches these predicates. `%` and `_` are ordinary characters,
 not wildcards. The predicates remain correct without an index; do not assume a
-free-text String index accelerates exact prefix or substring filters.
-
-Use [full-text search](../search/index.md) for tokenization, fuzzy matching, and
+free-text String index accelerates exact prefix or substring filters. Use
+[full-text search](../search/index.md) for tokenization, fuzzy matching, and
 relevance ranking.
 
 ### System fields
@@ -160,12 +181,12 @@ no binding, the bare form serves: `delete Person where @id = $who`,
 `delete Knows where @src = $who`. A bare `id` (`$p.id`, `where id = ...`)
 always names a user property called `id`; where none is declared it is the
 unknown-property error, which names the meta-field. Edge inserts keep
-addressing endpoints as `from` and `to`.
-
-`$e.@type` returns the bound edge's canonical schema type name as a non-null
-`String`, including on ordinary named traversals. It is synthesized query
-metadata and cannot be written. `@src` and `@dst` preserve stored orientation,
-including when the query traverses in reverse.
+addressing endpoints as `from` and `to`. `$e.@type` returns the bound edge's
+canonical schema type name as a non-null `String`, including on ordinary named
+traversals; it is synthesized query metadata and cannot be written. `@src` and
+`@dst` preserve stored orientation, including when the query traverses in
+reverse. In type position the same prefix names an engine-owned, read-only
+type: `$o: @Operator` binds the rows of the [engine catalogue](catalogue.md).
 
 ## Return, order, and limit
 
@@ -175,57 +196,59 @@ order { companies desc, $person.name asc }
 limit 20
 ```
 
-Return expressions include variables, properties, literals, `now()`, earlier
-projection aliases, and the aggregates `count`, `sum`, `avg`, `min`, and `max`.
-`min` and `max` accept a numeric, `String`, `Bool`, `Date`, or `DateTime`
-column and return the column's own type; `Bool` orders `false` before `true`,
-dates and datetimes chronologically. When no row matches, a query whose
-projections are all aggregates returns one row: `count` is 0 and every other
-aggregate is null; a query that also projects a group value returns no rows.
-A bare node variable returns the node as one object: its `@id` and every
-property except `Blob` and `Vector` ones, so `return { $p }` gives a column
-`p` holding `{"@id": "alice", "name": "alice", "age": 30}`; project a property
-(`$p.name`, `$p.embedding`) for a single field. `count($p)` counts rows; the
-other aggregates take a property, not a bare node binding (`T8`). Each
-projection produces one result column, named by its alias or, without one,
-by its expression (`$p.name` gives `p.name`, `$p.@id` gives `p.@id`). Two projections that would
-produce the same column name are refused at compile time (`T25`); give each
-its own alias. A comparison or Boolean expression gives a `Bool` column and
-needs an alias (`T43`), `$p.age > 30 as adult`; it is `Bool?` when an operand is
-nullable (`is null` and `is not null` are always `Bool`), and refused in an aggregated `return` (`T9`).
-Search expressions are documented in [Search](../search/index.md).
+Return expressions include variables, properties, literals, `now()`, and the
+aggregates `count`, `sum`, `avg`, `min`, and `max`. Each gives one column named by
+its alias or expression (`$p.name` gives `p.name`); duplicates are refused (`T25`).
 
-An explicit order is total and deterministic: OmniGraph adds entity ids as a
-final tie-breaker when user keys are equal, only where the ids can change the
-visible order (when every returned expression is an order key, equal rows are
-indistinguishable and no id is read). Ascending order places nulls first;
-descending order places them last. `nearest(...)` ordering requires a `limit`.
+Integer `sum` accumulates exactly in 128 bits and rounds once to `F64`; `avg`
+uses a floating-point accumulator. `min` and `max` accept numeric, `String`,
+`Bool`, `Date`, or `DateTime` columns and keep their type (false before true,
+dates chronologically). With no matches, an aggregate-only return gives one row
+(`count` 0, the rest null); a return that also projects a group value gives no rows.
 
-An order key that is a property access or a system field sorts as before,
-returned or not. Any other key except the leading search key (an aggregate,
-a comparison, a call) must be a return alias or an expression written in
-`return`, as in `return { count($d) as deals } order { count($d) desc }`;
-otherwise it is ``T42: order key `max($d.amount)` does not appear in return;
-add it to return or order by its alias``, with the key as written.
+A bare node returns one object with `@id` and every property except `Blob` and
+`Vector`: `$p` produces column `p`; project a property for one field. `count($p)`
+counts rows and `count(distinct $p)` distinct nodes; `count(distinct $p.city)`
+counts distinct non-null values, so a node reached by several paths counts once.
+Other aggregates require a property (`T8`) and refuse `distinct` (`T57`).
 
-Search orderings share that contract: `nearest(...)` ranks by ascending vector
-distance and `bm25(...)` by descending relevance score, so the score (never
-any internal scan or traversal order) is what the row order means, including
-through multi-hop traversals. Keys after the search function apply as
-secondary sorts before the id tie-breaker; the search function itself must
-lead the order clause. The score is also a result value: `return { $d.slug,
-nearest($d.vector, $v) as score }` returns the distance the ordering used, and
-`bm25(...) as score` the relevance score, provided the projected expression
-repeats the leading `order` key (`T33`); without an alias the column is
-`d._distance` or `d._score`. A rank expression under an aggregate (`T32`),
-`rrf(...)` in `return` (`T37`, until the fused score becomes a column), and
-the predicates `search(...)`, `fuzzy(...)` and `match_text(...)` in `return`
-(`T35`, they belong in `match`) are refused at compile time. Aggregated
-queries are outside search ordering: group
-results are not score-ranked and cannot project a score (`T9`). One bound on the tie-break: a `bm25()` ordering
-with no secondary keys reads a bounded set of top-scoring matches, so among
-rows tied exactly at that bound's cut, which rows enter the result follows
-the scan bound rather than entity ids.
+A comparison or Boolean expression requires an alias (`T43`), such as
+`$p.age > 30 as adult`; its result is `Bool`, or `Bool?` with a nullable operand,
+and `is null` is always `Bool`. In an aggregated return its operands are
+aggregates, literals, `now()` and parameters, evaluated per group after
+aggregation: `count($p) > 0 as any` is `Bool?` because `count` is `I64?`. A group
+value beside an aggregate is refused (`T58`), any other Boolean item too (`T9`).
+
+`return distinct { $p.name }` keeps one row per complete projected tuple.
+Repeated traversal matches and equal values on different entities collapse;
+nulls compare equal. Every projection is a key, including comparisons, and
+bare nodes deduplicate by identity. Deduplication follows `match` and precedes
+ordering and limiting, so the limit counts distinct rows. Aggregates with
+`distinct` are refused (`T56`). Except for a leading search function, DISTINCT
+order keys must be projected values or aliases, including property keys
+(`T42`). Remaining projected columns break ties ascending; no identity tiebreak is added.
+
+For ordinary returns, explicit order is total: entity ids break ties only when
+they can change the visible order, and no id is read when every projection is a
+key. Ascending puts nulls first, descending last. `nearest(...)` requires a limit.
+On ungrouped, non-DISTINCT rows, property and system-field order keys need not be projected;
+other keys, except the leading search function, must be return aliases or
+expressions written in return (`T42`), like `count($d)` after `return { count($d) as deals }`.
+
+For ordinary returns, `nearest(...)` orders by ascending distance and `bm25`
+and `rrf` by descending score, including through traversals, ranking the binding named whichever binding `match` declares first ([details](../search/index.md#ranking-a-traversal-reached-binding); `rrf` arms on two connected bindings: `T59`).
+The search function must lead; subsequent keys precede the identity tiebreak. Projected
+scores must repeat that leading function (`T33`); the [Search guide](../search/index.md)
+defines their names and types. Rank expressions under aggregates (`T32`) and
+search predicates in return (`T35`) are refused.
+
+For aggregate or DISTINCT returns, the leading search function selects the
+input population; it does not order the output. Subsequent keys order output
+rows, followed by every group or DISTINCT key ascending. Without subsequent
+keys, output is unordered. Aggregates cannot project scores (`T9`). DISTINCT
+uses the selected nearest population without retry overfetch, so duplicates
+can leave fewer rows than the limit. BM25 reads every matching entity before
+the final limit.
 
 ## Blobs
 
@@ -241,7 +264,7 @@ Reads default to `main`. Select another branch or an immutable commit with
 
 ```bash
 omnigraph query engineers --query queries.gq --branch review \
-  --params '{"title":"Engineer"}' --store graph.omni
+  --params '{"title":"Engineer"}' --target ./graph.omni
 ```
 
 When the snapshot has an effective graph head, `omnigraph query --json`
@@ -249,9 +272,7 @@ includes its `graph_commit_id`, pinned with the returned rows. Use that
 same-snapshot id with a later mutation's `--if-commit` option when implementing
 read-modify-write. On a newly created, unmodified branch, it is the head
 inherited from the source branch and is valid for the branch's first
-conditional mutation.
-
-See [Branches, Commits, and History](../branching/index.md).
+conditional mutation. See [Branches, Commits, and History](../branching/index.md).
 
 ## JSON result spelling
 
@@ -270,10 +291,16 @@ its own. The spellings a consumer sees:
   (`1.0e20`, `1.0e-7`); a non-finite computed value is `null`.
 - `Vector(N)` and list properties are JSON arrays.
 
-On input, a `Date` string is a calendar day, `"2024-01-01"`; a string that
-carries a time of day, such as `"2024-01-01T02:00:00+05:00"`, is refused as a
-load value, a param, or a `date(...)` literal, and an instant belongs in a
-`DateTime` property.
+Send a 64-bit integer above 2^53 as a decimal string, so a client that parses
+JSON through a double keeps every digit. On input, a JSON number for an `F64`
+parses to the nearest `F64` value, the one a GQ literal with the same digits
+names, so an `F64` value read from `rows` loads back unchanged. A `Date` string is a calendar day, `"2024-01-01"`; a
+string that carries a time of day, such as `"2024-01-01T02:00:00+05:00"`, is
+refused as a load value, a param, or a `date(...)` literal, and an instant
+belongs in a `DateTime` property. A `DateTime` holds milliseconds: a string
+with a non-zero digit past the third fractional digit, such as
+`"2024-01-01T00:00:00.123456Z"`, is refused as a load value, a param, or a
+`datetime(...)` literal; trailing zeros, as in `.123000`, are accepted.
 
 A `Date` or `DateTime` count outside the range the writer can format is refused
 on load. A read that meets one fails with status 500; the error names the

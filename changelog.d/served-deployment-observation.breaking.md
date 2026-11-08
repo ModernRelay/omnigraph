@@ -1,0 +1,3 @@
+- Served cluster deployment now supports `cluster plan --server`, durable acceptance with `apply --no-wait`, and bounded waiting through `apply --timeout` or `status --deployment-id ID --wait`. Plans show graph-root deletion without closing serving admission. Caller timeout preserves the original ID and never cancels or replays server work. An authenticated initiator can observe its exact receipt after a management-policy handoff. Exact lookup now returns `{deployment, active, in_progress}`; aggregate status retains `{status, active, in_progress}`. Update API consumers with the server. See [cluster deployment][served-deployment-observation].
+
+[served-deployment-observation]: ../docs/user/clusters/index.md

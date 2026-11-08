@@ -1,0 +1,1 @@
+- Diff, `commit changes`, `query --snapshot` and the change feed read a commit of a deleted branch while a live branch retains it, such as a stacked branch's merge base.

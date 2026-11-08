@@ -20,6 +20,9 @@ use crate::error::Result;
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     inner: omnigraph_catalog::Snapshot,
+    /// Opened through a branch incarnation that was already retired, by its
+    /// exact commit, while a live branch retained the commit.
+    retired_incarnation: bool,
 }
 
 /// Read-only view of one backing dataset pinned by a [`Snapshot`].
@@ -187,6 +190,19 @@ impl SnapshotDataset {
         self.inner.has_fts_index(column).await
     }
 
+    /// Whether a full-text segment on physical `column` holds postings; an
+    /// untrained segment, which only declares the analyzer, does not.
+    pub async fn has_fts_postings(&self, column: &str) -> Result<bool> {
+        self.inner.has_fts_postings(column).await
+    }
+
+    /// The names of this version's built index entries, read from the raw
+    /// index-metadata section; untrained full-text segments index no row
+    /// and are left out. Empty proves the version holds no built index.
+    pub async fn built_index_names(&self) -> Result<Vec<String>> {
+        self.inner.built_index_names().await
+    }
+
     /// Whether this dataset has a user vector index on physical `column`.
     pub async fn has_vector_index(&self, column: &str) -> Result<bool> {
         self.inner.has_vector_index(column).await
@@ -194,15 +210,34 @@ impl SnapshotDataset {
 }
 
 impl Snapshot {
+    pub(crate) fn clone_allocation_bytes(&self) -> usize {
+        self.inner.clone_allocation_bytes()
+    }
+
     pub(crate) fn same_manifest_image(&self, other: &Self) -> bool {
         self.inner.same_manifest_image(&other.inner)
     }
 
     pub(crate) fn wrap(inner: omnigraph_catalog::Snapshot) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            retired_incarnation: false,
+        }
     }
 
-    #[cfg(any(all(test, feature = "failpoints"), feature = "test-util"))]
+    /// Mark this view as opened through an already retired incarnation. Its
+    /// native ref has a unique name no recreated branch can reuse, so there is
+    /// no live name to reprove after its tables open.
+    pub(crate) fn retired_incarnation(mut self) -> Self {
+        self.retired_incarnation = true;
+        self
+    }
+
+    pub(crate) fn is_retired_incarnation(&self) -> bool {
+        self.retired_incarnation
+    }
+
+    #[cfg(feature = "test-util")]
     pub(crate) fn raw(&self) -> &omnigraph_catalog::Snapshot {
         &self.inner
     }
@@ -218,6 +253,16 @@ impl Snapshot {
         root_uri: &str,
     ) -> Result<omnigraph_catalog::SchemaContractRow> {
         omnigraph_catalog::ManifestCoordinator::read_schema_contract_for_snapshot(
+            root_uri,
+            &self.inner,
+        )
+        .await
+    }
+
+    /// The internal-schema (storage-format) stamp of this snapshot's own
+    /// `__manifest` version.
+    pub(crate) async fn internal_schema_stamp(&self, root_uri: &str) -> Result<Option<u32>> {
+        omnigraph_catalog::ManifestCoordinator::internal_schema_stamp_for_snapshot(
             root_uri,
             &self.inner,
         )
@@ -251,8 +296,18 @@ impl Snapshot {
             .map(SchemaContractIdentity::from)
     }
 
-    pub(crate) fn bind_catalog_aliases(&mut self, catalog: &Catalog) -> Result<()> {
-        self.inner.bind_catalog_aliases(catalog)
+    pub(crate) fn bind_catalog_aliases(
+        &mut self,
+        catalog: &Catalog,
+        live: &Snapshot,
+    ) -> Result<()> {
+        self.inner.bind_catalog_aliases(catalog, &live.inner)
+    }
+
+    /// Whether the accepted contract was published with the version this view
+    /// pins for `type_key` (see `omnigraph_catalog::Snapshot::contract_covers`).
+    pub(crate) fn contract_covers(&self, type_key: &str) -> bool {
+        self.inner.contract_covers(type_key)
     }
 
     /// Open a backing dataset at its pinned version by qualified graph type key. With read caches present

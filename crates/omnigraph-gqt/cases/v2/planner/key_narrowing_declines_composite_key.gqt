@@ -1,0 +1,55 @@
+# issue: none
+# traversal: auto
+# notes: Composite keys are never narrowed: equality on both key properties stays sequential (no property index), and equality on `first` alone returns both rows, which a narrowing to one id would lose.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Pair {
+    first: String
+    last: String
+    @key(first, last)
+}
+
+--- seed
+{"type":"Pair","data":{"first":"ada","last":"lovelace"}}
+{"type":"Pair","data":{"first":"ada","last":"byron"}}
+{"type":"Pair","data":{"first":"alan","last":"turing"}}
+
+--- query
+set engine = v2;
+query exact() {
+    match {
+        $p: Pair { first: "ada", last: "lovelace" }
+    }
+    return { $p.last }
+}
+--- expect unordered
+{"p.last":"lovelace"}
+--- expect shape
+p.last: String
+--- expect plan
+scan Pair as $p: access sequential
+not pass key_to_id
+
+--- query
+set engine = v2;
+query first_only() {
+    match {
+        $p: Pair
+        $p.first = "ada"
+    }
+    return { $p.last }
+}
+--- expect unordered
+{"p.last":"lovelace"}
+{"p.last":"byron"}
+--- expect shape
+p.last: String
+--- expect plan
+scan Pair as $p: access sequential
+not pass key_to_id

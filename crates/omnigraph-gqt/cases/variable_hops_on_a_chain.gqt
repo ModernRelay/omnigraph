@@ -2,11 +2,15 @@
 # notes: Hop ranges on the chain A->B->C->D: {1,3} reaches B, C and D, {2,3} skips the first
 # notes: hop, {2,2} keeps only C. Replaces the Rust tests variable_hops_1_to_3,
 # notes: variable_hops_2_to_3 and variable_hops_exact_2 (traversal.rs).
+# notes: A cross-type edge (WorksAt: Person -> Company) cannot chain, so a bound that allows
+# notes: a second hop is refused with T5 rather than run as one hop; omitted and {1,1} run.
 
 --- runner
 timeout_ms: 10000
 environments:
   - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
     storage: local-filesystem
 
 --- schema
@@ -14,7 +18,13 @@ node Person {
     name: String @key
 }
 
+node Company {
+    name: String @key
+}
+
 edge Knows: Person -> Person
+
+edge WorksAt: Person -> Company
 
 --- seed
 {"type":"Person","data":{"name":"A"}}
@@ -24,6 +34,8 @@ edge Knows: Person -> Person
 {"edge":"Knows","from":"A","to":"B"}
 {"edge":"Knows","from":"B","to":"C"}
 {"edge":"Knows","from":"C","to":"D"}
+{"type":"Company","data":{"name":"Acme"}}
+{"edge":"WorksAt","from":"A","to":"Acme"}
 
 --- query
 query reachable($name: String) {
@@ -81,3 +93,67 @@ query exactly_2($name: String) {
 
 --- expect shape
 f.name: String
+
+--- query
+query employer($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p worksAt $c
+    }
+    return { $c.name }
+}
+
+--- params
+{"name": "A"}
+
+--- expect unordered
+{"c.name": "Acme"}
+
+--- expect shape
+c.name: String
+
+--- query
+query employer_one_hop($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p worksAt{1,1} $c
+    }
+    return { $c.name }
+}
+
+--- params
+{"name": "A"}
+
+--- expect unordered
+{"c.name": "Acme"}
+
+--- expect shape
+c.name: String
+
+--- query
+query employer_within_two($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p worksAt{1,2} $c
+    }
+    return { $c.name }
+}
+
+--- params
+{"name": "A"}
+
+--- expect error: T5: multi-hop traversal `worksAt{1,2}` requires the same node type at both endpoints, but `WorksAt: Person -> Company` connects different types
+
+--- query
+query employer_at_two($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p worksAt{2,2} $c
+    }
+    return { $c.name }
+}
+
+--- params
+{"name": "A"}
+
+--- expect error: T5: multi-hop traversal `worksAt{2,2}`

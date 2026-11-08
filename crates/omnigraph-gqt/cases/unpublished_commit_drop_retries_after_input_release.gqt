@@ -1,0 +1,96 @@
+# issue: none
+# notes: A `commit drop` of a merge proposal that fails after releasing its input holds and before deleting
+# notes: the proposal tag leaves the proposal readable; the retried drop completes and the branch never saw the merge.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+branch create b0
+
+--- expect ok
+
+--- mutate branch: b0
+query insert_on_b0() {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query insert_on_main() {
+    insert Person { name: "carol", age: 52 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge b0 into main as commit
+
+--- expect outcome: merged
+
+--- bind commit $merge
+
+--- seam
+at: drop.post_inputs_pre_tag
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+commit drop "${merge}"
+
+--- expect error: injected failpoint triggered: drop.post_inputs_pre_tag
+
+--- query snapshot: $merge
+query names_at_proposal_after_failed_drop() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+{"p.name": "carol"}
+
+--- expect shape
+p.name: String
+
+--- mutate
+commit drop "${merge}"
+
+--- expect ok
+
+--- query snapshot: $merge
+query names_at_dropped() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect error: not found
+
+--- query
+query names_on_main() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "carol"}
+
+--- expect shape
+p.name: String

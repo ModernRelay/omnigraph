@@ -42,6 +42,103 @@ async fn cluster_management_policy_can_boot_beside_legacy_catalog_rules() {
     );
 }
 
+/// Deployment routes refuse with the error body: a server that resolves no
+/// actor refuses before anything else, and a body that does not decode keeps
+/// its own status and code once authorization admits the caller.
+#[tokio::test]
+async fn deployment_routes_refuse_with_the_error_body() {
+    let temp = tempfile::tempdir().unwrap();
+    let request = |method: Method,
+                   path: &str,
+                   token: Option<&str>,
+                   content_type: &str,
+                   body: &'static str| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header("content-type", content_type);
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        request.body(Body::from(body)).unwrap()
+    };
+    let open = build_app(
+        omnigraph_server::open_multi_graph_state(
+            Vec::new(),
+            Vec::new(),
+            None,
+            temp.path().join("open.yaml"),
+            false,
+        )
+        .await
+        .unwrap(),
+    );
+    for (method, path) in [
+        (Method::GET, "/cluster/deployments"),
+        (Method::GET, "/cluster/deployments/some-id"),
+        (Method::POST, "/cluster/plan"),
+        (Method::POST, "/cluster/deployments"),
+    ] {
+        let (status, body) = json_response(
+            &open,
+            request(method.clone(), path, None, "application/json", "{}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {body}");
+        assert_eq!(body["code"], "forbidden", "{method} {path}: {body}");
+        assert_eq!(
+            body["disposition"],
+            serde_json::json!({"effects": "none", "action": "refresh"}),
+            "{method} {path}"
+        );
+    }
+
+    let source = omnigraph_server::PolicySource::Inline(
+        "version: 1\ngroups:\n  operators: [operator]\nrules:\n  - id: configuration\n    allow:\n      actors: {group: operators}\n      actions: [config_manage]\n".into(),
+    );
+    let managed = build_app(
+        omnigraph_server::open_multi_graph_state(
+            Vec::new(),
+            vec![("operator".into(), "static-token".into())],
+            Some(&source),
+            temp.path().join("cluster.yaml"),
+            false,
+        )
+        .await
+        .unwrap(),
+    );
+    for path in ["/cluster/plan", "/cluster/deployments"] {
+        for (content_type, body, status, code) in [
+            (
+                "text/plain",
+                "{}",
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_media_type",
+            ),
+            (
+                "application/json",
+                "{",
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+            ),
+        ] {
+            let (answered, refusal) = json_response(
+                &managed,
+                request(Method::POST, path, Some("static-token"), content_type, body),
+            )
+            .await;
+            assert_eq!(answered, status, "{path} {content_type}: {refusal}");
+            assert_eq!(refusal["code"], code, "{path} {content_type}: {refusal}");
+            assert_eq!(
+                refusal["disposition"],
+                serde_json::json!({"effects": "none", "action": "fix"}),
+                "{path} {content_type}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn v2_settings_capture_holds_admission_across_drop_and_refuses_another_server() {
     let temp = converged_cluster_dir("").await;
@@ -161,6 +258,7 @@ async fn v2_startup_blocks_only_graphs_with_unavailable_or_changed_accepted_cont
             graphs,
             config_path,
             server_policy,
+            ..
         } = settings.mode;
         let state = omnigraph_server::open_multi_graph_state(
             graphs.clone(),
@@ -268,6 +366,7 @@ fn legacy_public_struct_literals_and_destructuring_compile() {
             graphs: vec![],
             config_path: "cluster".into(),
             server_policy: None,
+            catalogue_policy: None,
         },
         bind: "127.0.0.1:0".into(),
         allow_unauthenticated: true,
@@ -470,9 +569,8 @@ async fn managed_settings_bind_the_applied_store_not_the_config_directory() {
     .await
     .unwrap()
     .with_shutdown_grace(std::time::Duration::from_secs(7));
-    let legacy = cluster_settings(&config_path).await.unwrap();
+    let witnessed = managed.config().witness.state_cas.clone();
     assert_eq!(managed.canonical_root(), canonical_root);
-    assert_eq!(managed.config().witness.state_cas, legacy.witness.state_cas);
     assert_eq!(
         managed.config().shutdown_grace,
         std::time::Duration::from_secs(7)
@@ -481,6 +579,18 @@ async fn managed_settings_bind_the_applied_store_not_the_config_directory() {
     assert_eq!(graphs.len(), 1);
     assert_eq!(graphs[0].graph_id, "knowledge");
     assert!(graphs[0].uri.contains("/graphs/knowledge.omni"));
+    let admission = managed.config().cluster_admission.clone().unwrap();
+    drop(managed);
+    admission.release_after_settlement().await.unwrap();
+    let mut legacy = cluster_settings(&config_path).await.unwrap();
+    assert_eq!(witnessed, legacy.witness.state_cas);
+    legacy
+        .cluster_admission
+        .take()
+        .unwrap()
+        .release_after_settlement()
+        .await
+        .unwrap();
 
     let direct = omnigraph_server::load_server_settings_with_data_token_trust(
         Some(&std::path::PathBuf::from(&canonical_root)),
@@ -492,19 +602,14 @@ async fn managed_settings_bind_the_applied_store_not_the_config_directory() {
     .await
     .unwrap();
     assert_eq!(direct.canonical_root(), canonical_root);
-    assert_eq!(
-        direct.config().witness.state_cas,
-        managed.config().witness.state_cas
-    );
+    assert_eq!(direct.config().witness.state_cas, witnessed);
 }
 
 #[tokio::test]
 async fn applied_empty_cluster_still_requires_exact_data_trust_root() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("cluster.yaml"), "version: 1\ngraphs: {}\n").unwrap();
-    assert!(omnigraph_cluster::import_config_dir(temp.path()).await.ok);
-    let applied = omnigraph_cluster::apply_config_dir(temp.path()).await;
-    assert!(applied.ok && applied.converged, "{applied:?}");
+    support::apply_cluster_fixture(temp.path()).await;
     let mut tokens = data_tokens::DataTokens::new();
     let trust = temp.path().join("trust.json");
     fs::write(&trust, serde_json::to_vec(&tokens.document).unwrap()).unwrap();
@@ -542,7 +647,12 @@ async fn applied_empty_cluster_still_requires_exact_data_trust_root() {
     assert!(!settings.config().allow_unauthenticated);
     assert_eq!(
         settings.config().witness.booted_serving_digest,
-        applied.desired_revision.config_digest
+        Some(
+            omnigraph_cluster::capture_deployment(temp.path())
+                .unwrap()
+                .config_digest()
+                .to_owned()
+        )
     );
     let omnigraph_server::ServerConfigMode::Multi { graphs, .. } = &settings.config().mode;
     assert!(graphs.is_empty());
@@ -604,7 +714,7 @@ mod multi_graph_startup {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn signed_registry_lists_only_granted_ready_and_blocked_graphs() {
+    async fn identity_registry_lists_policy_authorized_ready_and_blocked_graphs() {
         let tokens = data_tokens::DataTokens::new();
         let policy = omnigraph_policy::PolicyEngine::load_server_from_source(&format!(
             "version: 1\ngroups:\n  viewers: [\"{}\"]\nrules:\n  - id: list\n    allow:\n      actors: {{group: viewers}}\n      actions: [graph_list]\n",tokens.actor
@@ -617,30 +727,33 @@ mod multi_graph_startup {
         .await;
         let state = state.with_data_token_trust(tokens.trust.clone());
         let app = build_app(state);
-        let token = tokens.token(serde_json::json!([
-            {"graph_id":"alpha","actions":["graph_list"]},
-            {"graph_id":"beta","actions":["read"]},
-            {"graph_id":"ghost-allowed","actions":["graph_list"]}
-        ]));
+        let token = tokens.identity_token();
         let (status, body) = json_response(&app, get_request("/graphs", &token)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["graphs"].as_array().unwrap().len(), 2);
+        assert_eq!(body["graphs"].as_array().unwrap().len(), 4);
         assert_eq!(body["graphs"][0]["graph_id"], "alpha");
         assert_eq!(body["graphs"][0]["state"], "ready");
-        assert_eq!(body["graphs"][1]["graph_id"], "ghost-allowed");
-        assert_eq!(body["graphs"][1]["state"], "blocked");
+        assert_eq!(body["graphs"][2]["graph_id"], "ghost-allowed");
+        assert_eq!(body["graphs"][2]["state"], "blocked");
         assert!(body.get("quarantined").is_none());
-        for (id, expected) in [
-            ("ghost-allowed", StatusCode::SERVICE_UNAVAILABLE),
-            ("ghost-hidden", StatusCode::FORBIDDEN),
-        ] {
+        // Listing permission reveals availability but grants no data access.
+        let (status, _) = json_response(&app, get_request("/graphs/alpha/snapshot", &token)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let hidden = tokens.identity_token_for("unlisted");
+        for id in ["ghost-allowed", "ghost-hidden"] {
             let (status, _) =
                 json_response(&app, get_request(&format!("/graphs/{id}/snapshot"), &token)).await;
-            assert_eq!(status, expected);
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            let (status, _) = json_response(
+                &app,
+                get_request(&format!("/graphs/{id}/snapshot"), &hidden),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
         }
-        let read = tokens.token(serde_json::json!([{"graph_id":"alpha","actions":["read"]}]));
-        let (status, _) = json_response(&app, get_request("/graphs", &read)).await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
+        let retired = tokens.token(serde_json::json!([{"graph_id":"alpha","actions":["read"]}]));
+        let (status, _) = json_response(&app, get_request("/graphs", &retired)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     /// Cluster route `/graphs/{graph_id}/snapshot` resolves to the right
@@ -718,25 +831,20 @@ mod multi_graph_startup {
             (Method::GET, "/graphs/alpha/commits", None),
             (
                 Method::POST,
-                "/graphs/alpha/read",
-                Some(r#"{"query_source":"query q() { return {} }"}"#),
+                "/graphs/alpha/query",
+                Some(r#"{"query":"query q() { return {} }"}"#),
             ),
             (
                 Method::POST,
-                "/graphs/alpha/change",
-                Some(r#"{"query_source":"query q() { return {} }"}"#),
+                "/graphs/alpha/mutate",
+                Some(r#"{"query":"query q() { return {} }"}"#),
             ),
             (
                 Method::POST,
                 "/graphs/alpha/export",
                 Some(r#"{"branch":"main"}"#),
             ),
-            (
-                Method::POST,
-                "/graphs/alpha/schema/apply",
-                Some(r#"{"schema_source":""}"#),
-            ),
-            (Method::POST, "/graphs/alpha/ingest", Some(r#"{"data":""}"#)),
+            (Method::POST, "/graphs/alpha/load", Some(r#"{"data":""}"#)),
             (
                 Method::POST,
                 "/graphs/alpha/branches/merge",
@@ -1271,7 +1379,7 @@ rules:
         assert_eq!(body["graphs"][1]["graph_id"], "beta");
         assert_eq!(body["graphs"][1]["state"], "blocked");
         assert_eq!(body["graphs"][1]["failure"], "open_failed");
-        assert_eq!(body["graphs"][1]["action"], "restart_after_correction");
+        assert_eq!(body["graphs"][1]["action"], "apply_correction_or_restart");
         assert_eq!(body["graphs"][1]["read_available"], false);
         assert_eq!(body["graphs"][1]["write_available"], false);
         assert!(body.get("quarantined").is_none());
@@ -1433,6 +1541,8 @@ mod owned_shutdown {
                     "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
                     if mode.starts_with("startup-") {
                         r#"{"startup-operator":"startup-secret"}"#
+                    } else if mode == "v2-finish" {
+                        r#"{"restart-operator":"restart-secret"}"#
                     } else {
                         "{}"
                     },
@@ -1505,6 +1615,33 @@ mod owned_shutdown {
         socket
     }
 
+    async fn mcp_schema(client: &reqwest::Client, address: &str) -> Value {
+        let response = client
+            .post(format!("http://{address}/mcp"))
+            .bearer_auth("restart-secret")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-11-25")
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "schema", "arguments": {"graph": "knowledge"}}
+            }))
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["result"]["isError"], false, "{body}");
+        let schema = body["result"]["structuredContent"].clone();
+        assert!(
+            schema["schema_source"]
+                .as_str()
+                .unwrap()
+                .contains("node Person")
+        );
+        schema
+    }
+
     fn server_config(root: &Path, grace: Duration) -> omnigraph_server::ServerConfig {
         let graph = graph_path(root);
         omnigraph_server::ServerConfig {
@@ -1520,6 +1657,7 @@ mod owned_shutdown {
                 }],
                 config_path: root.join("cluster.yaml"),
                 server_policy: None,
+                catalogue_policy: None,
             },
             bind: "127.0.0.1:0".into(),
             allow_unauthenticated: true,
@@ -1540,7 +1678,11 @@ mod owned_shutdown {
         if mode.starts_with("startup-") {
             let mut config = server_config(
                 &root,
-                Duration::from_secs(if mode == "startup-cutoff" { 2 } else { 10 }),
+                if mode == "startup-cutoff" {
+                    Duration::from_millis(500)
+                } else {
+                    Duration::from_secs(10)
+                },
             );
             config.require_all_graphs = mode.starts_with("startup-strict");
             let omnigraph_server::ServerConfigMode::Multi { server_policy, .. } = &mut config.mode;
@@ -1626,7 +1768,40 @@ mod owned_shutdown {
             .await
             .unwrap();
             config.shutdown_grace = Duration::from_secs(5);
-            omnigraph_server::serve(config).await.unwrap();
+            if mode == "v2-swallowed-error" {
+                let scope = config
+                    .cluster_admission
+                    .as_ref()
+                    .unwrap()
+                    .io_scope()
+                    .unwrap();
+                let storage =
+                    omnigraph::storage::storage_for_uri_scoped(root.to_str().unwrap(), scope)
+                        .unwrap();
+                let fault_root = root.clone();
+                tokio::spawn(async move {
+                    while !fault_root.join("inject-error").exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    fs::write(fault_root.join("file-blocker"), b"file").unwrap();
+                    // Deliberately swallow a real backend error. Logical owner
+                    // completion cannot erase the storage scope's uncertainty.
+                    assert!(
+                        storage
+                            .write_text(
+                                fault_root.join("file-blocker/child").to_str().unwrap(),
+                                "no",
+                            )
+                            .await
+                            .is_err()
+                    );
+                    fs::write(fault_root.join("fault-reached"), b"reached").unwrap();
+                });
+            }
+            if let Err(error) = omnigraph_server::serve(config).await {
+                eprintln!("native shutdown refused: {error:?}");
+                std::process::exit(2);
+            }
             fs::write(root.join("serve-returned"), b"returned").unwrap();
             std::process::exit(0);
         }
@@ -1693,7 +1868,11 @@ mod owned_shutdown {
         });
         let result = omnigraph_server::serve(server_config(
             &root,
-            Duration::from_secs(if cutoff { 2 } else { 10 }),
+            if cutoff {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(10)
+            },
         ))
         .await;
         if let Err(error) = &result {
@@ -1712,135 +1891,48 @@ mod owned_shutdown {
         std::process::exit(0);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn startup_listener_reports_progress_and_retains_open_ownership() {
-        for mode in [
-            "startup-progress",
-            "startup-strict",
-            "startup-finish",
-            "startup-cutoff",
-            "startup-panic",
-            "startup-strict-failed",
-            "startup-all-failed",
-        ] {
-            let temp = init_loaded_graph().await;
-            let root = temp.path();
-            let schema = fs::read_to_string(fixture("test.pg")).unwrap();
-            Omnigraph::init(root.join("sibling.omni").to_str().unwrap(), &schema)
-                .await
-                .unwrap();
-            let graph = graph_path(root);
-            let before = Omnigraph::open_read_only(graph.to_str().unwrap())
-                .await
-                .unwrap()
-                .list_commits(None)
-                .await
-                .unwrap();
-            let (mut child, address, output_thread) = spawn_owned_child(root, mode);
-            let started = Instant::now();
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert(
-                reqwest::header::AUTHORIZATION,
-                reqwest::header::HeaderValue::from_static("Bearer startup-secret"),
+    async fn startup_listener_reports_progress_and_retains_open_ownership(mode: &str) {
+        let temp = init_loaded_graph().await;
+        let root = temp.path();
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        Omnigraph::init(root.join("sibling.omni").to_str().unwrap(), &schema)
+            .await
+            .unwrap();
+        let graph = graph_path(root);
+        let before = Omnigraph::open_read_only(graph.to_str().unwrap())
+            .await
+            .unwrap()
+            .list_commits(None)
+            .await
+            .unwrap();
+        let (mut child, address, output_thread) = spawn_owned_child(root, mode);
+        let started = Instant::now();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_static("Bearer startup-secret"),
+        );
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        if mode == "startup-panic" {
+            wait_marker(&root.join("fault-reached"), &mut child.0);
+        } else if mode != "startup-all-failed" {
+            wait_marker(&root.join("holder-reached"), &mut child.0);
+            assert_eq!(
+                client
+                    .get(format!("http://{address}/healthz"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
             );
-            let client = reqwest::Client::builder()
-                .default_headers(headers)
-                .timeout(Duration::from_secs(2))
-                .build()
-                .unwrap();
-            if mode == "startup-panic" {
-                wait_marker(&root.join("fault-reached"), &mut child.0);
-            } else if mode != "startup-all-failed" {
-                wait_marker(&root.join("holder-reached"), &mut child.0);
-                assert_eq!(
-                    client
-                        .get(format!("http://{address}/healthz"))
-                        .send()
-                        .await
-                        .unwrap()
-                        .status(),
-                    StatusCode::OK
-                );
-                if mode == "startup-progress" {
-                    wait_ready(&address, &mut child.0, "degraded").await;
-                }
-                let readiness = client
-                    .get(format!("http://{address}/readyz"))
-                    .send()
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    readiness.status(),
-                    if mode == "startup-progress" {
-                        StatusCode::OK
-                    } else {
-                        StatusCode::SERVICE_UNAVAILABLE
-                    },
-                    "{mode}"
-                );
-                let readiness: Value = readiness.json().await.unwrap();
-                assert_eq!(
-                    readiness["status"],
-                    if mode == "startup-progress" {
-                        "degraded"
-                    } else {
-                        "loading"
-                    },
-                    "{mode}: {readiness}"
-                );
-                assert_eq!(
-                    readiness["ready_graph_count"],
-                    usize::from(mode == "startup-progress")
-                );
-                assert!(readiness["loading_graph_count"].as_u64().unwrap() > 0);
-                assert!(readiness.get("graphs").is_none());
-                let inventory = client
-                    .get(format!("http://{address}/graphs"))
-                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                    .send()
-                    .await
-                    .unwrap();
-                assert_eq!(inventory.status(), StatusCode::OK, "{mode}: inventory");
-                let inventory: Value = inventory.json().await.unwrap();
-                let owned = &inventory["graphs"][0];
-                assert_eq!(owned["graph_id"], "owned");
-                assert_eq!(owned["state"], "loading");
-                assert_eq!(owned["action"], "wait_for_startup");
-                assert_eq!(owned["read_available"], false);
-                assert_eq!(owned["write_available"], false);
-                assert!(owned.get("failure").is_none());
-                let response = client
-                    .get(format!("http://{address}/graphs/owned/snapshot"))
-                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                    .send()
-                    .await
-                    .unwrap();
-                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-                assert!(!response.headers().contains_key("retry-after"));
-                let unknown = client
-                    .get(format!("http://{address}/graphs/unknown/snapshot"))
-                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                    .send()
-                    .await
-                    .unwrap();
-                assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
-                if matches!(mode, "startup-progress" | "startup-strict") {
-                    let sibling = client
-                        .get(format!("http://{address}/graphs/sibling/snapshot"))
-                        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                        .send()
-                        .await
-                        .unwrap();
-                    assert_eq!(
-                        sibling.status(),
-                        if mode == "startup-progress" {
-                            StatusCode::OK
-                        } else {
-                            StatusCode::SERVICE_UNAVAILABLE
-                        }
-                    );
-                    fs::write(root.join("release"), b"release").unwrap();
-                    wait_ready(&address, &mut child.0, "serving").await;
+            if mode == "startup-progress" {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
                     let readiness: Value = client
                         .get(format!("http://{address}/readyz"))
                         .send()
@@ -1849,240 +1941,1970 @@ mod owned_shutdown {
                         .json()
                         .await
                         .unwrap();
-                    assert_eq!(readiness["status"], "serving");
-                    assert_eq!(readiness["ready_graph_count"], 2);
-                    assert_eq!(readiness["loading_graph_count"], 0);
-                }
-                if mode == "startup-strict-failed" {
-                    fs::write(root.join("release"), b"release").unwrap();
-                } else {
-                    assert_eq!(
-                        unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) },
-                        0
-                    );
-                    if matches!(mode, "startup-finish" | "startup-cutoff") {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        assert!(
-                            !root.join("serve-returned").exists(),
-                            "startup owner was dropped at shutdown"
-                        );
-                        assert!(child.0.try_wait().unwrap().is_none());
-                        if mode == "startup-finish" {
-                            fs::write(root.join("release"), b"release").unwrap();
-                        }
+                    if readiness["ready_graph_count"] == 1 {
+                        break;
                     }
+                    assert!(Instant::now() < deadline, "sibling did not finish opening");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
-            let deadline = Instant::now() + Duration::from_secs(15);
-            let status = loop {
-                if let Some(status) = child.0.try_wait().unwrap() {
-                    break status;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "{mode}: startup shutdown exceeded bound"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            };
+            let readiness = client
+                .get(format!("http://{address}/readyz"))
+                .send()
+                .await
+                .unwrap();
             assert_eq!(
-                status.code(),
-                Some(match mode {
-                    "startup-cutoff" | "startup-panic" => 2,
-                    "startup-strict-failed" | "startup-all-failed" => 1,
-                    _ => 0,
-                }),
+                readiness.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
                 "{mode}"
             );
-            if mode == "startup-panic" {
-                assert!(started.elapsed() < Duration::from_secs(5));
-                assert!(!root.join("serve-returned").exists());
-            }
-            output_thread.join().unwrap();
-            let after = Omnigraph::open_read_only(graph.to_str().unwrap())
-                .await
-                .unwrap()
-                .list_commits(None)
-                .await
-                .unwrap();
+            let readiness: Value = readiness.json().await.unwrap();
+            assert_eq!(readiness["status"], "loading", "{mode}: {readiness}");
             assert_eq!(
-                after, before,
-                "startup must not publish graph content: {mode}"
+                readiness["ready_graph_count"],
+                usize::from(mode == "startup-progress")
             );
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn disconnected_write_and_shutdown_share_ownership() {
-        for mode in [
-            "finish",
-            "cutoff",
-            "panic-before",
-            "panic-after",
-            "v2-finish",
-            "v2-crash",
-        ] {
-            let cutoff = mode == "cutoff";
-            let panic = mode.starts_with("panic-");
-            let v2 = mode.starts_with("v2-");
-            let temp = if v2 {
-                let temp = converged_cluster_dir("").await;
-                omnigraph_cluster::upgrade_deployment_ledger(
-                    &format!("file://{}", temp.path().display()),
-                    true,
-                    &omnigraph_cluster::DeploymentCaller::storage_owner(None),
-                )
+            assert!(readiness["loading_graph_count"].as_u64().unwrap() > 0);
+            assert!(readiness.get("graphs").is_none());
+            let inventory = client
+                .get(format!("http://{address}/graphs"))
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .send()
                 .await
                 .unwrap();
-                temp
-            } else {
-                init_loaded_graph().await
-            };
-            let root = temp.path();
-            let graph = if v2 {
-                root.join("graphs/knowledge.omni")
-            } else {
-                graph_path(root)
-            };
-            let ledger_before = v2.then(|| fs::read(root.join("__cluster/state.json")).unwrap());
-            let before = Omnigraph::open_read_only(graph.to_str().unwrap())
+            assert_eq!(inventory.status(), StatusCode::OK, "{mode}: inventory");
+            let inventory: Value = inventory.json().await.unwrap();
+            let owned = &inventory["graphs"][0];
+            assert_eq!(owned["graph_id"], "owned");
+            assert_eq!(owned["state"], "loading");
+            assert_eq!(owned["action"], "wait_for_startup");
+            assert_eq!(owned["read_available"], false);
+            assert_eq!(owned["write_available"], false);
+            assert!(owned.get("failure").is_none());
+            let response = client
+                .get(format!("http://{address}/graphs/owned/snapshot"))
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .send()
                 .await
-                .unwrap()
-                .list_commits(None)
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            // An unavailable graph asks for a retry, and says when.
+            assert_eq!(response.headers()["retry-after"], "60");
+            let unknown = client
+                .get(format!("http://{address}/graphs/unknown/snapshot"))
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .send()
                 .await
-                .unwrap()
-                .len();
-            let (mut child, address, output_thread) = spawn_owned_child(root, mode);
-            wait_ready(&address, &mut child.0, "serving").await;
-            let fault_started = Instant::now();
-            let retained_lock = v2.then(|| fs::read(root.join("__cluster/lock.json")).unwrap());
-            if v2 {
-                let signal = if mode == "v2-crash" {
-                    libc::SIGKILL
-                } else {
-                    libc::SIGTERM
-                };
-                assert_eq!(
-                    unsafe { libc::kill(child.0.id() as libc::pid_t, signal) },
-                    0
-                );
-            } else if panic {
-                let mut response = String::new();
-                // The response may be lost as fatal shutdown begins; the
-                // fault marker and process exit are the independent oracle.
-                let _ = send_mutation(&address, "Uncertain").read_to_string(&mut response);
-                wait_marker(&root.join("fault-reached"), &mut child.0);
-            } else {
-                let socket = send_mutation(&address, "Disconnected");
-                wait_marker(&root.join("http-staged"), &mut child.0);
-                socket.shutdown(Shutdown::Both).unwrap();
-                drop(socket);
-                // Give the real connection closure a turn; the next request must
-                // still find the disconnected write's actor reservation occupied.
-                std::thread::sleep(Duration::from_millis(100));
-                let mut refused = String::new();
-                send_mutation(&address, "MustNotRun")
-                    .read_to_string(&mut refused)
+                .unwrap();
+            assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+            if matches!(mode, "startup-progress" | "startup-strict") {
+                let sibling = client
+                    .get(format!("http://{address}/graphs/sibling/snapshot"))
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                    .send()
+                    .await
                     .unwrap();
-                assert!(refused.starts_with("HTTP/1.1 429"), "{refused}");
-                assert!(refused.contains("too_many_requests"), "{refused}");
+                assert_eq!(
+                    sibling.status(),
+                    if mode == "startup-progress" {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                );
+                fs::write(root.join("release"), b"release").unwrap();
+                wait_ready(&address, &mut child.0, "serving").await;
+                let readiness: Value = client
+                    .get(format!("http://{address}/readyz"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                assert_eq!(readiness["status"], "serving");
+                assert_eq!(readiness["ready_graph_count"], 2);
+                assert_eq!(readiness["loading_graph_count"], 0);
+            }
+            if mode == "startup-strict-failed" {
+                fs::write(root.join("release"), b"release").unwrap();
+            } else {
                 assert_eq!(
                     unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) },
                     0
                 );
-                wait_marker(&root.join("signal-observed"), &mut child.0);
-                std::thread::sleep(Duration::from_millis(100));
-                assert!(
-                    !root.join("serve-returned").exists(),
-                    "serve returned while its disconnected write was pending"
-                );
-                assert!(child.0.try_wait().unwrap().is_none());
-                if !cutoff {
-                    fs::write(root.join("release"), b"release").unwrap();
+                if matches!(mode, "startup-finish" | "startup-cutoff") {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    assert!(
+                        !root.join("serve-returned").exists(),
+                        "startup owner was dropped at shutdown"
+                    );
+                    assert!(child.0.try_wait().unwrap().is_none());
+                    if mode == "startup-finish" {
+                        fs::write(root.join("release"), b"release").unwrap();
+                    }
                 }
             }
-            let deadline = Instant::now() + Duration::from_secs(15);
-            let status = loop {
-                if let Some(status) = child.0.try_wait().unwrap() {
-                    break status;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "shutdown did not finish within its process bound"
-                );
-                std::thread::sleep(Duration::from_millis(10));
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{mode}: startup shutdown exceeded bound"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            status.code(),
+            Some(match mode {
+                "startup-cutoff" | "startup-panic" => 2,
+                "startup-strict-failed" | "startup-all-failed" => 1,
+                _ => 0,
+            }),
+            "{mode}"
+        );
+        if mode == "startup-panic" {
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert!(!root.join("serve-returned").exists());
+        }
+        output_thread.join().unwrap();
+        let after = Omnigraph::open_read_only(graph.to_str().unwrap())
+            .await
+            .unwrap()
+            .list_commits(None)
+            .await
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "startup must not publish graph content: {mode}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_listener_progress_retains_open_ownership() {
+        startup_listener_reports_progress_and_retains_open_ownership("startup-progress").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_listener_strict_retains_open_ownership() {
+        startup_listener_reports_progress_and_retains_open_ownership("startup-strict").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_listener_finish_retains_open_ownership() {
+        startup_listener_reports_progress_and_retains_open_ownership("startup-finish").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_listener_cutoff_retains_open_ownership() {
+        startup_listener_reports_progress_and_retains_open_ownership("startup-cutoff").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_listener_panic_retains_open_ownership() {
+        startup_listener_reports_progress_and_retains_open_ownership("startup-panic").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_listener_strict_failed_retains_open_ownership() {
+        startup_listener_reports_progress_and_retains_open_ownership("startup-strict-failed").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_listener_all_failed_retains_open_ownership() {
+        startup_listener_reports_progress_and_retains_open_ownership("startup-all-failed").await;
+    }
+
+    async fn disconnected_write_and_shutdown_share_ownership(mode: &str) {
+        let cutoff = mode == "cutoff";
+        let panic = mode.starts_with("panic-");
+        let v2 = mode.starts_with("v2-");
+        let temp = if v2 {
+            let temp = converged_cluster_dir("").await;
+            omnigraph_cluster::upgrade_deployment_ledger(
+                &format!("file://{}", temp.path().display()),
+                true,
+                &omnigraph_cluster::DeploymentCaller::storage_owner(None),
+            )
+            .await
+            .unwrap();
+            temp
+        } else {
+            init_loaded_graph().await
+        };
+        let root = temp.path();
+        let graph = if v2 {
+            root.join("graphs/knowledge.omni")
+        } else {
+            graph_path(root)
+        };
+        let ledger_before = v2.then(|| fs::read(root.join("__cluster/state.json")).unwrap());
+        let before = Omnigraph::open_read_only(graph.to_str().unwrap())
+            .await
+            .unwrap()
+            .list_commits(None)
+            .await
+            .unwrap()
+            .len();
+        let (mut child, address, output_thread) = spawn_owned_child(root, mode);
+        wait_ready(&address, &mut child.0, "serving").await;
+        // Keep the authenticated MCP connection pool alive across shutdown;
+        // its server-side owners must drain before the native lock is released.
+        let mcp_client = reqwest::Client::new();
+        let schema_before = if mode == "v2-finish" {
+            Some(mcp_schema(&mcp_client, &address).await)
+        } else {
+            None
+        };
+        let fault_started = Instant::now();
+        let retained_lock = v2.then(|| fs::read(root.join("__cluster/lock.json")).unwrap());
+        if v2 {
+            if mode == "v2-swallowed-error" {
+                fs::write(root.join("inject-error"), b"inject").unwrap();
+                wait_marker(&root.join("fault-reached"), &mut child.0);
+            }
+            let signal = if mode == "v2-crash" {
+                libc::SIGKILL
+            } else {
+                libc::SIGTERM
             };
-            if v2 {
-                if mode == "v2-finish" {
-                    assert_eq!(status.code(), Some(0));
-                    assert!(root.join("serve-returned").exists());
-                } else {
-                    use std::os::unix::process::ExitStatusExt;
-                    assert_eq!(status.signal(), Some(libc::SIGKILL));
-                }
+            assert_eq!(
+                unsafe { libc::kill(child.0.id() as libc::pid_t, signal) },
+                0
+            );
+        } else if panic {
+            let mut response = String::new();
+            let _lost_as_fatal_shutdown_begins =
+                send_mutation(&address, "Uncertain").read_to_string(&mut response);
+            wait_marker(&root.join("fault-reached"), &mut child.0);
+        } else {
+            let socket = send_mutation(&address, "Disconnected");
+            wait_marker(&root.join("http-staged"), &mut child.0);
+            socket.shutdown(Shutdown::Both).unwrap();
+            drop(socket);
+            std::thread::sleep(Duration::from_millis(100));
+            let mut refused = String::new();
+            send_mutation(&address, "MustNotRun")
+                .read_to_string(&mut refused)
+                .unwrap();
+            assert!(
+                refused.starts_with("HTTP/1.1 429"),
+                "after the connection closed, the next request must still find the \
+                 disconnected write's actor reservation occupied: {refused}"
+            );
+            assert!(refused.contains("too_many_requests"), "{refused}");
+            assert_eq!(
+                unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) },
+                0
+            );
+            wait_marker(&root.join("signal-observed"), &mut child.0);
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                !root.join("serve-returned").exists(),
+                "serve returned while its disconnected write was pending"
+            );
+            assert!(child.0.try_wait().unwrap().is_none());
+            if !cutoff {
+                fs::write(root.join("release"), b"release").unwrap();
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shutdown did not finish within its process bound"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if v2 {
+            if mode == "v2-finish" {
+                assert_eq!(status.code(), Some(0));
+                assert!(root.join("serve-returned").exists());
+            } else if mode == "v2-crash" {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(status.signal(), Some(libc::SIGKILL));
+            } else {
+                assert_eq!(status.code(), Some(2));
+            }
+            output_thread.join().unwrap();
+            assert_eq!(
+                fs::read(root.join("__cluster/state.json")).unwrap(),
+                ledger_before.unwrap()
+            );
+            if mode == "v2-finish" {
+                assert!(!root.join("__cluster/lock.json").exists());
+                // Ordinary boot, without a repair command, must reopen the
+                // same populated graph under a newly acquired lifetime.
+                let (mut successor, address, output_thread) = spawn_owned_child(root, mode);
+                wait_ready(&address, &mut successor.0, "serving").await;
+                assert_eq!(
+                    Some(mcp_schema(&mcp_client, &address).await),
+                    schema_before,
+                    "the restarted server must serve the same schema through authenticated MCP"
+                );
+                let successor_lock = fs::read(root.join("__cluster/lock.json")).unwrap();
+                assert_ne!(Some(successor_lock), retained_lock);
+                assert_eq!(
+                    unsafe { libc::kill(successor.0.id() as libc::pid_t, libc::SIGTERM) },
+                    0
+                );
+                let deadline = Instant::now() + Duration::from_secs(15);
+                let status = loop {
+                    if let Some(status) = successor.0.try_wait().unwrap() {
+                        break status;
+                    }
+                    assert!(Instant::now() < deadline, "successor shutdown timed out");
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                assert_eq!(status.code(), Some(0));
                 output_thread.join().unwrap();
+                assert!(!root.join("__cluster/lock.json").exists());
+            } else {
                 assert_eq!(
                     fs::read(root.join("__cluster/lock.json")).unwrap(),
                     retained_lock.unwrap()
                 );
-                assert_eq!(
-                    fs::read(root.join("__cluster/state.json")).unwrap(),
-                    ledger_before.unwrap()
-                );
                 let refusal = cluster_settings(root).await.unwrap_err();
                 assert!(refusal.to_string().contains("state_lock_held"), "{refusal}");
-                continue;
             }
-            assert_eq!(
-                status.code(),
-                Some(if mode == "finish" { 0 } else { 2 }),
-                "mode={mode}"
-            );
-            if panic {
-                assert!(
-                    fault_started.elapsed() < Duration::from_secs(5),
-                    "fatal completion should exit after known owners drain, before the ten-second watchdog"
-                );
-                assert!(
-                    !root.join("signal-observed").exists(),
-                    "fatal exit must not need SIGTERM"
-                );
-                assert!(
-                    !root.join("serve-returned").exists(),
-                    "uncertain owner must never be a clean serve return"
-                );
-            }
-            output_thread.join().unwrap();
-            if panic {
-                let db = Omnigraph::open_read_only(graph.to_str().unwrap())
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    db.list_commits(None).await.unwrap().len(),
-                    before + usize::from(mode == "panic-after"),
-                    "mode={mode}"
-                );
-                continue;
-            }
-            let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
-            assert_eq!(
-                db.list_commits(None).await.unwrap().len(),
-                before + if cutoff { 0 } else { 1 }
-            );
-            let rows = db
-                .query(
-                    omnigraph::db::ReadTarget::branch("main"),
-                    "query q() { match { $p: Person } return { $p.name } }",
-                    "q",
-                    &Default::default(),
-                )
-                .await
-                .unwrap();
-            let names = rows.to_rust_json().unwrap().to_string();
-            assert_eq!(names.contains("Disconnected"), !cutoff, "{names}");
+            return;
+        }
+        assert_eq!(
+            status.code(),
+            Some(if mode == "finish" { 0 } else { 2 }),
+            "mode={mode}"
+        );
+        if panic {
             assert!(
-                !names.contains("MustNotRun"),
-                "refused work published: {names}"
+                fault_started.elapsed() < Duration::from_secs(5),
+                "fatal completion should exit after known owners drain, before the ten-second watchdog"
+            );
+            assert!(
+                !root.join("signal-observed").exists(),
+                "fatal exit must not need SIGTERM"
+            );
+            assert!(
+                !root.join("serve-returned").exists(),
+                "uncertain owner must never be a clean serve return"
             );
         }
+        output_thread.join().unwrap();
+        if panic {
+            let db = Omnigraph::open_read_only(graph.to_str().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                db.list_commits(None).await.unwrap().len(),
+                before + usize::from(mode == "panic-after"),
+                "mode={mode}"
+            );
+            return;
+        }
+        let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
+        assert_eq!(
+            db.list_commits(None).await.unwrap().len(),
+            before + if cutoff { 0 } else { 1 }
+        );
+        let rows = db
+            .query(
+                omnigraph::db::ReadTarget::branch("main"),
+                "query q() { match { $p: Person } return { $p.name } }",
+                "q",
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        let names = rows.to_rust_json().unwrap().to_string();
+        assert_eq!(names.contains("Disconnected"), !cutoff, "{names}");
+        assert!(
+            !names.contains("MustNotRun"),
+            "refused work published: {names}"
+        );
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_write_and_shutdown_share_ownership_finish() {
+        disconnected_write_and_shutdown_share_ownership("finish").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_write_and_shutdown_share_ownership_cutoff() {
+        disconnected_write_and_shutdown_share_ownership("cutoff").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_write_and_shutdown_share_ownership_panic_before() {
+        disconnected_write_and_shutdown_share_ownership("panic-before").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_write_and_shutdown_share_ownership_panic_after() {
+        disconnected_write_and_shutdown_share_ownership("panic-after").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_write_and_shutdown_share_ownership_v2_finish() {
+        disconnected_write_and_shutdown_share_ownership("v2-finish").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_write_and_shutdown_share_ownership_v2_crash() {
+        disconnected_write_and_shutdown_share_ownership("v2-crash").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_write_and_shutdown_share_ownership_v2_swallowed_error() {
+        disconnected_write_and_shutdown_share_ownership("v2-swallowed-error").await;
+    }
+
+    /// A raw request to the cluster fixture's `knowledge` graph, whose
+    /// schema is `node Person { name: String @key }`.
+    fn send_knowledge_request(address: &str, route: &str, body: &Value) -> TcpStream {
+        let mut socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let body = body.to_string();
+        write!(socket,
+            "POST /graphs/knowledge/{route} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Type: application/json\r\n{HTTP_API_CONTRACT_HEADER}: {HTTP_API_CONTRACT}\r\nContent-Length: {}\r\n\r\n{body}", body.len()
+        ).unwrap();
+        socket.flush().unwrap();
+        socket
+    }
+
+    fn knowledge_response(address: &str, route: &str, body: &Value) -> String {
+        let mut response = String::new();
+        send_knowledge_request(address, route, body)
+            .read_to_string(&mut response)
+            .unwrap();
+        response
+    }
+
+    /// A served write whose storage request fails on one of Lance's
+    /// write-once table files is a definite failure: the caller gets its
+    /// 500, the next write on the same server publishes, reads keep serving,
+    /// readiness stays `serving`, and a clean SIGTERM still releases the
+    /// native lock. Nothing contains the process and nothing poisons the
+    /// storage scope. So is a failure of the publication's own transaction
+    /// file, which precedes the conditional manifest put: no manifest request
+    /// was sent, so the publication is not in doubt. The faults are real
+    /// backend I/O: a file planted where the Person table's `data/` directory
+    /// goes makes its first data-file write fail, and one planted where the
+    /// graph's `__manifest/_transactions/` goes makes the publisher's
+    /// transaction-file write fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn definite_write_failure_keeps_serving_and_releases_the_lock_issue_1067() {
+        let temp = converged_cluster_dir("").await;
+        omnigraph_cluster::upgrade_deployment_ledger(
+            &format!("file://{}", temp.path().display()),
+            true,
+            &omnigraph_cluster::DeploymentCaller::storage_owner(None),
+        )
+        .await
+        .unwrap();
+        let root = temp.path();
+        let graph = root.join("graphs/knowledge.omni");
+        let (commits_before, person_table) = {
+            let db = Omnigraph::open_read_only(graph.to_str().unwrap())
+                .await
+                .unwrap();
+            let commits = db.list_commits(None).await.unwrap().len();
+            let snapshot = db
+                .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+                .await
+                .unwrap();
+            let table = snapshot
+                .dataset("node:Person")
+                .unwrap()
+                .dataset_path
+                .clone();
+            (commits, graph.join(table.trim_start_matches('/')))
+        };
+        let data_blocker = person_table.join("data");
+        assert!(
+            !data_blocker.exists(),
+            "the empty Person table has no data directory yet: {}",
+            data_blocker.display()
+        );
+        let (mut child, address, output_thread) = spawn_owned_child(root, "v2-definite-failure");
+        wait_ready(&address, &mut child.0, "serving").await;
+        let held_lock = fs::read(root.join("__cluster/lock.json")).unwrap();
+
+        let insert = |name: &str| {
+            serde_json::json!({
+                "query": "query insert_person($name: String) { insert Person { name: $name } }",
+                "name": "insert_person",
+                "params": {"name": name}
+            })
+        };
+        fs::write(&data_blocker, b"not a directory").unwrap();
+        let failed = knowledge_response(&address, "mutate", &insert("stranded"));
+        assert!(failed.starts_with("HTTP/1.1 500"), "{failed}");
+        assert!(
+            failed.contains("\"code\":\"internal\""),
+            "a storage failure is the caller's 500: {failed}"
+        );
+        fs::remove_file(&data_blocker).unwrap();
+
+        let transactions = graph.join("__manifest/_transactions");
+        let parked = graph.join("__manifest/_transactions.parked");
+        fs::rename(&transactions, &parked).unwrap();
+        fs::write(&transactions, b"not a directory").unwrap();
+        let unpublished = knowledge_response(&address, "mutate", &insert("unsent"));
+        assert!(unpublished.starts_with("HTTP/1.1 500"), "{unpublished}");
+        fs::remove_file(&transactions).unwrap();
+        fs::rename(&parked, &transactions).unwrap();
+
+        let published = knowledge_response(&address, "mutate", &insert("after"));
+        assert!(
+            published.starts_with("HTTP/1.1 200"),
+            "the next write on the same server must publish: {published}"
+        );
+        let names = knowledge_response(
+            &address,
+            "query",
+            &serde_json::json!({
+                "query": "query names() { match { $p: Person } return { $p.name } }",
+                "name": "names",
+                "params": {}
+            }),
+        );
+        assert!(names.starts_with("HTTP/1.1 200"), "{names}");
+        assert!(names.contains("after"), "{names}");
+        assert!(
+            !names.contains("stranded") && !names.contains("unsent"),
+            "a failed write published: {names}"
+        );
+        wait_ready(&address, &mut child.0, "serving").await;
+
+        assert_eq!(
+            unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) },
+            0
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "clean shutdown timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "a definite failure never contains the process"
+        );
+        assert!(root.join("serve-returned").exists());
+        output_thread.join().unwrap();
+        assert!(
+            !root.join("__cluster/lock.json").exists(),
+            "clean shutdown releases the lock {}",
+            String::from_utf8_lossy(&held_lock)
+        );
+        let commits_after = Omnigraph::open_read_only(graph.to_str().unwrap())
+            .await
+            .unwrap()
+            .list_commits(None)
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(commits_after, commits_before + 1);
+    }
+}
+
+/// HTTP ownership and retry safety need request/body scheduling and cannot be
+/// expressed by GQT. The CLI lifecycle owner separately proves a real PID and
+/// listener survive schema/query replacement and graph addition.
+#[tokio::test(flavor = "multi_thread")]
+async fn live_deployment_retains_disconnected_owner_and_never_replays_original_id() {
+    live_deployment_fixture("journey").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn independent_live_deployment_activates_beside_a_blocked_graph() {
+    live_deployment_fixture("blocked_peer").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deletion_of_missing_registry_entry_refuses_before_effects() {
+    live_deployment_fixture("missing_peer").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_query_deployment_closes_admission_before_waiting_for_a_merge() {
+    live_deployment_fixture("merge").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deployment_acceptance_and_polling_track_the_owned_executor_through_activation() {
+    live_deployment_fixture("acceptance").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_deployment_installs_updates_preserves_and_removes_catalogue_policy() {
+    live_deployment_fixture("catalogue").await;
+}
+
+async fn live_deployment_fixture(mode: &str) {
+    use omnigraph_cluster::{CapturedDeployment, DeploymentStatus};
+    use omnigraph_server::{GraphId, GraphKey, RegistryLookup, ServerConfigMode};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn submit(id: &str, deployment: &CapturedDeployment, token: &str) -> Request<Body> {
+        Request::post("/cluster/deployments")
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "deployment_id": id, "deployment": deployment,
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    }
+    // Existing lifecycle assertions observe completed activation; the acceptance
+    // case below uses the raw HTTP helper to test each intermediate boundary.
+    async fn json_response(app: &Router, request: Request<Body>) -> (StatusCode, Value) {
+        let token = request
+            .headers()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .unwrap_or("")
+            .to_owned();
+        let (code, body) = support::json_response(app, request).await;
+        if code != StatusCode::ACCEPTED {
+            return (code, body);
+        }
+        assert_eq!(body["in_progress"], true, "{body}");
+        let id = body["deployment"]["id"].as_str().unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let (code, result) = support::json_response(
+                    app,
+                    get_request(&format!("/cluster/deployments/{id}"), &token),
+                )
+                .await;
+                assert_eq!(code, StatusCode::OK, "{result}");
+                if result["in_progress"] == false {
+                    return (code, result);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("accepted deployment must finish under its server owner")
+    }
+    async fn status(app: &Router, id: Option<&str>) -> (DeploymentStatus, bool, bool) {
+        let (code, body) =
+            json_response(app, get_request("/cluster/deployments", "operator-token")).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        let mut status: DeploymentStatus = serde_json::from_value(body["status"].clone()).unwrap();
+        let mut active = body["active"].as_bool().unwrap();
+        let mut in_progress = body["in_progress"].as_bool().unwrap();
+        if let Some(id) = id {
+            let (code, receipt) = json_response(
+                app,
+                get_request(&format!("/cluster/deployments/{id}"), "operator-token"),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK, "{receipt}");
+            assert!(
+                receipt.get("status").is_none(),
+                "exact receipts do not expose cluster status"
+            );
+            status.lookup = Some(serde_json::from_value(receipt["deployment"].clone()).unwrap());
+            active = receipt["active"].as_bool().unwrap();
+            in_progress = receipt["in_progress"].as_bool().unwrap();
+        }
+        (status, active, in_progress)
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(
+        temp.path().join("people.pg"),
+        "node Person { name: String @key }\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("peer.pg"),
+        "node Peer { name: String @key }\n",
+    )
+    .unwrap();
+    fs::write(temp.path().join("people.gq"), "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name } }\n").unwrap();
+    fs::write(temp.path().join("policy.yaml"), "version: 1\ngroups:\n  admins: [operator]\n  readers: [reader]\nrules:\n  - id: admins\n    allow:\n      actors: { group: admins }\n      actions: [schema_apply, read, invoke_query]\n  - id: readers\n    allow:\n      actors: { group: readers }\n      actions: [read]\n").unwrap();
+    fs::write(temp.path().join("cluster-policy.yaml"), "version: 1\ngroups:\n  admins: [operator]\nrules:\n  - id: manage\n    allow:\n      actors: { group: admins }\n      actions: [config_manage]\n").unwrap();
+    fs::write(temp.path().join("cluster.yaml"), "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries:\n      find_person:\n        file: ./people.gq\n  peer:\n    schema: ./peer.pg\npolicies:\n  access:\n    file: ./policy.yaml\n    applies_to: [knowledge, peer]\n  management:\n    file: ./cluster-policy.yaml\n    applies_to: [cluster]\n").unwrap();
+    if mode == "merge" {
+        let policy = fs::read_to_string(temp.path().join("policy.yaml")).unwrap();
+        fs::write(temp.path().join("policy.yaml"), policy.replace("[schema_apply, read, invoke_query]", "[schema_apply, read, invoke_query, change, branch_create, branch_merge, branch_delete]")).unwrap();
+    }
+    apply_cluster_fixture(temp.path()).await;
+    let mut settings = cluster_settings(temp.path()).await.unwrap();
+    settings
+        .cluster_admission
+        .take()
+        .unwrap()
+        .release_after_settlement()
+        .await
+        .unwrap();
+    let ServerConfigMode::Multi {
+        mut graphs,
+        config_path,
+        server_policy,
+        ..
+    } = settings.mode;
+    if mode == "blocked_peer" {
+        fs::remove_dir_all(temp.path().join("graphs/peer.omni")).unwrap();
+    } else if mode == "missing_peer" {
+        // An embedding supplied an incomplete registry: refuse deletion before
+        // touching the managed root rather than fail activation after purge.
+        graphs.retain(|graph| graph.graph_id != "peer");
+    }
+    let state = omnigraph_server::open_multi_graph_state(
+        graphs,
+        vec![
+            ("operator".into(), "operator-token".into()),
+            ("reader".into(), "reader-token".into()),
+        ],
+        server_policy.as_ref(),
+        config_path,
+        false,
+    )
+    .await
+    .unwrap();
+    let app = build_app(state.clone());
+    let key = GraphKey::cluster(GraphId::try_from("knowledge").unwrap());
+    let RegistryLookup::Ready(original) = state.routing().registry.get(&key) else {
+        panic!("ready")
+    };
+    let original_engine = Arc::clone(&original.engine);
+    let original_contract = original_engine.schema_contract_digest();
+    let before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+    let boot_ledger: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    let boot_id = boot_ledger["deployment_results"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        !status(&app, Some(&boot_id)).await.1,
+        "generic construction does not attest deployment bindings"
+    );
+    assert_eq!(
+        fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+        before,
+        "boot observation does not rewrite the durable receipt"
+    );
+    let (code, _) = json_response(&app, get_request("/cluster/deployments", "reader-token")).await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    let (initial_status, _, _) = status(&app, None).await;
+    let id = initial_status.next_deployment_id();
+
+    if mode == "catalogue" {
+        let config_path = temp.path().join("cluster.yaml");
+        let original_config = fs::read_to_string(&config_path).unwrap();
+        let policy_path = temp.path().join("catalogue.policy.yaml");
+        let policy_for = |actor: &str| {
+            format!(
+                "version: 1\ngroups:\n  readers: [{actor}]\nrules:\n  - id: catalogue-read\n    allow:\n      actors: {{group: readers}}\n      actions: [read]\n"
+            )
+        };
+        let catalogue_binding =
+            "  catalogue:\n    file: ./catalogue.policy.yaml\n    applies_to: [graph.og_catalog]\n";
+        let original_inventory = state.routing().registry.len();
+        for change in ["install", "unrelated", "update", "remove"] {
+            match change {
+                "install" => {
+                    fs::write(&policy_path, policy_for("reader")).unwrap();
+                    fs::write(
+                        &config_path,
+                        format!("{original_config}{catalogue_binding}"),
+                    )
+                    .unwrap();
+                }
+                "unrelated" => {
+                    let query_path = temp.path().join("people.gq");
+                    let query = fs::read_to_string(&query_path).unwrap();
+                    fs::write(query_path, format!("{query}\n// unrelated query update\n")).unwrap();
+                }
+                "update" => fs::write(&policy_path, policy_for("operator")).unwrap(),
+                "remove" => fs::write(&config_path, &original_config).unwrap(),
+                _ => unreachable!(),
+            }
+            let deployment = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
+            let (current, _, _) = status(&app, None).await;
+            let id = current.next_deployment_id();
+            let ledger_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+            let (code, refusal) =
+                json_response(&app, submit(&id, &deployment, "reader-token")).await;
+            assert_eq!(code, StatusCode::FORBIDDEN, "{refusal}");
+            assert_eq!(
+                fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+                ledger_before
+            );
+            let (code, receipt) =
+                json_response(&app, submit(&id, &deployment, "operator-token")).await;
+            assert_eq!(code, StatusCode::OK, "{change}: {receipt}");
+            assert_eq!(
+                receipt["deployment"]["result"]["converged"], true,
+                "{receipt}"
+            );
+            assert_eq!(receipt["active"], true, "{receipt}");
+            assert_eq!(state.routing().registry.len(), original_inventory);
+            assert!(!temp.path().join("graphs/og_catalog.omni").exists());
+            for (token, allowed) in [
+                ("reader-token", change != "update"),
+                ("operator-token", matches!(change, "update" | "remove")),
+            ] {
+                let (code, body) =
+                    json_response(&app, get_request("/graphs/og_catalog/schema", token)).await;
+                assert_eq!(
+                    code,
+                    if allowed {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::FORBIDDEN
+                    },
+                    "{change}: {token}: {body}"
+                );
+                let request = Request::post("/graphs/og_catalog/query")
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":"query catalogue() { match { $e: @Engine } return { $e.version } }"}"#))
+                    .unwrap();
+                let (code, body) = json_response(&app, request).await;
+                assert_eq!(
+                    code,
+                    if allowed {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::FORBIDDEN
+                    },
+                    "{change}: {token}: {body}"
+                );
+            }
+            let snapshot = omnigraph_cluster::read_deployment_serving_snapshot(
+                &format!("file://{}", temp.path().display()),
+                &[],
+            )
+            .await
+            .unwrap();
+            let policy = snapshot.policies.iter().find(|policy| {
+                policy
+                    .applies_to
+                    .iter()
+                    .any(|binding| binding == "graph.og_catalog")
+            });
+            assert_eq!(policy.is_some(), change != "remove");
+        }
+        return;
+    }
+    if mode == "merge" {
+        use omnigraph::seams::catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE;
+        struct RequestHold {
+            thread: std::thread::ThreadId,
+            hold: Arc<omnigraph::seams::Hold>,
+        }
+        impl omnigraph::seams::Behavior for RequestHold {
+            fn uninstalling(&self) {
+                self.hold.release();
+            }
+        }
+        impl omnigraph::seams::Decide for RequestHold {
+            fn decide(&self, name: &'static str) -> omnigraph::seams::Decision {
+                if std::thread::current().id() == self.thread {
+                    omnigraph::seams::Decide::decide(self.hold.as_ref(), name)
+                } else {
+                    omnigraph::seams::Decision::Pass
+                }
+            }
+        }
+        original_engine
+            .branch_create_as("feature", Some("operator"))
+            .await
+            .unwrap();
+        omnigraph::Session::from_defaults(Arc::clone(&original_engine), Default::default())
+            .mutate_as(
+                "feature",
+                "query add() { insert Person { name: \"Merged\" } }",
+                "add",
+                &Default::default(),
+                Some("operator"),
+            )
+            .await
+            .unwrap();
+        let merge_request = Request::post("/graphs/knowledge/branches/merge")
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header("authorization", "Bearer operator-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"source":"feature","delete_branch":true}"#))
+            .unwrap();
+        let merger_app = app.clone();
+        let (start, started) = std::sync::mpsc::channel();
+        let merger = std::thread::spawn(move || {
+            started.recv().unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move { json_response(&merger_app, merge_request).await })
+        });
+        let hold = Arc::new(omnigraph::seams::Hold::default());
+        let guard = BRANCH_MERGE_POST_AUTHORITY_CAPTURE.install(Arc::new(RequestHold {
+            thread: merger.thread().id(),
+            hold: Arc::clone(&hold),
+        }));
+        start.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !hold.reached() {
+                assert!(
+                    !merger.is_finished(),
+                    "merge must retain its shared schema gate"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // A schema plan observes the accepted contract while this merge owns
+        // the shared schema gate. It must not queue an exclusive graph open.
+        let schema_path = temp.path().join("people.pg");
+        let original_source = fs::read_to_string(&schema_path).unwrap();
+        fs::write(
+            &schema_path,
+            "node Person { name: String @key bio: String? }\n",
+        )
+        .unwrap();
+        let candidate = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
+        // Response delivery can precede the producer's final observer drop on
+        // another worker. Settle read owners before comparing stable snapshots;
+        // the held merge's write and response owners must remain charged.
+        let settled_owners = || async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let owners = state.operation_runtime().snapshot();
+                    if owners.active_reads == 0 {
+                        return owners;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("completed read producers must release their observers")
+        };
+        let owners_before_plan = settled_owners().await;
+        let plan_request = Request::post("/cluster/plan")
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header("authorization", "Bearer operator-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "deployment": candidate,
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let (code, plan) =
+            tokio::time::timeout(Duration::from_secs(5), json_response(&app, plan_request))
+                .await
+                .expect("schema planning must finish while the merge remains held");
+        assert_eq!(code, StatusCode::OK, "{plan}");
+        assert_eq!(plan["input_digest"], candidate.input_digest().unwrap());
+        assert_eq!(
+            plan["ok"], false,
+            "the live feature branch still prevents schema apply"
+        );
+        assert!(
+            plan["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic["code"] == "schema_preflight_failed"
+                        && diagnostic["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("requires only main")
+                }),
+            "{plan}"
+        );
+        assert!(
+            plan["changes"].as_array().unwrap().iter().any(|change| {
+                change["resource"] == "schema.knowledge" && change["migration"].is_object()
+            }),
+            "{plan}"
+        );
+        assert_eq!(settled_owners().await, owners_before_plan);
+        assert!(
+            !merger.is_finished(),
+            "planning must not release the parked writer"
+        );
+        assert!(!hold.timed_out());
+        assert_eq!(
+            fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+            before
+        );
+        assert_eq!(original_engine.schema_contract_digest(), original_contract);
+        let RegistryLookup::Ready(after_plan) = state.routing().registry.get(&key) else {
+            panic!("planning must leave graph admission ready");
+        };
+        assert!(
+            Arc::ptr_eq(&original, &after_plan),
+            "planning must preserve the installed binding"
+        );
+        let (code, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            json_response(
+                &app,
+                get_request("/graphs/knowledge/snapshot", "operator-token"),
+            ),
+        )
+        .await
+        .expect("graph reads stay admitted during planning and the held merge");
+        assert_eq!(code, StatusCode::OK);
+        fs::write(&schema_path, original_source).unwrap();
+        fs::write(temp.path().join("people.gq"), "// query-only deployment\nquery find_person($name: String) { match { $p: Person { name: $name } } return { $p.name } }\n").unwrap();
+        let deployment = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
+        let deploy_app = app.clone();
+        let request = submit(&id, &deployment, "operator-token");
+        let deployer = tokio::spawn(async move { json_response(&deploy_app, request).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(
+                state.routing().registry.get(&key),
+                RegistryLookup::Transitioning(_)
+            ) {
+                assert!(
+                    !deployer.is_finished(),
+                    "deployment must reach closure before the merge finishes"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("preview must not queue an exclusive graph open ahead of admission closure");
+        assert_eq!(
+            fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+            before
+        );
+        assert!(!deployer.is_finished());
+        assert_eq!(
+            json_response(
+                &app,
+                get_request("/graphs/knowledge/snapshot", "operator-token")
+            )
+            .await
+            .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            json_response(&app, get_request("/graphs/peer/snapshot", "operator-token"))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        hold.release();
+        let (code, merge) = tokio::task::spawn_blocking(move || merger.join().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(code, StatusCode::OK, "{merge}");
+        assert!(!hold.timed_out());
+        drop(guard);
+        let (code, applied) = deployer.await.unwrap();
+        assert_eq!(code, StatusCode::OK, "{applied}");
+        assert_eq!(applied["active"], true);
+        assert_eq!(
+            applied["deployment"]["result"]["graphs"]["knowledge"]["outcome"],
+            "query_only"
+        );
+        assert_eq!(original_engine.schema_contract_digest(), original_contract);
+        let RegistryLookup::Ready(view) = state.routing().registry.get(&key) else {
+            panic!("ready");
+        };
+        assert!(
+            view.queries
+                .as_ref()
+                .unwrap()
+                .lookup("find_person")
+                .unwrap()
+                .source
+                .starts_with("// query-only deployment")
+        );
+        return;
+    }
+    fs::write(
+        temp.path().join("people.pg"),
+        "node Person { name: String @key bio: String? }\n",
+    )
+    .unwrap();
+    fs::write(temp.path().join("people.gq"), "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.bio } }\n").unwrap();
+    let deployment = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
+    if mode == "acceptance" {
+        use omnigraph_cluster::seams::catalog::{
+            DEPLOYMENT_AFTER_ACCEPTANCE, DEPLOYMENT_AFTER_RESULT, DEPLOYMENT_BEFORE_ACCEPTANCE,
+        };
+        struct ScopedHold {
+            prefix: String,
+            hold: Arc<omnigraph::seams::Hold>,
+        }
+        impl omnigraph::seams::Behavior for ScopedHold {
+            fn uninstalling(&self) {
+                self.hold.release();
+            }
+        }
+        impl omnigraph::seams::Decide for ScopedHold {
+            fn decide(&self, name: &'static str) -> omnigraph::seams::Decision {
+                if std::thread::current()
+                    .name()
+                    .is_some_and(|name| name == self.prefix)
+                {
+                    omnigraph::seams::Decide::decide(self.hold.as_ref(), name)
+                } else {
+                    omnigraph::seams::Decision::Pass
+                }
+            }
+        }
+        async fn reached(hold: &omnigraph::seams::Hold) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !hold.reached() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("owned executor must reach its next boundary");
+        }
+        let plan_request = |token: &str| {
+            Request::post("/cluster/plan")
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({"deployment": deployment})).unwrap(),
+                ))
+                .unwrap()
+        };
+        let (code, plan) = json_response(&app, plan_request("operator-token")).await;
+        assert_eq!(code, StatusCode::OK, "{plan}");
+        assert_eq!(plan["ok"], true, "{plan}");
+        assert!(
+            plan["input_digest"]
+                .as_str()
+                .is_some_and(|digest| !digest.is_empty())
+        );
+        assert!(
+            plan["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|change| change.get("migration").is_some())
+        );
+        assert_eq!(
+            json_response(&app, plan_request("reader-token")).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+            before
+        );
+        assert_eq!(original_engine.schema_contract_digest(), original_contract);
+        assert!(matches!(
+            state.routing().registry.get(&key),
+            RegistryLookup::Ready(_)
+        ));
+
+        let prefix = format!("deployment-{}", initial_status.ledger_id);
+        let before_acceptance = Arc::new(omnigraph::seams::Hold::default());
+        let after_acceptance = Arc::new(omnigraph::seams::Hold::default());
+        let after_result = Arc::new(omnigraph::seams::Hold::default());
+        let guards = [
+            DEPLOYMENT_BEFORE_ACCEPTANCE.install(Arc::new(ScopedHold {
+                prefix: prefix.clone(),
+                hold: Arc::clone(&before_acceptance),
+            })),
+            DEPLOYMENT_AFTER_ACCEPTANCE.install(Arc::new(ScopedHold {
+                prefix: prefix.clone(),
+                hold: Arc::clone(&after_acceptance),
+            })),
+            DEPLOYMENT_AFTER_RESULT.install(Arc::new(ScopedHold {
+                prefix: prefix.clone(),
+                hold: Arc::clone(&after_result),
+            })),
+        ];
+        let request_app = app.clone();
+        let request = submit(&id, &deployment, "operator-token");
+        let (response, mut received) = tokio::sync::oneshot::channel();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name(prefix)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let reply = support::json_response(&request_app, request).await;
+                    response.send(reply).unwrap();
+                    let _ = stopped.await;
+                });
+        });
+        reached(&before_acceptance).await;
+        assert!(matches!(
+            received.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        let path = format!("/cluster/deployments/{id}");
+        let (code, preparing) = json_response(&app, get_request(&path, "operator-token")).await;
+        assert_eq!(code, StatusCode::OK, "{preparing}");
+        assert_eq!(preparing["deployment"]["status"], "not_recorded");
+        assert_eq!(preparing["in_progress"], true);
+        assert_eq!(
+            fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+            before
+        );
+        before_acceptance.release();
+        reached(&after_acceptance).await;
+        let (code, accepted) = tokio::time::timeout(Duration::from_secs(5), received)
+            .await
+            .expect("HTTP acceptance must not wait for graph effects or activation")
+            .unwrap();
+        assert_eq!(code, StatusCode::ACCEPTED, "{accepted}");
+        assert_eq!(accepted["deployment"]["status"], "outstanding");
+        assert_eq!(accepted["deployment"]["id"], id);
+        assert_eq!(accepted["deployment"]["input_digest"], plan["input_digest"]);
+        assert_eq!(accepted["active"], false);
+        assert_eq!(accepted["in_progress"], true);
+        let (_, running) = json_response(&app, get_request(&path, "operator-token")).await;
+        assert_eq!(running["deployment"]["status"], "outstanding");
+        assert_eq!(running["deployment"]["input_digest"], plan["input_digest"]);
+        assert_eq!(running["in_progress"], true);
+        assert!(running.get("status").is_none());
+        assert_eq!(
+            json_response(&app, submit(&id, &deployment, "operator-token"))
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            json_response(&app, plan_request("operator-token")).await.0,
+            StatusCode::CONFLICT
+        );
+        after_acceptance.release();
+        reached(&after_result).await;
+        let (_, completing) = json_response(&app, get_request(&path, "operator-token")).await;
+        assert_eq!(completing["deployment"]["status"], "complete");
+        assert_eq!(completing["active"], false);
+        assert_eq!(
+            completing["in_progress"], true,
+            "durable result precedes activation"
+        );
+        after_result.release();
+        let final_receipt = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let (_, receipt) = json_response(&app, get_request(&path, "operator-token")).await;
+                if receipt["in_progress"] == false {
+                    break receipt;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(final_receipt["active"], true, "{final_receipt}");
+        assert_eq!(final_receipt["deployment"]["result"]["id"], id);
+        assert_eq!(
+            final_receipt["deployment"]["result"]["input_digest"],
+            plan["input_digest"]
+        );
+        assert!(!state.operation_runtime().snapshot().closed);
+        assert!(
+            !before_acceptance.timed_out()
+                && !after_acceptance.timed_out()
+                && !after_result.timed_out()
+        );
+        stop.send(()).unwrap();
+        tokio::task::spawn_blocking(move || server.join().unwrap())
+            .await
+            .unwrap();
+        drop(guards);
+        return;
+    }
+    let (code, _) = json_response(&app, submit(&id, &deployment, "reader-token")).await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    assert_eq!(
+        fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+        before
+    );
+
+    if mode == "blocked_peer" {
+        let (code, response) =
+            json_response(&app, submit(&id, &deployment, "operator-token")).await;
+        assert_eq!(code, StatusCode::OK, "{response}");
+        assert_eq!(response["deployment"]["result"]["converged"], true);
+        assert!(matches!(
+            state.routing().registry.get(&key),
+            RegistryLookup::Ready(_)
+        ));
+        let peer_key = GraphKey::cluster(GraphId::try_from("peer").unwrap());
+        assert!(matches!(
+            state.routing().registry.get(&peer_key),
+            RegistryLookup::Blocked(_)
+        ));
+        assert!(!state.operation_runtime().snapshot().closed);
+        assert_eq!(
+            response["active"], true,
+            "unrelated availability is not activation"
+        );
+        assert!(status(&app, Some(&id)).await.1);
+        return;
+    }
+    if mode == "missing_peer" {
+        let config = fs::read_to_string(temp.path().join("cluster.yaml")).unwrap();
+        fs::write(
+            temp.path().join("cluster.yaml"),
+            config
+                .replace("  peer:\n    schema: ./peer.pg\n", "")
+                .replace("[knowledge, peer]", "[knowledge]"),
+        )
+        .unwrap();
+        let removal = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
+        let (code, response) = json_response(&app, submit(&id, &removal, "operator-token")).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{response}");
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap()
+                .contains("absent from the serving registry")
+        );
+        assert!(temp.path().join("graphs/peer.omni").exists());
+        assert_eq!(
+            fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+            before
+        );
+        assert!(!state.operation_runtime().snapshot().closed);
+        assert_eq!(original_engine.schema_contract_digest(), original_contract);
+        return;
+    }
+
+    // Runtime-only configuration is checked before creation or ledger acceptance.
+    // A typo in a new graph's secret reference must not stop healthy service.
+    let config = fs::read_to_string(temp.path().join("cluster.yaml")).unwrap();
+    let missing_key = format!("OG_UNSET_LIVE_DEPLOYMENT_{}", initial_status.ledger_id);
+    fs::write(
+        temp.path().join("blocked.pg"),
+        "node Blocked { name: String @key }\n",
+    )
+    .unwrap();
+    let blocked_config = config
+        .replace(
+            "policies:\n",
+            "  blocked:\n    schema: ./blocked.pg\n    embedding_provider: missing\npolicies:\n",
+        )
+        .replace("[knowledge, peer]", "[knowledge, peer, blocked]");
+    fs::write(temp.path().join("cluster.yaml"), format!("{blocked_config}providers:\n  embedding:\n    missing:\n      kind: openai-compatible\n      api_key: ${{{missing_key}}}\n")).unwrap();
+    let blocked = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
+    let (code, refusal) = json_response(&app, submit(&id, &blocked, "operator-token")).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{refusal}");
+    assert!(!state.operation_runtime().snapshot().closed);
+    assert!(!temp.path().join("graphs/blocked.omni").exists());
+    assert_eq!(
+        fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+        before
+    );
+    assert_eq!(original_engine.schema_contract_digest(), original_contract);
+    fs::write(temp.path().join("cluster.yaml"), config).unwrap();
+
+    // A deterministic refusal after closure restores the predecessor binding.
+    let future_id = format!(
+        "{}:{}:{}",
+        initial_status.ledger_id,
+        initial_status.next_sequence + 1,
+        id.rsplit(':').next().unwrap()
+    );
+    let (code, refusal) =
+        json_response(&app, submit(&future_id, &deployment, "operator-token")).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{refusal}");
+    assert!(!state.operation_runtime().snapshot().closed);
+    assert_eq!(original_engine.schema_contract_digest(), original_contract);
+    assert!(matches!(
+        state.routing().registry.get(&key),
+        RegistryLookup::Ready(_)
+    ));
+    assert_eq!(
+        fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+        before
+    );
+
+    // Park an already admitted invocation before it reaches the engine.
+    let (polled, body_polled) = tokio::sync::oneshot::channel();
+    let (release, body_released) = tokio::sync::oneshot::channel();
+    let body = Body::from_stream(futures::stream::once(async move {
+        polled.send(()).unwrap();
+        body_released.await.unwrap();
+        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+            br#"{"params":{"name":"Alice"}}"#,
+        ))
+    }));
+    let request = Request::post("/graphs/knowledge/queries/find_person")
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+        .header("authorization", "Bearer operator-token")
+        .header("content-type", "application/json")
+        .body(body)
+        .unwrap();
+    let request_app = app.clone();
+    let invocation = tokio::spawn(async move { json_response(&request_app, request).await });
+    tokio::time::timeout(Duration::from_secs(10), body_polled)
+        .await
+        .unwrap()
+        .unwrap();
+    let deployment_app = app.clone();
+    let request = submit(&id, &deployment, "operator-token");
+    let observer = tokio::spawn(async move { json_response(&deployment_app, request).await });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(
+            state.routing().registry.get(&key),
+            RegistryLookup::Transitioning(_)
+        ) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("deployment must close affected admission before draining");
+    assert!(
+        !status(&app, Some(&boot_id)).await.1,
+        "transitioning bindings are not active"
+    );
+    let (_, preparing) = json_response(
+        &app,
+        get_request(&format!("/cluster/deployments/{id}"), "operator-token"),
+    )
+    .await;
+    assert_eq!(preparing["deployment"]["status"], "not_recorded");
+    assert_eq!(preparing["in_progress"], true);
+    assert!(
+        !observer.is_finished(),
+        "HTTP acceptance must await durable recording"
+    );
+
+    let (code, _) =
+        json_response(&app, get_request("/graphs/peer/snapshot", "operator-token")).await;
+    assert_eq!(code, StatusCode::OK, "unaffected graph keeps serving");
+    let (code, _) = json_response(&app, submit(&id, &deployment, "operator-token")).await;
+    assert_eq!(
+        code,
+        StatusCode::CONFLICT,
+        "there is one process deployment owner"
+    );
+    observer.abort();
+    let _ = observer.await;
+    release.send(()).unwrap();
+    let (code, old_result) = invocation.await.unwrap();
+    assert_eq!(code, StatusCode::OK, "{old_result}");
+    let completed = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let (observed, active, in_progress) = status(&app, Some(&id)).await;
+            if active && !in_progress {
+                break observed;
+            }
+            assert!(
+                !state.operation_runtime().snapshot().closed,
+                "deployment must not close the process"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("server-owned deployment completes after caller disconnect");
+    let RegistryLookup::Ready(current) = state.routing().registry.get(&key) else {
+        panic!("ready")
+    };
+    assert!(original_engine.shares_runtime_owner(&current.engine));
+    assert_ne!(current.engine.schema_contract_digest(), original_contract);
+    let committed_head = original_engine.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    let (code, duplicate) = json_response(&app, submit(&id, &deployment, "operator-token")).await;
+    assert_eq!(code, StatusCode::OK, "{duplicate}");
+    assert_eq!(duplicate["active"], true);
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&fs::read(temp.path().join("__cluster/state.json")).unwrap())
+            .unwrap();
+    let receipt = persisted["deployment_results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|receipt| receipt["id"] == id)
+        .unwrap();
+    assert_eq!(receipt, &duplicate["deployment"]["result"]);
+    assert!(receipt.get("activation").is_none());
+    assert!(receipt.get("restart_required").is_none());
+    assert_eq!(
+        original_engine.list_commits(None).await.unwrap()[0].graph_commit_id,
+        committed_head
+    );
+
+    // A successor supersedes only the current activation observation. An old
+    // identity remains lookup-only and can never roll serving bindings back.
+    fs::write(
+        temp.path().join("people.pg"),
+        "node Person { name: String @key bio: String? note: String? }\n",
+    )
+    .unwrap();
+    let successor = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
+    let (code, mismatch) = json_response(&app, submit(&id, &successor, "operator-token")).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{mismatch}");
+    let successor_id = completed.next_deployment_id();
+    let (code, next) =
+        json_response(&app, submit(&successor_id, &successor, "operator-token")).await;
+    assert_eq!(code, StatusCode::OK, "{next}");
+    assert_eq!(next["active"], true);
+    assert!(!status(&app, Some(&id)).await.1);
+    let latest_contract = original_engine.schema_contract_digest();
+    let (code, old) = json_response(&app, submit(&id, &deployment, "operator-token")).await;
+    assert_eq!(code, StatusCode::OK, "{old}");
+    assert_eq!(old["active"], false);
+    assert_eq!(original_engine.schema_contract_digest(), latest_contract);
+    assert!(!state.operation_runtime().snapshot().closed);
+
+    // Unrelated runtime payload loss cannot veto another graph's cutover.
+    // The already-admitted knowledge view retains its verified query source.
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(temp.path().join("__cluster/state.json")).unwrap())
+            .unwrap();
+    let query_digest =
+        ledger["applied_revision"]["resources"]["query.knowledge.find_person"]["digest"]
+            .as_str()
+            .unwrap();
+    let catalog_query = temp.path().join(format!(
+        "__cluster/resources/query/knowledge/find_person/{query_digest}.gq"
+    ));
+    let source = fs::read(&catalog_query).unwrap();
+    fs::remove_file(&catalog_query).unwrap();
+    fs::write(
+        temp.path().join("peer.pg"),
+        "node Peer { name: String @key note: String? }\n",
+    )
+    .unwrap();
+    let independent = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
+    let (next, _, _) = status(&app, None).await;
+    let (code, changed) = json_response(
+        &app,
+        submit(&next.next_deployment_id(), &independent, "operator-token"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{changed}");
+    assert_eq!(changed["active"], true);
+    assert!(
+        !catalog_query.exists(),
+        "unrelated corruption must not be silently repaired"
+    );
+    assert!(!state.operation_runtime().snapshot().closed);
+    fs::write(catalog_query, source).unwrap();
+
+    // Existing policies can grant and revoke writes on the same runtime.
+    // Candidate authorization cannot grant its submitter permission to apply.
+    let old_policy = fs::read_to_string(temp.path().join("policy.yaml")).unwrap();
+    let old_management = fs::read_to_string(temp.path().join("cluster-policy.yaml")).unwrap();
+    let granted = old_policy.replace("actions: [read]", "actions: [read, change]");
+    fs::write(temp.path().join("policy.yaml"), &granted).unwrap();
+    fs::write(
+        temp.path().join("cluster-policy.yaml"),
+        old_management.replace("[operator]", "[reader]"),
+    )
+    .unwrap();
+    let denied_candidate = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
+    let (next, _, _) = status(&app, None).await;
+    let ledger_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+    let (code, _) = json_response(
+        &app,
+        submit(
+            &next.next_deployment_id(),
+            &denied_candidate,
+            "reader-token",
+        ),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    assert_eq!(
+        fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+        ledger_before
+    );
+    fs::write(temp.path().join("cluster-policy.yaml"), &old_management).unwrap();
+    let grant = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
+    let grant_id = next.next_deployment_id();
+    let (code, body) = json_response(&app, submit(&grant_id, &grant, "operator-token")).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["active"], true);
+
+    fn change(body: Body) -> Request<Body> {
+        Request::post("/graphs/knowledge/mutate")
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header("authorization", "Bearer reader-token")
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap()
+    }
+    let mutation = serde_json::json!({"query":"query add() { insert Person { name: \"Granted\" } }", "name":"add"});
+    let (code, body) = json_response(&app, change(Body::from(mutation.to_string()))).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert!(
+        status(&app, Some(&grant_id)).await.1,
+        "row commits keep the installed deployment active"
+    );
+
+    // A revocation waits for a request admitted under the granted policy. New
+    // captures close immediately; after cutover neither HTTP nor engine bypass
+    // can use the old grant.
+    let (polled, body_polled) = tokio::sync::oneshot::channel();
+    let (release, body_released) = tokio::sync::oneshot::channel();
+    let parked = change(Body::from_stream(futures::stream::once(async move {
+        polled.send(()).unwrap();
+        body_released.await.unwrap();
+        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+            br#"{"query":"query add() { insert Person { name: \"BeforeRevocation\" } }","name":"add"}"#,
+        ))
+    })));
+    let request_app = app.clone();
+    let writer = tokio::spawn(async move { json_response(&request_app, parked).await });
+    tokio::time::timeout(Duration::from_secs(10), body_polled)
+        .await
+        .unwrap()
+        .unwrap();
+    fs::write(temp.path().join("policy.yaml"), &old_policy).unwrap();
+    let revoke = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
+    let (next, _, _) = status(&app, None).await;
+    let revoke_request = submit(&next.next_deployment_id(), &revoke, "operator-token");
+    let request_app = app.clone();
+    let revoker = tokio::spawn(async move { json_response(&request_app, revoke_request).await });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(
+            state.routing().registry.get(&key),
+            RegistryLookup::Transitioning(_)
+        ) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !revoker.is_finished(),
+        "revocation must await admitted requests"
+    );
+    let (code, _) = json_response(&app, change(Body::from(mutation.to_string()))).await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+    release.send(()).unwrap();
+    let (code, body) = writer.await.unwrap();
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let (code, body) = revoker.await.unwrap();
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let (code, _) = json_response(&app, change(Body::from(mutation.to_string()))).await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    let RegistryLookup::Ready(revoked) = state.routing().registry.get(&key) else {
+        panic!("ready")
+    };
+    assert!(revoked.engine.shares_runtime_owner(&original_engine));
+    let engine = omnigraph::Session::from_defaults(Arc::clone(&revoked.engine), Default::default());
+    assert!(matches!(
+        engine
+            .mutate_as(
+                "main",
+                "query add() { insert Person { name: \"EngineBypass\" } }",
+                "add",
+                &Default::default(),
+                Some("reader")
+            )
+            .await,
+        Err(omnigraph::error::OmniError::Policy(_))
+    ));
+
+    // Provider definitions, graph selection and Blob allowlists are runtime
+    // settings. Updating and removing them keeps data/history and writer owner.
+    let base_config = fs::read_to_string(temp.path().join("cluster.yaml")).unwrap();
+    for model in ["first-model", "second-model"] {
+        let bound = base_config.replace("    schema: ./people.pg\n", "    schema: ./people.pg\n    embedding_provider: selected\n    external_blobs:\n      allow:\n        - base: s3://lifecycle-assets/allowed\n          scope: server_safe\n");
+        fs::write(temp.path().join("cluster.yaml"), format!("{bound}providers:\n  embedding:\n    selected:\n      kind: mock\n      model: {model}\n")).unwrap();
+        let candidate = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
+        let (next, _, _) = status(&app, None).await;
+        let (code, body) = json_response(
+            &app,
+            submit(&next.next_deployment_id(), &candidate, "operator-token"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert_eq!(body["active"], true);
+        let RegistryLookup::Ready(view) = state.routing().registry.get(&key) else {
+            panic!("ready")
+        };
+        assert!(view.engine.shares_runtime_owner(&original_engine));
+    }
+    // An invalid replacement cannot remove the currently working bindings.
+    let provider_config = fs::read_to_string(temp.path().join("cluster.yaml")).unwrap();
+    let broken = provider_config.replace(
+        "kind: mock",
+        &format!("kind: openai-compatible\n      api_key: ${{{missing_key}}}"),
+    );
+    fs::write(temp.path().join("cluster.yaml"), broken).unwrap();
+    let candidate = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
+    let (next, _, _) = status(&app, None).await;
+    let ledger_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+    let RegistryLookup::Ready(before) = state.routing().registry.get(&key) else {
+        panic!("ready")
+    };
+    let (code, _) = json_response(
+        &app,
+        submit(&next.next_deployment_id(), &candidate, "operator-token"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    let RegistryLookup::Ready(after) = state.routing().registry.get(&key) else {
+        panic!("ready")
+    };
+    assert!(Arc::ptr_eq(&before, &after));
+    assert_eq!(
+        fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+        ledger_before
+    );
+    fs::write(temp.path().join("cluster.yaml"), &base_config).unwrap();
+    let removed_bindings = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
+    let (code, body) = json_response(
+        &app,
+        submit(
+            &next.next_deployment_id(),
+            &removed_bindings,
+            "operator-token",
+        ),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+
+    // Removal waits for admitted request descendants and belongs to the
+    // server after its caller disconnects. The receipt proves physical deletion.
+    let peer_key = GraphKey::cluster(GraphId::try_from("peer").unwrap());
+    let RegistryLookup::Ready(peer) = state.routing().registry.get(&peer_key) else {
+        panic!("ready")
+    };
+    let deleted_contract = peer.engine.schema_contract_digest();
+    drop(peer);
+    let removed = base_config
+        .replace("  peer:\n    schema: ./peer.pg\n", "")
+        .replace("[knowledge, peer]", "[knowledge]");
+    fs::write(temp.path().join("cluster.yaml"), &removed).unwrap();
+    let candidate = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
+    let (next, _, _) = status(&app, None).await;
+    let delete_id = next.next_deployment_id();
+    let ledger_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+    let (code, _) = json_response(&app, submit(&delete_id, &candidate, "reader-token")).await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    assert_eq!(
+        fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+        ledger_before
+    );
+
+    let (polled, body_polled) = tokio::sync::oneshot::channel();
+    let (release, body_released) = tokio::sync::oneshot::channel();
+    let held_body = Body::from_stream(futures::stream::once(async move {
+        polled.send(()).unwrap();
+        body_released.await.unwrap();
+        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+            br#"{"query":"query peers() { match { $p: Peer } return { $p.name } }"}"#,
+        ))
+    }));
+    let request = Request::post("/graphs/peer/query")
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+        .header("authorization", "Bearer operator-token")
+        .header("content-type", "application/json")
+        .body(held_body)
+        .unwrap();
+    let request_app = app.clone();
+    let invocation = tokio::spawn(async move { json_response(&request_app, request).await });
+    tokio::time::timeout(Duration::from_secs(10), body_polled)
+        .await
+        .unwrap()
+        .unwrap();
+    let request = submit(&delete_id, &candidate, "operator-token");
+    let deletion_app = app.clone();
+    let observer = tokio::spawn(async move { json_response(&deletion_app, request).await });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(
+            state.routing().registry.get(&peer_key),
+            RegistryLookup::Transitioning(_)
+        ) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("deletion must close admission before waiting for the held request");
+    assert!(temp.path().join("graphs/peer.omni").exists());
+    assert_eq!(
+        fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+        ledger_before
+    );
+    assert_eq!(
+        json_response(&app, get_request("/graphs/peer/snapshot", "operator-token"))
+            .await
+            .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        json_response(
+            &app,
+            get_request("/graphs/knowledge/snapshot", "operator-token")
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    observer.abort();
+    let _ = observer.await;
+    release.send(()).unwrap();
+    let (code, body) = invocation.await.unwrap();
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let deleted = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let (observed, active, in_progress) = status(&app, Some(&delete_id)).await;
+            if active && !in_progress {
+                break observed;
+            }
+            assert!(!state.operation_runtime().snapshot().closed);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("owned deletion must finish after its caller disconnects");
+    let deleted = serde_json::to_value(deleted.lookup.unwrap()).unwrap();
+    assert_eq!(deleted["result"]["graphs"]["peer"]["outcome"], "deleted");
+    assert_eq!(
+        deleted["result"]["graphs"]["peer"]["contract"],
+        serde_json::to_value(deleted_contract).unwrap()
+    );
+    assert!(!temp.path().join("graphs/peer.omni").exists());
+    assert!(matches!(
+        state.routing().registry.get(&peer_key),
+        RegistryLookup::Gone
+    ));
+    assert_eq!(
+        json_response(&app, get_request("/graphs/peer/snapshot", "operator-token"))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    let after = fs::read(temp.path().join("__cluster/state.json")).unwrap();
+    let (code, repeated) =
+        json_response(&app, submit(&delete_id, &candidate, "operator-token")).await;
+    assert_eq!(code, StatusCode::OK, "{repeated}");
+    assert_eq!(repeated["deployment"], deleted);
+    assert_eq!(repeated["active"], true);
+    assert_eq!(
+        fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+        after
+    );
+    assert!(!temp.path().join("graphs/peer.omni").exists());
+
+    // Removing the final graph leaves an applied, ready empty cluster. The
+    // management policy remains usable for future deployments.
+    fs::write(
+        temp.path().join("cluster.yaml"),
+        "version: 1\ngraphs: {}\npolicies:\n  management:\n    file: ./cluster-policy.yaml\n    applies_to: [cluster]\n",
+    )
+    .unwrap();
+    let candidate = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
+    let (code, body) =
+        json_response(&app, get_request("/cluster/deployments", "operator-token")).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let next: DeploymentStatus = serde_json::from_value(body["status"].clone()).unwrap();
+    let (code, body) = json_response(
+        &app,
+        submit(&next.next_deployment_id(), &candidate, "operator-token"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["active"], true);
+    assert_eq!(
+        body["deployment"]["result"]["graphs"]["knowledge"]["outcome"],
+        "deleted"
+    );
+    assert!(!temp.path().join("graphs/knowledge.omni").exists());
+    assert!(state.routing().registry.is_empty());
+    let (code, body) = json_response(&app, get_request("/readyz", "operator-token")).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["ready"], true);
+    assert_eq!(body["served_graph_count"], 0);
+
+    // Management-policy handoff takes effect on all cloned routers. The old
+    // administrator cannot deploy or list; its own receipt remains observable.
+    // The newly granted administrator can observe the current cluster.
+    fs::write(
+        temp.path().join("cluster-policy.yaml"),
+        format!(
+            "{}  - id: inventory\n    allow:\n      actors: {{ group: admins }}\n      actions: [graph_list]\n",
+            old_management.replace("[operator]", "[reader]")
+        ),
+    )
+    .unwrap();
+    let candidate = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
+    let (next, _, _) = status(&app, None).await;
+    let handoff_id = next.next_deployment_id();
+    let (code, body) = json_response(&app, submit(&handoff_id, &candidate, "operator-token")).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["active"], true);
+    let (code, own_receipt) = json_response(
+        &app,
+        get_request(
+            &format!("/cluster/deployments/{handoff_id}"),
+            "operator-token",
+        ),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{own_receipt}");
+    assert_eq!(own_receipt["deployment"], body["deployment"]);
+    assert_eq!(own_receipt["in_progress"], false);
+    assert!(own_receipt.get("status").is_none());
+    assert_eq!(
+        json_response(
+            &app,
+            get_request(&format!("/cluster/deployments/{boot_id}"), "operator-token")
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN,
+        "storage-owner attribution is not the authenticated receipt owner"
+    );
+    assert_eq!(
+        json_response(&app, get_request("/cluster/deployments", "operator-token"))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        json_response(&app, get_request("/cluster/deployments", "reader-token"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        json_response(&app, get_request("/graphs", "operator-token"))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        json_response(&app, get_request("/graphs", "reader-token"))
+            .await
+            .0,
+        StatusCode::OK
+    );
 }

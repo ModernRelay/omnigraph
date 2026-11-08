@@ -20,6 +20,7 @@ node Person {
 
 --- mutate
 set merge_lineage = off;
+set write_max_bytes = 4093;
 
 --- expect ok
 
@@ -31,6 +32,12 @@ show merge_lineage;
 --- expect unordered
 {"name": "merge_lineage", "value": "off", "default": "on", "source": "file", "scope": "request"}
 
+--- query
+show write_max_bytes;
+
+--- expect unordered
+{"name": "write_max_bytes", "value": "4093", "default": "33554432", "source": "file", "scope": "request"}
+
 --- mutate
 reset all;
 
@@ -41,3 +48,9 @@ show merge_lineage;
 
 --- expect unordered
 {"name": "merge_lineage", "value": "verify", "default": "on", "source": "default", "scope": "request"}
+
+--- query
+show write_max_bytes;
+
+--- expect unordered
+{"name": "write_max_bytes", "value": "33554432", "default": "33554432", "source": "default", "scope": "request"}

@@ -7,16 +7,15 @@ use std::sync::Arc;
 use arrow_array::{BooleanArray, RecordBatch};
 use datafusion::common::Result as DfResult;
 use datafusion::execution::TaskContext;
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
-use futures::StreamExt;
 use omnigraph_compiler::ir::{IRExpr, ParamMap};
 
+use super::external;
 use super::memory::WorkMemory;
-use super::{external, polled, streaming_properties};
+use super::shape::{Mapped, Streaming};
 use crate::engine::expr::evaluate_filter;
 
 /// The refusal name the pool reports when a filtered batch does not fit.
@@ -44,7 +43,7 @@ pub(crate) struct FilterExec {
     input: Arc<dyn ExecutionPlan>,
     filters: Vec<IRExpr>,
     params: Arc<ParamMap>,
-    properties: Arc<PlanProperties>,
+    shape: Streaming,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -54,12 +53,12 @@ impl FilterExec {
         filters: Vec<IRExpr>,
         params: Arc<ParamMap>,
     ) -> Self {
-        let properties = streaming_properties(input.schema());
+        let shape = Streaming::new(input.schema());
         Self {
             input,
             filters,
             params,
-            properties,
+            shape,
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -90,7 +89,7 @@ impl ExecutionPlan for FilterExec {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
+        self.shape.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -117,42 +116,19 @@ impl ExecutionPlan for FilterExec {
         assert_eq!(partition, 0, "FilterExec has one partition");
         let input = self.input.execute(0, Arc::clone(&ctx))?;
         let memory = WorkMemory::new(ctx, OUTPUT)?;
-        let baseline = BaselineMetrics::new(&self.metrics, 0);
         let filters = self.filters.clone();
         let params = Arc::clone(&self.params);
-        let stream = futures::stream::try_unfold(
-            (input, memory, None::<WorkMemory>),
-            move |(mut input, memory, held)| {
-                let baseline = baseline.clone();
-                let filters = filters.clone();
-                let params = Arc::clone(&params);
-                async move {
-                    drop(held);
-                    match input.next().await {
-                        Some(Ok(batch)) => {
-                            let kept = match conjoined_mask(&batch, &filters, &params)? {
-                                Some(mask) => {
-                                    arrow_select::filter::filter_record_batch(&batch, &mask)?
-                                }
-                                None => batch,
-                            };
-                            let lease = memory.child(OUTPUT)?;
-                            lease.hold(&kept)?;
-                            baseline.record_output(kept.num_rows());
-                            Ok(Some((kept, (input, memory, Some(lease)))))
-                        }
-                        Some(Err(error)) => Err(error),
-                        None => {
-                            baseline.done();
-                            Ok(None)
-                        }
-                    }
-                }
-            },
-        );
-        Ok(polled(
-            &self.metrics,
-            Box::pin(RecordBatchStreamAdapter::new(self.schema(), stream)),
-        ))
+        Ok(self.shape.map(&self.metrics, input, move |batch| {
+            let kept = match conjoined_mask(&batch, &filters, &params)? {
+                Some(mask) => arrow_select::filter::filter_record_batch(&batch, &mask)?,
+                None => batch,
+            };
+            let lease = memory.child(OUTPUT)?;
+            lease.hold(&kept)?;
+            Ok(Mapped::Batch {
+                batch: kept,
+                lease: Some(lease),
+            })
+        }))
     }
 }

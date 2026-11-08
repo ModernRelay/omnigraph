@@ -1,0 +1,290 @@
+# issue: none
+# notes: Literal narrowing is chosen once from exact representability; parameters use their declared domain.
+# notes: Pushed node, edge and return comparisons agree, including F32 rounding and signed/U64 membership.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Number {
+    key: String @key
+    n: I64
+    f: F32
+    small: I32
+    u: U64
+    ns: [I64]
+    us: [U64]
+    fs: [F32]
+}
+edge Link: Number -> Number {
+    n: I64
+    f: F32
+}
+
+--- seed
+{"type":"Number","data":{"key":"a","n":9007199254740993,"f":0.1,"small":2,"u":18446744073709551615,"ns":[9007199254740993],"us":[18446744073709551615],"fs":[0.1]}}
+{"type":"Number","data":{"key":"b","n":9007199254740992,"f":0.5,"small":3,"u":0,"ns":[9007199254740992],"us":[0],"fs":[0.5]}}
+{"edge":"Link","from":"a","to":"b","data":{"n":9007199254740993,"f":0.1}}
+
+--- query
+set engine = v2;
+query integer_node_literal() {
+    match { $x: Number $x.n > 9007199254740992.0 }
+    return { $x.key }
+}
+--- expect unordered
+{"x.key":"a"}
+--- expect shape
+x.key: String
+--- expect plan
+scan Number as $x: filter reads [x.n]
+cast 9007199254740992.0: F64 -> I64
+no cast $x.n
+type $x.n: I64
+
+--- query
+set engine = v2;
+query integer_edge_literal() {
+    match { $x: Number $x $e:link $y $e.n > 9007199254740992.0 }
+    return { $x.key }
+}
+--- expect unordered
+{"x.key":"a"}
+--- expect shape
+x.key: String
+--- expect plan
+cast 9007199254740992.0: F64 -> I64
+no cast $e.n
+type $e.n: I64
+
+--- query
+set engine = v2;
+query integer_projection_literal() {
+    match { $x: Number }
+    return { $x.key, $x.n > 9007199254740992.0 as above }
+}
+--- expect unordered
+{"x.key":"a","above":true}
+{"x.key":"b","above":false}
+--- expect shape
+x.key: String
+above: Bool
+--- expect plan
+cast 9007199254740992.0: F64 -> I64
+no cast $x.n
+
+--- query
+set engine = v2;
+query f32_node_nonrepresentable_literal() {
+    match { $x: Number $x.f = 0.1 }
+    return { $x.key }
+}
+--- expect unordered
+--- expect shape
+x.key: String
+--- expect plan
+cast $x.f: F32 -> F64
+type 0.1: F64
+
+--- query
+set engine = v2;
+query f32_edge_nonrepresentable_literal() {
+    match { $x: Number $x $e:link $y $e.f = 0.1 }
+    return { $x.key }
+}
+--- expect unordered
+--- expect shape
+x.key: String
+--- expect plan
+cast $e.f: F32 -> F64
+type 0.1: F64
+
+--- query
+set engine = v2;
+query f32_exact_literal() {
+    match { $x: Number $x.f = 0.10000000149011612 }
+    return { $x.key }
+}
+--- expect unordered
+{"x.key":"a"}
+--- expect shape
+x.key: String
+--- expect plan
+cast 0.10000000149011612: F64 -> F32
+no cast $x.f
+
+--- query
+set engine = v2;
+query declared_f64_parameter($bound: F64) {
+    match { $x: Number $x.f = $bound }
+    return { $x.key }
+}
+--- params
+{"bound":0.1}
+--- expect unordered
+--- expect shape
+x.key: String
+--- expect plan
+cast $x.f: F32 -> F64
+type $bound: F64
+
+--- query
+set engine = v2;
+query declared_f64_parameter($bound: F64) {
+    match { $x: Number $x.f = $bound }
+    return { $x.key }
+}
+--- params
+{"bound":0.10000000149011612}
+--- expect unordered
+{"x.key":"a"}
+--- expect shape
+x.key: String
+--- expect plan
+cast $x.f: F32 -> F64
+type $bound: F64
+
+--- query
+set engine = v2;
+query declared_f32_parameter($bound: F32) {
+    match { $x: Number $x.f = $bound }
+    return { $x.key }
+}
+--- params
+{"bound":0.1}
+--- expect unordered
+{"x.key":"a"}
+--- expect shape
+x.key: String
+--- expect plan
+no cast $x.f
+no cast $bound
+type $bound: F32
+
+--- query
+set engine = v2;
+query integer_fractional_literal() {
+    match { $x: Number $x.small > 2.5 }
+    return { $x.key }
+}
+--- expect unordered
+{"x.key":"b"}
+--- expect shape
+x.key: String
+--- expect plan
+cast $x.small: I32 -> F64
+type 2.5: F64
+
+--- query
+set engine = v2;
+query unsigned_negative_parameter($bound: I64) {
+    match { $x: Number $x.u > $bound }
+    return { $x.key }
+}
+--- params
+{"bound":-1}
+--- expect unordered
+{"x.key":"a"}
+{"x.key":"b"}
+--- expect shape
+x.key: String
+--- expect plan
+cast $x.u: U64 -> exact_integer
+cast $bound: I64 -> exact_integer
+
+--- query
+set engine = v2;
+query signed_list_exact_literal() {
+    match { $x: Number }
+    return { $x.key, $x.ns contains 9007199254740992.0 as member }
+}
+--- expect unordered
+{"x.key":"a","member":false}
+{"x.key":"b","member":true}
+--- expect shape
+x.key: String
+member: Bool
+--- expect plan
+cast 9007199254740992.0: F64 -> I64
+no cast $x.ns
+
+--- query
+set engine = v2;
+query literal_list_exact_narrowing() {
+    match { $x: Number }
+    return { $x.key, $x.n in [9007199254740992.0] as member }
+}
+--- expect unordered
+{"x.key":"a","member":false}
+{"x.key":"b","member":true}
+--- expect shape
+x.key: String
+member: Bool
+--- expect plan
+cast [9007199254740992.0]: [F64] -> [I64]
+no cast $x.n
+
+--- query
+set engine = v2;
+query literal_list_one_common_domain() {
+    match { $x: Number }
+    return { $x.key, $x.n in [9007199254740992.0, 1.5] as member }
+}
+--- expect unordered
+{"x.key":"a","member":true}
+{"x.key":"b","member":true}
+--- expect shape
+x.key: String
+member: Bool
+--- expect plan
+cast $x.n: I64 -> F64
+type [9007199254740992.0, 1.5]: [F64]
+
+--- query
+set engine = v2;
+query unsigned_list_negative_needle($needle: I64) {
+    match { $x: Number }
+    return { $x.key, $x.us contains $needle as member }
+}
+--- params
+{"needle":-1}
+--- expect unordered
+{"x.key":"a","member":false}
+{"x.key":"b","member":false}
+--- expect shape
+x.key: String
+member: Bool
+--- expect plan
+cast $x.us: [U64] -> [exact_integer]
+cast $needle: I64 -> exact_integer
+
+--- query
+set engine = v2;
+query f32_list_nonrepresentable_needle() {
+    match { $x: Number $x.fs contains 0.1 }
+    return { $x.key }
+}
+--- expect unordered
+--- expect shape
+x.key: String
+--- expect plan
+cast $x.fs: [F32] -> [F64]
+type 0.1: F64
+
+--- query
+set engine = v2;
+query parameter_rounding_before_widening($small: F32, $wide: F64) {
+    match { $x: Number }
+    return { $x.key, $small = $wide as rounded }
+}
+--- params
+{"small":16777217.0,"wide":16777216.0}
+--- expect unordered
+{"x.key":"a","rounded":true}
+{"x.key":"b","rounded":true}
+--- expect shape
+x.key: String
+rounded: Bool

@@ -10,6 +10,8 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::timeout;
 
+use crate::redacted_cause::RedactedCause;
+
 /// At most two produced chunks may wait behind the response consumer.
 pub(crate) const EXPORT_QUEUE_CHUNKS: usize = 2;
 /// Queued and yielded chunks share these credits; clones and slices keep a
@@ -23,6 +25,9 @@ pub(crate) const EXPORT_QUEUE_RESERVED_BYTES: usize =
 pub(crate) const EXPORT_PROCESS_QUEUE_RESERVED_BYTES: usize = 8 * EXPORT_QUEUE_RESERVED_BYTES;
 /// A saturated request waits only briefly for a queue reservation.
 pub(crate) const EXPORT_RESERVATION_TIMEOUT: Duration = Duration::from_millis(250);
+/// The body error of a stream that failed after its 200 headers. The client
+/// reads no text from it; the server's HTTP trace layer logs it.
+const SERVED_STREAM_FAILED: &str = "served stream failed after response headers";
 
 static PROCESS_EXPORT_QUEUE_BYTES: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
@@ -74,7 +79,6 @@ impl ExportTransport {
             Ok(Ok(permit)) => Ok(Arc::new(ExportQueueLease {
                 _permit: permit,
                 frames: Arc::new(Semaphore::new(EXPORT_OUTSTANDING_FRAMES)),
-                reservation_timeout: self.reservation_timeout,
             })),
             Ok(Err(_closed)) => Err(OmniError::manifest_internal(
                 "served export transport byte budget closed unexpectedly",
@@ -97,7 +101,6 @@ impl ExportTransport {
 pub(crate) struct ExportQueueLease {
     _permit: OwnedSemaphorePermit,
     frames: Arc<Semaphore>,
-    reservation_timeout: Duration,
 }
 
 /// A single sequential producer hands off at most one unadmitted chunk at a
@@ -107,6 +110,8 @@ pub(crate) struct ExportQueueLease {
 pub(crate) struct ExportSender {
     sender: mpsc::Sender<ExportFrame>,
     lease: Arc<ExportQueueLease>,
+    /// Names the stream in the failure log.
+    stream: &'static str,
 }
 
 impl ExportSender {
@@ -123,19 +128,20 @@ impl ExportSender {
                 bytes as u64,
             ));
         }
-        let frame = timeout(
-            self.lease.reservation_timeout,
-            Arc::clone(&self.lease.frames).acquire_owned(),
-        )
-        .await
-        .map_err(|_| {
-            OmniError::resource_limit(
-                "stream_export_retained_chunks",
-                EXPORT_OUTSTANDING_FRAMES as u64,
-                (EXPORT_OUTSTANDING_FRAMES + 1) as u64,
-            )
-        })?
-        .map_err(|_| OmniError::manifest_internal("served export frame credits closed"))?;
+        // These bytes already have the pending producer slot. Ordinary socket
+        // backpressure is not admission failure: retain the reservation while
+        // waiting for the consumer to release a preceding allocation. Observe
+        // closure here too because the baseline cursor is sent after the
+        // handler's outer export/closed select has completed.
+        let frame = tokio::select! {
+            biased;
+            () = self.sender.closed() => {
+                return Err(OmniError::Io(io::Error::other("served export response closed")));
+            }
+            frame = Arc::clone(&self.lease.frames).acquire_owned() => {
+                frame.map_err(|_| OmniError::manifest_internal("served export frame credits closed"))?
+            }
+        };
         let bytes = Bytes::from_owner(ExportChunk {
             chunk,
             _frame: frame,
@@ -160,7 +166,25 @@ impl ExportSender {
         self.send_chunk(output.0).await
     }
 
-    pub(crate) async fn finish(&self, cut: ExportCut, error: Option<io::Error>) {
+    /// End the response, with the failure that ended it. An engine message
+    /// can hold object URIs or credentials, so the body error is a constant
+    /// and the log names the failure by its class. A failure after the client
+    /// has gone reaches nobody and is not logged.
+    pub(crate) async fn finish(&self, cut: ExportCut, failure: Option<OmniError>) {
+        let error = failure.map(|failure| {
+            if !self.sender.is_closed() {
+                let cause = RedactedCause::of(&failure);
+                tracing::error!(
+                    error_kind = "served_stream_failed",
+                    stream = self.stream,
+                    error_variant = cause.variant,
+                    storage_kind = ?cause.storage_kind,
+                    manifest_kind = ?cause.manifest_kind,
+                    "served stream failed after response headers"
+                );
+            }
+            io::Error::other(SERVED_STREAM_FAILED)
+        });
         let _ = self
             .sender
             .send(ExportFrame::Terminal {
@@ -222,12 +246,16 @@ pub(crate) struct ExportBodyStream {
     done: bool,
 }
 
-pub(crate) fn channel(lease: Arc<ExportQueueLease>) -> (ExportSender, ExportBodyStream) {
+pub(crate) fn channel(
+    lease: Arc<ExportQueueLease>,
+    stream: &'static str,
+) -> (ExportSender, ExportBodyStream) {
     let (sender, receiver) = mpsc::channel(EXPORT_QUEUE_CHUNKS);
     (
         ExportSender {
             sender,
             lease: Arc::clone(&lease),
+            stream,
         },
         ExportBodyStream {
             receiver,
@@ -314,7 +342,7 @@ mod tests {
         );
         let lease = transport.reserve().await.unwrap();
         let producer_lease = Arc::clone(&lease);
-        let (sender, mut body) = channel(lease);
+        let (sender, mut body) = channel(lease, "export");
         sender
             .send_chunk(vec![b'x'; EXPORT_CHUNK_MAX_BYTES])
             .await
@@ -358,7 +386,7 @@ mod tests {
             Duration::from_millis(10),
         );
         let lease = transport.reserve().await.unwrap();
-        let (sender, mut body) = channel(lease);
+        let (sender, mut body) = channel(lease, "export");
 
         sender
             .send_chunk(vec![b'a'; EXPORT_CHUNK_MAX_BYTES])
@@ -389,21 +417,25 @@ mod tests {
 
         // The single pending chunk occupies the fourth reserved slot. A body
         // that retains all three preceding allocations must not admit it.
-        let error = {
+        {
             let pending = sender.send_chunk(vec![b'd'; EXPORT_CHUNK_MAX_BYTES]);
             tokio::pin!(pending);
             assert!(futures::poll!(&mut pending).is_pending());
-            pending.await.unwrap_err()
-        };
-        assert!(matches!(error, OmniError::ResourceLimitExceeded {
-            ref resource, limit: 3, actual: 4,
-        } if resource == "stream_export_retained_chunks"));
-
-        // Dropping one of several views of an allocation returns no credit.
-        let last_view = retained.pop().unwrap().slice(0..1);
-        assert_eq!(sender.lease.frames.available_permits(), 0);
-        drop(last_view);
-        assert_eq!(sender.lease.frames.available_permits(), 1);
+            assert!(
+                timeout(Duration::from_millis(30), &mut pending)
+                    .await
+                    .is_err(),
+                "an admitted stream must wait beyond its initial admission deadline"
+            );
+            // Dropping one of several views of an allocation returns no credit.
+            let last_view = retained.pop().unwrap().slice(0..1);
+            assert_eq!(sender.lease.frames.available_permits(), 0);
+            drop(last_view);
+            pending.await.unwrap();
+        }
+        let fourth = body.next().await.unwrap().unwrap();
+        assert_eq!(fourth[0], b'd');
+        drop(fourth);
         // A consuming transport can deliver arbitrarily many frames. Its own
         // copied result is separate from the server-owned transport buffers.
         let mut received = Vec::new();
@@ -438,6 +470,7 @@ mod tests {
             body.next().await.unwrap().unwrap().as_ref(),
             b"\"cursor\"\n"
         );
+
         drop(sender);
         drop(body);
         assert_eq!(
@@ -450,7 +483,7 @@ mod tests {
     async fn missing_terminal_frame_is_a_body_error_not_clean_eof() {
         let transport = ExportTransport::new(4, 4, Duration::from_millis(10));
         let lease = transport.reserve().await.unwrap();
-        let (sender, mut body) = channel(lease);
+        let (sender, mut body) = channel(lease, "export");
         drop(sender);
 
         let error = body.next().await.unwrap().unwrap_err();
@@ -480,7 +513,7 @@ mod tests {
         );
         let lease = transport.reserve().await.unwrap();
         let producer_lease = Arc::clone(&lease);
-        let (sender, mut body) = channel(lease);
+        let (sender, mut body) = channel(lease, "export");
 
         let data_sender = sender.clone();
         let (cut, result) = cut
@@ -523,34 +556,73 @@ mod tests {
             EXPORT_QUEUE_RESERVED_BYTES
         );
 
-        // If retained data frames exhaust credits, no baseline cursor is
-        // emitted. Its terminal error releases the cut but not retained bytes.
+        // An engine failure after the headers reaches the body as a constant
+        // and the log as its class: the trace layer logs a body error's text,
+        // and an engine message can hold object URIs or credentials.
+        let capture = crate::test_log_capture::Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("info"));
         let cut = db.capture_served_export_cut("main", &[]).await.unwrap();
-        let (sender, mut body) = channel(transport.reserve().await.unwrap());
+        let (sender, mut body) = channel(transport.reserve().await.unwrap(), "export");
+        sender
+            .finish(
+                cut,
+                Some(OmniError::Storage(omnigraph::error::StorageFailure::new(
+                    omnigraph::error::StorageFailureKind::Unknown,
+                    "storage: GET s3://private-bucket/graph/nodes/0a.lance?token=secret",
+                ))),
+            )
+            .await;
+        drop(sender);
+        let error = body.next().await.unwrap().unwrap_err();
+        assert_eq!(error.to_string(), SERVED_STREAM_FAILED);
+        assert!(body.next().await.is_none());
+        drop(body);
+        let logs = capture.output();
+        for expected in [
+            r#"error_kind="served_stream_failed""#,
+            r#"stream="export""#,
+            r#"error_variant="Storage""#,
+            "storage_kind=Some(Unknown)",
+        ] {
+            assert!(logs.contains(expected), "missing {expected}: {logs}");
+        }
+        for leaked in ["private-bucket", "0a.lance", "token", "secret"] {
+            assert!(!logs.contains(leaked), "log leaked {leaked}: {logs}");
+        }
+
+        // Baseline sends its cursor after the outer export/closed select has
+        // completed. Receiver closure must release this producer's cut even
+        // when all frame credits survive in transport-owned clones or slices.
+        let cut = db.capture_served_export_cut("main", &[]).await.unwrap();
+        let (sender, mut body) = channel(transport.reserve().await.unwrap(), "change_baseline");
         let mut retained = Vec::new();
         for _ in 0..EXPORT_OUTSTANDING_FRAMES {
             sender
                 .send_chunk(vec![b'x'; EXPORT_CHUNK_MAX_BYTES])
                 .await
                 .unwrap();
-            retained.push(body.next().await.unwrap().unwrap());
+            retained.push(body.next().await.unwrap().unwrap().slice(..1));
         }
-        let error = sender
-            .send_json_line(&serde_json::json!({"baseline": {"resume_cursor": "cursor"}}))
-            .await
-            .unwrap_err();
-        sender
-            .finish(cut, Some(io::Error::other(error.to_string())))
-            .await;
+        {
+            let terminal = async {
+                let error = sender
+                    .send_json_line(&serde_json::json!({"baseline": {"resume_cursor": "cursor"}}))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, OmniError::Io(_)));
+                sender.finish(cut, Some(error)).await;
+            };
+            tokio::pin!(terminal);
+            assert!(futures::poll!(&mut terminal).is_pending());
+            drop(body);
+            assert!(futures::poll!(&mut terminal).is_ready());
+        }
         drop(sender);
-        let terminal = body.next().await.unwrap().unwrap_err();
-        assert!(
-            terminal
-                .to_string()
-                .contains("stream_export_retained_chunks")
+        assert_eq!(
+            capture.output().matches("served_stream_failed").count(),
+            1,
+            "a failure after the client has gone is not logged"
         );
-        assert!(body.next().await.is_none());
-        drop(body);
         assert_eq!(transport.available_bytes.available_permits(), 0);
         let retry = db.capture_served_export_cut("main", &[]).await.unwrap();
         drop(retry);

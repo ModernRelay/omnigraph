@@ -1,0 +1,262 @@
+{
+  "version": "4.0",
+  "category": "encode",
+  "description": "Primitive value encoding – strings, numbers, booleans, null",
+  "tests": [
+    {
+      "name": "encodes safe strings without quotes",
+      "input": "hello",
+      "expected": "hello",
+      "specSection": "7.2"
+    },
+    {
+      "name": "encodes safe string with underscore and numbers",
+      "input": "Ada_99",
+      "expected": "Ada_99",
+      "specSection": "7.2"
+    },
+    {
+      "name": "quotes empty string",
+      "input": "",
+      "expected": "\"\"",
+      "specSection": "7.2"
+    },
+    {
+      "name": "quotes string that looks like true",
+      "input": "true",
+      "expected": "\"true\"",
+      "specSection": "7.2"
+    },
+    {
+      "name": "quotes string that looks like false",
+      "input": "false",
+      "expected": "\"false\"",
+      "specSection": "7.2"
+    },
+    {
+      "name": "quotes string that looks like null",
+      "input": "null",
+      "expected": "\"null\"",
+      "specSection": "7.2"
+    },
+    {
+      "name": "quotes string that looks like integer",
+      "input": "42",
+      "expected": "\"42\"",
+      "specSection": "7.2"
+    },
+    {
+      "name": "quotes string that looks like a decimal",
+      "input": "3.14",
+      "expected": "\"3.14\"",
+      "specSection": "7.2"
+    },
+    {
+      "name": "quotes string that looks like scientific notation",
+      "input": "1e-6",
+      "expected": "\"1e-6\"",
+      "specSection": "7.2"
+    },
+    {
+      "name": "quotes string with leading zero",
+      "input": "05",
+      "expected": "\"05\"",
+      "specSection": "7.2",
+      "note": "Matches the numeric-like pattern, so it MUST be quoted"
+    },
+    {
+      "name": "escapes newline, tab, and carriage return in strings",
+      "input": ["line1\nline2", "tab\there", "return\rcarriage"],
+      "expected": "[3]: \"line1\\nline2\",\"tab\\there\",\"return\\rcarriage\"",
+      "specSection": "7.1"
+    },
+    {
+      "name": "escapes U+0004, U+0008, and U+000C via \\uXXXX and keeps DEL, U+0085, and U+2028 literal in quoted strings",
+      "input": { "val": "a\u0004\b\fb", "sep": "a:\u007f\u0085\u2028b" },
+      "expected": "val: \"a\\u0004\\u0008\\u000cb\"\nsep: \"a:\u007f\u0085\u2028b\"",
+      "specSection": "7.1",
+      "minSpecVersion": "4.2"
+    },
+    {
+      "name": "escapes backslash in string",
+      "input": "Users\\path",
+      "expected": "\"Users\\\\path\"",
+      "specSection": "7.1"
+    },
+    {
+      "name": "keeps a string with an interior hyphen or hash unquoted",
+      "input": "a-b #c",
+      "expected": "a-b #c",
+      "specSection": "7.2",
+      "minSpecVersion": "4.2"
+    },
+    {
+      "name": "quotes string starting with hyphen-space",
+      "input": "- item",
+      "expected": "\"- item\"",
+      "specSection": "7.2"
+    },
+    {
+      "name": "quotes single hyphen and hyphen-space string as object values",
+      "input": { "marker": "-", "note": "- item" },
+      "expected": "marker: \"-\"\nnote: \"- item\"",
+      "specSection": "7.2",
+      "note": "Either would otherwise read as a list item marker"
+    },
+    {
+      "name": "quotes single hyphen and leading-hyphen string in array",
+      "input": { "items": ["-", "-x"] },
+      "expected": "items[2]: \"-\",\"-x\"",
+      "specSection": "7.2"
+    },
+    {
+      "name": "quotes string with bracket notation",
+      "input": "a[test]",
+      "expected": "\"a[test]\"",
+      "specSection": "7.2"
+    },
+    {
+      "name": "quotes string with brace notation",
+      "input": "{key}",
+      "expected": "\"{key}\"",
+      "specSection": "7.2"
+    },
+    {
+      "name": "encodes Unicode string without quotes",
+      "input": "café",
+      "expected": "café",
+      "specSection": "7.2"
+    },
+    {
+      "name": "encodes string with emoji and spaces",
+      "input": "hello 👋 world",
+      "expected": "hello 👋 world",
+      "specSection": "7.2"
+    },
+    {
+      "name": "encodes emoji inside a quoted string",
+      "input": "a,🚀",
+      "expected": "\"a,🚀\"",
+      "specSection": "7.1",
+      "note": "Quoting is triggered by the delimiter; the supplementary scalar stays literal UTF-8, never a surrogate escape"
+    },
+    {
+      "name": "encodes positive integer",
+      "input": 42,
+      "expected": "42",
+      "specSection": "2"
+    },
+    {
+      "name": "encodes decimal number",
+      "input": 3.14,
+      "expected": "3.14",
+      "specSection": "2"
+    },
+    {
+      "name": "encodes negative integer",
+      "input": -7,
+      "expected": "-7",
+      "specSection": "2"
+    },
+    {
+      "name": "encodes zero",
+      "input": 0,
+      "expected": "0",
+      "specSection": "2"
+    },
+    {
+      "name": "encodes negative zero as zero",
+      "input": -0.0,
+      "expected": "0",
+      "specSection": "2"
+    },
+    {
+      "name": "encodes large integer without exponent notation",
+      "input": 1e6,
+      "expected": "1000000",
+      "specSection": "2",
+      "note": "Within the canonical decimal range"
+    },
+    {
+      "name": "encodes small decimal without exponent notation",
+      "input": 0.000001,
+      "expected": "0.000001",
+      "specSection": "2",
+      "note": "Lower bound of the canonical decimal range"
+    },
+    {
+      "name": "encodes large number",
+      "input": 100000000000000000000,
+      "expected": "100000000000000000000",
+      "specSection": "2"
+    },
+    {
+      "name": "encodes MAX_SAFE_INTEGER",
+      "input": 9007199254740991,
+      "expected": "9007199254740991",
+      "specSection": "2"
+    },
+    {
+      "name": "encodes floats with their shortest round-trip digits",
+      "input": [0.3333333333333333, 0.30000000000000004, -0.000001],
+      "expected": "[3]: 0.3333333333333333,0.30000000000000004,-0.000001",
+      "specSection": "2",
+      "minSpecVersion": "4.2"
+    },
+    {
+      "name": "encodes true",
+      "input": true,
+      "expected": "true",
+      "specSection": "2"
+    },
+    {
+      "name": "encodes false",
+      "input": false,
+      "expected": "false",
+      "specSection": "2"
+    },
+    {
+      "name": "encodes null",
+      "input": null,
+      "expected": "null",
+      "specSection": "2"
+    },
+    {
+      "name": "quotes leading-plus numeric-like string",
+      "input": "+1",
+      "expected": "\"+1\"",
+      "specSection": "7.2",
+      "note": "Unquoted, a v3 host-parser decoder would read the number 1"
+    },
+    {
+      "name": "quotes string starting with hash",
+      "input": "#hello",
+      "expected": "\"#hello\"",
+      "specSection": "7.2",
+      "note": "Comment marker at position 0 must be quoted"
+    },
+    {
+      "name": "quotes a root string starting with U+FEFF",
+      "input": "\ufeff8",
+      "expected": "\"\ufeff8\"",
+      "specSection": "7.2",
+      "note": "Unquoted, a decoder would remove the U+FEFF as a byte-order mark (§12) and read the number 8",
+      "minSpecVersion": "4.1"
+    },
+    {
+      "name": "encodes a large integer-valued number with its shortest round-trip digits",
+      "input": 123456789012345680000,
+      "expected": "123456789012345680000",
+      "specSection": "2",
+      "note": "The binary64 value is exactly 123456789012345683968",
+      "minSpecVersion": "4.2"
+    },
+    {
+      "name": "quotes a delimiter, colon, hyphen, or number sign that a combining mark follows",
+      "input": { "items": ["a,\u0301b", "-\u0301", "#\u0301"], "k": "x:\u0301" },
+      "expected": "items[3]: \"a,\u0301b\",\"-\u0301\",\"#\u0301\"\nk: \"x:\u0301\"",
+      "specSection": "1.2",
+      "minSpecVersion": "4.4"
+    }
+  ]
+}

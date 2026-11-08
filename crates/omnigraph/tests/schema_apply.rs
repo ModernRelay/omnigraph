@@ -1,6 +1,8 @@
 mod helpers;
 
 use base64::Engine;
+use lance::index::DatasetIndexExt;
+use std::collections::HashMap;
 #[cfg(feature = "failpoints")]
 use std::sync::Arc;
 
@@ -12,6 +14,7 @@ use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::loader::LoadMode;
 use omnigraph::{BlobContent, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
+use omnigraph_core::graph_commit_id::intent_nonce;
 use sha2::{Digest, Sha256};
 
 use helpers::*;
@@ -91,6 +94,17 @@ async fn plan_schema_reports_supported_additive_change() {
 
     let preview = db.preview_schema_apply(&desired).await.unwrap();
     assert_eq!(preview.catalog.node_types.len(), 2);
+
+    let contract = db.schema_contract_digest();
+    // The served observational planner uses the accepted in-memory contract;
+    // it must neither reopen this root nor wait on a schema gate.
+    let parked = dir.path().with_extension("parked");
+    std::fs::rename(dir.path(), &parked).unwrap();
+    let observed = db.plan_schema_at_contract(&desired, &contract).unwrap();
+    std::fs::rename(&parked, dir.path()).unwrap();
+    assert_eq!(observed, plan);
+    db.apply_schema(&desired).await.unwrap();
+    assert!(db.plan_schema_at_contract(&desired, &contract).is_err());
 }
 
 #[tokio::test]
@@ -472,21 +486,17 @@ async fn parked_writer_blocks_schema_apply() {
 
     let post_gate =
         helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_POST_LOCK_PRE_EFFECT);
+    let queued = helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_GATE_EXCLUSIVE_QUEUED);
     let schema_db = Arc::clone(&db);
     let schema_task = tokio::spawn(async move { schema_db.apply_schema(&desired).await });
-    // Wall time: an apply past the gate makes store requests before the seam.
-    let crossed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while !post_gate.reached() {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
-    .await;
+    queued.wait_until_reached().await;
     assert!(
-        crossed.is_err(),
+        !post_gate.reached(),
         "schema apply must wait behind a writer's held shared schema permit; it \
          crossed its effect gate while the writer was parked",
     );
     assert!(!schema_task.is_finished());
+    queued.release();
 
     in_envelope.release();
     writer
@@ -500,6 +510,74 @@ async fn parked_writer_blocks_schema_apply() {
         .unwrap()
         .expect("schema apply must complete once the writer's envelope releases");
     assert_eq!(count_rows(&db, "node:Person").await, 5);
+}
+
+/// Issue 643, schema-apply boundary, and the merge's tripwire (the writer's
+/// is `parked_writer_blocks_schema_apply`): a merge parked before its
+/// manifest commit holds its SHARED schema permit, so a schema apply waits at
+/// the exclusive side. Past the gate the apply refuses at once, because the
+/// merge's source branch exists, so an apply that returns while the merge is
+/// parked means the merge let its permit go early. After the merge publishes,
+/// the apply refuses and the merge's result is intact.
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn parked_merge_blocks_schema_apply_issue_643() {
+    use omnigraph::seams::catalog;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("s").await.unwrap();
+    for (branch, name, age) in [("s", "On-s", 61), ("main", "On-main", 62)] {
+        db.mutate(
+            branch,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", name)], &[("$age", age)]),
+        )
+        .await
+        .unwrap();
+    }
+    let db = Arc::new(db);
+    let desired = TEST_SCHEMA.replace("    age: I32?\n}", "    age: I32?\n    motto: String?\n}");
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let merge_db = Arc::clone(&db);
+    let merge = tokio::spawn(async move { merge_db.branch_merge("s", "main").await });
+    parked.wait_until_reached().await;
+
+    let schema_db = Arc::clone(&db);
+    let mut schema_task = tokio::spawn(async move { schema_db.apply_schema(&desired).await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut schema_task)
+            .await
+            .is_err(),
+        "schema apply must wait behind a merge's held shared schema permit; it \
+         answered while the merge was parked",
+    );
+
+    parked.release();
+    assert_eq!(
+        merge
+            .await
+            .unwrap()
+            .expect("the merge must publish after release")
+            .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    let refusal = schema_task
+        .await
+        .unwrap()
+        .expect_err("schema apply refuses while the merge's source branch exists");
+    assert!(
+        refusal
+            .to_string()
+            .contains("schema apply requires a graph with only main"),
+        "{refusal}"
+    );
+    assert_eq!(count_rows(&db, "node:Person").await, 6);
 }
 
 /// Read-only opens hold the schema gate through coherent catalog capture.
@@ -805,10 +883,16 @@ async fn prepared_schema_receipt_reconciles_its_own_publication_after_restart_an
     let predecessor = db.list_commits(None).await.unwrap()[0].clone();
     let files_before = schema_storage_bytes(dir.path());
     let desired = TEST_SCHEMA.replace("age: I32?", "age: I32?\n    nickname: String?");
-    let prepared = db
-        .prepare_schema_apply_as(&desired, Some("deployer"))
+    let (prepared, migration) = db
+        .prepare_schema_apply_with_plan_as(&desired, Some("deployer"))
         .await
         .unwrap();
+    assert!(migration.supported);
+    assert!(migration.steps.iter().any(|step| matches!(
+        step,
+        SchemaMigrationStep::AddProperty { type_name, property_name, .. }
+            if type_name == "Person" && property_name == "nickname"
+    )));
     assert!(!prepared.is_noop());
     assert_eq!(prepared.actor(), Some("deployer"));
     assert_eq!(
@@ -843,7 +927,12 @@ async fn prepared_schema_receipt_reconciles_its_own_publication_after_restart_an
         .unwrap();
     let commit = result.commit.as_ref().unwrap();
     assert!(result.applied);
-    assert_eq!(commit.graph_commit_id, commit_id);
+    assert_eq!(result.steps, migration.steps);
+    assert_eq!(
+        intent_nonce(&commit.graph_commit_id).unwrap(),
+        commit_id,
+        "the published ID carries the intent nonce"
+    );
     assert_eq!(
         commit.parent_commit_id.as_deref(),
         Some(predecessor.graph_commit_id.as_str())
@@ -851,7 +940,10 @@ async fn prepared_schema_receipt_reconciles_its_own_publication_after_restart_an
     assert_eq!(commit.actor_id.as_deref(), Some("deployer"));
     assert_eq!(commit.graph_manifest_version, result.graph_manifest_version);
     assert_eq!(&result.contract, prepared.desired_contract());
-    assert_eq!(db.get_commit(&commit_id).await.unwrap(), *commit);
+    assert_eq!(
+        db.get_commit(&commit.graph_commit_id).await.unwrap(),
+        *commit
+    );
     db.load_jsonl(
         r#"{"type":"Person","data":{"name":"After publication"}}"#,
         LoadMode::Merge,
@@ -951,7 +1043,7 @@ async fn prepared_schema_reconciliation_distinguishes_unpublished_effects_from_l
         );
         if published {
             assert!(
-                matches!(&error, OmniError::RecoveryRequired { operation_id, .. } if Some(operation_id.as_str()) == prepared.graph_commit_id())
+                matches!(&error, OmniError::RecoveryRequired { operation_id, .. } if intent_nonce(operation_id).unwrap() == prepared.graph_commit_id().unwrap())
             );
         }
         let files = schema_storage_bytes(dir.path());
@@ -964,8 +1056,8 @@ async fn prepared_schema_reconciliation_distinguishes_unpublished_effects_from_l
             {
                 SchemaApplyReconciliation::Committed { commit, contract } if published => {
                     assert_eq!(
-                        Some(commit.graph_commit_id.as_str()),
-                        prepared.graph_commit_id()
+                        intent_nonce(&commit.graph_commit_id).unwrap(),
+                        prepared.graph_commit_id().unwrap()
                     );
                     assert_eq!(
                         commit.parent_commit_id.as_deref(),
@@ -1001,16 +1093,16 @@ async fn prepared_schema_reconciliation_distinguishes_unpublished_effects_from_l
         match result {
             SchemaApplySettlement::Committed { commit, .. } if published => {
                 assert_eq!(
-                    Some(commit.graph_commit_id.as_str()),
-                    prepared.graph_commit_id()
+                    intent_nonce(&commit.graph_commit_id).unwrap(),
+                    prepared.graph_commit_id().unwrap()
                 );
             }
             SchemaApplySettlement::NotPublished {
                 proof: SchemaNonPublicationProof::Fence { commit, .. },
             } if !published => {
                 assert_eq!(
-                    Some(commit.graph_commit_id.as_str()),
-                    fence.graph_commit_id()
+                    intent_nonce(&commit.graph_commit_id).unwrap(),
+                    fence.graph_commit_id().unwrap()
                 );
                 assert_eq!(db.schema_source().as_str(), TEST_SCHEMA);
                 assert!(db.apply_prepared_schema_as(&prepared, None).await.is_err());
@@ -1340,9 +1432,10 @@ async fn apply_schema_unsupported_plan_does_not_advance_manifest() {
 //   and `DropProperty`; see the cleanup tests below.
 //
 // Every other destructive shape (narrow type, add required without
-// backfill, remove constraint) still returns an `UnsupportedChange` step that
-// surfaces as an error from `apply_schema`. These tests pin the current
-// contract so a regression in the planner can't silently change behavior.
+// backfill, remove a constraint from a property that stays) still returns an
+// `UnsupportedChange` step that surfaces as an error from `apply_schema`.
+// These tests pin the current contract so a regression in the planner can't
+// silently change behavior.
 
 #[tokio::test]
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
@@ -1428,8 +1521,8 @@ node Document {
     db.load_jsonl(&data, LoadMode::Overwrite).await.unwrap();
 
     // Admission policy is not durable graph data. Reopen with the default
-    // deny policy so the rewrite proves that a historical descriptor is
-    // carried without re-authorizing or probing its caller-owned target.
+    // deny policy so the drop proves that a stored descriptor stays in place
+    // without re-authorizing or probing its caller-owned target.
     let db = Omnigraph::open(uri).await.unwrap();
 
     let documents_before = count_rows(&db, "node:Document").await;
@@ -1440,10 +1533,9 @@ node Document {
         .graph_manifest_version();
 
     // Drop `note` from Document. v1 + chassis commit #3 emit
-    // `DropProperty`; the rewrite path projects to the
-    // target schema (no `note`), commits via stage_overwrite. Row
-    // counts are unchanged — only the column is dropped from the
-    // current schema view.
+    // `DropProperty`; a metadata-only Project removes the column from the
+    // table's schema and keeps every data file. Row counts are unchanged —
+    // only the column is dropped from the current schema view.
     let desired = initial.replace("    note: String?\n", "");
 
     // Confirm the plan emits DropProperty (not UnsupportedChange).
@@ -1461,10 +1553,10 @@ node Document {
         "expected DropProperty {{ type=Document, property=note }} in plan; got {plan:?}",
     );
 
-    // An unrelated schema rewrite carries the descriptor, not the external
-    // payload. The caller-owned target may be unavailable without blocking
-    // schema evolution.
+    // The drop reads no row, so the caller-owned target of a stored external
+    // descriptor may be unavailable without blocking schema evolution.
     std::fs::remove_file(&external_path).unwrap();
+    let files_before = data_file_paths(&db, "node:Document").await;
     let probes = omnigraph::instrumentation::MergeWriteProbes::default();
     let result = omnigraph::instrumentation::with_merge_write_probes(
         probes.clone(),
@@ -1474,10 +1566,12 @@ node Document {
     .unwrap();
     assert!(result.supported);
     assert!(result.applied);
-    // Three managed values (valid empty, inline, packed) in one batched read.
-    assert_eq!(probes.blob_managed_batch_read_calls(), 1);
-    assert_eq!(probes.blob_payload_read_calls(), 3);
+    // Metadata-only: no managed or external payload is read, and every data
+    // file the table had before is still the table's data.
+    assert_eq!(probes.blob_managed_batch_read_calls(), 0);
+    assert_eq!(probes.blob_payload_read_calls(), 0);
     assert_eq!(probes.external_blob_payload_read_calls(), 0);
+    assert_eq!(data_file_paths(&db, "node:Document").await, files_before);
     assert_exact_id_primary_key(&db, "node:Document").await;
 
     // Manifest advanced; row count unchanged.
@@ -1538,7 +1632,7 @@ node Document {
             assert_eq!(reference.length, None);
         }
         BlobContent::Managed { .. } => {
-            panic!("schema rewrite must preserve the external Blob descriptor")
+            panic!("schema apply must preserve the external Blob descriptor")
         }
     }
 
@@ -1632,11 +1726,450 @@ node Document {
     );
 }
 
+/// Adding, renaming and dropping properties is metadata-only, on a Blob table
+/// (rename + drop + adds: a Project then a Merge) and a plain table (rename +
+/// drop: one Project): no row or payload is read, every data file stays the
+/// table's data, field ids, stable property markers and index coverage
+/// survive, the historical snapshot keeps its shape, one graph commit
+/// publishes it, and keyed writes, queries and optimize work afterwards.
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn apply_schema_column_changes_keep_data_files_ids_and_index_coverage_issue_1014() {
+    use lance::index::DatasetIndexExt;
+
+    const MARKER: &str = "omnigraph.stable_property_id";
+
+    async fn fields(db: &Omnigraph, table_key: &str) -> Vec<(String, i32, Option<String>)> {
+        helpers::open_pinned_dataset_for_test(db, "main", table_key)
+            .await
+            .schema()
+            .fields
+            .iter()
+            .map(|field| {
+                (
+                    field.name.clone(),
+                    field.id,
+                    field.metadata.get(MARKER).cloned(),
+                )
+            })
+            .collect()
+    }
+
+    async fn coverage(db: &Omnigraph, table_key: &str) -> Vec<(Vec<i32>, Vec<u32>)> {
+        let mut coverage = helpers::open_pinned_dataset_for_test(db, "main", table_key)
+            .await
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|index| !lance_index::is_system_index(index))
+            .map(|index| {
+                (
+                    index.fields.clone(),
+                    index
+                        .fragment_bitmap
+                        .as_ref()
+                        .map(|bitmap| bitmap.iter().collect())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        coverage.sort();
+        coverage
+    }
+
+    fn field<'a>(
+        fields: &'a [(String, i32, Option<String>)],
+        name: &str,
+    ) -> &'a (String, i32, Option<String>) {
+        fields
+            .iter()
+            .find(|(field, _, _)| field == name)
+            .unwrap_or_else(|| panic!("no field '{name}' in {fields:?}"))
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let initial = r#"
+node Document {
+    title: String @key
+    rank: I32? @index
+    note: String? @index
+    content: Blob?
+}
+
+node Tag {
+    name: String @key
+    weight: I32? @index
+    color: I32? @index
+}
+"#;
+    let db = helpers::session(Omnigraph::init(uri, initial).await.unwrap());
+    let packed = base64::engine::general_purpose::STANDARD.encode(vec![b'p'; 96 * 1024]);
+    let dedicated = base64::engine::general_purpose::STANDARD.encode(vec![b'd'; 5 * 1024 * 1024]);
+    let rows = [
+        serde_json::json!({"type": "Document", "data": {"title": "inline", "rank": 1, "note": "n1", "content": "base64:SW5saW5l"}}),
+        serde_json::json!({"type": "Document", "data": {"title": "packed", "rank": 2, "note": "n2", "content": format!("base64:{packed}")}}),
+        serde_json::json!({"type": "Document", "data": {"title": "dedicated", "rank": 3, "note": "n3", "content": format!("base64:{dedicated}")}}),
+        serde_json::json!({"type": "Document", "data": {"title": "empty", "rank": 4, "note": "n4", "content": "base64:"}}),
+        serde_json::json!({"type": "Document", "data": {"title": "null", "rank": 5, "note": "n5", "content": null}}),
+        serde_json::json!({"type": "Tag", "data": {"name": "red", "weight": 7, "color": 1}}),
+        serde_json::json!({"type": "Tag", "data": {"name": "blue", "weight": 9, "color": 2}}),
+    ]
+    .iter()
+    .map(|row| row.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    db.load_jsonl(&rows, LoadMode::Overwrite).await.unwrap();
+    db.ensure_indices().await.unwrap();
+
+    let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let before_snapshot = db.resolve_snapshot("main").await.unwrap();
+    let mut before_state = HashMap::new();
+    for table in ["node:Document", "node:Tag"] {
+        let coverage_before = coverage(&db, table).await;
+        assert!(
+            coverage_before.len() >= 3,
+            "{table} needs its id and property indexes: {coverage_before:?}"
+        );
+        before_state.insert(
+            table,
+            (
+                data_file_paths(&db, table).await,
+                fields(&db, table).await,
+                coverage_before,
+            ),
+        );
+    }
+
+    let desired = r#"
+node Document {
+    title: String @key
+    score: I32? @rename_from("rank") @index
+    content: Blob?
+    summary: String?
+    thumb: Blob?
+}
+
+node Tag {
+    name: String @key
+    strength: I32? @rename_from("weight") @index
+}
+"#;
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let result = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.apply_schema(desired),
+    )
+    .await
+    .unwrap();
+    assert!(result.applied);
+    assert_eq!(probes.blob_managed_batch_read_calls(), 0);
+    assert_eq!(probes.blob_payload_read_calls(), 0);
+    assert_eq!(probes.external_blob_payload_read_calls(), 0);
+    let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(
+        after.graph_manifest_version(),
+        before.graph_manifest_version() + 1,
+        "one graph commit publishes every table's evolution and the contract"
+    );
+    for table in ["node:Document", "node:Tag"] {
+        let entry = after.dataset(table).unwrap();
+        assert_eq!(
+            entry.published_dataset_version,
+            before.dataset(table).unwrap().published_dataset_version + 1
+        );
+        assert_eq!(
+            entry.entity_count,
+            before.dataset(table).unwrap().entity_count
+        );
+    }
+
+    let mut dropped_ids = Vec::new();
+    for (table, renamed, from, dropped) in [
+        ("node:Document", "score", "rank", "note"),
+        ("node:Tag", "strength", "weight", "color"),
+    ] {
+        let (files_before, fields_before, coverage_before) = &before_state[table];
+        assert_eq!(
+            &data_file_paths(&db, table).await,
+            files_before,
+            "{table}: no data file is written or dropped"
+        );
+        let fields_after = fields(&db, table).await;
+        let (_, from_id, from_marker) = field(fields_before, from);
+        let (_, renamed_id, renamed_marker) = field(&fields_after, renamed);
+        assert_eq!(renamed_id, from_id, "{table}: a rename keeps the field id");
+        assert_eq!(
+            renamed_marker, from_marker,
+            "{table}: and the property identity"
+        );
+        assert!(from_marker.is_some());
+        assert!(fields_after.iter().all(|(name, _, _)| name != dropped));
+        for (name, id, marker) in fields_before {
+            if name != from && name != dropped {
+                assert_eq!(
+                    field(&fields_after, name),
+                    &(name.clone(), *id, marker.clone()),
+                    "{table}: an untouched column keeps its id and identity"
+                );
+            }
+        }
+        // A dropped property takes its own index with it (the drop's
+        // Project removes it); every other index keeps its coverage.
+        let (_, dropped_id, _) = field(fields_before, dropped);
+        let surviving = coverage_before
+            .iter()
+            .filter(|(fields, _)| fields != &[*dropped_id])
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            surviving.len(),
+            coverage_before.len() - 1,
+            "{table}: the dropped column was indexed before the apply"
+        );
+        assert_eq!(
+            coverage(&db, table).await,
+            surviving,
+            "{table}: every surviving index keeps its field and fragment coverage"
+        );
+        dropped_ids.push((table, *dropped_id));
+    }
+    // Reconciliation builds from the desired declarations, so nothing indexes
+    // a dropped column again.
+    db.ensure_indices().await.unwrap();
+    for (table, dropped_id) in dropped_ids {
+        assert!(
+            coverage(&db, table)
+                .await
+                .iter()
+                .all(|(fields, _)| fields != &[dropped_id]),
+            "{table}: ensure_indices leaves the dropped column unindexed"
+        );
+    }
+    for table in ["node:Document", "node:Tag"] {
+        helpers::assert_stable_property_markers(&db, table).await;
+        assert_exact_id_primary_key(&db, table).await;
+    }
+    let document_fields = fields(&db, "node:Document").await;
+    let max_before = before_state["node:Document"]
+        .1
+        .iter()
+        .map(|(_, id, _)| *id)
+        .max()
+        .unwrap();
+    for added in ["summary", "thumb"] {
+        let (_, id, marker) = field(&document_fields, added);
+        assert!(*id > max_before, "{added} takes a fresh field id");
+        assert!(marker.is_some(), "{added} carries its property identity");
+    }
+    assert_eq!(
+        document_fields
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["__id", "content", "score", "summary", "thumb", "title"],
+        "the physical column order follows the catalog, which orders properties by name"
+    );
+
+    // Payloads read back unchanged; the added Blob reads as null.
+    for (title, expected) in [
+        ("inline", b"Inline".to_vec()),
+        ("packed", vec![b'p'; 96 * 1024]),
+        ("dedicated", vec![b'd'; 5 * 1024 * 1024]),
+        ("empty", Vec::new()),
+    ] {
+        let bytes = read_managed_blob_bytes(
+            &db,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", title, "content"),
+        )
+        .await;
+        assert!(bytes == expected, "{title}: payload changed");
+    }
+    for (title, property) in [("null", "content"), ("inline", "thumb")] {
+        let error = db
+            .read_blob_at(
+                ReadTarget::branch("main"),
+                node_blob_cell("Document", title, property),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, OmniError::Manifest(ref error) if error.kind == ManifestErrorKind::NotFound),
+            "{title}.{property} reads as null, got {error:?}"
+        );
+    }
+
+    // The pre-apply snapshot keeps its own shape and values.
+    let historical = db
+        .snapshot_at_graph_manifest_version(before.graph_manifest_version())
+        .await
+        .unwrap()
+        .open_dataset("node:Document")
+        .await
+        .unwrap();
+    let historical_names = historical
+        .schema()
+        .fields
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<Vec<_>>();
+    assert!(historical_names.contains(&"note".to_string()));
+    assert!(historical_names.contains(&"rank".to_string()));
+    assert!(!historical_names.contains(&"score".to_string()));
+    assert_eq!(
+        read_managed_blob_bytes(
+            &db,
+            ReadTarget::snapshot(before_snapshot),
+            node_blob_cell("Document", "packed", "content"),
+        )
+        .await,
+        vec![b'p'; 96 * 1024]
+    );
+
+    // Keyed writes, filtered queries and optimize work on the evolved tables.
+    db.load_jsonl(
+        &serde_json::json!({
+            "type": "Document",
+            "data": {"title": "new", "score": 6, "summary": "fresh", "thumb": "base64:VGh1bWI="},
+        })
+        .to_string(),
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let writes = r#"
+query set_summary($title: String, $summary: String) {
+    update Document set { summary: $summary } where title = $title
+}
+
+query set_strength($name: String, $strength: I32) {
+    update Tag set { strength: $strength } where name = $name
+}
+"#;
+    mutate_main(
+        &db,
+        writes,
+        "set_summary",
+        &params(&[("$title", "dedicated"), ("$summary", "big")]),
+    )
+    .await
+    .unwrap();
+    mutate_main(
+        &db,
+        writes,
+        "set_strength",
+        &mixed_params(&[("$name", "red")], &[("$strength", 8)]),
+    )
+    .await
+    .unwrap();
+    let reads = r#"
+query scored($min: I32) {
+    match {
+        $d: Document
+        $d.score >= $min
+    }
+    return { $d.title }
+}
+
+query summarized() {
+    match {
+        $d: Document
+        $d.summary != ""
+    }
+    return { $d.title }
+}
+
+query strong($min: I32) {
+    match {
+        $t: Tag
+        $t.strength >= $min
+    }
+    return { $t.name }
+}
+"#;
+    let scored = query_main(&db, reads, "scored", &int_params(&[("$min", 3)]))
+        .await
+        .unwrap();
+    assert_eq!(
+        first_column_sorted(&scored),
+        ["dedicated", "empty", "new", "null"]
+    );
+    let summarized = query_main(&db, reads, "summarized", &params(&[]))
+        .await
+        .unwrap();
+    assert_eq!(first_column_sorted(&summarized), ["dedicated", "new"]);
+    let strong = query_main(&db, reads, "strong", &int_params(&[("$min", 8)]))
+        .await
+        .unwrap();
+    assert_eq!(first_column_sorted(&strong), ["blue", "red"]);
+    assert_eq!(
+        read_managed_blob_bytes(
+            &db,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "new", "thumb"),
+        )
+        .await,
+        b"Thumb"
+    );
+    assert_eq!(
+        read_managed_blob_bytes(
+            &db,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "dedicated", "content"),
+        )
+        .await,
+        vec![b'd'; 5 * 1024 * 1024],
+        "an update carries the untouched Blob of an evolved row"
+    );
+
+    db.optimize().await.unwrap();
+    assert_eq!(
+        read_managed_blob_bytes(
+            &db,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "packed", "content"),
+        )
+        .await,
+        vec![b'p'; 96 * 1024]
+    );
+    let scored = query_main(&db, reads, "scored", &int_params(&[("$min", 3)]))
+        .await
+        .unwrap();
+    assert_eq!(
+        first_column_sorted(&scored),
+        ["dedicated", "empty", "new", "null"]
+    );
+    let exported = db
+        .export_jsonl("main", &["Document".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(exported.lines().count(), 6);
+    assert!(exported.contains("\"score\":3"), "{exported}");
+    assert!(!exported.contains("\"rank\"") && !exported.contains("\"note\""));
+}
+
+/// A ranged external Blob descriptor survives a schema change on its table:
+/// the column changes are metadata-only, so the stored descriptor is never
+/// rebuilt and cannot be widened to its whole object.
 #[tokio::test]
 #[cfg(feature = "failpoints")]
 #[serial_test::parallel]
-async fn schema_apply_rejects_ranged_external_blob_before_arm_or_effects() {
-    use helpers::recovery::{branch_head_commit_id, sidecar_operation_ids};
+async fn schema_apply_preserves_ranged_external_blob_across_column_changes() {
+    async fn assert_ranged(db: &Omnigraph, target: ReadTarget, property: &str) {
+        let read = db
+            .read_blob_at(target, node_blob_cell("Document", "ranged", property))
+            .await
+            .unwrap();
+        match read.content {
+            BlobContent::External(reference) => {
+                assert_eq!(reference.uri, "s3://bucket/object");
+                assert_eq!((reference.offset, reference.length), (4, Some(8)));
+            }
+            BlobContent::Managed { .. } => panic!("the ranged descriptor must stay external"),
+        }
+    }
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -1646,62 +2179,62 @@ node Document {
     content: Blob?
 }
 "#;
-    let desired = r#"
+    let added = r#"
 node Document {
     title: String @key
     content: Blob?
     note: String?
 }
 "#;
+    let renamed = r#"
+node Document {
+    title: String @key
+    body: Blob? @rename_from("content")
+}
+"#;
     let db = Omnigraph::init(uri, initial).await.unwrap();
-    let table_uri = helpers::seed_ranged_external_blob_row(&db, uri).await;
+    helpers::seed_ranged_external_blob_row(&db, uri).await;
+    let before = db.resolve_snapshot("main").await.unwrap();
+    let files_before = data_file_paths(&db, "node:Document").await;
 
-    let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let manifest_before = before.graph_manifest_version();
-    let table_before = before
-        .dataset("node:Document")
-        .unwrap()
-        .published_dataset_version;
-    let physical_head_before = lance::Dataset::open(&table_uri)
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let apply = |desired: &'static str| {
+        omnigraph::instrumentation::with_merge_write_probes(
+            probes.clone(),
+            db.apply_schema(desired),
+        )
+    };
+    assert!(apply(added).await.unwrap().applied);
+    assert_ranged(&db, ReadTarget::branch("main"), "content").await;
+    // The snapshot before the add reads the same cell under the same name.
+    assert_ranged(&db, ReadTarget::snapshot(before), "content").await;
+
+    assert!(apply(renamed).await.unwrap().applied);
+    assert_ranged(&db, ReadTarget::branch("main"), "body").await;
+
+    assert_eq!(probes.blob_payload_read_calls(), 0);
+    assert_eq!(probes.external_blob_payload_read_calls(), 0);
+    assert_eq!(data_file_paths(&db, "node:Document").await, files_before);
+}
+
+/// The data files of a table's pinned version, per fragment id.
+async fn data_file_paths(db: &Omnigraph, table_key: &str) -> Vec<(u64, Vec<String>)> {
+    helpers::open_pinned_dataset_for_test(db, "main", table_key)
         .await
-        .unwrap()
-        .version()
-        .version;
-    let lineage_before = branch_head_commit_id(dir.path(), "main").await.unwrap();
-    assert!(sidecar_operation_ids(dir.path()).is_empty());
-
-    let error = db.apply_schema(desired).await.unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("cannot preserve ranged external Blob descriptor"),
-        "unexpected schema-apply refusal: {error}"
-    );
-    let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    assert_eq!(after.graph_manifest_version(), manifest_before);
-    assert_eq!(
-        after
-            .dataset("node:Document")
-            .unwrap()
-            .published_dataset_version,
-        table_before
-    );
-    assert_eq!(
-        lance::Dataset::open(&table_uri)
-            .await
-            .unwrap()
-            .version()
-            .version,
-        physical_head_before
-    );
-    assert_eq!(
-        branch_head_commit_id(dir.path(), "main").await.unwrap(),
-        lineage_before
-    );
-    assert!(
-        sidecar_operation_ids(dir.path()).is_empty(),
-        "ranged descriptor refusal must occur before recovery arm"
-    );
+        .get_fragments()
+        .iter()
+        .map(|fragment| {
+            (
+                fragment.id() as u64,
+                fragment
+                    .metadata()
+                    .files
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -1905,6 +2438,61 @@ async fn apply_schema_rejects_adding_a_required_property_without_backfill() {
             .unwrap()
             .graph_manifest_version(),
         before_version
+    );
+}
+
+/// A new edge type with a non-zero `@card` minimum from an existing node type
+/// would leave every existing source node below the minimum, so apply refuses
+/// it before effects, like a required property. The same edge from a node type
+/// the apply adds is admitted, and the minimum holds from the first write.
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn apply_schema_rejects_a_card_minimum_edge_from_an_existing_node_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let before_version = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .graph_manifest_version();
+
+    let err = db
+        .apply_schema(&format!(
+            "{TEST_SCHEMA}\nedge Mentors: Person -> Person @card(1..)\n"
+        ))
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("OG-MF-107") && msg.contains("existing node type 'Person'"),
+        "expected schema-lint code OG-MF-107 in error, got: {msg}"
+    );
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .graph_manifest_version(),
+        before_version,
+        "the refused apply must not publish"
+    );
+
+    db.apply_schema(&format!(
+        "{TEST_SCHEMA}\nnode Team {{\n    name: String @key\n}}\n\
+         edge LedBy: Team -> Person @card(1..1)\n"
+    ))
+    .await
+    .expect("a @card minimum from a node type added in the same apply has no existing source");
+    let err = db
+        .load_jsonl(
+            r#"{"type":"Team","data":{"name":"core"}}"#,
+            LoadMode::Append,
+        )
+        .await
+        .expect_err("a Team written without its LedBy edge is below @card(1..1)");
+    assert!(
+        err.to_string()
+            .contains("@card violation on edge LedBy: source 'core' has 0 edges (min 1)"),
+        "got: {err}"
     );
 }
 
@@ -2445,7 +3033,10 @@ node Anchor { name: String @key }
 // lived) stays pinned by the older `__manifest` versions, so
 // `snapshot_at_graph_manifest_version(pre_drop)` still reads it. It becomes
 // unreachable once `omnigraph cleanup --keep 1` stops retaining those versions
-// and the collector reclaims its files.
+// and the collector reclaims its manifest. The dropped values stay in the
+// current data files until optimize rewrites them;
+// `maintenance.rs::optimize_then_cleanup_erases_dropped_property_values` owns
+// that erasure.
 
 #[tokio::test]
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
@@ -2461,7 +3052,7 @@ async fn apply_schema_property_drop_is_reclaimed_by_cleanup_not_apply() {
         .unwrap()
         .graph_manifest_version();
 
-    // Drop the `age` column. Apply rewrites the table without it.
+    // Drop the `age` column, a metadata-only change of the table.
     let desired = TEST_SCHEMA.replace("    age: I32?\n", "");
     let result = db.apply_schema(&desired).await.unwrap();
     assert!(result.applied);
@@ -2635,6 +3226,102 @@ async fn index_only_constraint_apply_touches_no_table_data() {
     );
 }
 
+// A full-text call answers with the index's analyzer at every schema apply.
+// Lance applies the analyzer only through a segment of the index; with none,
+// its flat path tokenizes bare, so "deep" misses "Deep Learning". Declaring a
+// full-text `@index` on a populated table, and adding a full-text property,
+// each publish an untrained segment that carries the analyzer; an evolution
+// keeps the segment of a column it keeps or renames, and `ensure_indices`
+// later builds the postings.
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn full_text_analyzer_survives_schema_evolution_issue_904() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let v1 = "node Doc {\n    slug: String @key\n    body: String\n}\n";
+    let db = helpers::session(Omnigraph::init(uri, v1).await.unwrap());
+    db.load_jsonl(
+        r#"{"type":"Doc","data":{"slug":"d1","body":"Deep Learning"}}
+{"type":"Doc","data":{"slug":"d2","body":"deep dive"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let search = |column: &'static str| {
+        let db = &db;
+        async move {
+            let source = format!(
+                "query docs($q: String) {{ match {{ $d: Doc search($d.{column}, $q) }} return {{ $d.slug }} }}"
+            );
+            first_column_sorted(
+                &query_main(db, &source, "docs", &params(&[("q", "deep")]))
+                    .await
+                    .unwrap(),
+            )
+        }
+    };
+    let segments = |column: &'static str| {
+        let db = &db;
+        async move {
+            let ds = open_pinned_dataset_for_test(db, "main", "node:Doc").await;
+            let field = ds.schema().field(column).unwrap().id;
+            ds.load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|index| index.fields.contains(&field))
+                .map(|index| index.fragment_bitmap.as_ref().map(|bitmap| bitmap.len()))
+                .collect::<Vec<_>>()
+        }
+    };
+
+    // Declaring the full-text index publishes its analyzer with the contract.
+    let declared = "node Doc {\n    slug: String @key\n    body: String @index\n}\n";
+    let before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .dataset("node:Doc")
+        .unwrap()
+        .published_dataset_version;
+    assert!(db.apply_schema(declared).await.unwrap().applied);
+    let after = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .dataset("node:Doc")
+        .unwrap()
+        .published_dataset_version;
+    assert_eq!(after, before + 1, "the declaration is a table effect");
+    assert_eq!(
+        segments("body").await,
+        [Some(0)],
+        "one untrained segment: the analyzer without postings"
+    );
+    assert_eq!(search("body").await, ["d1", "d2"]);
+
+    // Renaming the column keeps its segment (no second declaration), and an
+    // added full-text property gets its own.
+    let evolved = "node Doc {\n    slug: String @key\n    text: String @rename_from(\"body\") @index\n    summary: String? @index\n}\n";
+    assert!(db.apply_schema(evolved).await.unwrap().applied);
+    assert_eq!(segments("text").await, [Some(0)]);
+    assert_eq!(segments("summary").await, [Some(0)]);
+    assert_eq!(search("text").await, ["d1", "d2"]);
+    db.load_jsonl(
+        r#"{"type":"Doc","data":{"slug":"d3","text":"Shallow","summary":"Deep Learning"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    assert_eq!(search("summary").await, ["d3"]);
+
+    // The reconciler builds the postings over the declarations.
+    db.ensure_indices().await.unwrap();
+    assert_eq!(segments("text").await, [Some(2)]);
+    assert_eq!(search("text").await, ["d1", "d2"]);
+    assert_eq!(search("summary").await, ["d3"]);
+}
+
 // Enum widening (iss-enum-widening-migration): adding variants to an enum is
 // a PURE metadata change — the accepted catalog updates, no table data is
 // touched, and the widened set is enforced immediately on writes. Narrowing
@@ -2795,8 +3482,8 @@ async fn schema_settlement_fences_only_the_original_candidate_and_repeats_its_ow
                 None,
             ) => {
                 assert_eq!(
-                    Some(commit.graph_commit_id.as_str()),
-                    fence.graph_commit_id()
+                    intent_nonce(&commit.graph_commit_id).unwrap(),
+                    fence.graph_commit_id().unwrap()
                 );
                 assert_eq!(
                     commit.graph_manifest_version,
@@ -3074,4 +3761,468 @@ async fn prepared_schema_numeric_fence_rejects_metadata_interposed_after_effects
             proof: SchemaNonPublicationProof::Occupied { .. }
         }
     ));
+}
+
+// Issue #721: a nullable property that every row now fills can be promoted to
+// required and unique without rebuilding the graph. Promotion must refuse,
+// leaving the accepted schema in force, while a null or a duplicate remains.
+const ISSUE_721_V1: &str = "node Decision {\n    slug: String @key\n    ref: String?\n}\n";
+const ISSUE_721_V2: &str = "node Decision {\n    slug: String @key\n    ref: String @unique\n}\n";
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn issue_721_backfilled_nullable_property_promotes_to_required_unique() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
+    db.load_jsonl(
+        "{\"type\":\"Decision\",\"data\":{\"slug\":\"a\",\"ref\":\"D-1\"}}\n\
+         {\"type\":\"Decision\",\"data\":{\"slug\":\"b\",\"ref\":\"D-2\"}}",
+        LoadMode::Merge,
+    )
+    .await
+    .expect("backfilled rows load");
+
+    let result = db
+        .apply_schema(ISSUE_721_V2)
+        .await
+        .expect("promotion of a fully backfilled, distinct property must apply");
+    assert!(result.supported && result.applied);
+
+    db.load_jsonl(
+        r#"{"type":"Decision","data":{"slug":"c"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect_err("a missing required value must be rejected after promotion");
+    db.load_jsonl(
+        r#"{"type":"Decision","data":{"slug":"d","ref":"D-1"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect_err("a duplicate unique value must be rejected after promotion");
+    db.load_jsonl(
+        r#"{"type":"Decision","data":{"slug":"e","ref":"D-3"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("a distinct value is accepted");
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn issue_721_promotion_refuses_while_a_null_or_duplicate_remains() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
+    db.load_jsonl(
+        "{\"type\":\"Decision\",\"data\":{\"slug\":\"a\",\"ref\":\"D-1\"}}\n\
+         {\"type\":\"Decision\",\"data\":{\"slug\":\"b\"}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let error = db
+        .apply_schema(ISSUE_721_V2)
+        .await
+        .expect_err("a null remains");
+    assert!(
+        error.to_string().contains("Decision")
+            && error.to_string().contains("'ref'")
+            && error.to_string().contains("OG-MF-104"),
+        "{error}"
+    );
+
+    db.load_jsonl(
+        "{\"type\":\"Decision\",\"data\":{\"slug\":\"b\",\"ref\":\"D-1\"}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let error = db
+        .apply_schema(ISSUE_721_V2)
+        .await
+        .expect_err("a duplicate remains");
+    assert!(
+        error.to_string().contains("OG-MF-108") && error.to_string().contains("D-1"),
+        "{error}"
+    );
+
+    // The previous schema stays usable: a null is still accepted.
+    db.load_jsonl(
+        r#"{"type":"Decision","data":{"slug":"z"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("failed validation leaves the accepted schema in force");
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn issue_721_promoted_table_still_evolves_and_reopens() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
+    db.load_jsonl(
+        r#"{"type":"Decision","data":{"slug":"a","ref":"D-1"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.apply_schema(ISSUE_721_V2)
+        .await
+        .expect("promotion applies");
+
+    // A later, unrelated change to the same table still plans and applies.
+    let v3 =
+        "node Decision {\n    slug: String @key\n    ref: String @unique\n    note: String?\n}\n";
+    db.apply_schema(v3)
+        .await
+        .expect("a later schema change applies");
+
+    // A fresh handle reads the promoted schema and keeps enforcing it.
+    let reopened = helpers::session(Omnigraph::open(uri).await.unwrap());
+    reopened
+        .load_jsonl(
+            r#"{"type":"Decision","data":{"slug":"c","note":"n"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .expect_err("a reopened graph still requires ref");
+    reopened
+        .load_jsonl(
+            r#"{"type":"Decision","data":{"slug":"d","ref":"D-9","note":"n"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .expect("a complete row loads");
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn issue_721_promotion_tightens_the_lance_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
+    db.load_jsonl(
+        r#"{"type":"Decision","data":{"slug":"a","ref":"D-1"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert!(
+        before
+            .open_dataset("node:Decision")
+            .await
+            .unwrap()
+            .schema()
+            .field("ref")
+            .unwrap()
+            .nullable
+    );
+
+    db.apply_schema(ISSUE_721_V2)
+        .await
+        .expect("promotion applies");
+
+    let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let dataset = after.open_dataset("node:Decision").await.unwrap();
+    assert!(
+        !dataset.schema().field("ref").unwrap().nullable,
+        "the Lance column is required after promotion"
+    );
+    assert_eq!(
+        after
+            .dataset("node:Decision")
+            .unwrap()
+            .published_dataset_version,
+        before
+            .dataset("node:Decision")
+            .unwrap()
+            .published_dataset_version
+            + 1,
+        "the tightening is one table commit"
+    );
+}
+
+/// Every value of `column` in `table` at main's head, deleted rows included,
+/// as `(deleted, is_null)`.
+async fn issue_721_physical_values(
+    db: &Omnigraph,
+    uri: &str,
+    table: &str,
+    column: &str,
+) -> Vec<(bool, bool)> {
+    use arrow_array::Array;
+    use futures::TryStreamExt;
+    // The snapshot API hides deleted rows, so read the pinned Lance version.
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let entry = snapshot.dataset(table).unwrap().clone();
+    let dataset = lance::Dataset::open(&format!("{uri}/{}", entry.dataset_path))
+        .await
+        .unwrap()
+        .checkout_version(entry.version_metadata.staged_version().unwrap())
+        .await
+        .unwrap();
+    let mut scanner = dataset.scan();
+    scanner.project(&[column]).unwrap();
+    scanner.with_row_id().include_deleted_rows();
+    let batches: Vec<_> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut values = Vec::new();
+    for batch in batches {
+        let row_ids = batch.column_by_name("_rowid").unwrap();
+        let column = batch.column_by_name(column).unwrap();
+        for row in 0..batch.num_rows() {
+            values.push((row_ids.is_null(row), column.is_null(row)));
+        }
+    }
+    values
+}
+
+// A deleted row keeps its null in the data file. Promotion rewrites the
+// fragments holding one, deletions materialized, before tightening the
+// column, whatever share of the fragment is deleted: half of it here, and 1
+// of 61 rows, below Lance's 10% `materialize_deletions_threshold`, which
+// `optimize` would leave in place. A later schema change, optimize and write
+// also succeed.
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn issue_721_deleted_null_row_is_purged_by_promotion() {
+    for filled in [1usize, 60] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
+        let mut rows = (0..filled)
+            .map(|i| format!(r#"{{"type":"Decision","data":{{"slug":"s{i}","ref":"D-{i}"}}}}"#))
+            .collect::<Vec<_>>();
+        rows.push(r#"{"type":"Decision","data":{"slug":"gone"}}"#.to_string());
+        db.load_jsonl(&rows.join("\n"), LoadMode::Merge)
+            .await
+            .unwrap();
+        mutate_main(
+            &db,
+            "query rm($slug: String) { delete Decision where slug = $slug }",
+            "rm",
+            &params(&[("slug", "gone")]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            issue_721_physical_values(&db, uri, "node:Decision", "ref")
+                .await
+                .contains(&(true, true)),
+            "the deleted row still holds its null before promotion ({filled} filled)"
+        );
+        let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+
+        db.apply_schema(ISSUE_721_V2)
+            .await
+            .unwrap_or_else(|error| panic!("promotion applies ({filled} filled): {error}"));
+
+        let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+        let values = issue_721_physical_values(&db, uri, "node:Decision", "ref").await;
+        assert_eq!(
+            values.len(),
+            filled,
+            "only live rows remain ({filled} filled)"
+        );
+        assert!(values.iter().all(|(_, null)| !null), "no null is stored");
+        assert!(
+            !after
+                .open_dataset("node:Decision")
+                .await
+                .unwrap()
+                .schema()
+                .field("ref")
+                .unwrap()
+                .nullable
+        );
+        assert_eq!(
+            after
+                .dataset("node:Decision")
+                .unwrap()
+                .published_dataset_version,
+            before
+                .dataset("node:Decision")
+                .unwrap()
+                .published_dataset_version
+                + 1,
+            "the rewrite and the tightening publish once"
+        );
+        let v3 = "node Decision {\n    slug: String @key\n    ref: String @unique\n    note: String?\n}\n";
+        db.apply_schema(v3)
+            .await
+            .expect("a later column addition applies");
+        db.optimize().await.expect("optimize succeeds");
+        db.load_jsonl(
+            r#"{"type":"Decision","data":{"slug":"d","ref":"D-new","note":"n"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .expect("a write after the later change succeeds");
+    }
+}
+
+// A promotion in the same apply as a rename of its property reads the stored
+// column under its old name: required and @unique both apply, a null or a
+// duplicate under the old name still refuses, and the renamed property keeps
+// enforcing both rules.
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn issue_721_promotion_with_a_rename_in_the_same_apply() {
+    let renamed = "node Decision {\n    slug: String @key\n    code: String @unique @rename_from(\"ref\")\n}\n";
+    for (rows, refusal) in [
+        (
+            "{\"type\":\"Decision\",\"data\":{\"slug\":\"a\",\"ref\":\"D-1\"}}\n\
+             {\"type\":\"Decision\",\"data\":{\"slug\":\"b\"}}",
+            Some("OG-MF-104"),
+        ),
+        (
+            "{\"type\":\"Decision\",\"data\":{\"slug\":\"a\",\"ref\":\"D-1\"}}\n\
+             {\"type\":\"Decision\",\"data\":{\"slug\":\"b\",\"ref\":\"D-1\"}}",
+            Some("OG-MF-108"),
+        ),
+        (
+            "{\"type\":\"Decision\",\"data\":{\"slug\":\"a\",\"ref\":\"D-1\"}}\n\
+             {\"type\":\"Decision\",\"data\":{\"slug\":\"b\",\"ref\":\"D-2\"}}",
+            None,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
+        db.load_jsonl(rows, LoadMode::Merge).await.unwrap();
+        let plan = db.plan_schema(renamed).await.unwrap();
+        assert!(plan.supported, "{plan:?}");
+        match refusal {
+            Some(code) => {
+                let error = db
+                    .apply_schema(renamed)
+                    .await
+                    .expect_err("a row breaks a rule");
+                assert!(error.to_string().contains(code), "{error}");
+                assert!(!error.to_string().contains("No field named"), "{error}");
+            }
+            None => {
+                db.apply_schema(renamed)
+                    .await
+                    .expect("the renamed promotion applies");
+                db.load_jsonl(
+                    r#"{"type":"Decision","data":{"slug":"c"}}"#,
+                    LoadMode::Merge,
+                )
+                .await
+                .expect_err("code is required");
+                db.load_jsonl(
+                    r#"{"type":"Decision","data":{"slug":"c","code":"D-2"}}"#,
+                    LoadMode::Merge,
+                )
+                .await
+                .expect_err("code is unique");
+                db.load_jsonl(
+                    r#"{"type":"Decision","data":{"slug":"c","code":"D-3"}}"#,
+                    LoadMode::Merge,
+                )
+                .await
+                .expect("a distinct code loads");
+            }
+        }
+    }
+}
+
+// A `@unique` that names a property the same apply adds has no stored column
+// to read: every stored row reads null there, and a key with a null part is
+// exempt, so it holds by construction. The apply must succeed on a populated
+// and on an empty table, at property and at type level, and enforce the rule
+// afterwards, never fail inside the row scan with `No field named`.
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn issue_721_unique_on_a_property_added_in_the_same_apply() {
+    let property_level =
+        "node Decision {\n    slug: String @key\n    ref: String?\n    code: String? @unique\n}\n";
+    let type_level = "node Decision {\n    slug: String @key\n    ref: String?\n    code: String?\n    @unique(ref, code)\n}\n";
+    let populated = "{\"type\":\"Decision\",\"data\":{\"slug\":\"a\",\"ref\":\"D-1\"}}\n\
+                     {\"type\":\"Decision\",\"data\":{\"slug\":\"b\",\"ref\":\"D-1\"}}";
+    for (desired, rows) in [
+        (property_level, Some(populated)),
+        (type_level, Some(populated)),
+        (property_level, None),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
+        if let Some(rows) = rows {
+            db.load_jsonl(rows, LoadMode::Merge).await.unwrap();
+        }
+        let plan = db.plan_schema(desired).await.unwrap();
+        assert!(plan.supported, "{plan:?}");
+        let result = db
+            .apply_schema(desired)
+            .await
+            .unwrap_or_else(|error| panic!("{desired}: {error}"));
+        assert!(result.supported && result.applied);
+
+        db.load_jsonl(
+            r#"{"type":"Decision","data":{"slug":"c","ref":"D-1","code":"X"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .expect("a first code loads");
+        db.load_jsonl(
+            r#"{"type":"Decision","data":{"slug":"d","ref":"D-1","code":"X"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .expect_err("the new @unique rejects a duplicate key");
+    }
+}
+
+// An edge property promotes too: refused while an edge holds a null, applied
+// once every edge is backfilled, and a null edge write is refused afterwards.
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn issue_721_edge_property_promotes_to_required() {
+    let v1 = "node P {\n    slug: String @key\n}\nedge Cites: P -> P {\n    why: String?\n}\n";
+    let v2 = "node P {\n    slug: String @key\n}\nedge Cites: P -> P {\n    why: String\n}\n";
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = helpers::session(Omnigraph::init(uri, v1).await.unwrap());
+    db.load_jsonl(
+        "{\"type\":\"P\",\"data\":{\"slug\":\"a\"}}\n\
+         {\"type\":\"P\",\"data\":{\"slug\":\"b\"}}\n\
+         {\"edge\":\"Cites\",\"from\":\"a\",\"to\":\"b\",\"data\":{}}",
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    let error = db.apply_schema(v2).await.expect_err("an edge holds a null");
+    assert!(error.to_string().contains("OG-MF-104"), "{error}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = helpers::session(Omnigraph::init(uri, v1).await.unwrap());
+    db.load_jsonl(
+        "{\"type\":\"P\",\"data\":{\"slug\":\"a\"}}\n\
+         {\"type\":\"P\",\"data\":{\"slug\":\"b\"}}\n\
+         {\"edge\":\"Cites\",\"from\":\"a\",\"to\":\"b\",\"data\":{\"why\":\"x\"}}",
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    db.apply_schema(v2)
+        .await
+        .expect("a backfilled edge property promotes");
+    db.load_jsonl(
+        "{\"edge\":\"Cites\",\"from\":\"b\",\"to\":\"a\",\"data\":{}}",
+        LoadMode::Append,
+    )
+    .await
+    .expect_err("an edge without why is refused");
 }

@@ -1,0 +1,44 @@
+# issue: none
+# notes: The tiny insert as an unattached branch root (`as unattached branch`): the new row is read at
+# notes: the snapshot, `main` is read to show its head did not move, and the snapshot is dropped for cleanup.
+# notes: Each repetition restores the fixture in a fresh worker.
+
+--- runner
+timeout_ms: 600000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- mutate
+query add() as unattached branch { insert Item { key: "c", val: 3 } }
+--- expect affected: nodes=1 edges=0
+--- bind commit $m
+
+--- query snapshot: $m
+query items_at_snapshot() {
+    match { $i: Item }
+    return { $i.key as key, $i.val as val }
+}
+--- expect unordered
+{"key":"a","val":1}
+{"key":"b","val":2}
+{"key":"c","val":3}
+--- expect shape
+key: String
+val: I64
+
+--- query branch: main
+query items_on_main() {
+    match { $i: Item }
+    return { $i.key as key, $i.val as val }
+}
+--- expect unordered
+{"key":"a","val":1}
+{"key":"b","val":2}
+--- expect shape
+key: String
+val: I64
+
+--- mutate
+commit drop "${m}"
+--- expect ok

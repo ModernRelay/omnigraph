@@ -1,17 +1,25 @@
-//! Durable offline schema/query deployments in the existing cluster ledger.
+//! Durable graph lifecycle and runtime configuration in the cluster ledger.
 //!
 //! Graph publication remains engine authority. This module stores immutable
 //! input and the engine's exact outcomes; it never reconstructs a receipt from
 //! schema-text equality or replays an interrupted schema invocation.
 
 use super::*;
-use omnigraph::db::{PreparedSchemaApply, PreparedSchemaSettlement, SchemaApplySettlement};
+use omnigraph::db::{
+    GraphCreateReconciliation, PreparedGraphCreate, PreparedSchemaApply, PreparedSchemaSettlement,
+    SchemaApplySettlement,
+};
 
 mod execution;
 pub use execution::*;
+mod bootstrap;
+pub use bootstrap::{
+    BootstrapServingReceipt, MAX_BOOTSTRAP_SERVING_RECEIPT_BYTES, bootstrap_serving,
+    claim_bootstrap_serving,
+};
 
 pub(crate) const MAX_LEDGER_BYTES: usize = 16 * 1024 * 1024;
-pub(crate) const MAX_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_RESULT_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_RESULTS_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_RESULTS: usize = 32;
@@ -19,14 +27,25 @@ pub(crate) const MAX_RESOURCES: usize = 4096;
 pub(crate) const MAX_DIAGNOSTIC_BYTES: usize = 4096;
 pub(crate) const GRAPH_COMPLETION_RESERVE_BYTES: usize = 8192;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum DeploymentMode {
-    Offline,
+/// Exact v2 first-initialization base, shared by planning and execution.
+pub(crate) fn pristine_bootstrap_state(state: &ClusterState) -> bool {
+    state.version == 2
+        && state.state_revision == 1
+        && state.next_sequence == Some(1)
+        && state.outstanding.is_none()
+        && state.deployment_results.as_ref().is_some_and(Vec::is_empty)
+        && state.applied_revision.result_revision == Some(0)
+        && state
+            .applied_revision
+            .schema_contracts
+            .as_ref()
+            .is_some_and(BTreeMap::is_empty)
+        && state.applied_revision.config_digest.is_none()
+        && state.applied_revision.resources.is_empty()
 }
 
-/// The caller still owns authentication. A stored authority record never
-/// grants permission to invoke an effect or disclose an earlier result.
+/// The caller still owns authentication. Stored authority never grants effect
+/// permission; an authenticated initiating actor may read its exact receipt.
 #[derive(Debug, Clone)]
 pub enum DeploymentCaller {
     StorageOwner { actor: Option<String> },
@@ -101,14 +120,41 @@ pub(crate) struct DeploymentAuthorization {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DeploymentBundle {
-    pub version: u32,
-    pub canonical_root: String,
-    pub config_digest: String,
-    pub config_semantics: String,
-    pub resources: BTreeMap<String, StateResource>,
-    pub sources: BTreeMap<String, String>,
+pub struct CapturedDeployment {
+    pub(crate) version: u32,
+    pub(crate) canonical_root: String,
+    pub(crate) config_digest: String,
+    pub(crate) config_semantics: String,
+    pub(crate) resources: BTreeMap<String, StateResource>,
+    pub(crate) sources: BTreeMap<String, String>,
 }
+
+/// Frozen, bounded source input. The server never opens caller-supplied paths.
+impl CapturedDeployment {
+    pub fn canonical_root(&self) -> &str {
+        &self.canonical_root
+    }
+    pub fn config_digest(&self) -> &str {
+        &self.config_digest
+    }
+    /// Immutable input identity used by the ledger and deployment receipts.
+    pub fn input_digest(&self) -> Result<String, Diagnostic> {
+        serde_json::to_vec(self)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|error| refusal("deployment_encode", error.to_string()))
+    }
+    pub fn graph_ids(&self) -> Vec<String> {
+        self.resources
+            .keys()
+            .filter_map(|address| match resource_kind(address) {
+                ResourceKind::Graph(graph) => Some(graph),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+pub(crate) type DeploymentBundle = CapturedDeployment;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -124,11 +170,24 @@ pub(crate) struct OutstandingDeployment {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GraphDeployment {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create: Option<PreparedGraphCreate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete: Option<GraphDeletion>,
     pub intent: Option<PreparedSchemaApply>,
     pub observed_manifest_version: u64,
     pub state: GraphDeploymentState,
     pub settlement: Option<PreparedSchemaSettlement>,
     pub recovery_executor: Option<DeploymentAuthority>,
+}
+
+/// Exact managed root accepted for deletion. This authority survives a partial
+/// purge, when opening a graph manifest is no longer possible.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GraphDeletion {
+    pub root: String,
+    pub contract: omnigraph::db::SchemaContractDigest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +201,13 @@ pub(crate) enum GraphDeploymentState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GraphDeploymentResult {
+    Deleted {
+        contract: omnigraph::db::SchemaContractDigest,
+    },
+    Created {
+        graph_manifest_version: u64,
+        contract: omnigraph::db::SchemaContractDigest,
+    },
     Schema {
         result: SchemaApplySettlement,
     },
@@ -163,6 +229,8 @@ impl GraphDeploymentResult {
                 result: SchemaApplySettlement::Committed { .. }
                     | SchemaApplySettlement::NoOp { .. }
             } | Self::QueryOnly { .. }
+                | Self::Created { .. }
+                | Self::Deleted { .. }
         )
     }
 
@@ -188,11 +256,10 @@ pub struct DeploymentResult {
     pub graphs: BTreeMap<String, GraphDeploymentResult>,
     pub recovery_executors: BTreeMap<String, DeploymentAuthority>,
     pub converged: bool,
-    pub restart_required: bool,
 }
 
 /// A bounded snapshot. Lookup never opens a graph or resumes execution.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentStatus {
     pub canonical_root: String,
     pub ledger_id: String,
@@ -204,11 +271,23 @@ pub struct DeploymentStatus {
     pub lookup: Option<DeploymentLookup>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+impl DeploymentStatus {
+    /// Allocate a fresh client-known identity before submission. This does not
+    /// reserve the sequence; stale concurrent submissions are refused.
+    pub fn next_deployment_id(&self) -> String {
+        format!("{}:{}:{}", self.ledger_id, self.next_sequence, Ulid::new())
+    }
+}
+
+// Bounded control responses deliberately own their result without a second
+// heap allocation; this is not a per-row or hot query representation.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DeploymentLookup {
     Outstanding {
         id: String,
+        input_digest: String,
         graphs: BTreeMap<String, String>,
     },
     Complete {
@@ -218,8 +297,8 @@ pub enum DeploymentLookup {
     /// The sequence was consumed, but the requested nonce's acceptance and
     /// outcome can no longer be established. This is never retry permission.
     ResultExpired {
-        acceptance: &'static str,
-        outcome: &'static str,
+        acceptance: String,
+        outcome: String,
     },
     NotRecorded,
     DifferentLedger,
@@ -229,6 +308,10 @@ pub enum DeploymentLookup {
 struct DeploymentId {
     ledger: String,
     sequence: u64,
+}
+
+fn canonical_ulid(part: &str) -> bool {
+    part.parse::<Ulid>().is_ok_and(|id| id.to_string() == part)
 }
 
 impl DeploymentId {
@@ -248,8 +331,6 @@ impl DeploymentId {
                 "invalid deployment identity",
             ));
         };
-        let canonical_ulid =
-            |part: &str| part.parse::<Ulid>().is_ok_and(|id| id.to_string() == part);
         let parsed_sequence = sequence
             .parse::<u64>()
             .ok()
@@ -267,7 +348,7 @@ impl DeploymentId {
     }
 }
 
-fn refusal(code: &str, message: impl Into<String>) -> Diagnostic {
+pub(crate) fn refusal(code: &str, message: impl Into<String>) -> Diagnostic {
     let mut message = message.into();
     const SUFFIX: &str = " [truncated]";
     if message.len() > MAX_DIAGNOSTIC_BYTES {
@@ -349,17 +430,21 @@ fn valid_contracts(
         && contracts.iter().all(|(graph, contract)| {
             graphs.contains(graph.as_str())
                 && resources.get(&schema_address(graph)) == Some(&contract.source_hash)
-                && authorization::valid_digest(&contract.source_hash)
-                && contract
-                    .schema_ir_hash
-                    .strip_prefix("sha256:")
-                    .is_some_and(authorization::valid_digest)
-                && contract
-                    .schema_identity_domain
-                    .parse::<Ulid>()
-                    .is_ok_and(|id| id.to_string() == contract.schema_identity_domain)
-                && contract.schema_identity_version == 2
+                && valid_contract(contract)
         })
+}
+
+fn valid_contract(contract: &omnigraph::db::SchemaContractDigest) -> bool {
+    authorization::valid_digest(&contract.source_hash)
+        && contract
+            .schema_ir_hash
+            .strip_prefix("sha256:")
+            .is_some_and(authorization::valid_digest)
+        && contract
+            .schema_identity_domain
+            .parse::<Ulid>()
+            .is_ok_and(|id| id.to_string() == contract.schema_identity_domain)
+        && contract.schema_identity_version == 2
 }
 
 fn validate_projection(state: &ClusterState) -> Result<(), Diagnostic> {
@@ -406,6 +491,8 @@ fn validate_projection(state: &ClusterState) -> Result<(), Diagnostic> {
                         || bindings.len() > MAX_RESOURCES
                         || bindings.iter().any(|binding| {
                             binding != "cluster"
+                                && binding.strip_prefix("graph.")
+                                    != Some(omnigraph_compiler::CATALOGUE_SCOPE)
                                 && (!matches!(resource_kind(binding), ResourceKind::Graph(_))
                                     || !resources.contains_key(binding))
                         })
@@ -440,8 +527,7 @@ fn validate_projection(state: &ClusterState) -> Result<(), Diagnostic> {
 
 pub(crate) fn validate_state(state: &ClusterState) -> Result<(), Diagnostic> {
     if state.version == 1 {
-        if state.mode.is_some()
-            || state.ledger_id.is_some()
+        if state.ledger_id.is_some()
             || state.next_sequence.is_some()
             || state.outstanding.is_some()
             || state.deployment_results.is_some()
@@ -455,10 +541,10 @@ pub(crate) fn validate_state(state: &ClusterState) -> Result<(), Diagnostic> {
         }
         return Ok(());
     }
-    if state.version != 2 || state.mode != Some(DeploymentMode::Offline) {
+    if state.version != 2 {
         return Err(refusal(
             "unsupported_state_version",
-            "only ledger v1 and offline v2 are supported",
+            "only operational ledger v2 is supported; v1 must be explicitly migrated",
         ));
     }
     let ledger_id = state
@@ -535,12 +621,20 @@ pub(crate) fn validate_state(state: &ClusterState) -> Result<(), Diagnostic> {
                 })
                 .sum::<usize>()
                 > MAX_DIAGNOSTIC_BYTES
-            || result.graphs.values().any(|outcome| match outcome {
+            || result.graphs.iter().any(|(graph, outcome)| match outcome {
                 GraphDeploymentResult::Refused { code } => {
                     code.len() > 128
                         || !code
                             .bytes()
                             .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+                }
+                GraphDeploymentResult::Created {
+                    graph_manifest_version,
+                    contract,
+                } => *graph_manifest_version == 0 || !valid_contract(contract),
+                GraphDeploymentResult::Deleted { contract } => {
+                    !valid_contract(contract)
+                        || result.base.schema_contracts.get(graph) != Some(contract)
                 }
                 GraphDeploymentResult::QueryOnly {
                     graph_manifest_version,
@@ -607,16 +701,34 @@ pub(crate) fn validate_state(state: &ClusterState) -> Result<(), Diagnostic> {
             })
             || pending.graphs.iter().any(|(graph, entry)| {
                 !valid_resource_name(graph)
-                    || !state
-                        .applied_revision
-                        .resources
-                        .contains_key(&graph_address(graph))
-                    || entry.observed_manifest_version == 0
+                    || (entry.create.is_none()
+                        && !state
+                            .applied_revision
+                            .resources
+                            .contains_key(&graph_address(graph)))
+                    || entry
+                        .create
+                        .as_ref()
+                        .is_some_and(|create| create.validate().is_err())
+                    || (entry.create.is_some()
+                        && (entry.intent.is_some() || entry.delete.is_some() || entry.observed_manifest_version != 0))
+                    || (entry.create.is_none() && entry.delete.is_none() && entry.observed_manifest_version == 0)
+                    || entry.delete.as_ref().is_some_and(|delete| {
+                        !valid_contract(&delete.contract)
+                            || delete.root.len() > 4096 || !delete.root.ends_with(&format!("/graphs/{graph}.omni"))
+                            || pending.authorization.base.schema_contracts.get(graph) != Some(&delete.contract)
+                            || entry.intent.is_some()
+                            || entry.settlement.is_some()
+                            || matches!(&entry.state, GraphDeploymentState::Settled { result } if !matches!(result.as_ref(), GraphDeploymentResult::Deleted { contract } if contract == &delete.contract))
+                    })
+                    || (entry.delete.is_none() && matches!(&entry.state, GraphDeploymentState::Settled { result } if matches!(result.as_ref(), GraphDeploymentResult::Deleted { .. })))
                     || entry.intent.as_ref().is_some_and(|intent| {
                         intent.actor() != pending.authorization.authority.actor.as_deref()
                             || intent.base_manifest_version() != entry.observed_manifest_version
                     })
                     || (entry.intent.is_none()
+                        && entry.create.is_none()
+                        && entry.delete.is_none()
                         && (entry.settlement.is_some()
                             || matches!(entry.state, GraphDeploymentState::Started)))
                     || entry
@@ -635,3 +747,6 @@ pub(crate) fn validate_state(state: &ClusterState) -> Result<(), Diagnostic> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

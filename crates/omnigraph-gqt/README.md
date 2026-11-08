@@ -12,11 +12,32 @@ selects an engine.
 The format contract and future extensions live in
 [RFC 0045](../../docs/rfcs/0045-gq-logic-tests.md).
 
+## Slow cases
+
+A case too slow for the complete corpus lives under `cases_slow/`, beside
+`cases/`, with the same subdirectories. The author decides: nothing measures a
+case and moves it. Put a case there when it needs seconds of engine work on
+its own, because the complete corpus runs four cases at once on the CI runner
+and each has ten seconds of wall time. `cargo test` never runs `cases_slow/`;
+the `GQT slow nightly` workflow runs it on main once a night, one case at a
+time, and a case there may declare `timeout_ms` above 10000. Run it locally
+with the binary:
+
+```bash
+cargo run --bin omnigraph-gqt -- cases_slow
+```
+
+A slow case is not a pull request's regression test: the fix regression gate
+counts only cases under `cases/`.
+
 ## Explicit execution
 
-Every case starts with its existing issue header, followed by required runner,
-schema and seed sections. Configuration has no default target, storage, seed
-or timeout:
+Every case starts with its issue header and a required runner section.
+Schema and seed sections are optional together; without them, embedded execution
+requires `--store <URI>` and served execution uses the selected server graph
+without schema validation or seed loading. A case may have zero steps, including
+a dataset containing only schema and seed. Configuration has no default target,
+storage, seed or timeout:
 
 ```yaml
 --- runner
@@ -29,11 +50,68 @@ environments:
     seeds: [0, 42]
 ```
 
-The complete scenario executes against a fresh graph for each environment.
-These two target/storage combinations are implemented. Direct engine execution
-currently refuses seams. Server targets, direct-engine memory storage, cloud
-storage and other combinations fail admission explicitly; their names do not
-imply implementation or qualification.
+With schema and seed, the complete scenario executes against a fresh graph
+for each environment. These two target/storage combinations are implemented.
+With `--store`, direct engine execution opens an existing `file://`, `s3://`
+or `az://` root matching the declared `local-filesystem`, `s3-compatible` or
+`azure-blob-storage` backend. It skips initialization, seed loading and
+automatic index building; ordinary steps may change the supplied store, and
+seams and concurrent blocks are refused there. An `omnigraph-engine-dst`
+environment takes `--store` with a `file://` root instead: the in-memory
+environment reads through to the root below the measure ledger and the seams
+(both the Lance store and the engine's control adapter), so a read of an
+object the root holds is one counted request and nothing is copied; the graph
+is opened there, and the case's steps, seams and concurrent blocks run on that
+view. Every write of the run stays in memory, and a delete masks the root's
+object for the rest of the run: the root is never written, since the store
+that reads it has no write path. A symlink anywhere under the root refuses
+the run by name, so nothing outside the root is ever read; a foreign file
+(a stray dotfile, say) is ignored. Each run of the replay pair starts from the
+root again, and the report's observations name the root; a saved report of
+such a run still does not replay, since the root is not frozen by the report.
+`--store` refuses files with schema and seed and server targets everywhere.
+Direct-engine memory storage and cloud fixture initialization fail admission
+explicitly.
+
+With `--server <URL> --graph <ID>` (plus `--token <TOKEN>` on a
+token-protected deployment), the declared `omnigraph-server` environments run
+against that server and nothing else is selected: each step travels to the
+route that already serves it (`--- query` and `branch list`/`show` to
+`POST /query`, `--- mutate` and the branch statements to `POST /mutate`,
+`--- load` and the seed to `POST /load`) and is judged from the answer the way
+the in-process path judges the engine. The server's graph must already carry
+the case's schema (`GET /schema` is compared; a cluster-backed graph refuses a
+remote schema apply), and the seed loads through `/load`, so the graph should
+be fresh. Without `--server`, an `omnigraph-server` environment is planned
+but not selected (the report says `partial`); the corpus therefore runs
+in-process as before, and the served conformance test in
+`crates/omnigraph-gqt-served/tests/gqt_served_conformance.rs` runs every case
+that declares the target against an in-process server and requires a green
+in-process verdict and the same served verdict; `gqt_served_count.rs` totals
+the served and skipped cases and refuses an empty served set. A declared
+`omnigraph-server-dst` environment is refused at admission on every run: no
+runner implements it. The declared `storage` is recorded, not checked: no
+route reports the server's backend. Refused before any request, by name: `--- restart`,
+`--- concurrent`, seam directives, settings steps and settings prefixes on a
+control or `show` step, `--- expect plan`, `--- expect same as v1`, the
+`# traversal:` pin, and queries that need indices (`search`, `fuzzy`,
+`nearest`, `rrf`). The `--- expect shape` section is not judged under a
+server target: it holds the executor's Arrow schema against the compiler's,
+which no wire answer carries. `--server` is exclusive with `--store`, and a
+served run never blesses. `--server` selects exactly one `omnigraph-server`
+environment (`--storage` picks when several are declared), since every pass
+would share the one graph. Parameters travel as the case spells them, or as
+its recipe generates them, and the server judges them, so a parameter error is
+the server's text. A served report
+carries no bearer token and does not replay: the server's state is not frozen
+in it, as an external `--store`'s is not.
+
+External workers inherit only the selected backend's storage configuration:
+`AWS_*` for S3; `AZURE_*`, Azurite and managed-identity endpoint variables,
+Azure HTTP allowances and object-store retry settings for Azure. These values
+are not written to reports. The engine's existing backend admission rules
+still apply. Keep external queries outside `cases/`: corpus execution has no
+store argument and refuses a file without schema and seed.
 
 One engine instance survives ordinary steps and expected errors. Only
 `--- restart` drops the engine and reopens the same storage. A case owns one
@@ -48,19 +126,246 @@ section; a `process` setting in a case body refuses the case at parse time. GQ o
 and GQT rows, shape, affected counts, errors and loop semantics are shared by
 both paths. Unordered row comparison preserves duplicate counts.
 
+A write's commit id can be bound for the rest of the case (RFC "Unpublished
+graph commits"): `--- bind commit $name`, an empty section directly after the
+`--- expect` of a mutation declaration, a `branch merge` or a `commit publish`
+expected to succeed, binds the receipt's commit id to `$name`
+(`$[a-z][a-z0-9_]*`); a write that published no commit fails the step. A
+`--- query snapshot: $name` header reads at that commit instead of a branch,
+and a commit statement whose whole quoted operand is the name,
+`commit publish "${name}"` or `commit drop "${name}"`, is dispatched with the
+bound id, as is a `branch create <branch> from commit "${name}"` whose
+commit is the whole quoted operand; these are the places `${` may appear in a statement
+body, and the engine receives an ordinary literal. A mutation declaration
+`as unattached branch on "${name}"` (RFC "Unattached graph branches") is
+substituted the same way, and a `--- params` body may spell a bound name,
+`{"base": "${name}"}`, beside the loop variable; a `--- mutate` header without
+`branch:` sends no request branch on the served path, so a child write
+inherits its base's recorded target. A name is bound once, before every use,
+outside a loop, and survives `--- restart`; the served path binds from the
+`ChangeOutput.commit` the route answered and sends `snapshot` on the read.
+
+A `--- query` step may hold a branch control read (RFC 0030 §8.5):
+`branch diff <source> [into <target>]`, `branch diff <from> to <to>`,
+`branch merge-base <source> [into <target>]` or
+`branch merge <source> [into <target>] dry run`. It takes `unordered`,
+`ordered` or `error:`; its rows are the statement's answer, compared as JSON
+whatever their key order, and it carries no shape section, since its columns
+are the statement's. A side spelled `"${name}"` runs with the commit
+`--- bind commit $name` captured, and `${name}` in an expected row stands for
+the same id. The engine and DST paths call `Session::branch_read`; the served
+path sends the statement to `POST /query`.
+
 The configuration accepts 1–16 distinct environment parameter sets,
 1–600000 milliseconds, and 1–64 distinct unsigned 64-bit seeds per DST
 environment. The required corpus refuses budgets above 10000 milliseconds;
 longer standalone reproductions must be selected deliberately. Unknown, duplicate, missing and inapplicable YAML fields are
-refused, as are aliases, anchors, merge keys and tags. Each DST seed runs twice
+refused, as are aliases, anchors, merge keys and tags. The same admission
+serves `--- seam` directives and generated recipes, and its errors name the
+section (runner configuration, seam directive, generated recipe). Mapping
+keys must be strings: a plain `true`, `1` or `~` key is refused rather than
+silently merged with its quoted twin. A YAML section body is the file text up
+to the next header with every line newline-terminated, so a block scalar that
+ends a body keeps the final line break the file shows. Each DST seed runs twice
 in fresh worker processes; completed assertion failures also replay and later
 seeds still run within the file budget. Matching replay of a failing graph
 assertion remains a failure unless it meets the explicit known-failure contract below.
 
+## CSV fixtures and the load statement
+
+A `--- mutate` step may hold one `load csv` statement
+([CSV loading](../../docs/user/mutations/index.md#csv-loading)); its
+`branch:` argument is the statement's target, as for a mutation declaration,
+and its `--- expect` takes the control-write forms (`ok`, `error: <needle>`).
+`--- bind commit $name` after it binds the load's commit. The source is a
+URI the engine reads under the case's external Blob policy, or the bare name
+of a `--- csv <name>` section: that section's body is the file's text, the
+runner writes every such section into a fresh directory before the store
+opens, rewrites the statement's source to the file's `file://` URI, and
+installs one `embedded_only` base over that directory on the case's handles,
+across a `--- restart` too, so the statement is authorized by the rule any
+source meets. A bare name without its section refuses the case. A served
+environment refuses fixture sections and bare source names at admission,
+before starting a worker or making any server request. A `load csv` step
+there names an absolute
+URI the server may read, and the `omnigraph-engine` environment is the one
+that runs section-backed loads. The step is reported as a `load` kind.
+
+```text
+--- csv person.csv
+id|firstName
+2|bob
+
+--- mutate branch: work
+load csv "person.csv" into node:Person mode append delimiter "|" header
+
+--- expect ok
+```
+
+A `--- expect plan` section directly after a `load csv` step's `--- expect ok`
+pins the load's planner document and executed report, read from the load's
+receipt ([explaining a load statement](../../docs/user/queries/explain-load.md)).
+The same section after a mutate step's `--- expect ok|affected` or a
+`branch merge` step's expect pins the write's `Validate` nodes, one planner
+document per table the write validated, read from the mutation's or the
+merge's receipt; a fact holds when any of those documents holds it, and the
+`executed` forms have no document to hold them.
+Each line is one fact; a fact the section does not mention is unchecked, as
+for a query plan. The forms: `load route: <plan|pipeline>` (the document's
+`engine` or `executor` route); `load scan: partitions <n> fallback
+single_scan`; `load validate value <table> [a, b]`; `load validate unique
+<table> <key|unique> [a, b]: access <delta|probe|scan>`; `load validate
+edge_ri <edge> <from|to> <Node>: access <delta|probe|scan>`; `load validate
+cardinality <edge> <from|to> <Node>`; `load validate retained_edges <node>
+<edge> <from|to>: access <delta|probe|scan>`; `load validate source_cardinality
+<node> <edge>: access <delta|probe|scan>`; `load write: <overwrite fragments|append strict_insert|
+merge upsert>`; `load executed: partitions <n> rows <m>`. The validate lines
+are the one `Validate` node's checks. Tables are qualified (`node:Person`, `edge:Knows`);
+an endpoint's referenced type is bare. A served environment refuses the
+section at admission, since the wire answer carries no plan.
+
+```text
+--- expect plan
+load route: plan
+load validate edge_ri edge:Knows from Person: access scan
+load write: overwrite fragments
+load executed: partitions 1 rows 2400
+```
+
+## Generated fixtures and loads
+
+An ordinary `--- seed` contains JSONL and loads with overwrite semantics.
+`--- seed generate: v1 seed: <u64>` contains a strict YAML recipe, appending
+one table batch per commit in recipe order. Later steps reuse that recipe:
+
+```yaml
+--- load generate: v1 seed: 42 mode: merge branch: work
+tables:
+  - kind: node
+    name: Person
+    rows: 3
+    commits: 2
+    start: 0
+    columns:
+      name: {kind: key, prefix: person-, width: 3}
+      score: {kind: ordinal, start: -1, step: -1}
+      bucket: {kind: modulo, modulus: 2}
+      payload: {kind: repeat, text: x, count: 64}
+      embedding: {kind: vector, dimensions: 3}
+--- expect ok
+```
+
+The schema declares the types and keys. A load requires `mode: append` or
+`mode: merge`; `branch:` defaults to `main` and must already exist. Its expect
+is `ok` or `error: <substring>`, with no params, affected-count, row or shape
+section. Table batches publish independently; a later failure does not undo
+earlier batches. A node batch therefore carries no edges, and a node type that
+is the source of an edge type with a non-zero `@card` minimum refuses it. A load in a loop repeats its unchanged recipe. Interpolation
+in generator bodies and headers is refused. Seed headers require an explicit
+unsigned 64-bit seed and `generate: v1`; load headers additionally require a
+mode. A load requires at least one nonempty batch; empty recipes are admitted
+only as seeds. Unknown, repeated or inapplicable arguments are refused.
+
+Each table requires `kind: node|edge`, `name`, `rows`, `commits` and `columns`.
+`start` defaults to zero; row `i` has ordinal `start + i`. Optional `wrap`
+reduces that ordinal modulo a positive bound, allowing reversible updates to
+existing keys. An edge also requires `from` and `to`. Optional `id` supplies
+an explicit identity; omitting it lets the loader derive a declared key.
+Envelope `id`, `from` and `to` generators must produce strings. Node recipes
+cannot supply endpoints. All these generators emit ordinary loader JSONL:
+
+| Column kind | Required fields | Value at ordinal `i` |
+| --- | --- | --- |
+| `literal` | `value` | The JSON value, including null |
+| `repeat` | `text`, `count` | `text` repeated `count` times |
+| `ordinal` | `start`, `step` | Signed 64-bit `start + step * i` |
+| `key` | `prefix`, `width` | Prefix plus a decimal ordinal, padded to at least `width` digits; optional positive `modulo` first reduces `i` |
+| `modulo` | `modulus` | `i % modulus`, with positive modulus |
+| `ranges` | `ranges`, `fallback` | First `{end, value}` with `i < end`, otherwise fallback; ends strictly increase |
+| `vector` | `dimensions` | Deterministic components in `[0, 1)`, exactly representable as `f32` |
+| `endpoint` | `prefix`, `width`, `population`, `distribution` | A padded key selected from `0..population` |
+| `blob` | `byte`, `length` | The `base64:` input text of a managed Blob holding `length` copies of `byte` (0–255) |
+
+Endpoint distribution is `{kind: ordinal}`, `{kind: uniform}`, or
+`{kind: zipf, exponent: 1.25}`. Ordinal selects `i % population`. Uniform
+uses rejection sampling. Zipf assigns rank `r = 1..population` weight
+`r^-exponent`. Explicit table order loads nodes before their dependent edges.
+
+For nonempty tables, `commits` is in `1..=rows`. Without `batch_rows`, rows
+split evenly across exactly that many calls, assigning remainder rows to the
+earliest calls. Optional `batch_rows` fixes chunk size and must produce exactly
+`commits` nonempty calls; the final chunk may be shorter. Zero rows require
+zero commits; an explicit `batch_rows` must still be in `1..=4096`. The recipe admits at most 256 tables, 256 columns per table,
+10 million total rows, 100000 total commits and a conservative 4 GiB JSON
+size bound. Each batch has at most 4096 rows and a conservative 16 MiB byte
+bound. Vectors have 1–4096 dimensions, key widths at most 128 and ranges at
+most 256 entries. Zipf requires a finite exponent in `(0, 16]`, population
+at most one million and at most eight million CDF entries across the recipe.
+Overflow, unsupported generators and YAML aliases, anchors, merge keys and
+tags are refused before initialization. A `#` line inside a recipe is YAML
+text, data inside a block scalar and dropped elsewhere; the `#`-line refusal
+applies to inline JSONL seed and expect bodies only. Schema compatibility is
+validated by the engine loader.
+
+`v1` pins the random stream to SHA-256 of the bytes
+`omnigraph-gqt-generate-v1\0`, then seed, ordinal, lane and rejection-attempt
+as little-endian `u64`, then the table and column names, each preceded by its
+UTF-8 byte length as little-endian `u64`. The word is the first eight digest
+bytes interpreted little-endian. Column names are `data.<name>` or `row.id`,
+`row.from`, `row.to`. Vector lane `d` uses word bits 40–63 divided by `2^24`.
+Uniform accepts words at or above `(-population) % population` in unsigned
+64-bit arithmetic, then takes the remainder; at most 128 attempts are admitted.
+Zipf accumulates weights in rank order using pinned `libm 0.2.16`, normalizes
+the cumulative sums, and selects the first bound strictly above word bits
+11–63 divided by `2^53`, clamping the final rank. Endpoint lane is zero;
+all non-rejection attempts are zero. Values depend on the seed, table, column
+and ordinal, so changing chunk boundaries leaves row values unchanged.
+
+A query or mutate step's parameters may be generated too. In place of a JSON
+`--- params` body, `--- params generate: v1 seed: <u64>` holds a strict YAML
+recipe whose `params:` map names each parameter with one column generator,
+evaluated at ordinal zero:
+
+```yaml
+--- params generate: v1 seed: 0
+params:
+  title: {kind: literal, value: exact}
+  content: {kind: blob, byte: 7, length: 33554432}
+```
+
+The header takes `generate: v1` and a seed, never `mode:` or `branch:`. A
+recipe names 1–256 parameters, and its values have a conservative 64 MiB JSON
+bound, enough for one 32 MiB Blob (about 44.7 MB of `base64:` text); its Zipf
+endpoints share the eight million CDF entry bound a table recipe has. All three
+are checked when the case parses. The case keeps the recipe, and its step
+generates the values when it runs, so a report carries the recipe, never the
+generated bytes. A recipe takes no `${` substitution, inside a loop or not. Its
+random stream uses table name `params` and column names `param.<name>`. On an
+`omnigraph-server` target the runner sends the generated values in the request
+body, so the server's request limits apply: a 32 MiB Blob exceeds the 1 MiB
+mutation body.
+
+`LoadStep::call_count()` exposes the exact number of engine loader calls.
+For one call, generation and JSON encoding complete before the execution
+host's operation callbacks. For multiple calls the callbacks surround the
+whole step, including batch generation; a benchmark selecting an engine-only
+load measurement must require exactly one call. Expectations run afterward.
+Every engine load error reaches the host as a typed fault before formatting.
+
+`benchmarks/fixtures/branch_merge_d50.gqt` declares the full synthetic merge
+dataset. `cases/generated_branch_merge_dataset.gqt` is its small parity
+fixture; tests compare its schema, rows, keys, payloads, branch divergence and
+publication history with the previous fixture builder, including reversible
+history preparation. A scaled D50 fixture also compares full content across
+four edge tables, including the `[5, 4, 4, 4]` update distribution. The full
+800000-row D50 recipe has a static check for 200 base publications and 12
+divergence publications per side, or 213 reachable commits per branch;
+that static check does not execute or verify the full-size dataset.
+
 ## Seam placement
 
 Place a seam directly before its mutate operation, a GQ mutation or a branch
-statement; no seam is crossed by a query step yet. Several seam blocks may
+statement, or before a generated load; no seam is crossed by a query step yet. Several seam blocks may
 precede one operation when they name distinct seams (contention at
 publication and a lost acknowledgement on one mutation,
 `cases/mutation_contention_and_lost_ack_survive_reopen.gqt`); each carries
@@ -89,7 +394,7 @@ subject that begins with
 `*`: the case reader refuses an unquoted leading `*` as a YAML alias; a
 quoted subject is read as one scalar, so globset's `{a,b}` and `[!x]` forms
 are fine inside the quotes. A store
-place is admitted before a mutate or branch step (a branch create writes
+place is admitted before a mutate, load, branch or commit step (a branch create writes
 nothing through the adapter, so a store place before it is `seam_unobserved`). `action` is `fail`,
 `contention`, `skip`, or a store action, the first being `misdirect`, with
 `lose`, `error`, `corrupt` and `delay` spellable and refused at admission
@@ -116,8 +421,8 @@ before the next operation or restart. Seam directives inside loops are
 refused. GQT does not add retries.
 
 A seam is admitted when its catalog operation matches the step it precedes:
-`mutation` before a mutate, `branch_merge`/`branch_create`/`branch_delete`
-before the matching branch statement, `any_write` before either; a seam of
+`mutation` before a mutate or load, `branch_merge`/`branch_create`/`branch_delete`
+before the matching branch statement, `any_write` before any of those; a seam of
 operation `unreachable` is refused. Occurrences must be 1–1000000. Delivery
 is proven by the runner's own decision: it counts crossings, fires the
 admitted effect on the declared occurrence, and the report carries
@@ -133,8 +438,8 @@ The store places, their methods and the actions each honors are RFC 0066's
 table; a place-and-action pair outside it, or listed but not implemented, is
 refused at admission naming the table row. An old `--- fault` block
 converts by renaming the section and its `return_error` action to
-`action: fail`; `at`, `occurrence` and `scope` keep their names. Process crashes,
-server/CLI sessions and network simulation are future extensions.
+`action: fail`; `at`, `occurrence` and `scope` keep their names. The DST runner
+does not support process crashes, server/CLI sessions or network simulation.
 
 ## Concurrent block
 
@@ -179,14 +484,22 @@ For replay, session observations and result evidence are grouped in declaration
 order. Each session's event order and values are preserved; completion timing
 does not determine report order.
 
-While a session waits on the script the block drives the paused clock
-itself (RFC 0045 §Concurrent block says why) up to ten virtual seconds past
-the last cursor move or request; past that the clock stands still and the
+Nothing drives the paused clock while a session waits on the script (RFC
+0045 §Concurrent block says why): the runtime idles and tokio moves the
+clock only to the earliest pending timer, never while a task of its own
+blocking pool runs, so a session's work on a foreign thread takes no
+virtual time; Lance's CPU pool is a second runtime the paused clock does
+not see, so a hop onto it that overlaps another session's modeled sleep
+wakes before or after that one jump, a one-tick window Lance owns. A
+timer farther than the block's work fires the moment a session parks with
+nothing nearer pending, so the engine's commits run without Lance's commit
+timeout under simulation (`lance_commit::commit_builder`) and any other
+far timer ends the block as its own timeout, visibly. The
 block fails as starved when neither an entry nor a request arrives for half
-the case's `timeout_ms` of wall time, at most ten seconds, or when a
-session finishes without a request entry of its own. A session blocked in
-the engine while no session waits on the script ends as the case's
-timeout. The example above is the read-during-publish case: on an engine
+the case's `timeout_ms` of wall time, at most ten seconds, read off the
+runtime by a guard thread, or when a session finishes without a request
+entry of its own. A session blocked in the engine while no session waits
+on the script ends as the case's timeout. The example above is the read-during-publish case: on an engine
 whose publish holds the schema gate and the handle's coordinator lock
 across the manifest commit, `r1` waits behind `w1` (at the schema gate,
 before it reaches the coordinator lock) and the block starves at entry 3;
@@ -201,7 +514,23 @@ with its wall times and the count of requests made outside any session are
 in the report's measurements, not the cost table. Under `--measure` each
 session is its own row, labeled by its session label, and the block's own
 row holds the requests made outside any session, so a read's virtual time
-beside a write is a number. Once a block is starved its sessions drain, and
+beside a write is a number. So is its wait: every in-process lock the engine
+takes is a gate whose acquisition crosses the seams `gate.<gate>.acquire`,
+`gate.<gate>.hold` and `gate.<gate>.release`, plus `gate.coordinator_cas.refused`
+for an install that ends without a hold (`table`, `branch`,
+`schema_shared`, `schema_exclusive`, `export`, `coordinator_cas`; the
+engine's `write_queue` module doc §Gates), and a session's `acquire`-to-`hold`
+spans on the virtual clock are summed per gate into `wait.<gate>` ticks, in
+its row's `waiting` column and in the TSV. The clock rule: the virtual clock
+moves only while a request sleeps its cost (or an engine timer its distance),
+so a wait is the modeled cost of what the holder did meanwhile, the same on
+every run of a seed; a wait no request fills reads 0 and a 0 says the clock
+stood still, not that the gate was free; a wait at the front door
+(a read parked at the schema gate before its first request) is in the row
+all the same, since the span starts at the crossing, not at a request. A gate
+seam is a wait event, not a phase: the session's phase stays the last other
+seam it crossed. Outside a block one statement runs on the handle at a time,
+so no `wait.<gate>` row is written there. Once a block is starved its sessions drain, and
 the requests they make from then on are in phase `after_abort`: a starved
 block's rows are the drain, not the interleaving the script named. Store
 requests are the only points an entry can name in this version; seams and
@@ -222,11 +551,18 @@ scan Doc: not columns [embedding]
 scan Doc as $d: filter reads [d.state]
 scan Doc as $e: no filter
 hash join $e
+anti join $p: key_set
 expand $d Knows $e: mode indexed_scan
 filter reads [d.rank, e.rank]
 sort tiebreak [$d, $e]
+hydrate $d: columns [body]
 pass projection_pushdown
 not pass aggregate_pushdown
+aggregate total: sum(I64?) exact_integer round_to_nearest -> F64?
+block aggregate sum($c.amount): sum(I64?) exact_integer round_to_nearest -> F64?
+validation scope exact_subset
+pipeline 0: Scan -> Projection => Sort
+pipeline 1: Sort => consumer after 0
 ```
 
 A `scan <Type>[ as $var]:` line selects the scans of that type (or the one
@@ -240,9 +576,60 @@ keys a physical `Sort` appends after user order keys. `$a` abbreviates `$a.@id`;
 `sort no tiebreak` requires an empty list. `rank fuse row tiebreak [...]` checks
 the exact downstream keys of `RankFuse`, and `rank fuse no row tiebreak` requires
 none. Dropping a type key or swapping key order fails these assertions.
-`pass <name>` states that a named optimizer pass fired, `not pass <name>` that
-it did not. Projection/read lists are sets; identity keys and selection members
+`hydrate $d: columns [..]` states that a physical `HydrateColumns` fetches
+exactly those columns of `$d` by row address above the root limit (pass
+`late_materialization`); the `scan` lines keep reading the logical plan, whose
+projection still lists them. `pass <name>` states that a named optimizer pass
+fired, `not pass <name>` that it did not. Projection/read lists are sets; identity keys and selection members
 are ordered lists. A mismatch prints the whole explain document.
+`aggregate <column>: <func>(<Type>) <accumulator> <overflow> -> <Type>`
+checks the named output's aggregate function, input type, accumulator,
+overflow rule and result type. Accumulators are `count`, `exact_integer`,
+`float64` and `extremum`; overflow rules are `round_to_nearest` and `error`.
+Types use shape syntax, node type names or `exact_integer`. A type's `?`
+declares nullability here; a shape line's `?` describes observed null cells.
+An unfiltered count-only query can use `MetadataCount`, which has no aggregate
+specification and does not satisfy an `aggregate` line.
+`block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`
+checks the same facts on an AntiJoin's aggregate leaf, named by its GQ text,
+even beneath a comparison cast. Bare row count has no aggregate spec.
+
+`result columns [total: F64?, person: Person]` checks the complete declared
+result in return order, including names, types and nullability. It follows
+Sort and Limit to the result node; a MetadataCount also declares columns.
+
+`type $p.age: I64?` requires at least one non-cast expression with that GQ
+text, and every matching expression must carry the stated type. Types are
+stored compiler declarations, including nullability. `cast $p.age: I64? ->
+F64?` requires an explicit conversion over that expression with exactly those
+source and target types; `no cast $p.age` refuses any conversion over it.
+The checks search every typed tree in the physical plan, including pushed
+filters, sort keys, ranked scans, join predicates, aggregate arguments and
+both block comparison operands.
+Cast text is transparent, so a `type` line selects the underlying expression.
+The internal `exact_integer` and `[exact_integer]` comparison types, optionally
+nullable, are accepted here but cannot be returned as public result columns.
+
+`pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]` claims
+one entry of the document's `pipelines` by position: the physical plan cut at
+every node whose operator emits nothing before it has seen its whole input
+(`Sort`, `Aggregate`, `AntiJoin`, `RankFuse`, a costed multi-hop `Expand`)
+and at a join's build side. The source is the entry's first node, the
+operators follow in run order, the sink is the node the pipeline drains into
+(a breaker by its name, a build side as `HashJoin(build)`, or the `consumer`)
+and `after` lists the pipelines drained before this one starts. A mismatch
+prints every pipeline the document holds in the same spelling.
+
+Every successful rows step compares the plan root's declared schema with the
+compiler's independent inference and with the executed result. The inference
+check compares declared nullability; the execution check rejects observed
+nulls in non-null columns and compares node objects by their complete Struct
+type. The runner also serializes and deserializes the executed bound plan,
+validates its typed expression trees and aggregate signatures/specs, compares
+its explain documents, and directly compares stored schemas, return types,
+named node-object declarations and complete block predicates/specs. These checks require no plan section
+and execute no additional query.
+
 Pass names must be registered optimizer passes. Excluded columns must
 exist in the selected type's catalog schema. Unknown names fail even in
 negative assertions. Assert destination projection on the dependent scan;
@@ -253,6 +640,23 @@ resolved member list and per-member directions. Selection kinds are `named`,
 canonical catalog names, with JSON quotes available for a member name. An
 endpoint-only `expand $a $b: mode indexed_scan` applies to every Expand between
 those bindings, including selections.
+The optional `# traversal: auto` header prepares indexes while leaving mode
+selection to the cost model. Without a traversal header or another index
+requirement, a fixture does not build indexes. `indexed` and `csr` prepare
+indexes and force their respective paths.
+
+The optional `# csv_slice_bytes: <n>` header sets the source bytes one
+`load csv` parse partition owns and the slice it reads at once, 8 MiB without
+the header, so a case of a few KiB cuts two or three partitions and pins what
+happens at their boundaries; the header's head range keeps its 64 KiB floor.
+An in-process pin: a server target refuses it.
+
+The optional `# overwrite_chunk_rows: <n>` header sets the rows one `load csv`
+overwrite chunk holds before a Lance writer takes it, Lance's file target
+(1 Mi rows) without the header, so a case of a few hundred records writes
+fragments before its last record is judged and pins what a late refusal leaves
+behind. An in-process pin: a server target refuses it.
+
 An `expand $src <Edge> $dst:` line selects every matching named-edge physical `Expand` between
 those bindings over that edge type and claims `mode csr` or `mode
 indexed_scan`, the traversal mode the planner recorded (pass `expand_mode`
@@ -261,21 +665,134 @@ plan or its mode differs. A `scan <Type>[ as $var]: access id_lookup` line
 selects the physical scans of that type (or the one bound to that binding)
 and claims each is a traversal's destination read once per slice of at most
 256 input rows; it fails when no such scan is in the physical plan, the scan
-is a table scan (no access path) or the build side of a hash join. A `hash
+has another access path or is the build side of a hash join. A `hash
 join $var` line claims that a physical `HashJoin` reaches `$var`'s rows by
 reading its table once as the build side the traversal probes (pass
 `access_path` when the cost model decided); it fails when the plan holds no
-hash join over that binding. The `hash join` and `expand` lines take a
+hash join over that binding. An `anti join $var: <correlated|key_set>` line
+claims the strategy of every physical `AntiJoin` correlated on `$var` (a `not`,
+`exists`, `count` or aggregate block): `correlated` starts its inner tree from
+the outer rows, `key_set` runs it once from the block's own bounded binding
+(pass `anti_join_strategy`); it fails when no such block is in the physical
+plan or one took the other strategy. The `hash join` and `expand` lines take a
 trailing `ran <side>` (`hash join $e ran id_lookup`, `mode indexed_scan ran
 csr`): the side of the node's declared switch the run took, read from the
 execution report of the same run (the last attempt of the node's row, joined
 to the explain row by the node's `id`); it fails when the run recorded no
 side on that node or another side. A `scan <Type>[ as $var]: ranked
-<nearest|bm25>[ fetch <n>][ nprobes <n>]` line claims the ranked access path
-of the scan, the candidates it asks the index for and, on a `nearest` scan,
-the probe cap the plan carries (`0` spells no cap, as the `ann_nprobes`
-setting does). Nothing is compared as rendered text, so a planner that
-reaches the same facts by another route keeps the case green.
+<nearest|bm25>[ fetch <n>][ nprobes <n>][ eligibility <placement>]` line
+claims the ranked access path of the scan, the candidates it asks the index
+for, on a `nearest` scan the probe cap the plan carries (`0` spells no cap,
+as the `ann_nprobes` setting does), and on a `bm25` scan where it applies its
+eligibility (`before_scoring` under full full-text coverage, else
+`after_scoring`). `validation scope <exact_subset|invariants_only>` claims
+what acceptance checked of the plan, as the document's `validation` reports
+it; a failed planning step has no document and keeps its `expect error:`.
+Nothing is compared as rendered text, so a planner that reaches the same
+facts by another route keeps the case green.
+
+A nearest ranked-scan line may end in `diagnostics present`, for example
+`scan Doc as $d: ranked nearest fetch 3 diagnostics present`. Every selected
+nearest scan must report at least one measured attempt; an RRF with two
+nearest arms must report both, while a BM25 sibling is not selected. A missing
+scan, missing report, or missing diagnostic fails the assertion. Other attempts
+may have no metrics, and their positions are never renumbered. The clause is
+refused on BM25 and takes no duration or counter value.
+
+Every successful inspected query also validates any ANN diagnostics without
+requiring a plan section: known counter/timing names with unsigned integer
+values, nonempty metric rows, unique `(id, rung, attempt)` identities, and joins
+to a physical nearest scan and an existing probe attempt. The same run's profile
+must preserve those diagnostics. Missing fields remain absent and zero is valid;
+no elapsed time, physical count, or equality across runs is asserted. Diagnostics
+are not added to DST replay observations. The explicit presence clause catches
+complete loss of metrics that these conditional checks alone would allow.
+
+A `scan <Type>[ as $var]: access sequential` line requires the recorded
+sequential choice. `access index_probe <physical-column>` requires a probe
+with that physical column in a leaf of `index_query`; it does not compare
+rendered search text, residuals or index names. `pass scan_access` records
+completed finalization; `pass key_to_id` records a safe key narrowing.
+
+A `load csv` step may carry an `--- expect plan` section directly after its
+`--- expect ok`.
+Its lines are checked against the planner document in the executed load's
+receipt ([Explaining a load statement](../../docs/user/queries/explain-load.md)).
+A mutate step's `--- expect ok|affected` and a `branch merge` step's expect
+may carry the same section: its lines are checked against the write's
+`Validate` documents, one per table the write validated (a JSONL load, a
+mutation, a blob cell or a branch merge plans each table it stages), and a
+line holds when any of them holds it; the `load executed` forms claim a
+report only a `load csv` receipt carries.
+Each line is one fact claim, and a fact no line mentions is unchecked:
+
+```text
+load route: plan|pipeline
+load scan: partitions <n> fallback single_scan
+load validate unique <table> key|unique [<cols>]: access delta|probe|scan
+load validate edge_ri <edge-table> from|to <node-type>: access probe|scan
+load validate edge_ri <edge-table> from|to <node-type>: probe swept|judged
+load validate cardinality <edge-table> from <node-type>
+load validate retained_edges <node-table> <edge-table> from|to: access delta|probe|scan
+load validate source_cardinality <node-table> <edge-table>: access delta|probe|scan
+load validate removal <table>: scan|none
+load write: overwrite fragments
+load write: append strict_insert
+load write: merge upsert
+load pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ partitions <n>][ after <n>[, <m>]]
+load executed: partitions <n> rows <m>
+load executed <Node>: rows <m>
+```
+
+`load route` claims the document's route, `plan` for `engine` and `pipeline`
+for `executor`.
+`load scan` claims the `CsvSource` node's partition count and its `single_scan`
+fallback.
+A `load validate` line claims one check of the `Validate` node with that
+identity, and its `access` suffix claims the check's access path. An
+`edge_ri` line with a `probe` suffix claims where the check probes the
+committed ids: `swept`, on the parse partitions as the delta arrives, when
+both endpoint checks read their set whole (`scan`) over node types keyed by
+one `I32`, `I64` or `U32` `@key`; `judged`, after the drain, otherwise.
+`load validate removal` claims the node's `removal`: `scan` when the plan
+finds the committed ids an overwrite removes, `none` when no planned check
+reads them (an empty committed table, a node target no edge type references,
+an edge target, append and merge).
+`load write` claims the `FragmentWrite` node's mode and adapter.
+`load pipeline` claims one entry of the document's `pipelines` by position:
+its source node, its streaming operators in run order, the sink it drains
+into (a node that holds its whole input, a join's build side, or the
+`consumer`), after `partitions` the streams its source runs (the `CsvSource`
+node's `max_partitions`, spelled only above one) and, after `after`, the
+pipelines drained before it starts; an overwrite load prints
+`0: CsvSource => Validate` and `1: Validate -> FragmentWrite => consumer after 0`,
+a source over 8 MiB `0: CsvSource => Validate partitions 2`.
+`load executed:` claims the partitions and rows the load executed;
+`load executed <Node>: rows <m>` claims the rows one node's operator emitted
+(`CsvSource`, `Validate`, or the rows `FragmentWrite` staged), read from the
+receipt's `executed.operators`; the operator timings there are measurements
+and have no line.
+
+```text
+--- csv knows.csv
+from|to
+1|2
+2|3
+
+--- mutate
+load csv "knows.csv" into edge:Knows mode overwrite delimiter "|" header
+
+--- expect ok
+
+--- expect plan
+load route: plan
+load scan: partitions 1 fallback single_scan
+load validate unique edge:Knows key [from, to]: access delta
+load validate edge_ri edge:Knows from Person: access probe
+load validate edge_ri edge:Knows to Person: access probe
+load write: overwrite fragments
+load executed: partitions 1 rows 2
+```
 
 ## Reference comparison
 
@@ -317,7 +834,71 @@ cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt
 cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --target omnigraph-engine-dst --storage in-memory-object-store --seed 42
 cargo run --bin omnigraph-gqt -- --replay ../../target/gqt-artifacts/invocation-EXAMPLE.json
 cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --measure
+cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --trace
+cargo run --bin omnigraph-gqt -- --store file:///path/to/graph /path/to/queries.gqt
 ```
+
+`--store` may precede or follow the case paths. External-store reports retain
+the URI and step evidence, but cannot replay: the report does not freeze the
+store contents. `--- restart` reopens that same root.
+
+`--trace` saves diagnostic JSONL for each selected DST attempt, including
+both runs of every seed. It requires at least one selected DST environment;
+direct-engine attempts in a mixed case still run without recording. The flag
+may precede or follow paths and combines with `--measure` and selectors.
+The case format and assertions stay unchanged. Recording is off by default.
+
+Each attempt gets a unique file under `target/gqt-artifacts/trace/`, or
+`<dir>/trace/` with `--artifacts <dir>`. The runner prints each path before
+launching its worker and includes it in the invocation report. Files contain
+GQT operations, observations and assertion evidence, every decision seam
+crossing, plus available `omnigraph` tracing spans and events from all
+worker threads. This is a diagnostic stream, not a complete graph history or
+a lineage oracle.
+
+Every line is one flat JSON object: `idx`, `kind`, the columns of that kind,
+and from the first `operation` on the step the runner began last as `step`,
+`step_line`, `loop_binding` and `generation` (the `truncated` terminator
+excepted: it carries no step columns, so it always fits the bytes reserved
+for it). The schema is
+[`trace_schema.json`](trace_schema.json), one branch per kind; a library
+test serialises one row of every kind against it.
+
+| `kind` | columns | meaning |
+|---|---|---|
+| `start` | `format`, `version`, `invocation_id`, `case_path`, the three digests, `environment`, `seed`, `replay` | the header the supervisor writes before the worker starts; never carries step columns |
+| `operation` | the step columns | the runner began a case operation |
+| `observation` | `text` | one host observation, the lines the report keeps |
+| `evidence` | `record`, `value`, `session` | one assertion evidence record (`record` is `expectation`, `assertion`, `seam_delivered`, ...) with its value |
+| `seam_crossing` | `seam`, `decision` (`pass`, `fire`, `store`), `effect`, `session` | the engine crossed a decision seam and the installed decider answered |
+| `store_request` | `verb`, `class`, `dataset`, `path`, `range`, `bytes`, `session` | one object-store request as the `--measure` ledger notes it, both realms; only with `--measure`; `session` is the ledger's label (`setup`, `step`, `runner` or a block session), never null |
+| `span`, `span_record`, `span_close` | `id`, `parent`, `target`, `name`, `level`, `file`, `line`, `thread`, `session`, `fields` | an `omnigraph` tracing span opened, recorded fields, closed |
+| `event` | `parent`, `target`, `name`, `level`, `file`, `line`, `thread`, `session`, `fields` | an `omnigraph` tracing event; `parent` is the enclosing span's `id`, as on `span` rows |
+| `finish` | `code`, `phase` | the worker completed with this result |
+| `truncated` | `reason`, `max_bytes`, `max_records` | recording stopped at the limit; never carries step columns |
+
+Seam crossings come from the runner, not the engine: a pass-through observer
+sits on every catalog seam the step did not arm, and the armed deciders are
+wrapped, so each crossing lands with the decision the decider returned. The
+crossing's position inside the action is not recorded; the seam name and the
+step are. Store requests are the measure ledger's: with `--trace --measure`
+every request of both realms lands as a `store_request` row at the moment
+the ledger notes it (a listing page refused later keeps its `list` verb in
+the trace and is `list_failed` in the ledger), with the ledger's label
+(`setup`, `step`, `runner` or a block session) as its `session`. `--trace`
+alone wraps no store, so a store place that is not armed leaves no row. A
+concurrent block is one step whose sessions interleave on one thread;
+`session` names the session a row belongs to: `null` outside a block on
+evidence, crossing, span and event rows, the ledger's label on store rows.
+
+Recording stops at 16 MiB or 100000 records with a `truncated` record. Trace
+fields may also be shortened to bound capture memory. A killed worker
+retains its written prefix; a missing `finish` means the recording is
+incomplete.
+Recording errors fail the invocation and preserve the original case error.
+Trace paths and bytes do not participate in deterministic replay comparison;
+`--replay <report.json>` replays the case without creating another trace.
+Recording adds host I/O and may consume more of the case's wall-time budget.
 
 `--measure` records, for every step of each DST environment, the object-store
 requests made while the step ran (the engine's, and under a `--- store` rule
@@ -389,6 +970,14 @@ control realm's limits below are the exceptions). Per group it reports:
   share one unit under every model, and the printout shows the parallelism
   achieved (requests per makespan tick) beside the parallelism available
   (requests per span tick);
+- its gate waits, for a concurrent block's session: the engine's six
+  in-process gates cross `gate.<gate>.acquire` and `gate.<gate>.hold`
+  (§Concurrent block), and the session's spans between the two are summed
+  per gate into ticks, printed after `waiting` as `<gate> <ticks>` when
+  above 0 and carried in the TSV as `wait.<gate>` for every gate the session
+  crossed, 0 included (0 means no request moved the clock while it waited,
+  not that it did not wait); schedule-derived like makespan, so in the
+  measurements, never in the `io` evidence row;
 - `sim ms`, the group's virtual time under the latency model, and `u$`, its
   requests at S3 list prices in microdollars (PUT, COPY and LIST 5.0, GET and
   HEAD 0.4, DELETE free).
@@ -420,7 +1009,9 @@ sharing a tick ran together) go to a `measurements` field the replay
 comparison skips. The invocation prints one ASCII table per environment, a
 row per step and per gap and a row per phase, and writes the long-form TSV
 under `target/gqt-artifacts/cost/` (phase rows as `phase.<name>.<field>`).
-Direct-engine environments record nothing: on a `file` root Lance bypasses
+`--measure` requires at least one selected DST environment and refuses a
+direct-only selection before starting any worker. In a mixed selection,
+direct-engine environments record nothing: on a `file` root Lance bypasses
 the wrapped store for data files, so only the DST in-memory object store
 sees every request. The control realm's counts are the in-memory adapter's:
 under DST its store never holds a Lance object, so the engine's probes of a
@@ -429,7 +1020,7 @@ always miss, `head_failed` then `list`. `delete_prefix` logs only its listing;
 deletes performed inside the adapter are not counted. An
 `exists` the store refused is `head_failed` whether the head or the list
 after it failed. An adapter the engine builds for itself instead of using
-the handle's (the storage upgrade or the graph-index load of a historical
+the handle's (the graph-index load of a historical
 read) is outside the wrapped one; no gqt step reaches one today. An adapter
 object probed then read in one step is a repeat read: `head` and whole-object
 `get` share a key. Repeated loads in that step also count as repeat reads.
@@ -519,10 +1110,24 @@ runner section. Ambient fault, entropy and pool overrides also refuse
 admission, including replay, as does a set settings variable
 (`OMNIGRAPH_ENGINE`, `OMNIGRAPH_RRF_PLAN`, `OMNIGRAPH_MERGE_LINEAGE`,
 `OMNIGRAPH_ANN_NPROBES`, `OMNIGRAPH_LOAD_CONCURRENCY`,
-`OMNIGRAPH_TRAVERSAL_WORK_LIMIT`) and the retired
+`OMNIGRAPH_TRAVERSAL_WORK_LIMIT`, `OMNIGRAPH_HISTORY_RELEASE_BYTES`) and the retired
 `OMNIGRAPH_TRAVERSAL_MODE`, which names no setting any more. A case session
 never reads the environment (the runner's own `OMNIGRAPH_GQ_ENGINE` above is
 the one seed), so neither variable decides anything; the refusal keeps a stale
 one in a CI environment from being mistaken for a live control, and keeps the
 retired name from lingering. A case that must run one value writes it in a
 `set` step.
+
+## Shared execution library
+
+`omnigraph-gqt-core` owns the format, ordinary execution and expectation checks.
+It runs over a supplied `Session` and uses an explicit host for observations
+and operation boundaries. The GQT runner owns process isolation, discovery,
+DST scheduling, reference comparisons and measurement reports. Core has no
+build script or engine `test-util` dependency.
+
+Run both packages to include the shared format and executor tests:
+
+```bash
+cargo test -p omnigraph-gqt -p omnigraph-gqt-core --locked
+```

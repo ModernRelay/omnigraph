@@ -1,0 +1,3 @@
+- Managed operator configuration now uses `profiles`, each with one identity and one `auth` provider object, instead of `connections` and nested named auth maps. Rebuild managed references and defaults with `profile`, use `--profile` and `config rename-profile`, and remove managed `default_auth` and `--auth`; old forms are rejected without compatibility aliases or an importer. Bare login proposes `omnigraph` at `https://platform.omnigraph.dev`, managed targets keep their pinned profile, and standalone named auth remains unchanged; see the [operator upgrade guide][operator-profiles-upgrade].
+
+[operator-profiles-upgrade]: ../docs/user/cli/targets.md#upgrade-from-the-old-format

@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-01
-updated: 2026-09-30
+updated: 2026-10-26
 discussion: "https://github.com/ModernRelay/omnigraph/pull/791"
 supersedes: []
 superseded_by: []
@@ -33,8 +33,9 @@ engine v2, the only query engine since v0.12.0 (PR #795), and on the compiler.
    prerequisites retain their distinct conflict response.
 2. **Full-text search on an unindexed property.** A property the schema does
    not declare `@index` is refused at compile time (`T27`); a declared index
-   that is not built is refused at planning (`FullTextIndexRequired`). Neither
-   falls back to Lance's case-sensitive flat scan.
+   with no segment at the query's snapshot is refused at planning
+   (`FullTextIndexRequired`). Neither falls back to Lance's case-sensitive
+   flat scan.
 3. **Ranking a traversal-introduced binding.** Declaration order stops
    mattering: the ranked binding roots its component, so a query ranks the
    binding it names whichever binding it declared first.
@@ -42,8 +43,10 @@ engine v2, the only query engine since v0.12.0 (PR #795), and on the compiler.
    query's remaining order keys, then binding identity, and `limit` cuts rows.
    The fused `rrf()` score becomes a projectable column. A search-ordered
    aggregate orders its groups by the remaining keys.
-5. **Read descriptors.** A read reports which retrievals ran and what each
-   projected rank column means, derived from the plan that ran.
+5. **The ranking a read reports.** A ranked read reports the search function
+   its order names, the direction its score ranks, whether its run searched
+   exhaustively, and which returned columns hold that score, derived from the
+   plan and the run that executed it.
 6. **The served read floor** is attributed to its phases and reported.
 7. **Plan validation.** One shared component checks the query's search
    requirements across lowering and optimization. It checks the invariants
@@ -51,8 +54,8 @@ engine v2, the only query engine since v0.12.0 (PR #795), and on the compiler.
    validation for a defined exact-search subset.
 
 Boundaries that do not change: no storage format change, no change to BM25 or
-vector scoring, the deprecated `POST /read` envelope stays byte-stable, the
-frozen reference engine keeps its bytes, and GQ gains no syntax.
+vector scoring, the frozen reference engine keeps its bytes, and GQ gains
+no syntax.
 
 Related decisions: [Shared expression model](2026-09-24-shared-expression-model.md)
 owns the query surface this RFC works within; RFC 0048
@@ -104,7 +107,7 @@ fixed by #760).
 
 Describing the selected physical plan does not establish that it implements
 the query. If lowering drops a search expression or optimization drops an
-order key, a descriptor derived from that plan can describe the wrong plan
+order key, a ranking derived from that plan can report the wrong plan
 consistently. Validation needs the original typed query requirements as well
 as facts derived from the selected operators.
 
@@ -149,14 +152,15 @@ catalogue by the change that adds each refusal.
 
 - `T27`: a full-text predicate or ranking (`search`, `fuzzy`, `match_text`,
   `bm25`) on a String property that the schema does not declare `@index`. The
-  fix is to declare `@index` and build it (`omnigraph optimize`). The check
-  reads only the schema, never physical index state.
-- `FullTextIndexRequired`: the property is declared but its index has no
-  built segments at the query's snapshot. It is refused at planning, before
-  any scan, as HTTP `409` with a typed detail, the shape RFC 0043's
-  `FullTextIndexRebuildRequired` already has; both can fire on one graph.
-  Rows written after the last build keep today's behavior: Lance scans them
-  with the index's analyzer.
+  fix is to declare `@index`; every write then carries the index's analyzer.
+  The check reads only the schema, never physical index state.
+- `FullTextIndexRequired`: the property is declared but no segment of its
+  index exists at the query's snapshot, in a table version that has rows. It
+  is refused at planning, before any scan, as HTTP `409` with a typed detail,
+  the shape RFC 0043's `FullTextIndexRebuildRequired` already has; both can
+  fire on one graph. Any segment carries the analyzer, the untrained one
+  every write declares included, and Lance scans the rows it does not cover
+  with that analyzer: partial coverage is never a refusal.
 
 The analyzer-equivalent exact scan that later lets an unbuilt index answer
 instead of refusing belongs to the analyzed lexical search RFC.
@@ -183,8 +187,8 @@ The ranked binding is where the component's scan starts. A later optimization
 may start at a selective other end and use traversal eligibility during
 retrieval, but only under the mode-specific conditions in
 [The ranked binding roots its component](#the-ranked-binding-roots-its-component).
-An approximate recall label alone does not authorize changing a candidate
-window or a scoring population. One shape stays refused, as a
+That a `nearest` search is approximate does not by itself authorize
+changing a candidate window or a scoring population. One shape stays refused, as a
 type error: `rrf()` arms that rank two different bindings of one
 traversal-connected component, since one scan cannot start at both.
 
@@ -241,51 +245,41 @@ descending with limit one therefore selects the null category. With no key
 after the search function the groups remain unordered, as today, and a test
 cannot expect an order.
 
-### Read descriptors
+### The ranking a read reports
 
 The canonical read envelope (`POST /query`, stored-query invocation, CLI
-`--json` and the `jsonl` metadata record) gains two additive arrays:
+`--json` and the `jsonl` metadata record) gains one additive object when the
+read's order is a search:
 
 ```json
-"retrievals": [{ "id": "r0", "binding": "d", "property": "embedding", "kind": "nearest",
-                 "recall": "approximate",
-                 "embedding_coverage": { "state": "unknown", "reason": "not_computed" } }],
-"metrics":    [{ "column": "score", "kind": "distance", "retrieval_id": "r0", "source": "nearest",
-                 "binding": "d", "property": "embedding", "descending": false,
-                 "recall": "approximate" }]
+"ranking": { "by": "nearest", "order": "ascending", "exhaustive": false,
+             "score_columns": ["d._distance"] }
 ```
 
-Retrieval ids identify producers within one accepted plan. Each fusion names
-its arms in query argument order. For
-`rrf(bm25($d.title, $q1), bm25($d.title, $q2))`, the shape is:
+Acceptance admits one ranking per read: the leading `order` key names one
+`nearest` or `bm25`, or one `rrf()` of two arms whose own scores `T33` keeps
+out of `return`. One object therefore describes it.
 
-```json
-"retrievals": [
-  { "id": "r0", "kind": "rrf", "arms": ["r1", "r2"], "recall": "exact" },
-  { "id": "r1", "kind": "bm25", "binding": "d", "property": "title", "recall": "exact" },
-  { "id": "r2", "kind": "bm25", "binding": "d", "property": "title", "recall": "exact" }
-],
-"metrics": [{ "column": "score", "kind": "rrf", "retrieval_id": "r0",
-              "source": "rrf", "descending": true, "recall": "exact" }]
-```
+- `by` is the search function: `nearest`, `bm25` or `rrf`.
+- `order` is `ascending` for a `nearest` distance and `descending` for a
+  `bm25` or fused score, so a client reads which value is better without
+  knowing each function.
+- `exhaustive` is what this run did: no row the search admitted and did not
+  return outranks a returned row. `bm25` scores every match, so it is always
+  exhaustive. A `nearest` search is exhaustive when its last attempt scored
+  every admitted row flat, searched every partition of the vector index, or
+  returned every admitted row, and not when a probe cap left partitions
+  unsearched. An `rrf()` is exhaustive when its `nearest` arms are. The claim
+  is per response, so a client relies only on the guarantee the answer in
+  hand states, whichever index exists.
+- `score_columns` lists the returned columns that hold the ranking's own
+  score, in return order: two columns reading one score both appear, and a
+  column computed from the score is not one. It is empty when the read
+  returns no score.
 
-An RRF descriptor uses `arms` instead of a singular `binding`/`property`.
-Its metric likewise refers to the fusion, not to one arm. Distinct producers
-keep distinct ids even when kind, binding and property match; parameter values
-are not exposed. Multiple projected columns reading one producer reference
-the same id. The arrays describe retrieval and score meaning, not the scope
-of the internal rewrite-validation guarantee.
-
-- `recall` reports the source's contract, not what one execution did: a
-  `nearest` is `approximate` even when a run happened to scan exactly, so a
-  client never relies on a guarantee that disappears when an index is built.
-- `embedding_coverage` is `known` with counts only when the run already
-  established them, and `unknown` otherwise. Exact counts on request belong to
-  RFC 0048's result metadata contract.
-- The deprecated `POST /read` envelope carries neither array.
-
-The extension is one additive change to the envelope, made together with the
-result column types that the self-contained server testing RFC needs.
+Parameter values never appear. Whether embeddings cover the ranked rows is
+not reported; exact counts on request belong to RFC 0048's result metadata
+contract.
 
 ### Served read floor
 
@@ -311,7 +305,7 @@ refused stored query is a pre-upgrade finding, never a boot failure.
 | Full-text index | `T27` | index presence as a planning fact |
 | Ranking a destination | lowering roots the component at the ranked binding; type error for `rrf` arms on two bindings of one component | optional reversal when the other end is selective |
 | Total order | `T33` admits a projected `rrf()`; `T37` retired | fused score column, `Sort` over the fusion and over a search-ordered aggregate |
-| Descriptors | None | derived from the physical plan's ranked scans and fusion |
+| Ranking | None | derived from the physical plan's ranked scans and fusion, and exhaustiveness from each `nearest` scan's last attempt in the run |
 | Read floor | None | Server instrumentation |
 
 Engine v1 is the frozen reference engine (`crates/omnigraph-reference-engine`),
@@ -399,6 +393,23 @@ check the earlier translation.
 | Row cut | limit and the query stage it applies to | final truncation follows eligibility and the required order; keep nearest candidate caps and RRF arm caps distinct from this final cut; aggregate limits cut groups, ordinary limits cut rows |
 | Approximation | the retrieval kind's declared contract | preserve the exact/approximate classification; an exact execution of `nearest` does not change its declared contract |
 
+A correlated block (`not`, `exists`, `count`, `sum`) is required as a block:
+its aggregate, comparison and right-hand side. Its inner predicates are
+checked through the block's plan subtree, not derived from the declaration's
+inner clauses, whose variables the lowering may rename.
+
+As built, requirements come from the compiler's typed lowering of the
+checked declaration, which acceptance receives beside it. Since every
+`QueryIR` expression carries its compiler type and every conversion is an
+explicit `Cast`, the lowering keeps the meaning the paragraph above feared
+it would lose, so requirements compare by structural equality, types
+included: a conjunct, traversal, block, search argument, return item and
+order key in the plan must equal the lowering's. The lowering is itself
+checked against the declaration first; its traversal, block, return item,
+order key and limit counts must be the declaration's. The declaration
+supplies only what the lowering does not name: which return items and which
+order key are the written score calls.
+
 For a search-ordered aggregate, derive population requirements before grouping
 and order/cut requirements after grouping. With no remaining order key, group
 order stays unspecified as defined above. Full-text index readiness comes
@@ -416,10 +427,37 @@ fact](#full-text-index-presence-as-a-planning-fact), not from query syntax.
    order, a Sort establishes its comparator's order, and a row limit preserves
    that order.
    These rules apply at the relevant input/output, including hidden score
-   columns; partition-local order does not establish a global order.
+   columns; partition-local order does not establish a global order. The
+   validator recomputes the order from the operators
+   (`optimizer::derived_order` over typed `OrderKey`s) rather than reading a
+   declared property. Three planner omissions in the identity tie-break are
+   comparator equivalences and accepted: an identity already in the
+   comparator, every identity when the query returns only order keys or
+   constants (rows that tie are indistinguishable), and the identities of
+   bindings the query does not name (anonymous endpoints, cycle temps),
+   after every named one.
 3. Check required properties and recorded prerequisites before accepting the
    plan. Cost estimates select among accepted candidates and cannot discharge
    a missing requirement.
+
+As built, predicate checks are two-sided. Retention requires every conjunct
+of the lowering to be tested somewhere in the pipelines the rows come from;
+origin requires every tested conjunct to be one the lowering requires, a
+constant `true`, or the identity equality that key narrowing derives (see the
+rule catalogue below). A plan that adds a predicate the query never wrote is
+therefore refused as surely as one that drops a written predicate. Each
+traversal keeps its identity: written endpoints, edge selection, direction,
+endpoint types and hop bounds.
+
+Acceptance is the only gate. Before the requirement checks, it checks that
+the plan is well formed: aggregate specifications agree with their typed
+signatures, every node's output schema agrees with what its operator
+derives, and a fusion's row keys are complete and canonical. Execution keeps
+only the checks that need the pinned snapshot or the bound values (traversal
+admission, literal and parameter conversion, stored-schema agreement). A
+saved plan that fails any acceptance check is a bad request (400) at the
+replay door, before execution; a fresh plan that fails one is a planner
+defect.
 
 Property checks do not by themselves prove row-selection equivalence. A plan
 with a dropped filter can have the same schema, ordering and row count. The
@@ -444,6 +482,10 @@ belong to the following closed list; anything else uses invariant checks only.
 No implicit cast, arithmetic, division, function call other than the selected
 BM25, clock/random read, subquery, list operation, traversal, join, optional
 match, aggregation, distinct, offset, nearest or RRF belongs to this fragment.
+As built, the admitted scalar types are Bool, I32, I64, U32, U64 and String,
+nullable or not, never a list; an integer literal compares with any integer
+property and a parameter only with its own declared type; a meta-field
+(`@id`) is no admitted operand, sort key or projection item.
 There is no inference from a general expression's claimed determinism. A
 parameter is resolved once; rewriting cannot reread the clock or substitute a
 new value. The fragment extends only through a versioned rule addition.
@@ -459,8 +501,11 @@ BM25. The planner records the facts forming `C`; replay verifies them against
 the accepted view. A changed eligible-id mask is not the same `C`.
 
 First reconstruct the canonical logical form from those checked inputs:
-`Project(V, Limit(n, Sort(K, Filter(p, S))))`, where `p=true` when absent and
-`S` is `Scan(C)` or `BM25(a, Scan(C))`. Match the compiler IR and initial
+`Limit(n, Sort(K, fetch=n, T, Project(V, [BM25(a)] Filter(p, Scan(C)))))`,
+the order the planner resolves a query in, where the projection carries
+every sort key as a hidden column, `Filter` is absent when `p=true`, `Sort`
+is absent for an unordered query, `T` is the identity tie-break and `fetch`
+is the limit. Match the compiler IR and initial
 logical plan to this form using the rules below, including typed column/alias
 maps. This also checks any pre-planner constant substitution against the
 retained bound values. A declaration, expression or hidden score lost during
@@ -469,8 +514,10 @@ well typed.
 
 A ***rewrite trace*** is a checked derivation from that form to the selected
 physical plan. It records rule ids, subtree references and typed substitutions.
-The checker reconstructs each successor itself and compares its typed
-structure to the proposed successor. Referenced nodes must already exist in
+The checker reconstructs each successor itself. As built, the trace carries no
+proposed successor: a successor is a function of its predecessor and the
+typed substitution, so a serialized copy would duplicate what the checker
+derives, and the final comparison with the candidate closes the derivation. Referenced nodes must already exist in
 the checked derivation. Node identity is established from validated contents;
 an optimizer-supplied id or hash is insufficient. The final reconstruction
 must equal the candidate, including all operator arguments, hidden-column
@@ -489,6 +536,27 @@ The initial rule catalogue is closed:
 | Use ordered top-k | `Limit(n, Sort(K, fetch=f, X))` becomes `Sort(K, fetch=min(n,f), X)`, taking `min(n,None)=n`. The same checked child `X`, typed comparator `K` and hidden-column map are retained. The Sort specification emits that ordered prefix. |
 | Remove a redundant Sort | `Sort(K, fetch=None, X)` becomes `X` only when independently derived global ordering has the full typed `K` as a prefix. With `fetch=f`, the successor is `Limit(f,X)`. Direction, null placement, comparison semantics, tie keys and output column mapping must all match. |
 
+As built in step 2a, the catalogue is the four rules the planner applies to
+the fragment: `lower` (any of the lowering rows above; the sort lowers after
+its ranking and leads with the score key), `absorb_scan_filter` (the
+unranked absorption row, `T` being the fragment's predicate grammar),
+`prune_scan_columns` (the scan reads a column set holding every column the
+nodes above it read and only columns of its table; it replaces the
+projection-placement row, since the planner prunes the scan rather than
+placing a projection) and `rank_bm25_scan` (the BM25 lowering row, with the
+eligibility placement below). The canonical sort already carries
+`fetch=n`, so no top-k rule applies, and the planner removes no Sort.
+
+Rules version 2 adds two rules. `narrow_key` lets the scan of a binding with
+a written equality on its type's single String key also test the identity
+equality `@id = <id>`, where `<id>` is the canonical id the loader derives
+from that key value; acceptance derives the id again through the catalog and
+admits no other conjunct by this rule. `hydrate_return_columns` is late
+materialization under a positive limit: the scan defers returned columns no
+other node reads and carries `_rowaddr` in their place, and a
+`HydrateColumns` root over the limit reads them from the same table by row
+address.
+
 `T` is a finite, versioned table from the admitted predicate's typed operators
 to typed scan-filter operators. Literal/parameter and property leaves retain
 their exact type, value and resolved identity; a comparison keeps its opcode
@@ -499,8 +567,17 @@ entry names source and target implementations of the same specified semantics
 and has null/boundary conformance tests. If an entry is absent, the absorption
 rule is unavailable and the standalone Filter remains. This is an enumerated
 implementation assumption, not a runtime test of arbitrary predicate
-equivalence. For BM25 the initial rules always keep eligibility above search;
-they never absorb it into the scoring scan.
+equivalence. As built, a BM25 scan absorbs eligibility like an unranked scan and
+declares where it applies it: before scoring (Lance's prefilter) only under
+the recorded full full-text coverage of the property, where Lance scores
+every row from the index's statistics and the filter changes no score;
+after scoring (Lance's postfilter, `prefilter(false)`) otherwise, which is
+eligibility above search. Lance scores fragments no full-text segment covers
+flat from statistics over the rows its prefilter admits, so filtering
+before scoring there changed BM25 scores; the step 2a regression
+`cases/v2/bm25_score_ignores_a_filter_over_an_unindexed_fragment.gqt` and the
+Lance guard `fts_prefilter_changes_unindexed_scores_and_postfilter_keeps_them`
+pin both facts.
 
 Projection carriers are internal columns, not returned fields. The outer
 visible projection may be implemented by a checked output-schema mapping,
@@ -524,7 +601,7 @@ binding/argument identity, retained predicate references, score origin,
 declared approximation, required ordering, cut placement and prerequisites,
 with their execution regressions. These checks do not establish population
 equivalence. Membership and the accepted scope are recorded in internal
-inspection/replay evidence, separately from retrieval `recall`.
+inspection/replay evidence, separately from the ranking a read reports.
 
 #### Evidence has bounded size and checking work
 
@@ -543,6 +620,22 @@ bound values, facts, evidence, rule/semantics versions and limits produce the
 same accept, invalid or budget-exhausted result; costs do not decide validity.
 Wall-clock timeout and cancellation remain separate resource outcomes.
 Exhaustion is not evidence that a query or plan is invalid.
+
+As built, `ValidationLimits::DEFAULT` allows 1 MiB of envelope bytes,
+4,096 derivation nodes, 1,024 rule applications and 2^20 visits; a visit is
+charged per expression and plan node checked and per conjunct an absorption
+copies. A member's derivation grows linearly with its conjuncts (the
+`instrument:` test `derivation_cost_grows_with_the_query` prints bytes, steps,
+nodes, visits and time; 256 conjuncts take about 58 KB, 261 steps and 11 ms).
+No planning-time memory pool exists. The checker's arena keeps only each
+role's current node and releases a replaced node before storing its
+successor, so its retained expressions partition the query's own: evidence
+memory is linear in the compiled query, whose size the request limits bound,
+while the node limit bounds the arena's slots and the visit charge bounds the
+copying work. The planner
+always records a member's derivation; no optional rewrite is skipped for
+budget, and exhaustion on a fresh plan is a resource outcome
+(`ResourceLimitExceeded`).
 
 If optional rewriting exceeds its evidence budget, use the already validated
 predecessor and its evidence. If baseline validation or replay exceeds the
@@ -579,6 +672,19 @@ trusted because it was serialized; any recorded branch observation must agree
 with the re-established evidence. This preserves the existing replay scope
 without asserting general equivalence between approximate search policies.
 
+As built, a `nearest` scan declares a `NearestPolicy` (`probe_factor`,
+`flat_rescan_on_unreached`, `uncapped_on_missing_counters`,
+`flat_when_eligible_within_fetch`), and every pre-pass declares `on_empty`
+(`proven_empty` for a standalone `nearest`, `postfilter` for a fusion) and
+`coverage_admits`, the recorded full coverage of the bm25 scans it feeds.
+The ladder and both gates read these from the plan. Acceptance requires a
+probe factor of at least two and both fallbacks, every pre-pass hop to be a
+required first hop of the query, feeds of the right kind, and the coverage
+guard to match the recorded facts. The execution report records each gate's
+verdict with its counts and each probe attempt per rung (`search`
+decisions, also profile rows), and a replay reruns the gates against the
+pinned snapshot and must record the same decisions.
+
 Replay carries original query inputs and the evidence for its accepted scope,
 including the exact-subset derivation when applicable. Its envelope identifies
 the evidence format, rule catalogue and compiler/operator semantics versions.
@@ -595,6 +701,18 @@ schema identities and snapshot facts remain fixed through execution.
 | Supplied evidence is malformed or fails a supported rule | Return invalid-evidence with the failing node/rule and reason. It is not a compiler defect merely because an external artifact is invalid. |
 | The planner produces invalid evidence, or a supported baseline lacks its required check | Report an internal compiler/planner defect. Do not turn the validator gap into a new language refusal. |
 | A configured validation limit, timeout or cancellation ends checking | Return the resource outcome defined above; no accepted wrapper is constructed. |
+
+As built, the replay envelope carries the query source and name, the scope,
+the digest of the accepted schema, the bound plan (whose values are the
+captured parameters) and a member's derivation, under `replay_version` 1,
+`rules_version` 2 and `semantics_version` 2 (the typed lowering and the
+step 5 total order). A version mismatch, a different
+schema digest and a dataset the plan did not pin are conflicts (409) that ask
+for the query again; malformed evidence or a plan failing a check is a bad
+request (400); exhaustion is `ResourceLimitExceeded` (413). The recorded
+full-text coverage is data-dependent evidence: replay reads it again from the
+pinned datasets, and a recorded value the snapshot contradicts is invalid
+evidence.
 
 Existing query-legality refusals and unavailable index prerequisites retain
 their distinct outcomes. Cross-version executable-plan portability is not
@@ -640,8 +758,9 @@ compiler with its code catalogue. `CompilerError::Query` carries it; its
 display is the legacy one-line form (`parse error: …`, `type error: T33: …`),
 so existing assertions and logic-test error needles keep holding. The planner
 builds the same type for its refusals, with `stage: plan` and the expression
-it refused; `plan_source::plan_query` maps `Unrouted::UnsupportedQuery` to
-that diagnostic instead of `no_plan`, which stays for genuine defects. The
+it refused; the engine's planning door (`plan_source::unaccepted`) maps
+`Unrouted::UnsupportedQuery` to that diagnostic instead of `no_plan`, which
+stays for genuine defects. The
 server's `ErrorOutput` gains the optional `diagnostic` detail, so every
 existing error body is byte-identical. A declaration without its parameter
 list needs a grammar recognizer (`missing_param_list`), because the parser
@@ -650,17 +769,41 @@ attempt it can name.
 
 ### Full-text index presence as a planning fact
 
-`PlanSource` gains one fact: whether a property's full-text index has built
-segments at the pinned dataset version. The planner reads it while resolving
+`PlanSource` gains one fact: whether a property's full-text index has
+segments at the pinned dataset version. Step 2a introduced it as
+`full_text_coverage` (`full`, `partial` or `absent`), recorded per ranked
+property in `Assumptions.full_text` for the eligibility placement; step 3
+reads `absent` for the refusal. The planner reads it while resolving
 a ranked scan or a search predicate and refuses when it is absent. The read
 goes through the recording wrapper, so the fact is part of the plan's
 `Assumptions` and a replay against another snapshot is refused, as for every
 other planner input. Index coverage of newer rows is not consulted: an
 uncovered tail is not a refusal.
 
+As built, the fact is derived from the planner's index facts for the pinned
+dataset, the same facts key narrowing and index selection read: `absent`
+when the property has no inverted index, `full` only when every inverted
+segment on the column reports known coverage of every fragment, and
+`partial` otherwise. Unknown coverage is never `full`. Replay derives it
+again from the pinned dataset.
+
 The `T27` rule is the catalog predicate index reconciliation already uses (a
 non-enum, single-column String `@index`), moved into the compiler so the type
 checker and reconciliation cannot drift.
+
+As built, step 3 lands after the change that makes every write declare a
+declared full-text column's analyzer with an untrained segment (an empty
+fragment bitmap, no postings), which Lance applies to every row no segment
+covers. `absent` therefore means only a table version with rows written
+before that change and never indexed since. Such a version refuses every
+full-text call on the property until the index is built (`omnigraph
+optimize` on main, `omnigraph rebuild-full-text-indexes --branch` on
+another branch); a historical snapshot of it stays refused. A table version
+with no fragment, and a type the snapshot does not hold, count as full,
+since no row could be answered differently. Every full-text call's property
+is checked and recorded, filters included, not only ranked scans, so replay
+re-derives each from the pinned dataset, and acceptance refuses a plan that
+records none, or `absent`, for a call it makes.
 
 ### The ranked binding roots its component
 
@@ -707,23 +850,30 @@ comparator defined in [One total order](#one-total-order). The runner's
 `ordered_refusal` drops its `rrf` rule and admits an
 aggregate order whose keys make it total.
 
-### Read descriptors
+### The ranking a read reports
 
-Each ranked `Scan` (`RankedAccess`), each retrieval arm stored inside a
-`RankFuse`, and the fusion itself yields a retrieval descriptor. Assign
-plan-local ids in deterministic preorder of the accepted physical plan,
-visiting fusion arms in query argument order. A retrieval embedded in an arm
-is identified by its fusion node and arm position, even when displayed fields
-match another arm. Revisiting the same producer reuses its id, including when
-multiple projections share it. The same accepted plan retains these ids on
-replay; a replan need not. Each projected column reading `_distance`, `_score`
-or `_rrf` yields a metric with its producer's `retrieval_id`. Both arrays
-are computed from the plan that ran, so they
-describe the selected retrieval and score producers. The shared validator
-separately checks the plan against the query's requirements within its stated
-scope. `recall` is a function of the retrieval kind: `nearest` is approximate,
-`bm25` exact, `rrf` approximate when
-either arm is.
+The planner derives what the plan says of the ranking
+(`omnigraph_planner::planned_ranking`): the search function of the one ranked
+`Scan` in the query's order, or `rrf` for a `RankFuse`; the return columns of
+the root's return list (a `return distinct`'s `Aggregate`) that read the
+ranking's score column, `_distance`, `_score` or `_rrf`, on the ranked
+binding (a fusion's primary arm's binding); and the ranked `nearest` scans. A
+plan with ranked scans of any other shape is an internal error, since
+acceptance refuses it. A stored property of a score column's name, on a
+schema older than the reservation, is no score column.
+
+The run supplies `exhaustive`. Each `nearest` scan records whether its last
+attempt in the pass whose rows the read returns ranked exactly: it was proven
+empty, ran flat (the ladder's choice, the overfetch loop's exact pass, or no
+vector index covering the column, which Lance reports by omitting both
+partition counters), searched every partition of the index, or returned every
+row it admitted, with no admitted row left unreached at `+inf`. Every vector
+index the engine builds is IVF_FLAT, which scores every row of a searched
+partition exactly; a source guard pins that. The ranking is exhaustive when
+every `nearest` scan's last attempt was exact; a `bm25` ranking has no
+candidate window and is exhaustive by construction. A scan the run never
+reached reports nothing and makes the ranking inexact. A replay repeats the
+run's probe decisions, so it reports the same ranking.
 
 ## Invariants
 
@@ -738,11 +888,11 @@ either arm is.
   never a refusal. The refusal follows RFC 0043's accepted fence shape and is
   lifted by the lexical RFC's exact scan.
 - **Bounded, observable resource use (11).** The fusion's `Sort` is a
-  streaming top-k; descriptors add no scan; the read floor is reported.
+  streaming top-k; the ranking adds no scan; the read floor is reported.
   Validation evidence and checking work have explicit limits and typed
   exhaustion outcomes, including decoding saved evidence.
-- **One source of truth (12).** Descriptors derive from the plan; no
-  retrieval description is kept beside it. The index fact is a recorded plan
+- **One source of truth (12).** The ranking derives from the plan and the
+  run's scan reports; no description of it is kept beside them. The index fact is a recorded plan
   input. Validation requirements derive from the checked query and remain
   independent of edits to the candidate plan.
 - Deny-list: no side channel for discarded rank (the fused score is a
@@ -751,8 +901,8 @@ either arm is.
 
 ## Compatibility and reversibility
 
-- **Wire:** `diagnostic`, `retrievals`, `metrics` and `usage` are additive and
-  omitted when absent. `POST /read` is untouched. OpenAPI regenerates.
+- **Wire:** `diagnostic`, `ranking` and `usage` are additive and omitted when
+  absent. `POST /read` is untouched. OpenAPI regenerates.
 - **Explain:** the additive validation-scope summary comes from the same
   acceptance path as execution. It does not add a validation field to an
   ordinary read response or expose the complete derivation by default.
@@ -786,7 +936,13 @@ either arm is.
 - **Record the retrieval in the `QueryIR`.** Rejected: engine v2's planner
   already states it once as typed plan nodes; a second record would be a
   second source of truth. Derived query requirements serve validation only;
-  they do not supply retrieval descriptors.
+  they do not supply the reported ranking.
+- **Describe every producer: `retrievals` and `metrics` arrays** with
+  plan-local ids, fusion-arm references, a per-kind `recall` label and
+  `embedding_coverage` (this RFC's earlier text). Rejected: a read has one
+  ranking, so ids name producers no client addresses separately; a label
+  fixed by the function repeats `by`; and a coverage that was always unknown
+  carried nothing.
 - **Validate only the final physical plan.** Rejected: deleting a search or
   filter can leave a structurally valid, ordered plan. Requirements retained
   from before lowering expose the missing obligation; checked rewrites cover
@@ -884,12 +1040,12 @@ and regressions. Step 7 can ship independently.
 | Step | Delivers | Closes |
 |---|---|---|
 | 1 | Diagnostics contract for parse and type refusals (PR #759, merged 2026-09-30) | None |
-| 2 | Planner refusals carry diagnostics; a refusal by design is a bad request | #786 |
-| 2a | Shared query/explain validation and acceptance; exact-subset rules, adaptive-policy checks, bounded/versioned replay evidence, GQT scope assertions | supports steps 3-6 |
-| 3 | `T27` and `FullTextIndexRequired` | #747 |
-| 4 | The ranked binding roots its component; the `rrf()` arms type error | #789 |
-| 5 | One total order: fused score column, `Sort` over fusion and search-ordered aggregates, `T37` retired | #787, #788 |
-| 6 | Read descriptors with producer ids and fusion-arm references | None |
+| 2 | Planner refusals carry diagnostics; a refusal by design is a bad request (PR #815, merged 2026-10-13) | #786 |
+| 2a | Shared query/explain validation and acceptance; exact-subset rules, adaptive-policy checks, bounded/versioned replay evidence, GQT scope assertions; the order checks of a fusion and of a search-ordered aggregate (PR #839, merged 2026-10-13) | supports steps 3-6 |
+| 3 | `T27` and `FullTextIndexRequired`, refusing only an index with no segment (PR #1066, merged 2026-10-18) | #747 |
+| 4 | The ranked binding roots its component; the `rrf()` arms type error (PR #1069, merged 2026-10-18) | #789 |
+| 5 | One total order: fused score column, `Sort` over fusion and search-ordered aggregates, `T37` retired, `T54` (PR #938, merged); its order checks land with step 2a | #787, #788 |
+| 6 | The ranking a read reports: search function, order, per-run exhaustiveness and score columns (PR #1130) | None |
 | 7 | Served read floor | #752 |
 | 8 | Engine v2 reverses a ranked component when selectivity and its mode-specific validation rule admit it | None (performance) |
 
@@ -905,6 +1061,9 @@ None.
 
 ## Decision log
 
+- 2026-10-05: Aligned this proposal with the maintainer-authorized removal of
+  deprecated HTTP routes. Removed Summary's `/read` byte-stability clause and
+  the read-descriptor exception for its envelope. The proposal remains draft.
 - 2026-09-01: first draft opened in PR #606, written against engine v1.
 - 2026-09-19: accepted as drafted in PR #606.
 - 2026-09-28: rewritten against engine v2 (`main` `b14c22c5`) and returned
@@ -931,3 +1090,101 @@ None.
   machine-applicable only after the edited text parses.
 - 2026-09-30: retitled to "Search plan validation and result guarantees" to
   reflect shared validation and the explicit scope of search result guarantees.
+- 2026-10-01: step 2a implemented, with these amendments where the
+  built planner differs from the text above and the behavior is sound: the
+  canonical form is the planner's resolve order, with the projection below
+  the sort; the derivation stores rule applications and substitutions, not
+  successors; the rule catalogue is `lower`, `absorb_scan_filter`,
+  `prune_scan_columns` and `rank_bm25_scan`; a BM25 scan filters before
+  scoring only under recorded full full-text coverage and after scoring
+  otherwise (which fixed filter-dependent scores on partially indexed
+  data); three tie-break omissions are comparator equivalences, and the
+  planner now orders declared bindings' identities before made-up ones (the
+  validator caught the old order); correlated blocks are required as
+  blocks; evidence memory is bounded by byte and node limits because no
+  planning pool exists; the fusion and aggregate order checks land with
+  step 5.
+- 2026-10-05: two review findings on step 2a, both fixed with regressions.
+  The row-cut check refused a wrong `limit` but accepted a cut the query
+  does not write; a plan now carries exactly the query's cut, one at the
+  root or none anywhere. The derivation arena kept every replaced node, so
+  its retained predicate data grew quadratically with the conjuncts while
+  every counter passed; it now releases a replaced node, and the statement
+  that the byte and node limits bound evidence memory is replaced by the
+  linear bound above.
+- 2026-10-06: a further review finding: the row-cut check counted `Limit`
+  and `Page` nodes only, so a capped `Sort` below the final sort cut rows
+  unseen. Every node kind now declares its count cut through one exhaustive
+  match, so a new kind cannot compile without a classification (a field
+  that gives an existing kind a cut still needs its arm audited by hand),
+  and acceptance justifies each declared cut by its position (root `Limit`
+  and final sort `fetch` at the query's `limit`, the fusion's limit, a
+  ranked scan's policy cap) and refuses every other.
+- 2026-10-10: step 2a brought onto the typed lowering, index facts, key
+  narrowing, late materialization and step 5. Requirements now come from
+  the compiler's typed lowering and compare by equality, types included;
+  the declaration supplies only the written score calls. Predicate checks
+  became two-sided (an added conjunct is refused, not only a dropped one),
+  and traversals keep their hop bounds, direction and endpoint types.
+  Acceptance is the single gate: the plan well-formedness checks the typed
+  lowering added to execution run first in acceptance, and a saved plan
+  failing them is a bad request at the replay door. Two rules joined the
+  catalogue (`narrow_key`, `hydrate_return_columns`; rules version 2), and
+  order checks for a fusion and a search-ordered aggregate replaced their
+  step 2a exemptions (semantics version 2); a fusion no longer cuts rows,
+  so acceptance justifies no fusion cut. Full-text coverage is derived
+  from the index facts, with unknown coverage never full. A constant return
+  item joined the tie-break equivalences, and an `order` clause whose keys
+  all fold to constants still requires the sort by the identity tie-break.
+  `return distinct`, which landed on main meanwhile, is checked as group
+  rows: its order keys bind to return items, its sort is total through
+  every unwritten group key with no identity tie-break, and it is outside
+  the exact fragment.
+- 2026-10-17: step 3 rescoped after writers began declaring every declared
+  full-text column's analyzer with an untrained segment. An untrained
+  segment carries the analyzer to the rows it does not cover, so
+  `FullTextIndexRequired` refuses only a property with no segment at all in
+  a table version that has rows: one written before that change and never
+  indexed since. Requiring built postings, as first drafted, would have
+  refused fresh writes the analyzer already answers. A table with no
+  fragment, and a type the snapshot does not hold, count as covered. The
+  remedy names the commands that exist (`optimize` on main,
+  `rebuild-full-text-indexes --branch` elsewhere); a command that builds a
+  branch's missing indexes alone (#840) is separate work. Steps 2 and 2a are
+  recorded as merged.
+- 2026-10-17: step 4 implemented. Lowering roots the component holding the
+  bindings the leading order key ranks; a ranked binding no declaration
+  introduces gets a scan of its checked type, so declaring it changes no
+  plan. Correlated blocks have no order and keep the searched-binding rule.
+  The `rrf()` refusal moved from the planner to the type checker as `T59`,
+  which carries the refused expression, and the planner codes `P001` and
+  `P005` are withdrawn: a compiled query no longer reaches either, so the
+  planner keeps both checks as internal errors against a lowering defect.
+  An `rrf()` over one reached binding keeps its arm windows, so its nearest
+  arm still ranks the corpus before the traversal keeps the reached rows.
+- 2026-10-26: step 6 implemented as one `ranking` object, amending the read
+  descriptors. Superseded: Summary item 5's "A read reports which retrievals
+  ran and what each projected rank column means"; "a descriptor derived from
+  that plan can describe the wrong plan consistently"; "An approximate recall
+  label alone does not authorize changing a candidate window or a scoring
+  population"; the whole of both "Read descriptors" sections, including the
+  `retrievals` and `metrics` arrays, "`recall` reports the source's contract,
+  not what one execution did", "`recall` is a function of the retrieval kind"
+  and the `embedding_coverage` bullet; the "Descriptors" table row; "separately
+  from retrieval `recall`"; "descriptors add no scan"; "Descriptors derive
+  from the plan; no retrieval description is kept beside it"; the wire
+  bullet's `retrievals` and `metrics`; "they do not supply retrieval
+  descriptors"; and rollout step 6's "Read descriptors with producer ids and
+  fusion-arm references". Reasons: acceptance admits one ranking per read, so
+  producer ids and arm references named nothing a client addresses
+  separately; a recall label fixed per function repeated the function, while
+  a client deciding whether to widen a search needs what the run did, now
+  `exhaustive`, which each answer states for itself, so no client relies on
+  a guarantee an index build removes; and `embedding_coverage` was always
+  unknown. Engine-built vector indexes have always been IVF_FLAT, so a search
+  of every partition is exact; a source guard now pins the constructor.
+  Readings: a column computed from a score, or a stored property of a score
+  column's name on a schema older than the reservation, is no score column;
+  and the Arrow IPC response, which has no JSON envelope, carries no
+  ranking. The result column types the self-contained server testing RFC
+  needs remain a separate additive change.

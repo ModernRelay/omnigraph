@@ -2,7 +2,9 @@ use super::*;
 use crate::dataset_index::is_full_text_index;
 use crate::error::missing_graph_type_at_snapshot;
 use crate::seams::{decide_seam, fail};
+use crate::table_store::{RefreshedIndex, TableStore};
 use lance::index::DatasetIndexExt;
+use omnigraph_compiler::types::PropIndexKind;
 
 pub(super) async fn graph_index(db: &Omnigraph) -> Result<Arc<crate::graph_index::GraphIndex>> {
     let (resolved, catalog) = db.capture_current_read_view().await?;
@@ -34,19 +36,96 @@ pub(super) async fn graph_index_for_resolved(
         .await
 }
 
-pub(super) async fn ensure_indices(db: &Omnigraph) -> Result<Vec<PendingIndex>> {
+pub(super) async fn ensure_indices(db: &Omnigraph) -> Result<IndexBuildResult> {
     let current_branch = db
         .coordinator
-        .read()
-        .await
+        .load_full()
         .current_branch()
         .map(str::to_string);
-    ensure_indices_for_branch(db, current_branch.as_deref()).await
+    ensure_indices_on_as(db, current_branch.as_deref().unwrap_or("main"), None).await
 }
 
-pub(super) async fn ensure_indices_on(db: &Omnigraph, branch: &str) -> Result<Vec<PendingIndex>> {
+pub(super) async fn ensure_indices_on_as(
+    db: &Omnigraph,
+    branch: &str,
+    actor: Option<&str>,
+) -> Result<IndexBuildResult> {
     let branch = normalize_branch_name(branch)?;
-    ensure_indices_for_branch(db, branch.as_deref()).await
+    let public_branch = branch.as_deref().unwrap_or("main");
+    db.enforce(
+        omnigraph_policy::PolicyAction::Change,
+        &omnigraph_policy::ResourceScope::Branch(public_branch.to_string()),
+        actor,
+    )?;
+    let outcome =
+        maintain_indices_for_branch(db, branch.as_deref(), IndexMaintenanceMode::Ensure, actor)
+            .await?;
+    Ok(IndexBuildResult {
+        branch: public_branch.to_string(),
+        graph_commit_id: outcome.graph_commit_id,
+        indexes: outcome.built_indexes,
+        pending: outcome.pending,
+    })
+}
+
+/// What one successful index build did on its branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexBuildResult {
+    /// The selected logical graph branch, including `main`.
+    pub branch: String,
+    /// The publication made by this operation, or `None` when no index had work.
+    pub graph_commit_id: Option<String>,
+    /// Every index built or refreshed, all published by `graph_commit_id`.
+    pub indexes: Vec<BuiltIndex>,
+    /// Declared indexes this pass leaves incomplete, each with its reason and remedy.
+    pub pending: Vec<PendingIndex>,
+}
+
+/// One index an index build published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltIndex {
+    pub type_key: String,
+    /// The indexed column: a declared property, or a system column such as
+    /// the identity column every table indexes.
+    pub property: String,
+    pub kind: BuiltIndexKind,
+    pub action: BuiltIndexAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BuiltIndexKind {
+    Btree,
+    FullText,
+    Vector,
+}
+
+impl BuiltIndexKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Btree => "btree",
+            Self::FullText => "full_text",
+            Self::Vector => "vector",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BuiltIndexAction {
+    /// The table had no usable index on the column; one was built from all
+    /// its rows.
+    Built,
+    /// The index left some of the table's current fragments uncovered; it
+    /// was rebuilt whole over all of them.
+    Refreshed,
+}
+
+impl BuiltIndexAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Built => "built",
+            Self::Refreshed => "refreshed",
+        }
+    }
 }
 
 /// The indexes replaced by one successfully published full-text rebuild.
@@ -75,6 +154,9 @@ enum IndexMaintenanceMode {
 struct IndexMaintenanceOutcome {
     pending: Vec<PendingIndex>,
     graph_commit_id: Option<String>,
+    /// What an `Ensure` pass published.
+    built_indexes: Vec<BuiltIndex>,
+    /// What a `RebuildFullText` pass published.
     rebuilt_indexes: Vec<RebuiltFullTextIndex>,
 }
 
@@ -185,17 +267,6 @@ pub(super) async fn failpoint_publish_table_head_without_index_rebuild_for_test(
     .await
 }
 
-pub(super) async fn ensure_indices_for_branch(
-    db: &Omnigraph,
-    branch: Option<&str>,
-) -> Result<Vec<PendingIndex>> {
-    Ok(
-        maintain_indices_for_branch(db, branch, IndexMaintenanceMode::Ensure, None)
-            .await?
-            .pending,
-    )
-}
-
 decide_seam! {
     pub static ENSURE_INDICES_POST_TABLE_EFFECT = ("ensure_indices.post_table_effect", Unreachable, [Fail]);
 }
@@ -245,6 +316,7 @@ async fn maintain_indices_for_branch(
             None => db.native_branch_for(branch).await?,
         }),
     };
+    let public_branch = active_branch.as_deref().unwrap_or("main");
     let catalog = Arc::clone(&txn.catalog);
 
     let mut targets: Vec<IndexTarget> = Vec::new();
@@ -271,7 +343,19 @@ async fn maintain_indices_for_branch(
         let ds = db.open_pinned_for_write(&full_path, entry).await?;
         let work = match mode {
             IndexMaintenanceMode::Ensure => {
-                plan_index_work_node(db, &catalog, type_name, &table_key, &ds).await?
+                let mut work =
+                    plan_index_work_node(db, &catalog, type_name, &table_key, &ds).await?;
+                work.refresh = TableStore::has_foldable_unindexed_fragments(ds.dataset()).await?;
+                let building = full_text_columns(&work.specs);
+                append_deferred_full_text_indexes(
+                    &ds,
+                    &table_key,
+                    public_branch,
+                    &building,
+                    &mut work.pending,
+                )
+                .await?;
+                work
             }
             IndexMaintenanceMode::RebuildFullText => {
                 let node = &catalog.node_types[type_name];
@@ -305,7 +389,10 @@ async fn maintain_indices_for_branch(
         let ds = db.open_pinned_for_write(&full_path, entry).await?;
         let work = match mode {
             IndexMaintenanceMode::Ensure => {
-                plan_index_work_edge_on_dataset(db, &ds, catalog.system_columns).await?
+                let mut work =
+                    plan_index_work_edge_on_dataset(db, &ds, catalog.system_columns).await?;
+                work.refresh = TableStore::has_foldable_unindexed_fragments(ds.dataset()).await?;
+                work
             }
             IndexMaintenanceMode::RebuildFullText => {
                 let edge = &catalog.edge_types[edge_name];
@@ -331,25 +418,60 @@ async fn maintain_indices_for_branch(
 
     // Validate the entire inventory before building any artifacts. In rebuild
     // mode an unsupported physical FTS index must refuse the whole operation,
-    // not leave a subset looking migrated. First-touch artifacts still wait
-    // for the fork.
-    for target in &targets {
-        if let Some(ds) = existing_targets.get(&target.table_key) {
-            let work = &work_by_table[&target.table_key];
-            let staged = db
-                .storage()
-                .stage_create_indices(ds, &work.specs)
-                .await
-                .map_err(|error| {
-                    error.with_context(format!(
-                        "stage index batch on {} ({:?})",
-                        target.table_key, work.specs
-                    ))
-                })?;
-            fail(&ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE)?;
-            existing_staged.insert(target.table_key.clone(), staged);
-        }
+    // not leave a subset looking migrated. An ensure target whose only work
+    // was a vector index that cannot train stages nothing and is dropped, so
+    // it never becomes a publication target beside productive siblings.
+    let mut refreshed_by_table = HashMap::<String, Vec<RefreshedIndex>>::new();
+    let mut staged_targets = Vec::with_capacity(targets.len());
+    for target in targets {
+        let Some(ds) = existing_targets.get(&target.table_key) else {
+            continue;
+        };
+        let work = &work_by_table[&target.table_key];
+        let context = |error: OmniError| {
+            error.with_context(format!(
+                "stage index batch on {} ({:?})",
+                target.table_key, work.specs
+            ))
+        };
+        let staged = match mode {
+            IndexMaintenanceMode::Ensure => {
+                let reconciliation = db
+                    .storage()
+                    .stage_index_reconciliation(ds, &work.specs)
+                    .await
+                    .map_err(context)?;
+                for (column, reason) in reconciliation.skipped {
+                    pending_by_table
+                        .entry(target.table_key.clone())
+                        .or_default()
+                        .push(PendingIndex {
+                            type_key: target.table_key.clone(),
+                            property: column,
+                            reason: format!(
+                                "vector index coverage lags and the column cannot train an index: {reason}"
+                            ),
+                        });
+                }
+                refreshed_by_table.insert(target.table_key.clone(), reconciliation.refreshed);
+                reconciliation.staged
+            }
+            IndexMaintenanceMode::RebuildFullText => Some(
+                db.storage()
+                    .stage_create_indices(ds, &work.specs)
+                    .await
+                    .map_err(context)?,
+            ),
+        };
+        let Some(staged) = staged else {
+            existing_targets.remove(&target.table_key);
+            continue;
+        };
+        fail(&ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE)?;
+        existing_staged.insert(target.table_key.clone(), staged);
+        staged_targets.push(target);
     }
+    let targets = staged_targets;
 
     let queue_keys: Vec<(String, Option<String>)> = targets
         .iter()
@@ -429,7 +551,11 @@ async fn maintain_indices_for_branch(
             })
             .collect::<crate::db::manifest::ExpectedTableVersions>();
         let lineage = db
-            .new_lineage_intent_for_branch(active_branch.as_deref(), actor)
+            .new_lineage_intent_for_branch(
+                active_branch.as_deref(),
+                actor,
+                HistoryReleaseBytes::PRODUCTION,
+            )
             .await?;
 
         let mut updates = Vec::with_capacity(targets.len());
@@ -452,7 +578,12 @@ async fn maintain_indices_for_branch(
             let witness = txn.authority.staging_witness()?;
             let (detached, identity) = db
                 .storage()
-                .commit_staged_detached(ds, staged, &witness)
+                .commit_staged_detached(
+                    ds,
+                    staged,
+                    &witness,
+                    &declared_full_text_columns(&catalog, &target.table_key),
+                )
                 .await?;
             let state = db
                 .storage()
@@ -484,6 +615,7 @@ async fn maintain_indices_for_branch(
             actor,
             &txn,
             lineage,
+            Publication::Publish,
         )
         .await?;
         Some(published.graph_commit_id)
@@ -496,6 +628,15 @@ async fn maintain_indices_for_branch(
     __dst_nk2.sort();
     for type_name in __dst_nk2 {
         if let Some(mut table_pending) = pending_by_table.remove(&format!("node:{type_name}")) {
+            pending.append(&mut table_pending);
+        }
+    }
+    // Edge tables declare no vector index, but a physical one that cannot
+    // train is still pending work and is reported after the node types.
+    let mut __dst_ek2: Vec<_> = catalog.edge_types.keys().collect();
+    __dst_ek2.sort();
+    for edge_name in __dst_ek2 {
+        if let Some(mut table_pending) = pending_by_table.remove(&format!("edge:{edge_name}")) {
             pending.append(&mut table_pending);
         }
     }
@@ -513,53 +654,147 @@ async fn maintain_indices_for_branch(
         }
         rebuilt_indexes.sort_by(|a, b| (&a.type_key, &a.property).cmp(&(&b.type_key, &b.property)));
     }
+    let mut built_indexes = Vec::new();
+    if mode == IndexMaintenanceMode::Ensure && graph_commit_id.is_some() {
+        for target in &targets {
+            let built = work_by_table[&target.table_key].specs.iter().map(|spec| {
+                let (property, kind) = match spec {
+                    crate::storage_layer::IndexBuildSpec::BTree { column, .. } => {
+                        (column, BuiltIndexKind::Btree)
+                    }
+                    crate::storage_layer::IndexBuildSpec::FullText { column } => {
+                        (column, BuiltIndexKind::FullText)
+                    }
+                    crate::storage_layer::IndexBuildSpec::Vector { column } => {
+                        (column, BuiltIndexKind::Vector)
+                    }
+                };
+                (property.clone(), kind, BuiltIndexAction::Built)
+            });
+            let refreshed = refreshed_by_table
+                .remove(&target.table_key)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|index| {
+                    let kind = if index.vector {
+                        BuiltIndexKind::Vector
+                    } else {
+                        BuiltIndexKind::Btree
+                    };
+                    (index.column, kind, BuiltIndexAction::Refreshed)
+                });
+            built_indexes.extend(built.chain(refreshed).map(|(property, kind, action)| {
+                BuiltIndex {
+                    type_key: target.table_key.clone(),
+                    property,
+                    kind,
+                    action,
+                }
+            }));
+        }
+        built_indexes.sort_by(|a, b| {
+            (&a.type_key, &a.property, a.kind).cmp(&(&b.type_key, &b.property, b.kind))
+        });
+    }
     Ok(IndexMaintenanceOutcome {
         pending,
         graph_commit_id,
+        built_indexes,
         rebuilt_indexes,
     })
 }
 
-/// The single scalar/vector index a node property receives from a one-column
-/// `@index`/`@key` declaration, or `None` when the property type is not
-/// indexable here (a list column or `Blob`).
-///
-/// Shared by `build_indices_on_dataset_for_catalog` (which builds the index)
-/// and `index_work_status_on_dataset_for_catalog` (which decides whether a
-/// table has index work to commit) so the two cannot drift: an enum or
-/// orderable scalar the builder gives a BTREE must also be reported as "needs
-/// work" until that BTREE exists.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum NodePropIndexKind {
-    Btree,
-    Fts,
-    Vector,
+/// The columns whose full-text index `specs` build whole.
+fn full_text_columns(specs: &[crate::storage_layer::IndexBuildSpec]) -> Vec<&str> {
+    specs
+        .iter()
+        .filter_map(|spec| match spec {
+            crate::storage_layer::IndexBuildSpec::FullText { column } => Some(column.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
-fn node_prop_index_kind(prop_type: &PropType) -> Option<NodePropIndexKind> {
-    if prop_type.list {
-        return None;
+/// Full-text coverage index maintenance leaves to the explicit rebuild: a
+/// full-text index whose segments leave a current fragment uncovered, or
+/// whose coverage is unknown. It is observable status, never folded
+/// (`TableStore::can_fold_index`); uncovered rows are still matched with the
+/// index's analyzer. `building` names columns the caller builds whole in the
+/// same pass, which that build covers. Optimize rechecks after physical work
+/// too: stable-ID compaction can change coverage while preserving index
+/// artifacts.
+pub(super) async fn append_deferred_full_text_indexes(
+    snapshot: &crate::storage_layer::SnapshotHandle,
+    table_key: &str,
+    branch: &str,
+    building: &[&str],
+    pending: &mut Vec<PendingIndex>,
+) -> Result<()> {
+    use lance::index::DatasetIndexInternalExt;
+
+    let ds = snapshot.dataset();
+    let indices = ds.load_indices().await.map_err(OmniError::storage)?;
+    let full_text: std::collections::BTreeMap<_, _> = indices
+        .iter()
+        .filter(|index| is_full_text_index(index))
+        .map(|index| (index.name.as_str(), index))
+        .collect();
+    let remedy = crate::error::FULL_TEXT_REBUILD_COMMAND.replace("<branch>", branch);
+    for (name, index) in full_text {
+        let coverage_unknown = indices
+            .iter()
+            .any(|segment| segment.name == name && segment.fragment_bitmap.is_none());
+        if !coverage_unknown
+            && ds
+                .unindexed_fragments(name)
+                .await
+                .map_err(OmniError::storage)?
+                .is_empty()
+        {
+            continue;
+        }
+        for field in index
+            .keyed_fields()
+            .iter()
+            .filter_map(|id| ds.schema().field_by_id(*id))
+            .filter(|field| !building.contains(&field.name.as_str()))
+        {
+            pending.push(PendingIndex {
+                type_key: table_key.to_string(),
+                property: field.name.clone(),
+                reason: format!(
+                    "full-text index '{name}' has incomplete or unknown coverage; run {remedy}"
+                ),
+            });
+        }
     }
-    // Enums are physically `String` but filtered by equality, so they take a
-    // scalar BTREE, not an FTS inverted index (Lance never consults an inverted
-    // index for `=`/range). Free-text Strings keep FTS for
-    // `search()`/`match_text`/`bm25`.
-    let is_enum = prop_type.enum_values.is_some();
-    match prop_type.scalar {
-        ScalarType::String if !is_enum => Some(NodePropIndexKind::Fts),
-        ScalarType::Vector(_) => Some(NodePropIndexKind::Vector),
-        ScalarType::String
-        | ScalarType::DateTime
-        | ScalarType::Date
-        | ScalarType::I32
-        | ScalarType::I64
-        | ScalarType::U32
-        | ScalarType::U64
-        | ScalarType::F32
-        | ScalarType::F64
-        | ScalarType::Bool => Some(NodePropIndexKind::Btree),
-        ScalarType::Blob => None,
-    }
+    Ok(())
+}
+
+/// The columns of `table_key` that carry a declared full-text index: every
+/// one-column `@index`/`@key` node property [`PropType::index_kind`] maps to
+/// full text, the same rule the index builder follows. Edges declare none.
+/// Every detached commit a writer publishes declares them
+/// (`TableStore::commit_staged_detached`).
+pub(crate) fn declared_full_text_columns(catalog: &Catalog, table_key: &str) -> Vec<String> {
+    let Some(node_type) = table_key
+        .strip_prefix("node:")
+        .and_then(|type_name| catalog.node_types.get(type_name))
+    else {
+        return Vec::new();
+    };
+    let mut columns: Vec<String> = node_type
+        .indices
+        .iter()
+        .filter_map(|index_cols| match index_cols.as_slice() {
+            [property] if node_type.has_full_text_index(property) => Some(property),
+            _ => None,
+        })
+        .cloned()
+        .collect();
+    columns.sort();
+    columns.dedup();
+    columns
 }
 
 /// Whether a vector column currently has at least one non-null vector — the
@@ -599,20 +834,24 @@ pub(super) struct IndexWorkStatus {
 /// zero commits and must NOT become publication targets).
 ///
 /// Per `build_indices_on_dataset_for_catalog`, nodes get BTree (id) plus, for
-/// each one-column `@index`/`@key` property, the index `node_prop_index_kind`
+/// each one-column `@index`/`@key` property, the index `PropType::index_kind`
 /// assigns: a scalar BTREE for enums and orderable scalars
 /// (DateTime/Date/numeric/Bool), FTS for free-text Strings, or a Vector
 /// index. Edges get BTree only (id, src, dst). This helper and the builder
-/// share `node_prop_index_kind` so they cannot drift — see its doc comment.
+/// share `PropType::index_kind` so they cannot drift — see its doc comment.
 #[derive(Default)]
 pub(super) struct PlannedIndexWork {
     pub(super) specs: Vec<crate::storage_layer::IndexBuildSpec>,
     pub(super) pending: Vec<PendingIndex>,
+    /// A foldable index leaves a current fragment uncovered, so a branch's
+    /// index build rebuilds it whole (`TableStore::stage_index_reconciliation`).
+    /// Optimize plans its fold separately and leaves this unset.
+    pub(super) refresh: bool,
 }
 
 impl PlannedIndexWork {
     fn needs_commit(&self) -> bool {
-        !self.specs.is_empty()
+        !self.specs.is_empty() || self.refresh
     }
 
     /// A property can reach the catalog's index-intent list through more than
@@ -638,9 +877,9 @@ async fn plan_full_text_rebuild(
     let mut columns = BTreeSet::new();
     for declaration in declarations {
         if let [column] = declaration.as_slice()
-            && properties.get(column).is_some_and(|property| {
-                node_prop_index_kind(property) == Some(NodePropIndexKind::Fts)
-            })
+            && properties
+                .get(column)
+                .is_some_and(|property| property.index_kind() == Some(PropIndexKind::FullText))
         {
             columns.insert(column.clone());
         }
@@ -696,9 +935,9 @@ async fn plan_full_text_rebuild(
             .filter(|_| index.covering_fields.is_empty())
             .and_then(|id| dataset.schema().fields.iter().find(|field| field.id == id));
         let Some(field) = field.filter(|field| {
-            properties.get(&field.name).is_some_and(|property| {
-                node_prop_index_kind(property) == Some(NodePropIndexKind::Fts)
-            })
+            properties
+                .get(&field.name)
+                .is_some_and(|property| property.index_kind() == Some(PropIndexKind::FullText))
         }) else {
             return Err(OmniError::manifest(format!(
                 "cannot rebuild full-text index '{}' on {}: only single, non-list, \
@@ -720,6 +959,7 @@ async fn plan_full_text_rebuild(
             .map(|column| crate::storage_layer::IndexBuildSpec::FullText { column })
             .collect(),
         pending: Vec::new(),
+        refresh: false,
     })
 }
 
@@ -760,15 +1000,18 @@ async fn plan_index_work_node(
         let Some(prop_type) = node_type.properties.get(prop_name) else {
             continue;
         };
-        match node_prop_index_kind(prop_type) {
-            Some(NodePropIndexKind::Fts) => {
-                if !db.storage().has_fts_index(ds, prop_name).await? {
+        match prop_type.index_kind() {
+            // An untrained segment only declares the analyzer
+            // (`TableStore::commit_staged_detached`); the postings are built
+            // here once no segment covers a fragment.
+            Some(PropIndexKind::FullText) => {
+                if !db.storage().has_fts_postings(ds, prop_name).await? {
                     work.push_spec(crate::storage_layer::IndexBuildSpec::FullText {
                         column: prop_name.clone(),
                     });
                 }
             }
-            Some(NodePropIndexKind::Vector) => {
+            Some(PropIndexKind::Vector) => {
                 if !db.storage().has_vector_index(ds, prop_name).await? {
                     if vector_column_trainable(db, ds, prop_name).await? {
                         work.push_spec(crate::storage_layer::IndexBuildSpec::Vector {
@@ -783,15 +1026,13 @@ async fn plan_index_work_node(
                     }
                 }
             }
-            Some(NodePropIndexKind::Btree)
-                if !db.storage().has_btree_index(ds, prop_name).await? =>
-            {
+            Some(PropIndexKind::Btree) if !db.storage().has_btree_index(ds, prop_name).await? => {
                 work.push_spec(crate::storage_layer::IndexBuildSpec::BTree {
                     column: prop_name.clone(),
                     name: None,
                 });
             }
-            Some(NodePropIndexKind::Btree) | None => {}
+            Some(PropIndexKind::Btree) | None => {}
         }
     }
     Ok(work)
@@ -1019,7 +1260,7 @@ pub(super) async fn open_owned_dataset_for_branch_write(
 /// vectors can be retried once populated; an existing full-text index with
 /// incomplete coverage requires explicit rebuilding. `reason` names the remedy.
 /// Reads retain their unindexed fallback; this status alone is not a write.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingIndex {
     pub type_key: String,
     pub property: String,
@@ -1170,15 +1411,13 @@ async fn commit_prepared_updates(
     updates: &[crate::db::DatasetUpdate],
     actor_id: Option<&str>,
 ) -> Result<u64> {
+    let (installed, mut next) = db.installed_coordinator_copy();
+    let outcome = next.commit_updates_with_actor(updates, actor_id).await;
+    db.install_coordinator(next, &installed);
     let PublishedSnapshot {
         graph_manifest_version: manifest_version,
         ..
-    } = db
-        .coordinator
-        .write()
-        .await
-        .commit_updates_with_actor(updates, actor_id)
-        .await?;
+    } = outcome?;
     Ok(manifest_version)
 }
 
@@ -1189,15 +1428,15 @@ async fn commit_prepared_updates_with_expected(
     expected_table_versions: &crate::db::manifest::ExpectedTableVersions,
     actor_id: Option<&str>,
 ) -> Result<u64> {
+    let (installed, mut next) = db.installed_coordinator_copy();
+    let outcome = next
+        .commit_updates_with_actor_with_expected(updates, expected_table_versions, actor_id)
+        .await;
+    db.install_coordinator(next, &installed);
     let PublishedSnapshot {
         graph_manifest_version: manifest_version,
         ..
-    } = db
-        .coordinator
-        .write()
-        .await
-        .commit_updates_with_actor_with_expected(updates, expected_table_versions, actor_id)
-        .await?;
+    } = outcome?;
     Ok(manifest_version)
 }
 
@@ -1211,8 +1450,7 @@ pub(super) async fn commit_prepared_updates_on_branch_with_expected(
 ) -> Result<u64> {
     let current_branch = db
         .coordinator
-        .read()
-        .await
+        .load_full()
         .current_branch()
         .map(str::to_string);
     let requested_branch = branch.map(str::to_string);
@@ -1263,17 +1501,82 @@ pub(super) async fn commit_updates(
 ) -> Result<u64> {
     let current_branch = db
         .coordinator
-        .read()
-        .await
+        .load_full()
         .current_branch()
         .map(str::to_string);
     let prepared = prepare_updates_for_commit(db, current_branch.as_deref(), updates, None).await?;
     commit_prepared_updates(db, &prepared, None).await
 }
 
+/// Where a prepared write's publication lands.
+pub(crate) enum Publication {
+    /// Advance the branch head: the ordinary publish.
+    Publish,
+    /// Write an unpublished commit (RFC "Unpublished graph commits"): the
+    /// branch head is unchanged, and a merge carries its held inputs.
+    Propose(Option<crate::db::manifest::UnpublishedMergeInputs>),
+    /// Write an unattached snapshot (RFC "Unattached graph branches"): a
+    /// root over the live head or a child over its base snapshot; the branch
+    /// head is unchanged and the snapshot never publishes.
+    Unattached(crate::db::manifest::UnattachedWriteBase),
+}
+
+async fn publish_prepared(
+    coordinator: &mut crate::db::graph_coordinator::GraphCoordinator,
+    changes: &[ManifestChange],
+    expected_table_versions: &crate::db::manifest::ExpectedTableVersions,
+    lineage_intent: crate::db::manifest::LineageIntent,
+    expectation: crate::db::manifest::GraphHeadExpectation,
+    publication: Publication,
+) -> Result<crate::db::GraphCommit> {
+    match publication {
+        Publication::Publish => {
+            let precondition =
+                crate::db::manifest::PublishPrecondition::ExactGraphHead(expectation);
+            Ok(coordinator
+                .commit_changes_with_intent_and_expected(
+                    changes,
+                    expected_table_versions,
+                    lineage_intent,
+                    &precondition,
+                )
+                .await?
+                .commit)
+        }
+        Publication::Propose(merge) => {
+            coordinator
+                .propose_changes(
+                    changes,
+                    expected_table_versions,
+                    &lineage_intent,
+                    &expectation,
+                    merge,
+                )
+                .await
+        }
+        Publication::Unattached(base) => {
+            let intent = crate::db::manifest::UnattachedIntent {
+                branch: expectation.branch.clone(),
+                actor_id: lineage_intent.actor_id.clone(),
+                created_at: lineage_intent.created_at,
+            };
+            coordinator
+                .propose_unattached(
+                    changes,
+                    expected_table_versions,
+                    &intent,
+                    &expectation,
+                    &base,
+                )
+                .await
+        }
+    }
+}
+
 /// Commit updates with a publisher-level OCC fence. The
 /// `expected_table_versions` map asserts the manifest's pre-write per-table
 /// versions; mismatches surface as `ManifestConflictDetails::PublishedDatasetVersionMismatch`.
+/// `publication` chooses the head-advancing publish or an unpublished commit.
 pub(super) async fn commit_updates_on_branch_with_expected(
     db: &Omnigraph,
     branch: Option<&str>,
@@ -1282,13 +1585,19 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     actor_id: Option<&str>,
     txn: &crate::db::WriteTxn,
     lineage_intent: crate::db::manifest::LineageIntent,
+    publication: Publication,
 ) -> Result<crate::db::GraphCommit> {
     if branch != txn.branch.as_deref() {
         return Err(OmniError::manifest_internal(
             "publication branch differs from its captured write transaction",
         ));
     }
-    let prepared = prepare_updates_for_commit(db, branch, updates, Some(txn)).await?;
+    // Every step before `publish_prepared` reads; the detached effects the
+    // updates name are unreachable until the publisher's one CAS, so a failure
+    // here is definite.
+    let prepared = prepare_updates_for_commit(db, branch, updates, Some(txn))
+        .await
+        .map_err(OmniError::unpublished)?;
 
     debug_assert_eq!(lineage_intent.actor_id.as_deref(), actor_id);
     let changes = prepared
@@ -1301,41 +1610,57 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         txn.authority.branch_identifier.clone(),
         txn.authority.graph_head.clone(),
     );
-    let precondition = crate::db::manifest::PublishPrecondition::ExactGraphHead(expectation);
 
-    // Choose and publish through one coordinator lock. A same-name cached
-    // coordinator can still hold another incarnation or incomplete lineage,
-    // so only an exact captured view is reused without a fresh open.
-    let mut active = db.coordinator.write().await;
-    let published = if branch == active.current_branch() {
-        let captured_view_matches = active.branch_identifier().await?
+    let advances_head = matches!(publication, Publication::Publish);
+    let installed = db.coordinator.load_full();
+    let bound_view = if branch == installed.current_branch() {
+        let captured_view_matches = installed
+            .branch_identifier()
+            .await
+            .map_err(OmniError::unpublished)?
             == txn.authority.branch_identifier
-            && active.exact_graph_head() == txn.authority.graph_head
-            && active.version() == txn.base.graph_manifest_version();
-        if !captured_view_matches {
-            // Keep the handle's binding while replacing only stale state.
-            // The publisher still reads fresh authority and applies its CAS.
-            *active = db.open_coordinator_for_branch(branch).await?;
-        }
-        active
-            .commit_changes_with_intent_and_expected(
-                &changes,
-                expected_table_versions,
-                lineage_intent,
-                &precondition,
-            )
-            .await?
+            && installed.exact_graph_head() == txn.authority.graph_head
+            && installed.version() == txn.base.graph_manifest_version();
+        Some(
+            captured_view_matches
+                .then(|| crate::db::graph_coordinator::GraphCoordinator::clone(&installed)),
+        )
+    } else {
+        None
+    };
+    let published = if let Some(captured) = bound_view {
+        let mut next = match captured {
+            Some(view) => view,
+            None => db
+                .open_coordinator_for_branch(branch)
+                .await
+                .map_err(OmniError::unpublished)?,
+        };
+        let outcome = publish_prepared(
+            &mut next,
+            &changes,
+            expected_table_versions,
+            lineage_intent,
+            expectation,
+            publication,
+        )
+        .await;
+        db.install_coordinator(next, &installed);
+        outcome?
     } else {
         // An operation on a non-bound branch owns its coordinator locally;
         // it must never temporarily change this handle's query/write binding.
-        drop(active);
         let cache_key = branch.unwrap_or("main");
         let captured = {
             let mut cache = db.merge_authority_cache.lock().await;
             let matches = if let Some((key, coordinator)) = cache.as_ref() {
                 key == cache_key
                     && coordinator.current_branch() == branch
-                    && coordinator.branch_identifier().await? == txn.authority.branch_identifier
+                    && coordinator
+                        .branch_identifier()
+                        .await
+                        .map_err(OmniError::unpublished)?
+                        == txn.authority.branch_identifier
                     && coordinator.exact_graph_head() == txn.authority.graph_head
                     && coordinator.version() == txn.base.graph_manifest_version()
             } else {
@@ -1349,24 +1674,65 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         };
         let mut coordinator = match captured {
             Some(coordinator) => coordinator,
-            None => db.open_coordinator_for_branch(branch).await?,
+            None => db
+                .open_coordinator_for_branch(branch)
+                .await
+                .map_err(OmniError::unpublished)?,
         };
         // The cache supplies only the already captured starting view. The
         // publisher still reads fresh state and enforces ExactGraphHead on
         // every CAS attempt. On error, drop a taken cache view; the next
         // capture must resolve any ambiguous durable publication.
-        let published = coordinator
-            .commit_changes_with_intent_and_expected(
-                &changes,
-                expected_table_versions,
-                lineage_intent,
-                &precondition,
-            )
-            .await?;
+        let published = publish_prepared(
+            &mut coordinator,
+            &changes,
+            expected_table_versions,
+            lineage_intent,
+            expectation,
+            publication,
+        )
+        .await?;
         *db.merge_authority_cache.lock().await = Some((cache_key.to_string(), coordinator));
         published
     };
-    Ok(published.commit)
+    if advances_head {
+        evict_superseded_handles(db, &txn.base, updates).await;
+    }
+    Ok(published)
+}
+
+/// Drop the held handle of every pin this publication replaced on its
+/// branch. The branch now names the new pins, so the base versions left its
+/// working set; holding them kept one decoded manifest, which lists every
+/// fragment, per superseded version of a steadily written table (issue 859).
+/// Keys stay version-exact, so this is memory hygiene: another branch still
+/// at a base pin pays at most one reopen.
+async fn evict_superseded_handles(
+    db: &Omnigraph,
+    base: &crate::db::Snapshot,
+    updates: &[crate::db::DatasetUpdate],
+) {
+    let handles = &db.read_caches().handles;
+    for update in updates {
+        let Some(entry) = base.dataset(&update.type_key) else {
+            continue;
+        };
+        let replaced = entry.published_dataset_version != update.published_dataset_version
+            || entry.native_dataset_branch != update.native_dataset_branch
+            || entry.version_metadata.staged_version() != update.version_metadata.staged_version()
+            || entry.version_metadata.e_tag() != update.version_metadata.e_tag();
+        if replaced {
+            handles
+                .evict(&omnigraph_core::handle_cache::TableHandleKey::new(
+                    &entry.dataset_path,
+                    entry.native_dataset_branch.as_deref(),
+                    entry.published_dataset_version,
+                    entry.version_metadata.staged_version(),
+                    entry.version_metadata.e_tag(),
+                ))
+                .await;
+        }
+    }
 }
 
 pub(super) async fn invalidate_graph_index(db: &Omnigraph) {

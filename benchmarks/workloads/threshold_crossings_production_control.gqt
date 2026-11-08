@@ -1,0 +1,56 @@
+# issue: none
+# notes: Selected insert at a configured history-release boundary shape; no optimize/index/cache threshold is assumed.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- mutate
+set history_release_bytes = 262144;
+--- expect ok
+
+--- mutate branch: b
+query next_publish() { insert Person { name: "carol", age: 1 } }
+--- expect affected: nodes=1 edges=0
+
+--- query branch: b
+query current_rows() { match { $r: Person } return { $r.name as name, $r.age as age } }
+--- expect unordered
+{"name":"alice","age":3}
+{"name":"bob","age":0}
+{"name":"carol","age":1}
+--- expect shape
+name: String
+age: I32
+
+--- query branch: main
+query current_rows() { match { $r: Person } return { $r.name as name, $r.age as age } }
+--- expect unordered
+{"name":"alice","age":0}
+{"name":"bob","age":0}
+--- expect shape
+name: String
+age: I32
+
+--- restart
+
+--- query branch: b
+query current_rows() { match { $r: Person } return { $r.name as name, $r.age as age } }
+--- expect unordered
+{"name":"alice","age":3}
+{"name":"bob","age":0}
+{"name":"carol","age":1}
+--- expect shape
+name: String
+age: I32
+
+--- query branch: main
+query current_rows() { match { $r: Person } return { $r.name as name, $r.age as age } }
+--- expect unordered
+{"name":"alice","age":0}
+{"name":"bob","age":0}
+--- expect shape
+name: String
+age: I32

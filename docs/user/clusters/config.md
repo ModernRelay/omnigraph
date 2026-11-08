@@ -1,6 +1,8 @@
 # Cluster configuration reference
 
-Cluster commands read a directory containing `cluster.yaml`:
+`--config DIR` reads desired configuration from a directory containing
+`cluster.yaml`. `--target NAME|ADDRESS` separately selects the backend for
+plan, apply and observation. Validation needs only source files:
 
 ```bash
 omnigraph cluster validate --config ./company-brain
@@ -17,7 +19,7 @@ version: 1
 metadata:
   name: company-brain
 
-# Omit for a cluster stored in this directory.
+# Optional assertion: must match the selected target for plan/apply.
 storage: s3://company-data/omnigraph/company-brain
 
 state:
@@ -57,9 +59,9 @@ policies:
 |---|---:|---|
 | `version` | yes | Configuration schema; currently `1` |
 | `metadata.name` | no | Display name |
-| `storage` | no | Cluster root: local by default, or `file://`, `s3://`, `az://` |
+| `storage` | no | Optional root assertion; must match the selected target for direct or server plan/apply |
 | `state.backend` | no | Omit or set to `cluster` |
-| `state.lock` | no | Serialize cluster operations; defaults to `true` |
+| `state.lock` | no | Exclusive writer admission; omit or set to `true`; `false` refuses execution |
 | `providers.embedding` | no | Named embedding provider profiles |
 | `graphs` | no | Graph declarations keyed by graph ID |
 | `policies` | no | Policy bundles keyed by bundle name |
@@ -107,9 +109,10 @@ type-check against the graph's desired schema fail validation.
 
 Provider `kind` may be `openai-compatible`, `openai`, `gemini`, or `mock`.
 Real providers require `api_key: ${ENVIRONMENT_VARIABLE}`; inline secrets are
-rejected. The environment variable is resolved when the server boots, not by
-`cluster validate`, `plan`, or `apply`. Vector dimensions remain part of the
-graph schema.
+rejected. The serving process resolves the environment variable at boot and
+during live deployment preflight for affected graphs. `cluster validate`,
+`plan`, and direct apply do not resolve it. Vector dimensions remain part of
+the graph schema.
 
 See [Embeddings](../search/embeddings.md) for provider behavior.
 
@@ -130,13 +133,13 @@ embedded host and may permit a local `file://` directory; it is not installed
 by the HTTP server or direct-store CLI. Bases must be absolute, non-overlapping,
 and free of credentials, query strings, fragments, and path traversal.
 
-A base must also name storage outside the cluster's storage root: the config
-directory when `storage` is omitted, or the `storage` URI. That root holds every
-graph and the applied state, and ingress reads with the process's own storage
-credentials, so a base over it would let any writer copy another graph's data
-or the cluster ledger into a readable Blob value. `cluster validate`, `plan`,
-and `apply` refuse such a base with `external_blob_base_overlaps_storage_root`,
-whatever its scope. Put external objects under a sibling prefix instead, for
+A base must also name storage outside the selected cluster root. That root
+holds every graph and the applied state, and ingress reads with the process's
+own storage credentials, so a base over it would let any writer copy another
+graph's data or the cluster ledger into a readable Blob value. Plan and apply
+refuse such a base with `external_blob_base_overlaps_storage_root`, whatever
+its scope. Offline validation checks overlap when `storage` declares a root;
+otherwise the destination check waits for plan/apply. Put external objects under a sibling prefix instead, for
 example `s3://company-assets/cluster-external/` beside
 `storage: s3://company-assets/cluster`. A server that finds an overlapping
 `server_safe` base in the applied state quarantines that graph and serves the
@@ -153,8 +156,10 @@ because disjointness cannot be proven. Moving the base does not clear that
 code; the storage root spelling does.
 
 The allow-list controls which external objects an authorized writer may cause
-the process to inspect. Cedar policy separately decides who may write. See
-[Blob values](../blobs.md).
+the process to inspect: a new external Blob reference, and the source of a
+`load csv` statement, which the engine reads in full once
+([CSV loading](../mutations/index.md#csv-loading)). Cedar policy separately
+decides who may write. See [Blob values](../blobs.md).
 
 ## Policies
 
@@ -174,13 +179,19 @@ Only one bundle may bind a given graph or the cluster scope. See
 
 ## Storage
 
-When `storage` is omitted, applied state and graph data live under the config
-directory. An `s3://` or `az://` value puts them under that object-storage root;
-the source bundle still stays in the operator's working tree.
+Plan and apply always use the selected direct-root or server target. Omitting
+`storage` makes the bundle portable between explicitly selected destinations.
+If present, `storage` is an equality assertion: a mismatch refuses before
+effects. Remote operations require an absolute path or `file://`, `s3://` or
+`az://` URI and read only source files from the caller's filesystem.
 
-Use the standard storage credential environment for the chosen backend. Azure
-is a qualification preview and requires the admission wrapper for every writer;
-see [Deployment](../deployment.md#azure-blob-preview).
+Registered direct targets accept local files only. The storage assertion above
+describes the deployment root; it does not select a target. An inline `s3://`
+root reaches only the commands listed in
+[S3 cluster roots](../operations/s3-cluster-roots.md).
+Cloud storage credentials and provider settings belong to the server or embedded
+initializer. Azure remains a qualification preview and requires its admission
+wrapper for every writer; see [Deployment](../deployment.md#azure-blob-preview).
 
 ## Declared paths
 
@@ -201,26 +212,21 @@ Prefer relative paths; they are what keep a bundle portable and hermetic.
 | Command | Changes graph or cluster state? | Use |
 |---|---:|---|
 | `validate` | no | Parse and type-check the declaration |
-| `plan` | no | Preview creates, updates, and deletes |
-| `apply` | yes | Converge to the declaration |
-| `approve` | yes | Approve one exact destructive plan item |
-| `status` | no | Read recorded state and lock status |
-| `refresh` | state only | Refresh observations for declared graphs |
-| `import` | state only | Adopt existing declared resources |
+| `plan` | no | Preview desired differences; unsupported deployment effects still refuse |
+| `apply` | yes | Converge graph inventory, schemas, queries, policies and provider/Blob settings |
+| `status` | no | Read recorded deployment and lock status; server status also observes activation |
+| `observe` | no | Report current observations without changing authority |
 | `force-unlock` | yes | Remove one proven-stale lock by exact ID |
-| `upgrade-ledger` | state only | Convert an applied, stopped cluster to durable offline deployments |
+| `upgrade-ledger` | state only | Convert a stopped legacy ledger without resetting graph data |
 
-On a v1 ledger, `apply` can create graphs, apply supported schema changes, publish query
-and policy resources, and execute approved graph deletion. It does not load
-graph data or start servers. A schema drop removes the data from the branch
-head and reclaims nothing at apply; `omnigraph cleanup` is the step that makes
-it unrecoverable. The plan shows such a step as `drop_property` or `drop_type`,
-with no mode.
-
-After explicit conversion to a v2 ledger, apply supports only schema and stored
-query changes on existing graphs, and requires `state.lock: true`. Other
-bindings and inventory remain fixed. Root-addressed status, reconciliation and
-conversion do not use `cluster.yaml`; see [the deployment workflow](index.md#durable-offline-deployments).
+All execution uses ledger v2 and requires `state.lock: true`. A server target
+submits apply to its existing writer and activates without restart. Direct
+apply owns exclusive admission and requires an explicit handoff before serving.
+Retained graph roots and storage formats stay fixed. Policy/provider/Blob bindings
+can change; removing a graph declaration deletes its managed storage and history. See
+[deployment boundaries](index.md#deployment-boundaries).
+Apply does not load rows or start servers. Root-addressed status, reconciliation
+and conversion do not use `cluster.yaml`; see [the deployment workflow](index.md).
 
 ## Limits
 
@@ -248,3 +254,9 @@ to admit a new deployment; outstanding authority is retained. These bounds do
 not cap graph data, native manifest-history scans or total process memory.
 
 See [Operating a cluster](index.md) for the end-to-end workflow.
+
+## Operator targets
+
+The operator file declares destinations separately from this source bundle.
+See [Operator targets](../cli/targets.md) for the format, provider settings,
+credentials, administration and migration.

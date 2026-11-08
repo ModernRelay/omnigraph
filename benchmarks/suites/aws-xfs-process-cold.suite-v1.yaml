@@ -1,6 +1,0 @@
-version: 1
-name: aws-xfs-process-cold
-
-runs:
-  - case: ../cases/branch-merge-d50-process-cold-xfs.case-v1.yaml
-    repetitions: 5

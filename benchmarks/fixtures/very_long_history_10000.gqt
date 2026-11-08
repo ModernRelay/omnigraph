@@ -1,0 +1,34 @@
+# issue: none
+# notes: 10000 real paired updates, one live fixed-size row; 10002 reachable commits including genesis and seed. Extended checkpoints are opt-in.
+
+--- runner
+timeout_ms: 600000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node HistoryRow { key: String @key value: I64 payload: String }
+
+--- seed
+{"type":"HistoryRow","data":{"key":"hot","value":0,"payload":"fixed"}}
+
+--- loop $cycle 0 5000
+--- mutate
+query set_one() { update HistoryRow set { value: 1 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query restore_zero() { update HistoryRow set { value: 0 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+
+--- endloop
+
+--- query branch: main
+query current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }
+--- expect unordered
+{"key":"hot","value":0,"payload":"fixed"}
+--- expect shape
+key: String
+value: I64
+payload: String

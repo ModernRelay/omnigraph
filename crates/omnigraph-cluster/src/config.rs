@@ -381,7 +381,7 @@ fn parse_cluster_config_captured(config_dir: &Path, capture: &mut SourceCapture)
         };
     }
 
-    let raw = match serde_yaml::from_str::<RawClusterConfig>(&text) {
+    let raw = match yaml_serde::from_str::<RawClusterConfig>(&text) {
         Ok(raw) => Some(raw),
         Err(err) => {
             diagnostics.push(Diagnostic::error(
@@ -486,10 +486,10 @@ pub(crate) fn state_resource_digests(state: &ClusterState) -> BTreeMap<String, S
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn initial_import_state(desired: &DesiredCluster) -> ClusterState {
     ClusterState {
         version: 1,
-        mode: None,
         ledger_id: None,
         next_sequence: None,
         outstanding: None,
@@ -576,7 +576,7 @@ pub(crate) async fn observe_declared_graphs(
             }
         }
 
-        match observe_live_graph(&graph_uri).await {
+        match observe_live_graph(backend, &graph_uri).await {
             Ok(observation) => {
                 let schema_matches = observation.schema_digest == graph.schema_digest;
                 state.applied_revision.resources.insert(
@@ -682,30 +682,19 @@ pub(crate) async fn observe_declared_graphs(
     graph_error_count
 }
 
-/// RFC-004 §D7: the data-aware preview — the engine's migration plan for a
-/// desired schema against the live graph, computed read-only (no lock).
-pub(crate) async fn preview_schema_migration(
-    graph_uri: &str,
-    schema_path: &str,
-) -> Result<SchemaMigrationPlan, String> {
-    let source = fs::read_to_string(schema_path).map_err(|err| err.to_string())?;
-    let db = Omnigraph::open_read_only(graph_uri)
-        .await
-        .map_err(|err| err.to_string())?;
-    let preview = db
-        .preview_schema_apply(&source)
-        .await
-        .map_err(|err| err.to_string())?;
-    Ok(preview.plan)
-}
-
 pub(crate) struct LiveGraphObservation {
     graph_manifest_version: u64,
     schema_digest: String,
 }
 
-pub(crate) async fn observe_live_graph(graph_uri: &str) -> Result<LiveGraphObservation, String> {
-    let db = Omnigraph::open_read_only(graph_uri)
+pub(crate) async fn observe_live_graph(
+    backend: &ClusterStore,
+    graph_uri: &str,
+) -> Result<LiveGraphObservation, String> {
+    let storage = backend
+        .graph_storage(graph_uri)
+        .map_err(|error| error.message)?;
+    let db = Omnigraph::open_read_only_with_storage(graph_uri, storage)
         .await
         .map_err(|err| err.to_string())?;
     let snapshot = db
@@ -751,20 +740,86 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
 }
 
 pub(crate) fn capture_desired(config_dir: &Path) -> CapturedDesired {
+    capture_desired_with_root(config_dir, StorageRootMode::ConfigDirectoryDefault)
+}
+
+/// Capture portable source without treating its directory as a destination.
+/// A declared storage root still constrains validation; otherwise the selected
+/// destination is checked later by direct capture or server bundle validation.
+pub(crate) fn capture_desired_source(config_dir: &Path) -> CapturedDesired {
+    capture_desired_with_root(config_dir, StorageRootMode::SourceOnly)
+}
+
+/// Capture source against a destination selected independently by the caller.
+/// A declared storage path is an equality assertion relative to the source.
+pub(crate) fn capture_desired_at_root(config_dir: &Path, root: &str) -> CapturedDesired {
+    capture_desired_with_root(config_dir, StorageRootMode::Selected(root))
+}
+
+enum StorageRootMode<'a> {
+    ConfigDirectoryDefault,
+    SourceOnly,
+    Selected(&'a str),
+}
+
+fn capture_desired_with_root(config_dir: &Path, root: StorageRootMode<'_>) -> CapturedDesired {
     let mut capture = SourceCapture::default();
-    let outcome = load_desired_captured(config_dir, &mut capture);
+    let outcome = load_desired_captured(config_dir, &mut capture, root);
     CapturedDesired {
         outcome,
         sources: capture.sources,
     }
 }
 
-fn load_desired_captured(config_dir: &Path, capture: &mut SourceCapture) -> LoadOutcome {
+fn bind_direct_source_root(
+    raw: &mut RawClusterConfig,
+    settings: &mut ClusterSettings,
+    config_dir: &Path,
+    selected_root: &str,
+) -> Result<(), Diagnostic> {
+    let canonical = crate::store::canonical_storage_root(selected_root)?;
+    if let Some(assertion) = &settings.storage_root {
+        let assertion = if omnigraph_storage::storage_kind_for_uri(assertion).map_err(|error| {
+            Diagnostic::error("storage_root_invalid", "storage", error.to_string())
+        })? == omnigraph_storage::StorageKind::Local
+        {
+            let local = omnigraph_storage::normalize_root_uri(assertion).map_err(|error| {
+                Diagnostic::error("storage_root_invalid", "storage", error.to_string())
+            })?;
+            let path = Path::new(&local);
+            if path.is_relative() {
+                config_dir.join(path).to_string_lossy().into_owned()
+            } else {
+                local
+            }
+        } else {
+            assertion.clone()
+        };
+        if crate::store::canonical_storage_root(&assertion)? != canonical {
+            return Err(Diagnostic::error(
+                "deployment_input_invalid",
+                "storage",
+                "declared storage differs from the selected target; no deployment was submitted",
+            ));
+        }
+        // Freeze an asserted local path into the captured semantics. Revalidation
+        // must not reinterpret it against a later process working directory.
+        raw.storage = Some(canonical.clone());
+    }
+    settings.storage_root = Some(canonical);
+    Ok(())
+}
+
+fn load_desired_captured(
+    config_dir: &Path,
+    capture: &mut SourceCapture,
+    root_mode: StorageRootMode<'_>,
+) -> LoadOutcome {
     let parsed = parse_cluster_config_captured(config_dir, capture);
     let config_dir = parsed.config_dir;
     let config_file = parsed.config_file;
     let mut diagnostics = parsed.diagnostics;
-    let Some(raw) = parsed.raw else {
+    let Some(mut raw) = parsed.raw else {
         return LoadOutcome {
             desired: None,
             diagnostics,
@@ -789,14 +844,32 @@ fn load_desired_captured(config_dir: &Path, capture: &mut SourceCapture) -> Load
             config_file,
         };
     }
-    let settings = validate_cluster_header(&raw, &mut diagnostics);
+    let mut settings = validate_cluster_header(&raw, &mut diagnostics);
+    if let StorageRootMode::Selected(root) = root_mode {
+        if !has_errors(&diagnostics)
+            && let Err(error) = bind_direct_source_root(&mut raw, &mut settings, &config_dir, root)
+        {
+            diagnostics.push(error);
+        }
+        if has_errors(&diagnostics) {
+            return LoadOutcome {
+                desired: None,
+                diagnostics,
+                config_dir,
+                config_file,
+            };
+        }
+    }
     // Every graph root and the cluster ledger live under this one root, so a
-    // Blob base disjoint from it is disjoint from all of them. An invalid
-    // declared root already carries its own error, and has no layout to guard.
-    let storage_root = match (&raw.storage, &settings.storage_root) {
-        (_, Some(root)) => Some(root.clone()),
-        (None, None) => Some(config_dir.to_string_lossy().into_owned()),
-        (Some(_), None) => None,
+    // Blob base disjoint from it is disjoint from all of them. Portable source
+    // has no implicit destination; an invalid declared root already carries
+    // its own error, and has no layout to guard.
+    let storage_root = match (&raw.storage, &settings.storage_root, root_mode) {
+        (_, Some(root), _) => Some(root.clone()),
+        (None, None, StorageRootMode::ConfigDirectoryDefault) => {
+            Some(config_dir.to_string_lossy().into_owned())
+        }
+        _ => None,
     };
 
     let mut resources = BTreeMap::new();
@@ -1080,7 +1153,7 @@ fn load_desired_captured(config_dir: &Path, capture: &mut SourceCapture) -> Load
                             from: policy_address.clone(),
                             to: graph_address(&graph_id),
                         });
-                    } else {
+                    } else if graph_id != omnigraph_compiler::CATALOGUE_SCOPE {
                         diagnostics.push(Diagnostic::error(
                             "dangling_graph_reference",
                             format!("policies.{policy_name}.applies_to[{idx}]"),
@@ -1232,7 +1305,7 @@ fn load_desired_captured(config_dir: &Path, capture: &mut SourceCapture) -> Load
     }
 }
 
-fn validate_external_blob_policy(
+pub(crate) fn validate_external_blob_policy(
     graph_id: &str,
     config: &ExternalBlobsConfig,
     storage_root: Option<&str>,
@@ -1368,7 +1441,7 @@ fn stored_declarations(
 /// so an operator carrying a development `cluster.yaml` is told what happened
 /// and what to do.
 pub(crate) fn removed_field_diagnostics(text: &str) -> Vec<Diagnostic> {
-    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(text) else {
+    let Ok(value) = yaml_serde::from_str::<yaml_serde::Value>(text) else {
         return Vec::new();
     };
     let Some(graphs) = value.get("graphs").and_then(|graphs| graphs.as_mapping()) else {
@@ -1389,7 +1462,7 @@ pub(crate) fn removed_field_diagnostics(text: &str) -> Vec<Diagnostic> {
 }
 
 pub(crate) fn future_field_diagnostics(text: &str) -> Vec<Diagnostic> {
-    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(text) else {
+    let Ok(value) = yaml_serde::from_str::<yaml_serde::Value>(text) else {
         return Vec::new();
     };
     let Some(mapping) = value.as_mapping() else {
@@ -1451,12 +1524,12 @@ pub(crate) fn normalize_policy_target(value: &str) -> PolicyTarget {
     }
 }
 
-enum EmbeddingProviderTarget {
+pub(crate) enum EmbeddingProviderTarget {
     Provider(String),
     WrongKind(String),
 }
 
-fn normalize_embedding_provider_target(value: &str) -> EmbeddingProviderTarget {
+pub(crate) fn normalize_embedding_provider_target(value: &str) -> EmbeddingProviderTarget {
     if let Some(name) = value.strip_prefix("provider.embedding.") {
         EmbeddingProviderTarget::Provider(name.to_string())
     } else if value.contains('.') {

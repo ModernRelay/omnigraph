@@ -12,7 +12,10 @@ use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 
 use omnigraph::Session;
-use omnigraph::changes::{ChangeFilter, ChangeOp, EntityKind};
+use omnigraph::changes::{
+    ChangeEntityKind, ChangeFeedScope, ChangeOpKind, GraphDiffRequest, GraphDiffSides,
+    GraphEntityChange,
+};
 use omnigraph::db::{InitOptions, Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::error::{OmniError, Result as OmniResult};
 use omnigraph::loader::LoadMode;
@@ -643,17 +646,25 @@ pub struct Scenario {
     /// TARGETED SCHEDULING: schedule the crash at failpoint
     /// `.0` on the `.1`-th sampled op whose KIND matches the window's family
     /// (`window_matches`), instead of a blind fixed index — merge windows get
-    /// hit by actual merges. At most one crash per universe, exactly like
-    /// `crash_at`, and just as deterministic: the trigger is a pure function
-    /// of the seeded op stream.
+    /// hit by actual merges. At most one targeted attempt per universe,
+    /// in addition to any setup crash; the trigger is a pure function of
+    /// the seeded op stream.
     pub crash_on_match: Option<(&'static str, usize)>,
+    /// SETUP CRASH: skip `.1` matching ops, then attempt failpoint `.0`
+    /// before `crash_on_match`. Successful, legally rejected and deferred
+    /// attempts leave setup pending until a recorded crash. A window whose
+    /// precondition is an earlier crash's aftermath takes its setup from
+    /// [`setup_crash_for`]. The target starts matching on the following op,
+    /// so its skip counts ops that can see the aftermath; `probe_only`
+    /// leaves the setup as a real crash attempt.
+    pub setup_crash: Option<(&'static str, usize)>,
     /// CROSSING PROBE: with `crash_on_match` set, install a
     /// RECORD-ONLY callback instead of an injected failure — the op executes
     /// normally and `UniverseReport.crossed` says whether execution actually
     /// walked through the window. The hunt uses this to tell
     /// "scheduled-but-never-reached" apart from "crossed-but-ABSORBED":
     /// windows whose injected error the engine heals transparently (the
-    /// branch post_native ambiguity classifiers, phase-D sidecar delete) are
+    /// branch post_native ambiguity classifiers) are
     /// invisible to the `crashes > 0` signal yet fully exercised.
     pub probe_only: bool,
     /// Storage-fault plan for the whole universe (None = clean storage).
@@ -680,7 +691,7 @@ pub struct Scenario {
     /// handle instead of reopening — the whole universe runs on one handle,
     /// like a real client under a fault storm, and the report's `reopens`
     /// stays zero. Incompatible with the crash knobs (`crash_at`,
-    /// `crash_on_match`, `die_at_write`, `recovery_crash`): a dead process
+    /// `setup_crash`, `crash_on_match`, `die_at_write`, `recovery_crash`): a dead process
     /// has no handle to keep.
     pub keep_handle: bool,
     /// Kill-at-kth-write: die at durable write #k (1-based). `usize::MAX`
@@ -698,9 +709,9 @@ pub struct Scenario {
     /// Unlike `probe_only` (which scopes the probe to the single matched op
     /// for the hunt's per-op attribution), this answers the census question
     /// "did ANY execution in this universe walk the line" — and it composes
-    /// with a REAL `crash_on_match` setup crash, which is how the
-    /// recovery.* internals get their preconditions built. Cleanup workloads
-    /// obtain unused forks through ordinary branch deletion.
+    /// with a real `setup_crash`, which can strand unpublished staging for
+    /// cleanup. Cleanup workloads obtain unused forks through ordinary
+    /// branch deletion.
     pub probe_window: Option<&'static str>,
     /// SENSITIVITY KNOB (test-only red proof): force
     /// the maintenance-obligation RERUN to fail through a real engine
@@ -780,10 +791,8 @@ enum Milestone {
     /// Delete a base-fixture person on the milestone branch — puts a DELETE
     /// in the branch's merge delta (the rewrite-with-deletes merge route).
     DeleteFixtureOnBranch,
-    /// `ensure_indices` on main (the non-fork ensure_indices windows).
+    /// `ensure_indices` on main.
     EnsureIndicesMain,
-    /// `ensure_indices` on the milestone branch after a data op there.
-    EnsureIndicesBranch,
     /// `cleanup` on main (branch-snapshot resolution / fork reconciliation /
     /// table GC run against whatever state earlier milestones built).
     CleanupMain,
@@ -818,12 +827,11 @@ fn milestone_steps(window: &str) -> Vec<Milestone> {
         }
         // Diverge main after the branch insert so this reaches the general
         // rewrite publisher, whose insert commit precedes the update phase.
-        // The hook also fires when that phase has no update payload.
-        "branch_merge.rewrite_after_insert_pre_update" => {
+        // The hook also fires when that phase has no update payload. A merge
+        // into an unchanged main only switches pins, so the rewrite is also
+        // the route that stages a table effect.
+        "branch_merge.rewrite_after_insert_pre_update" | "branch_merge.post_table_effect" => {
             return vec![EnsureBranch, DataOnBranch, MutateMain, MergeBranch];
-        }
-        "ensure_indices.post_table_effect" => {
-            return vec![EnsureBranch, DataOnBranch, EnsureIndicesBranch];
         }
         // cleanup with state to work on: a live branch fork.
         "cleanup.resolve_branch_snapshot" => {
@@ -832,10 +840,13 @@ fn milestone_steps(window: &str) -> Vec<Milestone> {
         "cleanup.table_gc" | "cleanup.pre_gates" => {
             return vec![MutateMain, DeleteFixtureOnMain, CleanupMain];
         }
-        // Recovery internals: build the PRIMARY crash's precondition (the
-        // census adds the crash itself).
-        "recovery.before_roll_forward_publish" => {
-            return vec![EnsureBranch, DataOnBranch, DataOnBranch, MergeBranch];
+        // A dead staging for cleanup to reclaim: `setup_crash_for`'s crash
+        // stops the index build after its first table effect, stranding a
+        // detached commit whose witness records main's head; the second
+        // insert moves that head on, so the next cleanup judges the staging
+        // dead and deletes its files before its manifest.
+        "cleanup.sweep_pre_dead_manifest_delete" => {
+            return vec![MutateMain, EnsureIndicesMain, MutateMain, CleanupMain];
         }
         _ => {}
     }
@@ -847,12 +858,86 @@ fn milestone_steps(window: &str) -> Vec<Milestone> {
         "fork" => vec![ForkLoad],
         "load" if window == "load.post_branch_create_pre_stage" => vec![ForkLoad],
         "load" => vec![DataOnBranch], // LoadMerge/Append on main
-        "mutation" | "graph_publish" | "publish" | "classify" | "recovery" => vec![MutateMain],
+        "mutation" | "graph_publish" | "publish" | "classify" => vec![MutateMain],
+        // Index maintenance builds only missing indexes, and so does an
+        // Optimize; the sampler holds Optimize back while a recipe still
+        // owes its index build, so an EnsureIndices is the first index build
+        // and has the fixture's unbuilt indexes to build.
         "ensure_indices" => vec![MutateMain, EnsureIndicesMain],
         "cleanup" => vec![MutateMain, CleanupMain],
         "optimize" => vec![MutateMain],
         _ => Vec::new(),
     }
+}
+
+/// The setup crash a window needs (`Scenario::setup_crash`), shared by the
+/// reach census, the hunt and the fleet. The setup window must be crossed
+/// only once its aftermath exists, since a recorded setup crash arms the
+/// target.
+/// - the window before the dead stagings' manifests: an index build crashed
+///   after its first table effect leaves the unpublished staging that the
+///   window's recipe then makes dead and reclaims. Its pre-manifest window
+///   would not do: an index build with nothing to build crosses that too.
+pub fn setup_crash_for(window: &str) -> Option<(&'static str, usize)> {
+    match window {
+        "cleanup.sweep_pre_dead_manifest_delete" => Some(("ensure_indices.post_table_effect", 0)),
+        _ => None,
+    }
+}
+
+/// The windows no seeded universe can cross, each with its reason. The
+/// reach census fails, naming the window, when another window stays dark or
+/// a listed one crosses; the hunt and the fleet do not schedule these.
+pub const REACH_EXPECTED_DARK: &[(&str, &str)] = &[
+    (
+        "init.after_coordinator_init",
+        "graph birth precedes the probe; dst_birth_contract_sweep owns it",
+    ),
+    (
+        "init.post_manifest_create",
+        "graph birth precedes the probe; dst_birth_contract_sweep owns it",
+    ),
+    (
+        "blob_read.post_capture",
+        "the DST schema has no Blob property",
+    ),
+    (
+        "mutation.post_no_effect_pre_gate",
+        "crossed only by a no-effect mutation that carries an expected graph head; \
+         the workload sends none",
+    ),
+    (
+        "branch_merge.between_delete_chunks",
+        "needs a merge that deletes more than one chunk of rows",
+    ),
+    (
+        "classify.fresh_read",
+        "crossed only for a table with native fork trees, a table fork from before format v11",
+    ),
+    (
+        "cleanup.resolve_branch_snapshot",
+        "crossed only for a table with native fork trees, a table fork from before format v11",
+    ),
+    (
+        "branch_merge.adopt_after_append_pre_upsert",
+        "a merge adopts a delta only from a forked source table (adopt_advances_head)",
+    ),
+    (
+        "branch_merge.adopt_after_upsert_pre_delete",
+        "a merge adopts a delta only from a forked source table (adopt_advances_head)",
+    ),
+    (
+        "branch_merge.adopt_between_insert_chunks",
+        "a merge adopts a delta only from a forked source table (adopt_advances_head)",
+    ),
+];
+
+/// Why `window` is in [`REACH_EXPECTED_DARK`], if it is.
+pub fn expected_dark_reason(window: &str) -> Option<&'static str> {
+    REACH_EXPECTED_DARK
+        .iter()
+        .find(|(dark, _)| *dark == window)
+        .map(|(_, reason)| *reason)
 }
 
 /// Emit the next pending milestone op if it is due (seeded coin, or forced
@@ -1003,15 +1088,6 @@ fn milestone_op(
             branch: "main".to_string(),
             op: Op::EnsureIndices,
         },
-        Milestone::EnsureIndicesBranch => {
-            if !world.branches.contains_key(MILESTONE_BRANCH) {
-                return None; // wait for EnsureBranch
-            }
-            WorldOp::Data {
-                branch: MILESTONE_BRANCH.to_string(),
-                op: Op::EnsureIndices,
-            }
-        }
         Milestone::CleanupMain => WorldOp::Data {
             branch: "main".to_string(),
             op: Op::Cleanup,
@@ -1104,7 +1180,8 @@ pub struct UniverseReport {
     /// (0 without `client_retry`).
     pub client_retries: usize,
     /// Failed maintenance attempts whose obligation pass ran (rerun
-    /// converged + per-op obligation held), including returned Cleanup errors.
+    /// converged + per-op obligation held), including returned Cleanup errors
+    /// and cleanups a scheduled window left owing a table.
     pub maintenance_reruns: usize,
     /// content reads returned with read-time bit rot (0 without
     /// `corrupt_read_pct`). Bite evidence for the corruption axis; the
@@ -1147,7 +1224,9 @@ pub struct UniverseReport {
     /// (context, verdict, channel) where context names what died or was
     /// deferred (`crash:<window>@op<i>`, `crash-state:write#k@op<i>`,
     /// `fault@op<i>`, `watch-interrupt@op<i>` for a watch-ending op judged
-    /// inside the resolution, `keep-serving-deferred@op<i>`),
+    /// inside the resolution, `keep-serving-deferred@op<i>`,
+    /// `deferred:<window>@op<i>` for a cleanup the window left owing a
+    /// table, verdict `Deferred` on channel `cleanup`),
     /// verdict is `Applied` / `AppliedTwice` / `ForkOnly` / `NotApplied`; the
     /// keep-serving-deferred rows append ` matched=<composition>`
     /// provenance (e.g. `Applied matched=A+E`), a human-triage surface,
@@ -1884,12 +1963,10 @@ fn is_load_op(op: &Op) -> bool {
 }
 
 /// Window family (failpoint name prefix) → the op kinds that can execute
-/// through it. Static knowledge read off the catalog plus the v0/v1 hunts'
-/// EVIDENCE: `mutation.*`, `graph_publish.*`, `publish.*`, `fork.*`,
-/// `recovery.*` and `classify.*` all hit via mutation ops (the write path
-/// consults recovery sidecars and fork classification at txn open); loads
-/// share that machinery; refresh/sync run the roll-forward healer (loader
-/// walk Finding 5); the maintenance and branch families are their own verbs.
+/// through it. Mutation and load ops share graph publication, detached
+/// staging and fork classification. Maintenance and branch families have
+/// their own verbs. Precision rules below narrow individual windows whose
+/// preconditions require a particular op within a family.
 /// Families the workload has NO op for return false everywhere (init/open →
 /// schedule-scope).
 fn window_matches(window: &str, wop: &WorldOp) -> bool {
@@ -1961,12 +2038,6 @@ fn window_matches(window: &str, wop: &WorldOp) -> bool {
             matches!(wop, WorldOp::LoadFork { .. })
                 || matches!(wop, WorldOp::Data { op, .. } if is_mutation_op(op) || is_load_op(op))
         }
-        "recovery" => {
-            matches!(wop, WorldOp::LoadFork { .. })
-                || matches!(wop, WorldOp::Data { op, .. } if is_mutation_op(op)
-                    || is_load_op(op)
-                    || matches!(op, Op::Refresh | Op::SyncBranch))
-        }
         _ => false,
     }
 }
@@ -1979,6 +2050,7 @@ fn window_matches(window: &str, wop: &WorldOp) -> bool {
 /// to the windows only its ops can reach.
 pub fn window_needs_wide(window: &str) -> bool {
     matches!(window.split('.').next().unwrap_or(window), "load")
+        || setup_crash_for(window).is_some_and(|(setup, _)| window_needs_wide(setup))
 }
 
 /// Does scheduling this window require the schema-op face
@@ -1988,7 +2060,7 @@ pub fn window_needs_schema_ops(window: &str) -> bool {
     matches!(
         window.split('.').next().unwrap_or(window),
         "schema_apply" | "schema_reload"
-    )
+    ) || setup_crash_for(window).is_some_and(|(setup, _)| window_needs_schema_ops(setup))
 }
 
 /// Can the CURRENT workload produce any op reaching this window's family?
@@ -2016,7 +2088,6 @@ pub fn workload_can_reach(window: &str) -> bool {
             | "graph_publish"
             | "publish"
             | "fork"
-            | "recovery"
             | "classify"
     )
 }
@@ -3467,9 +3538,9 @@ async fn capture_history(db: &Omnigraph, main: &Model, history: &mut Vec<(String
 ///    must equal the recorded model state — for EVERY commit in the
 ///    universe's history. A recovery or maintenance op that corrupts the
 ///    PAST while preserving the head passed every oracle before this one.
-/// 2. **Conservative Person diff** over adjacent commits via
-///    `diff_commits`: every model-changed name must appear in the engine's
-///    ChangeSet, every engine-reported Delete must be a model delete, and
+/// 2. **Conservative Person diff** over adjacent commits via the graph diff
+///    (`diff_page`, every page): every model-changed name must appear in the
+///    engine's changes, every engine-reported Delete must be a model delete, and
 ///    engine deletes may not exceed model deletes. Deliberately one-sided
 ///    where semantics are ambiguous (a value-equal upsert may legitimately
 ///    surface as an engine Update the model-diff can't see) — no guessing,
@@ -3501,12 +3572,12 @@ async fn assert_history_matches(db: &Session, history: &[(String, Model)], where
     for pair in history.windows(2) {
         let (a_id, a_m) = &pair[0];
         let (b_id, b_m) = &pair[1];
-        let filter = ChangeFilter {
-            kinds: Some(vec![EntityKind::Node]),
+        let scope = ChangeFeedScope {
+            kinds: Some(vec![ChangeEntityKind::Node]),
             type_names: Some(vec!["Person".to_string()]),
             ops: None,
         };
-        let cs = match Box::pin(db.diff_commits(a_id, b_id, &filter)).await {
+        let changes = match Box::pin(graph_diff_changes(db, a_id, b_id, &scope)).await {
             Ok(changes) => changes,
             Err(OmniError::ChangeSchemaBoundary {
                 graph_commit_id,
@@ -3518,7 +3589,7 @@ async fn assert_history_matches(db: &Session, history: &[(String, Model)], where
                 continue;
             }
             Err(error) => panic!(
-                "{where_}: diff_commits over recorded history failed without a matching \
+                "{where_}: the graph diff over recorded history failed without a matching \
                  accepted schema transition: {error:?}"
             ),
         };
@@ -3540,30 +3611,57 @@ async fn assert_history_matches(db: &Session, history: &[(String, Model)], where
                 model_changed.insert(name.clone());
             }
         }
-        let engine_ids: BTreeSet<&str> = cs.changes.iter().map(|c| c.id.as_str()).collect();
-        let engine_deletes: BTreeSet<&str> = cs
-            .changes
+        let engine_ids: BTreeSet<&str> = changes.iter().map(|c| c.id.as_str()).collect();
+        let engine_deletes: BTreeSet<&str> = changes
             .iter()
-            .filter(|c| matches!(c.op, ChangeOp::Delete))
+            .filter(|c| matches!(c.op, ChangeOpKind::Delete))
             .map(|c| c.id.as_str())
             .collect();
         for name in model_changed.iter().chain(model_deleted.iter()) {
             assert!(
                 engine_ids.contains(name.as_str()),
-                "{where_}: diff_commits {a_id}→{b_id} is MISSING model-changed Person '{name}'"
+                "{where_}: the graph diff {a_id}→{b_id} is MISSING model-changed Person '{name}'"
             );
         }
         for name in &model_deleted {
             assert!(
                 engine_deletes.contains(name.as_str()),
-                "{where_}: diff_commits {a_id}→{b_id} did not report model-deleted Person '{name}' as Delete"
+                "{where_}: the graph diff {a_id}→{b_id} did not report model-deleted Person '{name}' as Delete"
             );
         }
         for id in &engine_deletes {
             assert!(
                 model_deleted.contains(*id),
-                "{where_}: diff_commits {a_id}→{b_id} reports a Delete of '{id}' the model never deleted"
+                "{where_}: the graph diff {a_id}→{b_id} reports a Delete of '{id}' the model never deleted"
             );
+        }
+    }
+}
+
+/// Every change of the graph diff `from` → `to` within `scope`, page by page.
+async fn graph_diff_changes(
+    db: &Session,
+    from: &str,
+    to: &str,
+    scope: &ChangeFeedScope,
+) -> omnigraph::error::Result<Vec<GraphEntityChange>> {
+    let mut request = GraphDiffRequest {
+        sides: GraphDiffSides::Between {
+            from: from.to_string(),
+            to: to.to_string(),
+        },
+        scope: scope.clone(),
+        page_token: None,
+        max_changes: None,
+        max_bytes: None,
+    };
+    let mut changes = Vec::new();
+    loop {
+        let page = db.diff_page(&request).await?;
+        changes.extend(page.changes);
+        match page.next_page_token {
+            Some(token) => request.page_token = Some(token),
+            None => return Ok(changes),
         }
     }
 }
@@ -4745,6 +4843,10 @@ enum CrashOutcome {
     /// The op failed for its OWN legal reason (model-predicted merge
     /// conflict), not the scheduled window — no crash to reconcile.
     LegalRejection,
+    /// The window was hit inside cleanup's per-table pass: cleanup reported
+    /// the table's error and returned, so nothing died, but the table is
+    /// owed the retry a crashed cleanup gets.
+    CleanupDeferred,
     /// The window was hit; reconcile ran; `outcome` = how the op settled,
     /// `channel` = the observation channel(s) the arbitration rested on
     /// (values documented on `UniverseReport::reconcile_verdicts`).
@@ -4752,6 +4854,30 @@ enum CrashOutcome {
         outcome: ReconcileOutcome,
         channel: &'static str,
     },
+}
+
+/// Was the scheduled window hit inside this cleanup? Cleanup catches a
+/// table's error into that table's row, so the window's error text is in
+/// the deferrals the op recorded rather than in its result. This covers
+/// returned per-table errors only; warning-only native-fork reconciliation
+/// failures are not exposed through this channel.
+#[cfg(feature = "failpoints")]
+fn cleanup_deferred_by(db: &Session, wop: &WorldOp, failpoint: &str) -> bool {
+    if !matches!(
+        wop,
+        WorldOp::Data {
+            op: Op::Cleanup,
+            ..
+        }
+    ) {
+        return false;
+    }
+    let injected = format!("injected failpoint triggered: {failpoint}");
+    LAST_CLEANUP_DEFERRED
+        .lock()
+        .expect("cleanup deferral map")
+        .get(db.uri())
+        .is_some_and(|deferred| deferred.values().any(|error| error.contains(&injected)))
 }
 
 #[cfg(feature = "failpoints")]
@@ -4788,6 +4914,9 @@ async fn crash_op(
                     format!("engine ACCEPTED a merge the model predicts conflicts (op={wop:?})"),
                     "the engine's accept/conflict decision matches the three-way prediction",
                 );
+            }
+            if cleanup_deferred_by(&db, wop, failpoint) {
+                return (db, CrashOutcome::CleanupDeferred);
             }
             return (db, CrashOutcome::OpSucceeded);
         }
@@ -5276,15 +5405,17 @@ pub fn run_universe_caught(root: &str, sc: &Scenario) -> std::thread::Result<Uni
         !(sc.keep_handle
             && (sc.crash_at.is_some()
                 || sc.crash_on_match.is_some()
+                || sc.setup_crash.is_some()
                 || sc.die_at_write.is_some()
                 || sc.recovery_crash.is_some())),
         "keep_handle is a live-handle liveness mode; a crash universe has no handle to keep"
     );
     println!(
-        "dst universe [root={root} seed={} ops={} crash={:?} crash_on_match={:?} faults={} kill={:?}]",
+        "dst universe [root={root} seed={} ops={} crash={:?} setup_crash={:?} crash_on_match={:?} faults={} kill={:?}]",
         sc.seed,
         sc.ops,
         sc.crash_at,
+        sc.setup_crash,
         sc.crash_on_match,
         sc.faults
             .as_ref()
@@ -5324,302 +5455,6 @@ pub fn run_universe_caught(root: &str, sc: &Scenario) -> std::thread::Result<Uni
                 "universe cleanup failed: {error}; original={result:?}"
             ))),
         },
-    }
-}
-
-/// Replay evidence for legacy-file admission during offline storage upgrade.
-/// These adapter reads are not part of current-format serving.
-#[derive(Debug, PartialEq, Eq)]
-pub struct LegacyUpgradeReadReport {
-    pub checks_passed: usize,
-    pub checks_failed: usize,
-    pub reads_corrupted: usize,
-    pub reads_truncated: usize,
-    pub latent_errors: usize,
-    pub stale_reads_served: usize,
-    pub detections: Vec<String>,
-    pub missing_ir_refused: bool,
-    pub final_rows: Vec<(String, i64, i64)>,
-    pub commit_ids: Vec<String>,
-}
-
-struct LegacyUpgradeReadScenario {
-    plan: FaultPlan,
-    attempts: usize,
-    execute_under_weather: bool,
-}
-
-/// Exercise the actual legacy-file consumer in a seeded universe. The fixture
-/// becomes genuine flat-v11 rows before weather starts. Every weathered attempt
-/// must leave all stored objects unchanged; execution attempts are refusal-only.
-pub fn run_legacy_upgrade_read_weather(
-    root: &str,
-    seed: u64,
-    plan: FaultPlan,
-    attempts: usize,
-    execute_under_weather: bool,
-) -> LegacyUpgradeReadReport {
-    assert!(
-        !plan.lance_realm,
-        "legacy adapter weather requires strict replay"
-    );
-    assert!(attempts > 0);
-    crate::env_knobs::require_pool_env();
-    let environment = MemoryEnvironment::new(root, seed, UniverseProcess::Shared);
-    let scenario = LegacyUpgradeReadScenario {
-        plan,
-        attempts,
-        execute_under_weather,
-    };
-    let run = crate::environment::run_universe(&environment, &scenario);
-    run.cleanup
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-        .expect("legacy upgrade universe cleanup");
-    run.result
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-        .expect("legacy upgrade universe setup")
-}
-
-async fn legacy_upgrade_stored_objects(resources: &MemoryStorage) -> BTreeMap<String, Vec<u8>> {
-    use futures::TryStreamExt;
-    use lance_io::object_store::providers::shared_memory::SharedMemoryStoreProvider;
-    use lance_io::object_store::{ObjectStoreParams, ObjectStoreProvider};
-    use object_store::ObjectStoreExt;
-
-    let mut objects = BTreeMap::new();
-    for uri in resources.adapter.list_dir(&resources.root).await.unwrap() {
-        let text = resources.adapter.read_text(&uri).await.unwrap();
-        objects.insert(format!("adapter:{uri}"), text.into_bytes());
-    }
-    let url = url::Url::parse(&resources.root).unwrap();
-    let provider = SharedMemoryStoreProvider::default();
-    let prefix = provider.extract_path(&url).unwrap();
-    let store = provider
-        .new_store(url, &ObjectStoreParams::default())
-        .await
-        .unwrap()
-        .inner;
-    let mut listing = store.list(Some(&prefix));
-    while let Some(object) = listing.try_next().await.unwrap() {
-        let bytes = store
-            .get(&object.location)
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
-        objects.insert(format!("lance:{}", object.location), bytes.to_vec());
-    }
-    objects
-}
-
-impl UniverseScenario<MemoryStorage> for LegacyUpgradeReadScenario {
-    type Output = LegacyUpgradeReadReport;
-
-    async fn run<'a>(
-        &'a self,
-        resources: &'a mut MemoryStorage,
-        _workload_seed: u64,
-    ) -> LegacyUpgradeReadReport {
-        use omnigraph::db::{UpgradeOptions, UpgradeOutcome, upgrade_storage};
-
-        let root = resources.root.as_str();
-        let db = Session::from_defaults(
-            Arc::new(
-                Omnigraph::init_with_storage(
-                    root,
-                    TEST_SCHEMA,
-                    resources.adapter.clone(),
-                    InitOptions::default(),
-                )
-                .await
-                .unwrap(),
-            ),
-            SessionSettings::default(),
-        );
-        db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
-        let expected_export = db.export_jsonl("main", &[]).await.unwrap();
-        let expected_rows = person_rows(&db).await;
-        let expected_edges = knows_pairs(&db).await;
-        let expected_commits = db.list_commits(None).await.unwrap();
-        drop(db);
-        let (source, ir, state) = omnigraph::db::dst_prepare_legacy_upgrade_fixture(root)
-            .await
-            .unwrap();
-        for (name, text) in [
-            ("_schema.pg", source.as_str()),
-            ("_schema.ir.json", ir.as_str()),
-            ("__schema_state.json", state.as_str()),
-        ] {
-            resources
-                .adapter
-                .write_text(&format!("{root}/{name}"), text)
-                .await
-                .unwrap();
-        }
-
-        let source_uri = format!("{root}/_schema.pg");
-        if self.plan.stale_read_pct > 0 {
-            resources
-                .adapter
-                .write_text(
-                    &source_uri,
-                    &format!("{}\nnode FormerFixture {{ value: String }}\n", source),
-                )
-                .await
-                .unwrap();
-        }
-        let failing = Arc::new(FailingStorage::new(
-            resources.adapter.clone(),
-            self.plan.clone(),
-            None,
-            None,
-        ));
-        if self.plan.stale_read_pct > 0 {
-            failing.write_text(&source_uri, &source).await.unwrap();
-        }
-        let _decoration =
-            omnigraph::storage::STORAGE.install(Arc::new(FailingStorageDecorator(failing.clone())));
-        let before = legacy_upgrade_stored_objects(resources).await;
-
-        let clean_check = upgrade_storage(
-            root,
-            UpgradeOptions {
-                check: true,
-                to_format: Some(13),
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(clean_check.outcome, UpgradeOutcome::CheckPassed);
-        assert_eq!(legacy_upgrade_stored_objects(resources).await, before);
-
-        let mut report = LegacyUpgradeReadReport {
-            checks_passed: 0,
-            checks_failed: 0,
-            reads_corrupted: 0,
-            reads_truncated: 0,
-            latent_errors: 0,
-            stale_reads_served: 0,
-            detections: Vec::new(),
-            missing_ir_refused: false,
-            final_rows: Vec::new(),
-            commit_ids: Vec::new(),
-        };
-        failing.enable();
-        for attempt in 0..self.attempts {
-            let damage_before = failing.damage_events() + failing.stale_reads_count();
-            let result = upgrade_storage(
-                root,
-                UpgradeOptions {
-                    check: !self.execute_under_weather,
-                    to_format: Some(13),
-                },
-            )
-            .await
-            .expect("upgrade exposes preflight refusals as a typed report");
-            assert!(
-                result.last_durable_completed_boundary.is_none(),
-                "{result:?}"
-            );
-            assert!(result.recovery.is_none(), "{result:?}");
-            match result.outcome {
-                UpgradeOutcome::CheckPassed if !self.execute_under_weather => {
-                    report.checks_passed += 1;
-                }
-                UpgradeOutcome::CheckFailed => {
-                    report.checks_failed += 1;
-                    assert!(
-                        failing.damage_events() + failing.stale_reads_count() > damage_before,
-                        "refusal without a delivered read fault: {result:?}"
-                    );
-                    assert!(
-                        result
-                            .findings
-                            .iter()
-                            .any(|finding| finding.code == "preflight_failed"),
-                        "{result:?}"
-                    );
-                    for finding in result.findings {
-                        report.detections.push(format!(
-                            "attempt={attempt} {}: {}",
-                            finding.code,
-                            finding.message.replace(root, "<root>"),
-                        ));
-                    }
-                }
-                other => panic!("unexpected legacy admission outcome {other:?}: {result:?}"),
-            }
-            assert_eq!(legacy_upgrade_stored_objects(resources).await, before);
-        }
-        failing.suspend();
-        report.reads_corrupted = failing.reads_corrupted();
-        report.reads_truncated = failing.reads_truncated();
-        report.latent_errors = failing.latent_errors();
-        report.stale_reads_served = failing.stale_reads_count();
-
-        let ir_uri = format!("{root}/_schema.ir.json");
-        resources.adapter.delete(&ir_uri).await.unwrap();
-        let missing_before = legacy_upgrade_stored_objects(resources).await;
-        let missing = upgrade_storage(
-            root,
-            UpgradeOptions {
-                check: false,
-                to_format: Some(13),
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(missing.outcome, UpgradeOutcome::CheckFailed);
-        assert!(missing.last_durable_completed_boundary.is_none());
-        assert!(missing.recovery.is_none());
-        assert!(
-            missing
-                .findings
-                .iter()
-                .any(|finding| finding.code == "preflight_failed")
-        );
-        assert_eq!(
-            legacy_upgrade_stored_objects(resources).await,
-            missing_before
-        );
-        resources.adapter.write_text(&ir_uri, &ir).await.unwrap();
-        report.missing_ir_refused = true;
-        assert_eq!(legacy_upgrade_stored_objects(resources).await, before);
-
-        let converted = upgrade_storage(root, UpgradeOptions::default())
-            .await
-            .unwrap();
-        assert_eq!(
-            converted.outcome,
-            UpgradeOutcome::Completed,
-            "{converted:?}"
-        );
-        let db = Session::from_defaults(
-            Arc::new(
-                Omnigraph::open_with_storage(root, resources.adapter.clone())
-                    .await
-                    .unwrap(),
-            ),
-            SessionSettings::default(),
-        );
-        assert_eq!(db.export_jsonl("main", &[]).await.unwrap(), expected_export);
-        report.final_rows = person_rows(&db).await;
-        assert_eq!(report.final_rows, expected_rows);
-        assert_eq!(knows_pairs(&db).await, expected_edges);
-        let commits = db.list_commits(None).await.unwrap();
-        assert_eq!(
-            commits, expected_commits,
-            "storage conversion preserves graph lineage"
-        );
-        report.commit_ids = commits
-            .into_iter()
-            .map(|commit| commit.graph_commit_id)
-            .collect();
-        assert!(!report.commit_ids.is_empty());
-        assert!(!report.final_rows.is_empty());
-        assert!(resources.adapter.list_dir(root).await.unwrap().is_empty());
-        report
     }
 }
 
@@ -5731,6 +5566,10 @@ impl UniverseScenario<RustResources> for Scenario {
             Some((_, skip)) => (true, skip),
             None => (false, 0),
         };
+        let (mut setup_pending, mut setup_skip) = match sc.setup_crash {
+            Some((_, skip)) => (true, skip),
+            None => (false, 0),
+        };
         let crossed_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // The persistent record-only census probe over the whole
         // universe — recoveries and audits included. Held to universe end.
@@ -5767,16 +5606,34 @@ impl UniverseScenario<RustResources> for Scenario {
                 &mut next_ver,
             )
             .unwrap_or_else(|| {
-                sample_world_op(
-                    &mut rng,
-                    &world,
-                    &mut next_ver,
-                    sc.hostile,
-                    sc.wide,
-                    sc.schema_ops,
-                    &mut schema_extras,
-                    &mut fresh_load,
-                )
+                // An Optimize builds missing indexes too: while the recipe
+                // still owes its index build, a sampled one would leave that
+                // build nothing to do, so the sampler draws again.
+                let owes_index_build =
+                    reach_steps[reach_progress..].contains(&Milestone::EnsureIndicesMain);
+                loop {
+                    let wop = sample_world_op(
+                        &mut rng,
+                        &world,
+                        &mut next_ver,
+                        sc.hostile,
+                        sc.wide,
+                        sc.schema_ops,
+                        &mut schema_extras,
+                        &mut fresh_load,
+                    );
+                    if !(owes_index_build
+                        && matches!(
+                            wop,
+                            WorldOp::Data {
+                                op: Op::Optimize,
+                                ..
+                            }
+                        ))
+                    {
+                        break wop;
+                    }
+                }
             });
             if matches!(
                 wop,
@@ -5882,13 +5739,25 @@ impl UniverseScenario<RustResources> for Scenario {
             // this op kind (no-op when the cost ledger is disarmed).
             crate::cost::set_label(&crate::cost::debug_head(&wop));
 
-            // Unified crash trigger: blind index (`crash_at`) or targeted
-            // family match (`crash_on_match`) — at most one crash either way.
+            // Unified crash trigger: blind index (`crash_at`), the setup
+            // crash, or targeted family match (`crash_on_match`, which waits
+            // for the setup) — at most one crash per op.
             let mut crash_now: Option<&'static str> = None;
             if let Some((crash_idx, failpoint)) = sc.crash_at {
                 crash_now = (i == crash_idx).then_some(failpoint);
             }
-            if crash_now.is_none() && match_pending {
+            let mut setup_now: Option<&'static str> = None;
+            if crash_now.is_none() && setup_pending {
+                let (failpoint, _) = sc.setup_crash.expect("pending implies present");
+                if window_matches(failpoint, &wop) {
+                    if setup_skip == 0 {
+                        setup_now = Some(failpoint);
+                    } else {
+                        setup_skip -= 1;
+                    }
+                }
+            }
+            if crash_now.is_none() && setup_now.is_none() && !setup_pending && match_pending {
                 let (failpoint, _) = sc.crash_on_match.expect("pending implies present");
                 if window_matches(failpoint, &wop) {
                     if match_skip == 0 {
@@ -5899,12 +5768,16 @@ impl UniverseScenario<RustResources> for Scenario {
                     }
                 }
             }
-            let heads_before = if failing.is_some() || (crash_now.is_some() && !sc.probe_only) {
+            // `probe_only` probes a scheduled window instead of crashing it;
+            // the setup is always a real crash.
+            let probe_now = crash_now.filter(|_| sc.probe_only);
+            let crash_now = setup_now.or(crash_now.filter(|_| !sc.probe_only));
+            let heads_before = if failing.is_some() || crash_now.is_some() {
                 branch_heads(&db, &world, i, &wop, failing.as_deref()).await
             } else {
                 Vec::new()
             };
-            if let Some(failpoint) = crash_now.filter(|_| !sc.probe_only) {
+            if let Some(failpoint) = crash_now {
                 let (new_db, outcome) = Box::pin(crash_op(
                     db,
                     storage.clone(),
@@ -5920,59 +5793,82 @@ impl UniverseScenario<RustResources> for Scenario {
                 ))
                 .await;
                 db = new_db;
-                match outcome {
-                    CrashOutcome::OpSucceeded => apply_world(&mut world, &wop),
-                    CrashOutcome::LegalRejection => legal_rejections += 1,
+                if setup_now.is_some() && matches!(&outcome, CrashOutcome::Crashed { .. }) {
+                    setup_pending = false;
+                }
+                let owed = match outcome {
+                    CrashOutcome::OpSucceeded => {
+                        apply_world(&mut world, &wop);
+                        None
+                    }
+                    CrashOutcome::LegalRejection => {
+                        legal_rejections += 1;
+                        None
+                    }
+                    CrashOutcome::CleanupDeferred => {
+                        let context = format!("deferred:{failpoint}@op{i}");
+                        reconcile_verdicts.push((
+                            context.clone(),
+                            "Deferred".to_string(),
+                            "cleanup".to_string(),
+                        ));
+                        apply_world(&mut world, &wop);
+                        Some(context)
+                    }
                     CrashOutcome::Crashed { outcome, channel } => {
                         reopens += 1;
                         crashes += 1;
+                        let context = format!("crash:{failpoint}@op{i}");
                         reconcile_verdicts.push((
-                            format!("crash:{failpoint}@op{i}"),
+                            context.clone(),
                             format!("{outcome:?}"),
                             channel.to_string(),
                         ));
                         outcome.apply(&mut world, &wop);
-                        // a maintenance death gets its
-                        // obligations judged, fault-suspended. Gated on the
-                        // target still existing: a same-iteration ruling can
-                        // remove it, and the convergence rerun would fail
-                        // "not found" — a false red, not a divergence.
-                        if let Some(f) = &failing {
-                            f.suspend();
-                        }
-                        let ran = if op_targets_live(&world, &wop) {
-                            Box::pin(maintenance_obligations(
-                                &db,
-                                &world,
-                                &wop,
-                                &format!("crash:{failpoint}@op{i}"),
-                                i,
-                                sc.fail_maintenance_rerun,
-                                CleanupEvidence {
-                                    images: &cleanup_images,
-                                    paths: cleanup_paths.as_ref(),
-                                },
-                            ))
-                            .await
-                        } else {
-                            false
-                        };
-                        if let Some(f) = &failing {
-                            f.resume();
-                        }
-                        if ran {
-                            maintenance_reruns += 1;
-                            if matches!(
-                                &wop,
-                                WorldOp::Data {
-                                    op: Op::Cleanup,
-                                    ..
-                                }
-                            ) {
-                                // The rerun is a cleanup ATTEMPT — same
-                                // retention-horizon truncation as mainline.
-                                history_verified_from = history.len().saturating_sub(1);
+                        Some(context)
+                    }
+                };
+                // a maintenance death, or a cleanup the window left owing a
+                // table, gets its obligations judged, fault-suspended. Gated
+                // on the target still existing: a same-iteration ruling can
+                // remove it, and the convergence rerun would fail "not
+                // found" — a false red, not a divergence.
+                if let Some(context) = owed {
+                    if let Some(f) = &failing {
+                        f.suspend();
+                    }
+                    let ran = if op_targets_live(&world, &wop) {
+                        Box::pin(maintenance_obligations(
+                            &db,
+                            &world,
+                            &wop,
+                            &context,
+                            i,
+                            sc.fail_maintenance_rerun,
+                            CleanupEvidence {
+                                images: &cleanup_images,
+                                paths: cleanup_paths.as_ref(),
+                            },
+                        ))
+                        .await
+                    } else {
+                        false
+                    };
+                    if let Some(f) = &failing {
+                        f.resume();
+                    }
+                    if ran {
+                        maintenance_reruns += 1;
+                        if matches!(
+                            &wop,
+                            WorldOp::Data {
+                                op: Op::Cleanup,
+                                ..
                             }
+                        ) {
+                            // The rerun is a cleanup ATTEMPT — same
+                            // retention-horizon truncation as mainline.
+                            history_verified_from = history.len().saturating_sub(1);
                         }
                     }
                 }
@@ -6016,8 +5912,8 @@ impl UniverseScenario<RustResources> for Scenario {
             // attribution.
             #[cfg(feature = "failpoints")]
             let exec_result = {
-                let _probe_guard = match crash_now {
-                    Some(failpoint) if sc.probe_only => {
+                let _probe_guard = match probe_now {
+                    Some(failpoint) => {
                         let flag = crossed_flag.clone();
                         Some(
                             omnigraph::seams::catalog::decide(failpoint)
@@ -6034,7 +5930,7 @@ impl UniverseScenario<RustResources> for Scenario {
                 let effect_window = sc.faults.as_ref().and_then(|plan| {
                     if plan.engine_effect_error_pct == 0
                         || sc.probe_window.is_some()
-                        || (sc.probe_only && crash_now.is_some())
+                        || probe_now.is_some()
                         || !matches!(&wop, WorldOp::Data { op, .. } if is_mutation_op(op) || is_load_op(op))
                         || effect_rng.below(100) >= plan.engine_effect_error_pct
                     {
@@ -6063,7 +5959,7 @@ impl UniverseScenario<RustResources> for Scenario {
                         matches!(&error, OmniError::Manifest(detail)
                             if detail.kind == omnigraph::error::ManifestErrorKind::BadRequest
                                 && detail.details.is_none()
-                                && !detail.publication_in_doubt
+                                && detail.publication_in_doubt.is_none()
                                 && detail.message == format!("injected failpoint triggered: {window}")),
                         "counted effect fired but an unrelated error escaped: {error}"
                     );
@@ -6076,7 +5972,10 @@ impl UniverseScenario<RustResources> for Scenario {
                 }
             };
             #[cfg(not(feature = "failpoints"))]
-            let exec_result = exec_world_op(&db, &wop).await;
+            let exec_result = {
+                let _ = probe_now;
+                exec_world_op(&db, &wop).await
+            };
 
             // the dead flag — not the error text, not even the
             // op's verdict — is the authority. The dying op may surface a
@@ -7304,12 +7203,20 @@ mod collector_oracle_tests {
                     .unwrap()
                     .dataset_path
                     .clone();
+                let pinned = snapshot
+                    .open_dataset("node:Person")
+                    .await
+                    .unwrap()
+                    .published_dataset_version();
+                // The base is the manifest main pins; a table's first write
+                // also leaves the effect beneath its full-text declaration,
+                // a link no commit pins.
                 let initial = objects(store.as_ref()).await;
                 let base_manifests: Vec<_> = initial
                     .keys()
                     .filter(|path| {
-                        path.as_ref().contains(&format!("{table}/_versions/d"))
-                            && path.as_ref().ends_with(".manifest")
+                        path.as_ref()
+                            .ends_with(&format!("{table}/_versions/d{pinned}.manifest"))
                     })
                     .cloned()
                     .collect();

@@ -1,0 +1,181 @@
+# issue: none
+# notes: One checked warmup precedes one measured query per fresh process; a restart and exact result check follow. This repetition boundary differs from the former repeated Rust timing loop.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- query
+query friends() { match { $p: Person $p knows $q } return { $p.name, $q.name } }
+--- expect unordered
+{"p.name":"p000500","q.name":"p000501"}
+{"p.name":"p000502","q.name":"p000503"}
+{"p.name":"p000504","q.name":"p000505"}
+{"p.name":"p000506","q.name":"p000507"}
+{"p.name":"p000508","q.name":"p000509"}
+{"p.name":"p000510","q.name":"p000511"}
+{"p.name":"p000512","q.name":"p000513"}
+{"p.name":"p000514","q.name":"p000515"}
+{"p.name":"p000516","q.name":"p000517"}
+{"p.name":"p000518","q.name":"p000519"}
+{"p.name":"p000520","q.name":"p000521"}
+{"p.name":"p000522","q.name":"p000523"}
+{"p.name":"p000524","q.name":"p000525"}
+{"p.name":"p000526","q.name":"p000527"}
+{"p.name":"p000528","q.name":"p000529"}
+{"p.name":"p000530","q.name":"p000531"}
+{"p.name":"p000532","q.name":"p000533"}
+{"p.name":"p000534","q.name":"p000535"}
+{"p.name":"p000536","q.name":"p000537"}
+{"p.name":"p000538","q.name":"p000539"}
+{"p.name":"p000540","q.name":"p000541"}
+{"p.name":"p000542","q.name":"p000543"}
+{"p.name":"p000544","q.name":"p000545"}
+{"p.name":"p000546","q.name":"p000547"}
+{"p.name":"p000548","q.name":"p000549"}
+{"p.name":"p000550","q.name":"p000551"}
+{"p.name":"p000552","q.name":"p000553"}
+{"p.name":"p000554","q.name":"p000555"}
+{"p.name":"p000556","q.name":"p000557"}
+{"p.name":"p000558","q.name":"p000559"}
+{"p.name":"p000560","q.name":"p000561"}
+{"p.name":"p000562","q.name":"p000563"}
+{"p.name":"p000564","q.name":"p000565"}
+{"p.name":"p000566","q.name":"p000567"}
+{"p.name":"p000568","q.name":"p000569"}
+{"p.name":"p000570","q.name":"p000571"}
+{"p.name":"p000572","q.name":"p000573"}
+{"p.name":"p000574","q.name":"p000575"}
+{"p.name":"p000576","q.name":"p000577"}
+{"p.name":"p000578","q.name":"p000579"}
+{"p.name":"p000580","q.name":"p000581"}
+{"p.name":"p000582","q.name":"p000583"}
+{"p.name":"p000584","q.name":"p000585"}
+{"p.name":"p000586","q.name":"p000587"}
+{"p.name":"p000588","q.name":"p000589"}
+{"p.name":"p000590","q.name":"p000591"}
+{"p.name":"p000592","q.name":"p000593"}
+{"p.name":"p000594","q.name":"p000595"}
+{"p.name":"p000596","q.name":"p000597"}
+{"p.name":"p000598","q.name":"p000599"}
+--- expect shape
+p.name: String
+q.name: String
+
+--- query
+query friends() { match { $p: Person $p knows $q } return { $p.name, $q.name } }
+--- expect unordered
+{"p.name":"p000500","q.name":"p000501"}
+{"p.name":"p000502","q.name":"p000503"}
+{"p.name":"p000504","q.name":"p000505"}
+{"p.name":"p000506","q.name":"p000507"}
+{"p.name":"p000508","q.name":"p000509"}
+{"p.name":"p000510","q.name":"p000511"}
+{"p.name":"p000512","q.name":"p000513"}
+{"p.name":"p000514","q.name":"p000515"}
+{"p.name":"p000516","q.name":"p000517"}
+{"p.name":"p000518","q.name":"p000519"}
+{"p.name":"p000520","q.name":"p000521"}
+{"p.name":"p000522","q.name":"p000523"}
+{"p.name":"p000524","q.name":"p000525"}
+{"p.name":"p000526","q.name":"p000527"}
+{"p.name":"p000528","q.name":"p000529"}
+{"p.name":"p000530","q.name":"p000531"}
+{"p.name":"p000532","q.name":"p000533"}
+{"p.name":"p000534","q.name":"p000535"}
+{"p.name":"p000536","q.name":"p000537"}
+{"p.name":"p000538","q.name":"p000539"}
+{"p.name":"p000540","q.name":"p000541"}
+{"p.name":"p000542","q.name":"p000543"}
+{"p.name":"p000544","q.name":"p000545"}
+{"p.name":"p000546","q.name":"p000547"}
+{"p.name":"p000548","q.name":"p000549"}
+{"p.name":"p000550","q.name":"p000551"}
+{"p.name":"p000552","q.name":"p000553"}
+{"p.name":"p000554","q.name":"p000555"}
+{"p.name":"p000556","q.name":"p000557"}
+{"p.name":"p000558","q.name":"p000559"}
+{"p.name":"p000560","q.name":"p000561"}
+{"p.name":"p000562","q.name":"p000563"}
+{"p.name":"p000564","q.name":"p000565"}
+{"p.name":"p000566","q.name":"p000567"}
+{"p.name":"p000568","q.name":"p000569"}
+{"p.name":"p000570","q.name":"p000571"}
+{"p.name":"p000572","q.name":"p000573"}
+{"p.name":"p000574","q.name":"p000575"}
+{"p.name":"p000576","q.name":"p000577"}
+{"p.name":"p000578","q.name":"p000579"}
+{"p.name":"p000580","q.name":"p000581"}
+{"p.name":"p000582","q.name":"p000583"}
+{"p.name":"p000584","q.name":"p000585"}
+{"p.name":"p000586","q.name":"p000587"}
+{"p.name":"p000588","q.name":"p000589"}
+{"p.name":"p000590","q.name":"p000591"}
+{"p.name":"p000592","q.name":"p000593"}
+{"p.name":"p000594","q.name":"p000595"}
+{"p.name":"p000596","q.name":"p000597"}
+{"p.name":"p000598","q.name":"p000599"}
+--- expect shape
+p.name: String
+q.name: String
+
+--- restart
+
+--- query
+query friends() { match { $p: Person $p knows $q } return { $p.name, $q.name } }
+--- expect unordered
+{"p.name":"p000500","q.name":"p000501"}
+{"p.name":"p000502","q.name":"p000503"}
+{"p.name":"p000504","q.name":"p000505"}
+{"p.name":"p000506","q.name":"p000507"}
+{"p.name":"p000508","q.name":"p000509"}
+{"p.name":"p000510","q.name":"p000511"}
+{"p.name":"p000512","q.name":"p000513"}
+{"p.name":"p000514","q.name":"p000515"}
+{"p.name":"p000516","q.name":"p000517"}
+{"p.name":"p000518","q.name":"p000519"}
+{"p.name":"p000520","q.name":"p000521"}
+{"p.name":"p000522","q.name":"p000523"}
+{"p.name":"p000524","q.name":"p000525"}
+{"p.name":"p000526","q.name":"p000527"}
+{"p.name":"p000528","q.name":"p000529"}
+{"p.name":"p000530","q.name":"p000531"}
+{"p.name":"p000532","q.name":"p000533"}
+{"p.name":"p000534","q.name":"p000535"}
+{"p.name":"p000536","q.name":"p000537"}
+{"p.name":"p000538","q.name":"p000539"}
+{"p.name":"p000540","q.name":"p000541"}
+{"p.name":"p000542","q.name":"p000543"}
+{"p.name":"p000544","q.name":"p000545"}
+{"p.name":"p000546","q.name":"p000547"}
+{"p.name":"p000548","q.name":"p000549"}
+{"p.name":"p000550","q.name":"p000551"}
+{"p.name":"p000552","q.name":"p000553"}
+{"p.name":"p000554","q.name":"p000555"}
+{"p.name":"p000556","q.name":"p000557"}
+{"p.name":"p000558","q.name":"p000559"}
+{"p.name":"p000560","q.name":"p000561"}
+{"p.name":"p000562","q.name":"p000563"}
+{"p.name":"p000564","q.name":"p000565"}
+{"p.name":"p000566","q.name":"p000567"}
+{"p.name":"p000568","q.name":"p000569"}
+{"p.name":"p000570","q.name":"p000571"}
+{"p.name":"p000572","q.name":"p000573"}
+{"p.name":"p000574","q.name":"p000575"}
+{"p.name":"p000576","q.name":"p000577"}
+{"p.name":"p000578","q.name":"p000579"}
+{"p.name":"p000580","q.name":"p000581"}
+{"p.name":"p000582","q.name":"p000583"}
+{"p.name":"p000584","q.name":"p000585"}
+{"p.name":"p000586","q.name":"p000587"}
+{"p.name":"p000588","q.name":"p000589"}
+{"p.name":"p000590","q.name":"p000591"}
+{"p.name":"p000592","q.name":"p000593"}
+{"p.name":"p000594","q.name":"p000595"}
+{"p.name":"p000596","q.name":"p000597"}
+{"p.name":"p000598","q.name":"p000599"}
+--- expect shape
+p.name: String
+q.name: String

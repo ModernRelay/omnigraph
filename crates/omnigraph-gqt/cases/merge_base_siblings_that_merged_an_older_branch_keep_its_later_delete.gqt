@@ -1,0 +1,117 @@
+# issue: none
+# notes: a makes two commits after main and b makes one; left and right fork from a, each writes once, then each merges b.
+# notes: a's head and b's commit are both lowest common ancestors, and a's head has the higher generation. right deletes w after the import.
+# notes: merge.md: siblings that merged the same third branch share its commit as their base, so w (changed only on right
+# notes: after the import) stays deleted. From a's head, w is left's insert and survives the merge.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"p","age":0}}
+{"type":"Person","data":{"name":"l","age":0}}
+{"type":"Person","data":{"name":"r","age":0}}
+
+--- mutate
+branch create a;
+
+--- expect ok
+
+--- mutate
+branch create b;
+
+--- expect ok
+
+--- mutate branch: a
+query touch_p_once() {
+    update Person set { age: 0 } where name = "p"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: a
+query touch_p_twice() {
+    update Person set { age: 0 } where name = "p"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: b
+query insert_w() {
+    insert Person { name: "w", age: 0 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch create left from a;
+
+--- expect ok
+
+--- mutate
+branch create right from a;
+
+--- expect ok
+
+--- mutate branch: left
+query set_l() {
+    update Person set { age: 1 } where name = "l"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: right
+query set_r() {
+    update Person set { age: 1 } where name = "r"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge b into left;
+
+--- expect outcome: merged
+
+--- mutate
+branch merge b into right;
+
+--- expect outcome: merged
+
+--- mutate branch: right
+query delete_w() {
+    delete Person where name = "w"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge left into right;
+
+--- expect outcome: merged
+
+--- query branch: right
+query people_on_right() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"l","p.age":1}
+{"p.name":"p","p.age":0}
+{"p.name":"r","p.age":1}
+
+--- expect shape
+p.name: String
+p.age: I32
