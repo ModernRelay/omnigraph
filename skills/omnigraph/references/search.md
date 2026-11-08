@@ -44,7 +44,10 @@ from the source property it names, at its `Vector(N)` dimension. Pass the schema
 the graph was initialized or applied with (`omnigraph schema show` prints the
 accepted one). A recorded `@embed(model="…")` must equal the model the provider
 resolves, or the run is refused before it writes anything, as a text `nearest`
-would be.
+would be. The check covers the vectors the run fills: when one type declares
+vectors of different models, run once per provider with `--vector
+Type.property` naming the matching declared vectors; the others stay as they
+were.
 
 The source value is embedded exactly as stored, with no type or field-name
 template, which is also how a text `nearest($c.embedding, $q)` embeds `$q`; a
@@ -57,7 +60,8 @@ By default it fills missing vectors. Load the output explicitly afterward.
 
 Use the same form with `--reembed-all` to replace selected vectors, or `--clean`
 to remove them. `--type` (a type that declares an `@embed` vector) and
-`--select` narrow the records. A seed manifest naming `schema`,
+`--select` narrow the records, and `--vector Type.property` the declared
+vectors. A seed manifest naming `schema`,
 `sources.raw_seed` and `artifacts.embedded_seed` is an alternative:
 
 ```bash

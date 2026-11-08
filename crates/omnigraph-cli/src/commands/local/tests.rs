@@ -86,6 +86,7 @@ async fn embed_report_failure_keeps_the_completed_output_file() {
             clean: true,
             reembed_all: false,
             types: Vec::new(),
+            vectors: Vec::new(),
             selectors: Vec::new(),
             json,
         };

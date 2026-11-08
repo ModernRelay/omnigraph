@@ -37,6 +37,11 @@ pub(crate) struct EmbedArgs {
     /// Restrict processing to these type names
     #[arg(long = "type")]
     pub types: Vec<String>,
+    /// Process only these declared vectors, each named `Type.property`. The
+    /// schema must declare it with `@embed`; its source, dimension and model
+    /// still come from that declaration
+    #[arg(long = "vector", value_name = "TYPE.PROPERTY")]
+    pub vectors: Vec<String>,
     /// Reembed or clean matching records only. Syntax: Type:field=value or field=value
     #[arg(long = "select")]
     pub selectors: Vec<String>,
@@ -215,6 +220,57 @@ impl EmbedPlan {
         Ok(self)
     }
 
+    /// Keep only the vectors `--vector` names, each `Type.property`. Every
+    /// name must be an `@embed` vector the schema declares on a type the run
+    /// processes, and every `--type` must keep one, so a run selects one
+    /// declared vector without restating its source, dimension or model.
+    fn restrict_to_vectors(
+        mut self,
+        selected: &[String],
+        type_filter: &HashSet<String>,
+    ) -> Result<Self> {
+        if selected.is_empty() {
+            return Ok(self);
+        }
+        let mut keep = BTreeMap::<String, HashSet<String>>::new();
+        for name in selected {
+            let (type_name, property) = name
+                .split_once('.')
+                .filter(|(type_name, property)| !type_name.is_empty() && !property.is_empty())
+                .ok_or_else(|| eyre!("--vector {name}: expected Type.property"))?;
+            if !type_filter.is_empty() && !type_filter.contains(type_name) {
+                bail!("--vector {name}: --type does not select {type_name}");
+            }
+            let declared = self
+                .types
+                .get(type_name)
+                .is_some_and(|targets| targets.iter().any(|target| target.property == property));
+            if !declared {
+                bail!(
+                    "--vector {name}: the schema declares no `@embed` vector {type_name}.{property}"
+                );
+            }
+            keep.entry(type_name.to_string())
+                .or_default()
+                .insert(property.to_string());
+        }
+        if let Some(type_name) = type_filter
+            .iter()
+            .filter(|type_name| !keep.contains_key(*type_name))
+            .min()
+        {
+            bail!("--type {type_name}: no --vector names a vector on that type");
+        }
+        self.types.retain(|type_name, targets| {
+            let Some(properties) = keep.get(type_name) else {
+                return false;
+            };
+            targets.retain(|target| properties.contains(&target.property));
+            true
+        });
+        Ok(self)
+    }
+
     /// Refuse to embed for a property whose recorded `@embed` model the
     /// provider does not resolve to, the rule a text `nearest()` applies to
     /// the same property.
@@ -227,7 +283,8 @@ impl EmbedPlan {
                     "{}.{} records `@embed(model=\"{recorded}\")`, but the embedding provider \
                      resolves to model '{}'; vectors from another model would not answer a text \
                      nearest() on it. Set OMNIGRAPH_EMBED_MODEL='{recorded}' (and the matching \
-                     provider), or restrict the run with --type.",
+                     provider), or select the vectors this provider fills with \
+                     --vector Type.property.",
                     target.type_name,
                     target.property,
                     config.model
@@ -329,7 +386,9 @@ pub(crate) fn resolve_embed_job(args: &EmbedArgs) -> Result<EmbedJob> {
             .ok_or_else(|| eyre!("--schema is required when --seed is not provided"))?;
         (input, output, schema)
     };
-    let plan = EmbedPlan::from_schema_file(&schema)?.restrict_to(&type_filter)?;
+    let plan = EmbedPlan::from_schema_file(&schema)?
+        .restrict_to(&type_filter)?
+        .restrict_to_vectors(&args.vectors, &type_filter)?;
 
     Ok(EmbedJob {
         input,
@@ -876,6 +935,83 @@ node Tag {
         }
     }
 
+    /// `--vector` keeps the declared vectors it names and refuses one the
+    /// schema does not declare, one on a type `--type` leaves out, and a
+    /// `--type` it leaves without a vector; the kept target is the
+    /// declaration itself, so its model check stays on that vector alone.
+    #[test]
+    fn a_vector_selector_keeps_only_declared_vectors() {
+        let names = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        let types = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<HashSet<_>>()
+        };
+        let plan = issue_plan()
+            .restrict_to_vectors(&names(&["Issue.embedding"]), &types(&[]))
+            .unwrap();
+        assert_eq!(
+            plan.targets(),
+            vec![target("embedding", "title", 8, None, true)]
+        );
+        plan.check_model(mock_client(Some("text-embedding-3-large")).config())
+            .unwrap();
+        let plan = issue_plan()
+            .restrict_to_vectors(&names(&["Issue.body_embedding"]), &types(&["Issue"]))
+            .unwrap();
+        assert_eq!(
+            plan.targets(),
+            vec![target(
+                "body_embedding",
+                "body",
+                4,
+                Some("mock-body"),
+                false
+            )]
+        );
+
+        for (vectors, type_filter, expected) in [
+            (
+                &["Issue.title"][..],
+                &[][..],
+                "--vector Issue.title: the schema declares no `@embed` vector Issue.title",
+            ),
+            (
+                &["Tag.embedding"],
+                &[],
+                "--vector Tag.embedding: the schema declares no `@embed` vector",
+            ),
+            (
+                &["embedding"],
+                &[],
+                "--vector embedding: expected Type.property",
+            ),
+            (&["Issue."], &[], "--vector Issue.: expected Type.property"),
+            (
+                &["Issue.embedding"],
+                &["Tag"],
+                "--vector Issue.embedding: --type does not select Issue",
+            ),
+            (
+                &["Issue.embedding"],
+                &["Issue", "Doc"],
+                "--type Doc: no --vector names a vector on that type",
+            ),
+        ] {
+            let err = issue_plan()
+                .restrict_to_vectors(&names(vectors), &types(type_filter))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "{vectors:?} {type_filter:?}: {err}");
+        }
+    }
+
     /// The rule a text `nearest()` applies to a property's recorded model.
     #[test]
     fn a_recorded_model_the_provider_does_not_resolve_is_refused() {
@@ -934,6 +1070,7 @@ node Tag {
             clean: false,
             reembed_all: false,
             types: Vec::new(),
+            vectors: Vec::new(),
             selectors: Vec::new(),
             json: false,
         })

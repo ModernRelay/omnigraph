@@ -113,8 +113,12 @@ graph's accepted schema. A schema without an `@embed` declaration is refused.
 When an `@embed` records a `model`, the command refuses to run unless the
 embedding provider resolves to exactly that model id, the check a text
 `nearest` query applies to the same property. The refusal comes before the
-input is read or the output is written. Use `--type` to leave out a type whose
-recorded model the provider does not serve.
+input is read or the output is written. The check covers only the vectors the
+run fills, so when one type declares vectors of different models, run once per
+provider and select the matching vectors with `--vector Type.property`
+(repeatable). A selected vector keeps the source, dimension and model its
+`@embed` declares, and the run leaves every other vector of the record as it
+was.
 
 The source's string value is embedded unchanged, as described under
 [Schema annotation](#schema-annotation). A processed record whose source is
@@ -126,8 +130,9 @@ A source value that is not a string is refused.
 
 By default it fills missing vectors. Use `--reembed-all` to replace selected
 vectors or `--clean` to remove them. `--type` restricts the run to the named
-node types, each of which must declare an `@embed` vector, and `--select`
-restricts the records processed.
+node types, each of which must declare an `@embed` vector, `--vector` restricts
+it to the named `@embed` vectors (each must be declared, on a type `--type`
+selects when both are given), and `--select` restricts the records processed.
 
 `--json` prints a summary: the `input`, `output` and `schema` paths, the
 `records` read, the `selected_records`, and the `mode`. A record counts once in
