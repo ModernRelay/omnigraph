@@ -3161,8 +3161,13 @@ facts, one resource protocol) are the retrieval algebra §2.10 asked for and
 every one survives the redesign. `candidates: n` as a window distinct from
 `limit`, with the rule that "a downstream limit never sizes an upstream
 window", fixes a real defect (an `rrf` vector arm fetching exactly `limit`
-targets). Weighted `rrf` with 2 to 16 arms and projectable per-arm scores that
-are null outside the arm's window is exactly §9.5's arm model. `nearest(…,
+targets). Weighted `rrf` with 2 to 16 arms is §9.5's arm model. Its
+projectable per-arm scores, null outside the arm's window, are not: §9.5
+keeps today's columns, where a row outside a lone arm's window is absent and
+under `rrf` an arm's own column is not a value. A row of a fused result can
+sit outside one arm's window, so a per-arm column under fusion is nullable,
+and that nullable column stays RFC 0048's to add, with `RankFuse` carrying
+each arm's column. `nearest(…,
 exact: true)` is the right spelling for the exact contract. `Vector(n,
 distance="cosine")`, the recipe identity (model revision plus encoding
 choices, hashed over a canonical typed form, never a label) and `coverage =
