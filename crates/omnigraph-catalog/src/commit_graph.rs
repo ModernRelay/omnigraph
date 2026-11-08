@@ -129,6 +129,12 @@ pub struct HistoryCache {
     /// branch writes a block, so its other commits are buffered there too
     /// until they are released or merged. A hint for where to look first,
     /// never an answer: a branch that no longer holds the commit drops it.
+    /// It cannot alternate: a block is released to `__history` whole by the
+    /// branch that writes it (a publish continues a block only on its own
+    /// native branch), and the hint is learned only by the live-branch scan,
+    /// which runs only while `__history` lacks the commit, so the writer then
+    /// buffers the whole block. A fork holding a prefix of it costs one miss,
+    /// after which the scan finds the writer.
     homes: Arc<Mutex<HashMap<Ulid, Option<String>>>>,
 }
 
@@ -136,7 +142,9 @@ pub struct HistoryCache {
 /// are dropped: a few branches' worth of logarithmic fragment counts.
 const COLD_REGISTRY_FILES: usize = 64;
 
-/// Block homes held per handle before all are dropped and found again.
+/// Block homes held per handle. At the bound, remembering a new block drops
+/// one other, chosen arbitrarily: a lookup of the dropped block scans every
+/// live branch once and learns it again.
 const BLOCK_HOMES: usize = 4096;
 
 impl HistoryCache {
@@ -153,8 +161,11 @@ impl HistoryCache {
     /// of `block` when a lookup read it.
     pub(crate) fn remember_block_home(&self, block: Ulid, native: Option<String>) {
         let mut homes = self.homes.lock().unwrap_or_else(PoisonError::into_inner);
-        if homes.len() >= BLOCK_HOMES && !homes.contains_key(&block) {
-            homes.clear();
+        if homes.len() >= BLOCK_HOMES
+            && !homes.contains_key(&block)
+            && let Some(evicted) = homes.keys().next().copied()
+        {
+            homes.remove(&evicted);
         }
         homes.insert(block, native);
     }
@@ -270,13 +281,18 @@ impl HistoryCache {
         Ok(None)
     }
 
-    /// Forget every settled commit and every `__history` object: the root was
-    /// replaced under this handle, so nothing held describes the new root.
-    /// Reaches every clone sharing this cache, unlike a new `HistoryCache`.
+    /// Forget every settled commit, every `__history` object, every cold
+    /// registry file and every block home: the root was replaced under this
+    /// handle, so nothing held describes the new root. Reaches every clone
+    /// sharing this cache, unlike a new `HistoryCache`.
     pub fn reset(&self) {
         *self.settled.lock().unwrap_or_else(PoisonError::into_inner) = None;
         self.objects.clear();
         self.cold
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.homes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
