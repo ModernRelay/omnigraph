@@ -511,56 +511,95 @@ async fn init_creates_graph() {
 }
 
 #[tokio::test]
-async fn open_accepts_historical_body_unique_blob_but_init_rejects_it() {
-    const BASE_SCHEMA: &str = r#"
+async fn open_accepts_historical_body_unique_but_init_rejects_it_issue_1305() {
+    // Body-level `@unique` was admitted on Blob, list and vector members, none
+    // of which the write path can enforce (issue 1305 for list and vector).
+    // New admission refuses each; a graph that already holds one still opens.
+    const CASES: [(&str, &str, &str); 3] = [
+        (
+            r#"
 node Document {
     title: String @key
     content: Blob?
 }
-"#;
-    const HISTORICAL_SCHEMA: &str = r#"
+"#,
+            r#"
 node Document {
     title: String @key
     content: Blob?
     @unique(content)
 }
-"#;
+"#,
+            "@unique is not supported on blob property Document.content",
+        ),
+        (
+            r#"
+node Document {
+    title: String @key
+    tags: [String]?
+}
+"#,
+            r#"
+node Document {
+    title: String @key
+    tags: [String]?
+    @unique(tags)
+}
+"#,
+            "@unique is not supported on list property Document.tags",
+        ),
+        (
+            r#"
+node Document {
+    title: String @key
+    embedding: Vector(2)?
+}
+"#,
+            r#"
+node Document {
+    title: String @key
+    embedding: Vector(2)?
+    @unique(embedding)
+}
+"#,
+            "@unique is not supported on vector property Document.embedding",
+        ),
+    ];
 
-    let rejected_dir = tempfile::tempdir().unwrap();
-    let rejected_uri = rejected_dir.path().to_str().unwrap();
-    let error = match Omnigraph::init(rejected_uri, HISTORICAL_SCHEMA).await {
-        Ok(_) => panic!("new init must reject body-level @unique(Blob)"),
-        Err(error) => error,
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("@unique is not supported on blob property Document.content")
-    );
+    for (base_schema, historical_schema, refusal) in CASES {
+        let rejected_dir = tempfile::tempdir().unwrap();
+        let rejected_uri = rejected_dir.path().to_str().unwrap();
+        let error = match Omnigraph::init(rejected_uri, historical_schema).await {
+            Ok(_) => panic!("new init must refuse: {refusal}"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(refusal), "{error}");
 
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, BASE_SCHEMA).await.unwrap();
-    let accepted = db.catalog().bound_schema_ir().unwrap().clone();
-    drop(db);
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, base_schema).await.unwrap();
+        let accepted = db.catalog().bound_schema_ir().unwrap().clone();
+        drop(db);
 
-    let historical_ir = resolve_schema_ir(&accepted, &compile_persisted_shape(HISTORICAL_SCHEMA))
-        .unwrap()
-        .schema_ir;
-    publish_schema_contract_row(uri, HISTORICAL_SCHEMA, &historical_ir).await;
+        let historical_ir =
+            resolve_schema_ir(&accepted, &compile_persisted_shape(historical_schema))
+                .unwrap()
+                .schema_ir;
+        publish_schema_contract_row(uri, historical_schema, &historical_ir).await;
 
-    let reopened = Omnigraph::open(uri)
-        .await
-        .expect("historically admitted v6 schema must remain openable");
-    assert_eq!(reopened.schema_source().as_str(), HISTORICAL_SCHEMA);
-    assert!(
-        reopened
-            .snapshot_of(ReadTarget::branch("main"))
+        let reopened = Omnigraph::open(uri)
             .await
-            .unwrap()
-            .dataset("node:Document")
-            .is_some()
-    );
+            .unwrap_or_else(|error| panic!("historically admitted schema must open: {error}"));
+        assert_eq!(reopened.schema_source().as_str(), historical_schema);
+        assert!(
+            reopened
+                .snapshot_of(ReadTarget::branch("main"))
+                .await
+                .unwrap()
+                .dataset("node:Document")
+                .is_some()
+        );
+    }
 }
 
 #[tokio::test]

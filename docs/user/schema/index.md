@@ -105,8 +105,11 @@ and a stored floating-point bound as a decimal with the recorded value.
 Complete outstanding deployments containing affected schema source before
 upgrading the binary; deployment source validation uses the admission rules.
 
-`Blob`, list, and vector properties cannot be keys. Blob properties also cannot
-be unique or indexed.
+`Blob`, list, and vector properties cannot be keys or unique, in the
+property-level or the body form. Blob properties also cannot be indexed. A graph
+whose accepted schema already declares a body-level `@unique` on one of them
+still opens, but a write that gives that property a value is refused; rebuild
+the graph without the constraint to store values there.
 
 Current automatic property indexes are created for single-property node declarations:
 orderable scalars and enums receive a scalar index, free-text Strings receive a
