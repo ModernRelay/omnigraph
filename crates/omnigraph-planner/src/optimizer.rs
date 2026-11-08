@@ -3871,14 +3871,9 @@ impl Lowering<'_> {
         };
         let facts = self.source.index_facts(&image.table);
         let indexed = !columns.is_empty()
-            && columns.iter().all(|column| {
-                let mut candidates = facts
-                    .iter()
-                    .filter(|fact| fact.column == *column)
-                    .peekable();
-                candidates.peek().is_some()
-                    && candidates.all(|fact| fact.fully_covers_btree(column))
-            });
+            && columns
+                .iter()
+                .all(|column| crate::source::btree_covers_column(&facts, column));
         let index_coverage = if indexed {
             ValidateIndexCoverage::Full
         } else if facts.iter().any(|fact| {
@@ -3974,10 +3969,7 @@ impl Lowering<'_> {
         let input_rows = estimate_rows(self.logical, input, self.source);
         let columns = self.source.node_type(src_type)?.columns;
         let facts = self.source.index_facts(&format!("edge:{edge_type}"));
-        let covered = |column| {
-            let mut candidates = facts.iter().filter(|fact| fact.column == column).peekable();
-            candidates.peek().is_some() && candidates.all(|fact| fact.fully_covers_btree(column))
-        };
+        let covered = |column| crate::source::btree_covers_column(&facts, column);
         let full_coverage = match direction {
             Direction::Out => covered(columns.src),
             Direction::In => covered(columns.dst),
