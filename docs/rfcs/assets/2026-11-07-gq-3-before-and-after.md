@@ -19,6 +19,7 @@ interface Named { name: String }
 node Person implements Named { handle: String @key  name: String  age: I32?  city: String? }
 node Company implements Named { slug: String @key  name: String }
 node Doc { id: String @key  title: String  body: String @index(fulltext)  year: I32  tags: [String]  embedding: Vector(3)? }
+// `@index(fulltext, …)` is edition-3 schema syntax, additive; edition 2 spells a String's full-text index `@index`.
 node Collection { slug: String @key  min_docs: I32 }
 
 edge WorksAt: Person -> Company @card(0..1)
@@ -107,9 +108,12 @@ query homeless() {
 }
 ```
 
-**Interface binding.** Unchanged: every implementor of `Named`.
+**Interface binding.** Edition 2: **Not supported** (`T1`, an interface is
+not a node type), and edition 3 refuses it with the same code until stage
+Poly, which adds the polymorphic `Scan`.
 
 ```gq
+// edition 3, stage Poly
 query names() {
   match { $n: Named }
   return { $n.name }
@@ -199,9 +203,21 @@ query boss($slug: String) {
 
 ## 3. Aggregation
 
-**Count per group.** Unchanged: the non-aggregated items are the keys.
+**Count per group.** The non-aggregated items are the keys in both editions.
+Edition 2 needs an end of the triple typed (`T5`); edition 3 starts an
+unanchored triple from the edge's declared source type.
 
 ```gq
+// edition 2
+query headcount() {
+  match { $c: Company  $p worksAt $c }
+  return { $c.name, count($p) as n }
+  order { n desc }
+}
+```
+
+```gq
+// edition 3
 query headcount() {
   match { $p worksAt $c }
   return { $c.name, count($p) as n }
@@ -223,8 +239,11 @@ query distinct_cities() {
 }
 ```
 
-**Filter on an aggregate.** Edition 2: **Not supported.** No `having`, and a
-filter cannot see a `return` column.
+**Filter on an aggregate.** Edition 2 writes a literal or parameter bound
+with a count block, `$c: Company  count { $p worksAt $c } >= 100`, and that
+form stays. New in edition 3 is a threshold over a grouped column, which a
+count block cannot express: no `having`, and a filter cannot see a `return`
+column.
 
 ```gq
 // edition 3
@@ -238,12 +257,15 @@ query big_employers() {
 }
 ```
 
-**Aggregate of an aggregate.** Edition 2: **Not supported.**
+**Aggregate of an aggregate.** Edition 2: **Not supported.** The block form
+keeps a company with no employees at zero; the grouped form (`from { match {
+$p worksAt $c } return { $c, count($p) as n } }`) drops it. They are
+different terms, not two spellings of one.
 
 ```gq
 // edition 3
 query average_headcount() {
-  match { from { match { $p worksAt $c } return { $c, count($p) as n } } }
+  match { $c: Company  let $n = count { $p worksAt $c } }
   return { avg($n) as mean, max($n) as largest }
 }
 ```
@@ -338,10 +360,10 @@ query colleagues($of: String) {
 
 query colleagues_of_colleagues($of: String) {
   match {
-    from { match { from colleagues($of) } return { $q as c } }
-    from { match { from colleagues($c.handle) } return { $q as r } }
+    from { match { from colleagues($of) } return { $q.handle as h1 } }   // the call's $q enters scope; a second call needs it renamed (T68)
+    from colleagues($h1)
   }
-  return distinct { $r.name }
+  return distinct { $q.name }
 }
 ```
 
@@ -479,7 +501,7 @@ calls; only the positional option moves.
 ```gq
 // edition 2
 query mentions($q: String) {
-  match { $d: Doc  search($d.body, $q)  fuzzy($d.title, $q, 2) }
+  match { $d: Doc  search($d.body, $q)  fuzzy($d.body, $q, 2) }   // over the indexed property; `title` has no index
   return { $d.title }
 }
 ```
@@ -487,7 +509,7 @@ query mentions($q: String) {
 ```gq
 // edition 3
 query mentions($q: String) {
-  match { $d: Doc  search($d.body, $q)  fuzzy($d.title, $q, max_edits: 2) }
+  match { $d: Doc  search($d.body, $q)  fuzzy($d.body, $q, max_edits: 2) }
   return { $d.title }
 }
 ```
@@ -526,8 +548,9 @@ and there is no arithmetic.
 query weighted($q: String, $v: Vector(3)) {
   match {
     let $docs = { match { $d: Doc } return { $d } }
+    let $docs2 = { match { from $docs } return { $d as d2 } }               // the second arm's column renamed before it is ranked (T68)
     from { match { from distance($docs, $d.embedding, $v) } return { $d, $distance as vec } }
-    from { match { from bm25($docs, $d.body, $q) } return { $d as d2, $score as lex } }
+    from { match { from bm25($docs2, $d2.body, $q) } return { $d2, $score as lex } }
     $d = $d2
   }
   return { $d.title, 0.7 * (1.0 / (1.0 + $vec)) + 0.3 * $lex as s }
@@ -590,15 +613,16 @@ query relocate($h: String) {
 }
 ```
 
-**A write whose targets come from a traversal.** Edition 2: **Not
-supported.** The agent reads the ids first and writes `in [ids]` on a second
-snapshot.
+**A write whose targets come from a traversal.** Edition 2 reaches an edge
+by its own endpoint, `delete WorksAt where @dst = $slug`; a selection that
+needs a neighbour's property is **Not supported** there, and the agent reads
+the ids first and writes `in [ids]` on a second snapshot.
 
 ```gq
 // edition 3
-query close_company($slug: String) {
+query close_office($slug: String, $city: String) {
   $c: Company { slug: $slug }
-  $p $k:worksAt $c
+  $p: Person { city: $city }  $p $k:worksAt $c
   delete $k
 }
 ```

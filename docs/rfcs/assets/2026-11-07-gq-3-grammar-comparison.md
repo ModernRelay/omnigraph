@@ -46,7 +46,7 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 | `$x: Type { prop: expr, … }` (`binding`) | `(x:Type {prop: expr})` | `(x:Type {prop: expr})` | `FROM type_table x WHERE x.prop = expr` | `type(X), prop(X, V)` or `node(X, "Type", …)` |
 | variable sigil `$x`; `$x` is also a parameter, told apart by declaration | bare `x`; `$x` is a parameter | bare `x`; `$x` is a parameter | an alias `x`; `$1` a parameter | capitalised `X`; no parameters |
 | the type is required and one name, `UpperCamel` (`type_ref`) | label optional; label expressions `:A\|B`, `:A&B`, `:!A` | label optional; `:A\|B`, `:A&B`, `:!A` (Neo4j 5) | the table is required | the relation is required |
-| an interface binds every implementor: `$n: Named` | none; labels are sets, a node may carry several | none | none (PG table inheritance is the nearest) | a rule per subtype, or a union relation |
+| an interface binds every implementor: `$n: Named` (stage Poly; `T1` until then) | none; labels are sets, a node may carry several | none | none (PG table inheritance is the nearest) | a rule per subtype, or a union relation |
 | a property match value is any `expr`; a comparison is a filter clause, not a match | `(n {p: v})` literal map; `(n WHERE n.p > 1)` inside the element | `(n {p: v})`; `WHERE` outside | `WHERE` | a constraint in the body |
 | no anonymous endpoint: every end is a variable | `()` and `-[]->` | `()` and `-->` | n/a | `_` |
 | `$k:knows` binds the edge (`edge_binding`) | `-[k:KNOWS]->` | `-[k:KNOWS]->` | an alias on the edge table | an edge-id argument, `knows(X, Y, K)` |
