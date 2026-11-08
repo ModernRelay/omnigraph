@@ -651,8 +651,9 @@ query retract($h: String, $c: Commit) @if_commit($c) {      // the writes RFC
   returning { @id }
 }
 
-batch explore @brief("which people are in Berlin") @phase(explore) {   // the batch RFC
-  query a() @budget(rows = 1000, on_exceed = refuse) { match { $p: Person } return { $p.handle } }
+query bounded() @budget(rows = 1000, on_exceed = refuse) {     // the agent-interaction stage
+  match { $p: Person }
+  return { $p.handle }
 }
 
 query namespaced() {

@@ -24,7 +24,7 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 | `gq 3;` edition line (`edition`) | none; `SESSION SET` for session state | `CYPHER 5` / `CYPHER 25` query prefix (Neo4j 5) | none; `SET` for session state (PG) | none; `.pragma` (Soufflé) |
 | `query name($p: T = lit) @ann { read_body }`, a stored declared read (`query_decl`) | none in the language; procedures are catalog objects created outside GQL and invoked with `CALL` | none in openCypher; Neo4j has no stored Cypher (APOC `apoc.custom.declareProcedure`) | `CREATE VIEW v AS SELECT …` (no parameters); `CREATE FUNCTION f(p T) RETURNS TABLE (…) AS $$ … $$` (SQL/PSM, PG) | every rule is a named relation: `.decl r(x: T)` and `r(X) :- …` |
 | `query name(…) [as commit \| as unattached branch] { mutation_body }`: the same keyword, the body's shape is the kind | none; write statements run inline inside a transaction | none | `CREATE PROCEDURE` (SQL/PSM) | none; pure Datalog has no writes |
-| `batch name @ann { declaration* }` (`batch_decl`, a slot) | a procedure body: statements joined by `NEXT` | a script of `;`-separated statements | a transaction block | a program is a set of rules |
+| several declarations in one request, run on one snapshot and answered with one result each (a request shape, no keyword) | a procedure body: statements joined by `NEXT` | a script of `;`-separated statements | a transaction block | a program is a set of rules |
 | `$p: Type = literal`, a typed parameter with a default (`param`) | `$p`, untyped, supplied by the session | `$p`, untyped | `$1` / `?` / `:p`, typed by context; `PREPARE p(int)`; function parameters with `DEFAULT` | none; an input relation stands in |
 | `@name(pos, k = v)` on any declaration (`annotation`) | none | none; `OPTIONS { }` on index and constraint DDL (Neo4j 5) | `COMMENT ON`, `WITH (…)` storage options, function attributes (`IMMUTABLE`) | relation qualifiers `inline`, `overridable`, `.pragma` (Soufflé) |
 | one grammar for schema and queries (`query_file` holds `schema_decl`) | one grammar: catalog, graph-type and query statements | none for schema in openCypher; Neo4j DDL (`CREATE CONSTRAINT`) shares the parser | one grammar: DDL and DML | one grammar: `.decl` and rules |
@@ -176,7 +176,6 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 | an edge by bound references: `$p $k:worksAt $c  delete $k` | the pattern binds the endpoints | the pattern binds the endpoints | `DELETE … USING` with a join | n/a |
 | `as commit`, `as unattached branch` on the declaration | `START TRANSACTION`, `COMMIT`, `ROLLBACK` as statements | transactions are the driver's | `BEGIN`, `COMMIT`, `ROLLBACK` | none |
 | `returning { @id }` (a slot) | `INSERT … RETURN n` | `CREATE … RETURN n` | `RETURNING …` (PG); `NEW TABLE (INSERT …)` (standard) | n/a |
-| `batch` with its five annotations (a slot) | a procedure body | a script | a transaction | n/a |
 
 ## 12. Schema
 
