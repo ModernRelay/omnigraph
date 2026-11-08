@@ -377,6 +377,26 @@ pub(super) async fn execute_node_scan(
         }
         _ => true,
     };
+    // A vector index that does not rank exactly by squared L2 (quantized,
+    // HNSW, another metric, unreadable details) is one the engine never
+    // builds; using it would return approximate or differently ranked rows
+    // as an exhaustive answer. Indexes are derived state, so the scan
+    // answers from the flat exact kNN instead (issue #1297). The details
+    // are read only when the scan would otherwise use the index.
+    if use_index && !scan_proven_empty {
+        if let Some((property, _, _)) = nearest_target.as_ref() {
+            if !super::plan_source::indexes::vector_indexes_rank_exactly_by_l2(&read.ds, property)
+                .await?
+            {
+                tracing::debug!(
+                    variable,
+                    "the vector index on the nearest column does not rank exactly by L2; \
+                     scanning flat"
+                );
+                use_index = false;
+            }
+        }
+    }
     scan_report.probes.clear();
     scan_report.ann_metrics.clear();
     scan_report.exact = false;
@@ -470,12 +490,13 @@ pub(super) async fn execute_node_scan(
             rows,
         });
         let unreached = batches_hold_infinite_distance(&batches);
-        // Every vector index the engine builds is IVF_FLAT, which scores
-        // every row of a partition it searches exactly, so an attempt that
-        // searched every partition ranked exactly; Lance reports neither
-        // partition counter when no index covers the column and it scores
-        // every row flat. A row the prefilter admitted and the search did
-        // not reach comes back at `+inf`, out of its place.
+        // The scan uses a vector index only when it is IVF_FLAT by L2 (any
+        // other runs flat, above), which scores every row of a partition it
+        // searches exactly, so an attempt that searched every partition
+        // ranked exactly; Lance reports neither partition counter when no
+        // index covers the column and it scores every row flat. A row the
+        // prefilter admitted and the search did not reach comes back at
+        // `+inf`, out of its place.
         let every_partition = match summary {
             Some((None, None)) => true,
             Some((Some(searched), Some(ranked))) => searched >= ranked,

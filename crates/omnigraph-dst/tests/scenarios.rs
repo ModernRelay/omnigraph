@@ -2886,6 +2886,138 @@ fn warm_read_cost_rows(replay: &str) -> String {
     rows
 }
 
+/// A `nearest` read over the vector index the engine builds, on a freshly
+/// opened handle and again on the warm one. Before it uses the index, the scan
+/// reads the column's vector index details (issue #1297, through
+/// `Dataset::load_indices`); these rows pin that this read adds no storage
+/// call beyond what the planner's own index read already made.
+fn nearest_cost_rows(replay: &str) -> String {
+    const SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    embedding: Vector(2) @index
+}
+"#;
+    const QUERIES: &str = r#"
+query nearest_docs($q: Vector(2)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 4
+}
+"#;
+    const LABELS: [&str; 3] = ["NearestOpen", "NearestColdIndexed", "NearestWarmIndexed"];
+
+    struct NearestCost;
+
+    impl NearestCost {
+        async fn nearest(db: &Session) -> serde_json::Value {
+            use omnigraph_compiler::query::ast::Literal;
+            let mut params = omnigraph_compiler::ir::ParamMap::new();
+            params.insert(
+                "q".to_string(),
+                Literal::List(vec![Literal::Float(3.0), Literal::Float(1.0)]),
+            );
+            db.query(
+                omnigraph::db::ReadTarget::branch("main"),
+                QUERIES,
+                "nearest_docs",
+                &params,
+            )
+            .await
+            .unwrap()
+            .to_rust_json()
+            .unwrap()
+        }
+
+        /// The rows, with the ANN partitions the scan searched and ranked.
+        async fn nearest_through_index(db: &Session) -> (serde_json::Value, (u64, u64)) {
+            use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+            use std::sync::atomic::Ordering;
+            let probes = QueryIoProbes::default();
+            let rows = with_query_io_probes(probes.clone(), Self::nearest(db)).await;
+            let searched = probes.ann_partitions_searched.load(Ordering::Relaxed);
+            let ranked = probes.ann_partitions_ranked.load(Ordering::Relaxed);
+            (rows, (searched, ranked))
+        }
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for NearestCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_nearest_setup");
+            let writer = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::init_with_storage(
+                        &resources.root,
+                        SCHEMA,
+                        resources.adapter.clone(),
+                        InitOptions::default(),
+                    )
+                    .await
+                    .unwrap(),
+                ),
+                SessionSettings::default(),
+            );
+            let seed = (0..32)
+                .map(|row| {
+                    format!(
+                        r#"{{"type":"Doc","data":{{"slug":"d{row:02}","embedding":[{x:?},{y:?}]}}}}"#,
+                        x = row as f32,
+                        y = (row % 5) as f32
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            writer.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
+            writer.ensure_indices_as(None).await.unwrap();
+            omnigraph_dst::cost::set_label(LABELS[0]);
+            let reader = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                        .await
+                        .unwrap(),
+                ),
+                SessionSettings::default(),
+            );
+            omnigraph_dst::cost::set_label(LABELS[1]);
+            let (cold, cold_partitions) = Self::nearest_through_index(&reader).await;
+            omnigraph_dst::cost::set_label(LABELS[2]);
+            let (warm, warm_partitions) = Self::nearest_through_index(&reader).await;
+            omnigraph_dst::cost::set_label("_nearest_verify");
+            // The labels say "Indexed": keep them true. A flat scan reports no
+            // partition counters, so a planner change that made this read flat
+            // would leave the rows green without measuring the details read.
+            for (label, (searched, ranked)) in
+                [(LABELS[1], cold_partitions), (LABELS[2], warm_partitions)]
+            {
+                assert!(
+                    searched > 0 && ranked > 0,
+                    "{label} must scan through the vector index: \
+                     {searched} of {ranked} partitions searched"
+                );
+            }
+            assert_eq!(cold, warm);
+            assert_eq!(
+                cold.as_array().unwrap().len(),
+                4,
+                "the four nearest docs: {cold}"
+            );
+        }
+    }
+
+    labeled_cost_rows_of(
+        format!("shared-memory://dst-nearest-cost-{replay}"),
+        &NearestCost,
+        &LABELS,
+    )
+}
+
 /// Where each warm-read call goes: per label, the calls by realm (the
 /// `__manifest` dataset, `__history`, a graph table, or the control-object
 /// adapter), Lance directory and verb, at several history depths. Prints
@@ -3713,6 +3845,7 @@ fn dst_bench_cost_count_golden() {
     table.push_str(&overwrite_removal_cost_rows("a"));
     table.push_str(&endpoint_probe_cost_rows("a"));
     table.push_str(&warm_read_cost_rows("a"));
+    table.push_str(&nearest_cost_rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-b", &sc);
     let mut table2 = ledger2.render_calls();
@@ -3725,6 +3858,7 @@ fn dst_bench_cost_count_golden() {
     table2.push_str(&overwrite_removal_cost_rows("b"));
     table2.push_str(&endpoint_probe_cost_rows("b"));
     table2.push_str(&warm_read_cost_rows("b"));
+    table2.push_str(&nearest_cost_rows("b"));
     assert_eq!(
         table, table2,
         "the counting pass must replay identically before any golden claim"
