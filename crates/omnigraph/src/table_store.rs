@@ -5842,7 +5842,7 @@ impl TableStore {
                 .await?
         };
         let mut account = PendingScanAccount::new(budget)?;
-        account.add_batches(&pending)?;
+        let pending = account.retain_all(pending)?;
 
         let scan_rows = account.next_scan_rows();
         let scan_bytes = account.next_scan_bytes();
@@ -5876,8 +5876,7 @@ impl TableStore {
             if batch.num_rows() == 0 {
                 continue;
             }
-            account.add_batch(&batch)?;
-            committed.push(batch);
+            committed.push(account.retain(batch)?);
         }
 
         committed.extend(pending);
@@ -6013,7 +6012,7 @@ impl TableStore {
                 .collect::<Result<Vec<_>>>()?,
         };
         let mut account = PendingScanAccount::new(budget)?;
-        account.add_batches(&pending)?;
+        let pending = account.retain_all(pending)?;
         let carried_without_blobs: Option<SchemaRef> =
             (!carried.fields.iter().any(|field| field.is_blob()))
                 .then(|| Arc::new((&carried).into()));
@@ -6056,20 +6055,22 @@ impl TableStore {
                 continue;
             }
             account.ensure_additional_rows(batch.num_rows())?;
+            if let Some(schema) = &carried_without_blobs {
+                let carried_rows = predicate_rows_as(schema, &batch)?;
+                committed.push(account.retain(carried_rows)?);
+                continue;
+            }
+
             // This predicate scan contains every logical non-blob column and
             // `_rowid`, but no blob descriptors/payloads. Charge the logical
             // columns now so an already-overwide match fails before
-            // `take_rows` performs the second full-row read.
+            // `take_rows` performs the second full-row read. The scanner's
+            // batch is a slice of its decoded fragment batch, so measure a
+            // copy of the matched rows, as `PendingScanAccount::retain` does.
+            let batch = copy_batch_range(&batch, 0, batch.num_rows())?;
             let non_blob_bytes = non_blob_column_bytes(committed_ds, &batch)?;
             account.remaining_bytes_after(non_blob_bytes)?;
             let payload_budget = account.write_budget.bytes() - account.payload_bytes;
-
-            if let Some(schema) = &carried_without_blobs {
-                let carried_rows = predicate_rows_as(schema, &batch)?;
-                account.add_batch(&carried_rows)?;
-                committed.push(carried_rows);
-                continue;
-            }
 
             let row_ids = batch
                 .column_by_name("_rowid")
@@ -6125,8 +6126,7 @@ impl TableStore {
                 Err(error) => return Err(error),
                 Ok(materialized) => materialized,
             };
-            account.add_batch(&materialized)?;
-            committed.push(materialized);
+            committed.push(account.retain(materialized)?);
         }
 
         committed.extend(pending);
@@ -6466,7 +6466,9 @@ fn assign_row_id_meta(fragments: &mut [Fragment], start_row_id: u64) -> Result<(
 ///
 /// The retained `Vec<RecordBatch>` never grows past this account: pending
 /// results are charged first, and each committed scanner emission is charged
-/// only after pending-key shadowing. `initial_rows` represents this table's
+/// only after pending-key shadowing. Every kept batch goes through
+/// [`Self::retain`], so neither the charge nor the memory held depends on the
+/// rows stored beside a match. `initial_rows` represents this table's
 /// retained batches, while `initial_bytes` represents every table retained by
 /// `MutationStaging`, so a chained cross-table update receives only the
 /// remaining graph-operation byte budget.
@@ -6498,11 +6500,28 @@ impl PendingScanAccount {
         &self.table_key
     }
 
-    fn add_batches(&mut self, batches: &[RecordBatch]) -> Result<()> {
-        for batch in batches {
-            self.add_batch(batch)?;
-        }
-        Ok(())
+    /// [`Self::retain`] each batch in order.
+    fn retain_all(&mut self, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+        batches
+            .into_iter()
+            .map(|batch| self.retain(batch))
+            .collect()
+    }
+
+    /// The one way a pending-aware scan keeps a batch: copy its rows into
+    /// buffers of their own, then charge the copy, and return the copy to
+    /// keep.
+    ///
+    /// A filtered Lance scan returns matched rows as slices of the batch
+    /// decoded from their fragment, and a slice pins every buffer of its
+    /// parent, so charging (or keeping) the slice would count the rows stored
+    /// beside the match. Copying first makes both the charge and the memory
+    /// held depend only on the kept rows, never on fragment layout (issue
+    /// #1303). The copy is bounded by the same write budget it is charged to.
+    fn retain(&mut self, batch: RecordBatch) -> Result<RecordBatch> {
+        let batch = copy_batch_range(&batch, 0, batch.num_rows())?;
+        self.add_batch(&batch)?;
+        Ok(batch)
     }
 
     fn add_batch(&mut self, batch: &RecordBatch) -> Result<()> {
@@ -7727,7 +7746,7 @@ fn next_proven_insert_batch(
         {
             batch.clone()
         } else {
-            copy_proven_insert_batch_range(batch, offset, rows)?
+            copy_batch_range(batch, offset, rows)?
         };
         let usage = write_batch_bytes(&candidate)?;
         let bytes = usage.rows.max(usage.payload);
@@ -7839,18 +7858,16 @@ fn finish_proven_insert_batch(
     Ok(batch)
 }
 
-fn copy_proven_insert_batch_range(
-    batch: &RecordBatch,
-    offset: usize,
-    rows: usize,
-) -> Result<RecordBatch> {
+/// Copy `rows` rows from `offset` into buffers of their own, so the result
+/// pins none of `batch`'s other rows.
+fn copy_batch_range(batch: &RecordBatch, offset: usize, rows: usize) -> Result<RecordBatch> {
     let end = offset
         .checked_add(rows)
-        .ok_or_else(|| OmniError::manifest_internal("proven insert delta range overflow"))?;
+        .ok_or_else(|| OmniError::manifest_internal("batch copy range overflow"))?;
     let offset = u64::try_from(offset)
-        .map_err(|_| OmniError::manifest_internal("proven insert delta offset exceeds u64"))?;
+        .map_err(|_| OmniError::manifest_internal("batch copy offset exceeds u64"))?;
     let end = u64::try_from(end)
-        .map_err(|_| OmniError::manifest_internal("proven insert delta end exceeds u64"))?;
+        .map_err(|_| OmniError::manifest_internal("batch copy end exceeds u64"))?;
     let indices = UInt64Array::from_iter_values(offset..end);
     arrow_select::take::take_record_batch(batch, &indices).map_err(OmniError::arrow_internal)
 }

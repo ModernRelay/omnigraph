@@ -464,6 +464,11 @@ payload lengths have an independent allowance of the same size. Payload
 accounts count logical payload lengths; builder over-capacity (up to about one
 third) is outside them. Pending-aware
 update scans charge both accounts, including their initial pending input.
+Every batch such a scan keeps passes through `PendingScanAccount::retain`,
+which copies its rows into buffers of their own before charging them: a
+filtered Lance scan returns matched rows as slices that pin the whole decoded
+fragment batch, and admission must not depend on the rows stored beside a
+match.
 The keyed parse spool separately caps its row estimate and decoded Blob bytes.
 Inline and copied external payload lengths are admitted together before GETs;
 materialized row and payload accounts are checked again before staging.
