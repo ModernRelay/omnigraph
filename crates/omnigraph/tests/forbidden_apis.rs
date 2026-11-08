@@ -28,7 +28,10 @@
 //! preceding line contains the sentinel comment
 //! `// forbidden-api-allow: <reason>` are exempt from the lexical deny-list —
 //! reviewers see the sentinel in diff and can ask whether the exemption is
-//! justified.
+//! justified. A qualified durable primitive (`Owner::name`) is matched where
+//! its path is spelled, in a call or a struct literal; an import that renames
+//! or glob-imports the owner (`use …::Operation::*`) is not resolved, so a
+//! qualified entry pins the spelled form, not every reachable one.
 //!
 //! The graph-write protocol guard is structural rather than grep-based. It
 //! parses Rust with `syn`, classifies all public async inherent `Omnigraph`
@@ -1240,7 +1243,7 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     // No engine writer creates a data overlay: Lance drops an index's coverage
     // of a fragment whose overlay is newer than the index, and optimize's
     // index-rows ceiling measures the lag before the rewrite (lance.md, "Index
-    // coverage").
+    // coverage"). A struct literal is the only construction (`visit_expr_struct`).
     "Operation::DataOverlay",
     ".update_config(",
     ".update_schema_metadata(",
@@ -1484,8 +1487,11 @@ fn path_ends_with(expr: &Expr, suffix: &[&str]) -> bool {
     let Expr::Path(path) = expr else {
         return false;
     };
+    syn_path_ends_with(&path.path, suffix)
+}
+
+fn syn_path_ends_with(path: &syn::Path, suffix: &[&str]) -> bool {
     let segments = path
-        .path
         .segments
         .iter()
         .map(|segment| segment.ident.to_string())
@@ -1759,6 +1765,24 @@ impl<'ast> Visit<'ast> for CallInventory {
             }
         }
         visit::visit_expr_call(self, node);
+    }
+
+    /// A struct literal constructs a qualified primitive as a call does:
+    /// `Operation::DataOverlay { groups }` is the only shape Lance accepts for
+    /// that variant, and a pattern (`| Operation::DataOverlay { .. }`) is not
+    /// an expression, so a read-side match never counts.
+    fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+        for primitive in DURABLE_PRIMITIVES {
+            let qualified = primitive.trim_start_matches('.').trim_end_matches('(');
+            if !qualified.contains("::") {
+                continue;
+            }
+            let suffix = qualified.split("::").collect::<Vec<_>>();
+            if syn_path_ends_with(&node.path, &suffix) {
+                self.record(*primitive);
+            }
+        }
+        visit::visit_expr_struct(self, node);
     }
 
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
@@ -4885,6 +4909,33 @@ fn in_process_waits_are_gates_in_write_queue() {
          mark the line `{SENTINEL} <why it is not a gate>` (a cache held across no \
          round trip).\n  {}",
         violations.join("\n  ")
+    );
+}
+
+/// A qualified durable primitive is found wherever its path is constructed: a
+/// call, and a struct literal such as Lance's `Operation::DataOverlay { .. }`.
+/// A match pattern on the same path is a read and counts nothing.
+#[test]
+fn durable_primitive_struct_literals_are_inventoried() {
+    let ast: syn::File = syn::parse_str(
+        "fn write(groups: Vec<G>) -> Operation {\n    \
+             lance::dataset::transaction::Operation::DataOverlay { groups }\n}\n\
+         fn read(op: &Operation) -> bool {\n    \
+             matches!(op, Operation::DataOverlay { .. } | Operation::Delete { .. })\n}\n\
+         fn call() { let _ = compact_files(1); }\n",
+    )
+    .unwrap();
+    let inventory = call_inventory(&ast);
+    assert_eq!(
+        inventory.counts.get("Operation::DataOverlay"),
+        Some(&1),
+        "the literal is counted once, the pattern not at all: {:?}",
+        inventory.counts
+    );
+    assert_eq!(
+        inventory.counts.get("compact_files"),
+        Some(&1),
+        "a plain call is recorded by its final identifier"
     );
 }
 
