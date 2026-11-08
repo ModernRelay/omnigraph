@@ -111,7 +111,9 @@ property-level or the body form. Blob properties also cannot be indexed.
 Earlier releases admitted a body-level `@unique` on a list or vector property.
 A graph that already declares one still opens, but a write that gives the
 property a value is refused, and reapplying that source is refused at
-admission. To remove the constraint in place, drop every property it names in
+admission. In a cluster, every `cluster apply` of a deployment that contains
+such a graph is refused, even one that changes only another graph, query or
+policy, until the constraint is removed. To remove the constraint in place, drop every property it names in
 one schema change, then add the properties back without it; dropping a
 property discards its stored values. A constraint that also names another
 property or `@src`/`@dst` cannot be removed in place: rebuild the graph
