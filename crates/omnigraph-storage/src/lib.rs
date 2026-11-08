@@ -288,6 +288,14 @@ impl StorageError {
         Self::Internal(message.into())
     }
 
+    /// Whether a conditional write ended with no answer that settled it: a
+    /// copy may still land. Every other error of a conditional write is a
+    /// refusal that applied nothing, the owning scope's refusal of a key with
+    /// an unsettled request included.
+    pub fn is_unresolved_conditional(&self) -> bool {
+        matches!(self, Self::Backend(failure) if failure.message.contains(UNRESOLVED_CONDITIONAL_MARKER))
+    }
+
     fn backend(kind: StorageFailureKind, message: impl Into<String>) -> Self {
         Self::Backend(StorageFailure::new(kind, message))
     }
@@ -2621,13 +2629,17 @@ fn log_conditional_reissue(op: &'static str, reissue: u32, error: &object_store:
 
 /// No answer settled a conditional write and the key does not show it, so
 /// a copy may still land.
+/// The one phrase an unresolved conditional write's message carries, which
+/// [`StorageError::is_unresolved_conditional`] reads back.
+const UNRESOLVED_CONDITIONAL_MARKER: &str = "is unresolved for";
+
 fn unresolved_conditional_error(action: &str, uri: &str, err: object_store::Error) -> StorageError {
     let kind = classify_object_store_error(&err);
     StorageError::backend(
         kind,
         format!(
-            "storage {action} is unresolved for '{uri}': no answer settled the request and the \
-             object does not show it, so a copy may still land: {err}"
+            "storage {action} {UNRESOLVED_CONDITIONAL_MARKER} '{uri}': no answer settled the \
+             request and the object does not show it, so a copy may still land: {err}"
         ),
     )
 }

@@ -67,6 +67,27 @@ fn classify(error: &color_eyre::Report) -> Refusal {
     }
 }
 
+/// How a lookup during the wait ended. The operation is accepted by then
+/// (or its submission is in doubt), so a refusal says the record cannot be
+/// observed now, never that nothing started.
+#[derive(Debug, PartialEq, Eq)]
+enum LookupAnswer {
+    /// A definite refusal: the id is accepted but cannot be observed by this
+    /// caller now (a grant removed, the graph gone, the record foreign).
+    Refused,
+    /// No definite answer, or the server is busy: ask again.
+    Unanswered,
+}
+
+fn classify_lookup(error: &color_eyre::Report) -> LookupAnswer {
+    match error.downcast_ref::<RemoteErrorCli>() {
+        Some(remote) if remote.status.as_u16() < 500 && remote.status.as_u16() != 429 => {
+            LookupAnswer::Refused
+        }
+        _ => LookupAnswer::Unanswered,
+    }
+}
+
 fn request_body(request: &ServedOptimize, operation_id: &str) -> Value {
     let mut body = json!({ "operation_id": operation_id });
     if !request.tables.is_empty() {
@@ -134,18 +155,18 @@ pub(crate) async fn run(
     loop {
         match &answer {
             Ok(_) => unanswered = 0,
-            // A definite refusal ends the wait with its own exit; a lost
-            // answer is retried a bounded number of times.
-            Err(error) => match classify(error) {
-                Refusal::DifferentRequest => {
-                    writeln!(stderr, "error: {error}")?;
-                    return Ok(Completion::exit(DIFFERENT_REQUEST));
+            // The operation is accepted or in doubt by now, so a refused
+            // lookup is doubt about its outcome, never "nothing started"; a
+            // lost answer is retried a bounded number of times.
+            Err(error) => match classify_lookup(error) {
+                LookupAnswer::Refused => {
+                    writeln!(
+                        stderr,
+                        "operation {operation_id} cannot be observed now ({error}); it may still run, observe it with `omnigraph optimize --operation {operation_id}`"
+                    )?;
+                    return Ok(Completion::exit(IN_DOUBT));
                 }
-                Refusal::BeforeAcceptance => {
-                    writeln!(stderr, "error: {error}")?;
-                    return Ok(Completion::exit(NO_EFFECTS));
-                }
-                Refusal::AnotherActive | Refusal::Unanswered => {
+                LookupAnswer::Unanswered => {
                     unanswered += 1;
                     if unanswered >= UNANSWERED_LOOKUPS {
                         writeln!(
@@ -290,6 +311,30 @@ mod tests {
         assert_eq!(
             classify(&color_eyre::eyre::eyre!("connection reset")),
             Refusal::Unanswered
+        );
+    }
+
+    #[test]
+    fn a_refused_lookup_is_doubt_not_a_refusal_before_acceptance() {
+        assert_eq!(
+            classify_lookup(&remote(403, "forbidden", "maintain was revoked")),
+            LookupAnswer::Refused
+        );
+        assert_eq!(
+            classify_lookup(&remote(404, "not_found", "graph gone")),
+            LookupAnswer::Refused
+        );
+        assert_eq!(
+            classify_lookup(&remote(429, "too_many_requests", "busy")),
+            LookupAnswer::Unanswered
+        );
+        assert_eq!(
+            classify_lookup(&remote(503, "service_unavailable", "draining")),
+            LookupAnswer::Unanswered
+        );
+        assert_eq!(
+            classify_lookup(&color_eyre::eyre::eyre!("connection reset")),
+            LookupAnswer::Unanswered
         );
     }
 

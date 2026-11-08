@@ -39,6 +39,7 @@ pub struct ClusterAdmission(Option<Arc<AdmissionOwner>>);
 
 /// The held operation-record gate ([`ClusterAdmission::lock_operations`]).
 pub struct OperationsLock {
+    gate: Arc<tokio::sync::Mutex<()>>,
     _held: tokio::sync::OwnedMutexGuard<()>,
 }
 
@@ -217,8 +218,10 @@ impl ClusterAdmission {
     /// in this process and the conditional put's precondition is the version
     /// the holder read.
     pub async fn lock_operations(&self) -> OperationsLock {
+        let gate = Arc::clone(&self.owner().operations);
         OperationsLock {
-            _held: Arc::clone(&self.owner().operations).lock_owned().await,
+            _held: Arc::clone(&gate).lock_owned().await,
+            gate,
         }
     }
 
@@ -234,8 +237,12 @@ impl ClusterAdmission {
     /// The operation record and its version token, under the gate.
     pub async fn read_operations(
         &self,
-        _lock: &OperationsLock,
+        lock: &OperationsLock,
     ) -> Result<Option<(crate::OperationRecord, String)>, Diagnostic> {
+        debug_assert!(
+            Arc::ptr_eq(&lock.gate, &self.owner().operations),
+            "an operation-record gate is read under the admission that gave it"
+        );
         self.owner().store.read_operations().await
     }
 
@@ -244,10 +251,14 @@ impl ClusterAdmission {
     /// first.
     pub async fn write_operations(
         &self,
-        _lock: &OperationsLock,
+        lock: &OperationsLock,
         record: &crate::OperationRecord,
         expected_version: Option<&str>,
     ) -> Result<crate::OperationWrite, Diagnostic> {
+        debug_assert!(
+            Arc::ptr_eq(&lock.gate, &self.owner().operations),
+            "an operation-record gate is written under the admission that gave it"
+        );
         self.validate_current_lock().await?;
         self.owner()
             .store
@@ -293,6 +304,15 @@ impl ClusterAdmission {
                         "operation_record_changed",
                         crate::CLUSTER_OPERATIONS_FILE,
                         "the operation record changed under this process's gate; another writer holds the root",
+                    ));
+                }
+                crate::OperationWrite::Refused { error } => {
+                    return Err(Diagnostic::error(
+                        "operation_record_refused",
+                        crate::CLUSTER_OPERATIONS_FILE,
+                        format!(
+                            "the operation record write was refused and applied nothing: {error}"
+                        ),
                     ));
                 }
                 crate::OperationWrite::InDoubt { error } => {

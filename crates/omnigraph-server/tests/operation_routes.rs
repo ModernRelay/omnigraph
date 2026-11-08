@@ -20,6 +20,9 @@ mod support;
 use support::*;
 
 const ROOT: &str = "OMNIGRAPH_OPERATIONS_TEST_ROOT";
+/// When set, the served child parks the first optimize run at its
+/// authority-capture seam until this file exists.
+const HOLD_RELEASE: &str = "OMNIGRAPH_OPERATIONS_TEST_HOLD_RELEASE";
 const OPERATION_ID: &str = "01JC0000000000000000000001";
 
 const POLICY: &str = r#"
@@ -133,9 +136,13 @@ fn applied_cluster() -> tempfile::TempDir {
     temp
 }
 
-fn spawn_server(root: &Path) -> (ContainedChild, String) {
+fn spawn_server(root: &Path, hold_release: Option<&Path>) -> (ContainedChild, String) {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    if let Some(release) = hold_release {
+        command.env(HOLD_RELEASE, release);
+    }
     let mut child = ContainedChild(
-        Command::new(std::env::current_exe().unwrap())
+        command
             .args(["--exact", "served_child", "--ignored", "--nocapture"])
             .env(ROOT, root)
             .env("OMNIGRAPH_OPERATION_ROUTES", "true")
@@ -172,6 +179,21 @@ async fn served_child() {
     let Some(root) = std::env::var_os(ROOT).map(PathBuf::from) else {
         return;
     };
+    // A parked run: the first optimize stops after its `running` write and
+    // before any table work, until the parent creates the release file.
+    let _scenario = omnigraph::seams::FailScenario::setup();
+    let _hold = std::env::var_os(HOLD_RELEASE).map(|release| {
+        let release = PathBuf::from(release);
+        let (installed, hold) =
+            omnigraph::seams::catalog::OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES.hold();
+        std::thread::spawn(move || {
+            while !release.exists() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            hold.release();
+        });
+        installed
+    });
     let mut config = cluster_settings(&root).await.unwrap();
     config.bind = "127.0.0.1:0".into();
     omnigraph_server::serve(config).await.unwrap();
@@ -268,7 +290,7 @@ async fn recorded_optimize_keeps_a_record_a_caller_reads_by_id() {
             .unwrap();
         }
     }
-    let (mut child, address) = spawn_server(temp.path());
+    let (mut child, address) = spawn_server(temp.path(), None);
     let client = Client {
         http: reqwest::Client::new(),
         base: format!("http://{address}"),
@@ -356,5 +378,88 @@ async fn recorded_optimize_keeps_a_record_a_caller_reads_by_id() {
     assert_eq!(record["ledger_id"], ledger["ledger_id"]);
     assert_eq!(record["terminal"][0]["operation_id"], OPERATION_ID);
     assert!(record.get("active").is_none(), "{record}");
+    drop(child);
+}
+
+/// With the run parked after its `running` write: a repeat of the same request
+/// answers the running record (202, in progress) instead of 429, and another
+/// id is refused 429 naming the active one. Then the record is made unreadable
+/// while the run finishes, so its final write fails; the known ending is kept
+/// and applied by the next lookup once the record reads again, so the run is
+/// `succeeded`, never `interrupted`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_known_ending_survives_a_failed_final_write_and_a_repeat_answers_the_running_record() {
+    let temp = applied_cluster();
+    apply_cluster_fixture(temp.path()).await;
+    let release = temp.path().join("release-the-run");
+    let (mut child, address) = spawn_server(temp.path(), Some(&release));
+    let client = Client {
+        http: reqwest::Client::new(),
+        base: format!("http://{address}"),
+    };
+    client.wait_ready(&mut child.0).await;
+    let record_path = temp.path().join("__cluster/operations.json");
+
+    let body = json!({ "operation_id": OPERATION_ID });
+    let (status, accepted) = client.submit("op-secret", body.clone()).await;
+    assert_eq!(status, 202, "{accepted}");
+    // The run reaches the seam after its `running` write.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (_, found) = client.lookup(OPERATION_ID).await;
+        if found["operation"]["state"] == "running" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the run never reached running: {found}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let (status, repeated) = client.submit("op-secret", body.clone()).await;
+    assert_eq!(
+        status, 202,
+        "a repeat answers the running record: {repeated}"
+    );
+    assert_eq!(repeated["operation"]["state"], "running", "{repeated}");
+    assert_eq!(repeated["in_progress"], true, "{repeated}");
+    let (status, refused) = client
+        .submit(
+            "op-secret",
+            json!({ "operation_id": "01JC0000000000000000000002" }),
+        )
+        .await;
+    assert_eq!(status, 429, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("operation {OPERATION_ID} is active")),
+        "the refusal names the active id: {refused}"
+    );
+
+    // The final write meets an unreadable record, so it cannot land.
+    let intact = fs::read(&record_path).unwrap();
+    fs::write(&record_path, b"not a record").unwrap();
+    fs::write(&release, b"").unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    fs::write(&record_path, &intact).unwrap();
+
+    let (status, found) = client.lookup(OPERATION_ID).await;
+    assert_eq!(status, 200, "{found}");
+    assert_eq!(
+        found["operation"]["state"], "succeeded",
+        "the kept ending is applied once the record reads again: {found}"
+    );
+    assert!(
+        found["operation"]["outcome"]["tables"]
+            .as_array()
+            .is_some_and(|tables| tables
+                .iter()
+                .any(|table| table["type_key"] == "node:Person")),
+        "the ending carries its table outcomes: {found}"
+    );
+    assert_eq!(found["in_progress"], false, "{found}");
     drop(child);
 }

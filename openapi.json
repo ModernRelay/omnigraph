@@ -11064,7 +11064,7 @@
             }
           },
           "503": {
-            "description": "The routes are not enabled, or admission is closed; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
+            "description": "The routes are not enabled, admission is closed, or the operation record write was refused and nothing was accepted (a refusal naming an unsettled earlier request holds until the server restarts); graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {

@@ -1185,7 +1185,10 @@ impl ClusterStore {
                 Err(error) => OperationWrite::InDoubt { error },
             },
             Ok(None) => OperationWrite::Conflict,
-            Err(error) => OperationWrite::InDoubt {
+            Err(error) if error.is_unresolved_conditional() => OperationWrite::InDoubt {
+                error: error.to_string(),
+            },
+            Err(error) => OperationWrite::Refused {
                 error: error.to_string(),
             },
         })

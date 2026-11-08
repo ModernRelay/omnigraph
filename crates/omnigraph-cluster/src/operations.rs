@@ -940,6 +940,11 @@ pub enum OperationWrite {
     Written { version: String },
     /// The precondition failed: another write changed the record.
     Conflict,
+    /// Nothing applied: the store, or this process's storage scope, refused
+    /// the request before it could land. A scope refuses a key with an
+    /// earlier request of unknown outcome until a replacement scope, so this
+    /// can hold for the rest of the process's life.
+    Refused { error: String },
     /// No definite answer. The key is unsettled until a re-read settles it.
     InDoubt { error: String },
 }

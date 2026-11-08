@@ -215,9 +215,10 @@ struct LiveRun {
     cancel_reason: Option<String>,
 }
 
-/// A final record write whose answer was lost. The outcome is known here, so
-/// the change is applied again to the record as it stands at the next access,
-/// never as an old snapshot over a newer record.
+/// A run's final record change that no write has applied yet. The outcome is
+/// known here, so the change is applied again to the record as it stands at
+/// the next access, never as an old snapshot over a newer record, and kept
+/// until a write applies it or the record no longer holds the run active.
 enum PendingEnding {
     Finish(Box<Operation>),
     Defer {
@@ -228,7 +229,7 @@ enum PendingEnding {
 
 pub(crate) struct RecordedOperations {
     settings: OperationSettings,
-    pending: SyncMutex<Option<PendingEnding>>,
+    pending: SyncMutex<BTreeMap<String, PendingEnding>>,
     /// One admission gate per scope, held by the owned operation.
     gates: BTreeMap<AdmissionScope, Arc<Mutex<()>>>,
     /// The runs this process holds; changed only under the record gate.
@@ -525,13 +526,24 @@ fn record_refusal(error: omnigraph_cluster::Diagnostic) -> ApiError {
                 error.message
             ),
         ),
+        // Nothing applied: the store or this process's storage scope refused
+        // the request before sending it. A scope keeps refusing a key whose
+        // earlier request is unsettled until the server is replaced.
+        "operation_record_refused" => ApiError::new(
+            ErrorCode::ServiceUnavailable,
+            format!(
+                "{}; nothing was accepted, and a refusal that names an unsettled earlier request holds until the server restarts",
+                error.message
+            ),
+        ),
         _ => refusal(error),
     }
 }
 
-/// Every record change this process makes, under the gate: a pending ending
-/// re-applied, orphans settled, the walks applied where the record still
-/// matches, then `change`. The record comes back as written.
+/// Every record change this process makes, under the gate: the pending endings
+/// applied (and dropped once applied or superseded), orphans settled, the
+/// walks applied where the record still matches, then `change`. The record
+/// comes back as written; a failed write keeps every pending ending.
 async fn update<T>(
     state: &AppState,
     owner: &ClusterAdmission,
@@ -539,32 +551,32 @@ async fn update<T>(
     walks: &[(String, Option<ResolutionProgress>, Resolution)],
     change: impl FnOnce(&mut OperationRecord) -> (bool, T),
 ) -> Result<OperationsUpdate<T>, ApiError> {
-    let pending = state
-        .recorded
-        .pending
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .take();
+    let pending = std::mem::take(
+        &mut *state
+            .recorded
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+    );
     let live = state.recorded.live_ids();
     let outcome = owner
         .update_operations(lock, |record| {
             let mut changed = false;
-            if let Some(pending) = &pending {
-                changed |= match pending {
-                    PendingEnding::Finish(operation) => {
-                        record.active_mut(&operation.operation_id).is_some()
-                            && record.finish((**operation).clone()).is_ok()
-                    }
-                    PendingEnding::Defer {
-                        operation_id,
-                        reason,
-                    } => {
-                        record.active_mut(operation_id).is_some()
-                            && record
-                                .defer_publication(operation_id, reason.clone())
-                                .is_ok()
-                    }
-                };
+            for (operation_id, ending) in &pending {
+                // Applied while the run is still active; superseded, and so
+                // dropped, once the record settled it another way.
+                changed |= record.active_mut(operation_id).is_some()
+                    && match ending {
+                        PendingEnding::Finish(operation) => {
+                            record.finish((**operation).clone()).is_ok()
+                        }
+                        PendingEnding::Defer {
+                            operation_id,
+                            reason,
+                        } => record
+                            .defer_publication(operation_id, reason.clone())
+                            .is_ok(),
+                    };
             }
             changed |= record.interrupt_orphans(&live);
             for (operation_id, started_at, resolution) in walks {
@@ -583,15 +595,13 @@ async fn update<T>(
     match outcome {
         Ok(update) => Ok(update),
         Err(error) => {
-            if let Some(pending) = pending
-                && error.code == "operation_record_outcome_unknown"
-            {
-                *state
-                    .recorded
-                    .pending
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = Some(pending);
-            }
+            // Whatever failed, the endings are still known and still owed.
+            state
+                .recorded
+                .pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(pending);
             Err(record_refusal(error))
         }
     }
@@ -658,7 +668,7 @@ type Acceptance = Result<Operation, ApiError>;
         (status = 409, description = "The same id with a different request (`[operation_request_mismatch]`), an id at or before the eviction mark (`[operation_id_expired]`), an outstanding deployment, four unresolved publications, or a record from another ledger (`[operation_record_foreign]`)", body = crate::api::ErrorOutput),
         (status = 429, description = "Another operation is active in the maintenance scope, or that scope's admission gate is held across an acceptance; honor `Retry-After`", body = crate::api::ErrorOutput),
         (status = 500, description = "Internal failure (code `internal`), or a record write with no definite answer (code `outcome_unknown`); look the operation up by its id", body = crate::api::ErrorOutput),
-        (status = 503, description = "The routes are not enabled, or admission is closed", body = crate::api::ErrorOutput),
+        (status = 503, description = "The routes are not enabled, admission is closed, or the operation record write was refused and nothing was accepted (a refusal naming an unsettled earlier request holds until the server restarts)", body = crate::api::ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -799,6 +809,12 @@ pub(crate) async fn start_optimize(
                 Ok(OperationWrite::Written { .. }) => Ok(operation.clone()),
                 Ok(OperationWrite::Conflict) => Err(ApiError::conflict(
                     "the operation record changed during admission; retry",
+                )),
+                Ok(OperationWrite::Refused { error }) => Err(ApiError::new(
+                    ErrorCode::ServiceUnavailable,
+                    format!(
+                        "the operation record write was refused and nothing was accepted: {error}"
+                    ),
                 )),
                 Ok(OperationWrite::InDoubt { error }) => {
                     Err(outcome_unknown(&operation_id, &error))
@@ -1055,17 +1071,17 @@ async fn run(
         })
         .await;
         if let Err(error) = written {
-            // The outcome is known here; it is applied again at the next
-            // access to the record as it then stands.
+            // Whatever kept the write from landing, the outcome is known
+            // here; it is applied again at the next access to the record as
+            // it then stands.
             state.recorded.clear_live(&id);
-            if error.code == ErrorCode::OutcomeUnknown
-                && let Some(pending) = pending
-            {
-                *state
+            if let Some(pending) = pending {
+                state
                     .recorded
                     .pending
                     .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = Some(pending);
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(id.clone(), pending);
             }
             tracing::warn!(operation_id = %id, error = %error.message, "the recorded operation's final record write did not land; a later access re-applies it");
         }

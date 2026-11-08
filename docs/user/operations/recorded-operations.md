@@ -59,7 +59,7 @@ reason to resubmit the same work under the same id.
 | The same id with a different request (message prefix `[operation_request_mismatch]`); an id at or before the record's eviction mark (`[operation_id_expired]`, mint a new one); an outstanding deployment; four unresolved publications; a record from another ledger at this root (`[operation_record_foreign]`) | 409 `conflict` |
 | Another operation is active in the maintenance scope (its id is in the message), or the scope is admitting one | 429 `too_many_requests`, with `Retry-After` |
 | A gate hold above the server's ceiling, an `operation_id` that is not a canonical ULID, or one dated more than a minute ahead of the server's clock | 400 `bad_request` |
-| The routes are off, or the server is draining | 503 `service_unavailable` |
+| The routes are off, the server is draining, or the record write was refused and nothing was accepted (a refusal that names an earlier request with an unknown outcome holds until the server restarts) | 503 `service_unavailable` |
 | A record write without a definite answer | 500 `outcome_unknown`; look the id up |
 
 ## From the CLI
@@ -75,7 +75,7 @@ and `--timeout` bounds the wait, not the operation. `--tables` and
 |---|---|
 | `succeeded`, or accepted or observed with `--no-wait` | 0 |
 | Refused before acceptance, or `failed`, `cancelled` or `interrupted` | 1 |
-| Still `publishing` or running when the wait ended, `unsettled`, `unknown` after a lost response, or five lookups in a row without a definite answer | 2 |
+| Still `publishing` or running when the wait ended, `unsettled`, `unknown` after a lost response, a lookup refused after acceptance, or five lookups in a row without a definite answer | 2 |
 | The same id with a different request | 4 |
 | Another operation is active in the scope | 75 |
 

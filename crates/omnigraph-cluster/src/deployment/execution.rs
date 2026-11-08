@@ -2387,8 +2387,11 @@ async fn settle_graph_operations(
     schema_identity_domain: &str,
     root_readable: bool,
 ) -> Result<(), Diagnostic> {
-    let lock = admission.lock_operations().await;
-    let record = match admission.read_operations(&lock).await {
+    // The history walks read only, from the record as it stands with the
+    // lifetime's active records released; the gate is taken afterwards and
+    // each answer applied only where the record's cursor is still the one the
+    // walk started from, so no writer waits for a walk.
+    let record = match admission.peek_operations().await {
         Ok(Some((record, _))) => record,
         Ok(None) => return Ok(()),
         Err(error) => {
@@ -2403,8 +2406,6 @@ async fn settle_graph_operations(
     {
         return Ok(());
     }
-    // The history walks read only, from the record as it stands after the
-    // lifetime's active records are released.
     let mut resolutions = Vec::new();
     if root_readable {
         let mut released = record.clone();
@@ -2423,8 +2424,8 @@ async fn settle_graph_operations(
                 else {
                     continue;
                 };
-                let mut cursor = operation
-                    .resolution
+                let started_at = operation.resolution.clone();
+                let mut cursor = started_at
                     .as_ref()
                     .and_then(|progress| progress.cursor.clone());
                 let resolution = loop {
@@ -2474,24 +2475,30 @@ async fn settle_graph_operations(
                         }
                     }
                 };
-                resolutions.push((operation.operation_id.clone(), resolution));
+                resolutions.push((operation.operation_id.clone(), started_at, resolution));
             }
         }
     }
-    let outcome = admission
-        .update_operations(&lock, |record| {
-            let mut changed = false;
-            if root_readable {
-                changed |= record.orphan_lifetime(graph, schema_identity_domain);
-                for (operation_id, resolution) in resolutions {
-                    changed |= record.settle(&operation_id, resolution);
+    let lock = admission.lock_operations().await;
+    let outcome =
+        admission
+            .update_operations(&lock, |record| {
+                let mut changed = false;
+                if root_readable {
+                    changed |= record.orphan_lifetime(graph, schema_identity_domain);
+                    for (operation_id, started_at, resolution) in resolutions {
+                        if record.unresolved.iter().any(|op| {
+                            op.operation_id == operation_id && op.resolution == started_at
+                        }) {
+                            changed |= record.settle(&operation_id, resolution);
+                        }
+                    }
+                } else {
+                    changed |= record.settle_graph_deleted(graph, schema_identity_domain);
                 }
-            } else {
-                changed |= record.settle_graph_deleted(graph, schema_identity_domain);
-            }
-            Ok((changed, ()))
-        })
-        .await;
+                Ok((changed, ()))
+            })
+            .await;
     match outcome {
         Ok(_) => Ok(()),
         Err(error) if error.code == "operation_record_foreign" => {

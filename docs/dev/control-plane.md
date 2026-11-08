@@ -115,7 +115,7 @@ keys its active operations by admission scope and each kind's state by graph
 and kind, and each record names its settlement branch; `optimize` is the
 first kind. A write with no definite answer (`OperationWrite::InDoubt`) stops
 the run's writes; the server's next admission or lookup reads the record
-back and re-applies a lost final change to the record as it then stands. An `accepted` or `running` operation no live run holds becomes
+back and re-applies a run's final change, kept per operation id until a write applies it or the record settled the run another way, to the record as it then stands. A write the store or the process's storage scope refuses is a definite `Refused` outcome (503, nothing accepted), distinct from one with no answer (`InDoubt`, 500 `outcome_unknown`): a scope keeps refusing a key whose earlier request is unsettled until the server is replaced. An `accepted` or `running` operation no live run holds becomes
 `interrupted`, and a `publishing` one joins at most four unresolved
 operations, settled by `Omnigraph::resolve_publication` once the settlement
 branch's graph head moves: one page of the branch's first-parent chain per
