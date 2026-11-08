@@ -6,17 +6,14 @@ use lance::index::scalar::IndexDetails;
 use lance_core::datatypes::Schema;
 use lance_table::format::IndexMetadata;
 use lance_table::system_index::is_system_index;
+use omnigraph_core::dataset_index::SegmentCoverage;
 use omnigraph_planner::{FragmentCoverage, IndexFact, IndexKind};
 
 use crate::error::{OmniError, Result};
 
 pub(super) async fn gather(dataset: &Dataset) -> Result<Vec<IndexFact>> {
     let indices = dataset.load_indices().await.map_err(OmniError::storage)?;
-    let current: BTreeSet<_> = dataset
-        .fragments()
-        .iter()
-        .map(|fragment| fragment.id)
-        .collect();
+    let current = omnigraph_core::dataset_index::current_fragments(dataset);
     let physical_rows_known = dataset
         .fragments()
         .iter()
@@ -69,10 +66,7 @@ fn kind(index: &IndexMetadata) -> IndexKind {
         return IndexKind::Unknown;
     };
     let details = IndexDetails(details.clone());
-    if details
-        .get_plugin()
-        .is_ok_and(|plugin| plugin.name() == "BTree")
-    {
+    if omnigraph_core::dataset_index::is_btree_index(index) {
         IndexKind::Btree { usable: false }
     } else if details.supports_fts() {
         IndexKind::Inverted
@@ -148,12 +142,7 @@ fn fact(
     current: &BTreeSet<u64>,
     physical_rows_known: bool,
 ) -> IndexFact {
-    let covered: BTreeSet<_> = segments
-        .iter()
-        .filter_map(|segment| segment.fragment_bitmap.as_ref())
-        .flat_map(|bitmap| bitmap.iter().map(u64::from))
-        .filter(|fragment| current.contains(fragment))
-        .collect();
+    let SegmentCoverage { covered, known } = SegmentCoverage::of(segments.iter().copied(), current);
     let mut index_kind = segments
         .first()
         .map_or(IndexKind::Unknown, |segment| kind(segment));
@@ -167,13 +156,10 @@ fn fact(
         name,
         column,
         kind: index_kind,
-        coverage: segments
-            .iter()
-            .all(|segment| segment.fragment_bitmap.is_some())
-            .then_some(FragmentCoverage {
-                covered: covered.len() as u64,
-                total: current.len() as u64,
-            }),
+        coverage: known.then_some(FragmentCoverage {
+            covered: covered.len() as u64,
+            total: current.len() as u64,
+        }),
     }
 }
 
@@ -393,5 +379,110 @@ mod tests {
             catalog(&schema, &[top, system, nested], &BTreeSet::from([1]), true),
             first
         );
+    }
+
+    /// Issue #1298: a run that has to probe coverage (a plan without pinned
+    /// index facts, or a bound edge scan) decides as the plan's facts do.
+    /// Before, the run read the first BTREE segment it found, took an
+    /// unreported bitmap for full coverage and sniffed the type URL.
+    #[test]
+    fn run_time_key_coverage_agrees_with_the_plan_facts() {
+        use arrow_schema::{DataType, Field};
+        use omnigraph_core::dataset_index::{IndexCoverage, key_column_coverage};
+        let schema = Schema::try_from(&arrow_schema::Schema::new(vec![Field::new(
+            "__src",
+            DataType::Utf8,
+            false,
+        )]))
+        .unwrap();
+        let btree = |name: &str, fragments: Option<&[u32]>| {
+            segment(name, 0, fragments, Some("BTreeIndexDetails"))
+        };
+        let all = BTreeSet::from([1, 2, 3]);
+        let cases = [
+            (
+                "segments cover together",
+                vec![btree("key", Some(&[1, 2])), btree("key", Some(&[3]))],
+                &all,
+                true,
+                true,
+            ),
+            (
+                "one segment short",
+                vec![btree("key", Some(&[1, 2]))],
+                &all,
+                true,
+                false,
+            ),
+            (
+                "one segment unknown",
+                vec![btree("key", Some(&[1, 2, 3])), btree("key", None)],
+                &all,
+                true,
+                false,
+            ),
+            (
+                "unknown first",
+                vec![btree("key", None), btree("key", Some(&[1, 2, 3]))],
+                &all,
+                true,
+                false,
+            ),
+            (
+                "rows unknown",
+                vec![btree("key", Some(&[1, 2, 3]))],
+                &all,
+                false,
+                false,
+            ),
+            (
+                "no fragment",
+                vec![btree("key", Some(&[1]))],
+                &BTreeSet::new(),
+                true,
+                false,
+            ),
+            (
+                "second index short",
+                vec![btree("a", Some(&[1, 2, 3])), btree("b", Some(&[1]))],
+                &all,
+                true,
+                false,
+            ),
+            (
+                "unresolvable details",
+                vec![segment(
+                    "key",
+                    0,
+                    Some(&[1, 2, 3]),
+                    Some("FutureBTreeIndexDetails"),
+                )],
+                &all,
+                true,
+                false,
+            ),
+            (
+                "another kind on the column",
+                vec![
+                    btree("key", Some(&[1, 2, 3])),
+                    segment("text", 0, Some(&[1, 2, 3]), Some("InvertedIndexDetails")),
+                ],
+                &all,
+                true,
+                false,
+            ),
+            ("no index", vec![], &all, true, false),
+        ];
+        for (case, indices, current, rows, expected) in cases {
+            let facts = catalog(&schema, &indices, current, rows);
+            let planned = omnigraph_planner::btree_covers_column(&facts, "__src");
+            let run = key_column_coverage(&indices, 0, "__src", current, rows);
+            assert_eq!(planned, expected, "{case}: plan");
+            assert_eq!(
+                run == IndexCoverage::Indexed,
+                expected,
+                "{case}: run {run:?}"
+            );
+        }
     }
 }

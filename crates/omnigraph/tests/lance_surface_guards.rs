@@ -3966,10 +3966,13 @@ async fn filtered_scan_projects_blob_descriptors_on_indexed_multi_fragment_table
 
 // --- Guard 11: scalar-index coverage surface (physical_rows + index details) ---
 //
-// `table_store.rs::key_column_index_coverage` mirrors Lance's `create_filter_plan`
-// C6 fallback: it reads `fragment.physical_rows` (the field whose absence on ANY
-// fragment disables the scalar index for the whole scan) and sniffs the BTREE via
-// `load_indices()` → `index.fields` / `index.index_details.type_url`. This is the
+// `dataset_index::key_column_index_coverage` and the planner's index facts
+// (`engine/plan_source/indexes.rs`) mirror Lance's `create_filter_plan` C6
+// fallback: they read `fragment.physical_rows` (the field whose absence on ANY
+// fragment disables the scalar index for the whole scan), group `load_indices()`
+// segments by `index.name` and `index.keyed_field()`, classify a BTREE by the
+// plugin its details resolve to, and union the segments' `fragment_bitmap`s as
+// Lance's `scalar_index_info` does (`dataset_index::SegmentCoverage`). This is the
 // one real Lance-internal coupling on the indexed-traversal read path. If any of
 // these surfaces renames or changes type, the coverage check (and the cost-based
 // traversal chooser that consumes it) silently misclassifies. Compile-only.
@@ -3991,16 +3994,24 @@ async fn _compile_scalar_index_coverage_surface() -> lance::Result<()> {
         // index `fragment_bitmap`.
         let _id: u64 = frag.id;
     }
-    // The index sniff: BTREE presence is detected by single-field index whose
-    // details type_url ends with "BTreeIndexDetails". The fragment coverage check
-    // reads `fragment_bitmap` (Option<RoaringBitmap>) and calls `.contains(u32)`.
+    // The index sniff: segments group by name and keyed field; a BTREE is the
+    // segment whose details resolve to the "BTree" plugin (the `has_*_index_on`
+    // helpers still read the details type_url). The coverage union iterates each
+    // segment's `fragment_bitmap` (Option<RoaringBitmap>) as u32 fragment ids.
     let indices = ds.load_indices().await?;
     for index in indices.iter() {
         let _fields: &Vec<i32> = &index.fields;
+        let _name: &str = index.name.as_str();
+        let _keyed: Option<i32> = index.keyed_field();
         if let Some(details) = index.index_details.as_ref() {
             let _type_url: &str = details.type_url.as_str();
+            let _plugin: Option<String> = lance::index::scalar::IndexDetails(details.clone())
+                .get_plugin()
+                .ok()
+                .map(|plugin| plugin.name().to_string());
         }
         let _covered: Option<bool> = index.fragment_bitmap.as_ref().map(|b| b.contains(0u32));
+        let _ids: Option<Vec<u32>> = index.fragment_bitmap.as_ref().map(|b| b.iter().collect());
     }
     Ok(())
 }
