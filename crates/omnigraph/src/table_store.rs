@@ -3087,27 +3087,18 @@ impl TableStore {
         for index in indices.iter().filter(|index| Self::can_fold_index(index)) {
             by_name.entry(index.name.clone()).or_default().push(index);
         }
+        let current = crate::dataset_index::current_fragments(ds);
         let mut lag = Vec::new();
         for (name, segments) in by_name {
+            let coverage =
+                crate::dataset_index::SegmentCoverage::of(segments.iter().copied(), &current);
             // As on the public coverage surface, unknown coverage is not
             // evidence of work. Such legacy inventory needs explicit handling.
-            if segments
-                .iter()
-                .any(|segment| segment.fragment_bitmap.is_none())
-            {
+            if !coverage.known {
                 continue;
             }
-            let mut covered = std::collections::HashSet::<u32>::new();
-            for segment in &segments {
-                if let Some(bitmap) = segment.fragment_bitmap.as_ref() {
-                    covered.extend(bitmap.iter());
-                }
-            }
             let vector = Self::index_is_vector(segments[0]);
-            let complete = ds
-                .fragments()
-                .iter()
-                .all(|fragment| covered.contains(&(fragment.id as u32)));
+            let complete = coverage.covers_every(&current);
             // A scalar index whose segments together cover every fragment
             // is current. A vector index split into segments (Lance's own
             // fold left deltas, or a partial rebuild) is collapsed into one.
