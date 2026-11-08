@@ -1,6 +1,15 @@
 # issue: none
-# notes: An update carries every Blob it does not assign and counts it as `materialized blob payload bytes`; assigning a Blob (here to null) carries no payload.
+# notes: An update that rewrites whole rows carries every Blob it does not assign and counts it as `materialized blob payload bytes`; assigning a Blob (here to null) carries no payload.
 # notes: The seeded payload is 2,048 bytes: write_max_bytes = 2047 refuses the carry and leaves the title old, 2048 admits it exactly.
+# notes: Whether that sole update is admitted depends only on the request and the rows, never on how
+# notes: it is written: an index on the assigned column (`Indexed`) or a row sharing a large fragment
+# notes: under a wide assignment (`Packed`, 8,192-byte payload at 8191) would favour a row rewrite,
+# notes: which does not fit, so the update patches and is admitted in both.
+# notes: Nor does it depend on the rows stored beside the matched one: `Shared` holds the same 301
+# notes: rows in one fragment that `Apart` holds in two (the 300 small rows appended later), and the
+# notes: same sole update is admitted on both at 4096. The scan copies the matched rows out of the
+# notes: decoded fragment batch before charging them; charged as a slice, `Shared` cost 7,670 bytes.
+# notes: A second statement on the type keeps the update on whole rows. Alone, the same update patches the title column (issue #1264) and carries nothing, so 2047 admits it; the carry that follows is still refused at 2047, so the Blob kept its 2,048 bytes.
 
 --- runner
 timeout_ms: 10000
@@ -15,13 +24,391 @@ node Doc {
     title: String
 }
 
+node Indexed {
+    slug: String @key
+    content: Blob?
+    title: String @index
+}
+
+node Packed {
+    slug: String @key
+    content: Blob?
+    title: String
+}
+
+node Shared {
+    slug: String @key
+    content: Blob?
+    title: String
+}
+
+node Apart {
+    slug: String @key
+    content: Blob?
+    title: String
+}
+
 --- seed
 {"type":"Doc","data":{"slug":"big","content":"base64:0001000200030004000500060007000800090010001100120013001400150016001700180019002000210022002300240025002600270028002900300031003200330034003500360037003800390040004100420043004400450046004700480049005000510052005300540055005600570058005900600061006200630064006500660067006800690070007100720073007400750076007700780079008000810082008300840085008600870088008900900091009200930094009500960097009800990100010101020103010401050106010701080109011001110112011301140115011601170118011901200121012201230124012501260127012801290130013101320133013401350136013701380139014001410142014301440145014601470148014901500151015201530154015501560157015801590160016101620163016401650166016701680169017001710172017301740175017601770178017901800181018201830184018501860187018801890190019101920193019401950196019701980199020002010202020302040205020602070208020902100211021202130214021502160217021802190220022102220223022402250226022702280229023002310232023302340235023602370238023902400241024202430244024502460247024802490250025102520253025402550256025702580259026002610262026302640265026602670268026902700271027202730274027502760277027802790280028102820283028402850286028702880289029002910292029302940295029602970298029903000301030203030304030503060307030803090310031103120313031403150316031703180319032003210322032303240325032603270328032903300331033203330334033503360337033803390340034103420343034403450346034703480349035003510352035303540355035603570358035903600361036203630364036503660367036803690370037103720373037403750376037703780379038003810382038303840385038603870388038903900391039203930394039503960397039803990400040104020403040404050406040704080409041004110412041304140415041604170418041904200421042204230424042504260427042804290430043104320433043404350436043704380439044004410442044304440445044604470448044904500451045204530454045504560457045804590460046104620463046404650466046704680469047004710472047304740475047604770478047904800481048204830484048504860487048804890490049104920493049404950496049704980499050005010502050305040505050605070508050905100511051205130514051505160517051805190520052105220523052405250526052705280529053005310532053305340535053605370538053905400541054205430544054505460547054805490550055105520553055405550556055705580559056005610562056305640565056605670568056905700571057205730574057505760577057805790580058105820583058405850586058705880589059005910592059305940595059605970598059906000601060206030604060506060607060806090610061106120613061406150616061706180619062006210622062306240625062606270628062906300631063206330634063506360637063806390640064106420643064406450646064706480649065006510652065306540655065606570658065906600661066206630664066506660667066806690670067106720673067406750676067706780679068006810682AAA=","title":"old"}}
+{"type":"Indexed","data":{"slug":"big","content":"base64:0001000200030004000500060007000800090010001100120013001400150016001700180019002000210022002300240025002600270028002900300031003200330034003500360037003800390040004100420043004400450046004700480049005000510052005300540055005600570058005900600061006200630064006500660067006800690070007100720073007400750076007700780079008000810082008300840085008600870088008900900091009200930094009500960097009800990100010101020103010401050106010701080109011001110112011301140115011601170118011901200121012201230124012501260127012801290130013101320133013401350136013701380139014001410142014301440145014601470148014901500151015201530154015501560157015801590160016101620163016401650166016701680169017001710172017301740175017601770178017901800181018201830184018501860187018801890190019101920193019401950196019701980199020002010202020302040205020602070208020902100211021202130214021502160217021802190220022102220223022402250226022702280229023002310232023302340235023602370238023902400241024202430244024502460247024802490250025102520253025402550256025702580259026002610262026302640265026602670268026902700271027202730274027502760277027802790280028102820283028402850286028702880289029002910292029302940295029602970298029903000301030203030304030503060307030803090310031103120313031403150316031703180319032003210322032303240325032603270328032903300331033203330334033503360337033803390340034103420343034403450346034703480349035003510352035303540355035603570358035903600361036203630364036503660367036803690370037103720373037403750376037703780379038003810382038303840385038603870388038903900391039203930394039503960397039803990400040104020403040404050406040704080409041004110412041304140415041604170418041904200421042204230424042504260427042804290430043104320433043404350436043704380439044004410442044304440445044604470448044904500451045204530454045504560457045804590460046104620463046404650466046704680469047004710472047304740475047604770478047904800481048204830484048504860487048804890490049104920493049404950496049704980499050005010502050305040505050605070508050905100511051205130514051505160517051805190520052105220523052405250526052705280529053005310532053305340535053605370538053905400541054205430544054505460547054805490550055105520553055405550556055705580559056005610562056305640565056605670568056905700571057205730574057505760577057805790580058105820583058405850586058705880589059005910592059305940595059605970598059906000601060206030604060506060607060806090610061106120613061406150616061706180619062006210622062306240625062606270628062906300631063206330634063506360637063806390640064106420643064406450646064706480649065006510652065306540655065606570658065906600661066206630664066506660667066806690670067106720673067406750676067706780679068006810682AAA=","title":"old"}}
+{"type":"Packed","data":{"slug":"big","content":"base64:BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=","title":"old"}}
+{"type":"Packed","data":{"slug":"small00","title":"old"}}
+{"type":"Packed","data":{"slug":"small01","title":"old"}}
+{"type":"Packed","data":{"slug":"small02","title":"old"}}
+{"type":"Packed","data":{"slug":"small03","title":"old"}}
+{"type":"Packed","data":{"slug":"small04","title":"old"}}
+{"type":"Packed","data":{"slug":"small05","title":"old"}}
+{"type":"Packed","data":{"slug":"small06","title":"old"}}
+{"type":"Packed","data":{"slug":"small07","title":"old"}}
+{"type":"Packed","data":{"slug":"small08","title":"old"}}
+{"type":"Packed","data":{"slug":"small09","title":"old"}}
+{"type":"Packed","data":{"slug":"small10","title":"old"}}
+{"type":"Packed","data":{"slug":"small11","title":"old"}}
+{"type":"Packed","data":{"slug":"small12","title":"old"}}
+{"type":"Packed","data":{"slug":"small13","title":"old"}}
+{"type":"Packed","data":{"slug":"small14","title":"old"}}
+{"type":"Packed","data":{"slug":"small15","title":"old"}}
+{"type":"Packed","data":{"slug":"small16","title":"old"}}
+{"type":"Packed","data":{"slug":"small17","title":"old"}}
+{"type":"Packed","data":{"slug":"small18","title":"old"}}
+{"type":"Packed","data":{"slug":"small19","title":"old"}}
+{"type":"Packed","data":{"slug":"small20","title":"old"}}
+{"type":"Packed","data":{"slug":"small21","title":"old"}}
+{"type":"Packed","data":{"slug":"small22","title":"old"}}
+{"type":"Packed","data":{"slug":"small23","title":"old"}}
+{"type":"Packed","data":{"slug":"small24","title":"old"}}
+{"type":"Packed","data":{"slug":"small25","title":"old"}}
+{"type":"Packed","data":{"slug":"small26","title":"old"}}
+{"type":"Packed","data":{"slug":"small27","title":"old"}}
+{"type":"Packed","data":{"slug":"small28","title":"old"}}
+{"type":"Packed","data":{"slug":"small29","title":"old"}}
+{"type":"Packed","data":{"slug":"small30","title":"old"}}
+{"type":"Packed","data":{"slug":"small31","title":"old"}}
+{"type":"Packed","data":{"slug":"small32","title":"old"}}
+{"type":"Packed","data":{"slug":"small33","title":"old"}}
+{"type":"Packed","data":{"slug":"small34","title":"old"}}
+{"type":"Packed","data":{"slug":"small35","title":"old"}}
+{"type":"Packed","data":{"slug":"small36","title":"old"}}
+{"type":"Packed","data":{"slug":"small37","title":"old"}}
+{"type":"Packed","data":{"slug":"small38","title":"old"}}
+{"type":"Packed","data":{"slug":"small39","title":"old"}}
+{"type":"Packed","data":{"slug":"small40","title":"old"}}
+{"type":"Packed","data":{"slug":"small41","title":"old"}}
+{"type":"Packed","data":{"slug":"small42","title":"old"}}
+{"type":"Packed","data":{"slug":"small43","title":"old"}}
+{"type":"Packed","data":{"slug":"small44","title":"old"}}
+{"type":"Packed","data":{"slug":"small45","title":"old"}}
+{"type":"Packed","data":{"slug":"small46","title":"old"}}
+{"type":"Packed","data":{"slug":"small47","title":"old"}}
+{"type":"Packed","data":{"slug":"small48","title":"old"}}
 
+{"type":"Shared","data":{"slug":"big","content":"base64:0001000200030004000500060007000800090010001100120013001400150016001700180019002000210022002300240025002600270028002900300031003200330034003500360037003800390040004100420043004400450046004700480049005000510052005300540055005600570058005900600061006200630064006500660067006800690070007100720073007400750076007700780079008000810082008300840085008600870088008900900091009200930094009500960097009800990100010101020103010401050106010701080109011001110112011301140115011601170118011901200121012201230124012501260127012801290130013101320133013401350136013701380139014001410142014301440145014601470148014901500151015201530154015501560157015801590160016101620163016401650166016701680169017001710172017301740175017601770178017901800181018201830184018501860187018801890190019101920193019401950196019701980199020002010202020302040205020602070208020902100211021202130214021502160217021802190220022102220223022402250226022702280229023002310232023302340235023602370238023902400241024202430244024502460247024802490250025102520253025402550256025702580259026002610262026302640265026602670268026902700271027202730274027502760277027802790280028102820283028402850286028702880289029002910292029302940295029602970298029903000301030203030304030503060307030803090310031103120313031403150316031703180319032003210322032303240325032603270328032903300331033203330334033503360337033803390340034103420343034403450346034703480349035003510352035303540355035603570358035903600361036203630364036503660367036803690370037103720373037403750376037703780379038003810382038303840385038603870388038903900391039203930394039503960397039803990400040104020403040404050406040704080409041004110412041304140415041604170418041904200421042204230424042504260427042804290430043104320433043404350436043704380439044004410442044304440445044604470448044904500451045204530454045504560457045804590460046104620463046404650466046704680469047004710472047304740475047604770478047904800481048204830484048504860487048804890490049104920493049404950496049704980499050005010502050305040505050605070508050905100511051205130514051505160517051805190520052105220523052405250526052705280529053005310532053305340535053605370538053905400541054205430544054505460547054805490550055105520553055405550556055705580559056005610562056305640565056605670568056905700571057205730574057505760577057805790580058105820583058405850586058705880589059005910592059305940595059605970598059906000601060206030604060506060607060806090610061106120613061406150616061706180619062006210622062306240625062606270628062906300631063206330634063506360637063806390640064106420643064406450646064706480649065006510652065306540655065606570658065906600661066206630664066506660667066806690670067106720673067406750676067706780679068006810682AAA=","title":"old"}}
+{"type":"Shared","data":{"slug":"small000","title":"old"}}
+{"type":"Shared","data":{"slug":"small001","title":"old"}}
+{"type":"Shared","data":{"slug":"small002","title":"old"}}
+{"type":"Shared","data":{"slug":"small003","title":"old"}}
+{"type":"Shared","data":{"slug":"small004","title":"old"}}
+{"type":"Shared","data":{"slug":"small005","title":"old"}}
+{"type":"Shared","data":{"slug":"small006","title":"old"}}
+{"type":"Shared","data":{"slug":"small007","title":"old"}}
+{"type":"Shared","data":{"slug":"small008","title":"old"}}
+{"type":"Shared","data":{"slug":"small009","title":"old"}}
+{"type":"Shared","data":{"slug":"small010","title":"old"}}
+{"type":"Shared","data":{"slug":"small011","title":"old"}}
+{"type":"Shared","data":{"slug":"small012","title":"old"}}
+{"type":"Shared","data":{"slug":"small013","title":"old"}}
+{"type":"Shared","data":{"slug":"small014","title":"old"}}
+{"type":"Shared","data":{"slug":"small015","title":"old"}}
+{"type":"Shared","data":{"slug":"small016","title":"old"}}
+{"type":"Shared","data":{"slug":"small017","title":"old"}}
+{"type":"Shared","data":{"slug":"small018","title":"old"}}
+{"type":"Shared","data":{"slug":"small019","title":"old"}}
+{"type":"Shared","data":{"slug":"small020","title":"old"}}
+{"type":"Shared","data":{"slug":"small021","title":"old"}}
+{"type":"Shared","data":{"slug":"small022","title":"old"}}
+{"type":"Shared","data":{"slug":"small023","title":"old"}}
+{"type":"Shared","data":{"slug":"small024","title":"old"}}
+{"type":"Shared","data":{"slug":"small025","title":"old"}}
+{"type":"Shared","data":{"slug":"small026","title":"old"}}
+{"type":"Shared","data":{"slug":"small027","title":"old"}}
+{"type":"Shared","data":{"slug":"small028","title":"old"}}
+{"type":"Shared","data":{"slug":"small029","title":"old"}}
+{"type":"Shared","data":{"slug":"small030","title":"old"}}
+{"type":"Shared","data":{"slug":"small031","title":"old"}}
+{"type":"Shared","data":{"slug":"small032","title":"old"}}
+{"type":"Shared","data":{"slug":"small033","title":"old"}}
+{"type":"Shared","data":{"slug":"small034","title":"old"}}
+{"type":"Shared","data":{"slug":"small035","title":"old"}}
+{"type":"Shared","data":{"slug":"small036","title":"old"}}
+{"type":"Shared","data":{"slug":"small037","title":"old"}}
+{"type":"Shared","data":{"slug":"small038","title":"old"}}
+{"type":"Shared","data":{"slug":"small039","title":"old"}}
+{"type":"Shared","data":{"slug":"small040","title":"old"}}
+{"type":"Shared","data":{"slug":"small041","title":"old"}}
+{"type":"Shared","data":{"slug":"small042","title":"old"}}
+{"type":"Shared","data":{"slug":"small043","title":"old"}}
+{"type":"Shared","data":{"slug":"small044","title":"old"}}
+{"type":"Shared","data":{"slug":"small045","title":"old"}}
+{"type":"Shared","data":{"slug":"small046","title":"old"}}
+{"type":"Shared","data":{"slug":"small047","title":"old"}}
+{"type":"Shared","data":{"slug":"small048","title":"old"}}
+{"type":"Shared","data":{"slug":"small049","title":"old"}}
+{"type":"Shared","data":{"slug":"small050","title":"old"}}
+{"type":"Shared","data":{"slug":"small051","title":"old"}}
+{"type":"Shared","data":{"slug":"small052","title":"old"}}
+{"type":"Shared","data":{"slug":"small053","title":"old"}}
+{"type":"Shared","data":{"slug":"small054","title":"old"}}
+{"type":"Shared","data":{"slug":"small055","title":"old"}}
+{"type":"Shared","data":{"slug":"small056","title":"old"}}
+{"type":"Shared","data":{"slug":"small057","title":"old"}}
+{"type":"Shared","data":{"slug":"small058","title":"old"}}
+{"type":"Shared","data":{"slug":"small059","title":"old"}}
+{"type":"Shared","data":{"slug":"small060","title":"old"}}
+{"type":"Shared","data":{"slug":"small061","title":"old"}}
+{"type":"Shared","data":{"slug":"small062","title":"old"}}
+{"type":"Shared","data":{"slug":"small063","title":"old"}}
+{"type":"Shared","data":{"slug":"small064","title":"old"}}
+{"type":"Shared","data":{"slug":"small065","title":"old"}}
+{"type":"Shared","data":{"slug":"small066","title":"old"}}
+{"type":"Shared","data":{"slug":"small067","title":"old"}}
+{"type":"Shared","data":{"slug":"small068","title":"old"}}
+{"type":"Shared","data":{"slug":"small069","title":"old"}}
+{"type":"Shared","data":{"slug":"small070","title":"old"}}
+{"type":"Shared","data":{"slug":"small071","title":"old"}}
+{"type":"Shared","data":{"slug":"small072","title":"old"}}
+{"type":"Shared","data":{"slug":"small073","title":"old"}}
+{"type":"Shared","data":{"slug":"small074","title":"old"}}
+{"type":"Shared","data":{"slug":"small075","title":"old"}}
+{"type":"Shared","data":{"slug":"small076","title":"old"}}
+{"type":"Shared","data":{"slug":"small077","title":"old"}}
+{"type":"Shared","data":{"slug":"small078","title":"old"}}
+{"type":"Shared","data":{"slug":"small079","title":"old"}}
+{"type":"Shared","data":{"slug":"small080","title":"old"}}
+{"type":"Shared","data":{"slug":"small081","title":"old"}}
+{"type":"Shared","data":{"slug":"small082","title":"old"}}
+{"type":"Shared","data":{"slug":"small083","title":"old"}}
+{"type":"Shared","data":{"slug":"small084","title":"old"}}
+{"type":"Shared","data":{"slug":"small085","title":"old"}}
+{"type":"Shared","data":{"slug":"small086","title":"old"}}
+{"type":"Shared","data":{"slug":"small087","title":"old"}}
+{"type":"Shared","data":{"slug":"small088","title":"old"}}
+{"type":"Shared","data":{"slug":"small089","title":"old"}}
+{"type":"Shared","data":{"slug":"small090","title":"old"}}
+{"type":"Shared","data":{"slug":"small091","title":"old"}}
+{"type":"Shared","data":{"slug":"small092","title":"old"}}
+{"type":"Shared","data":{"slug":"small093","title":"old"}}
+{"type":"Shared","data":{"slug":"small094","title":"old"}}
+{"type":"Shared","data":{"slug":"small095","title":"old"}}
+{"type":"Shared","data":{"slug":"small096","title":"old"}}
+{"type":"Shared","data":{"slug":"small097","title":"old"}}
+{"type":"Shared","data":{"slug":"small098","title":"old"}}
+{"type":"Shared","data":{"slug":"small099","title":"old"}}
+{"type":"Shared","data":{"slug":"small100","title":"old"}}
+{"type":"Shared","data":{"slug":"small101","title":"old"}}
+{"type":"Shared","data":{"slug":"small102","title":"old"}}
+{"type":"Shared","data":{"slug":"small103","title":"old"}}
+{"type":"Shared","data":{"slug":"small104","title":"old"}}
+{"type":"Shared","data":{"slug":"small105","title":"old"}}
+{"type":"Shared","data":{"slug":"small106","title":"old"}}
+{"type":"Shared","data":{"slug":"small107","title":"old"}}
+{"type":"Shared","data":{"slug":"small108","title":"old"}}
+{"type":"Shared","data":{"slug":"small109","title":"old"}}
+{"type":"Shared","data":{"slug":"small110","title":"old"}}
+{"type":"Shared","data":{"slug":"small111","title":"old"}}
+{"type":"Shared","data":{"slug":"small112","title":"old"}}
+{"type":"Shared","data":{"slug":"small113","title":"old"}}
+{"type":"Shared","data":{"slug":"small114","title":"old"}}
+{"type":"Shared","data":{"slug":"small115","title":"old"}}
+{"type":"Shared","data":{"slug":"small116","title":"old"}}
+{"type":"Shared","data":{"slug":"small117","title":"old"}}
+{"type":"Shared","data":{"slug":"small118","title":"old"}}
+{"type":"Shared","data":{"slug":"small119","title":"old"}}
+{"type":"Shared","data":{"slug":"small120","title":"old"}}
+{"type":"Shared","data":{"slug":"small121","title":"old"}}
+{"type":"Shared","data":{"slug":"small122","title":"old"}}
+{"type":"Shared","data":{"slug":"small123","title":"old"}}
+{"type":"Shared","data":{"slug":"small124","title":"old"}}
+{"type":"Shared","data":{"slug":"small125","title":"old"}}
+{"type":"Shared","data":{"slug":"small126","title":"old"}}
+{"type":"Shared","data":{"slug":"small127","title":"old"}}
+{"type":"Shared","data":{"slug":"small128","title":"old"}}
+{"type":"Shared","data":{"slug":"small129","title":"old"}}
+{"type":"Shared","data":{"slug":"small130","title":"old"}}
+{"type":"Shared","data":{"slug":"small131","title":"old"}}
+{"type":"Shared","data":{"slug":"small132","title":"old"}}
+{"type":"Shared","data":{"slug":"small133","title":"old"}}
+{"type":"Shared","data":{"slug":"small134","title":"old"}}
+{"type":"Shared","data":{"slug":"small135","title":"old"}}
+{"type":"Shared","data":{"slug":"small136","title":"old"}}
+{"type":"Shared","data":{"slug":"small137","title":"old"}}
+{"type":"Shared","data":{"slug":"small138","title":"old"}}
+{"type":"Shared","data":{"slug":"small139","title":"old"}}
+{"type":"Shared","data":{"slug":"small140","title":"old"}}
+{"type":"Shared","data":{"slug":"small141","title":"old"}}
+{"type":"Shared","data":{"slug":"small142","title":"old"}}
+{"type":"Shared","data":{"slug":"small143","title":"old"}}
+{"type":"Shared","data":{"slug":"small144","title":"old"}}
+{"type":"Shared","data":{"slug":"small145","title":"old"}}
+{"type":"Shared","data":{"slug":"small146","title":"old"}}
+{"type":"Shared","data":{"slug":"small147","title":"old"}}
+{"type":"Shared","data":{"slug":"small148","title":"old"}}
+{"type":"Shared","data":{"slug":"small149","title":"old"}}
+{"type":"Shared","data":{"slug":"small150","title":"old"}}
+{"type":"Shared","data":{"slug":"small151","title":"old"}}
+{"type":"Shared","data":{"slug":"small152","title":"old"}}
+{"type":"Shared","data":{"slug":"small153","title":"old"}}
+{"type":"Shared","data":{"slug":"small154","title":"old"}}
+{"type":"Shared","data":{"slug":"small155","title":"old"}}
+{"type":"Shared","data":{"slug":"small156","title":"old"}}
+{"type":"Shared","data":{"slug":"small157","title":"old"}}
+{"type":"Shared","data":{"slug":"small158","title":"old"}}
+{"type":"Shared","data":{"slug":"small159","title":"old"}}
+{"type":"Shared","data":{"slug":"small160","title":"old"}}
+{"type":"Shared","data":{"slug":"small161","title":"old"}}
+{"type":"Shared","data":{"slug":"small162","title":"old"}}
+{"type":"Shared","data":{"slug":"small163","title":"old"}}
+{"type":"Shared","data":{"slug":"small164","title":"old"}}
+{"type":"Shared","data":{"slug":"small165","title":"old"}}
+{"type":"Shared","data":{"slug":"small166","title":"old"}}
+{"type":"Shared","data":{"slug":"small167","title":"old"}}
+{"type":"Shared","data":{"slug":"small168","title":"old"}}
+{"type":"Shared","data":{"slug":"small169","title":"old"}}
+{"type":"Shared","data":{"slug":"small170","title":"old"}}
+{"type":"Shared","data":{"slug":"small171","title":"old"}}
+{"type":"Shared","data":{"slug":"small172","title":"old"}}
+{"type":"Shared","data":{"slug":"small173","title":"old"}}
+{"type":"Shared","data":{"slug":"small174","title":"old"}}
+{"type":"Shared","data":{"slug":"small175","title":"old"}}
+{"type":"Shared","data":{"slug":"small176","title":"old"}}
+{"type":"Shared","data":{"slug":"small177","title":"old"}}
+{"type":"Shared","data":{"slug":"small178","title":"old"}}
+{"type":"Shared","data":{"slug":"small179","title":"old"}}
+{"type":"Shared","data":{"slug":"small180","title":"old"}}
+{"type":"Shared","data":{"slug":"small181","title":"old"}}
+{"type":"Shared","data":{"slug":"small182","title":"old"}}
+{"type":"Shared","data":{"slug":"small183","title":"old"}}
+{"type":"Shared","data":{"slug":"small184","title":"old"}}
+{"type":"Shared","data":{"slug":"small185","title":"old"}}
+{"type":"Shared","data":{"slug":"small186","title":"old"}}
+{"type":"Shared","data":{"slug":"small187","title":"old"}}
+{"type":"Shared","data":{"slug":"small188","title":"old"}}
+{"type":"Shared","data":{"slug":"small189","title":"old"}}
+{"type":"Shared","data":{"slug":"small190","title":"old"}}
+{"type":"Shared","data":{"slug":"small191","title":"old"}}
+{"type":"Shared","data":{"slug":"small192","title":"old"}}
+{"type":"Shared","data":{"slug":"small193","title":"old"}}
+{"type":"Shared","data":{"slug":"small194","title":"old"}}
+{"type":"Shared","data":{"slug":"small195","title":"old"}}
+{"type":"Shared","data":{"slug":"small196","title":"old"}}
+{"type":"Shared","data":{"slug":"small197","title":"old"}}
+{"type":"Shared","data":{"slug":"small198","title":"old"}}
+{"type":"Shared","data":{"slug":"small199","title":"old"}}
+{"type":"Shared","data":{"slug":"small200","title":"old"}}
+{"type":"Shared","data":{"slug":"small201","title":"old"}}
+{"type":"Shared","data":{"slug":"small202","title":"old"}}
+{"type":"Shared","data":{"slug":"small203","title":"old"}}
+{"type":"Shared","data":{"slug":"small204","title":"old"}}
+{"type":"Shared","data":{"slug":"small205","title":"old"}}
+{"type":"Shared","data":{"slug":"small206","title":"old"}}
+{"type":"Shared","data":{"slug":"small207","title":"old"}}
+{"type":"Shared","data":{"slug":"small208","title":"old"}}
+{"type":"Shared","data":{"slug":"small209","title":"old"}}
+{"type":"Shared","data":{"slug":"small210","title":"old"}}
+{"type":"Shared","data":{"slug":"small211","title":"old"}}
+{"type":"Shared","data":{"slug":"small212","title":"old"}}
+{"type":"Shared","data":{"slug":"small213","title":"old"}}
+{"type":"Shared","data":{"slug":"small214","title":"old"}}
+{"type":"Shared","data":{"slug":"small215","title":"old"}}
+{"type":"Shared","data":{"slug":"small216","title":"old"}}
+{"type":"Shared","data":{"slug":"small217","title":"old"}}
+{"type":"Shared","data":{"slug":"small218","title":"old"}}
+{"type":"Shared","data":{"slug":"small219","title":"old"}}
+{"type":"Shared","data":{"slug":"small220","title":"old"}}
+{"type":"Shared","data":{"slug":"small221","title":"old"}}
+{"type":"Shared","data":{"slug":"small222","title":"old"}}
+{"type":"Shared","data":{"slug":"small223","title":"old"}}
+{"type":"Shared","data":{"slug":"small224","title":"old"}}
+{"type":"Shared","data":{"slug":"small225","title":"old"}}
+{"type":"Shared","data":{"slug":"small226","title":"old"}}
+{"type":"Shared","data":{"slug":"small227","title":"old"}}
+{"type":"Shared","data":{"slug":"small228","title":"old"}}
+{"type":"Shared","data":{"slug":"small229","title":"old"}}
+{"type":"Shared","data":{"slug":"small230","title":"old"}}
+{"type":"Shared","data":{"slug":"small231","title":"old"}}
+{"type":"Shared","data":{"slug":"small232","title":"old"}}
+{"type":"Shared","data":{"slug":"small233","title":"old"}}
+{"type":"Shared","data":{"slug":"small234","title":"old"}}
+{"type":"Shared","data":{"slug":"small235","title":"old"}}
+{"type":"Shared","data":{"slug":"small236","title":"old"}}
+{"type":"Shared","data":{"slug":"small237","title":"old"}}
+{"type":"Shared","data":{"slug":"small238","title":"old"}}
+{"type":"Shared","data":{"slug":"small239","title":"old"}}
+{"type":"Shared","data":{"slug":"small240","title":"old"}}
+{"type":"Shared","data":{"slug":"small241","title":"old"}}
+{"type":"Shared","data":{"slug":"small242","title":"old"}}
+{"type":"Shared","data":{"slug":"small243","title":"old"}}
+{"type":"Shared","data":{"slug":"small244","title":"old"}}
+{"type":"Shared","data":{"slug":"small245","title":"old"}}
+{"type":"Shared","data":{"slug":"small246","title":"old"}}
+{"type":"Shared","data":{"slug":"small247","title":"old"}}
+{"type":"Shared","data":{"slug":"small248","title":"old"}}
+{"type":"Shared","data":{"slug":"small249","title":"old"}}
+{"type":"Shared","data":{"slug":"small250","title":"old"}}
+{"type":"Shared","data":{"slug":"small251","title":"old"}}
+{"type":"Shared","data":{"slug":"small252","title":"old"}}
+{"type":"Shared","data":{"slug":"small253","title":"old"}}
+{"type":"Shared","data":{"slug":"small254","title":"old"}}
+{"type":"Shared","data":{"slug":"small255","title":"old"}}
+{"type":"Shared","data":{"slug":"small256","title":"old"}}
+{"type":"Shared","data":{"slug":"small257","title":"old"}}
+{"type":"Shared","data":{"slug":"small258","title":"old"}}
+{"type":"Shared","data":{"slug":"small259","title":"old"}}
+{"type":"Shared","data":{"slug":"small260","title":"old"}}
+{"type":"Shared","data":{"slug":"small261","title":"old"}}
+{"type":"Shared","data":{"slug":"small262","title":"old"}}
+{"type":"Shared","data":{"slug":"small263","title":"old"}}
+{"type":"Shared","data":{"slug":"small264","title":"old"}}
+{"type":"Shared","data":{"slug":"small265","title":"old"}}
+{"type":"Shared","data":{"slug":"small266","title":"old"}}
+{"type":"Shared","data":{"slug":"small267","title":"old"}}
+{"type":"Shared","data":{"slug":"small268","title":"old"}}
+{"type":"Shared","data":{"slug":"small269","title":"old"}}
+{"type":"Shared","data":{"slug":"small270","title":"old"}}
+{"type":"Shared","data":{"slug":"small271","title":"old"}}
+{"type":"Shared","data":{"slug":"small272","title":"old"}}
+{"type":"Shared","data":{"slug":"small273","title":"old"}}
+{"type":"Shared","data":{"slug":"small274","title":"old"}}
+{"type":"Shared","data":{"slug":"small275","title":"old"}}
+{"type":"Shared","data":{"slug":"small276","title":"old"}}
+{"type":"Shared","data":{"slug":"small277","title":"old"}}
+{"type":"Shared","data":{"slug":"small278","title":"old"}}
+{"type":"Shared","data":{"slug":"small279","title":"old"}}
+{"type":"Shared","data":{"slug":"small280","title":"old"}}
+{"type":"Shared","data":{"slug":"small281","title":"old"}}
+{"type":"Shared","data":{"slug":"small282","title":"old"}}
+{"type":"Shared","data":{"slug":"small283","title":"old"}}
+{"type":"Shared","data":{"slug":"small284","title":"old"}}
+{"type":"Shared","data":{"slug":"small285","title":"old"}}
+{"type":"Shared","data":{"slug":"small286","title":"old"}}
+{"type":"Shared","data":{"slug":"small287","title":"old"}}
+{"type":"Shared","data":{"slug":"small288","title":"old"}}
+{"type":"Shared","data":{"slug":"small289","title":"old"}}
+{"type":"Shared","data":{"slug":"small290","title":"old"}}
+{"type":"Shared","data":{"slug":"small291","title":"old"}}
+{"type":"Shared","data":{"slug":"small292","title":"old"}}
+{"type":"Shared","data":{"slug":"small293","title":"old"}}
+{"type":"Shared","data":{"slug":"small294","title":"old"}}
+{"type":"Shared","data":{"slug":"small295","title":"old"}}
+{"type":"Shared","data":{"slug":"small296","title":"old"}}
+{"type":"Shared","data":{"slug":"small297","title":"old"}}
+{"type":"Shared","data":{"slug":"small298","title":"old"}}
+{"type":"Shared","data":{"slug":"small299","title":"old"}}
+{"type":"Apart","data":{"slug":"big","content":"base64:0001000200030004000500060007000800090010001100120013001400150016001700180019002000210022002300240025002600270028002900300031003200330034003500360037003800390040004100420043004400450046004700480049005000510052005300540055005600570058005900600061006200630064006500660067006800690070007100720073007400750076007700780079008000810082008300840085008600870088008900900091009200930094009500960097009800990100010101020103010401050106010701080109011001110112011301140115011601170118011901200121012201230124012501260127012801290130013101320133013401350136013701380139014001410142014301440145014601470148014901500151015201530154015501560157015801590160016101620163016401650166016701680169017001710172017301740175017601770178017901800181018201830184018501860187018801890190019101920193019401950196019701980199020002010202020302040205020602070208020902100211021202130214021502160217021802190220022102220223022402250226022702280229023002310232023302340235023602370238023902400241024202430244024502460247024802490250025102520253025402550256025702580259026002610262026302640265026602670268026902700271027202730274027502760277027802790280028102820283028402850286028702880289029002910292029302940295029602970298029903000301030203030304030503060307030803090310031103120313031403150316031703180319032003210322032303240325032603270328032903300331033203330334033503360337033803390340034103420343034403450346034703480349035003510352035303540355035603570358035903600361036203630364036503660367036803690370037103720373037403750376037703780379038003810382038303840385038603870388038903900391039203930394039503960397039803990400040104020403040404050406040704080409041004110412041304140415041604170418041904200421042204230424042504260427042804290430043104320433043404350436043704380439044004410442044304440445044604470448044904500451045204530454045504560457045804590460046104620463046404650466046704680469047004710472047304740475047604770478047904800481048204830484048504860487048804890490049104920493049404950496049704980499050005010502050305040505050605070508050905100511051205130514051505160517051805190520052105220523052405250526052705280529053005310532053305340535053605370538053905400541054205430544054505460547054805490550055105520553055405550556055705580559056005610562056305640565056605670568056905700571057205730574057505760577057805790580058105820583058405850586058705880589059005910592059305940595059605970598059906000601060206030604060506060607060806090610061106120613061406150616061706180619062006210622062306240625062606270628062906300631063206330634063506360637063806390640064106420643064406450646064706480649065006510652065306540655065606570658065906600661066206630664066506660667066806690670067106720673067406750676067706780679068006810682AAA=","title":"old"}}
 --- mutate
 set write_max_bytes = 2047;
 query retitle_one_byte_short() {
     update Doc set { title: "new" } where slug = "big"
+    update Doc set { title: "none" } where slug = "nobody"
 }
 
 --- expect error: materialized blob payload bytes
@@ -43,6 +430,7 @@ d.title: String
 set write_max_bytes = 2048;
 query retitle_exact() {
     update Doc set { title: "new" } where slug = "big"
+    update Doc set { title: "none" } where slug = "nobody"
 }
 
 --- expect affected: nodes=1 edges=0
@@ -59,6 +447,36 @@ query titles_after_carry() {
 --- expect shape
 d.slug: String
 d.title: String
+
+--- mutate
+set write_max_bytes = 2047;
+query retitle_alone() {
+    update Doc set { title: "patched" } where slug = "big"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query titles_after_patch() {
+    match { $d: Doc }
+    return { $d.slug, $d.title }
+}
+
+--- expect unordered
+{"d.slug": "big", "d.title": "patched"}
+
+--- expect shape
+d.slug: String
+d.title: String
+
+--- mutate
+set write_max_bytes = 2047;
+query carry_after_patch_still_counts_the_payload() {
+    update Doc set { title: "new" } where slug = "big"
+    update Doc set { title: "none" } where slug = "nobody"
+}
+
+--- expect error: materialized blob payload bytes
 
 --- mutate
 set write_max_bytes = 2047;
@@ -83,3 +501,89 @@ query titles_after_clear() {
 --- expect shape
 d.slug: String
 d.title: String
+
+--- mutate
+set write_max_bytes = 2047;
+query retitle_indexed_alone() {
+    update Indexed set { title: "patched" } where slug = "big"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+set write_max_bytes = 8191;
+query retitle_packed_alone() {
+    update Packed set { title: "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt" } where slug = "big"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query titles_after_layout_independent_patches() {
+    match { $d: Indexed }
+    return { $d.slug, $d.title }
+}
+
+--- expect unordered
+{"d.slug": "big", "d.title": "patched"}
+
+--- expect shape
+d.slug: String
+d.title: String
+
+--- query
+query packed_title_after_patch() {
+    match { $d: Packed { slug: "big" } }
+    return { $d.slug, $d.title }
+}
+
+--- expect unordered
+{"d.slug": "big", "d.title": "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt"}
+
+--- expect shape
+d.slug: String
+d.title: String
+
+--- load generate: v1 seed: 0 mode: append
+tables:
+  - kind: node
+    name: Apart
+    rows: 300
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: small, width: 3}
+      title: {kind: repeat, text: old, count: 1}
+
+--- expect ok
+
+--- mutate
+set write_max_bytes = 4096;
+query retitle_shared_fragment() {
+    update Shared set { title: "patched" } where slug = "big"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+set write_max_bytes = 4096;
+query retitle_apart_fragment() {
+    update Apart set { title: "patched" } where slug = "big"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query titles_after_fragment_independent_updates() {
+    match {
+        $s: Shared { slug: "big" }
+        $a: Apart { slug: "big" }
+    }
+    return { $s.title, $a.title }
+}
+
+--- expect unordered
+{"s.title": "patched", "a.title": "patched"}
+
+--- expect shape
+s.title: String
+a.title: String
