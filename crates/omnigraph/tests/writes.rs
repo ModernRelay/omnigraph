@@ -1763,10 +1763,13 @@ query update_all() {
     );
 }
 
-/// Blob descriptors do not represent their payload allocation. An update must
-/// consult `BlobFile::size()` against its remaining byte budget before calling
-/// `BlobFile::read`; the scoped payload-read probe makes this a structural
-/// assertion rather than inferring it from the eventual error.
+/// Blob descriptors do not represent their payload allocation. An update that
+/// carries a Blob (here, beside a second statement on the type, it rewrites
+/// whole rows) must consult `BlobFile::size()` against its remaining byte
+/// budget before calling `BlobFile::read`; the scoped payload-read probe makes
+/// this a structural assertion rather than inferring it from the eventual
+/// error. Alone, the same update patches `note` (issue #1264): it keeps the
+/// oversized external reference without sizing or reading it.
 #[tokio::test]
 async fn mutation_update_rejects_oversized_blob_before_payload_read_pre_effect() {
     const LIMIT: u64 = 32 * 1024 * 1024;
@@ -1779,6 +1782,11 @@ node Document {
 "#;
     const UPDATE: &str = r#"
 query update_note($note: String) {
+    update Document set { note: $note } where title = "wide"
+    update Document set { note: $note } where title = "nobody"
+}
+
+query patch_note($note: String) {
     update Document set { note: $note } where title = "wide"
 }
 "#;
@@ -1877,6 +1885,38 @@ query update_note($note: String) {
         "oversized update must fail before writing a recovery sidecar"
     );
 
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let result = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.mutate(
+            "main",
+            UPDATE,
+            "patch_note",
+            &params(&[("$note", "patched")]),
+        ),
+    )
+    .await
+    .expect("a column patch never sizes or reads the carried reference");
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(
+        (
+            probes.blob_payload_read_calls(),
+            probes.external_blob_probe_calls()
+        ),
+        (0, 0)
+    );
+    let kept = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "wide", "content"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(kept.content, omnigraph::BlobContent::External(_)),
+        "the oversized reference is kept as stored"
+    );
+
     const REPLACE: &str = r#"
 query replace_content($c: Blob) {
     update Document set { content: $c } where title = "wide"
@@ -1912,9 +1952,12 @@ query replace_content($c: Blob) {
     assert_eq!(&bytes[..], &[1, 2, 3]);
 }
 
-/// A predicate update carrying many rows' Blob cells reads the managed ones in
-/// one batched read and the external one through its admitted object, and
-/// rewrites each exactly; the null stays null and the external becomes managed.
+/// A predicate update that rewrites whole rows (here beside a second
+/// statement on the type) carries many rows' Blob cells: it reads the managed
+/// ones in one batched read and the external one through its admitted object,
+/// and rewrites each exactly; the null stays null and the external becomes
+/// managed. The same update alone patches `note` (issue #1264) and reads no
+/// Blob payload at all.
 #[tokio::test]
 async fn mutation_update_carries_mixed_blob_rows_through_batched_managed_read() {
     use base64::Engine;
@@ -1929,6 +1972,11 @@ node Document {
 "#;
     const UPDATE: &str = r#"
 query update_shelf($note: String) {
+    update Document set { note: $note } where shelf = "a"
+    update Document set { note: $note } where title = "nobody"
+}
+
+query patch_shelf($note: String) {
     update Document set { note: $note } where shelf = "a"
 }
 "#;
@@ -2052,6 +2100,37 @@ query update_shelf($note: String) {
         matches!(null, OmniError::Manifest(ref error) if error.kind == omnigraph::error::ManifestErrorKind::NotFound),
         "the null cell stays null, got {null:?}"
     );
+
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let result = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.mutate(
+            "main",
+            UPDATE,
+            "patch_shelf",
+            &params(&[("$note", "patched")]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.affected_nodes, 6);
+    assert_eq!(
+        (
+            probes.blob_payload_read_calls(),
+            probes.blob_managed_batch_read_calls()
+        ),
+        (0, 0),
+        "the update alone patches `note` and reads no Blob payload"
+    );
+    for (title, bytes) in &managed {
+        let actual = read_managed_blob_bytes(
+            &db,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", *title, "content"),
+        )
+        .await;
+        assert!(actual == *bytes, "{title} changed through the patch");
+    }
 }
 
 /// Blob puts retain their fixed cap under raised session allowances.
@@ -2414,11 +2493,14 @@ query clear_both($content: Blob?, $preview: Blob?) {
         .expect("an update assigning both cells reads neither");
 }
 
-/// Carrying an unassigned stored external reference needs the graph's policy
-/// to admit its source; under Deny the refusal names the row and property, and
-/// assigning the property (a new value or null) replaces it without reading it.
+/// An update that rewrites whole rows carries an unassigned stored external
+/// reference, which needs the graph's policy to admit its source; under Deny
+/// the refusal names the row and property. An update that is the mutation's
+/// only write to the type patches its scalar columns instead (issue #1264):
+/// it keeps the reference without probing, reading or refusing it. Assigning
+/// the property (a new value or null) replaces it without reading it.
 #[tokio::test]
-async fn mutation_update_replaces_stored_external_reference_under_deny() {
+async fn mutation_update_keeps_or_replaces_stored_external_reference_under_deny_issue_1264() {
     const SCHEMA: &str = r#"
 node Document {
     title: String @key
@@ -2429,6 +2511,11 @@ node Document {
     const MUTATIONS: &str = r#"
 query update_note($note: String) {
     update Document set { note: $note } where title = "doc"
+}
+
+query update_note_beside_another($note: String) {
+    update Document set { note: $note } where title = "doc"
+    update Document set { note: $note } where title = "nobody"
 }
 
 query set_content($c: Blob?) {
@@ -2493,7 +2580,7 @@ query set_content($c: Blob?) {
         db.mutate(
             "main",
             MUTATIONS,
-            "update_note",
+            "update_note_beside_another",
             &params(&[("$note", "after")]),
         ),
     )
@@ -2527,6 +2614,36 @@ query set_content($c: Blob?) {
         before_table
     );
     assert_eq!(head_commit_id(&uri).await, before_head);
+
+    // Alone, the update patches `note` and never touches the stored reference.
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let result = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.mutate(
+            "main",
+            MUTATIONS,
+            "update_note",
+            &params(&[("$note", "after")]),
+        ),
+    )
+    .await
+    .expect("a column patch keeps the stored reference without admitting it");
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(probes.external_blob_probe_calls(), 0);
+    assert_eq!(probes.external_blob_payload_read_calls(), 0);
+    let kept = db
+        .read_blob_at(ReadTarget::branch("main"), cell())
+        .await
+        .unwrap();
+    let omnigraph::BlobContent::External(kept) = kept.content else {
+        panic!("the patch must keep the external descriptor");
+    };
+    assert_eq!(kept.uri, stored.uri, "the reference is kept as stored");
+    assert_eq!(
+        latest_update_mode(&db, "main", "node:Document").await,
+        Some(lance::dataset::transaction::UpdateMode::RewriteColumns),
+        "the sole scalar update stages a column patch"
+    );
 
     let probes = omnigraph::instrumentation::MergeWriteProbes::default();
     let result = omnigraph::instrumentation::with_merge_write_probes(
@@ -4426,6 +4543,20 @@ async fn filtered_read_after_append_and_delete_is_consistent() {
     }
 }
 
+/// The update mode of the transaction that wrote the branch's pinned version
+/// of `table_key`, `None` when that transaction is not an `Update`.
+async fn latest_update_mode(
+    db: &Omnigraph,
+    branch: &str,
+    table_key: &str,
+) -> Option<lance::dataset::transaction::UpdateMode> {
+    let dataset = open_pinned_dataset_for_test(db, branch, table_key).await;
+    match dataset.read_transaction().await.unwrap()?.operation {
+        lance::dataset::transaction::Operation::Update { update_mode, .. } => update_mode,
+        _ => None,
+    }
+}
+
 async fn head_commit_id(uri: &str) -> String {
     CommitGraph::open(uri)
         .await
@@ -4902,5 +5033,217 @@ query set_since() {
             .contains("update mutation for edge type `Knows` is not supported"),
         "got: {}",
         err
+    );
+}
+
+/// Issue #1264: an `update` of one scalar on a type with a Blob and a vector
+/// patches the assigned column in place when that saves bytes, so the bytes it
+/// writes do not follow the size of the row: the graph grows by about the same
+/// small amount whether each row holds a 64 KiB or a 1 MiB Blob, the
+/// transaction is Lance's `RewriteColumns`, and the Blob bytes, vectors and
+/// stable row ids are as before. A one-row update of a large table whose
+/// omitted columns are a small vector rewrites the whole row, which writes
+/// less there. The read and write byte counts per Blob size and match count
+/// are measured with GQT `--measure` (see the pull request); this test keeps
+/// the write side and the mode choice.
+#[tokio::test]
+async fn update_of_one_scalar_patches_instead_of_rewriting_blobs_and_vectors_issue_1264() {
+    use arrow_array::cast::AsArray;
+    use base64::Engine as _;
+    use lance::dataset::transaction::UpdateMode;
+
+    const SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    age: I32
+    score: I32?
+    content: Blob?
+    emb: Vector(8)?
+}
+"#;
+    const UPDATE: &str = r#"
+query bump($slug: String) {
+    update Doc set { score: 1 } where slug = $slug
+}
+query bump_all() {
+    update Doc set { score: 2 } where age >= 0
+}
+"#;
+
+    fn dir_bytes(path: &std::path::Path) -> u64 {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let meta = entry.metadata().unwrap();
+                if meta.is_dir() {
+                    dir_bytes(&entry.path())
+                } else {
+                    meta.len()
+                }
+            })
+            .sum()
+    }
+
+    async fn vectors(db: &Omnigraph) -> Vec<(String, Vec<f32>, u64)> {
+        let ds = open_pinned_dataset_for_test(db, "main", "node:Doc").await;
+        let mut scanner = ds.scan();
+        scanner.with_row_id();
+        let batch = scanner
+            .project(&["slug", "emb"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let slugs = batch.column_by_name("slug").unwrap().as_string::<i32>();
+        let embs = batch.column_by_name("emb").unwrap().as_fixed_size_list();
+        let row_ids = batch
+            .column_by_name("_rowid")
+            .unwrap()
+            .as_primitive::<arrow_array::types::UInt64Type>();
+        let mut rows = (0..batch.num_rows())
+            .map(|row| {
+                let values = embs.value(row);
+                let values = values.as_primitive::<arrow_array::types::Float32Type>();
+                (
+                    slugs.value(row).to_string(),
+                    values.values().to_vec(),
+                    row_ids.value(row),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
+    let mut growth = Vec::new();
+    for blob_bytes in [64 * 1024_usize, 1024 * 1024] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = helpers::session(Omnigraph::init(uri, SCHEMA).await.unwrap());
+        let rows = (0..4)
+            .map(|row| {
+                let payload = vec![row as u8 + 1; blob_bytes];
+                serde_json::json!({"type": "Doc", "data": {
+                    "slug": format!("d{row}"),
+                    "age": row,
+                    "content": format!(
+                        "base64:{}",
+                        base64::engine::general_purpose::STANDARD.encode(&payload)
+                    ),
+                    "emb": (0..8).map(|i| (row * 8 + i) as f32).collect::<Vec<_>>(),
+                }})
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        db.load_jsonl(&rows, LoadMode::Overwrite).await.unwrap();
+        let before_vectors = vectors(&db).await;
+
+        let before = dir_bytes(dir.path());
+        let result = db
+            .mutate("main", UPDATE, "bump", &params(&[("$slug", "d2")]))
+            .await
+            .unwrap();
+        assert_eq!(result.affected_nodes, 1);
+        let one = dir_bytes(dir.path()) - before;
+        assert_eq!(
+            latest_update_mode(&db, "main", "node:Doc").await,
+            Some(UpdateMode::RewriteColumns),
+            "{blob_bytes}: a one-row scalar update of a Blob row patches the column"
+        );
+        let before = dir_bytes(dir.path());
+        let result = db
+            .mutate(
+                "main",
+                UPDATE,
+                "bump_all",
+                &omnigraph_compiler::ir::ParamMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.affected_nodes, 4);
+        let all = dir_bytes(dir.path()) - before;
+        assert_eq!(
+            latest_update_mode(&db, "main", "node:Doc").await,
+            Some(UpdateMode::RewriteColumns)
+        );
+        growth.push((blob_bytes, one, all));
+
+        assert_eq!(
+            vectors(&db).await,
+            before_vectors,
+            "vectors and stable row ids are untouched"
+        );
+        for row in 0..4 {
+            assert_eq!(
+                read_managed_blob_bytes(
+                    &db,
+                    ReadTarget::branch("main"),
+                    node_blob_cell("Doc", format!("d{row}"), "content"),
+                )
+                .await,
+                vec![row as u8 + 1; blob_bytes],
+                "d{row}: the Blob keeps its bytes"
+            );
+        }
+    }
+    for (blob_bytes, one, all) in &growth {
+        assert!(
+            *one < 64 * 1024 && *all < 64 * 1024,
+            "{blob_bytes}-byte Blobs: an update writes no Blob bytes (one row {one}, all rows {all})"
+        );
+    }
+    let (_, small_one, small_all) = growth[0];
+    let (_, large_one, large_all) = growth[1];
+    assert!(
+        large_one.abs_diff(small_one) < 4096 && large_all.abs_diff(small_all) < 4096,
+        "the bytes an update writes do not follow the Blob size: {growth:?}"
+    );
+
+    // A one-row update of a 512-row fragment whose omitted column is a
+    // 32-byte vector: patching would write a column file over every row of
+    // the fragment, so it rewrites the row.
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(
+            uri,
+            "node Doc {\n    slug: String @key\n    age: I32\n    score: I32?\n    emb: Vector(8)?\n}\n",
+        )
+        .await
+        .unwrap(),
+    );
+    let rows = (0..512)
+        .map(|row| {
+            serde_json::json!({"type": "Doc", "data": {
+                "slug": format!("d{row}"), "age": row,
+                "emb": (0..8).map(|i| (row * 8 + i) as f32).collect::<Vec<_>>(),
+            }})
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    db.load_jsonl(&rows, LoadMode::Overwrite).await.unwrap();
+    db.mutate("main", UPDATE, "bump", &params(&[("$slug", "d2")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        latest_update_mode(&db, "main", "node:Doc").await,
+        Some(UpdateMode::RewriteRows),
+        "a narrow one-row update rewrites the row"
+    );
+    db.mutate(
+        "main",
+        UPDATE,
+        "bump_all",
+        &omnigraph_compiler::ir::ParamMap::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        latest_update_mode(&db, "main", "node:Doc").await,
+        Some(UpdateMode::RewriteColumns),
+        "an update of every row patches the column"
     );
 }
