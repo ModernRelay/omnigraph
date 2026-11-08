@@ -634,12 +634,12 @@ query people_over($cutoff: I32)
 }
 ```
 
-**Reserved in edition 3, refused with the owning RFC named.** Edition 2:
-**Not supported** and not parseable. Each parses in edition 3 and is refused
-with a `T6x` naming its owner.
+**Added by later stages.** Edition 2: **Not supported** and not parseable.
+Each is a parse error today and additive when its stage lands; `@if_commit`
+alone is refused by name, so that it is never silently kept as metadata.
 
 ```gq
-// edition 3, slots
+// edition 3, later stages
 query schema_types() {
   match { $t: @Type  $p: @Property  $t @property $p }       // the schema catalogue
   return { $t.name, $p.name }

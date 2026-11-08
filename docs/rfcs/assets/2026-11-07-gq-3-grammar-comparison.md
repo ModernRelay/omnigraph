@@ -50,8 +50,8 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 | a property match value is any `expr`; a comparison is a filter clause, not a match | `(n {p: v})` literal map; `(n WHERE n.p > 1)` inside the element | `(n {p: v})`; `WHERE` outside | `WHERE` | a constraint in the body |
 | no anonymous endpoint: every end is a variable | `()` and `-[]->` | `()` and `-->` | n/a | `_` |
 | `$k:knows` binds the edge (`edge_binding`) | `-[k:KNOWS]->` | `-[k:KNOWS]->` | an alias on the edge table | an edge-id argument, `knows(X, Y, K)` |
-| `a::b::Type` namespace segments (`type_ref`, a slot) | `/schema/path` and `USE graph` | none; `USE db` (Neo4j) | `schema.table` | none; Soufflé components `.comp` |
-| `@Type`, `@Property`, catalogue types (a slot) | none; `SHOW` is vendor | `SHOW CONSTRAINTS`, `db.schema.visualization()` (Neo4j) | `information_schema`, `pg_catalog` | none |
+| `a::b::Type` namespace segments (`type_ref`, a later stage) | `/schema/path` and `USE graph` | none; `USE db` (Neo4j) | `schema.table` | none; Soufflé components `.comp` |
+| `@Type`, `@Property`, catalogue types (stage S) | none; `SHOW` is vendor | `SHOW CONSTRAINTS`, `db.schema.visualization()` (Neo4j) | `information_schema`, `pg_catalog` | none |
 
 ## 4. Traversal
 
@@ -65,7 +65,7 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 | unbounded reachability: refused (an open upper bound on `Expand` is the named later change) | `-[:E]->+`, `->*`, `{1,}` | `-[:E*]->` | `WITH RECURSIVE` | native: `path(X, Y) :- edge(X, Z), path(Z, Y).` |
 | a path value: refused | `p = (a)-[]->*(b)`, `PATH_LENGTH(p)`, `NODES(p)` | `p = …`, `nodes(p)`, `length(p)` | none in `GRAPH_TABLE` | none (a list encoding) |
 | `$d "in" $coll`, a quoted edge name (`string_lit` in `edge_sel`) | `` `in` ``, backtick-delimited | `` `in` `` | `"in"` (a delimited identifier) | none |
-| `@edge` of the catalogue (`catalogue_edge`, a slot) | none | none | none | none |
+| `@edge` of the catalogue (`catalogue_edge`, stage S) | none | none | none | none |
 | the written-incoming order (`$c worksAt $p`) is accepted and `fmt` rewrites it | the arrow says it; no rewrite | the arrow says it; LangChain's `CypherQueryCorrector` is the rewrite, after generation | the join keys say it | the argument order says it |
 | `-e->`, `<-e-`, `-e-`: recognised to print the triple as the fix (`arrow_traversal`) | the form itself | the form itself | n/a | n/a |
 
@@ -161,7 +161,7 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 | `Blob` | none | none | `BYTEA` | none |
 | enum `enum(a, b)` | none | none | `CREATE TYPE … AS ENUM` (PG) | none |
 | `Date`, `DateTime` | `DATE`, `ZONED DATETIME`, `LOCAL DATETIME`, `DURATION` | `date`, `datetime`, `localdatetime`, `duration` | `DATE`, `TIMESTAMP [WITH TIME ZONE]`, `INTERVAL` | none |
-| parameter kinds `Branch`, `Commit` (a slot) | none | none | none | none |
+| parameter kinds `Branch`, `Commit` (a later stage) | none | none | none | none |
 
 ## 11. Writes
 
@@ -175,7 +175,7 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 | upsert: outside the language (`load --mode`) | none | `MERGE … ON CREATE SET … ON MATCH SET …` | `MERGE INTO … WHEN MATCHED …`, `INSERT … ON CONFLICT` (PG) | n/a |
 | an edge by bound references: `$p $k:worksAt $c  delete $k` | the pattern binds the endpoints | the pattern binds the endpoints | `DELETE … USING` with a join | n/a |
 | `as commit`, `as unattached branch` on the declaration | `START TRANSACTION`, `COMMIT`, `ROLLBACK` as statements | transactions are the driver's | `BEGIN`, `COMMIT`, `ROLLBACK` | none |
-| `returning { @id }` (a slot) | `INSERT … RETURN n` | `CREATE … RETURN n` | `RETURNING …` (PG); `NEW TABLE (INSERT …)` (standard) | n/a |
+| `returning { @id }` (the writes stage) | `INSERT … RETURN n` | `CREATE … RETURN n` | `RETURNING …` (PG); `NEW TABLE (INSERT …)` (standard) | n/a |
 
 ## 12. Schema
 
@@ -228,9 +228,9 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 | `HAVING` | SQL | derived: a filter after `from { … }` |
 | `GROUP BY` | SQL, GQL | implicit |
 | `CALL { }` subquery | GQL, Cypher | present as `from { }` |
-| `RETURNING`, `RETURN` after a write | all three | a slot (`returning`) |
-| `OFFSET` / `SKIP` | all three | a slot (the paging stage) |
-| `IS LABELED`, `x:Label` as a predicate | GQL, Cypher | a slot (`is`, the polymorphism RFC) |
+| `RETURNING`, `RETURN` after a write | all three | the writes stage (`returning`) |
+| `OFFSET` / `SKIP` | all three | the paging stage |
+| `IS LABELED`, `x:Label` as a predicate | GQL, Cypher | the polymorphism stage (`is`) |
 | `UNION` of two reads | all four | **gap**: the core has `Union`; the surface has no form for a reader to union two reads |
 | a list to rows (`FOR`, `UNWIND`, `unnest`) | GQL, Cypher, SQL | **gap**: `from` takes a relation only, and no form turns a list parameter into rows |
 | arithmetic, unary minus, negative and exponent literals | all four | **gap in the text**: the core and section 7 use arithmetic; section 6 and `query.pest` have no production |
