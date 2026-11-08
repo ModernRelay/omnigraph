@@ -13,11 +13,11 @@ begins with `gq 3;`, omitted below.
 
 ## The schema, shared by every example
 
-```gq
+```pg
 interface Named { name: String }
 
-node Person: Named { handle: String @key  name: String  age: I32?  city: String? }
-node Company: Named { slug: String @key  name: String }
+node Person implements Named { handle: String @key  name: String  age: I32?  city: String? }
+node Company implements Named { slug: String @key  name: String }
 node Doc { id: String @key  title: String  body: String @index(fulltext)  year: I32  tags: [String]  embedding: Vector(3)? }
 node Collection { slug: String @key  min_docs: I32 }
 
@@ -28,8 +28,8 @@ edge Cites: Doc -> Doc
 edge In: Doc -> Collection        // traversed as "in": the bare name is reserved
 ```
 
-Edition 2 declares `node Person implements Named`; edition 3 writes the
-interface after a colon. Nothing else in the schema changes.
+The schema is `.pg` text and is the same in both editions; the `analyzer`
+and `distance` options are edition 3's additive declarations.
 
 ## 1. Lookups and filters
 
@@ -155,8 +155,8 @@ query around($h: String) {
   match {
     $p: Person { handle: $h }
     $p <knows> $friend
-    $p (knows | authored) $thing
     $p knows{2,2} $second
+    $near: Person
     $p *{1,3} $near
   }
   return { $friend.name, count($second) as seconds, count($near) as near }
@@ -338,8 +338,8 @@ query colleagues($of: String) {
 
 query colleagues_of_colleagues($of: String) {
   match {
-    from colleagues($of)
-    from { from colleagues($q.handle) return { $q as r } }
+    from { match { from colleagues($of) } return { $q as c } }
+    from { match { from colleagues($c.handle) } return { $q as r } }
   }
   return distinct { $r.name }
 }
@@ -390,7 +390,7 @@ query similar($q: Vector(3)) {
 ```gq
 // edition 3
 query similar($q: Vector(3)) {
-  match { from nearest({ match { $d: Doc  $d.year >= 2025 } return { $d } }, embedding, $q, k: 20) }
+  match { from nearest({ match { $d: Doc  $d.year >= 2025 } return { $d } }, $d.embedding, $q, k: 20) }
   return { $d.title }
   order { $distance }
 }
@@ -411,7 +411,7 @@ query similar_scored($q: Vector(3)) {
 ```gq
 // edition 3
 query similar_scored($q: Vector(3)) {
-  match { from nearest({ match { $d: Doc } return { $d } }, embedding, $q, k: 20) }
+  match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20) }
   return { $d.title, $distance as s }
   order { $distance }
 }
@@ -426,7 +426,7 @@ documents.
 // edition 3
 query cited_near($coll: String, $q: Vector(3)) {
   match {
-    from nearest({ match { $d "in" $x  $x: Collection { slug: $coll } } return { $d } }, embedding, $q, k: 20)
+    from nearest({ match { $d "in" $x  $x: Collection { slug: $coll } } return { $d } }, $d.embedding, $q, k: 20)
     $d cites $other
   }
   return { $d.title, $distance, count($other) as cites }
@@ -442,7 +442,7 @@ form answers a different question.
 // edition 3
 query within_radius($q: Vector(3), $r: F32) {
   match {
-    from l2({ match { $d: Doc  $d.year >= 2025 } return { $d } }, embedding, $q)
+    from distance({ match { $d: Doc  $d.year >= 2025 } return { $d } }, $d.embedding, $q)
     $distance <= $r
   }
   return { $d.title, $distance }
@@ -466,7 +466,7 @@ query about($q: String) {
 ```gq
 // edition 3
 query about($q: String) {
-  match { from bm25({ match { $d: Doc } return { $d } }, body, $q) }
+  match { from bm25({ match { $d: Doc } return { $d } }, $d.body, $q) }
   return { $d.title, $score as s }
   order { $score desc }
   limit 10
@@ -510,7 +510,7 @@ query hybrid($q: String, $v: Vector(3)) {
 query hybrid($q: String, $v: Vector(3)) {
   match {
     let $docs = { match { $d: Doc } return { $d } }
-    from rrf(nearest($docs, embedding, $v, k: 50), bm25($docs, body, $q), k: 60)
+    from rrf(nearest($docs, $d.embedding, $v, k: 50), bm25($docs, $d.body, $q), k: 60)
   }
   return { $d.title, $score }
   order { $score desc }
@@ -526,12 +526,12 @@ and there is no arithmetic.
 query weighted($q: String, $v: Vector(3)) {
   match {
     let $docs = { match { $d: Doc } return { $d } }
-    from { from l2($docs, embedding, $v) return { $d, $distance as vec } }
-    from { from bm25($docs, body, $q) return { $d as d2, $score as lex } }
+    from { match { from distance($docs, $d.embedding, $v) } return { $d, $distance as vec } }
+    from { match { from bm25($docs, $d.body, $q) } return { $d as d2, $score as lex } }
     $d = $d2
   }
   return { $d.title, 0.7 * (1.0 / (1.0 + $vec)) + 0.3 * $lex as s }
-  order { $s desc }
+  order { s desc }
   limit 10
 }
 ```
@@ -542,7 +542,7 @@ budget is a session setting.
 ```gq
 // edition 3
 query similar_fast($q: Vector(3)) {
-  match { from nearest({ match { $d: Doc } return { $d } }, embedding, $q, k: 20, recall: 0.9) }
+  match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20, recall: 0.9) }
   return { $d.title, $distance }
 }
 ```
@@ -561,13 +561,18 @@ query hire($h: String, $slug: String) {
 ```
 
 **Update and delete by predicate.** Edition 2 names the type and a `where`;
-edition 3 binds the entity and names it.
+edition 3 binds the entity and names it. Neither edition mixes a `delete`
+with an `update` in one write, and edition 2 cannot assign `null`, so
+clearing a property is edition 3 only.
 
 ```gq
 // edition 2
 query retire($h: String) as commit {
   delete WorksAt where @src = $h
-  update Person set { city: null } where handle = $h
+}
+
+query relocate($h: String) {
+  update Person set { city: "unknown" } where handle = $h
 }
 ```
 
@@ -577,6 +582,10 @@ query retire($h: String) as commit {
   $p: Person { handle: $h }
   $p $k:worksAt $c
   delete $k
+}
+
+query relocate($h: String) {
+  $p: Person { handle: $h }
   update $p set { city: null }
 }
 ```
@@ -591,7 +600,6 @@ query close_company($slug: String) {
   $c: Company { slug: $slug }
   $p $k:worksAt $c
   delete $k
-  update $p set { city: null }
 }
 ```
 
@@ -611,7 +619,7 @@ supported.**
 ```gq
 // edition 3
 query tag_near($q: Vector(3)) {
-  from nearest({ match { $d: Doc } return { $d } }, embedding, $q, k: 20)
+  from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20)
   update $d set { tags: ["near"] }
 }
 ```

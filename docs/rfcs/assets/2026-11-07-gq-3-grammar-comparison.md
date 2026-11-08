@@ -102,9 +102,9 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 
 | GQ 3 | GQL | Cypher | SQL | Datalog |
 |---|---|---|---|---|
-| `l2(rel, field, $q)`: every row scored, exact (`Score`) | none | `vector.similarity.euclidean(a, b)` function (Neo4j 5.18) | pgvector `a <-> $q` operator (PG) | none; a user functor |
-| `nearest(rel, field, $q, k: n)`: at most `n` rows, declared recall (`ApproxTopK`) | none | `CALL db.index.vector.queryNodes('idx', k, $q) YIELD node, score` (Neo4j 5) | `ORDER BY a <-> $q LIMIT k`: the planner picks the index, recall is a session setting (`hnsw.ef_search`) and not declared | none |
-| `bm25(rel, field, $q)` (`Score`, lexical) | none | `CALL db.index.fulltext.queryNodes('idx', $q) YIELD node, score` (Neo4j 5) | `ts_rank_cd(tsv, to_tsquery($q))` with `@@` (PG) | none |
+| `distance(rel, $x.f, $q)`: every row scored under the field's declared distance, exact (`Score`) | none | `vector.similarity.euclidean(a, b)` function (Neo4j 5.18) | pgvector `a <-> $q` operator (PG) | none; a user functor |
+| `nearest(rel, $x.f, $q, k: n)`: at most `n` rows, declared recall (`ApproxTopK`) | none | `CALL db.index.vector.queryNodes('idx', k, $q) YIELD node, score` (Neo4j 5) | `ORDER BY a <-> $q LIMIT k`: the planner picks the index, recall is a session setting (`hnsw.ef_search`) and not declared | none |
+| `bm25(rel, $x.f, $q)` (`Score`, lexical) | none | `CALL db.index.fulltext.queryNodes('idx', $q) YIELD node, score` (Neo4j 5) | `ts_rank_cd(tsv, to_tsquery($q))` with `@@` (PG) | none |
 | `rrf(rel, rel, …, k: n)` (`Fuse`) | none | written by hand in `WITH` over two `CALL`s | written by hand over two CTEs with `row_number()` | none |
 | the score is a column, `$distance` / `$score`, named by the function | n/a | `YIELD score` | an aliased expression | n/a |
 | exact and approximate are different operators, never the planner's choice | n/a | a function versus a procedure: the same split, by accident of packaging | one spelling, the planner chooses; `SET enable_indexscan` to force | n/a |
