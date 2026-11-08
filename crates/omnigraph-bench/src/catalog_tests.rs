@@ -24,7 +24,7 @@ fn setup() -> (tempfile::TempDir, Catalog) {
     (directory, catalog)
 }
 fn changed(catalog: &Catalog, config: &ConfigV2) -> Result<Catalog, Vec<crate::Diagnostic>> {
-    Catalog::from_source(&catalog.path, &serde_yaml::to_string(config).unwrap())
+    Catalog::from_source(&catalog.path, &yaml_serde::to_string(config).unwrap())
 }
 
 #[test]

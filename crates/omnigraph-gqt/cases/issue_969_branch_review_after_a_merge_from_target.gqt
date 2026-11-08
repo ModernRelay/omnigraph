@@ -1,0 +1,66 @@
+# issue: 969
+# red_on: the row-identity rule with the branch form's ancestry taken for granted: the merge base of a source that merged its target is reached through the merge commit's second parent, and the two sibling first commits' inserts share a row id and a stamp, so the rule paired `x` with `y` as one unchanged row and the review dropped `y`'s insert (refused under `verify`).
+# notes: A branch review whose merge base is not on the source's first-parent chain takes the exact
+# notes: merge. Main and feature each insert one row in their first commit after the fork, so Lance
+# notes: gives both rows the same row id and the same version stamp; feature then merges main in,
+# notes: which makes main's head the merge base of the pair. The review must report feature's own
+# notes: insert and nothing for main's, and the two-point diff from main's head must agree.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Person","data":{"name":"bob","age":40}}
+
+--- mutate
+branch create feature
+
+--- expect ok
+
+--- mutate
+query x_on_main() {
+    insert Person { name: "x", age: 1 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $main_after_x
+
+--- mutate branch: feature
+query y_on_feature() {
+    insert Person { name: "y", age: 2 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge main into feature
+
+--- expect outcome: merged
+
+--- query
+branch diff feature into main
+
+--- expect ordered
+{"after":{"properties":{"age":2,"name":"y"}},"id":"y","kind":"node","op":"insert","type":"Person"}
+
+--- query
+branch diff "${main_after_x}" to feature
+
+--- expect ordered
+{"after":{"properties":{"age":2,"name":"y"}},"id":"y","kind":"node","op":"insert","type":"Person"}

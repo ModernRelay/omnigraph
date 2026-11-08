@@ -1,0 +1,35 @@
+# issue: none
+# notes: A graph with no external Blob policy denies every `load csv` source: the default is
+# notes: deny, the refusal names it, and nothing is read or loaded.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    id: I64 @key
+    name: String
+}
+
+--- seed
+{"type":"Person","data":{"id":1,"name":"alice"}}
+
+--- mutate
+load csv "s3://bucket/imports/people.csv" into node:Person mode append header
+
+--- expect error: ingress is denied for this graph
+
+--- query
+query unchanged() {
+    match { $p: Person }
+    return { $p.id }
+}
+
+--- expect unordered
+{"p.id": 1}
+
+--- expect shape
+p.id: I64

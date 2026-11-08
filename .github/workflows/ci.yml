@@ -99,6 +99,7 @@ jobs:
           run_deployment=false
           for path in "${changed[@]}"; do
             case "$path" in
+              docs/user/queries/catalogue.md) run_full_ci=true ;;
               docs/*.md|docs/*.mdx|docs/*.rst|docs/*.adoc|changelog.d/*.md|changelog.d/release.json) ;;
               README.md|AGENTS.md|CLAUDE.md|CHANGELOG.md|CONTRIBUTING.md|CODE_OF_CONDUCT.md) ;;
               LICENSE|LICENSE.md) ;;
@@ -173,8 +174,27 @@ jobs:
       - name: Test release-note composition
         run: python3 scripts/test_release_notes.py
 
+      - name: Test edge release decisions and text
+        run: python3 scripts/test_edge_release.py
+
       - name: Render release-note preview
         run: python3 scripts/release_notes.py preview --target HEAD > "$RUNNER_TEMP/release-notes-preview.md"
+
+      # The edge publisher composes its release text from this preview
+      # (`scripts/edge_release.py body`), so a renderer change that breaks
+      # the composer fails here, in its own pull request.
+      - name: Compose edge release text from the preview
+        run: |
+          set -euo pipefail
+          commit=0000000000000000000000000000000000000000
+          printf '%s\n' "{\"version\":\"0.0.1-edge+0000000\",\"channel\":\"edge\",\"commit\":\"${commit}\",\"http_contract\":\"0.0\",\"internal_schema\":{\"writes\":1,\"serves\":[1,1]}}" \
+            > "$RUNNER_TEMP/edge-version.json"
+          python3 scripts/edge_release.py body --repository "$GITHUB_REPOSITORY" --commit "$commit" \
+            --build-tag edge-20260101-0000000 --build-version "$RUNNER_TEMP/edge-version.json" \
+            --notes "$RUNNER_TEMP/release-notes-preview.md" > /dev/null
+          python3 scripts/edge_release.py body --repository "$GITHUB_REPOSITORY" --commit "$commit" \
+            --build-tag edge-20260101-0000000 --build-version "$RUNNER_TEMP/edge-version.json" \
+            --notes "$RUNNER_TEMP/release-notes-preview.md" --rolling > /dev/null
 
       - name: Upload release-note preview
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -222,6 +242,9 @@ jobs:
 
       - name: Check required test cells exist in the sources
         run: python3 scripts/check-ci-cells.py --self-test
+
+      - name: Self-test the release-note check
+        run: python3 scripts/check-release-note.py --self-test
 
       - name: Assert the classification copies match this workflow
         run: |
@@ -349,7 +372,7 @@ jobs:
         if: env.VOCABULARY_AUDIT_ENABLED == 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       - name: Restore pinned public-Rust tooling
         if: env.VOCABULARY_AUDIT_ENABLED == 'true'
@@ -416,25 +439,16 @@ jobs:
             --cargo-public-api "$tool" \
             --public-api-target-dir target/vocabulary-public-api
 
-  release_edge_after_vocabulary:
-    name: Release edge after vocabulary audit
-    needs: [classify_changes, graph_vocabulary_guard]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.classify_changes.outputs.run_full_ci == 'true'
-    permissions:
-      actions: read
-      contents: write
-    uses: ./.github/workflows/release-edge.yml
-    with:
-      source_ref: ${{ github.sha }}
-      ci_run_id: ${{ format('{0}', github.run_id) }}
-
   release_tag_after_vocabulary:
     name: Release tag after vocabulary audit
     needs: graph_vocabulary_guard
     if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    # The called publisher attests its archives' build provenance.
     permissions:
       actions: read
       contents: write
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/release.yml
     with:
       tag: ${{ github.ref_name }}
@@ -446,10 +460,13 @@ jobs:
     name: Publish tag image after vocabulary audit
     needs: graph_vocabulary_guard
     if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    # The called publisher attests the pushed image's build provenance.
     permissions:
       actions: read
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/publish-image.yml
     with:
       tag: ${{ github.ref_name }}
@@ -568,7 +585,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       # See the toolchain note in `fmt`. Before the cache step so the cache
       # key sees the pinned rustc.
@@ -641,10 +658,22 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
+      # A lock bump rebuilds the bumped layer beside the restored cache, two
+      # debug copies of most of the tree; PR 1270's merge-queue run died
+      # linking on a full disk. Drop the toolchains this job never uses and
+      # print the headroom before and after the build.
+      - name: Free the runner's disk of unused toolchains
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift
+          df -h /
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       - name: Install pinned toolchain
         run: rustup toolchain install
@@ -680,6 +709,17 @@ jobs:
         run: |
           cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --no-run --timings \
             --features "$FAILPOINT_FEATURES"
+
+      # Printed red or green, so a full disk is named; `target` is absent when
+      # an earlier step failed.
+      - name: Report the disk headroom after the build
+        if: always()
+        run: |
+          df -h /
+          if [ -d target ]; then du -sh target; fi
+
+      - name: Verify catalogue inventories against the built CLI
+        run: python3 scripts/check-catalogue-docs.py --binary target/debug/omnigraph
 
       - name: Install genuine v0.9 release for upgrade regression
         run: |
@@ -799,14 +839,14 @@ jobs:
   storage_upgrade_compatibility:
     name: Storage Upgrade Compatibility
     runs-on: ubuntu-latest
-    # Two builds use one target directory here: the genuine stamp-13
-    # predecessor CLI (one package, one bin, no test features), then the
-    # current tree's test targets. Their dependency feature sets differ (the
+    # Three builds use one target directory here: genuine stamp-13 and
+    # Lance 11 predecessor CLIs (one package, one bin, no test features),
+    # then the current tree's test targets. Their dependency feature sets differ (the
     # test builds enable dev-dependency features such as lance-io's defaults
     # and test-util), so the second build reuses only the dependency artifacts
     # whose features match. The v5 fence measured a cold predecessor CLI at
     # 25m40s.
-    timeout-minutes: 90
+    timeout-minutes: 120
     permissions:
       contents: read
     env:
@@ -825,7 +865,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       - name: Install pinned toolchain
         run: rustup toolchain install
@@ -914,6 +954,33 @@ jobs:
             --target-dir "$GITHUB_WORKSPACE/target"
           echo "OMNIGRAPH_V13_BIN=$v13_bin" >> "$GITHUB_ENV"
 
+      # Same graph format, genuinely older substrate. A version label alone
+      # cannot distinguish this writer from the candidate, so pin its source.
+      - name: Build genuine Lance 11 CLI
+        env:
+          LANCE11_SOURCE_COMMIT: 0a62bb7b2aa5b99b012f413807c216277f7f9596
+        run: |
+          set -euo pipefail
+          lance11_source="$RUNNER_TEMP/omnigraph-lance-11"
+          lance11_bin="$RUNNER_TEMP/omnigraph-lance-11-bin"
+          git fetch --no-tags --depth=1 origin "$LANCE11_SOURCE_COMMIT"
+          git worktree add --detach "$lance11_source" "$LANCE11_SOURCE_COMMIT"
+          test "$(git -C "$lance11_source" rev-parse HEAD)" = "$LANCE11_SOURCE_COMMIT"
+          # Run inside the predecessor checkout so its workspace configuration applies.
+          (cd "$lance11_source" && cargo build --locked \
+            --package omnigraph-cli \
+            --bin omnigraph \
+            --target-dir "$GITHUB_WORKSPACE/target")
+          cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$lance11_bin"
+          test -x "$lance11_bin"
+          # Remove both path-package identities before linking the candidate tests.
+          cargo clean --workspace --locked \
+            --manifest-path "$lance11_source/Cargo.toml" \
+            --target-dir "$GITHUB_WORKSPACE/target"
+          cargo clean --workspace --locked \
+            --target-dir "$GITHUB_WORKSPACE/target"
+          echo "OMNIGRAPH_LANCE11_BIN=$lance11_bin" >> "$GITHUB_ENV"
+
       # The owner is the `crossversion_upgrade` module of the CLI's
       # `integration` binary. The exact case names come from the compiled
       # inventory (`-- --list` on the same feature graph, so a valid test the
@@ -986,7 +1053,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       - name: Install pinned toolchain
         run: rustup toolchain install
@@ -1083,7 +1150,7 @@ jobs:
         if: needs.classify_changes.outputs.run_full_ci == 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       - name: Install pinned toolchain
         if: needs.classify_changes.outputs.run_full_ci == 'true'
@@ -1168,7 +1235,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev python3-pip
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold python3-pip
 
       - name: Install pinned toolchain
         run: rustup toolchain install
@@ -1280,7 +1347,19 @@ jobs:
             -p omnigraph-cli \
             --test lance_surface_guards \
             --test s3_cluster \
+            --test bound_storage \
             -- --nocapture --test-threads=1 2>&1 | tee -a "$test_log"
+
+          # Keep the same package feature graph for this admitted-startup unit
+          # fixture; selecting only server would rebuild Lance and object_store.
+          cargo test --locked \
+            -p omnigraph-engine \
+            -p omnigraph-server \
+            -p omnigraph-cluster \
+            -p omnigraph-cli \
+            --lib \
+            settings::tests::s3_bootstrap_handoff_serves_empty_then_deploys_first_graph \
+            -- --exact --nocapture --test-threads=1 2>&1 | tee -a "$test_log"
 
           if grep -Eiq \
             "SKIP public_physical_ref_token_rejects_s3_same_version_aba|skipping s3 " \
@@ -1300,7 +1379,9 @@ jobs:
             public_physical_ref_token_rejects_s3_same_version_aba \
             s3::server_opens_s3_graph_directly_and_serves_snapshot_and_read \
             s3::server_boots_cluster_from_bare_storage_uri_and_serves_query \
+            settings::tests::s3_bootstrap_handoff_serves_empty_then_deploys_first_graph \
             s3_cluster_full_lifecycle_import_apply_serve_evolve_delete \
+            bound_handle_never_reaches_the_ambient_endpoint \
             cli_cluster_e2e::cluster_e2e_s3_live_apply_without_restart \
             system_local::local_cli_s3_end_to_end_init_load_read_flow
           do
@@ -1318,8 +1399,9 @@ jobs:
       - name: Run RustFS detached publication retention
         if: matrix.shard == 'failpoints'
         # Exercise detached write and compaction pins through S3 after a lost
-        # publication acknowledgement, then prove another write succeeds.
-        # Require both owners and reject unconfigured early returns.
+        # publication acknowledgement, then prove another write succeeds, and
+        # retry cleanup after a pass stopped in each window of its sweep.
+        # Require every owner and reject unconfigured early returns.
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/rustfs-failpoints.log"
@@ -1331,7 +1413,8 @@ jobs:
           fi
           for test_name in \
             s3_write_detached_pin_survives_next_write \
-            s3_optimize_detached_pin_survives_next_write
+            s3_optimize_detached_pin_survives_next_write \
+            s3_collector_retry_converges_after_every_sweep_window
           do
             grep -Fq "test ${test_name} ... ok" "$test_log" \
               || { echo "::error::required RustFS failpoint cell did not pass: $test_name"; exit 1; }
@@ -1395,7 +1478,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       - name: Install pinned toolchain
         run: rustup toolchain install
@@ -1532,6 +1615,7 @@ jobs:
           run_cell azure_write_detached_pin_survives_next_write --test failpoints
           run_cell azure_optimize_detached_pin_survives_next_write --test failpoints
           run_cell azure_schema_apply_post_commit_failure_leaves_readable_contract --test failpoints
+          run_cell azure_collector_retry_converges_after_every_sweep_window --test failpoints
           run_cell azure_cluster_full_lifecycle_import_apply_serve_evolve_delete --test s3_cluster
           run_cell s3::server_opens_azure_graph_directly_and_serves_snapshot_and_read --test integration
           run_cell s3::server_boots_azure_cluster_from_bare_storage_uri_and_serves_query --test integration

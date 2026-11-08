@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-09
-updated: 2026-10-06
+updated: 2026-10-29
 discussion: https://github.com/ModernRelay/omnigraph/pull/691
 supersedes: []
 superseded_by: []
@@ -15,6 +15,15 @@ blocked_on: []
 ---
 
 # RFC: Identity credentials and applied policy authorization
+
+> **RFC 0059 disposition:** [RFC 0059](0059-config-cli-coherency.md) replaces
+> the connected-folder routing in User behavior and the folder/independent
+> `--organization` selection inputs in Provider-native access and standard clients
+> with managed target identity and an explicit authentication mechanism.
+> Historical: those selection forms and their command examples. Current:
+> provider-native login/refresh, principal and session custody, verified fresh-login
+> organization selection, independent data credentials and current-policy authority.
+> The accepted design's implementation cutover remains tracked by RFC 0059.
 
 ## Summary
 
@@ -243,6 +252,13 @@ of a particular deployment remain separate from the accepted library contract.
 
 ## Decision log
 
+- 2026-10-29: New human logins receive a 30-day absolute renewal deadline;
+  existing saved deadlines remain unchanged. Required provider inactivity is 14 days,
+  access JWTs remain at most 15 minutes, and graph credentials retain their
+  independent one-hour default and 24-hour maximum. AuthKit renewal may retry
+  transient failures only within its documented replay grace period, under the
+  bounds below. Provider configuration and live qualification remain separate.
+
 - 2026-10-06: User behavior and Compatibility replace the token command spelling
   with `cluster token --managed`, using the explicit service mode from
   [RFC 0052](0052-managed-control-plane-cli.md).
@@ -271,14 +287,76 @@ of a particular deployment remain separate from the accepted library contract.
 This extension replaces the opaque managed login/session brokerage described
 in RFC 0052 with direct AuthKit public-client
 device login and refresh through the official SDK. Login metadata pins the
-provider family, client, issuer, organization and fixed endpoints. The API
+provider family, client, issuer and fixed endpoints. Discovery version 2 has
+no organization field: the verified session and folder context bind it. The API
 verifies the raw access token and returns stable principal identity. The CLI
-uses a new OS-keychain namespace, an eight-hour absolute renewable deadline,
-serialized refresh with a pending-before-send marker and atomic credential
-replacement, and no automatic retry after an uncertain exchange. Old managed
+uses the OS-keychain namespace, a 30-day absolute renewable deadline for new
+sign-ins, serialized refresh with a pending-before-send marker and atomic
+credential replacement. Old managed
 sessions require new login. The API and CLI switch together; no broker
 compatibility path or gradual authentication migration is required.
 Direct/static configuration remains supported.
+
+The version 2 keychain namespace holds a separate device session for each
+canonical API and organization. A bounded index contains at most 128 selected
+organizations per API; credential records retain the exact provider, account,
+principal, subject and session identity. A command selects one organization
+once. Another shell's login cannot retarget that command, even within the same
+organization. Refresh and reuse by `login` retain the entire selected identity
+and original saved deadline, including shorter deadlines from older clients.
+Configure the provider for a 14-day inactivity timeout (no refresh); it may end
+a session sooner. The CLI cannot override provider policy.
+Access JWTs remain bounded to 15 minutes; graph credentials keep their
+independent one-hour default and 24-hour maximum. Logout removes only the
+selected organization's custody.
+
+The custody format and namespace stay unchanged. An older client enforcing the
+eight-hour maximum refuses a new 30-day record, including during login.
+Upgrade the clients sharing that profile together; deliberate downgrade needs
+logout by the newer client before login by the older one, never automatic deletion.
+
+AuthKit documents a [30-second refresh replay grace period](https://workos.com/docs/authkit/session-resilience)
+for the fixed `/user_management/authenticate` endpoint: replay of the same
+just-consumed refresh token returns the same rotated pair. Ordinary renewal
+may make at most three identical exchanges in one invocation, each bounded to
+six seconds, within 20 seconds measured monotonically before the first send.
+Backoff is 250 milliseconds then one second, increased to `Retry-After` when
+present; a delay or attempt that cannot fit stops the loop. Only transport
+timeouts/network failures and HTTP 408, 429 or 5xx qualify. Terminal provider
+refusal, malformed successful responses and identity drift do not. SDK/HTTP automatic
+retries remain disabled. A retained pending exchange is never retried by a
+later invocation or beyond that budget.
+
+After provider success, bounded read-only session verification may retry the
+same returned bearer at most three times: four seconds per attempt, 15 seconds
+total, with the same backoffs and transient-status rules. It never exchanges
+the refresh token again. The existing 35-second overall renewal budget remains.
+Only a verified pair replaces secure custody. Exhausted verification or failed
+secure persistence retains uncertainty; still-valid old access may be used,
+but expired access requires explicit login. Transient failures do not delete
+the session. No authentication retry can replay a submitted graph operation.
+
+First login may use the organization's selection in the hosted provider flow.
+For explicit `--organization`, a fresh device response for another organization
+or no organization is selected through the provider's documented refresh
+`organization_id` parameter before resource-server acceptance. Only that fresh
+response's refresh token may be exchanged, once; no intermediate credential is
+saved. The exchange must preserve the expected provider, client, user and session
+and return the requested organization, whose bearer the API verifies before
+custody. The initial organization need not be enrolled at the API. Indexed
+credentials are inspected read-only to refuse a provider-session collision
+before selection or revocation; their token pairs are never used or changed.
+The serialized, read-only keychain checks, including interactive OS consent,
+finish before the network budget starts. Selection and resource-server
+verification share one 35-second network budget. An uncertain selection requires
+a new explicit device login, without replay.
+Device initiation/exchange use only the official SDK parameters. Ordinary
+renewal names only the already selected organization and retains the complete
+identity; it cannot switch or clone an existing organization's session.
+Ambiguous cached selection refuses. A version 1
+managed session or context requires fresh sign-in and binding. The data cache
+also separates API, organization and cluster; its independent expiry and
+explicit clearing contract remain unchanged.
 
 Normal native data commands acquire a self-only identity credential before
 execution. A permission refusal never triggers login or mutation replay.
@@ -309,9 +387,11 @@ per-cluster native signing key.
 
 When OIDC trust is configured, the server exposes protected-resource metadata
 and a stateless `/mcp` transport built on the official Rust MCP SDK. Its
-initial tools provide graph existence, stored-read catalog and stored-read
-invocation through the same HTTP handler functions and Cedar gates. The
+initial tools provided graph existence, stored-read catalog and stored-read
+invocation through the same HTTP handler functions and Cedar gates; the
 read-kind assertion prevents invoking a mutation through the read tool.
+[RFC 0003](0003-mcp-server-surface.md) owns the tool catalog, discovery paths
+and mounting from then on.
 Protocol framing, negotiation and cancellation use the SDK. Requests are
 bounded to 64 KiB, returned tool data to 1 MiB, read attempts to 30 seconds
 and concurrent tools to 16. Tool visibility is not permission to invoke.

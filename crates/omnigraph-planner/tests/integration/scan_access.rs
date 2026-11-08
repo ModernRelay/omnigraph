@@ -87,11 +87,7 @@ fn source() -> ProbeSource {
         .with_node_type(
             "Doc",
             NodeTypeSpec {
-                table: TableRef {
-                    type_key: "node:Doc".into(),
-                    dataset_path: "node/Doc".into(),
-                    native_branch: None,
-                },
+                table: TableRef::dataset("node:Doc", "node/Doc", None),
                 version: Some(7),
                 columns: SYSTEM_COLUMNS_V3,
                 schema: Arc::new(Schema::new(fields.clone())),
@@ -157,6 +153,7 @@ fn query(two: bool) -> QueryIR {
             column: "a.id".into(),
             ty: prop("a").ty().clone(),
         }],
+        distinct: false,
         order_by: vec![],
         limit: None,
     }

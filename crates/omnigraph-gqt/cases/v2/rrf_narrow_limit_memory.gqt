@@ -1,6 +1,7 @@
 # issue: none
-# red_on: 2026-10-11 full-population RRF working tree: one retained batch per entity exceeds query_memory_bytes (157286918 > 157286400) before the limit.
+# red_on: 2026-10-11 full-population RRF working tree: one retained batch per entity exceeds query_memory_bytes (157286918 > 157286400) before the limit, at 45,000 Docs under the default allowance.
 # notes: Narrow identical BM25 arms and limit one expose full-population fusion allocation without any hydration saving.
+# notes: 2,048 Docs under 4 MiB: the bounded fusion asks 3,069,008 bytes under 2 MiB and holds under 4 MiB; a per-entity retained population at the 2026-10-11 rate (3,495 bytes per Doc) is 7.2 MB.
 --- runner
 timeout_ms: 10000
 environments:
@@ -12,13 +13,14 @@ node Doc { slug: String @key text: String @index }
 tables:
   - kind: node
     name: Doc
-    rows: 45000
-    commits: 12
+    rows: 2048
+    commits: 2
     columns:
       slug: {kind: key, prefix: "", width: 6}
       text: {kind: literal, value: needle}
 --- query
 set engine = v2;
+set query_memory_bytes = 4194304;
 query narrow_fused_limit() {
   match { $d: Doc }
   return { 1 as one }

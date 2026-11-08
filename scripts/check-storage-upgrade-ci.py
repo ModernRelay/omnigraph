@@ -19,9 +19,11 @@ CONTEXT = "Storage Upgrade Compatibility"
 JOB = "storage_upgrade_compatibility"
 FEATURES = "omnigraph-engine/failpoints,omnigraph-cluster/failpoints"
 STAMP_13_SOURCE_COMMIT = "c0a4519f38d65dc1356728981983da8b096cfbef"
+LANCE11_SOURCE_COMMIT = "0a62bb7b2aa5b99b012f413807c216277f7f9596"
 CASES = (
     "storage_upgrade_current_binary_reports_already_current_on_a_fresh_graph",
     "genuine_v13_storage_upgrade_preserves_history",
+    "genuine_lance11_storage_upgrade_round_trip",
     "storage_upgrade_refuses_cluster_path_aliases",
     "genuine_v0_11_0_storage_upgrade_preserves_history",
     "genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup",
@@ -175,6 +177,8 @@ CROSSVERSION_INVENTORY_SCRIPT = (
 PREDECESSOR_TOKENS = (
     "OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS: '1'",
     f"STAMP_13_SOURCE_COMMIT: {STAMP_13_SOURCE_COMMIT}",
+    f"LANCE11_SOURCE_COMMIT: {LANCE11_SOURCE_COMMIT}",
+    'echo "OMNIGRAPH_LANCE11_BIN=$lance11_bin" >> "$GITHUB_ENV"',
     'git worktree add --detach "$v13_source" "$STAMP_13_SOURCE_COMMIT"',
     'echo "OMNIGRAPH_V13_BIN=$v13_bin" >> "$GITHUB_ENV"',
 )
@@ -201,6 +205,27 @@ cargo clean --workspace --locked \\
 cargo clean --workspace --locked \\
   --target-dir "$GITHUB_WORKSPACE/target"
 echo "OMNIGRAPH_V13_BIN=$v13_bin" >> "$GITHUB_ENV\""""
+LANCE11_SCRIPT = """\
+set -euo pipefail
+lance11_source="$RUNNER_TEMP/omnigraph-lance-11"
+lance11_bin="$RUNNER_TEMP/omnigraph-lance-11-bin"
+git fetch --no-tags --depth=1 origin "$LANCE11_SOURCE_COMMIT"
+git worktree add --detach "$lance11_source" "$LANCE11_SOURCE_COMMIT"
+test "$(git -C "$lance11_source" rev-parse HEAD)" = "$LANCE11_SOURCE_COMMIT"
+# Run inside the predecessor checkout so its workspace configuration applies.
+(cd "$lance11_source" && cargo build --locked \\
+  --package omnigraph-cli \\
+  --bin omnigraph \\
+  --target-dir "$GITHUB_WORKSPACE/target")
+cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$lance11_bin"
+test -x "$lance11_bin"
+# Remove both path-package identities before linking the candidate tests.
+cargo clean --workspace --locked \\
+  --manifest-path "$lance11_source/Cargo.toml" \\
+  --target-dir "$GITHUB_WORKSPACE/target"
+cargo clean --workspace --locked \\
+  --target-dir "$GITHUB_WORKSPACE/target"
+echo "OMNIGRAPH_LANCE11_BIN=$lance11_bin" >> "$GITHUB_ENV\""""
 RELEASE_TOKENS = (
     'echo "OMNIGRAPH_V6_BIN=$v6_dir/omnigraph" >> "$GITHUB_ENV"',
     'echo "OMNIGRAPH_V011_BIN=$v011_dir/omnigraph" >> "$GITHUB_ENV"',
@@ -288,6 +313,8 @@ def validate(workflow: str, table: dict | None = None) -> list[str]:
     scripts = {"\n".join(line[10:] for line in body.rstrip().splitlines()) for body in scripts}
     if PREDECESSOR_SCRIPT not in scripts:
         failures.append("storage compatibility requires the exact genuine stamp-13 build script")
+    if LANCE11_SCRIPT not in scripts:
+        failures.append("storage compatibility requires the exact genuine Lance 11 build script")
     if RELEASE_SCRIPT not in scripts:
         failures.append("storage compatibility requires the exact released v0.10.0 and v0.11.0 install script")
     for scope in SCOPES:
@@ -458,27 +485,30 @@ class GuardTests(unittest.TestCase):
                 changed = self.workflow.replace(token, "")
                 self.assertNotEqual(changed, self.workflow)
                 self.assertTrue(validate(changed))
-        moved = self.workflow.replace(STAMP_13_SOURCE_COMMIT, "0" * 40)
-        self.assertNotEqual(moved, self.workflow)
-        self.assertTrue(validate(moved))
+        for commit in (STAMP_13_SOURCE_COMMIT, LANCE11_SOURCE_COMMIT):
+            moved = self.workflow.replace(commit, "0" * 40)
+            self.assertNotEqual(moved, self.workflow)
+            self.assertTrue(validate(moved))
 
     def test_removed_or_altered_predecessor_build_line_fails(self):
-        exact = ["storage compatibility requires the exact genuine stamp-13 build script"]
-        lines = PREDECESSOR_SCRIPT.splitlines()
-        block = "".join(f"          {line}\n" for line in lines)
-        self.assertEqual(self.workflow.count(block), 1)
-        for index, line in enumerate(lines):
-            for replacement in ([], [f"true # {line}"], [f"{line} || true"]):
-                with self.subTest(line=line, replacement=replacement):
-                    altered = lines[:index] + replacement + lines[index + 1:]
-                    changed = self.workflow.replace(
-                        block, "".join(f"          {line}\n" for line in altered)
-                    )
-                    failures = validate(changed)
-                    self.assertTrue(set(exact) <= set(failures), failures)
+        errors = []
+        for script, label in ((PREDECESSOR_SCRIPT, "stamp-13"), (LANCE11_SCRIPT, "Lance 11")):
+            error = f"storage compatibility requires the exact genuine {label} build script"
+            errors.append(error)
+            lines = script.splitlines()
+            block = "".join(f"          {line}\n" for line in lines)
+            self.assertEqual(self.workflow.count(block), 1)
+            for index, line in enumerate(lines):
+                for replacement in ([], [f"true # {line}"], [f"{line} || true"]):
+                    with self.subTest(script=label, line=line, replacement=replacement):
+                        altered = lines[:index] + replacement + lines[index + 1:]
+                        changed = self.workflow.replace(
+                            block, "".join(f"          {line}\n" for line in altered)
+                        )
+                        self.assertIn(error, validate(changed))
         swapped = self.workflow.replace("--package omnigraph-cli", "--package omnigraph-server")
         self.assertNotEqual(swapped, self.workflow)
-        self.assertEqual(validate(swapped), exact)
+        self.assertEqual(validate(swapped), errors)
 
     def storage_job(self):
         start = self.workflow.index("  storage_upgrade_compatibility:\n")

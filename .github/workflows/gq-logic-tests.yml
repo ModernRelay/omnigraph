@@ -100,6 +100,7 @@ jobs:
           run_deployment=false
           for path in "${changed[@]}"; do
             case "$path" in
+              docs/user/queries/catalogue.md) run_full_ci=true ;;
               docs/*.md|docs/*.mdx|docs/*.rst|docs/*.adoc|changelog.d/*.md|changelog.d/release.json) ;;
               README.md|AGENTS.md|CLAUDE.md|CHANGELOG.md|CONTRIBUTING.md|CODE_OF_CONDUCT.md) ;;
               LICENSE|LICENSE.md) ;;
@@ -159,7 +160,7 @@ jobs:
         if: needs.classify_changes.outputs.run_gqt == 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       # The `rust-toolchain.toml` pin, not a floating `stable` action (see
       # the `fmt` job in ci.yml): rustc is part of the cache key.

@@ -1,4 +1,4 @@
-# OmniGraph agent guide
+# Omnigraph agent guide
 
 This file is the always-on map for coding agents. Keep it short: current detail
 belongs in `docs/`, exact behavior in code and tests, decisions in RFCs, and
@@ -29,9 +29,9 @@ Tools that support `@` imports include these automatically:
 
 ## Repository snapshot
 
-- Version surveyed: 0.13.0
+- Version surveyed: 0.15.0
 - Rust stable, edition 2024; toolchain pinned in `rust-toolchain.toml`
-- Storage substrate: Lance 11.0.0
+- Storage substrate: Lance 13.0.0
 - Workspace: compiler, planner (logical/physical plans and optimizer), storage,
   `omnigraph-core` (the engine's shared base: `OmniError`, Lance dataset
   access, request instrumentation, Lance native ref control
@@ -39,15 +39,17 @@ Tools that support `@` imports include these automatically:
   `omnigraph-catalog` (the `__manifest` catalog: graph branch registrations
   and lineage, the publish), `omnigraph-seams` (the one seam type every
   test-time substitution uses; RFC 0066), engine (`omnigraph-engine`
-  package), policy, API types, cluster, CLI, server, Azure admission
-  wrapper, benchmark harness,
+  package), policy, API types, cluster, CLI,
+  `omnigraph-skill` (rooted at `skills/`; embeds the `skills/omnigraph` agent
+  skill in the CLI and MCP), `omnigraph-mcp` (MCP protocol and catalog), server,
+  Azure admission wrapper, benchmark harness,
   `omnigraph-gqt` (the `.gqt` logic-test corpus and its runner; one libtest
   test per case), and `omnigraph-dst` (deterministic simulation testing; needs
   `--cfg tokio_unstable`, set by the workspace `.cargo/config.toml` for every
   build — the workspace test gate excludes the crate by name)
 - License: MIT
 
-OmniGraph is a typed property-graph engine coordinating many versioned Lance
+Omnigraph is a typed property-graph engine coordinating many versioned Lance
 datasets. One graph commit publishes all participating table versions and graph
 lineage together. It provides `.pg` schemas, `.gq` queries, graph branches,
 three-way merge, vector/full-text search, Cedar policy, a CLI, and a cluster-only
@@ -73,17 +75,19 @@ authority model.
 
 | Need | Start here |
 |---|---|
-| Use OmniGraph | [User guide](docs/user/index.md) |
-| Change OmniGraph | [Developer guide](docs/dev/index.md) |
+| Use Omnigraph | [User guide](docs/user/index.md) |
+| Change Omnigraph | [Developer guide](docs/dev/index.md) |
 | Review architectural rules | [Invariants](docs/dev/invariants.md) |
 | Align with Lance | [Lance guide](docs/dev/lance.md) |
 | Find test ownership | [Testing guide](docs/dev/testing.md) |
+| Keep builds warm across features and worktrees | [Local builds](docs/dev/local-builds.md) |
 | Understand atomic writes and crashes | [Write path](docs/dev/writes.md) and [recovery](docs/dev/recovery.md) |
 | Understand query execution | [Execution](docs/dev/execution.md) |
 | Understand clusters and serving | [Control plane](docs/dev/control-plane.md) |
 | Propose or inspect a decision | [RFC registry](docs/rfcs/README.md) |
 | Write documentation | [Documentation guide](docs/dev/documentation.md) |
 | Review shipped history | [Release notes](docs/releases/) |
+| Cut a release | [Release checklist](docs/dev/documentation.md#release-checklist) |
 
 ## Engineering rules
 
@@ -92,7 +96,7 @@ more changes of the same kind. Prefer one source of truth with cheap derived
 views. Correctness outranks simplicity, which outranks performance. Demand more
 evidence for irreversible format, protocol, and substrate decisions.
 Always validate your assumptions and don't assume a certain function/modules/symbol will work in a certain way. Especially always validate your assumptions about Lance internals by reading the implementations in the upstream code.
-Reason from first principles about OmniGraph instead of in arbitrary database categories.
+Reason from first principles about Omnigraph instead of in arbitrary database categories.
 Fundamentally, a database is **an observable contract, implemented by physical mechanisms optimized for an expected distribution of work**. Therefore, you should always be explicit and aware what observable contract and distribution of work you are implementing for and what tradeoffs you are making. Read [first principles data systems](docs/dev/systems.md)
 
 The full rules live in [invariants](docs/dev/invariants.md). Keep these in
@@ -124,6 +128,11 @@ changes the invariant.
 
 `protoc` is a build dependency. The engine directory is `crates/omnigraph`, but
 its Cargo package is `omnigraph-engine`.
+
+In a new worktree, run `sh scripts/seed-target.sh` once before the first build
+to clone a warm `target/` (a Claude Code session-start hook already does), and
+prefer the `cargo dev-test` / `dev-nextest` / `dev-clippy` aliases, which share
+one feature set; see [local builds](docs/dev/local-builds.md).
 
 ```bash
 cargo build --workspace --locked
@@ -209,17 +218,32 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   rows with v1's. A defect seen on v1 is fixed on v2
   (`crates/omnigraph/src/engine/`); a v1 edit needs the pin updated in the
   same PR and a reviewer's eyes.
+- A change to what an operation reads or writes in storage adds or updates
+  its row in the DST storage-cost golden,
+  `crates/omnigraph-dst/cost_table.txt`, and the pull request explains every
+  changed line ([testing](docs/dev/testing.md#dst-storage-cost-golden)).
 - Update user-visible docs in the same change as a flag, endpoint, format,
   schema construct, behavior, or limit.
+- Reconcile the agent skill in that same change: every statement in
+  `skills/omnigraph` (`SKILL.md` and `references/`) about what the change
+  adds, alters or removes. `omnigraph skill export` ships it with the binary,
+  so a stale skill instruction is a user-facing bug.
 - Update current developer guides when architecture or support boundaries
   change. Put rationale/history in one RFC, not a copied design note.
 - Add a permanent `changelog.d/<slug>.<category>.md` note for user-visible changes;
   follow [release-note authoring](docs/dev/documentation.md#release-notes).
   Keep private tickets and planning shorthand out of public history.
+- When a change alters or removes something an unreleased `changelog.d` note
+  describes, edit or delete that note in the same pull request; notes stay
+  editable until their release is tagged.
 - Title a pull request `type(scope)!: description` and read the title back
   after opening it; the `PR Title` check refuses every other shape, and the
   squash subject on `main` is that title
   ([CONTRIBUTING.md](CONTRIBUTING.md), Pull Requests).
+- Spell the product name `Omnigraph` in prose, titles, release notes, docs,
+  messages and generated text, never `OmniGraph`. Code identifiers keep their
+  spelling (`Omnigraph::open`, `omnigraph-engine`, `omnigraph://`), and so do
+  published release documents and the bytes they are verified against.
 - Recheck exact flags, environment variables, routes, and constants in source
   before documenting them.
 - Keep this file a map. New deep content goes in its audience-owned guide.

@@ -1044,14 +1044,9 @@ async fn load_merge_upserts_existing_and_inserts_new() {
 /// match the same target row on (id = "TEST-1")` even though every
 /// source batch had one row per key.
 ///
-/// Triggered by Lance's `processed_row_ids: Mutex<HashSet<u64>>`
-/// (lance-6.0.1 `src/dataset/write/merge_insert.rs:2099`) double-
-/// processing the same source/target match against datasets previously
-/// rewritten by merge_insert. Worked around by opting
-/// `MergeInsertBuilder` into `SourceDedupeBehavior::FirstSeen` in
-/// `crates/omnigraph/src/table_store.rs` — see that file for the full
-/// rationale and the safety pin (`loader_rejects_intra_batch_duplicate_keys`).
-/// Tracked at MR-957; upstream: lance-format/lance#6877.
+/// Regression for lance-format/lance#6877. Repeated loads retain their
+/// semantics with strict native duplicate matching; genuine source duplicates
+/// remain rejected by `loader_rejects_intra_batch_duplicate_keys`.
 #[tokio::test]
 async fn load_merge_repeated_against_overlapping_keys_succeeds() {
     let dir = tempfile::tempdir().unwrap();
@@ -1096,25 +1091,9 @@ node Thing {
     assert_eq!(count_rows(&db, "node:Thing").await, 55);
 }
 
-/// Safety pin for the `SourceDedupeBehavior::FirstSeen` workaround in
-/// `crates/omnigraph/src/table_store.rs`. FirstSeen tells Lance to
-/// silently skip a duplicate source row instead of erroring. Our use of
-/// it depends on user-provided duplicates being rejected *before* the
-/// batch reaches Lance — otherwise FirstSeen could silently drop user
-/// data.
-///
-/// Defense in depth:
-/// 1. The loader's `enforce_unique_constraints_intra_batch`
-///    (`loader/mod.rs:1442`), invoked unconditionally on any node type
-///    with a `@key`, errors on intra-batch duplicate `@key` values at
-///    intake — pinned by this test across every `LoadMode`.
-/// 2. The `check_batch_unique_by_keys` precondition at the top of
-///    `merge_insert_batch` and `stage_merge_insert` is the final
-///    fail-fast guard: even if a future caller bypasses the loader path
-///    (e.g. branch-merge's `publish_rewritten_merge_table` builds its
-///    own source batch directly), a real duplicate id reaches Lance
-///    only after surfacing as an `OmniError::Manifest`, never silently
-///    via FirstSeen. Pinned by the unit tests in `table_store::tests`.
+/// Duplicate public keys are rejected at intake in every load mode before
+/// rows persist. The storage adapter separately validates unique physical IDs
+/// and preserves typed key conflicts; its staged-table tests own that boundary.
 #[tokio::test]
 async fn loader_rejects_intra_batch_duplicate_keys() {
     let dir = tempfile::tempdir().unwrap();
@@ -1363,25 +1342,12 @@ query insert_item($slug: String, $a: String, $b: String) {
     assert_eq!(count_rows(&reopened, "node:Item").await, 2);
 }
 
-/// Canary for the upstream Lance gap that the `FirstSeen` workaround
-/// in `table_store.rs` masks. The bug class is "Window 2": load →
-/// indices built explicitly → merge → merge. Even with the engine
-/// fully aligned to the "indexes are derived state" invariant
-/// (MR-848), as long as an `id` index has been built between the
-/// first and second merge_insert, the Lance internal that triggers
-/// the bug remains reachable.
-///
-/// This test runs the Window-2 sequence under the FirstSeen workaround.
-/// It is expected to pass today. If a future Lance upgrade or local
-/// change makes it START failing, the workaround has lost effectiveness
-/// (upstream Lance changed something, or the FirstSeen setter was
-/// dropped from `table_store.rs`). If a future Lance upgrade fixes the
-/// bug class, this test continues to pass and the FirstSeen setter can
-/// be retired.
-///
-/// Tracked at MR-957; upstream: lance-format/lance#6877.
+/// Repeated merge loads remain valid after explicit index reconciliation.
+/// The stale-index native route behind lance-format/lance#6877 is pinned by
+/// the staged-table known-present-update owner; load upserts use the sealed
+/// adapter's filter-bearing route even when an index exists.
 #[tokio::test]
-async fn load_merge_window_2_documents_upstream_lance_gap() {
+async fn load_merge_repeated_with_index_rebuilds_succeeds() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let schema = r#"
@@ -1402,11 +1368,7 @@ node Thing {
     }
     db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
 
-    // Explicit ensure_indices between seed and the merges — the Window
-    // 2 trigger. The eager-build behavior (MR-583) means the BTREE on
-    // `id` is already present here, but calling explicitly pins the
-    // invariant for the post-MR-848 future where the eager build is
-    // gone.
+    // Build the key index explicitly before exercising the merge loads.
     db.ensure_indices().await.unwrap();
 
     let mut delta = String::new();
@@ -1417,18 +1379,13 @@ node Thing {
         ));
     }
 
-    // Both merges must succeed under the FirstSeen workaround.
-    // `processed_row_ids` re-processes the same target row_id under
-    // the default `SourceDedupeBehavior::Fail`; FirstSeen tolerates it.
     db.load_jsonl(&delta, LoadMode::Merge)
         .await
         .expect("first merge after ensure_indices must succeed");
     db.ensure_indices().await.unwrap();
-    db.load_jsonl(&delta, LoadMode::Merge).await.expect(
-        "second merge after ensure_indices must succeed \
-             (Window 2 canary: drop the FirstSeen setter in table_store.rs \
-             only when this stays green WITHOUT it)",
-    );
+    db.load_jsonl(&delta, LoadMode::Merge)
+        .await
+        .expect("second merge after ensure_indices must succeed");
     assert_eq!(count_rows(&db, "node:Thing").await, 55);
 }
 

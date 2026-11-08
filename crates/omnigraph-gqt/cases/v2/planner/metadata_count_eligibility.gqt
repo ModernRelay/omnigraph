@@ -27,18 +27,20 @@ edge Knows: Doc -> Doc
 --- query
 set engine = v2;
 query count_empty() {
-    match { $e: Empty } return { count($e) as n }
+    match { $e: Empty } return { count($e) as n, count($e) > 0 as has_rows }
 }
 
 --- expect unordered
-{"n":0}
+{"n":0,"has_rows":false}
 
 --- expect shape
 n: I64
+has_rows: Bool?
 
 --- expect plan
 pass aggregate_pushdown
-result columns [n: I64?]
+result columns [n: I64?, has_rows: Bool?]
+validation scope invariants_only
 
 --- query
 set engine = v2;
@@ -122,19 +124,21 @@ not pass aggregate_pushdown
 --- query
 set engine = v2;
 query count_grouped() {
-    match { $d: Doc } return { $d.score, count($d) as n }
+    match { $d: Doc } return { $d.score, count($d) as n, count($d) > 1 as multiple }
 }
 
 --- expect unordered
-{"d.score":1,"n":2}
-{"n":1}
+{"d.score":1,"n":2,"multiple":true}
+{"n":1,"multiple":false}
 
 --- expect shape
 d.score: I64?
 n: I64
+multiple: Bool?
 
 --- expect plan
 not pass aggregate_pushdown
+validation scope invariants_only
 
 --- query
 set engine = v2;

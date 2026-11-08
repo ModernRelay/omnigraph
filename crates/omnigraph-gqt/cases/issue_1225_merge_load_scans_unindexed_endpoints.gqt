@@ -1,0 +1,63 @@
+# issue: 1225
+# red_on: 3e0e467e; both pipeline-route loads planned `edge_ri ... : access probe` for the unindexed Person table.
+# notes: A merge or append edge load checks its endpoints against a node table with no usable BTREE
+# notes: on the key by one projected scan of the id column, not by a probe: an unindexed probe hands
+# notes: Lance one `id IN (every endpoint in the batch)` filter that is copied per fragment for the
+# notes: whole read, so a request's memory grows with fragments times batch (11 GB at 3,400 fragments
+# notes: and 8,000 edges). The overwrite route already costs this choice; the pipeline route fixed probe.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person { id: String @key }
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 8
+    commits: 4
+    columns:
+      id: {kind: key, prefix: p, width: 6}
+
+--- csv edges.csv
+from,to
+p000000,p000001
+p000002,p000003
+p000004,p000005
+p000006,p000007
+
+--- mutate
+load csv "edges.csv" into edge:Knows mode merge header
+--- expect ok
+--- expect plan
+load route: pipeline
+load validate edge_ri edge:Knows from Person: access scan
+load validate edge_ri edge:Knows to Person: access scan
+load executed: partitions 1 rows 4
+
+--- csv more_edges.csv
+from,to
+p000001,p000000
+p000003,p000002
+
+--- mutate
+load csv "more_edges.csv" into edge:Knows mode append header
+--- expect ok
+--- expect plan
+load route: pipeline
+load validate edge_ri edge:Knows from Person: access scan
+load validate edge_ri edge:Knows to Person: access scan
+load executed: partitions 1 rows 2
+
+--- query
+query loaded() { match { $a: Person $a knows $b } return { count($b) as n } }
+--- expect unordered
+{"n": 6}
+--- expect shape
+n: I64

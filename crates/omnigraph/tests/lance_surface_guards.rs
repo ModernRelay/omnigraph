@@ -62,7 +62,10 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_namespace::LanceNamespace;
+use lance_table::format::RowIdMeta;
 use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
+use lance_table::rowids::read_row_ids;
+use lance_table::rowids::version::{RowDatasetVersionMeta, read_dataset_versions};
 use omnigraph_compiler::schema::parser::parse_schema;
 
 use helpers::{init_and_load, open_pinned_dataset_for_test, snapshot_main};
@@ -124,7 +127,7 @@ impl Drop for NativeBlockingGate {
 }
 
 /// Negative qualification guard: cancelling the future and dropping its writer
-/// is not an I/O-settlement receipt. Lance 11's queued native persist still
+/// is not an I/O-settlement receipt. Lance 13's queued native persist still
 /// publishes the final file. See the server runtime RFC's full-B gate.
 #[test]
 fn dropped_local_writer_can_persist_after_its_owner_returns() {
@@ -806,6 +809,94 @@ async fn rename_only_project_keeps_fragments_field_ids_pk_marker_and_indexes() {
         "the scalar index follows the field id across the rename"
     );
     assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
+}
+
+/// Guard (#721): the promotion null check reads deleted rows. On a
+/// stable-row-id V2_2 table, a scan with `with_row_id` and
+/// `include_deleted_rows` returns a deleted row with a null `_rowid` and its
+/// stored value (here a null), and `_rowaddr` names its fragment, while an
+/// ordinary scan hides it. Schema apply relies on this to find the fragments
+/// whose deleted rows hold a null before it makes the column non-nullable.
+#[tokio::test]
+async fn include_deleted_rows_returns_a_deleted_rows_stored_null_issue_721() {
+    use arrow_array::Array;
+    use futures::TryStreamExt;
+    use lance::dataset::{WriteMode, WriteParams};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("value", DataType::Int32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["kept", "gone"])),
+            Arc::new(Int32Array::from(vec![Some(1), None])),
+        ],
+    )
+    .unwrap();
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(params),
+    )
+    .await
+    .unwrap();
+    dataset.delete("id = 'gone'").await.unwrap();
+    assert_eq!(
+        dataset
+            .count_rows(Some("value IS NULL".to_string()))
+            .await
+            .unwrap(),
+        0,
+        "an ordinary count hides the deleted row"
+    );
+
+    let mut scanner = dataset.scan();
+    scanner.project(&["value"]).unwrap();
+    scanner
+        .with_row_id()
+        .with_row_address()
+        .include_deleted_rows();
+    let batches: Vec<RecordBatch> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let row_ids = batch.column_by_name("_rowid").unwrap();
+        let addrs = batch
+            .column_by_name("_rowaddr")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap();
+        let values = batch.column_by_name("value").unwrap();
+        for row in 0..batch.num_rows() {
+            rows.push((
+                row_ids.is_null(row),
+                values.is_null(row),
+                addrs.value(row) >> 32,
+            ));
+        }
+    }
+    let fragment = dataset.get_fragments()[0].id() as u64;
+    assert_eq!(
+        rows,
+        vec![(false, false, fragment), (true, true, fragment)],
+        "the deleted row comes back with a null _rowid, its stored null and its fragment"
+    );
 }
 
 /// Guard: schema apply's metadata-only evolution. On a stable-row-id V2_2
@@ -1566,7 +1657,7 @@ async fn public_physical_ref_incarnation(dataset: &Dataset) -> PublicPhysicalRef
 /// A fragment reader reads a data file in the dataset's own base through the
 /// scan scheduler `FragReadConfig` passes, and a file the dataset reaches
 /// through a `base_id` (the files a branch inherits) through a
-/// maximum-bandwidth scheduler Lance 11 opens for it, ignoring the one
+/// maximum-bandwidth scheduler Lance 13 opens for it, ignoring the one
 /// passed: the passed scheduler reads that file's rows without a byte.
 /// `HydrateExec` bounds Lance's read-ahead with the scheduler it passes, and
 /// for this reason reads a fragment holding an inherited file (a table fork
@@ -2066,16 +2157,18 @@ async fn public_physical_ref_token_rejects_local_same_version_aba() {
     recreate_named_branch_and_assert_token_changes(&mut second, true).await;
 }
 
-/// Exercise the production-shaped shared-Session case. "Stable" here means
-/// stable across an unchanged reopen: an ordinary commit must rotate the
-/// current transaction/e_tag witness while preserving the branch identifier.
+/// Exercise native shared-Session discovery. Lance 13 returns a quoted local
+/// ETag from commit and an unquoted one from direct local discovery. The clone
+/// adapter owns normalization; this guard pins the upstream discrepancy and
+/// still requires stable discovery across unchanged reopens. An ordinary
+/// commit must rotate the transaction/e_tag witness, not the branch identifier.
 /// Once the canonical first incarnation is cached, deleting and recreating
 /// main at the same URI/version must still resolve the second incarnation
 /// rather than reuse the cached transaction UUID. A fresh public DatasetBuilder
 /// open is the cache-bypass fallback and must agree with the shared-Session
 /// result.
 #[tokio::test]
-async fn local_physical_ref_token_is_stable_and_survives_shared_session_aba() {
+async fn local_physical_ref_token_survives_shared_session_aba_with_native_etag_quoting() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rfc024-shared-session-token.lance");
     let uri = path.to_str().unwrap();
@@ -2097,8 +2190,22 @@ async fn local_physical_ref_token_is_stable_and_survives_shared_session_aba() {
         .expect("the first local incarnation must reopen through the shared Session");
     let first_token = public_physical_ref_incarnation(&first).await;
     assert_eq!(
-        first_committed_token, first_token,
-        "the public token must be stable from the commit result through a shared-Session reopen"
+        first_committed_token.branch_identifier,
+        first_token.branch_identifier
+    );
+    assert_eq!(
+        first_committed_token.transaction_uuid,
+        first_token.transaction_uuid
+    );
+    let discovered_etag = first_token
+        .manifest_e_tag
+        .as_ref()
+        .expect("native local discovery must expose its metadata-derived ETag");
+    assert!(!discovered_etag.starts_with('"'));
+    assert_eq!(
+        first_committed_token.manifest_e_tag,
+        Some(format!("\"{discovered_etag}\"")),
+        "Lance's native local ETag quoting changed; re-audit the narrow clone-adapter normalization"
     );
 
     let first_again = DatasetBuilder::from_uri(uri)
@@ -2477,7 +2584,7 @@ async fn _compile_uncommitted_full_table_vector_index_shape() -> lance::Result<(
 // --- Guard 8b: MergeInsertJob::execute_uncommitted returns
 //     UncommittedMergeInsert { transaction, affected_rows, stats, inserted_rows_filter } ---
 //
-// `TableStore::stage_merge_insert` has the same staged commit contract as
+// `TableStore::stage_keyed_write` has the same staged commit contract as
 // delete: the Lance transaction and `affected_rows` metadata must travel
 // together into `commit_staged`.
 #[allow(
@@ -2524,7 +2631,7 @@ async fn _compile_uncommitted_merge_insert_field_shape() -> lance::Result<()> {
 //   5. a live slash-name path-child makes force delete remove an ancestor's
 //      BranchContents but intentionally retain its dataset files. OmniGraph's
 //      prefix-disjoint live-name invariant prevents this false-success shape.
-//   6. Lance 11 refuses even force deletion while a tag targets the branch.
+//   6. Lance 13 refuses even force deletion while a tag targets the branch.
 //      The ref, tree, and tagged snapshot remain readable until the tag is
 //      explicitly removed. Graph-level retention authority remains separate.
 
@@ -4337,6 +4444,23 @@ async fn linear_vector_dataset(
     dimension: usize,
     rows_per_fragment: usize,
 ) -> Dataset {
+    linear_vector_dataset_with_format(
+        uri,
+        rows,
+        dimension,
+        rows_per_fragment,
+        LanceFileVersion::V2_2,
+    )
+    .await
+}
+
+async fn linear_vector_dataset_with_format(
+    uri: &str,
+    rows: usize,
+    dimension: usize,
+    rows_per_fragment: usize,
+    file_format: LanceFileVersion,
+) -> Dataset {
     use arrow_array::{FixedSizeListArray, Float32Array};
 
     let item = Arc::new(Field::new("item", DataType::Float32, true));
@@ -4374,7 +4498,7 @@ async fn linear_vector_dataset(
             mode: WriteMode::Create,
             enable_stable_row_ids: true,
             max_rows_per_file: rows_per_fragment,
-            data_storage_version: Some(LanceFileVersion::V2_2),
+            data_storage_version: Some(file_format),
             ..Default::default()
         }),
     )
@@ -4619,7 +4743,7 @@ async fn nearest_scan_stats_report_partitions_searched_and_ranked() {
 
 // --- Guard: an explicit projection may name `_distance` before `nearest` ---
 //
-// Lance 11 resolves the scoring columns (`_distance`, `_score`) in
+// Lance 13 resolves the scoring columns (`_distance`, `_score`) in
 // `ProjectionPlan` independently of the dataset schema (lance-datafusion
 // `projection.rs`, `SCORING_COLUMNS`), so `project` before `nearest` is legal.
 
@@ -4763,17 +4887,155 @@ async fn fts_scan_accepts_score_in_a_projection_set_before_full_text_search() {
     );
 }
 
-// --- Lance 10 compatibility: fence late-hydrated KNN ordering --------------
+/// The two Lance 13 facts BM25 eligibility placement rests on. Lance scores
+/// the fragments no full-text segment covers flat, counting documents and
+/// tokens over the rows its prefilter admits, so a prefilter changes an
+/// uncovered row's score; with `prefilter(false)` the full-text search
+/// scores the whole corpus and the filter refines its output, so the score is
+/// the unfiltered one. OmniGraph filters a bm25 scan before scoring only under
+/// full coverage (`Eligibility::BeforeScoring`) and runs Lance's postfilter
+/// otherwise. If the first assertion goes red (the flat tail scores from
+/// filter-independent statistics), the placement rule can be dropped.
+#[tokio::test]
+async fn fts_prefilter_changes_unindexed_scores_and_postfilter_keeps_them() {
+    use arrow_array::types::Float32Type;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("tail_scores.lance");
+    let uri = uri.to_str().unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("text", DataType::Utf8, false),
+        Field::new("year", DataType::Int64, false),
+    ]));
+    let batch = |rows: &[(&str, &str, i64)]| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(arrow_array::Int64Array::from(
+                    rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    };
+    let indexed = batch(&[
+        ("d1", "graph engines", 2020),
+        ("d2", "graph search", 2021),
+        ("d3", "databases", 2019),
+    ]);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(indexed)], schema.clone()),
+        uri,
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let tail = batch(&[
+        ("t1", "graph", 2022),
+        (
+            "t2",
+            "graph graph graph graph graph graph graph graph",
+            1990,
+        ),
+    ]);
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(tail)], schema.clone()),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    let score_of = |batch: &RecordBatch, id: &str| {
+        let ids = batch.column_by_name("id").unwrap().as_string::<i32>();
+        let scores = batch
+            .column_by_name("_score")
+            .unwrap()
+            .as_primitive::<Float32Type>();
+        (0..batch.num_rows())
+            .find(|row| ids.value(*row) == id)
+            .map(|row| scores.value(row))
+    };
+    let search = |filter: Option<(&'static str, bool)>| {
+        let dataset = dataset.clone();
+        async move {
+            let mut scanner = dataset.scan();
+            scanner.project(&["id", "_score"]).unwrap();
+            if let Some((filter, prefilter)) = filter {
+                scanner.filter(filter).unwrap();
+                scanner.prefilter(prefilter);
+            }
+            scanner
+                .full_text_search(
+                    FullTextSearchQuery::new("graph".to_string())
+                        .with_column("text".to_string())
+                        .unwrap(),
+                )
+                .unwrap();
+            scanner.try_into_batch().await.unwrap()
+        }
+    };
+    let unfiltered = search(None).await;
+    let prefiltered = search(Some(("year >= 2000", true))).await;
+    let postfiltered = search(Some(("year >= 2000", false))).await;
+    let whole = score_of(&unfiltered, "t1").expect("t1 matches");
+    assert_ne!(
+        score_of(&prefiltered, "t1"),
+        Some(whole),
+        "a prefilter changes the score of a row no full-text segment covers"
+    );
+    assert_eq!(
+        score_of(&postfiltered, "t1"),
+        Some(whole),
+        "a postfilter keeps the whole corpus's score"
+    );
+    assert_eq!(
+        score_of(&postfiltered, "t2"),
+        None,
+        "the postfilter still refines"
+    );
+    assert_eq!(
+        score_of(&prefiltered, "d1"),
+        score_of(&unfiltered, "d1"),
+        "an indexed row scores from the index's statistics either way"
+    );
+}
+
+// --- Guard: parallel late-hydrated KNN preserves global order -----------
 //
-// lance#7868 makes execute_plan preserve order when the plan still advertises
-// its sorted KNN candidate stream. An ordinary projected payload adds a late
-// `LanceRead` that drops that metadata in Lance 10, so the parallel final
-// coalesce can still scramble large-k results. OmniGraph temporarily requests
-// one output partition for nearest scans. This full-payload stable-row-ID guard
-// pins both the residual and the fence's exact globally ordered result.
+// Lance 13 carries sorted KNN candidate metadata through V2 row-stream payload
+// hydration, so the final merge preserves global order with parallel output.
+// Pin the graph's V2_2 format with full payloads, stable row IDs and multiple
+// output batches.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn flat_knn_late_payload_order_is_fenced_to_one_output_partition() {
+async fn flat_knn_v2_late_payload_preserves_order() {
     use arrow_array::types::{Float32Type, Int32Type};
     use datafusion::physical_plan::ExecutionPlanProperties;
 
@@ -4785,11 +5047,12 @@ async fn flat_knn_late_payload_order_is_fenced_to_one_output_partition() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().join("flat_knn_global_order.lance");
     let uri = uri.to_str().unwrap();
-    let dataset = linear_vector_dataset(
+    let dataset = linear_vector_dataset_with_format(
         uri,
         FRAGMENTS * ROWS_PER_FRAGMENT,
         DIMENSION,
         ROWS_PER_FRAGMENT,
+        LanceFileVersion::V2_2,
     )
     .await;
     assert_eq!(
@@ -4799,39 +5062,27 @@ async fn flat_knn_late_payload_order_is_fenced_to_one_output_partition() {
     );
     let query = arrow_array::Float32Array::from(vec![0.0_f32; DIMENSION]);
 
-    let mut unfenced = dataset.scan();
-    unfenced.nearest("vector", &query, K).unwrap();
-    unfenced.use_index(false);
-    unfenced.target_parallelism(8);
-    let unfenced_plan = unfenced.create_plan().await.unwrap();
+    let mut parallel = dataset.scan();
+    parallel.nearest("vector", &query, K).unwrap();
+    parallel.use_index(false);
+    parallel.target_parallelism(8);
+    let parallel_plan = parallel.create_plan().await.unwrap();
     assert!(
-        unfenced_plan.properties().partitioning.partition_count() > 1,
-        "the compatibility tripwire must exercise parallel late hydration"
+        parallel_plan.properties().partitioning.partition_count() > 1,
+        "the guard must exercise parallel late hydration"
     );
     assert!(
-        unfenced_plan.output_ordering().is_none(),
-        "Lance now preserves KNN ordering through late payload hydration; remove the \
-         target_parallelism(1) compatibility fence and replace this residual assertion"
+        parallel_plan.output_ordering().is_some(),
+        "V2 late payload hydration must retain KNN ordering for the final merge"
     );
 
-    let mut fenced_plan_scanner = dataset.scan();
-    fenced_plan_scanner.nearest("vector", &query, K).unwrap();
-    fenced_plan_scanner.use_index(false);
-    fenced_plan_scanner.target_parallelism(1);
-    let fenced_plan = fenced_plan_scanner.create_plan().await.unwrap();
-    assert_eq!(
-        fenced_plan.properties().partitioning.partition_count(),
-        1,
-        "the compatibility fence must leave no scheduling-ordered final coalesce"
-    );
-
-    // Keep repeated execution even behind the fence: a future optimizer may
-    // silently reintroduce partitions above the plan node asserted above.
+    // Repeated execution catches reordering across output batches, including
+    // optimizer changes above the plan node whose properties we checked.
     for iteration in 0..10 {
         let mut scanner = dataset.scan();
         scanner.nearest("vector", &query, K).unwrap();
         scanner.use_index(false);
-        scanner.target_parallelism(1);
+        scanner.target_parallelism(8);
         let batch = scanner.try_into_batch().await.unwrap();
         assert_eq!(batch.num_rows(), K, "iteration {iteration}");
 
@@ -5463,8 +5714,13 @@ async fn indexed_update_only_route_leaves_rewritten_fragments_uncovered() {
         .iter()
         .map(|field| field.id as u32)
         .collect::<Vec<_>>();
+    let schema_preorder_fields = dataset
+        .schema()
+        .fields_pre_order()
+        .map(|field| field.id as u32)
+        .collect::<Vec<_>>();
     assert!(
-        dataset.schema().fields_pre_order().count() > top_level_fields.len(),
+        schema_preorder_fields.len() > top_level_fields.len(),
         "list property must contribute a nested field id"
     );
     let indices_before = dataset.load_indices().await.unwrap();
@@ -5531,7 +5787,9 @@ async fn indexed_update_only_route_leaves_rewritten_fragments_uncovered() {
     else {
         panic!("indexed update-only route must stage Operation::Update");
     };
-    assert_eq!(fields_for_preserving_frag_bitmap, &top_level_fields);
+    // Lance 13 includes nested field ids: omitting them could make a stale
+    // nested-field index falsely claim the rewritten fragment as covered.
+    assert_eq!(fields_for_preserving_frag_bitmap, &schema_preorder_fields);
     assert_eq!(
         update_mode,
         &Some(lance::dataset::transaction::UpdateMode::RewriteRows)
@@ -5931,13 +6189,12 @@ async fn filtered_scan_tolerates_merge_update_row_id_overlap() {
 
 // --- Guard: merge-insert refuses an external Blob reference outside the bases ---
 //
-// Lance 11's merge-insert writer stages its files with `WriteParams::default()`,
-// whose `allow_external_blob_outside_bases` is false, and a merge-insert takes
-// no other write params. A keyed write therefore cannot carry a stored external
-// reference as a reference: the engine reads it and stores managed bytes, or
-// refuses it under a denying policy (RFC 0033 §4.3). When this goes red,
-// merge-insert stores such a reference, and carrying a sibling's reference
-// without reading it is open again (RFC 0033, Phase 4).
+// Lance 13 validates source-provided Blob references against the dataset's
+// registered external bases before writing. Its writer permits references
+// already carried from target columns, but a source supplying an outside URI
+// still refuses. The engine reads supplied references and stores managed bytes,
+// or refuses them under a denying policy (RFC 0033 §4.3). When this goes red,
+// reconsider the supplied-reference restriction (RFC 0033, Phase 4).
 #[tokio::test]
 async fn merge_insert_refuses_an_external_blob_outside_the_dataset_bases() {
     let dir = tempfile::tempdir().unwrap();
@@ -6224,7 +6481,7 @@ async fn contains_filter_routes_to_ngram_index_and_rechecks_exactly() {
 
 // --- Guard 23: index kinds get distinct default names; replacement is by name --
 //
-// Lance 11 derives `{column}_idx`, then `_2`, `_3`, ... when an existing name
+// Lance 13 derives `{column}_idx`, then `_2`, `_3`, ... when an existing name
 // belongs to another field or index kind. A same-kind rebuild reuses its
 // default name, and `.replace(true)` still removes indexes BY NAME. The
 // engine retains explicit companion names: independent uncommitted builders
@@ -6371,7 +6628,7 @@ async fn index_default_names_distinguish_kinds_and_replacement_is_by_name() {
 
 /// GQT cannot inspect native index base IDs or bypass the engine adapter.
 #[tokio::test]
-async fn stock_lance_nested_clone_overwrites_inherited_index_base_issue_7840() {
+async fn stock_lance_nested_clone_preserves_inherited_index_base_issue_7840() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().join("nested-index.lance");
     let uri = uri.to_str().unwrap();
@@ -6385,10 +6642,21 @@ async fn stock_lance_nested_clone_overwrites_inherited_index_base_issue_7840() {
     let inherited = first.load_indices().await.unwrap()[0].clone();
     let version = first.version().version;
     let second = first.create_branch("second", version, None).await.unwrap();
-    let rewritten = second.load_indices().await.unwrap()[0].clone();
-    assert_eq!(rewritten.uuid, inherited.uuid);
-    assert_ne!(rewritten.base_id, inherited.base_id);
-    let mut scanner = second.scan();
+    let preserved = second.load_indices().await.unwrap()[0].clone();
+    assert_eq!(preserved, inherited);
+    assert_eq!(
+        second.manifest().base_paths[&preserved.base_id.unwrap()].path,
+        root.uri()
+    );
+    // A fresh session must resolve the inherited index's original base from
+    // persisted metadata, without either clone's cached index handle.
+    let cold = DatasetBuilder::from_uri(uri)
+        .with_branch("second", Some(second.version().version))
+        .with_session(Arc::new(Session::default()))
+        .load()
+        .await
+        .unwrap();
+    let mut scanner = cold.scan();
     scanner.filter("value = 1").unwrap();
     assert!(
         scanner
@@ -6397,13 +6665,14 @@ async fn stock_lance_nested_clone_overwrites_inherited_index_base_issue_7840() {
             .unwrap()
             .contains("ScalarIndexQuery")
     );
-    let result = match scanner.try_into_stream().await {
-        Ok(stream) => stream.try_collect::<Vec<RecordBatch>>().await.map(|_| ()),
-        Err(error) => Err(error),
-    };
-    assert!(
-        result.is_err(),
-        "remove the engine index-origin adapter when stock Lance preserves inherited bases"
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(batch["id"].as_string::<i32>().value(0), "alice");
+    assert_eq!(
+        batch["value"]
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .value(0),
+        1
     );
 }
 
@@ -6618,12 +6887,279 @@ async fn fts_prefilter_does_not_change_covered_fragment_scores() {
     );
 }
 
+fn segment_guard_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("text", DataType::Utf8, false),
+        Field::new("status", DataType::Utf8, false),
+    ]))
+}
+
+fn segment_guard_batch(rows: &[(&str, &str, &str)]) -> RecordBatch {
+    RecordBatch::try_new(
+        segment_guard_schema(),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+async fn segment_guard_write(uri: &str, rows: &[(&str, &str, &str)], mode: WriteMode) -> Dataset {
+    let batches = if rows.is_empty() {
+        Vec::new()
+    } else {
+        vec![Ok(segment_guard_batch(rows))]
+    };
+    Dataset::write(
+        RecordBatchIterator::new(batches, segment_guard_schema()),
+        uri,
+        Some(WriteParams {
+            mode,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+/// Every row a full-text search returns, by id, with its score's bits; a row
+/// returned twice is listed twice.
+async fn segment_guard_search(ds: &Dataset, query: &str) -> Vec<(String, u32)> {
+    let mut scanner = ds.scan();
+    scanner.project(&["id", "_score"]).unwrap();
+    scanner
+        .full_text_search(
+            FullTextSearchQuery::new(query.to_string())
+                .with_column("text".to_string())
+                .unwrap(),
+        )
+        .unwrap();
+    let batch = scanner.try_into_batch().await.unwrap();
+    let ids = batch.column_by_name("id").unwrap().as_string::<i32>();
+    let scores = batch
+        .column_by_name("_score")
+        .unwrap()
+        .as_primitive::<arrow_array::types::Float32Type>();
+    let mut rows: Vec<_> = (0..batch.num_rows())
+        .map(|row| (ids.value(row).to_string(), scores.value(row).to_bits()))
+        .collect();
+    rows.sort();
+    rows
+}
+
+async fn segment_guard_filter(ds: &Dataset, filter: &str) -> Vec<String> {
+    let mut scanner = ds.scan();
+    scanner.project(&["id"]).unwrap();
+    scanner.filter(filter).unwrap();
+    let batch = scanner.try_into_batch().await.unwrap();
+    let ids = batch.column_by_name("id").unwrap().as_string::<i32>();
+    let mut rows: Vec<_> = (0..batch.num_rows())
+        .map(|row| ids.value(row).to_string())
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn segment_guard_ids(rows: &[(String, u32)]) -> Vec<&str> {
+    rows.iter().map(|(id, _)| id.as_str()).collect()
+}
+
+/// An inverted index with no trained rows — built over an empty table, or
+/// with `train(false)` over a populated one — has an empty fragment bitmap
+/// and no postings, yet Lance matches every row it does not cover with that
+/// index's tokenizer: the rows and BM25 scores equal a full build's. With no
+/// segment at all, Lance's flat path tokenizes with a bare `SimpleTokenizer`
+/// (no lowercasing, no stemming) and answers differently. Declaring a
+/// full-text index's analyzer with an untrained segment, before its postings
+/// are built, rests on this. If it goes red, an untrained segment no longer
+/// carries the analyzer to uncovered rows.
+#[tokio::test]
+async fn fts_untrained_segment_applies_its_analyzer_to_rows_it_does_not_cover() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+    let rows = [
+        ("e1", "Deep Learning", "open"),
+        ("e2", "deep dive", "open"),
+        ("e3", "Diving deeper into graphs", "open"),
+    ];
+    let params = InvertedIndexParams::default();
+
+    let no_segment = segment_guard_write(&path("none.lance"), &rows, WriteMode::Create).await;
+
+    let mut full = segment_guard_write(&path("full.lance"), &rows, WriteMode::Create).await;
+    full.create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    let mut empty_first = segment_guard_write(&path("empty.lance"), &[], WriteMode::Create).await;
+    empty_first
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+    let empty_first = segment_guard_write(&path("empty.lance"), &rows, WriteMode::Append).await;
+
+    let mut untrained =
+        segment_guard_write(&path("untrained.lance"), &rows, WriteMode::Create).await;
+    untrained
+        .create_index_builder(&["text"], IndexType::Inverted, &params)
+        .train(false)
+        .await
+        .unwrap();
+
+    for ds in [&empty_first, &untrained] {
+        let segments = ds.load_indices().await.unwrap();
+        let segment = segments
+            .iter()
+            .find(|index| {
+                index
+                    .fields
+                    .contains(&ds.schema().field("text").unwrap().id)
+            })
+            .expect("the untrained full-text segment is published");
+        assert!(
+            segment.fragment_bitmap.as_ref().unwrap().is_empty(),
+            "an untrained segment covers no fragment, so every row is scanned flat"
+        );
+    }
+    for query in ["deep", "Deep", "dive"] {
+        let built = segment_guard_search(&full, query).await;
+        assert_eq!(
+            segment_guard_search(&empty_first, query).await,
+            built,
+            "{query}"
+        );
+        assert_eq!(
+            segment_guard_search(&untrained, query).await,
+            built,
+            "{query}"
+        );
+    }
+    assert_eq!(
+        segment_guard_ids(&segment_guard_search(&full, "deep").await),
+        ["e1", "e2"]
+    );
+    assert_eq!(
+        segment_guard_ids(&segment_guard_search(&no_segment, "deep").await),
+        ["e2"],
+        "without a segment the flat path is case-sensitive, so this guard tells \
+         a segment's analyzer from the bare tokenizer"
+    );
+}
+
+/// Lance masks a logical index's results by the union of its segments'
+/// fragment coverage (`DatasetPreFilter::new`). On a stable-row-id dataset an
+/// update keeps the row id and moves the row to a new fragment; once a delta
+/// segment covers that fragment, the older segment's entry for the row passes
+/// the mask. Full-text search then returns the row for a term it no longer
+/// holds, and twice for a term both versions hold; a BTREE equality returns it
+/// for its old value. Lance applies per-segment ownership to vector search
+/// only (lance#7371, lance#8351). OmniGraph therefore keeps one segment per
+/// scalar and full-text index: a lagging index is rebuilt whole
+/// (`stage_index_fold`, the full-text rebuild), never folded into a delta.
+/// When this goes red, ownership covers these paths and a delta fold becomes
+/// safe after updates.
+#[tokio::test]
+async fn index_delta_segment_serves_stale_entries_of_an_updated_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("stale.lance");
+    let uri = uri.to_str().unwrap();
+    let mut ds = segment_guard_write(
+        uri,
+        &[
+            ("a1", "graph engines", "open"),
+            ("a2", "graph search", "open"),
+            ("a3", "relational databases", "done"),
+        ],
+        WriteMode::Create,
+    )
+    .await;
+    ds.create_index(
+        &["text"],
+        IndexType::Inverted,
+        Some("text_fts".into()),
+        &InvertedIndexParams::default(),
+        true,
+    )
+    .await
+    .unwrap();
+    ds.create_index(
+        &["status"],
+        IndexType::BTree,
+        Some("status_btree".into()),
+        &ScalarIndexParams::default(),
+        true,
+    )
+    .await
+    .unwrap();
+    let staged = stage_pk_merge(
+        Arc::new(ds.clone()),
+        segment_guard_batch(&[("a1", "omega engines", "done")]),
+        "id",
+        WhenMatched::UpdateAll,
+        WhenNotMatched::DoNothing,
+        None,
+    )
+    .await;
+    let mut ds = CommitBuilder::new(Arc::new(ds))
+        .execute(staged.transaction)
+        .await
+        .unwrap();
+
+    // One segment per index: the updated row's new fragment is unindexed and
+    // the old entry is masked.
+    assert_eq!(
+        segment_guard_ids(&segment_guard_search(&ds, "graph").await),
+        ["a2"]
+    );
+    assert_eq!(segment_guard_filter(&ds, "status = 'open'").await, ["a2"]);
+
+    ds.optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    let segments = ds.load_indices().await.unwrap();
+    for name in ["text_fts", "status_btree"] {
+        assert_eq!(
+            segments.iter().filter(|index| index.name == name).count(),
+            2,
+            "append-mode optimize leaves a delta segment for {name}"
+        );
+    }
+    let red = "a delta segment no longer serves an updated row's stale entry: \
+               Lance applies segment ownership here, so a delta fold is safe after updates";
+    assert_eq!(
+        segment_guard_ids(&segment_guard_search(&ds, "graph").await),
+        ["a1", "a2"],
+        "{red}"
+    );
+    assert_eq!(
+        segment_guard_ids(&segment_guard_search(&ds, "engines").await),
+        ["a1", "a1"],
+        "{red}"
+    );
+    assert_eq!(
+        segment_guard_filter(&ds, "status = 'open'").await,
+        ["a1", "a2"],
+        "{red}"
+    );
+}
+
 /// A branch ref read racing `replace_metadata` on the same ref must succeed:
-/// the ref is never deleted, so any error is a torn read (Lance 11.0.0 read refs
+/// the ref is never deleted, so any error is a torn read (Lance 13.0.0 reads refs
 /// as `head` then `get_range`, and a rewrite between the two calls yields a prefix).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "lance-one-get-ref-read: needs a Lance whose `from_path` reads a ref in one `get` \
-            (the 0179 Lance PR); red on 11.0.0, which reads `head` then `get_range`. Un-ignore \
+            (the 0179 Lance PR); still red on 13.0.0, which reads `head` then `get_range`. Un-ignore \
             at that bump, where the `branch_control` stale-head tests go red and the retry arm leaves"]
 async fn branch_ref_read_survives_concurrent_metadata_rewrite() {
     let unique = std::time::SystemTime::now()
@@ -6926,6 +7462,93 @@ async fn rfc_0067_detached_commit_from_a_pin_is_private_chains_and_needs_a_retry
         2,
         "HEAD still unmoved"
     );
+}
+
+/// The pure-insert merge proof crosses a `CreateIndex` link as a commit that
+/// moves no row (`is_index_only_commit` in `table_store.rs`). Lance 13
+/// applies `CreateIndex` with every fragment of the version it read and
+/// changes only the index list, for a first build and for a whole rebuild
+/// that removes the older segment, both committed detached as the engine
+/// commits them. Red when an apply rewrites fragments inside `CreateIndex`,
+/// even with the same ids and row counts: a fast-forward would then adopt
+/// bytes the proof never certified.
+#[tokio::test]
+async fn rfc_0067_create_index_keeps_every_fragment_of_its_read_version() {
+    use lance_table::format::{Fragment, IndexMetadata};
+
+    fn fragments(ds: &Dataset) -> Vec<Fragment> {
+        ds.get_fragments()
+            .iter()
+            .map(|fragment| fragment.metadata().clone())
+            .collect()
+    }
+
+    async fn segments(ds: &Dataset) -> Vec<IndexMetadata> {
+        ds.load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|index| index.name == "value_idx")
+            .cloned()
+            .collect()
+    }
+
+    async fn build_detached(base: &Dataset, removed_indices: Vec<IndexMetadata>) -> Dataset {
+        let mut staging = base.clone();
+        let params = ScalarIndexParams::default();
+        let segment = staging
+            .create_index_builder(&["value"], IndexType::BTree, &params)
+            .name("value_idx".to_string())
+            .replace(true)
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let transaction = Transaction::new(
+            base.version().version,
+            Operation::CreateIndex {
+                new_indices: vec![segment],
+                removed_indices,
+            },
+            None,
+        );
+        CommitBuilder::new(Arc::new(base.clone()))
+            .with_detached(true)
+            .with_skip_auto_cleanup(true)
+            .execute(transaction)
+            .await
+            .unwrap()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("t.lance");
+    let uri = uri.to_str().unwrap();
+    let v1 = rfc0067_create(uri).await;
+    let parent = rfc0067_append(v1, &["b1", "b2"]).await;
+    assert_eq!(parent.get_fragments().len(), 2, "two fragments to keep");
+    let parent_fragments = fragments(&parent);
+    let parent_ids = rfc0067_ids(&parent).await;
+
+    let built = build_detached(&parent, Vec::new()).await;
+    let built = rfc0067_pinned(uri, built.version().version).await;
+    assert_eq!(
+        fragments(&built),
+        parent_fragments,
+        "a first build keeps every fragment: ids, physical rows, data files, deletions"
+    );
+    let first = segments(&built).await;
+    assert_eq!(first.len(), 1, "the build added one segment");
+
+    let rebuilt = build_detached(&built, first.clone()).await;
+    let rebuilt = rfc0067_pinned(uri, rebuilt.version().version).await;
+    assert_eq!(
+        fragments(&rebuilt),
+        parent_fragments,
+        "a rebuild that removes the older segment keeps every fragment too"
+    );
+    let second = segments(&rebuilt).await;
+    assert_eq!(second.len(), 1, "the rebuild replaced the segment");
+    assert_ne!(second[0].uuid, first[0].uuid, "the older segment is gone");
+    assert_eq!(rfc0067_ids(&rebuilt).await, parent_ids, "rows unchanged");
 }
 
 /// RFC 0067 §Promotion: replaying the transaction recorded in a detached
@@ -7529,6 +8152,176 @@ async fn rfc_detached_only_detached_commit_never_triggers_auto_cleanup() {
     );
 }
 
+/// Detached-only RFC §Garbage collection, probe 1b: stock cleanup is
+/// destructive on a graph table. Lance 13 never reads a `d{n}.manifest`, so no
+/// detached commit's files count as referenced, and since lance#8944 it lists
+/// `data/` through `max(retained-manifest floor, now − 7 days)` and deletes
+/// every listed file no attached manifest references (`unverified` mode). A
+/// graph table's one attached version is its `v1` create, so stock default
+/// cleanup keeps every detached manifest but deletes week-old data files used
+/// only by detached versions. Their pins still open but fail to read, including
+/// a recent descendant that reuses an aged file. Lance 11 listed `data/` only
+/// below the retained floor, which the `v1` create sets earlier than its detached
+/// files, so the same run left them alone (`_indices/` has always been listed
+/// whole). This is why the engine never calls stock cleanup on a graph table
+/// (`forbidden_apis.rs`) and why an external Lance cleanup of a graph root is a
+/// data-loss path. Both halves are pinned: the seven-day floor keeps a fresh
+/// detached-only file, while an aged one is swept despite its detached readers.
+#[tokio::test]
+async fn stock_cleanup_sweeps_a_week_old_detached_data_file_lance_13() {
+    use std::time::{Duration, SystemTime};
+
+    const DAY: u64 = 24 * 60 * 60;
+    let now = SystemTime::now();
+    let retained_time = now - Duration::from_secs(10 * DAY);
+    let aged_file_time = now - Duration::from_secs(8 * DAY);
+    let verification_cutoff = now - Duration::from_secs(7 * DAY);
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("t.lance");
+    let uri = uri.to_str().unwrap();
+    let created = rfc0067_create(uri).await;
+    // Cleanup derives its listing floor from the manifest's embedded commit
+    // timestamp, not the manifest file's mtime. Model an old attached create
+    // followed by a newer detached write, and cold-open the rewritten bytes.
+    let mut manifest = created.manifest().clone();
+    assert!(manifest.index_section.is_none());
+    let transaction = created.read_transaction().await.unwrap();
+    let inline_transaction = manifest.transaction_section.map(|_| {
+        lance_table::format::Transaction::from(
+            transaction
+                .as_ref()
+                .expect("an inline transaction section must decode"),
+        )
+    });
+    manifest.set_timestamp(
+        retained_time
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    );
+    let store = created.object_store(None).await.unwrap();
+    lance_table::io::commit::write_manifest_file_to_path(
+        &store,
+        &mut manifest,
+        None,
+        &created.manifest_location().path,
+        inline_transaction,
+    )
+    .await
+    .unwrap();
+    drop(created);
+    let base = rfc0067_pinned(uri, 1).await;
+    assert_eq!(
+        base.manifest().timestamp(),
+        chrono::DateTime::<chrono::Utc>::from(retained_time),
+        "the cold open must observe the old embedded commit timestamp"
+    );
+    assert_eq!(
+        base.read_transaction().await.unwrap(),
+        transaction,
+        "rewriting the timestamp must preserve the original transaction"
+    );
+    let aged = rfc_detached_only_append(&base, &["c1"]).await;
+    let fresh = rfc_detached_only_append(&aged, &["d1"]).await;
+    let aged_version = aged.version().version;
+    let fresh_version = fresh.version().version;
+    assert!(lance_table::format::is_detached_version(aged_version));
+    assert!(lance_table::format::is_detached_version(fresh_version));
+    assert!(
+        fresh.manifest().timestamp() > chrono::DateTime::<chrono::Utc>::from(verification_cutoff),
+        "the descendant whose reads fail after cleanup is recent"
+    );
+
+    let data_dir = dir.path().join("t.lance").join("data");
+    let protected_file = rfc_detached_only_fragment_files(&base, 0);
+    let aged_file = rfc_detached_only_fragment_files(&aged, 1);
+    let fresh_file = rfc_detached_only_fragment_files(&fresh, 2);
+    assert_eq!(
+        (protected_file.len(), aged_file.len(), fresh_file.len()),
+        (1, 1, 1)
+    );
+    let protected_file = data_dir.join(&protected_file[0]);
+    let aged_file = data_dir.join(&aged_file[0]);
+    let fresh_file = data_dir.join(&fresh_file[0]);
+    assert!(fresh_file.is_file());
+    // Both aged files are newer than the retained manifest floor but older
+    // than the seven-day threshold. Lance 11's listing misses both; Lance 13
+    // lists both, and only the attached reference protects the original file.
+    for file in [&protected_file, &aged_file] {
+        assert!(file.is_file());
+        std::fs::File::options()
+            .write(true)
+            .open(file)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(aged_file_time))
+            .unwrap();
+        let modified = std::fs::metadata(file).unwrap().modified().unwrap();
+        assert!(retained_time < modified);
+        assert!(modified < verification_cutoff);
+    }
+    let fresh_modified = std::fs::metadata(&fresh_file).unwrap().modified().unwrap();
+    assert!(verification_cutoff < fresh_modified);
+
+    let head = rfc0067_head(uri).await;
+    assert_eq!(
+        head.version().version,
+        1,
+        "the graph-table shape: v1 is the only attached version"
+    );
+    assert_eq!(head.manifest().timestamp(), base.manifest().timestamp());
+    assert_eq!(head.list_detached_manifests().await.unwrap().len(), 2);
+    let removed = cleanup_old_versions(&head, CleanupPolicy::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        (removed.old_versions, removed.data_files_removed),
+        (0, 1),
+        "the only attached version is retained, yet one data file is swept: the aged \
+         detached commit's, which no attached manifest references"
+    );
+    assert!(
+        !aged_file.exists(),
+        "the week-old detached data file is deleted as unverified"
+    );
+    assert!(
+        protected_file.is_file(),
+        "the equally old original data file is protected by the attached manifest"
+    );
+    assert!(
+        fresh_file.is_file(),
+        "the fresh detached data file survives on the seven-day floor alone"
+    );
+    assert_eq!(
+        head.list_detached_manifests().await.unwrap().len(),
+        2,
+        "stock cleanup never traces a detached manifest, so it deletes neither"
+    );
+    let aged = rfc0067_pinned(uri, aged_version).await;
+    assert!(
+        rfc_detached_only_scan_rows(&aged).await.is_err(),
+        "the aged detached version still opens but its rows are gone"
+    );
+    let fresh = rfc0067_pinned(uri, fresh_version).await;
+    assert!(
+        rfc_detached_only_scan_rows(&fresh).await.is_err(),
+        "the chain above the swept file is unreadable too: the fresh manifest \
+         lists the aged fragment by its own file"
+    );
+    let v1 = rfc0067_pinned(uri, 1).await;
+    assert_eq!(
+        rfc_detached_only_scan_rows(&v1).await.unwrap(),
+        2,
+        "control: the attached create's rows are untouched"
+    );
+}
+
+async fn rfc_detached_only_scan_rows(ds: &Dataset) -> lance::Result<usize> {
+    let mut scanner = ds.scan();
+    scanner.project(&["id"]).unwrap();
+    let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
+    Ok(batches.iter().map(|batch| batch.num_rows()).sum())
+}
+
 /// Detached-only RFC §Garbage collection, probe 2: a detached manifest lists
 /// every fragment of its version by its own file, so marking a version's
 /// files needs no walk of the chain behind it.
@@ -7976,7 +8769,7 @@ async fn native_ref_unlink_keeps_descendant_head_and_fork_point_readable() {
     assert_eq!(rfc_detached_only_values(&fork).await, fork_rows);
 }
 
-/// Lance 11 refuses a null VALUE inside a packed struct child (the children may be declared
+/// Lance 13 refuses a null VALUE inside a packed struct child (the children may be declared
 /// nullable) and cannot project a fixed-width child alone, so the stamp-12 `__manifest` keeps its
 /// nulls in `record`'s `present` child and scans `record` whole; red at the bump lifting either.
 #[tokio::test]
@@ -8020,7 +8813,7 @@ async fn packed_struct_refuses_null_values_and_lone_child_projection_lance_11() 
         UInt64Array::from(vec![Some(1u64), Some(2)]),
     )
     .await;
-    let error = refused.expect_err("Lance 11 refuses a null inside a packed struct child");
+    let error = refused.expect_err("Lance 13 refuses a null inside a packed struct child");
     assert!(
         error
             .to_string()
@@ -8049,7 +8842,7 @@ async fn packed_struct_refuses_null_values_and_lone_child_projection_lance_11() 
         Err(error) => Err(error),
     };
     let error = child_alone
-        .expect_err("Lance 11 cannot decode a fixed-width child of a packed struct on its own");
+        .expect_err("Lance 13 cannot decode a fixed-width child of a packed struct on its own");
     assert!(
         error
             .to_string()
@@ -8060,7 +8853,7 @@ async fn packed_struct_refuses_null_values_and_lone_child_projection_lance_11() 
     filtered.project(&["id", "record"]).unwrap();
     filtered.filter("id = 'b'").unwrap();
     let error = filtered.try_into_batch().await.expect_err(
-        "Lance 11's default materialization splits the fixed child out of a packed struct",
+        "Lance 13's default materialization splits the fixed child out of a packed struct",
     );
     assert!(
         error
@@ -8092,5 +8885,209 @@ async fn packed_struct_refuses_null_values_and_lone_child_projection_lance_11() 
             .as_primitive::<arrow_array::types::UInt64Type>()
             .value(0),
         0
+    );
+}
+
+const ROW_IDENTITY_SCHEMA: &str = "node Person {\n    name: String @key\n    age: I32?\n}\n";
+
+fn row_identity_rows(range: std::ops::Range<u64>, age: i32) -> String {
+    range
+        .map(|index| format!(r#"{{"type":"Person","data":{{"name":"p{index:03}","age":{age}}}}}"#))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Every live row's `(_rowid, _row_last_updated_at_version)` by key.
+async fn row_identity_stamps(ds: &Dataset) -> HashMap<String, (u64, u64)> {
+    let mut scanner = ds.scan();
+    scanner
+        .project(&["__id", ROW_ID, ROW_LAST_UPDATED_AT_VERSION])
+        .unwrap();
+    let batches: Vec<RecordBatch> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut out = HashMap::new();
+    for batch in batches {
+        let ids = batch.column_by_name("__id").unwrap().as_string::<i32>();
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<arrow_array::types::UInt64Type>();
+        let stamps = batch
+            .column_by_name(ROW_LAST_UPDATED_AT_VERSION)
+            .unwrap()
+            .as_primitive::<arrow_array::types::UInt64Type>();
+        for row in 0..batch.num_rows() {
+            out.insert(
+                ids.value(row).to_string(),
+                (row_ids.value(row), stamps.value(row)),
+            );
+        }
+    }
+    out
+}
+
+/// Every fragment carries both sequences inline and decodable, one entry per
+/// physical row (a deleted row keeps its entry; the deletion vector masks it).
+/// Returns the fragment count.
+fn row_identity_inline_sequences(ds: &Dataset) -> usize {
+    let fragments = ds.get_fragments();
+    for fragment in &fragments {
+        let meta = fragment.metadata();
+        let Some(RowIdMeta::Inline(row_id_bytes)) = &meta.row_id_meta else {
+            panic!("fragment {} has no inline row id sequence", meta.id);
+        };
+        let Some(RowDatasetVersionMeta::Inline(stamp_bytes)) = &meta.last_updated_at_version_meta
+        else {
+            panic!("fragment {} has no inline last-updated sequence", meta.id);
+        };
+        let row_ids = read_row_ids(&row_id_bytes[..]).unwrap();
+        let stamps = read_dataset_versions(&stamp_bytes[..]).unwrap();
+        let physical_rows = meta.physical_rows.unwrap() as u64;
+        assert_eq!(
+            row_ids.len(),
+            physical_rows,
+            "fragment {}: one row id per physical row",
+            meta.id
+        );
+        assert_eq!(
+            stamps.len(),
+            physical_rows,
+            "fragment {}: one stamp per physical row",
+            meta.id
+        );
+    }
+    fragments.len()
+}
+
+/// The Lance 13 facts `changes::candidate_scan::row_identity_plan` rests on,
+/// through the engine's writers; each assertion names its fact, and a bump
+/// that moves one is a design review of the rule, not a test to weaken.
+#[tokio::test]
+async fn row_identity_discovery_stamps_row_ids_and_rewrites_lance_13() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = helpers::session(
+        omnigraph::db::Omnigraph::init(uri, ROW_IDENTITY_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let merge = omnigraph::loader::LoadMode::Merge;
+    db.load_with_receipt("main", &row_identity_rows(0..32, 0), merge)
+        .await
+        .unwrap();
+    db.load_with_receipt("main", &row_identity_rows(32..64, 0), merge)
+        .await
+        .unwrap();
+    let loaded = open_pinned_dataset_for_test(&db, "main", "node:Person").await;
+    assert!(
+        row_identity_inline_sequences(&loaded) >= 2,
+        "two loads write at least two fragments"
+    );
+    let before = row_identity_stamps(&loaded).await;
+    assert_eq!(before.len(), 64);
+
+    db.load_with_receipt("main", &row_identity_rows(1..2, 1), merge)
+        .await
+        .unwrap();
+    let updated = open_pinned_dataset_for_test(&db, "main", "node:Person").await;
+    row_identity_inline_sequences(&updated);
+    let after = row_identity_stamps(&updated).await;
+    assert_eq!(
+        after["p001"].0, before["p001"].0,
+        "an updated row keeps its stable row id"
+    );
+    assert!(lance_table::format::is_detached_version(
+        updated.version().version
+    ));
+    assert_eq!(
+        after["p001"].1,
+        loaded.version().version + 1,
+        "the stamp is the read manifest's version plus one"
+    );
+    assert_ne!(
+        after["p001"].1,
+        updated.version().version,
+        "the stamp is not the detached version the commit received"
+    );
+    for (name, pair) in &before {
+        if name != "p001" {
+            assert_eq!(
+                after[name], *pair,
+                "{name}: an untouched row keeps id and stamp"
+            );
+        }
+    }
+
+    db.branch_create("sibling-a").await.unwrap();
+    db.branch_create("sibling-b").await.unwrap();
+    db.load_with_receipt("sibling-a", &row_identity_rows(2..3, 2), merge)
+        .await
+        .unwrap();
+    db.load_with_receipt("sibling-b", &row_identity_rows(2..3, 3), merge)
+        .await
+        .unwrap();
+    let on_a =
+        row_identity_stamps(&open_pinned_dataset_for_test(&db, "sibling-a", "node:Person").await)
+            .await;
+    let on_b =
+        row_identity_stamps(&open_pinned_dataset_for_test(&db, "sibling-b", "node:Person").await)
+            .await;
+    assert_eq!(
+        on_a["p002"].0, on_b["p002"].0,
+        "the row id survives both updates"
+    );
+    assert_eq!(
+        on_a["p002"].1, on_b["p002"].1,
+        "sibling first commits after one fork stamp the row alike: equality proves a shared \
+         row only along one lineage"
+    );
+    assert_eq!(on_a["p002"].1, updated.version().version + 1);
+    assert_ne!(on_a["p002"].1, after["p002"].1);
+
+    db.mutate(
+        "main",
+        "query d() { delete Person where name = \"p003\" }",
+        "d",
+        &omnigraph_compiler::ir::ParamMap::new(),
+    )
+    .await
+    .unwrap();
+    let deleted = open_pinned_dataset_for_test(&db, "main", "node:Person").await;
+    let fragments_before_compaction = row_identity_inline_sequences(&deleted);
+    let surviving = row_identity_stamps(&deleted).await;
+    assert!(!surviving.contains_key("p003"));
+    assert_eq!(surviving.len(), 63);
+    for (name, pair) in &surviving {
+        assert_eq!(
+            after[name], *pair,
+            "{name}: a deletion-only commit restamps no surviving row"
+        );
+    }
+
+    let stats = db.optimize().await.unwrap();
+    let person = stats
+        .iter()
+        .find(|stat| stat.type_key == "node:Person")
+        .expect("optimize reports the Person table");
+    assert!(
+        person.fragments_removed >= 2 && person.fragments_added >= 1,
+        "the small fragments must be rewritten: removed {} added {}",
+        person.fragments_removed,
+        person.fragments_added
+    );
+    let compacted = open_pinned_dataset_for_test(&db, "main", "node:Person").await;
+    assert!(
+        row_identity_inline_sequences(&compacted) < fragments_before_compaction,
+        "the rewritten fragments keep their sequences inline"
+    );
+    assert_eq!(
+        row_identity_stamps(&compacted).await,
+        surviving,
+        "compaction carries every live row's id and stamp into the rewritten fragments"
     );
 }

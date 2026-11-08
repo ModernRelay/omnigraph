@@ -1,5 +1,6 @@
 use crate::helpers;
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 
@@ -9,8 +10,13 @@ use lance::Dataset;
 use lance_index::is_system_index;
 
 use omnigraph::db::commit_graph::CommitGraph;
-use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
-use omnigraph::error::{CompletionEvidence, ManifestErrorKind, MergeConflictKind, OmniError};
+use omnigraph::db::{
+    BranchCreated, BranchDetail, GraphCommit, MergeOutcome, Omnigraph, ReadTarget, Snapshot,
+    SnapshotId,
+};
+use omnigraph::error::{
+    BranchStartRefusal, CompletionEvidence, ManifestErrorKind, MergeConflictKind, OmniError,
+};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
 use omnigraph::{
@@ -278,6 +284,250 @@ async fn branch_create_open_list_and_lazy_branching_work() {
 
     let main = Omnigraph::open(uri).await.unwrap();
     assert_eq!(count_rows(&main, "node:Person").await, 4);
+}
+
+/// The newest commit `list_commits` reports for `branch`.
+async fn newest_commit(db: &Omnigraph, branch: &str) -> GraphCommit {
+    db.list_commits(Some(branch)).await.unwrap().remove(0)
+}
+
+/// Every branch's detail, keyed by name, from a listing that may read all.
+async fn detailed_branches(db: &Omnigraph) -> BTreeMap<String, BranchDetail> {
+    let listing = db.branch_list_detailed(&mut |_| true).await.unwrap();
+    let names: Vec<_> = listing.details.iter().map(|d| d.name.clone()).collect();
+    assert_eq!(names, listing.branches, "every readable branch has details");
+    listing
+        .details
+        .into_iter()
+        .map(|detail| (detail.name.clone(), detail))
+        .collect()
+}
+
+fn unix_micros_now() -> i64 {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    i64::try_from(elapsed.as_micros()).unwrap()
+}
+
+/// Where a branch's details say it started: `from` and `from_commit_id`.
+fn started(detail: &BranchDetail) -> (Option<&str>, Option<&str>) {
+    (detail.from.as_deref(), detail.from_commit_id.as_deref())
+}
+
+/// What a create receipt says the new branch started at.
+fn receipt(created: &BranchCreated) -> (Option<&str>, Option<&str>) {
+    (
+        Some(created.from.as_str()),
+        Some(created.from_commit_id.as_str()),
+    )
+}
+
+/// A branch's details answer what a client would otherwise derive from its
+/// whole commit list: its head, the branch and commit its current lifetime
+/// started from, as its create receipt said, when it was created and when it
+/// last moved. The start is fixed for the lifetime, so a merge moves the merge
+/// base but not the start; deleting and recreating the name starts a new
+/// lifetime with its own start and creation time; cleanup leaves every start
+/// readable.
+#[tokio::test]
+async fn branch_list_detailed_reports_head_start_and_lifetime() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let insert = |name: &str| mixed_params(&[("$name", name)], &[("$age", 30)]);
+    let loaded = newest_commit(&db, "main").await;
+
+    let before_create = unix_micros_now() / 1_000_000 * 1_000_000;
+    let created = db
+        .branch_create_from(ReadTarget::branch("main"), "feature")
+        .await
+        .unwrap();
+    let after_create = unix_micros_now();
+    let details = detailed_branches(&db).await;
+    let main = &details["main"];
+    assert_eq!(main.head, loaded);
+    assert_eq!((started(main), main.created_at), ((None, None), None));
+    assert_eq!(main.updated_at, loaded.created_at);
+    let unwritten = &details["feature"];
+    assert_eq!(
+        unwritten.head, loaded,
+        "an unwritten branch reads its start"
+    );
+    assert_eq!(started(unwritten), receipt(&created));
+    assert_eq!(created.from_commit_id, loaded.graph_commit_id);
+    let created_at = unwritten.created_at.unwrap();
+    assert!(
+        (before_create..=after_create).contains(&created_at),
+        "{before_create} <= {created_at} <= {after_create}"
+    );
+    assert_eq!(unwritten.updated_at, created_at);
+
+    mutate_main(&db, MUTATION_QUERIES, "insert_person", &insert("Mia"))
+        .await
+        .unwrap();
+    mutate_branch(
+        &db,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &insert("Eve"),
+    )
+    .await
+    .unwrap();
+    let written = newest_commit(&db, "feature").await;
+    assert_eq!(
+        written.parent_commit_id.as_deref(),
+        Some(loaded.graph_commit_id.as_str())
+    );
+    let child_created = db
+        .branch_create_from(ReadTarget::branch("feature"), "child")
+        .await
+        .unwrap();
+    assert_eq!(child_created.from_commit_id, written.graph_commit_id);
+    mutate_branch(
+        &db,
+        "child",
+        MUTATION_QUERIES,
+        "insert_person",
+        &insert("Kid"),
+    )
+    .await
+    .unwrap();
+    // A branch started at a past commit reads that commit as its start, from
+    // the version it was cloned at, once it has written its own head.
+    let at_load = db
+        .branch_create_from(
+            ReadTarget::snapshot(SnapshotId::new(loaded.graph_commit_id.clone())),
+            "at_load",
+        )
+        .await
+        .unwrap();
+    mutate_branch(
+        &db,
+        "at_load",
+        MUTATION_QUERIES,
+        "insert_person",
+        &insert("Old"),
+    )
+    .await
+    .unwrap();
+    let details = detailed_branches(&db).await;
+    let feature = &details["feature"];
+    assert_eq!(feature.head, written);
+    assert_eq!(feature.updated_at, written.created_at);
+    assert_eq!(
+        started(feature),
+        receipt(&created),
+        "a written branch keeps the commit it started at"
+    );
+    let child = &details["child"];
+    assert_eq!(child.head, newest_commit(&db, "child").await);
+    assert_eq!(started(child), receipt(&child_created));
+    let at_load_detail = &details["at_load"];
+    assert_eq!(at_load_detail.head, newest_commit(&db, "at_load").await);
+    assert_eq!(started(at_load_detail), receipt(&at_load));
+    assert_eq!(at_load.from_commit_id, loaded.graph_commit_id);
+
+    let main_head = newest_commit(&db, "main").await;
+    db.branch_merge("main", "feature").await.unwrap();
+    let merged = newest_commit(&db, "feature").await;
+    assert_eq!(
+        merged.merged_parent_commit_id.as_deref(),
+        Some(main_head.graph_commit_id.as_str())
+    );
+    let base = db.merge_base("feature", "main").await.unwrap().merge_base;
+    assert_eq!(base, main_head, "the merge moved the merge base");
+    let details = detailed_branches(&db).await;
+    assert_eq!(details["feature"].head, merged);
+    assert_eq!(
+        started(&details["feature"]),
+        receipt(&created),
+        "a merge does not move the start"
+    );
+
+    db.branch_delete("feature").await.unwrap();
+    let recreated_receipt = db
+        .branch_create_from(ReadTarget::branch("main"), "feature")
+        .await
+        .unwrap();
+    assert_eq!(recreated_receipt.from_commit_id, main_head.graph_commit_id);
+    let details = detailed_branches(&db).await;
+    assert_eq!(
+        details.keys().collect::<Vec<_>>(),
+        ["at_load", "child", "feature", "main"]
+    );
+    let recreated = &details["feature"];
+    assert_eq!(started(recreated), receipt(&recreated_receipt));
+    assert_eq!(recreated.head, main_head);
+    assert!(recreated.created_at.unwrap() >= created_at);
+    assert_eq!(
+        started(&details["child"]),
+        receipt(&child_created),
+        "`from` names the source as it was named then"
+    );
+
+    mutate_branch(
+        &db,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &insert("Ann"),
+    )
+    .await
+    .unwrap();
+    db.cleanup(omnigraph::db::CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+    let details = detailed_branches(&db).await;
+    assert_eq!(started(&details["feature"]), receipt(&recreated_receipt));
+    assert_eq!(started(&details["child"]), receipt(&child_created));
+    assert_eq!(started(&details["at_load"]), receipt(&at_load));
+
+    let mut asked = Vec::new();
+    let listing = db
+        .branch_list_detailed(&mut |name: &str| {
+            asked.push(name.to_string());
+            name != "child"
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        asked,
+        ["main", "at_load", "child", "feature"],
+        "asked once per branch"
+    );
+    assert_eq!(listing.branches, ["main", "at_load", "child", "feature"]);
+    assert_eq!(
+        listing
+            .details
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect::<Vec<_>>(),
+        ["main", "at_load", "feature"],
+        "a branch the caller may not read lists by name alone"
+    );
+
+    // A fast-forward into a branch that has written nothing publishes a new
+    // commit on it: the head and `updated_at` follow that commit, and the
+    // start stays where the branch was created.
+    let ff_created = db
+        .branch_create_from(ReadTarget::branch("main"), "ff")
+        .await
+        .unwrap();
+    mutate_main(&db, MUTATION_QUERIES, "insert_person", &insert("Fay"))
+        .await
+        .unwrap();
+    let outcome = db.branch_merge("main", "ff").await.unwrap();
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
+    let fast_forwarded = newest_commit(&db, "ff").await;
+    let details = detailed_branches(&db).await;
+    let ff = &details["ff"];
+    assert_eq!(ff.head, fast_forwarded);
+    assert_eq!(started(ff), receipt(&ff_created));
+    assert_eq!(ff.updated_at, fast_forwarded.created_at);
 }
 
 #[tokio::test]
@@ -3232,6 +3482,354 @@ async fn branch_created_from_non_main_inherits_branch_state() {
     assert_eq!(main_qr.num_rows(), 0);
 }
 
+/// Every person on `branch` with its age, read from the table the branch pins.
+async fn people_on(db: &Omnigraph, branch: &str) -> BTreeMap<String, Option<i32>> {
+    let mut people = BTreeMap::new();
+    for batch in read_table_branch(db, branch, "node:Person").await {
+        let names = batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let ages = batch
+            .column_by_name("age")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            let age = (!ages.is_null(row)).then(|| ages.value(row));
+            people.insert(names.value(row).to_string(), age);
+        }
+    }
+    people
+}
+
+/// Each table a snapshot pins, with the exact version and metadata of the pin.
+fn table_pins(snapshot: &Snapshot) -> BTreeMap<String, (u64, String)> {
+    snapshot
+        .datasets()
+        .map(|entry| {
+            (
+                entry.type_key.clone(),
+                (
+                    entry.published_dataset_version,
+                    format!("{:?}", entry.version_metadata),
+                ),
+            )
+        })
+        .collect()
+}
+
+fn at_commit(id: &str) -> ReadTarget {
+    ReadTarget::snapshot(SnapshotId::new(id))
+}
+
+/// A branch started at a past commit of main holds exactly that commit's
+/// tables and history: its first manifest is the version that published the
+/// commit, main is untouched, and the branch writes on the commit and merges
+/// back three ways from it.
+#[tokio::test]
+async fn branch_create_at_a_main_commit_starts_at_its_tables_and_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let eve = db
+        .mutate_with_receipt(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        )
+        .await
+        .unwrap()
+        .commit
+        .expect("the insert publishes a commit");
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
+    )
+    .await
+    .unwrap();
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "remove_person",
+        &params(&[("$name", "Bob")]),
+    )
+    .await
+    .unwrap();
+    let main_version = version_main(&db).await.unwrap();
+    let main_commits = db.list_commits(Some("main")).await.unwrap();
+    let main_people = people_on(&db, "main").await;
+
+    let created = db
+        .branch_create_from(at_commit(&eve.graph_commit_id), "fix")
+        .await
+        .unwrap();
+    assert_eq!(
+        created,
+        BranchCreated {
+            from: "main".to_string(),
+            from_commit_id: eve.graph_commit_id.clone(),
+        },
+        "the receipt names the branch that wrote the commit, and the commit"
+    );
+
+    let fix = snapshot_branch(&db, "fix").await.unwrap();
+    assert_eq!(
+        fix.graph_manifest_version(),
+        eve.graph_manifest_version,
+        "the first manifest is a clone of the version that published the commit"
+    );
+    assert_eq!(
+        table_pins(&fix),
+        table_pins(
+            &db.snapshot_of(at_commit(&eve.graph_commit_id))
+                .await
+                .unwrap()
+        ),
+        "the new branch pins exactly the commit's table versions"
+    );
+    let fix_commits = db.list_commits(Some("fix")).await.unwrap();
+    assert_eq!(fix_commits[0].graph_commit_id, eve.graph_commit_id);
+    assert_eq!(
+        fix_commits.as_slice(),
+        &main_commits[2..],
+        "the branch's history is the commit's: the two later main commits are not in it"
+    );
+    let people = people_on(&db, "fix").await;
+    assert_eq!(people.get("Alice"), Some(&Some(30)));
+    assert!(people.contains_key("Bob") && people.contains_key("Eve"));
+
+    assert_eq!(version_main(&db).await.unwrap(), main_version);
+    assert_eq!(db.list_commits(Some("main")).await.unwrap(), main_commits);
+    assert_eq!(people_on(&db, "main").await, main_people);
+
+    let zed = db
+        .mutate_with_receipt(
+            "fix",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Zed")], &[("$age", 50)]),
+        )
+        .await
+        .unwrap()
+        .commit
+        .unwrap();
+    assert_eq!(
+        zed.parent_commit_id.as_deref(),
+        Some(eve.graph_commit_id.as_str()),
+        "the branch's first write builds on the commit"
+    );
+    let merged = db.branch_merge("fix", "main").await.unwrap();
+    assert_eq!(merged.outcome, MergeOutcome::Merged);
+    let after = people_on(&db, "main").await;
+    assert_eq!(
+        after.get("Alice"),
+        Some(&Some(31)),
+        "main's later update stays"
+    );
+    assert!(!after.contains_key("Bob"), "main's later delete stays");
+    assert_eq!(
+        after.get("Zed"),
+        Some(&Some(50)),
+        "the branch's write lands"
+    );
+}
+
+/// A commit a named branch wrote starts a branch from that branch's own
+/// `__manifest` history, and reopening the graph reads the same start.
+#[tokio::test]
+async fn branch_create_at_a_named_branch_commit_reads_that_branch_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    let frank = db
+        .mutate_with_receipt(
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Frank")], &[("$age", 41)]),
+        )
+        .await
+        .unwrap()
+        .commit
+        .unwrap();
+    mutate_branch(
+        &db,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Grace")], &[("$age", 42)]),
+    )
+    .await
+    .unwrap();
+
+    let created = db
+        .branch_create_from(at_commit(&frank.graph_commit_id), "retry")
+        .await
+        .unwrap();
+    assert_eq!(created.from, "feature", "the branch that wrote the commit");
+    assert_eq!(created.from_commit_id, frank.graph_commit_id);
+
+    let reopened = helpers::session(Omnigraph::open(uri).await.unwrap());
+    let people = people_on(&reopened, "retry").await;
+    assert!(people.contains_key("Frank"));
+    assert!(
+        !people.contains_key("Grace"),
+        "a later commit of the branch is not in it"
+    );
+    assert_eq!(
+        reopened.list_commits(Some("retry")).await.unwrap()[0].graph_commit_id,
+        frank.graph_commit_id
+    );
+    assert_eq!(
+        people_on(&reopened, "feature").await.len(),
+        people.len() + 1,
+        "the source branch keeps its head"
+    );
+}
+
+/// What is not branch history is refused before any effect, never
+/// approximated: an unknown id, an unpublished commit, an unattached
+/// snapshot, a commit of a deleted branch (one answer whether its name
+/// names nothing or a branch created again since), and a commit written
+/// under an earlier schema. No refusal creates a branch or moves main.
+#[tokio::test]
+async fn branch_create_at_a_commit_refuses_what_is_not_branch_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let loaded = db.list_commits(Some("main")).await.unwrap()[0].clone();
+
+    let proposal = db
+        .mutate_with_receipt(
+            "main",
+            r#"
+query propose($name: String, $age: I32) as commit {
+    insert Person { name: $name, age: $age }
+}
+"#,
+            "propose",
+            &mixed_params(&[("$name", "Pat")], &[("$age", 7)]),
+        )
+        .await
+        .unwrap()
+        .commit
+        .unwrap();
+    let snapshot = db
+        .mutate_with_receipt(
+            "main",
+            r#"
+query park($name: String, $age: I32) as unattached branch {
+    insert Person { name: $name, age: $age }
+}
+"#,
+            "park",
+            &mixed_params(&[("$name", "Una")], &[("$age", 9)]),
+        )
+        .await
+        .unwrap()
+        .commit
+        .unwrap();
+    db.branch_create("gone").await.unwrap();
+    let on_gone = db
+        .mutate_with_receipt(
+            "gone",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Gil")], &[("$age", 3)]),
+        )
+        .await
+        .unwrap()
+        .commit
+        .unwrap();
+    db.branch_delete("gone").await.unwrap();
+
+    let refusal = |result: omnigraph::error::Result<BranchCreated>| {
+        let error = result.expect_err("a refused start creates nothing");
+        assert_eq!(
+            error.completion_evidence(),
+            Some(CompletionEvidence::BeforeEffect),
+            "{error}"
+        );
+        match error.into_completion_evidence().0 {
+            OmniError::BranchStartRefused { reason, .. } => reason,
+            other => panic!("expected a branch start refusal, got {other:?}"),
+        }
+    };
+    let unwrapped = |result: omnigraph::error::Result<BranchCreated>| {
+        result
+            .expect_err("a refused start creates nothing")
+            .into_completion_evidence()
+            .0
+    };
+    assert_eq!(
+        refusal(
+            db.branch_create_from(at_commit(&proposal.graph_commit_id), "b1")
+                .await
+        ),
+        BranchStartRefusal::UnpublishedCommit
+    );
+    assert_eq!(
+        refusal(
+            db.branch_create_from(at_commit(&snapshot.graph_commit_id), "b2")
+                .await
+        ),
+        BranchStartRefusal::UnattachedSnapshot
+    );
+    let unknown = ulid::Ulid::new().to_string();
+    assert!(matches!(
+        unwrapped(db.branch_create_from(at_commit(&unknown), "b3").await),
+        OmniError::Manifest(error) if error.kind == ManifestErrorKind::NotFound
+    ));
+    let deleted = BranchStartRefusal::BranchDeleted {
+        branch: "gone".to_string(),
+    };
+    assert_eq!(
+        refusal(
+            db.branch_create_from(at_commit(&on_gone.graph_commit_id), "b4")
+                .await
+        ),
+        deleted,
+        "the branch that wrote the commit is gone"
+    );
+    db.branch_create("gone").await.unwrap();
+    assert_eq!(
+        refusal(
+            db.branch_create_from(at_commit(&on_gone.graph_commit_id), "b4")
+                .await
+        ),
+        deleted,
+        "a branch created again under the name did not write the commit"
+    );
+    db.branch_delete("gone").await.unwrap();
+    assert!(matches!(
+        unwrapped(db.branch_create_from(at_commit(&loaded.graph_commit_id), "main").await),
+        OmniError::Manifest(error) if error.message.contains("cannot create branch 'main'")
+    ));
+
+    let schema = TEST_SCHEMA.replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    );
+    db.apply_schema(&schema).await.unwrap();
+    let main_version = version_main(&db).await.unwrap();
+    assert_eq!(
+        refusal(
+            db.branch_create_from(at_commit(&loaded.graph_commit_id), "b5")
+                .await
+        ),
+        BranchStartRefusal::SchemaChanged
+    );
+
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
+    assert_eq!(version_main(&db).await.unwrap(), main_version);
+}
+
 #[tokio::test]
 async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_needed() {
     let dir = tempfile::tempdir().unwrap();
@@ -3249,6 +3847,9 @@ async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_ne
     )
     .await
     .unwrap();
+    // The insert leaves feature's identity index lagging; building it here
+    // leaves the child below nothing to index.
+    feature.ensure_indices_on("feature").await.unwrap();
     feature
         .branch_create_from(ReadTarget::branch("feature"), "experiment")
         .await
@@ -3919,7 +4520,7 @@ async fn branch_namespace_rejects_live_physical_path_prefix_collisions() {
     db.branch_create("feature").await.unwrap();
     for result in [
         db.branch_create("feature").await,
-        db.branch_create_from("main", "feature").await,
+        db.branch_create_from("main", "feature").await.map(drop),
     ] {
         let error = result.unwrap_err();
         assert!(
@@ -3929,7 +4530,9 @@ async fn branch_namespace_rejects_live_physical_path_prefix_collisions() {
     }
     for result in [
         db.branch_create("feature/child").await,
-        db.branch_create_from("main", "feature/child").await,
+        db.branch_create_from("main", "feature/child")
+            .await
+            .map(drop),
     ] {
         let error = result.unwrap_err();
         assert!(
@@ -3976,7 +4579,7 @@ async fn branch_namespace_rejects_live_physical_path_prefix_collisions() {
     );
     for result in [
         db.branch_create("feature").await,
-        db.branch_create_from("main", "feature").await,
+        db.branch_create_from("main", "feature").await.map(drop),
     ] {
         let error = result.unwrap_err();
         assert!(

@@ -1,0 +1,160 @@
+{
+  "version": "4.0",
+  "category": "encode",
+  "description": "Arrays of objects encoding – list form for non-uniform objects and complex structures",
+  "tests": [
+    {
+      "name": "uses list form for objects with different fields",
+      "input": {
+        "items": [
+          { "id": 1, "name": "First" },
+          { "id": 2, "name": "Second", "extra": true }
+        ]
+      },
+      "expected": "items[2]:\n  - id: 1\n    name: First\n  - id: 2\n    name: Second\n    extra: true",
+      "specSection": "9.4"
+    },
+    {
+      "name": "preserves field order in list items",
+      "input": {
+        "items": [
+          { "nums": [1, 2, 3], "name": "Ada" },
+          { "name": "Ada", "nums": [1, 2, 3] }
+        ]
+      },
+      "expected": "items[2]:\n  - nums[3]: 1,2,3\n    name: Ada\n  - name: Ada\n    nums[3]: 1,2,3",
+      "specSection": "10"
+    },
+    {
+      "name": "uses list form for objects containing arrays of arrays",
+      "input": {
+        "items": [
+          { "matrix": [[1, 2], [3, 4]], "name": "grid" }
+        ]
+      },
+      "expected": "items[1]:\n  - matrix[2]:\n      - [2]: 1,2\n      - [2]: 3,4\n    name: grid",
+      "specSection": "10"
+    },
+    {
+      "name": "uses tabular form for a list-item object's first field, with and without sibling fields",
+      "input": {
+        "items": [
+          { "users": [{ "id": 1, "name": "Ada" }, { "id": 2, "name": "Bob" }], "status": "active" },
+          { "users": [{ "id": 3, "name": "Cy" }, { "id": 4, "name": "Dee" }] }
+        ]
+      },
+      "expected": "items[2]:\n  - users[2]{id,name}:\n      1,Ada\n      2,Bob\n    status: active\n  - users[2]{id,name}:\n      3,Cy\n      4,Dee",
+      "specSection": "10",
+      "note": "Tabular header on hyphen line with rows at depth +2 and sibling fields at depth +1"
+    },
+    {
+      "name": "uses list form for nested object arrays with mismatched keys",
+      "input": {
+        "items": [
+          { "users": [{ "id": 1, "name": "Ada" }, { "id": 2 }], "status": "active" }
+        ]
+      },
+      "expected": "items[1]:\n  - users[2]:\n      - id: 1\n        name: Ada\n      - id: 2\n    status: active",
+      "specSection": "10"
+    },
+    {
+      "name": "places empty arrays on the hyphen line when first and at field depth when later",
+      "input": {
+        "items": [
+          { "data": [], "name": "Ada" },
+          { "name": "Bob", "data": [] }
+        ]
+      },
+      "expected": "items[2]:\n  - data: []\n    name: Ada\n  - name: Bob\n    data: []",
+      "specSection": "10"
+    },
+    {
+      "name": "uses field order from first object for tabular headers",
+      "input": {
+        "items": [
+          { "a": 1, "b": 2, "c": 3 },
+          { "c": 30, "b": 20, "a": 10 }
+        ]
+      },
+      "expected": "items[2]{a,b,c}:\n  1,2,3\n  10,20,30",
+      "specSection": "9.3"
+    },
+    {
+      "name": "uses list form when one object has nested field",
+      "input": {
+        "items": [
+          { "id": 1, "data": "string" },
+          { "id": 2, "data": { "nested": true } }
+        ]
+      },
+      "expected": "items[2]:\n  - id: 1\n    data: string\n  - id: 2\n    data:\n      nested: true",
+      "specSection": "9.4"
+    },
+    {
+      "name": "uses list form for arrays containing empty objects",
+      "input": {
+        "items": [{}, {}]
+      },
+      "expected": "items[2]:\n  -\n  -",
+      "specSection": "9.4",
+      "note": "Empty objects are excluded from tabular detection (§9.3), so the array uses list form with bare hyphen markers (§10)"
+    },
+    {
+      "name": "encodes a keyed-eligible object in a tabular column as a nested field group",
+      "input": {
+        "a": [
+          {
+            "t": {
+              "p": {
+                "x": 1
+              },
+              "q": {
+                "x": 2
+              }
+            },
+            "other": 9
+          }
+        ]
+      },
+      "expected": "a[1]{t{p{x},q{x}},other}:\n  1,2,9",
+      "specSection": "9.5",
+      "note": "Keyed tabular form is mandated in object-field and root positions, not in a column",
+      "minSpecVersion": "4.1"
+    },
+    {
+      "name": "places an empty object first field on the hyphen line",
+      "input": {
+        "items": [
+          {
+            "a": {},
+            "b": 1
+          }
+        ]
+      },
+      "expected": "items[1]:\n  - a:\n    b: 1",
+      "specSection": "10"
+    },
+    {
+      "name": "uses tabular form for a later field of a list-item object",
+      "input": {
+        "items": [
+          {
+            "id": 1,
+            "users": [
+              {
+                "id": 1,
+                "name": "Ada"
+              },
+              {
+                "id": 2,
+                "name": "Bob"
+              }
+            ]
+          }
+        ]
+      },
+      "expected": "items[1]:\n  - id: 1\n    users[2]{id,name}:\n      1,Ada\n      2,Bob",
+      "specSection": "10"
+    }
+  ]
+}

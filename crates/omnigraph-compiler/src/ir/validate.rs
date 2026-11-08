@@ -246,6 +246,7 @@ mod tests {
             let expression = IRExpr::null_test(
                 IRExpr::Aggregate {
                     func: AggFunc::Sum,
+                    distinct: false,
                     arg: Box::new(IRExpr::Literal(
                         Literal::Integer(1),
                         crate::types::ExprType::from_prop(&crate::types::PropType::scalar(

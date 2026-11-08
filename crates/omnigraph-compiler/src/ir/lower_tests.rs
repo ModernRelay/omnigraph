@@ -1388,6 +1388,117 @@ return { $p.name }
     }
 }
 
+/// The binding the leading order key ranks roots its component, whatever the
+/// declaration order. One only a traversal introduces gets a `NodeScan` of
+/// its checked type; every declared binding is then deferred, and its inline
+/// filter moves onto the reverse expand that introduces it.
+#[test]
+fn test_lower_ranked_binding_roots_its_component_issue_789() {
+    let catalog = build_catalog(
+        &parse_schema(
+            r#"
+node Person { name: String }
+node Doc { body: String @index  embedding: Vector(2) @index }
+edge Knows: Person -> Doc
+edge Cites: Doc -> Doc
+"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let query = |pattern: &str, order: &str| {
+        format!(
+            "query q($q: String, $v: Vector(2)) {{ match {{ {pattern} }} return {{ $d.body }} order {{ {order} }} limit 3 }}"
+        )
+    };
+    let ranked_root = |ir: &QueryIR| match &ir.pipeline[0] {
+        IROp::NodeScan {
+            variable,
+            type_name,
+            filters,
+        } => (variable.clone(), type_name.clone(), filters.len()),
+        other => panic!("a NodeScan root, got {other:?}"),
+    };
+
+    for order in [
+        "bm25($d.body, $q)",
+        "nearest($d.embedding, $v)",
+        "rrf(nearest($d.embedding, $v), bm25($d.body, $q))",
+    ] {
+        // Undeclared: the traversal alone introduces `$d`.
+        let ir = lower(
+            &catalog,
+            &query("$p: Person { name: \"p1\" }  $p knows $d", order),
+        );
+        assert_eq!(ir.pipeline.len(), 2, "{order}: {:?}", ir.pipeline);
+        assert_eq!(ranked_root(&ir), ("d".into(), "Doc".into(), 0), "{order}");
+        assert!(
+            matches!(
+                &ir.pipeline[1],
+                IROp::Expand { src_var, dst_var, src_type, dst_type, dst_filters, .. }
+                if src_var == "d" && dst_var == "p" && src_type == "Doc"
+                    && dst_type == "Person" && dst_filters.len() == 1
+            ),
+            "{order}: {:?}",
+            ir.pipeline[1]
+        );
+
+        // Declared second: the same plan.
+        let declared = lower(
+            &catalog,
+            &query("$p: Person { name: \"p1\" }  $d: Doc  $p knows $d", order),
+        );
+        assert_eq!(
+            format!("{:?}", declared.pipeline),
+            format!("{:?}", ir.pipeline),
+            "{order}"
+        );
+    }
+
+    // Two hops back to the declared source.
+    let ir = lower(
+        &catalog,
+        &query(
+            "$p: Person { name: \"p1\" }  $p knows $x  $x cites $d",
+            "bm25($d.body, $q)",
+        ),
+    );
+    assert_eq!(ranked_root(&ir), ("d".into(), "Doc".into(), 0));
+    let expands: Vec<_> = ir.pipeline[1..]
+        .iter()
+        .map(|op| match op {
+            IROp::Expand {
+                src_var, dst_var, ..
+            } => (src_var.as_str(), dst_var.as_str()),
+            other => panic!("an expand, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(expands, [("d", "x"), ("x", "p")]);
+
+    // A ranked binding in a component of its own and an unranked component
+    // keep their declaration order; the order key decides only its component.
+    let ir = lower(
+        &catalog,
+        &query("$p: Person  $o: Doc  $p knows $d", "bm25($o.body, $q)"),
+    );
+    let scans: Vec<_> = ir
+        .pipeline
+        .iter()
+        .filter_map(|op| match op {
+            IROp::NodeScan { variable, .. } => Some(variable.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(scans, ["p", "o"]);
+
+    // Without a ranking, the first declared binding roots the component.
+    let ir = lower(
+        &catalog,
+        &query("$p: Person { name: \"p1\" }  $p knows $d", "$d.body"),
+    );
+    assert_eq!(ranked_root(&ir), ("p".into(), "Person".into(), 1));
+}
+
 /// A block binding whose component reaches the outer variable is deferred
 /// onto the expand from `$p`, its inline filter a destination filter (#763).
 #[test]

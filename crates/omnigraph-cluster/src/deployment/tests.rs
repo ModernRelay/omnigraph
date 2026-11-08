@@ -159,6 +159,129 @@ async fn bootstrap_and_add_graph_use_one_v2_protocol_without_reset() {
 }
 
 #[tokio::test]
+async fn direct_source_operations_use_selected_root_and_same_id_never_reexecutes() {
+    let source = crate::tests::identity_fixture();
+    let selected = tempfile::tempdir().unwrap();
+    let root = selected.path().to_str().unwrap();
+    let source_base = format!("file://{}/", source.path().display());
+    edit_config(source.path(), |config| {
+        config["graphs"]["knowledge"]["external_blobs"] = yaml_serde::from_str(&format!(
+            "allow:\n  - base: {source_base}\n    scope: embedded_only\n"
+        ))
+        .unwrap();
+    });
+    let validated = validate_config_dir(source.path());
+    assert!(validated.ok, "{:?}", validated.diagnostics);
+    let binding = omnigraph_storage::CapturedStorageBinding::capture(
+        root,
+        &omnigraph_storage::StorageDestination::Local,
+    )
+    .unwrap();
+    let preview =
+        plan_config_dir_with_binding_as(source.path(), &binding, Some("principal:owner".into()))
+            .await;
+    assert!(preview.ok, "{:?}", preview.diagnostics);
+    assert!(!source.path().join(CLUSTER_STATE_FILE).exists());
+    assert!(!selected.path().join(CLUSTER_STATE_FILE).exists());
+    let result =
+        apply_deployment_with_binding(source.path(), &binding, None, &owner(), |_, _, _| {})
+            .await
+            .unwrap();
+    let DeploymentLookup::Complete { result } = result else {
+        panic!("{result:?}");
+    };
+    assert!(result.converged);
+    assert!(selected.path().join("graphs/knowledge.omni").is_dir());
+    assert!(!source.path().join("graphs").exists());
+    assert!(!source.path().join(CLUSTER_STATE_FILE).exists());
+    let ledger = fs::read(selected.path().join(CLUSTER_STATE_FILE)).unwrap();
+    let repeated = apply_deployment_with_binding(
+        source.path(),
+        &binding,
+        Some(&result.id),
+        &owner(),
+        |_, _, _| panic!("known identity must not execute"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(repeated, DeploymentLookup::Complete { result: prior } if prior.id == result.id)
+    );
+    assert_eq!(
+        fs::read(selected.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        ledger
+    );
+    let observed = observe_config_dir_with_binding(source.path(), &binding).await;
+    assert!(observed.ok, "{:?}", observed.diagnostics);
+    assert_eq!(
+        fs::read(selected.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        ledger
+    );
+    let config_path = source.path().join(CLUSTER_CONFIG_FILE);
+    let config = fs::read_to_string(&config_path).unwrap();
+    edit_config(source.path(), |config| {
+        config["graphs"]["knowledge"]["external_blobs"]["allow"][0]["base"] =
+            yaml_serde::Value::String(format!("file://{root}/"));
+    });
+    // Offline source validation has no destination. Plan and apply must still
+    // refuse a policy that overlaps the selected root before ledger effects.
+    assert!(validate_config_dir(source.path()).ok);
+    let overlap =
+        plan_config_dir_with_binding_as(source.path(), &binding, Some("principal:owner".into()))
+            .await;
+    assert!(!overlap.ok);
+    assert!(
+        overlap
+            .diagnostics
+            .iter()
+            .any(|error| error.code == "external_blob_base_overlaps_storage_root")
+    );
+    assert_eq!(
+        apply_deployment_with_binding(source.path(), &binding, None, &owner(), |_, _, _| panic!(
+            "overlapping destination must not execute"
+        ))
+        .await
+        .unwrap_err()
+        .code,
+        "external_blob_base_overlaps_storage_root"
+    );
+    assert_eq!(
+        fs::read(selected.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        ledger
+    );
+    fs::write(&config_path, format!("storage: .\n{config}")).unwrap();
+    let refused =
+        plan_config_dir_with_binding_as(source.path(), &binding, Some("principal:owner".into()))
+            .await;
+    assert!(!refused.ok);
+    assert!(
+        refused
+            .diagnostics
+            .iter()
+            .any(|error| error.code == "deployment_input_invalid")
+    );
+    assert!(
+        !observe_config_dir_with_binding(source.path(), &binding)
+            .await
+            .ok
+    );
+    assert_eq!(
+        apply_deployment_with_binding(source.path(), &binding, None, &owner(), |_, _, _| panic!(
+            "mismatched target must not execute"
+        ))
+        .await
+        .unwrap_err()
+        .code,
+        "deployment_input_invalid"
+    );
+    assert_eq!(
+        fs::read(selected.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        ledger
+    );
+    assert!(!source.path().join(CLUSTER_STATE_FILE).exists());
+}
+
+#[tokio::test]
 async fn held_server_owner_applies_twice_and_retains_exact_achieved_receipts() {
     let dir = crate::tests::identity_fixture();
     let root = dir.path().to_str().unwrap();
@@ -327,8 +450,8 @@ async fn held_server_owner_applies_twice_and_retains_exact_achieved_receipts() {
         config["graphs"]
             .as_mapping_mut()
             .unwrap()
-            .remove(serde_yaml::Value::from("second"));
-        config["policies"]["base"]["applies_to"] = serde_yaml::from_str("[knowledge]").unwrap();
+            .remove(yaml_serde::Value::from("second"));
+        config["policies"]["base"]["applies_to"] = yaml_serde::from_str("[knowledge]").unwrap();
     });
     let bundle = capture_deployment(dir.path()).unwrap();
     // A removed graph may be blocked without a live engine. Observing its
@@ -635,11 +758,11 @@ async fn authenticated_deployment_checks_current_policy_before_every_effect() {
     // Graph removal still requires the existing schema capability in addition
     // to cluster management. A candidate policy cannot grant it retroactively.
     edit_config(dir.path(), |config| {
-        config["graphs"] = serde_yaml::from_str("{}").unwrap();
+        config["graphs"] = yaml_serde::from_str("{}").unwrap();
         config["policies"]
             .as_mapping_mut()
             .unwrap()
-            .remove(serde_yaml::Value::from("base"));
+            .remove(yaml_serde::Value::from("base"));
     });
     let graph_before = graph_state(dir.path(), "knowledge").await;
     let error = apply_deployment(
@@ -910,9 +1033,9 @@ async fn graph_lifecycle_cannot_escape_cluster_root_through_symlink() {
                 config["graphs"]
                     .as_mapping_mut()
                     .unwrap()
-                    .remove(serde_yaml::Value::from("second"));
+                    .remove(yaml_serde::Value::from("second"));
                 config["policies"]["base"]["applies_to"] =
-                    serde_yaml::from_str("[knowledge]").unwrap();
+                    yaml_serde::from_str("[knowledge]").unwrap();
             });
         } else {
             add_second_graph(dir.path());
@@ -991,6 +1114,78 @@ fn remote_capture_does_not_open_server_storage() {
         assert_eq!(captured.canonical_root(), root);
     }
 
+    // Portable source may allow files beside itself. Only the advertised
+    // destination matters, and its path still need not exist on this client.
+    let remote_parent = tempfile::tempdir().unwrap();
+    let remote_path = remote_parent.path().join("server-only-storage");
+    let remote_root = format!("file://{}", remote_path.display());
+    fs::write(&config_path, &config).unwrap();
+    edit_config(dir.path(), |config| {
+        config["graphs"]["knowledge"]["external_blobs"] = yaml_serde::from_str(&format!(
+            "allow:\n  - base: file://{}/\n    scope: embedded_only\n",
+            dir.path().display()
+        ))
+        .unwrap();
+    });
+    let captured = capture_deployment_for_server(dir.path(), &remote_root).unwrap();
+    assert_eq!(captured.canonical_root(), remote_root);
+    assert!(!remote_path.exists());
+    let colocated_root = format!("file://{}", fs::canonicalize(dir.path()).unwrap().display());
+    assert_eq!(
+        capture_deployment_for_server(dir.path(), &colocated_root)
+            .unwrap_err()
+            .code,
+        "deployment_input_invalid"
+    );
+
+    // Direct targets choose storage independently from source. Absence is not
+    // a source-directory fallback, and local assertions are source-relative.
+    fs::write(&config_path, &config).unwrap();
+    let selected = tempfile::tempdir().unwrap();
+    let selected_root = selected.path().to_str().unwrap();
+    let selected_identity = format!(
+        "file://{}",
+        fs::canonicalize(selected.path()).unwrap().display()
+    );
+    let direct = capture_deployment_at_root(dir.path(), selected_root).unwrap();
+    assert_eq!(direct.canonical_root(), selected_identity);
+    for assertion in [selected_root, selected_identity.as_str()] {
+        fs::write(&config_path, format!("storage: {assertion}\n{config}")).unwrap();
+        let asserted = capture_deployment_at_root(dir.path(), selected_root).unwrap();
+        assert_eq!(asserted.canonical_root(), selected_identity);
+        validate_bundle(&asserted, &selected_identity).unwrap();
+    }
+    fs::write(&config_path, &config).unwrap();
+    assert!(!dir.path().join(CLUSTER_STATE_FILE).exists());
+    assert!(!selected.path().join(CLUSTER_STATE_FILE).exists());
+    assert_eq!(
+        capture_deployment_at_root(dir.path(), missing.to_str().unwrap())
+            .unwrap_err()
+            .code,
+        "storage_root_invalid"
+    );
+    fs::write(&config_path, format!("storage: .\n{config}")).unwrap();
+    assert_eq!(
+        capture_deployment_at_root(dir.path(), selected_root)
+            .unwrap_err()
+            .code,
+        "deployment_input_invalid"
+    );
+    let colocated = capture_deployment_at_root(dir.path(), dir.path().to_str().unwrap()).unwrap();
+    assert_eq!(
+        colocated.canonical_root(),
+        format!("file://{}", fs::canonicalize(dir.path()).unwrap().display())
+    );
+    #[cfg(unix)]
+    {
+        let alias = dir.path().join("selected-alias");
+        std::os::unix::fs::symlink(selected.path(), &alias).unwrap();
+        fs::write(&config_path, format!("storage: ./selected-alias\n{config}")).unwrap();
+        let asserted = capture_deployment_at_root(dir.path(), selected_root).unwrap();
+        assert_eq!(asserted.canonical_root(), selected_identity);
+        validate_bundle(&asserted, &selected_identity).unwrap();
+    }
+
     // Existing local roots produce identical frozen input across executors.
     let local_root = format!("file://{}", fs::canonicalize(dir.path()).unwrap().display());
     fs::write(&config_path, format!("storage: {local_root}\n{config}")).unwrap();
@@ -1022,11 +1217,11 @@ fn remote_capture_does_not_open_server_storage() {
     }
 }
 
-fn edit_config(dir: &Path, edit: impl FnOnce(&mut serde_yaml::Value)) {
+fn edit_config(dir: &Path, edit: impl FnOnce(&mut yaml_serde::Value)) {
     let path = dir.join(CLUSTER_CONFIG_FILE);
-    let mut value = serde_yaml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let mut value = yaml_serde::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     edit(&mut value);
-    fs::write(path, serde_yaml::to_string(&value).unwrap()).unwrap();
+    fs::write(path, yaml_serde::to_string(&value).unwrap()).unwrap();
 }
 
 async fn graph_state(dir: &Path, graph: &str) -> (omnigraph::db::SchemaContractDigest, u64) {
@@ -1075,9 +1270,9 @@ async fn current_policy_authorizes_policy_edits_rebinding_and_removal() {
         config["policies"]
             .as_mapping_mut()
             .unwrap()
-            .remove(serde_yaml::Value::from("base"));
+            .remove(yaml_serde::Value::from("base"));
         config["policies"]["replacement"] =
-            serde_yaml::from_str("file: ./replacement.policy.yaml\napplies_to: [knowledge]\n")
+            yaml_serde::from_str("file: ./replacement.policy.yaml\napplies_to: [knowledge]\n")
                 .unwrap();
     });
     bootstrap(dir.path()).await;
@@ -1086,7 +1281,7 @@ async fn current_policy_authorizes_policy_edits_rebinding_and_removal() {
         config["policies"]
             .as_mapping_mut()
             .unwrap()
-            .remove(serde_yaml::Value::from("replacement"));
+            .remove(yaml_serde::Value::from("replacement"));
     });
     bootstrap(dir.path()).await;
     let (state, _) = execution::read_existing(&store).await.unwrap();
@@ -1134,12 +1329,12 @@ async fn provider_crud_binding_and_blob_updates_preserve_graph_identity() {
     let original = graph_state(dir.path(), "knowledge").await;
     for model in ["mock:first", "mock:second"] {
         edit_config(dir.path(), |config| {
-            config["providers"] = serde_yaml::from_str(&format!(
+            config["providers"] = yaml_serde::from_str(&format!(
                 "embedding:\n  selected:\n    kind: mock\n    model: {model}\n"
             ))
             .unwrap();
             config["graphs"]["knowledge"]["embedding_provider"] = "selected".into();
-            config["graphs"]["knowledge"]["external_blobs"] = serde_yaml::from_str(
+            config["graphs"]["knowledge"]["external_blobs"] = yaml_serde::from_str(
                 "allow:\n  - base: s3://trusted-bucket/data/\n    scope: server_safe\n",
             )
             .unwrap();
@@ -1151,10 +1346,10 @@ async fn provider_crud_binding_and_blob_updates_preserve_graph_identity() {
         config
             .as_mapping_mut()
             .unwrap()
-            .remove(serde_yaml::Value::from("providers"));
+            .remove(yaml_serde::Value::from("providers"));
         let graph = config["graphs"]["knowledge"].as_mapping_mut().unwrap();
-        graph.remove(serde_yaml::Value::from("embedding_provider"));
-        graph.remove(serde_yaml::Value::from("external_blobs"));
+        graph.remove(yaml_serde::Value::from("embedding_provider"));
+        graph.remove(yaml_serde::Value::from("external_blobs"));
     });
     bootstrap(dir.path()).await;
     let store = ClusterStore::for_config_dir(dir.path());
@@ -1204,8 +1399,8 @@ async fn graph_removal_deletes_exact_managed_root_and_retains_peers() {
             config["graphs"]
                 .as_mapping_mut()
                 .unwrap()
-                .remove(serde_yaml::Value::from("second"));
-            config["policies"]["base"]["applies_to"] = serde_yaml::from_str("[knowledge]").unwrap();
+                .remove(yaml_serde::Value::from("second"));
+            config["policies"]["base"]["applies_to"] = yaml_serde::from_str("[knowledge]").unwrap();
         });
         let captured = capture_deployment(dir.path()).unwrap();
         if initial_root == "foreign" {
@@ -1396,7 +1591,7 @@ async fn corrupt_catalog_payloads_refuse_without_repair_or_candidate_authority()
                 config["graphs"]["knowledge"]
                     .as_mapping_mut()
                     .unwrap()
-                    .remove(serde_yaml::Value::from("queries"));
+                    .remove(yaml_serde::Value::from("queries"));
             });
         }
         let captured = capture_deployment(dir.path()).unwrap();
@@ -1435,9 +1630,9 @@ async fn configuration_management_does_not_require_unrelated_graph_data_read() {
     )
     .unwrap();
     edit_config(dir.path(), |config| {
-        config["policies"]["base"]["applies_to"] = serde_yaml::from_str("[knowledge]").unwrap();
+        config["policies"]["base"]["applies_to"] = yaml_serde::from_str("[knowledge]").unwrap();
         config["policies"]["closed"] =
-            serde_yaml::from_str("file: ./closed.policy.yaml\napplies_to: [second]\n").unwrap();
+            yaml_serde::from_str("file: ./closed.policy.yaml\napplies_to: [second]\n").unwrap();
     });
     bootstrap(dir.path()).await;
     unlock(root).await;
@@ -1487,4 +1682,70 @@ async fn configuration_management_does_not_require_unrelated_graph_data_read() {
             )
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn catalogue_policy_deploys_without_a_managed_graph_and_survives_projection() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let config = dir.path().join(CLUSTER_CONFIG_FILE);
+    let policy = dir.path().join("catalogue.policy.yaml");
+    fs::write(
+        &config,
+        "version: 1\npolicies:\n  catalogue:\n    file: ./catalogue.policy.yaml\n    applies_to: [graph.og_catalog]\n",
+    )
+    .unwrap();
+    fs::write(&policy, "version: 1\nrules: []\n").unwrap();
+    let captured = capture_deployment(dir.path()).unwrap();
+    assert!(captured.graph_ids().is_empty());
+    let first = bootstrap(dir.path()).await;
+    assert!(first.graphs.is_empty());
+    assert!(!dir.path().join("graphs/og_catalog.omni").exists());
+
+    for snapshot in [
+        read_serving_snapshot_from_storage(root).await.unwrap(),
+        read_deployment_serving_snapshot(root, &[]).await.unwrap(),
+        read_deployment_serving_snapshot(root, &["unrelated".into()])
+            .await
+            .unwrap(),
+    ] {
+        assert!(snapshot.graphs.is_empty());
+        assert!(snapshot.applied_graphs.is_empty());
+        assert_eq!(snapshot.policies.len(), 1);
+        assert_eq!(snapshot.policies[0].applies_to, ["graph.og_catalog"]);
+    }
+    unlock(root).await;
+    fs::write(&policy, "version: 1\nrules: []\n# updated\n").unwrap();
+    let second = bootstrap(dir.path()).await;
+    assert!(second.graphs.is_empty());
+    let snapshot = read_serving_snapshot_from_storage(root).await.unwrap();
+    assert_eq!(
+        snapshot.policies[0].source,
+        fs::read_to_string(&policy).unwrap()
+    );
+    unlock(root).await;
+
+    fs::write(&config, "version: 1\n").unwrap();
+    let removed = bootstrap(dir.path()).await;
+    assert!(removed.graphs.is_empty());
+    assert!(
+        read_serving_snapshot_from_storage(root)
+            .await
+            .unwrap()
+            .policies
+            .is_empty()
+    );
+    unlock(root).await;
+
+    fs::write(dir.path().join("people.pg"), crate::tests::SCHEMA).unwrap();
+    fs::write(
+        &config,
+        "version: 1\ngraphs:\n  og_reserved:\n    schema: ./people.pg\n",
+    )
+    .unwrap();
+    let error = apply_deployment(dir.path(), None, &owner(), |_, _, _| {})
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "reserved_graph_id");
+    assert!(!dir.path().join("graphs/og_reserved.omni").exists());
 }

@@ -10,9 +10,12 @@ use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
 use omnigraph_compiler::traversal::EdgeSelection;
 
 use crate::aggregate::AggregateSpec;
-use crate::cost::{AccessPath, ExpandMode, ExpandPolicy};
+use crate::cost::{AccessPath, ExpandMode, ExpandPolicy, ValidateRemoval};
 use crate::error::PlanError;
-use crate::logical::{ColumnRef, KeyJoinKind, ScanSpec};
+use crate::logical::{
+    ColumnRef, CsvSourceSpec, DeltaSourceSpec, FragmentWriteSpec, KeyJoinKind, ScanSpec,
+    ValidateSpec,
+};
 use crate::physical::{
     HydratedBinding, NodeId, PhysicalNode, PhysicalPlan, RankArm, RankedAccess, ScanInput,
 };
@@ -86,6 +89,37 @@ impl ContainsJoinFields<'_> {
     pub fn conjunct(&self) -> IRExpr {
         self.conjunct.clone()
     }
+}
+
+/// The fields of [`PhysicalNode::CsvSource`].
+#[derive(Debug, Clone, Copy)]
+pub struct CsvSourceFields<'p> {
+    pub spec: &'p CsvSourceSpec,
+    pub max_partitions: u32,
+    pub max_workers: u32,
+}
+
+/// The fields of [`PhysicalNode::DeltaSource`].
+#[derive(Debug, Clone, Copy)]
+pub struct DeltaSourceFields<'p> {
+    pub spec: &'p DeltaSourceSpec,
+}
+
+/// The fields of [`PhysicalNode::Validate`] beside its input.
+#[derive(Debug, Clone, Copy)]
+pub struct ValidateFields<'p> {
+    pub table: &'p str,
+    pub checks: &'p [ValidateSpec],
+    pub removal: ValidateRemoval,
+    pub max_workers: u32,
+}
+
+/// The fields of [`PhysicalNode::FragmentWrite`] beside its input.
+#[derive(Debug, Clone, Copy)]
+pub struct FragmentWriteFields<'p> {
+    pub spec: &'p FragmentWriteSpec,
+    pub max_input_bytes: u64,
+    pub max_workers: u32,
 }
 
 /// One method per [`PhysicalNode`] variant, called by [`PhysicalPlan::lower`]
@@ -244,6 +278,34 @@ pub trait Lower {
         order_by: &[IROrdering],
         fetch: Option<usize>,
         tiebreak: &[ColumnRef],
+        input: Self::Op,
+    ) -> Result<Self::Op, Self::Error>;
+
+    /// A load's leaf.
+    fn csv_source(
+        &mut self,
+        id: NodeId,
+        fields: CsvSourceFields<'_>,
+    ) -> Result<Self::Op, Self::Error>;
+
+    /// A write's leaf, the executor's staged delta.
+    fn delta_source(
+        &mut self,
+        id: NodeId,
+        fields: DeltaSourceFields<'_>,
+    ) -> Result<Self::Op, Self::Error>;
+
+    fn validate(
+        &mut self,
+        id: NodeId,
+        fields: ValidateFields<'_>,
+        input: Self::Op,
+    ) -> Result<Self::Op, Self::Error>;
+
+    fn fragment_write(
+        &mut self,
+        id: NodeId,
+        fields: FragmentWriteFields<'_>,
         input: Self::Op,
     ) -> Result<Self::Op, Self::Error>;
 
@@ -533,6 +595,55 @@ impl PhysicalPlan {
             } => {
                 let input = self.lower_node(*input, l)?;
                 l.sort(id, order_by, *fetch, tiebreak, input)
+            }
+            PhysicalNode::DeltaSource { spec } => l.delta_source(id, DeltaSourceFields { spec }),
+            PhysicalNode::CsvSource {
+                spec,
+                max_partitions,
+                max_workers,
+            } => l.csv_source(
+                id,
+                CsvSourceFields {
+                    spec,
+                    max_partitions: *max_partitions,
+                    max_workers: *max_workers,
+                },
+            ),
+            PhysicalNode::Validate {
+                input,
+                table,
+                checks,
+                removal,
+                max_workers,
+            } => {
+                let input = self.lower_node(*input, l)?;
+                l.validate(
+                    id,
+                    ValidateFields {
+                        table,
+                        checks,
+                        removal: *removal,
+                        max_workers: *max_workers,
+                    },
+                    input,
+                )
+            }
+            PhysicalNode::FragmentWrite {
+                input,
+                spec,
+                max_input_bytes,
+                max_workers,
+            } => {
+                let input = self.lower_node(*input, l)?;
+                l.fragment_write(
+                    id,
+                    FragmentWriteFields {
+                        spec,
+                        max_input_bytes: *max_input_bytes,
+                        max_workers: *max_workers,
+                    },
+                    input,
+                )
             }
         }
     }

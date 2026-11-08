@@ -5,7 +5,8 @@
 
 use crate::helpers;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use arrow_array::{Array, LargeBinaryArray, StringArray};
@@ -13,12 +14,17 @@ use base64::Engine;
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
+use lance::io::WrappingObjectStore;
 use lance_core::datatypes::BlobHandling;
+use lance_io::utils::tracking_store::IOTracker;
+use lance_table::io::commit::ManifestNamingScheme;
 use omnigraph::IndexCoverage;
 use omnigraph::db::{
     CleanupPolicyOptions, MergeOutcome, Omnigraph, ReadTarget, RepairAction, RepairClassification,
-    RepairOptions,
+    RepairOptions, SnapshotId,
 };
+use omnigraph::error::{BranchStartRefusal, OmniError};
+use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
 use omnigraph::loader::LoadMode;
 use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 
@@ -483,7 +489,11 @@ node Doc {
         .pending_indexes;
     assert_eq!(deferred.len(), 1);
     assert_eq!(deferred[0].property, "slug");
-    assert!(deferred[0].reason.contains("rebuild-full-text-indexes"));
+    assert!(
+        deferred[0]
+            .reason
+            .contains("omnigraph index rebuild --kind full-text")
+    );
     let commits_before = db.list_commits(None).await.unwrap().len();
     for _ in 0..2 {
         let repeated = db.optimize().await.unwrap();
@@ -1927,6 +1937,158 @@ async fn full_text_rebuild_replaces_all_columns_and_segments_in_one_publication(
     );
 }
 
+/// An index build on a branch builds the declared indexes a type whose first
+/// rows landed there lacks, rebuilds a BTREE whose coverage lags the branch's
+/// new rows, and publishes both in one commit on that branch, attributed to
+/// its actor. Full-text coverage is pending with the rebuild that refreshes
+/// it; main keeps its registrations and history; a second run publishes
+/// nothing.
+#[tokio::test]
+async fn index_build_on_a_branch_builds_missing_and_lagging_indexes_issue_840() {
+    use omnigraph::db::{BuiltIndex, BuiltIndexAction, BuiltIndexKind};
+
+    let dir = tempfile::tempdir().unwrap();
+    let schema =
+        format!("{TEST_SCHEMA}\nnode Tag {{\n    slug: String @key\n    rank: I64 @index\n}}\n");
+    let db = helpers::init_and_load_with_schema(&dir, &schema).await;
+    db.branch_create("feature").await.unwrap();
+    db.load(
+        "feature",
+        concat!(
+            r#"{"type":"Tag","data":{"slug":"graphs","rank":1}}"#,
+            "\n",
+            r#"{"type":"Tag","data":{"slug":"search","rank":2}}"#,
+            "\n",
+            r#"{"type":"Person","data":{"name":"Eve","age":41}}"#,
+        ),
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let main_before = snapshot_main(&db).await.unwrap();
+    let main_commits_before = db.list_commits(None).await.unwrap();
+    let feature_before = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
+    let tag = feature_before.open_dataset("node:Tag").await.unwrap();
+    assert!(!tag.has_btree_index("__id").await.unwrap());
+    assert!(!tag.has_btree_index("rank").await.unwrap());
+    assert!(matches!(
+        feature_before
+            .open_dataset("node:Person")
+            .await
+            .unwrap()
+            .index_coverage("__id")
+            .await
+            .unwrap(),
+        IndexCoverage::Degraded { .. }
+    ));
+
+    let result = db
+        .ensure_indices_on_as("feature", Some("act-indexer"))
+        .await
+        .unwrap();
+    let built = |type_key: &str, property: &str, kind, action| BuiltIndex {
+        type_key: type_key.to_string(),
+        property: property.to_string(),
+        kind,
+        action,
+    };
+    assert_eq!(result.branch, "feature");
+    assert_eq!(
+        result.indexes,
+        vec![
+            built(
+                "node:Person",
+                "__id",
+                BuiltIndexKind::Btree,
+                BuiltIndexAction::Refreshed
+            ),
+            built(
+                "node:Tag",
+                "__id",
+                BuiltIndexKind::Btree,
+                BuiltIndexAction::Built
+            ),
+            built(
+                "node:Tag",
+                "rank",
+                BuiltIndexKind::Btree,
+                BuiltIndexAction::Built
+            ),
+            built(
+                "node:Tag",
+                "slug",
+                BuiltIndexKind::FullText,
+                BuiltIndexAction::Built
+            ),
+        ]
+    );
+    assert_eq!(result.pending.len(), 1, "{:?}", result.pending);
+    assert_eq!(result.pending[0].type_key, "node:Person");
+    assert_eq!(result.pending[0].property, "name");
+    assert!(
+        result.pending[0]
+            .reason
+            .contains(&omnigraph::error::FULL_TEXT_REBUILD_COMMAND.replace("<branch>", "feature")),
+        "{}",
+        result.pending[0].reason
+    );
+
+    let feature_after = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
+    let tag = feature_after.open_dataset("node:Tag").await.unwrap();
+    for column in ["__id", "rank"] {
+        assert!(
+            matches!(
+                tag.index_coverage(column).await.unwrap(),
+                IndexCoverage::Indexed
+            ),
+            "{column}"
+        );
+    }
+    assert!(matches!(
+        feature_after
+            .open_dataset("node:Person")
+            .await
+            .unwrap()
+            .index_coverage("__id")
+            .await
+            .unwrap(),
+        IndexCoverage::Indexed
+    ));
+    let feature_commits = db.list_commits(Some("feature")).await.unwrap();
+    assert_eq!(
+        result.graph_commit_id.as_deref(),
+        Some(feature_commits[0].graph_commit_id.as_str())
+    );
+    assert_eq!(feature_commits[0].actor_id.as_deref(), Some("act-indexer"));
+
+    let main_after = snapshot_main(&db).await.unwrap();
+    for table_key in [
+        "node:Person",
+        "node:Company",
+        "node:Tag",
+        "edge:Knows",
+        "edge:WorksAt",
+    ] {
+        assert_same_dataset_entry(
+            main_before.dataset(table_key).unwrap(),
+            main_after.dataset(table_key).unwrap(),
+        );
+    }
+    assert_eq!(db.list_commits(None).await.unwrap(), main_commits_before);
+
+    let again = db
+        .ensure_indices_on_as("feature", Some("act-indexer"))
+        .await
+        .unwrap();
+    assert_eq!(again.graph_commit_id, None);
+    assert!(again.indexes.is_empty(), "{:?}", again.indexes);
+    assert_eq!(again.pending, result.pending);
+    assert_eq!(
+        db.list_commits(Some("feature")).await.unwrap(),
+        feature_commits
+    );
+}
+
 /// A branch rebuild stages a detached pin on the inherited location; main's
 /// registrations and rows stay as they were.
 #[tokio::test]
@@ -2035,7 +2197,7 @@ async fn full_text_rebuild_reports_empty_builds_but_not_no_work() {
     .await
     .unwrap();
     let before = snapshot_main(&db).await.unwrap();
-    let result = db.rebuild_full_text_indices_on(" main ").await.unwrap();
+    let result = db.rebuild_full_text_indices_on("main").await.unwrap();
     assert_eq!(result.branch, "main");
     assert_eq!(result.graph_commit_id, None);
     assert!(result.rebuilt_indexes.is_empty());
@@ -2337,6 +2499,74 @@ async fn cleanup_preserves_main_version_pinned_by_live_lazy_branch() {
         count_rows_branch(&db, "feature", "node:Person").await,
         feature_people_before,
         "time-only cleanup must honor the same live lazy-branch floor"
+    );
+}
+
+/// A branch started at a past commit keeps that commit retained: its first
+/// `__manifest` version is its base, which cleanup always retains with every
+/// table version it pins. A commit whose table versions cleanup reclaimed
+/// starts no branch: the refusal names the reclaimed table, and nothing is
+/// created.
+#[tokio::test]
+async fn cleanup_retains_the_commit_a_branch_starts_at() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let loaded = db.list_commits(Some("main")).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 40)]),
+    )
+    .await
+    .unwrap();
+    let eve = db.list_commits(Some("main")).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    add_person_fragments(&db).await;
+    let at = |id: &str| ReadTarget::snapshot(SnapshotId::new(id));
+
+    db.branch_create_from(at(&loaded), "at-load").await.unwrap();
+    let people_at_load = count_rows_branch(&db, "at-load", "node:Person").await;
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        count_rows_branch(&db, "at-load", "node:Person").await,
+        people_at_load,
+        "the branch's base keeps the commit's table versions"
+    );
+    db.branch_create_from(at(&loaded), "again")
+        .await
+        .expect("a commit a live branch starts at stays retained");
+
+    let refused = db
+        .branch_create_from(at(&eve), "at-eve")
+        .await
+        .expect_err("cleanup reclaimed the Person version Eve's commit pins")
+        .into_completion_evidence()
+        .0;
+    assert!(
+        matches!(
+            &refused,
+            OmniError::BranchStartRefused {
+                graph_commit_id,
+                reason: BranchStartRefusal::NotRetained { table_key, .. },
+            } if graph_commit_id == &eve && table_key == "node:Person"
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        !db.branch_list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|branch| branch == "at-eve")
     );
 }
 
@@ -4047,6 +4277,10 @@ async fn collector_cost_is_bounded_by_retained_versions_and_garbage_examined() {
         report.cost.manifest_snapshots
     );
     assert_eq!(
+        report.cost.manifest_time_reads, 0,
+        "--keep alone decides retention from the version listing, reading no commit time"
+    );
+    assert_eq!(
         report.cost.manifest_rechecks, live,
         "coherent capture revalidates each live branch exactly once"
     );
@@ -4099,6 +4333,270 @@ async fn collector_cost_is_bounded_by_retained_versions_and_garbage_examined() {
         report.cost.transaction_reads <= report.cost.table_opens,
         "every transaction read is one of those opens: {:?}",
         report.cost
+    );
+}
+
+/// Attached `__manifest` versions by live branch: `None` for main's
+/// `__manifest/_versions/`, the branch's logical name for
+/// `__manifest/tree/<branch>.<incarnation>/_versions/`.
+type ManifestVersions = BTreeMap<Option<String>, BTreeSet<u64>>;
+
+fn attached_manifest_version(path: &str) -> Option<(Option<String>, u64)> {
+    let start = path.find("__manifest")?;
+    let (dir, file) = path[start..].rsplit_once("/_versions/")?;
+    let version = ManifestNamingScheme::detect_scheme(file)
+        .filter(|_| !file.starts_with('d'))?
+        .parse_version(file)?;
+    let branch = match dir.strip_prefix("__manifest/tree/") {
+        Some(tree) => Some(tree.rsplit_once('.')?.0.to_string()),
+        None if dir == "__manifest" => None,
+        None => return None,
+    };
+    Some((branch, version))
+}
+
+fn attached_manifests_on_disk(root: &std::path::Path) -> ManifestVersions {
+    let mut versions = ManifestVersions::new();
+    let mut pending = vec![root.join("__manifest")];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if let Some((branch, version)) =
+                attached_manifest_version(path.to_str().unwrap())
+            {
+                versions.entry(branch).or_default().insert(version);
+            }
+        }
+    }
+    versions
+}
+
+/// Plan `options` and return the attached `__manifest` versions whose
+/// manifest the plan read, from the request log of every `__manifest` store it opened (a
+/// store's own tracker also sees Lance's direct local reads).
+async fn plan_reading_manifests(
+    db: &Omnigraph,
+    options: CleanupPolicyOptions,
+) -> (omnigraph::db::CollectorReport, ManifestVersions) {
+    let probes = QueryIoProbes {
+        manifest_wrapper: Some(Arc::new(IOTracker::default()) as Arc<dyn WrappingObjectStore>),
+        ..Default::default()
+    };
+    let stores = probes.manifest_stores.clone();
+    let report = with_query_io_probes(probes, db.cleanup_plan(options))
+        .await
+        .unwrap();
+    let mut read = ManifestVersions::new();
+    for store in stores.stores() {
+        for request in store.io_stats_incremental().requests {
+            if let Some((branch, version)) = attached_manifest_version(request.path.as_ref()) {
+                read.entry(branch).or_default().insert(version);
+            }
+        }
+    }
+    (report, read)
+}
+
+/// Issue 644: every policy takes each live branch's `__manifest` version
+/// numbers from the `_versions/` listing. `--keep` alone reads the manifests
+/// of the versions it retains and of the merge base, however long the history
+/// grows; `--older-than` reads the commit time of exactly the versions
+/// `--keep` leaves undecided. With a
+/// zero age window the cutoff retains nothing `--keep` does not, so both
+/// policies plan the same retention and the same sweep, at both depths.
+#[tokio::test]
+async fn cleanup_plans_from_the_manifest_listing_issue_644() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    for name in ["Eve", "Frank", "Grace", "Heidi"] {
+        insert_person(&db, "main", name).await;
+    }
+    db.branch_create("feature").await.unwrap();
+    for name in ["Ivan", "Judy", "Mallory"] {
+        insert_person(&db, "feature", name).await;
+    }
+    insert_person(&db, "main", "Niaj").await;
+    let keep = CleanupPolicyOptions {
+        keep_versions: Some(2),
+        older_than: None,
+    };
+    let aged = CleanupPolicyOptions {
+        keep_versions: Some(2),
+        older_than: Some(Duration::ZERO),
+    };
+
+    let mut time_reads = Vec::new();
+    for later in [
+        &[][..],
+        &["Olivia", "Peggy", "Rupert", "Sybil", "Trent", "Victor"][..],
+    ] {
+        for name in later {
+            insert_person(&db, "main", name).await;
+        }
+        let on_disk = attached_manifests_on_disk(dir.path());
+        assert_eq!(
+            on_disk.keys().cloned().collect::<Vec<_>>(),
+            vec![None, Some("feature".to_string())],
+            "main and the feature tree: {on_disk:?}"
+        );
+        let (keep_plan, keep_read) = plan_reading_manifests(&db, keep.clone()).await;
+        let (aged_plan, aged_read) = plan_reading_manifests(&db, aged.clone()).await;
+        assert_eq!(
+            keep_plan.cost.manifest_time_reads, 0,
+            "--keep alone reads no commit time"
+        );
+
+        // The feature tree's oldest version is main's commit at the fork, the
+        // merge base of the two heads, which cleanup retains on its own rule.
+        let fork = *on_disk[&Some("feature".to_string())].first().unwrap();
+        let mut pruned_total = 0;
+        for (branch, versions) in &on_disk {
+            let row = retained_on(&keep_plan, branch.as_deref());
+            let retained = row.retained.iter().copied().collect::<BTreeSet<_>>();
+            let pruned = row.would_prune.iter().copied().collect::<BTreeSet<_>>();
+            assert_eq!(
+                &retained.union(&pruned).copied().collect::<BTreeSet<_>>(),
+                versions,
+                "{branch:?}: the listing names every attached manifest"
+            );
+            assert!(!pruned.is_empty(), "{branch:?}: {row:?}");
+            pruned_total += pruned.len() as u64;
+            let mut kept = retained.clone();
+            if branch.is_none() {
+                kept.insert(fork);
+            }
+            assert_eq!(
+                keep_read.get(branch).cloned().unwrap_or_default(),
+                kept,
+                "{branch:?}: --keep reads the manifests of the versions it retains \
+                 and of the merge base {fork}, and no other"
+            );
+            let read = aged_read.get(branch).cloned().unwrap_or_default();
+            assert!(
+                pruned.is_subset(&read),
+                "{branch:?}: the cutoff reads each undecided version for its time: \
+                 read {read:?}, pruned {pruned:?}"
+            );
+        }
+        assert_eq!(
+            aged_plan.cost.manifest_time_reads, pruned_total,
+            "the cutoff reads the time of the versions below the --keep floor, \
+             other than HEAD and a branch's base, and no other"
+        );
+        time_reads.push(aged_plan.cost.manifest_time_reads);
+
+        for branch in [None, Some("feature")] {
+            let (keep_row, aged_row) = (
+                retained_on(&keep_plan, branch),
+                retained_on(&aged_plan, branch),
+            );
+            assert_eq!(keep_row.retained, aged_row.retained, "{branch:?}");
+            assert_eq!(keep_row.would_prune, aged_row.would_prune, "{branch:?}");
+        }
+        let sweep = |report: &omnigraph::db::CollectorReport| {
+            report
+                .tables
+                .iter()
+                .map(|plan| {
+                    assert!(
+                        plan.errors.is_empty(),
+                        "{}: {:?}",
+                        plan.location,
+                        plan.errors
+                    );
+                    (
+                        plan.location.clone(),
+                        (
+                            plan.roots.clone(),
+                            plan.linear_roots.clone(),
+                            plan.sweep.clone(),
+                            plan.sweep_paths.clone(),
+                        ),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let keep_sweep = sweep(&keep_plan);
+        assert!(
+            keep_sweep
+                .values()
+                .any(|(_, _, sweep, _)| !sweep.is_empty()),
+            "the fixture has table versions to sweep: {keep_sweep:?}"
+        );
+        assert_eq!(keep_sweep, sweep(&aged_plan));
+    }
+    assert_eq!(
+        time_reads[1],
+        time_reads[0] + 6,
+        "the cutoff's time reads grow with main's history, one per new commit"
+    );
+
+    // A manifest below the floor that is not the merge base is not read by
+    // `--keep`, so a broken one leaves its plan unchanged; the cutoff reads
+    // it for its time and refuses. Each plan opens a fresh handle, so no
+    // session cache stands in for the store.
+    let uri = dir.path().to_str().unwrap().to_string();
+    let plan = |options: CleanupPolicyOptions| {
+        let uri = uri.clone();
+        async move {
+            let fresh = Omnigraph::open(&uri).await.unwrap();
+            fresh.cleanup_plan(options).await
+        }
+    };
+    let outcome = |report: &omnigraph::db::CollectorReport| {
+        let rows = [None, Some("feature")].map(|branch| {
+            let row = retained_on(report, branch);
+            (row.retained.clone(), row.would_prune.clone())
+        });
+        let sweep = report
+            .tables
+            .iter()
+            .map(|plan| {
+                (
+                    plan.location.clone(),
+                    (plan.roots.clone(), plan.sweep.clone()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        (rows, sweep)
+    };
+    let main_manifest = |version: u64| {
+        std::fs::read_dir(dir.path().join("__manifest/_versions"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| attached_manifest_version(path.to_str().unwrap()) == Some((None, version)))
+            .unwrap()
+    };
+    let before = outcome(&plan(keep.clone()).await.unwrap());
+    let fork = *attached_manifests_on_disk(dir.path())[&Some("feature".to_string())]
+        .first()
+        .unwrap();
+    let (_, pruned) = &before.0[0];
+    let (body_swapped, garbage) = (pruned[1], pruned[0]);
+    assert!(
+        garbage < body_swapped && body_swapped < fork,
+        "{pruned:?}, fork {fork}"
+    );
+
+    std::fs::copy(main_manifest(body_swapped + 1), main_manifest(body_swapped)).unwrap();
+    assert_eq!(outcome(&plan(keep.clone()).await.unwrap()), before);
+    let error = plan(aged.clone()).await.unwrap_err();
+    assert!(
+        error.to_string().contains(&format!(
+            "__manifest version {body_swapped} holds a manifest of version {}",
+            body_swapped + 1
+        )),
+        "the cutoff refuses a manifest whose body names another version: {error}"
+    );
+
+    std::fs::write(main_manifest(garbage), b"not a manifest").unwrap();
+    assert_eq!(outcome(&plan(keep).await.unwrap()), before);
+    let error = plan(aged).await.unwrap_err();
+    assert!(
+        error.storage_failure().is_some(),
+        "the cutoff refuses a manifest it cannot decode: {error}"
     );
 }
 

@@ -1138,7 +1138,7 @@ mod tests {
         ] {
             let error = serve_external(&reference, "snapshot-1")
                 .expect_err("a redirect must not widen a ranged external Blob");
-            assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
         }
     }
 }

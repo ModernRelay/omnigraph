@@ -759,6 +759,26 @@ async fn run_cell(
             };
             acknowledged = outcome.is_ok();
             if let Err(error) = outcome {
+                // A data writer that fails after a detached effect and before
+                // its publication never reports an outcome it cannot
+                // establish: the injected refusal is typed, and an opaque
+                // failure in the same window carries `Unpublished`. The
+                // maintenance and schema writers do not carry that mark yet.
+                if matches!(
+                    writer,
+                    Writer::Insert
+                        | Writer::MultiTable
+                        | Writer::Load
+                        | Writer::Merge
+                        | Writer::BlobPut
+                        | Writer::BlobClear
+                ) {
+                    assert_ne!(
+                        error.completion_evidence(),
+                        Some(omnigraph::error::CompletionEvidence::Uncertain),
+                        "{cell}: a failure before publication is definite: {error}"
+                    );
+                }
                 note = format!("err: {}", error.to_string().lines().next().unwrap_or(""));
             }
         }

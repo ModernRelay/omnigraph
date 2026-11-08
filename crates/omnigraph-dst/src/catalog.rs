@@ -1,5 +1,5 @@
 //! The full crash-window catalog for the hunt
-//! (`dst_hunt_crash_window_sweep`): 52 of the engine's decision seams
+//! (`dst_hunt_crash_window_sweep`): 53 of the engine's decision seams
 //! (`omnigraph::seams::catalog`) at the pinned engine version. A seam added
 //! to the engine enters here as never-reached until its workload exists.
 //!
@@ -7,7 +7,7 @@
 //! be a name the engine catalog declares, so a typo'd or renamed-away window
 //! fails the suite instead of compiling and silently never firing.
 
-pub const CRASH_WINDOWS: [&str; 52] = [
+pub const CRASH_WINDOWS: [&str; 53] = [
     "blob_read.post_capture",
     "branch_control.pre_gates",
     "branch_create.post_native",
@@ -62,11 +62,27 @@ pub const CRASH_WINDOWS: [&str; 52] = [
     "cleanup.sweep_between_manifests",
     "cleanup.sweep_pre_file_delete",
     "branch_delete.post_archive",
+    "cleanup.sweep_pre_dead_manifest_delete",
 ];
 
 #[cfg(test)]
 mod tests {
     use super::CRASH_WINDOWS;
+
+    /// Every window the reach census expects dark is a catalog window, so a
+    /// renamed or removed window cannot linger in that list.
+    #[test]
+    fn expected_dark_windows_are_catalog_windows() {
+        let stale: Vec<&str> = crate::harness::REACH_EXPECTED_DARK
+            .iter()
+            .map(|(window, _)| *window)
+            .filter(|window| !CRASH_WINDOWS.contains(window))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "REACH_EXPECTED_DARK names windows the catalog does not hold: {stale:?}"
+        );
+    }
 
     /// The catalog's names-guard (module doc): every entry must be a seam
     /// the engine catalog declares.

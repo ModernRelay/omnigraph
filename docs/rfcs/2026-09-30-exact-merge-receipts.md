@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - OmniGraph maintainers
 created: 2026-09-30
-updated: 2026-10-07
+updated: 2026-10-13
 discussion: null
 supersedes: []
 superseded_by: []
@@ -40,9 +40,10 @@ Nullable metadata retains the publication's value. Fast-forward publishes its
 own target commit with the source head as merged parent; it does not return the
 source commit. `already_up_to_date` explicitly returns `commit: null`.
 
-The dedicated CLI trims source and target names before opening storage or
-submitting HTTP work, matching the engine's canonical names. Empty names refuse
-before dispatch. Receipt validation and optional deletion use those same names.
+The dedicated CLI refuses a source or target name that is empty, padded or
+holds a control character before opening storage or submitting HTTP work, as
+the engine and the server refuse it; no name is trimmed. Receipt validation and
+optional deletion use the names as given.
 
 Optional source deletion remains a subsequent, separately authorized effect.
 When requested, `branch_deleted` is `true` on success or `false` on failure.
@@ -114,3 +115,9 @@ executed gates before marking implementation complete.
   while hardening the reviewed stack.
 
 - 2026-10-07: Replaced the Compatibility sentence tying receipts to v0.12 with the current HTTP admission decision; receipt semantics are unchanged.
+
+- 2026-10-13: Branch names are refused, not trimmed, at the CLI as at the
+  engine and the server. This supersedes "The dedicated CLI trims source and
+  target names before opening storage or submitting HTTP work, matching the
+  engine's canonical names. Empty names refuse before dispatch. Receipt
+  validation and optional deletion use those same names."

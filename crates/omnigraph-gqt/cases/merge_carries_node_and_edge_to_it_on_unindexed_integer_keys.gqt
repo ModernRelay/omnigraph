@@ -1,0 +1,46 @@
+# issue: none
+# notes: A branch inserts an integer-keyed Person and then an edge to it, two statements; the merge
+# notes: into main carries both tables, the edge's target is found among the merge's own Person rows
+# notes: before the target's swept key set is consulted, and the merge fast-forwards.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person { id: I64 @key }
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 8
+    commits: 4
+    columns:
+      id: {kind: ordinal, start: 0, step: 1}
+
+--- mutate
+branch create b
+--- expect ok
+
+--- mutate branch: b
+query add_node() { insert Person { id: 100 } }
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: b
+query add_edge() { insert Knows { from: "0", to: "100" } }
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+branch merge b
+--- expect outcome: fast_forward
+
+--- query
+query merged() { match { $a: Person $a knows $b } return { count($b) as n } }
+--- expect unordered
+{"n": 1}
+--- expect shape
+n: I64

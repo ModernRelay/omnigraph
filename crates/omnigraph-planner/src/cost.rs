@@ -4,7 +4,7 @@
 //! decision on `PhysicalNode::Expand`. Execution adjusts for the observed
 //! frontier and warm CSR; only legacy plans probe index coverage again.
 
-use omnigraph_compiler::ir::IRExpr;
+use omnigraph_compiler::ir::{IRExpr, ValidateCheck};
 use omnigraph_compiler::query::ast::{CompOp, Literal};
 use omnigraph_compiler::types::Direction;
 use serde::{Deserialize, Serialize};
@@ -127,6 +127,31 @@ pub fn choose_access_path(
     } else {
         AccessPath::IdLookup
     })
+}
+
+/// How a correlated block (`not { … }`, `count { … } > 2`) reaches the
+/// inner matches of its outer rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AntiJoinStrategy {
+    /// The inner tree runs once over the outer rows, starting from them: work
+    /// scales with the outer rows times the correlation binding's fanout.
+    #[default]
+    Correlated,
+    /// The inner tree runs once from its most bounded binding, with no outer
+    /// rows, and ends on the correlation binding; the outer rows are kept by
+    /// the aggregate of their key's matches. Work scales with the block alone.
+    KeySet,
+}
+
+/// The strategy of a correlated block from the summed row estimates of its two
+/// inner trees (`chain_rows`): the key set only when it produces fewer rows.
+pub fn choose_anti_join_strategy(correlated_rows: u64, key_set_rows: u64) -> AntiJoinStrategy {
+    if key_set_rows < correlated_rows {
+        AntiJoinStrategy::KeySet
+    } else {
+        AntiJoinStrategy::Correlated
+    }
 }
 
 /// Whether the per-hop `key_col IN (...)` scan is served by the BTREE
@@ -379,6 +404,43 @@ fn bounded_property<'a>(
 /// destination type's row count, so a hub can exceed it. `None` where the
 /// source holds no statistic for a node the estimate depends on.
 pub fn estimate_rows(plan: &LogicalPlan, node: LogicalId, source: &dyn PlanSource) -> Option<u64> {
+    estimate_rows_over(plan, node, source, None)
+}
+
+/// The rows a correlated block's single-input chain produces, summed from
+/// `top` down to its leaf: the `OuterReference` leaf counts `outer_rows`, a
+/// key-set tree's root scan its own estimate. The anti-join cost measure:
+/// every row a chain node emits is a row the next node reads. `None` when a
+/// node has another shape or any estimate is unknown.
+pub fn chain_rows(
+    plan: &LogicalPlan,
+    top: LogicalId,
+    source: &dyn PlanSource,
+    outer_rows: Option<u64>,
+) -> Option<u64> {
+    let mut total = 0u64;
+    let mut node = Some(top);
+    while let Some(id) = node {
+        total = total.saturating_add(estimate_rows_over(plan, id, source, outer_rows)?);
+        node = match plan.node(id)? {
+            LogicalNode::TableScan { input, .. } => *input,
+            LogicalNode::Expand { input, .. } | LogicalNode::Filter { input, .. } => Some(*input),
+            LogicalNode::OuterReference { .. } => None,
+            _ => return None,
+        };
+    }
+    Some(total)
+}
+
+fn estimate_rows_over(
+    plan: &LogicalPlan,
+    node: LogicalId,
+    source: &dyn PlanSource,
+    outer_rows: Option<u64>,
+) -> Option<u64> {
+    let estimate_rows = |plan: &LogicalPlan, node: LogicalId, source: &dyn PlanSource| {
+        estimate_rows_over(plan, node, source, outer_rows)
+    };
     match plan.node(node)? {
         LogicalNode::TableScan { input, spec } => {
             let rows = scan_row_estimate(spec, source)?;
@@ -433,13 +495,290 @@ pub fn estimate_rows(plan: &LogicalPlan, node: LogicalId, source: &dyn PlanSourc
             estimate_rows(plan, *left, source)?
                 .saturating_mul(estimate_rows(plan, *right, source)?),
         ),
-        LogicalNode::OuterReference { .. } | LogicalNode::MergeClassify { .. } => None,
+        LogicalNode::OuterReference { .. } => outer_rows,
+        LogicalNode::MergeClassify { .. } => None,
+        LogicalNode::CsvSource { spec } => Some(spec.estimated_rows),
+        LogicalNode::DeltaSource { spec } => Some(spec.rows),
+        LogicalNode::Validate { input, .. } => estimate_rows(plan, *input, source),
+        LogicalNode::FragmentWrite { .. } => Some(1),
+    }
+}
+
+/// Keys per uniqueness probe chunk. Endpoint probes use one filtered scan
+/// carrying the whole endpoint set, without this chunking.
+pub const PROBE_CHUNK_KEYS: u64 = 8_192;
+
+/// Source bytes per parser partition: a smaller file stays one partition,
+/// so the parallel source never splits what one reader finishes first.
+pub const SOURCE_PARTITION_BYTES: u64 = 8 * 1024 * 1024;
+
+/// How a load validation reads the committed image it judges the delta
+/// against: nothing (the delta alone decides), a filtered probe per key
+/// chunk, or one projected scan matched in memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidateAccess {
+    Delta,
+    Probe,
+    Scan,
+}
+
+impl ValidateAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Delta => "delta",
+            Self::Probe => "probe",
+            Self::Scan => "scan",
+        }
+    }
+}
+
+/// Whether a load validation finds the ids an overwrite removes, committed
+/// ids absent from the delta: one projected scan of the committed id column,
+/// or none, when no planned check consumes them. An empty committed table
+/// removes nothing, so its retained-edge checks are not planned and the scan
+/// is not either; append and merge remove nothing by definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidateRemoval {
+    #[default]
+    Scan,
+    None,
+}
+
+impl ValidateRemoval {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scan => "scan",
+            Self::None => "none",
+        }
+    }
+}
+
+/// Where an edge load's endpoint checks probe the committed node ids: on the
+/// parse partitions as the delta arrives (`Swept`), when both endpoint checks
+/// read their committed set whole (`Scan`) and both node types carry one
+/// integer `@key`, so the sets load beside the parse and each partition keeps
+/// its earliest miss; or after the drain on one thread (`Judged`), the route a
+/// `Probe` needs, since it reads `id IN (delta values)`, and the route a text
+/// key set keeps, since the delta values bound it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointProbe {
+    Swept,
+    Judged,
+}
+
+impl EndpointProbe {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Swept => "swept",
+            Self::Judged => "judged",
+        }
+    }
+}
+
+/// Usable BTREE coverage of a validation's filter columns. Fragment counts
+/// cannot estimate row work for partially covered tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidateIndexCoverage {
+    Absent,
+    Full,
+    Partial,
+}
+
+/// Accepted row counts and usable BTREE coverage for a validation's filter columns.
+#[derive(Debug, Clone, Copy)]
+pub struct ValidateCostInputs {
+    pub input_rows: Option<u64>,
+    pub consulted_rows: Option<u64>,
+    pub index_coverage: ValidateIndexCoverage,
+}
+
+impl ValidateCostInputs {
+    /// Estimated row work: probe, scan and filtered-scan calls. A probe first
+    /// builds its key list, one entry per input row, then an indexed lookup
+    /// pays the dependent-scan per-row factor and an unindexed one reads the
+    /// table once per call. Partial coverage is costed as a full index: the
+    /// filtered read serves the covered fragments through the index and scans
+    /// the rest, at most one table read more than the estimate, so the probe
+    /// is kept only while its key list is small against the table.
+    pub fn costs(self, check: &ValidateCheck) -> Option<(u64, u64, u64)> {
+        let (input, table) = (self.input_rows?, self.consulted_rows?);
+        let calls = if matches!(check, ValidateCheck::Unique { .. }) {
+            input.div_ceil(PROBE_CHUNK_KEYS)
+        } else {
+            u64::from(input > 0)
+        };
+        let lookup = if self.index_coverage != ValidateIndexCoverage::Absent {
+            input.saturating_mul(HASH_JOIN_RATIO)
+        } else {
+            table.saturating_mul(calls).saturating_add(input)
+        };
+        let probe = lookup.saturating_add(input);
+        let scan = table.saturating_add(input);
+        Some((probe, scan, calls))
+    }
+}
+
+/// Pick the cheaper supported access. Ties and unknown statistics retain
+/// Probe; cardinality and retained-edge checks only implement Probe, apart
+/// from an overwrite's cardinality scan under a minimum, which the optimizer
+/// chooses before costing.
+pub fn choose_validate_access(check: &ValidateCheck, inputs: ValidateCostInputs) -> ValidateAccess {
+    if matches!(
+        check,
+        ValidateCheck::RetainedEdges { .. }
+            | ValidateCheck::Cardinality { .. }
+            | ValidateCheck::SourceCardinality { .. }
+    ) {
+        return ValidateAccess::Probe;
+    }
+    match inputs.costs(check) {
+        Some((probe, scan, _)) if scan < probe => ValidateAccess::Scan,
+        _ => ValidateAccess::Probe,
+    }
+}
+
+/// The access of a committed lookup when the write keeps the consulted table
+/// (append, merge): `Probe` only under full BTREE coverage, where the index
+/// answers the key list and no fragment reads a filter. Lance hands an
+/// unindexed or partly covered table one copy of the whole key list per
+/// uncovered fragment, and its probe reads the id column whole anyway, so
+/// every other coverage scans. Cardinality and retained-edge checks only
+/// implement `Probe`.
+pub fn coverage_validate_access(
+    check: &ValidateCheck,
+    coverage: ValidateIndexCoverage,
+) -> ValidateAccess {
+    if matches!(
+        check,
+        ValidateCheck::RetainedEdges { .. }
+            | ValidateCheck::Cardinality { .. }
+            | ValidateCheck::SourceCardinality { .. }
+    ) || coverage == ValidateIndexCoverage::Full
+    {
+        ValidateAccess::Probe
+    } else {
+        ValidateAccess::Scan
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validation_costs_distinguish_endpoint_and_unique_probe_calls() {
+        use omnigraph_compiler::ir::{Endpoint, UniqueRole};
+        let endpoint = ValidateCheck::EdgeRi {
+            endpoint: Endpoint::From,
+            node_type: "Person".into(),
+        };
+        let unique = ValidateCheck::Unique {
+            role: UniqueRole::Unique,
+            columns: vec!["email".into()],
+        };
+        let inputs = ValidateCostInputs {
+            input_rows: Some(8193),
+            consulted_rows: Some(1_000_000),
+            index_coverage: ValidateIndexCoverage::Absent,
+        };
+        assert_eq!(inputs.costs(&endpoint), Some((1_016_386, 1_008_193, 1)));
+        assert_eq!(inputs.costs(&unique), Some((2_016_386, 1_008_193, 2)));
+        assert_eq!(
+            choose_validate_access(&endpoint, inputs),
+            ValidateAccess::Scan
+        );
+        let indexed = ValidateCostInputs {
+            index_coverage: ValidateIndexCoverage::Full,
+            consulted_rows: Some(1024),
+            input_rows: Some(2),
+        };
+        assert_eq!(indexed.costs(&endpoint), Some((18, 1026, 1)));
+        assert_eq!(
+            choose_validate_access(&endpoint, indexed),
+            ValidateAccess::Probe
+        );
+        assert_eq!(
+            choose_validate_access(&unique, inputs),
+            ValidateAccess::Scan
+        );
+        let partial = ValidateCostInputs {
+            index_coverage: ValidateIndexCoverage::Partial,
+            ..inputs
+        };
+        assert_eq!(partial.costs(&endpoint), Some((73_737, 1_008_193, 1)));
+        assert_eq!(partial.costs(&unique), Some((73_737, 1_008_193, 2)));
+        assert_eq!(
+            choose_validate_access(&endpoint, partial),
+            ValidateAccess::Probe
+        );
+        let partial_large = ValidateCostInputs {
+            input_rows: Some(200),
+            consulted_rows: Some(65),
+            index_coverage: ValidateIndexCoverage::Partial,
+        };
+        assert_eq!(partial_large.costs(&endpoint), Some((1_800, 265, 1)));
+        assert_eq!(
+            choose_validate_access(&endpoint, partial_large),
+            ValidateAccess::Scan
+        );
+        let unknown = ValidateCostInputs {
+            input_rows: None,
+            ..inputs
+        };
+        assert_eq!(
+            choose_validate_access(&endpoint, unknown),
+            ValidateAccess::Probe
+        );
+        let empty = ValidateCostInputs {
+            input_rows: Some(0),
+            ..inputs
+        };
+        assert_eq!(
+            choose_validate_access(&unique, empty),
+            ValidateAccess::Probe
+        );
+    }
+
+    #[test]
+    fn kept_table_lookups_probe_only_under_full_coverage() {
+        use omnigraph_compiler::ir::{Endpoint, UniqueRole};
+        let endpoint = ValidateCheck::EdgeRi {
+            endpoint: Endpoint::To,
+            node_type: "Person".into(),
+        };
+        let unique = ValidateCheck::Unique {
+            role: UniqueRole::Unique,
+            columns: vec!["email".into()],
+        };
+        let cardinality = ValidateCheck::Cardinality {
+            endpoint: Endpoint::From,
+            node_type: "Person".into(),
+            min: 0,
+            max: Some(2),
+        };
+        for check in [&endpoint, &unique] {
+            assert_eq!(
+                coverage_validate_access(check, ValidateIndexCoverage::Full),
+                ValidateAccess::Probe
+            );
+            assert_eq!(
+                coverage_validate_access(check, ValidateIndexCoverage::Partial),
+                ValidateAccess::Scan
+            );
+            assert_eq!(
+                coverage_validate_access(check, ValidateIndexCoverage::Absent),
+                ValidateAccess::Scan
+            );
+        }
+        assert_eq!(
+            coverage_validate_access(&cardinality, ValidateIndexCoverage::Absent),
+            ValidateAccess::Probe
+        );
+    }
 
     /// Cost inputs with generous hard caps, so the cost comparison (not a
     /// ceiling) is what an assertion exercises unless it sets one on purpose.

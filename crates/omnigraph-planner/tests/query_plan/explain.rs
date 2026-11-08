@@ -238,6 +238,7 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
         params: vec![],
         pipeline: vec![scan("c")],
         return_exprs: vec![projection(prop("c", "slug"), &[scan("c")])],
+        distinct: false,
         order_by: vec![
             IROrdering {
                 expr: IRExpr::Nearest {
@@ -287,7 +288,8 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
     assert_eq!(sort["fetch"], 10);
     assert_eq!(
         sort["properties"]["ordering"],
-        serde_json::json!(["$c._distance asc", "$c.rank desc"])
+        serde_json::json!(["$c._distance asc", "$c.rank desc", "$c.@id asc"]),
+        "a sort's output order is its whole comparator, identity keys included"
     );
     assert!(sort["properties"].get("schema").is_none());
     let projection = &sort["inputs"][0];
@@ -306,6 +308,12 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
             "fetch": 10,
             "nprobes": null,
             "scope": "order",
+            "policy": {
+                "probe_factor": 4,
+                "flat_rescan_on_unreached": true,
+                "uncapped_on_missing_counters": true,
+                "flat_when_eligible_within_fetch": true,
+            },
         })
     );
     assert_eq!(
@@ -426,11 +434,11 @@ fn a_search_order_plans_its_score_sort_and_a_fusion_two_arms() {
     );
 }
 
-/// Both inputs of a `CrossJoin` keep their operators in `pipelines_json`, and
-/// a query's explain carries no `pipelines`: the engine lowers it to one
-/// DataFusion plan, which its own explain rows print.
+/// A `CrossJoin` collects its whole left side before it pairs, so that side
+/// is a build pipeline keeping its operators, the right side streams through
+/// the join, and a query's explain carries the plan's `pipelines`.
 #[test]
-fn a_cross_join_side_keeps_its_operators_and_a_query_explain_has_no_pipelines() {
+fn a_cross_join_left_side_is_a_build_pipeline_and_a_query_explain_has_pipelines() {
     let op = ir(
         vec![scan("a"), expand("a", "b", vec![]), scan("c")],
         vec![prop("b", "slug"), prop("c", "slug")],
@@ -448,14 +456,23 @@ fn a_cross_join_side_keeps_its_operators_and_a_query_explain_has_no_pipelines() 
     );
     let (plan, _) = physical(&op, &source());
     let pipelines = plan.pipelines_json();
-    let join = &pipelines[0]["source"];
-    assert_eq!(join["node"], "CrossJoin");
+    let names = |operators: &serde_json::Value| -> Vec<String> {
+        operators
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|operator| operator["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(pipelines[0]["source"]["node"], "Scan");
     assert_eq!(
-        join["left"]["operators"],
-        serde_json::json!(["Expand", "Scan(input ids)"])
+        names(&pipelines[0]["operators"]),
+        ["Expand", "Scan(input_ids)"]
     );
-    assert_eq!(join["left"]["source"]["node"], "Scan");
-    assert_eq!(join["right"]["operators"], serde_json::json!([]));
+    assert_eq!(pipelines[0]["sink"]["name"], "CrossJoin(build)");
+    assert_eq!(pipelines[1]["source"]["node"], "Scan");
+    assert_eq!(names(&pipelines[1]["operators"])[0], "CrossJoin(probe)");
+    assert_eq!(pipelines[1]["depends_on"], serde_json::json!([0]));
     let decision = omnigraph_planner::route(
         &op,
         &source(),
@@ -466,6 +483,16 @@ fn a_cross_join_side_keeps_its_operators_and_a_query_explain_has_no_pipelines() 
     let explain = decision.explain().unwrap();
     assert_eq!(explain.route, "engine");
     assert!(explain.physical_plan.is_some());
-    assert!(explain.pipelines.is_none());
-    assert!(explain.to_value().get("pipelines").is_none());
+    assert_eq!(
+        explain
+            .pipelines
+            .as_ref()
+            .map(|p| p.as_array().map(Vec::len)),
+        Some(Some(2)),
+        "the collected left side is drained first, the right side streams through the join"
+    );
+    assert_eq!(
+        explain.to_value()["pipelines"][1]["operators"][0]["name"],
+        "CrossJoin(probe)"
+    );
 }

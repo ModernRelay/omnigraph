@@ -10,7 +10,8 @@ use lance::blob::blob_field;
 use lance::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::schema::parser::parse_schema;
-use omnigraph_compiler::types::{PropType, ScalarType};
+use omnigraph_compiler::settings::ChangeLineage;
+use omnigraph_compiler::types::PropType;
 use omnigraph_compiler::{
     SchemaIR, SchemaIdentityDomain, SchemaMigrationPlan, SchemaMigrationStep, SchemaShape,
     SchemaTypeKind, SystemColumns, build_catalog_from_ir, compile_schema_shape,
@@ -18,9 +19,11 @@ use omnigraph_compiler::{
 };
 
 use crate::db::graph_coordinator::{
-    CapturedLineage, GraphCoordinator, PublishedSnapshot, ResolvedCommitRange, commit_not_found,
+    CapturedLineage, GraphCoordinator, PublishedSnapshot, commit_not_found,
+    descends_linearly_from_in,
 };
-use crate::error::{OmniError, Result, dataset_subject};
+use crate::db::write_queue::observed;
+use crate::error::{BranchStartRefusal, ManifestErrorKind, OmniError, Result, dataset_subject};
 use crate::runtime_cache::RuntimeCache;
 use crate::seams::{decide_seam, fail};
 use crate::storage::{
@@ -42,7 +45,8 @@ pub(crate) mod table_ops;
 
 pub use collector::{
     CollectorCost, CollectorPathSnapshot, CollectorReport, CollectorRowSummary,
-    RetainedManifestVersions, StagingVerdict, TableCollectionPlan, UnpublishedManifest,
+    RetainedManifestVersions, StagingVerdict, TableCollectionPlan, UnattachedTagRecord,
+    UnpublishedManifest, unattached_release_order,
 };
 #[doc(hidden)]
 pub use export::{EXPORT_CHUNK_MAX_BYTES, ExportCut};
@@ -65,7 +69,10 @@ pub use system_column_upgrade::{
 };
 pub(crate) use table_ops::OpenedForMutation;
 pub(crate) use table_ops::Publication;
-pub use table_ops::{FullTextIndexRebuildResult, PendingIndex, RebuiltFullTextIndex};
+pub use table_ops::{
+    BuiltIndex, BuiltIndexAction, BuiltIndexKind, FullTextIndexRebuildResult, IndexBuildResult,
+    PendingIndex, RebuiltFullTextIndex,
+};
 
 use super::commit_graph::GraphCommit;
 use super::manifest::{
@@ -79,6 +86,23 @@ use super::schema_state::{
 use super::snapshot::Snapshot;
 use super::{ReadTarget, ResolvedTarget, SnapshotId};
 
+/// Commits one page of a commit list holds when the caller sets no limit.
+pub const COMMIT_LIST_DEFAULT_PAGE_COMMITS: usize = 100;
+/// The most commits one page of a commit list may hold.
+pub const COMMIT_LIST_MAX_PAGE_COMMITS: usize = 1000;
+
+/// One page of a branch's commit list ([`Omnigraph::list_commits_page`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitListPage {
+    /// The head the first page resolved; every page of the list answers for
+    /// its first-parent chain.
+    pub head_commit_id: String,
+    /// Newest first.
+    pub commits: Vec<GraphCommit>,
+    /// Continues the list below `commits`; absent on its last page.
+    pub next_page_token: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeOutcome {
     AlreadyUpToDate,
@@ -87,19 +111,70 @@ pub enum MergeOutcome {
 }
 
 /// What a graph commit id addresses for a control write: a proposal that is
-/// not published, or the published commit a repeat answers.
-enum AddressedCommit {
+/// not published, an unattached snapshot while its candidate tag stands
+/// (whatever its lifetime), or the published commit a repeat answers.
+pub(crate) enum AddressedCommit {
     Proposal(Box<super::manifest::UnpublishedCommit>),
+    Unattached(Box<super::manifest::UnattachedCommit>),
     Published(GraphCommit),
 }
 
-/// A merge's disposition and the graph commit published by that invocation.
+impl AddressedCommit {
+    /// The branch a control write on the commit addresses (`None` = main).
+    pub(crate) fn target_branch(&self) -> Option<&str> {
+        match self {
+            Self::Proposal(candidate) => candidate.property.graph_branch.as_deref(),
+            Self::Unattached(candidate) => candidate.property.graph_branch.as_deref(),
+            Self::Published(published) => published.graph_branch.as_deref(),
+        }
+    }
+}
+
+/// What a branch create started from: the branch it forked and the commit
+/// the new branch's head is.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchCreated {
+    /// The branch the new branch was forked off: the branch named, or for a
+    /// start at a commit, the branch that wrote the commit.
+    pub from: String,
+    /// The graph commit the new branch starts at: the branch's head when the
+    /// branch was created, or the named commit.
+    pub from_commit_id: String,
+}
+
+/// Where `branch_create_from_impl` starts the new branch: a branch's head
+/// when it is captured, or a published commit of the branch that wrote it.
+enum CreateStart {
+    Head(String),
+    Commit(GraphCommit),
+}
+
+/// Table versions a commit start opens at once, and objects it probes at
+/// once, to prove the commit is retained.
+const BRANCH_START_RETENTION_PROBES: usize = 8;
+
+/// A start at `commit_id` refused because cleanup reclaimed the version of
+/// `entry` the commit pins.
+fn branch_start_not_retained(commit_id: &str, entry: &crate::db::DatasetEntry) -> OmniError {
+    OmniError::branch_start_refused(
+        commit_id,
+        BranchStartRefusal::NotRetained {
+            table_key: entry.type_key.clone(),
+            published_dataset_version: entry.published_dataset_version,
+        },
+    )
+}
+
+/// A merge's disposition and the graph commit published by that invocation.
+#[derive(Debug, Clone)]
 pub struct MergeResult {
     pub outcome: MergeOutcome,
     /// `None` only when the merge was already up to date. This receipt is
     /// captured at publication, so later writers cannot replace its identity.
     pub commit: Option<GraphCommit>,
+    /// The planner's document per candidate table the merge validated, in
+    /// table order; empty when nothing needed validation.
+    pub plans: Vec<omnigraph_planner::explain::Explain>,
 }
 
 #[derive(Debug, Clone)]
@@ -218,6 +293,46 @@ pub(crate) struct WriteTxn {
     /// current and fall back to a full coherent capture on mismatch. The
     /// publisher still performs its own fresh CAS read.
     pub(crate) manifest_probe: crate::db::manifest::CapturedManifestProbe,
+    /// Set on a child unattached write: `base` is then the base snapshot's
+    /// view at its detached version, not the live head, while `authority`
+    /// stays the live head the chain's root captured.
+    pub(crate) unattached_base: Option<UnattachedTxnBase>,
+}
+
+/// The base snapshot a child unattached write extends, as resolved before
+/// the write was prepared; revalidated under the effect gates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnattachedTxnBase {
+    pub(crate) root_commit_id: String,
+    pub(crate) base_commit_id: String,
+    /// `D`, the detached `__manifest` version the base's candidate tag names.
+    pub(crate) detached_version: u64,
+    /// The root's captured effective head, which the live head must still be.
+    pub(crate) captured_head_commit_id: String,
+    pub(crate) tag_name: String,
+}
+
+impl UnattachedTxnBase {
+    fn of(base: &super::manifest::UnattachedCommit) -> Self {
+        Self {
+            root_commit_id: base.property.root_commit_id.clone(),
+            base_commit_id: base.property.graph_commit_id.clone(),
+            detached_version: base.detached_version,
+            captured_head_commit_id: base.property.captured_head_commit_id.clone(),
+            tag_name: base.tag_name(),
+        }
+    }
+
+    /// The publisher's description of the base: the chain and the
+    /// coordinates the child's rows come from.
+    pub(crate) fn write_base(&self) -> super::manifest::UnattachedWriteBase {
+        super::manifest::UnattachedWriteBase::Snapshot {
+            root_commit_id: self.root_commit_id.clone(),
+            base_commit_id: self.base_commit_id.clone(),
+            detached_version: self.detached_version,
+            captured_head_commit_id: self.captured_head_commit_id.clone(),
+        }
+    }
 }
 
 /// One coherent handle-local projection of the durable schema contract.
@@ -255,23 +370,10 @@ pub struct Omnigraph {
     /// session, while mutable control metadata uses a zero-cache session. Both
     /// share one process-wide object-store registry/client pool.
     lance_access: crate::lance_access::LanceAccessContext,
-    /// Coordinator state behind a tokio `RwLock`. PR 2 (MR-686) wraps
-    /// this so engine write APIs can be `&self` (the HTTP server's
-    /// `AppState` holds `Arc<Omnigraph>` and dispatches concurrent
-    /// calls without a global write lock). Reads (`snapshot`, `version`,
-    /// `current_branch`, `branch_list`, `resolve_*`, `head_commit_id`,
-    /// `list_commits`, …) acquire `.read().await` and parallelize.
-    /// Writes (`refresh`, `branch_create`, `branch_delete`, `commit_*`)
-    /// acquire `.write().await` and serialize. The atomic commit invariant —
-    /// table-version rows and the graph commit are one unit — holds by
-    /// construction since RFC-013 Phase 7: both ride a SINGLE manifest publish
-    /// CAS (`commit_changes_with_lineage`), so there is no two-write window to
-    /// keep atomic. PR 2 Phase 2
-    /// converted from `Mutex` to `RwLock` because the bench showed
-    /// the Mutex was the dominant serializer for disjoint-table
-    /// workloads. Lock acquisition order: always before `runtime_cache`
-    /// (when both are needed in one scope).
-    coordinator: Arc<tokio::sync::RwLock<GraphCoordinator>>,
+    /// The installed state of the bound branch: an immutable value readers
+    /// load with no lock, replaced whole by `install_coordinator` once a
+    /// publish or refresh has done its storage round trips on a clone.
+    coordinator: Arc<ArcSwap<GraphCoordinator>>,
     table_store: TableStore,
     runtime_cache: RuntimeCache,
     /// Warm change-feed cut for this handle's bound branch. A cut (head,
@@ -327,8 +429,12 @@ pub struct Omnigraph {
     /// state; its independent fresh graph-head CAS remains authoritative. A
     /// successful publish returns the updated coordinator, while failure drops
     /// the taken view so the next capture starts fresh.
-    /// The mutex serializes captures — the schema serial queue already
-    /// serializes merges and branch controls at capture time.
+    /// The mutex serializes a capture's selection and read of the entry, but
+    /// a miss opens the branch's coordinator with the mutex released: the
+    /// schema gate is shared by merges and branch captures, so holding it
+    /// across that open would make captures on different branches wait out
+    /// each other's full open. Two captures that miss on the same branch
+    /// open it twice; the entry is a hint either way.
     merge_authority_cache: tokio::sync::Mutex<Option<(String, GraphCoordinator)>>,
     /// The settled commits this handle has read from `__history`, shared by
     /// every coordinator it opens. Only an operation that asks for history
@@ -410,6 +516,25 @@ decide_seam! {
     pub static OPEN_BEFORE_SCHEMA_CONTRACT_READ = ("open.before_schema_contract_read", Unreachable, [Fail]);
 }
 
+decide_seam! {
+    /// `install_coordinator` starts a compare-and-swap round on the handle's
+    /// coordinator pointer; a round past the first is one lost to another
+    /// install, a wait of the CAS kind (`write_queue` §Gates).
+    pub static GATE_COORDINATOR_CAS_ACQUIRE = ("gate.coordinator_cas.acquire", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    /// `install_coordinator`'s swap won: the coordinator pointer is `next`.
+    pub static GATE_COORDINATOR_CAS_HOLD = ("gate.coordinator_cas.hold", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    /// `install_coordinator` refused the install (the binding moved to another
+    /// branch, or `derived_from` was replaced and `next` does not supersede the
+    /// installed state): the round's `acquire` ends with no `hold`.
+    pub static GATE_COORDINATOR_CAS_REFUSED = ("gate.coordinator_cas.refused", Unreachable, [Fail]);
+}
+
 impl Omnigraph {
     /// Create a new graph at `uri` from schema source.
     ///
@@ -440,9 +565,9 @@ impl Omnigraph {
         Self::init_with_storage_impl(uri, schema_source, storage_for_uri(uri)?, options).await
     }
 
-    // Injected-storage constructor: test-only authority, exists only
-    // under the `dst` feature (see the feature doc in Cargo.toml).
-    #[cfg(feature = "dst")]
+    /// Create a graph using an explicit captured storage provider.
+    ///
+    /// Admission, control objects and Lance data access retain this binding.
     pub async fn init_with_storage(
         uri: &str,
         schema_source: &str,
@@ -489,9 +614,9 @@ impl Omnigraph {
         legacy_system_columns: bool,
         prepared: Option<&PreparedGraphCreate>,
     ) -> Result<Self> {
+        let lance_access = crate::lance_access::LanceAccessContext::with_storage(storage.as_ref());
         let storage = crate::storage::decorate(storage);
         let root = normalize_root_uri(uri)?;
-        let lance_access = crate::lance_access::LanceAccessContext::new();
         let write_queue_identity = write_queue_root_identity(&root)?;
         let write_queue =
             crate::db::write_queue::WriteQueueManager::for_root(&write_queue_identity);
@@ -615,14 +740,14 @@ impl Omnigraph {
             storage,
             lance_access,
             history: coordinator.history().clone(),
-            coordinator: Arc::new(tokio::sync::RwLock::new(coordinator)),
+            coordinator: Arc::new(ArcSwap::from_pointee(coordinator)),
             // The graph-scoped data session keeps table metadata/index caches
             // warm across reads, writes, and maintenance. Mutable control
             // metadata uses the context's separate zero-cache session; both
             // sessions reuse the process-wide object-store registry.
             table_store: TableStore::new(&root, session),
             runtime_cache: RuntimeCache::default(),
-            feed_cut_cache: tokio::sync::RwLock::new(None),
+            feed_cut_cache: tokio::sync::RwLock::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
             read_caches,
             schema_view: Arc::new(ArcSwap::from_pointee(HandleSchemaView {
                 catalog,
@@ -631,7 +756,7 @@ impl Omnigraph {
                 schema_identity_domain,
             })),
             write_queue,
-            merge_authority_cache: tokio::sync::Mutex::new(None),
+            merge_authority_cache: tokio::sync::Mutex::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
             embedding_config: None,
@@ -646,10 +771,46 @@ impl Omnigraph {
         Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadWrite).await
     }
 
+    /// Open within a caller-owned storage lifetime, including all Lance writes.
+    pub async fn open_with_io_scope(
+        uri: &str,
+        scope: crate::storage::StorageIoScope,
+    ) -> Result<Self> {
+        let storage = crate::storage::storage_for_uri_scoped(uri, scope)?;
+        Self::open_with_storage_and_mode(uri, storage, OpenMode::ReadWrite).await
+    }
+
     /// Open an existing graph for read-only consumers (NDJSON export,
     /// `commit list`, etc.). Performs no open-time writes — see [`OpenMode`].
     pub async fn open_read_only(uri: &str) -> Result<Self> {
         Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadOnly).await
+    }
+
+    /// Whether a graph exists at `uri`: `false` only when Lance finds no
+    /// `__manifest` dataset at the root. Every other failure is the error, so
+    /// a manifest that names a missing object or a missing ref never reads as
+    /// an absent graph, although an open reports both with the same storage
+    /// kind. Opens the latest `__manifest` version and drops it; it reads no
+    /// graph state and writes nothing.
+    ///
+    /// This is a point-in-time observation: a graph created or removed
+    /// afterwards changes what a later open finds.
+    pub async fn exists(uri: &str) -> Result<bool> {
+        Self::exists_with_storage(uri, storage_for_uri(uri)?).await
+    }
+
+    /// [`Self::exists`] through the caller's explicit storage binding, the
+    /// binding a following [`Self::open_read_only_with_storage`] uses.
+    pub async fn exists_with_storage(uri: &str, storage: Arc<dyn StorageAdapter>) -> Result<bool> {
+        let lance_access = crate::lance_access::LanceAccessContext::with_storage(storage.as_ref());
+        let root = normalize_root_uri(uri)?;
+        let manifest = crate::instrumentation::open_dataset_if_present(
+            &crate::db::manifest::manifest_uri(&root),
+            Some(&lance_access.control_session()),
+            crate::instrumentation::manifest_wrapper(),
+        )
+        .await?;
+        Ok(manifest.is_some())
     }
 
     /// Observe that no legacy recovery sidecar is present.
@@ -662,8 +823,14 @@ impl Omnigraph {
     /// not writer exclusion or a transferable recovery capability. Callers must
     /// retain their existing writer exclusion through any subsequent effect.
     pub async fn ensure_no_pending_recovery(uri: &str) -> Result<()> {
+        Self::ensure_no_pending_recovery_with_storage(uri, storage_for_uri(uri)?).await
+    }
+
+    pub async fn ensure_no_pending_recovery_with_storage(
+        uri: &str,
+        storage: Arc<dyn StorageAdapter>,
+    ) -> Result<()> {
         let root = normalize_root_uri(uri)?;
-        let storage = storage_for_uri(&root)?;
         let identity = write_queue_root_identity(&root)?;
         let queues = crate::db::write_queue::WriteQueueManager::for_root(&identity);
         let _schema_gate = queues.acquire_schema_shared().await;
@@ -678,7 +845,12 @@ impl Omnigraph {
     /// [`SnapshotDataset::has_external_base_paths`](crate::db::SnapshotDataset::has_external_base_paths)
     /// as false.
     pub async fn manifest_has_external_base_paths(&self, branch: Option<&str>) -> Result<bool> {
-        crate::db::manifest::manifest_has_external_base_paths(&self.root_uri, branch).await
+        crate::db::manifest::manifest_has_external_base_paths_with_session(
+            &self.root_uri,
+            branch,
+            &self.control_session(),
+        )
+        .await
     }
 
     /// Open with a caller-supplied [`StorageAdapter`]. Used by init/test paths
@@ -688,10 +860,7 @@ impl Omnigraph {
         Self::open_with_storage_and_mode(uri, storage, OpenMode::ReadWrite).await
     }
 
-    // Read-only injected-storage twin, so a harness can audit the same
-    // universe through the read-only open path. Test-only authority,
-    // exists only under the `dst` feature (see the Cargo.toml feature doc).
-    #[cfg(feature = "dst")]
+    /// Read-only open retaining the caller's explicit storage binding.
     pub async fn open_read_only_with_storage(
         uri: &str,
         storage: Arc<dyn StorageAdapter>,
@@ -704,9 +873,9 @@ impl Omnigraph {
         storage: Arc<dyn StorageAdapter>,
         mode: OpenMode,
     ) -> Result<Self> {
+        let lance_access = crate::lance_access::LanceAccessContext::with_storage(storage.as_ref());
         let storage = crate::storage::decorate(storage);
         let root = normalize_root_uri(uri)?;
-        let lance_access = crate::lance_access::LanceAccessContext::new();
         let write_queue_identity = write_queue_root_identity(&root)?;
         let write_queue =
             crate::db::write_queue::WriteQueueManager::for_root(&write_queue_identity);
@@ -764,14 +933,14 @@ impl Omnigraph {
             storage,
             lance_access,
             history: coordinator.history().clone(),
-            coordinator: Arc::new(tokio::sync::RwLock::new(coordinator)),
+            coordinator: Arc::new(ArcSwap::from_pointee(coordinator)),
             // The graph-scoped data session keeps table metadata/index caches
             // warm across reads, writes, and maintenance. Mutable control
             // metadata uses the context's separate zero-cache session; both
             // sessions reuse the process-wide object-store registry.
             table_store: TableStore::new(&root, session),
             runtime_cache: RuntimeCache::default(),
-            feed_cut_cache: tokio::sync::RwLock::new(None),
+            feed_cut_cache: tokio::sync::RwLock::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
             read_caches,
             schema_view: Arc::new(ArcSwap::from_pointee(HandleSchemaView {
                 catalog,
@@ -780,7 +949,7 @@ impl Omnigraph {
                 schema_identity_domain,
             })),
             write_queue,
-            merge_authority_cache: tokio::sync::Mutex::new(None),
+            merge_authority_cache: tokio::sync::Mutex::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
             embedding_config: None,
@@ -932,11 +1101,11 @@ impl Omnigraph {
             coordinator: Arc::clone(&self.coordinator),
             table_store,
             runtime_cache: RuntimeCache::default(),
-            feed_cut_cache: tokio::sync::RwLock::new(None),
+            feed_cut_cache: tokio::sync::RwLock::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
             read_caches: Arc::clone(&self.read_caches),
             schema_view: Arc::clone(&self.schema_view),
             write_queue: Arc::clone(&self.write_queue),
-            merge_authority_cache: tokio::sync::Mutex::new(None),
+            merge_authority_cache: tokio::sync::Mutex::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
             history: self.history.clone(),
             policy,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
@@ -967,12 +1136,20 @@ impl Omnigraph {
     /// * If policy is installed AND actor is Some → call
     ///   `PolicyChecker::check(action, scope, actor)`; map denial /
     ///   internal failure to `OmniError::Policy(...)`.
+    ///
+    /// Before any of these, a branch name in `scope` that is not canonical is
+    /// refused as a bad request: the decision judges the name as written, and
+    /// the writer then opens that same name.
     pub(crate) fn enforce(
         &self,
         action: omnigraph_policy::PolicyAction,
         scope: &omnigraph_policy::ResourceScope,
         actor: Option<&str>,
     ) -> Result<()> {
+        let (branch, target_branch) = scope.to_branch_pair();
+        for name in [branch, target_branch].into_iter().flatten() {
+            ensure_canonical_branch_name(name)?;
+        }
         let Some(checker) = self.policy.as_ref() else {
             return Ok(());
         };
@@ -993,7 +1170,7 @@ impl Omnigraph {
     /// holds: a memo hit is a contract validated when it was built; a miss reads
     /// the row once.
     pub(crate) async fn ensure_schema_state_valid(&self) -> Result<()> {
-        let snapshot = self.coordinator.read().await.snapshot();
+        let snapshot = self.coordinator.load_full().snapshot();
         self.accepted_catalog_for_snapshot(&snapshot)
             .await
             .map(|_| ())
@@ -1007,10 +1184,15 @@ impl Omnigraph {
     /// caller MUST already hold a schema permit (either side); this helper does
     /// not acquire one because the gate is non-reentrant on one task.
     pub(crate) async fn load_accepted_catalog_with_schema_gate_held(&self) -> Result<Arc<Catalog>> {
+        Ok(self.load_accepted_view_with_schema_gate_held().await?.0)
+    }
+
+    /// The accepted catalog and the live view of the current branch it was
+    /// accepted against.
+    async fn load_accepted_view_with_schema_gate_held(&self) -> Result<(Arc<Catalog>, Snapshot)> {
         let current_branch = self
             .coordinator
-            .read()
-            .await
+            .load_full()
             .current_branch()
             .unwrap_or("main")
             .to_string();
@@ -1020,7 +1202,7 @@ impl Omnigraph {
             .snapshot;
         let (catalog, _) = self.accepted_catalog_for_snapshot(&snapshot).await?;
         validate_bound_catalog_against_snapshot(&catalog, &snapshot)?;
-        Ok(catalog)
+        Ok((catalog, snapshot))
     }
 
     /// Accept the contract bytes in this snapshot before reusing its catalog.
@@ -1079,7 +1261,7 @@ impl Omnigraph {
     /// A capture without retained content reads its pinned dataset.
     async fn read_schema_contract_row_for(&self, snapshot: &Snapshot) -> Result<SchemaContractRow> {
         {
-            let coord = self.coordinator.read().await;
+            let coord = self.coordinator.load_full();
             if coord.snapshot().same_manifest_image(snapshot) {
                 return coord.read_schema_contract().await;
             }
@@ -1317,7 +1499,7 @@ impl Omnigraph {
     /// one branch-scoped open resolves it through the manifest ref registry.
     pub(crate) async fn native_branch_for(&self, branch: &str) -> Result<String> {
         {
-            let coordinator = self.coordinator.read().await;
+            let coordinator = self.coordinator.load_full();
             if coordinator.current_branch() == Some(branch) {
                 if let Some(native) = coordinator.native_branch() {
                     return Ok(native.to_string());
@@ -1373,7 +1555,7 @@ impl Omnigraph {
         branch: Option<&str>,
     ) -> Result<GraphCoordinator> {
         {
-            let coord = self.coordinator.read().await;
+            let coord = self.coordinator.load_full();
             if branch == coord.current_branch() {
                 let held = coord.manifest_incarnation();
                 if coord.probe_latest_incarnation().await?.matches(&held) {
@@ -1428,6 +1610,69 @@ impl Omnigraph {
             caller_expected_graph_head: None,
             catalog,
             manifest_probe,
+            unattached_base: None,
+        })
+    }
+
+    /// The write transaction of a child unattached snapshot (RFC "Unattached
+    /// graph branches"): the live authority of `target`, the recorded target
+    /// the chain's root captured, beside the base snapshot `base` pins, which
+    /// the per-table opens, the validation and the expected versions read.
+    /// Refused once the live incarnation or effective head differs from what
+    /// the root captured, or the live schema identity from the base's: the
+    /// base has expired, or is about to.
+    pub(crate) async fn open_write_txn_on_unattached(
+        &self,
+        target: Option<&str>,
+        base: &super::manifest::UnattachedCommit,
+    ) -> Result<WriteTxn> {
+        let target = normalize_branch_name(target.unwrap_or("main"))?;
+        if target != base.property.graph_branch {
+            return Err(OmniError::manifest_internal(format!(
+                "a child of unattached branch '{}' opens on branch '{}' but its recorded \
+                 target is '{}'",
+                base.property.graph_commit_id,
+                target.as_deref().unwrap_or("main"),
+                base.property.graph_branch.as_deref().unwrap_or("main"),
+            )));
+        }
+        base.require_extendable()?;
+        let (branch_identifier, graph_head, effective_graph_head, live, manifest_probe) = self
+            .write_authority_for_known_branch(target.as_deref(), true)
+            .await?;
+        if branch_identifier != base.property.branch_identifier
+            || effective_graph_head.as_deref()
+                != Some(base.property.captured_head_commit_id.as_str())
+        {
+            return Err(OmniError::manifest_not_found(format!(
+                "unattached branch '{}' not found: it expired (branch '{}' moved past the \
+                 captured head '{}' to '{}') and awaits cleanup",
+                base.property.graph_commit_id,
+                target.as_deref().unwrap_or("main"),
+                base.property.captured_head_commit_id,
+                effective_graph_head.as_deref().unwrap_or("<absent>"),
+            )));
+        }
+        let snapshot = Snapshot::wrap(base.snapshot(self.uri(), &self.control_session())?);
+        let (catalog, identity) = self.accepted_catalog_for_snapshot(&snapshot).await?;
+        let (_, live_identity) = self.accepted_catalog_for_snapshot(&live).await?;
+        if live_identity != identity {
+            return Err(OmniError::manifest_read_set_changed(
+                "schema_ir_hash".to_string(),
+                Some(identity.schema_ir_hash),
+                Some(live_identity.schema_ir_hash),
+            ));
+        }
+        validate_bound_catalog_against_snapshot(&catalog, &snapshot)?;
+        Ok(WriteTxn {
+            branch: target,
+            base: snapshot,
+            authority: identity.write_authority(branch_identifier, graph_head),
+            effective_graph_head,
+            caller_expected_graph_head: None,
+            catalog,
+            manifest_probe,
+            unattached_base: Some(UnattachedTxnBase::of(base)),
         })
     }
 
@@ -1500,6 +1745,7 @@ impl Omnigraph {
                 caller_expected_graph_head: None,
                 catalog: Arc::clone(&catalog),
                 manifest_probe,
+                unattached_base: None,
             };
         Ok((
             make_txn(
@@ -1602,7 +1848,7 @@ impl Omnigraph {
     ) -> Result<ResolvedTarget> {
         let requested = ReadTarget::Branch(branch.unwrap_or("main").to_string());
         let normalized = normalize_branch_name(branch.unwrap_or("main"))?;
-        let coord = self.coordinator.read().await;
+        let coord = self.coordinator.load_full();
         if normalized.as_deref() == coord.current_branch() {
             let graph_commit_id = coord.effective_graph_head().await?;
             let snapshot_id = graph_commit_id
@@ -1641,7 +1887,7 @@ impl Omnigraph {
         crate::db::manifest::CapturedManifestProbe,
     )> {
         let bound = {
-            let coord = self.coordinator.read().await;
+            let coord = self.coordinator.load_full();
             let bound = branch == coord.current_branch();
             if bound {
                 let current = if fresh {
@@ -1705,7 +1951,7 @@ impl Omnigraph {
         crate::db::manifest::CapturedManifestProbe,
     )> {
         {
-            let coord = self.coordinator.read().await;
+            let coord = self.coordinator.load_full();
             if branch == coord.current_branch() {
                 let held = coord.manifest_incarnation();
                 if coord.probe_latest_incarnation().await?.matches(&held) {
@@ -1794,7 +2040,13 @@ impl Omnigraph {
                 }
             }
         } else {
+            // A miss reopens the branch's coordinator: many storage round
+            // trips. Open it without the lock so captures on other branches
+            // proceed meanwhile, then install it; the entry is a hint, and
+            // the capture reads it under the returned guard.
+            drop(cache);
             let coord = self.open_coordinator_for_branch(branch).await?;
+            cache = self.merge_authority_cache.lock().await;
             *cache = Some((key, coord));
         }
         Ok(cache)
@@ -1838,7 +2090,7 @@ impl Omnigraph {
     /// Revalidate a prepared mutation/load attempt after its branch/table
     /// gates are held and before any table effect.
     pub(crate) async fn revalidate_write_txn(&self, txn: &WriteTxn) -> Result<Snapshot> {
-        let bound = txn.branch.as_deref() == self.coordinator.read().await.current_branch();
+        let bound = txn.branch.as_deref() == self.coordinator.load_full().current_branch();
         let (branch_identifier, graph_head, effective_graph_head, snapshot) =
             if !bound && txn.manifest_probe.is_current().await? {
                 (
@@ -1914,8 +2166,37 @@ impl Omnigraph {
                 Some(live.schema_identity_version.to_string()),
             ));
         }
+        if let Some(pinned) = &txn.unattached_base {
+            self.revalidate_unattached_base(pinned).await?;
+        }
         validate_bound_catalog_against_snapshot(&txn.catalog, &snapshot)?;
         Ok(snapshot)
+    }
+
+    /// Re-read a child write's base under the effect gates: a base dropped,
+    /// retagged or expired since its resolution refuses the write before any
+    /// detached table commit.
+    async fn revalidate_unattached_base(&self, pinned: &UnattachedTxnBase) -> Result<()> {
+        let base = self
+            .unattached_commit(&pinned.base_commit_id)
+            .await?
+            .ok_or_else(|| {
+                OmniError::manifest_not_found(format!(
+                    "unattached branch '{}' not found: it was dropped before the write on \
+                     it was committed",
+                    pinned.base_commit_id
+                ))
+            })?;
+        base.require_extendable()?;
+        let live = UnattachedTxnBase::of(&base);
+        if live != *pinned {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("unattached_base:{}", pinned.base_commit_id),
+                Some(format!("{}@{}", pinned.tag_name, pinned.detached_version)),
+                Some(format!("{}@{}", live.tag_name, live.detached_version)),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) async fn snapshot_for_branch(&self, branch: Option<&str>) -> Result<Snapshot> {
@@ -1938,28 +2219,41 @@ impl Omnigraph {
     /// `resolve_target` additionally assembles the lineage projection the OCC
     /// read never consults. Skipping that work is a pure read-cost reduction,
     /// not a freshness change.
+    ///
+    /// The re-read goes through this handle's control session, so it observes
+    /// the destination the handle is bound to rather than one the ambient
+    /// provider configuration selects.
     pub(crate) async fn fresh_snapshot_for_branch_unchecked(
         &self,
         branch: Option<&str>,
     ) -> Result<Snapshot> {
+        let session = self.control_session();
         let manifest = match branch {
             Some(branch) => {
-                crate::db::manifest::ManifestCoordinator::open_at_branch(self.uri(), branch).await?
+                crate::db::manifest::ManifestCoordinator::open_at_branch_with_session(
+                    self.uri(),
+                    branch,
+                    &session,
+                )
+                .await?
             }
-            None => crate::db::manifest::ManifestCoordinator::open(self.uri()).await?,
+            None => {
+                crate::db::manifest::ManifestCoordinator::open_with_session(self.uri(), &session)
+                    .await?
+            }
         };
         Ok(Snapshot::wrap(manifest.snapshot()))
     }
 
     #[cfg(test)]
     pub(crate) async fn version(&self) -> u64 {
-        self.coordinator.read().await.version()
+        self.coordinator.load_full().version()
     }
 
     /// Return an immutable Snapshot from the known manifest state. No storage I/O.
     #[cfg(test)]
     pub(crate) async fn snapshot(&self) -> Snapshot {
-        self.coordinator.read().await.snapshot()
+        self.coordinator.load_full().snapshot()
     }
 
     pub async fn snapshot_of(&self, target: impl Into<ReadTarget>) -> Result<Snapshot> {
@@ -2017,10 +2311,56 @@ impl Omnigraph {
         let next_snapshot = next.snapshot();
         let (catalog, _) = self.accepted_catalog_for_snapshot(&next_snapshot).await?;
         validate_bound_catalog_against_snapshot(&catalog, &next_snapshot)?;
-        *self.coordinator.write().await = next;
+        self.coordinator.store(Arc::new(next));
         self.invalidate_read_caches().await;
         self.reload_schema_view_from_coordinator().await?;
         Ok(())
+    }
+
+    /// The installed coordinator and an operation-local copy of it: the pair
+    /// a publish or refresh carries to `install_coordinator`, so the install
+    /// can tell a clone of the installed state from a clone of a state since
+    /// replaced.
+    pub(crate) fn installed_coordinator_copy(&self) -> (Arc<GraphCoordinator>, GraphCoordinator) {
+        let installed = self.coordinator.load_full();
+        let copy = GraphCoordinator::clone(&installed);
+        (installed, copy)
+    }
+
+    /// Install `next`, produced on a clone of `derived_from` with no lock
+    /// held, as the bound coordinator: one pointer swap. Refused when the
+    /// binding moved to another branch, or when `derived_from` is no longer
+    /// the installed pointer and `next` does not supersede the installed
+    /// state within its lifetime (`ManifestIncarnation::supersedes`): a clone
+    /// of the installed state always installs, a clone of a replaced state
+    /// installs only a newer version of the same lifetime, never a lifetime
+    /// another install has already left. Returns whether the install happened.
+    pub(crate) fn install_coordinator(
+        &self,
+        next: GraphCoordinator,
+        derived_from: &Arc<GraphCoordinator>,
+    ) -> bool {
+        let next = Arc::new(next);
+        let mut installed = self.coordinator.load();
+        loop {
+            observed(&GATE_COORDINATOR_CAS_ACQUIRE);
+            let ordered = Arc::ptr_eq(&installed, derived_from)
+                || next
+                    .manifest_incarnation()
+                    .supersedes(&installed.manifest_incarnation());
+            if installed.current_branch() != next.current_branch() || !ordered {
+                observed(&GATE_COORDINATOR_CAS_REFUSED);
+                return false;
+            }
+            let previous = self
+                .coordinator
+                .compare_and_swap(&*installed, Arc::clone(&next));
+            if Arc::ptr_eq(&previous, &installed) {
+                observed(&GATE_COORDINATOR_CAS_HOLD);
+                return true;
+            }
+            installed = previous;
+        }
     }
 
     async fn invalidate_read_caches(&self) {
@@ -2037,7 +2377,9 @@ impl Omnigraph {
     /// Refresh the coordinator and its schema view from the published contract.
     pub async fn refresh(&self) -> Result<()> {
         let _serial = self.write_queue.acquire_schema_exclusive().await;
-        self.coordinator.write().await.refresh().await?;
+        let (installed, mut next) = self.installed_coordinator_copy();
+        next.refresh().await?;
+        self.install_coordinator(next, &installed);
         self.reload_schema_view_from_coordinator().await?;
         self.invalidate_read_caches().await;
         Ok(())
@@ -2046,7 +2388,7 @@ impl Omnigraph {
     /// Refresh the schema view while the exclusive schema permit is held.
     async fn reload_schema_view_from_coordinator(&self) -> Result<()> {
         fail(&SCHEMA_RELOAD_BEFORE_CONTRACT_READ)?;
-        let live_snapshot = self.coordinator.read().await.snapshot();
+        let live_snapshot = self.coordinator.load_full().snapshot();
         let accepted = self.accepted_schema_for_snapshot(&live_snapshot).await?;
         validate_bound_catalog_against_snapshot(&accepted.catalog, &live_snapshot)?;
         let identity = &accepted.identity;
@@ -2072,7 +2414,9 @@ impl Omnigraph {
 
     /// Refresh coordinator state while the caller owns the applicable schema permit.
     pub(crate) async fn refresh_coordinator_only(&self) -> Result<()> {
-        self.coordinator.write().await.refresh().await?;
+        let (installed, mut next) = self.installed_coordinator_copy();
+        next.refresh().await?;
+        self.install_coordinator(next, &installed);
         self.invalidate_read_caches().await;
         Ok(())
     }
@@ -2080,8 +2424,7 @@ impl Omnigraph {
     pub async fn resolve_snapshot(&self, branch: &str) -> Result<SnapshotId> {
         self.ensure_schema_state_valid().await?;
         self.coordinator
-            .read()
-            .await
+            .load_full()
             .resolve_snapshot_id(branch)
             .await
     }
@@ -2124,6 +2467,7 @@ impl Omnigraph {
                 .set_read_caches(crate::db::manifest::SnapshotReadCaches {
                     session: self.read_caches.session.clone(),
                     handles: self.read_caches.handles.clone(),
+                    table_wrapper: None,
                 });
         }
         Ok(resolved)
@@ -2154,12 +2498,12 @@ impl Omnigraph {
             validate_bound_catalog_against_snapshot(&catalog, &resolved.snapshot)?;
             return Ok((resolved, catalog));
         }
-        let catalog = self.load_accepted_catalog_with_schema_gate_held().await?;
+        let (catalog, live) = self.load_accepted_view_with_schema_gate_held().await?;
         if bind_historical_aliases {
             let catalog = self
                 .catalog_for_image_vintage(&resolved.snapshot, catalog)
                 .await?;
-            resolved.snapshot.bind_catalog_aliases(&catalog)?;
+            resolved.snapshot.bind_catalog_aliases(&catalog, &live)?;
             return Ok((resolved, catalog));
         }
         Ok((resolved, catalog))
@@ -2169,8 +2513,7 @@ impl Omnigraph {
         let _schema_permit = self.write_queue().acquire_schema_shared().await;
         let current_branch = self
             .coordinator
-            .read()
-            .await
+            .load_full()
             .current_branch()
             .unwrap_or("main")
             .to_string();
@@ -2189,23 +2532,23 @@ impl Omnigraph {
         version: u64,
     ) -> Result<(Snapshot, Arc<Catalog>)> {
         let _schema_permit = self.write_queue().acquire_schema_shared().await;
-        let catalog = self.load_accepted_catalog_with_schema_gate_held().await?;
+        let (catalog, live) = self.load_accepted_view_with_schema_gate_held().await?;
         let branch = self
             .coordinator
-            .read()
-            .await
+            .load_full()
             .current_branch()
             .map(str::to_string);
         let mut snapshot = Snapshot::wrap(
-            crate::db::manifest::ManifestCoordinator::snapshot_at(
+            crate::db::manifest::ManifestCoordinator::snapshot_at_with_session(
                 self.uri(),
                 branch.as_deref(),
                 version,
+                &self.control_session(),
             )
             .await?,
         );
         let catalog = self.catalog_for_image_vintage(&snapshot, catalog).await?;
-        snapshot.bind_catalog_aliases(&catalog)?;
+        snapshot.bind_catalog_aliases(&catalog, &live)?;
         Ok((snapshot, catalog))
     }
 
@@ -2267,8 +2610,8 @@ impl Omnigraph {
     async fn resolve_target_inner(&self, target: &ReadTarget) -> Result<ResolvedTarget> {
         if let ReadTarget::Branch(branch) = target {
             let normalized = normalize_branch_name(branch)?;
-            {
-                let coord = self.coordinator.read().await;
+            let (installed, mut next) = {
+                let coord = self.coordinator.load_full();
                 if normalized.as_deref() != coord.current_branch() {
                     drop(coord);
                     if let Some(resolved) = self
@@ -2277,104 +2620,28 @@ impl Omnigraph {
                     {
                         return Ok(resolved);
                     }
-                    return self.coordinator.read().await.resolve_target(target).await;
+                    return self.coordinator.load_full().resolve_target(target).await;
                 }
                 let held = coord.manifest_incarnation();
                 if coord.probe_latest_incarnation().await?.matches(&held) {
                     return warm_resolved_target(&coord, target).await;
                 }
-                // Stale: refresh under the write lock below.
+                let copy = GraphCoordinator::clone(&coord);
+                (coord, copy)
+            };
+            next.refresh().await?;
+            let resolved = warm_resolved_target(&next, target).await?;
+            if self.install_coordinator(next, &installed) {
+                self.invalidate_read_caches().await;
             }
-            let mut coord = self.coordinator.write().await;
-            if normalized.as_deref() == coord.current_branch() {
-                // Re-check after taking the write lock; another writer may have
-                // refreshed (tokio RwLock has no read->write upgrade).
-                let held = coord.manifest_incarnation();
-                let mut refreshed = false;
-                if !coord.probe_latest_incarnation().await?.matches(&held) {
-                    coord.refresh().await?;
-                    refreshed = true;
-                }
-                let resolved = warm_resolved_target(&coord, target).await?;
-                drop(coord);
-                if refreshed {
-                    self.invalidate_read_caches().await;
-                }
-                return Ok(resolved);
-            }
-            // Branch changed while waiting for the write lock: cold resolve.
-            return coord.resolve_target(target).await;
+            return Ok(resolved);
         }
 
         // Snapshot target: resolve through the commit graph as before.
-        self.coordinator.read().await.resolve_target(target).await
+        self.coordinator.load_full().resolve_target(target).await
     }
 
     // ─── Change detection ────────────────────────────────────────────────
-
-    pub async fn diff_between(
-        &self,
-        from: impl Into<ReadTarget>,
-        to: impl Into<ReadTarget>,
-        filter: &crate::changes::ChangeFilter,
-    ) -> Result<crate::changes::ChangeSet> {
-        let from_resolved = self.resolved_target(from).await?;
-        let to_resolved = self.resolved_target(to).await?;
-        crate::changes::diff_snapshots(
-            &self.table_store,
-            &from_resolved.snapshot,
-            &to_resolved.snapshot,
-            filter,
-            to_resolved.branch.clone().or(from_resolved.branch.clone()),
-            to_resolved.graph_commit_id.clone(),
-        )
-        .await
-    }
-
-    /// Diff two graph commits. Resolves each commit to
-    /// `(graph_branch, graph_manifest_version)`
-    /// and creates branch-aware snapshots. Supports cross-branch comparison.
-    pub async fn diff_commits(
-        &self,
-        from_commit_id: &str,
-        to_commit_id: &str,
-        filter: &crate::changes::ChangeFilter,
-    ) -> Result<crate::changes::ChangeSet> {
-        let coord = self.coordinator.read().await;
-        let range = coord
-            .resolve_commit_range(
-                &SnapshotId::new(from_commit_id),
-                &SnapshotId::new(to_commit_id),
-            )
-            .await?;
-        // Classify direct adjacency from the child's persisted first-parent
-        // pointer without changing this API's net-current result shape. The
-        // future feed can reuse that relationship without an ancestry index.
-        let (from_commit, to_commit) = match range {
-            ResolvedCommitRange::FirstParent(edge) => (edge.parent, edge.child),
-            ResolvedCommitRange::Arbitrary { from, to } => (from, to),
-        };
-        let from_snap = coord
-            .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(
-                from_commit.graph_commit_id.clone(),
-            )))
-            .await?;
-        let to_snap = coord
-            .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(
-                to_commit.graph_commit_id.clone(),
-            )))
-            .await?;
-        drop(coord);
-        crate::changes::diff_snapshots(
-            &self.table_store,
-            &from_snap.snapshot,
-            &to_snap.snapshot,
-            filter,
-            to_snap.branch.clone().or(from_snap.branch.clone()),
-            to_snap.graph_commit_id.clone(),
-        )
-        .await
-    }
 
     /// One bounded, deterministic page of the exact entity changes a graph
     /// commit made relative to its first parent, in graph vocabulary with
@@ -2387,6 +2654,28 @@ impl Omnigraph {
         page_token: Option<&str>,
         max_changes: Option<usize>,
         max_bytes: Option<u64>,
+    ) -> Result<crate::changes::CommitChangesPage> {
+        self.commit_changes_page_under(
+            commit_id,
+            scope,
+            page_token,
+            max_changes,
+            max_bytes,
+            crate::changes::default_change_lineage(),
+        )
+        .await
+    }
+
+    /// [`Self::commit_changes_page`] under one session's `change_lineage`,
+    /// the door a [`crate::Session`] calls.
+    pub async fn commit_changes_page_under(
+        &self,
+        commit_id: &str,
+        scope: &crate::changes::ChangeFeedScope,
+        page_token: Option<&str>,
+        max_changes: Option<usize>,
+        max_bytes: Option<u64>,
+        lineage: ChangeLineage,
     ) -> Result<crate::changes::CommitChangesPage> {
         use crate::changes::token;
 
@@ -2408,7 +2697,7 @@ impl Omnigraph {
             error => error,
         };
 
-        let coord = self.coordinator.read().await;
+        let coord = self.coordinator.load_full();
         let commit = coord.resolve_commit(&SnapshotId::new(commit_id)).await?;
         let Some(parent_id) = commit.parent_commit_id.clone() else {
             return Err(OmniError::CommitHasNoParent {
@@ -2461,6 +2750,7 @@ impl Omnigraph {
             &child.snapshot,
             &graph_identity,
             commit_id,
+            crate::changes::enumerate::ChangeDiscovery::for_commit(lineage, &commit),
             scope,
             resume.as_ref(),
             &mut budget,
@@ -2513,6 +2803,17 @@ impl Omnigraph {
         &self,
         request: crate::changes::ChangeFeedRequest,
     ) -> Result<crate::changes::ChangeFeedPage> {
+        self.poll_change_feed_under(request, crate::changes::default_change_lineage())
+            .await
+    }
+
+    /// [`Self::poll_change_feed`] under one session's `change_lineage`, the
+    /// door a [`crate::Session`] calls.
+    pub async fn poll_change_feed_under(
+        &self,
+        request: crate::changes::ChangeFeedRequest,
+        lineage: ChangeLineage,
+    ) -> Result<crate::changes::ChangeFeedPage> {
         let branch = request
             .branch
             .as_deref()
@@ -2526,7 +2827,7 @@ impl Omnigraph {
         let requested = branch.as_deref();
         let cut =
             {
-                let coord = self.coordinator.read().await;
+                let coord = self.coordinator.load_full();
                 if requested == coord.current_branch() {
                     let held = coord.manifest_incarnation();
                     if coord.probe_latest_incarnation().await?.matches(&held) {
@@ -2551,27 +2852,16 @@ impl Omnigraph {
                             }
                         }
                     } else {
-                        drop(coord);
-                        let mut coord = self.coordinator.write().await;
-                        if requested == coord.current_branch() {
-                            let held = coord.manifest_incarnation();
-                            let mut refreshed = false;
-                            if !coord.probe_latest_incarnation().await?.matches(&held) {
-                                coord.refresh().await?;
-                                refreshed = true;
-                            }
-                            let refreshed_incarnation = coord.manifest_incarnation();
-                            let cut = Arc::new(coord.build_change_feed_cut().await?);
-                            drop(coord);
-                            if refreshed {
-                                self.invalidate_read_caches().await;
-                            }
-                            *self.feed_cut_cache.write().await =
-                                Some((refreshed_incarnation, Arc::clone(&cut)));
-                            cut
-                        } else {
-                            Arc::new(coord.capture_change_cut(requested).await?)
+                        let mut next = GraphCoordinator::clone(&coord);
+                        next.refresh().await?;
+                        let refreshed_incarnation = next.manifest_incarnation();
+                        let cut = Arc::new(next.build_change_feed_cut().await?);
+                        if self.install_coordinator(next, &coord) {
+                            self.invalidate_read_caches().await;
                         }
+                        *self.feed_cut_cache.write().await =
+                            Some((refreshed_incarnation, Arc::clone(&cut)));
+                        cut
                     }
                 } else {
                     Arc::new(coord.capture_change_cut(requested).await?)
@@ -2589,8 +2879,734 @@ impl Omnigraph {
             &graph_identity,
             &cut,
             &request,
+            lineage,
         )
         .await
+    }
+
+    /// One bounded page of a graph diff (RFC 0030 §8): the net entity changes
+    /// between two read targets, or between a source branch's merge base with
+    /// a target and the source head, in the commit diff's entity shape and
+    /// order, without a cause. The first page resolves both endpoints to
+    /// exact graph commits; its page token keeps them, so later pages answer
+    /// for the same commits whatever the named branches did since.
+    pub async fn diff_page(
+        &self,
+        request: &crate::changes::GraphDiffRequest,
+    ) -> Result<crate::changes::GraphDiffPage> {
+        self.diff_page_under(request, crate::changes::default_change_lineage())
+            .await
+    }
+
+    /// [`Self::diff_page`] under one session's `change_lineage`, the door a
+    /// [`crate::Session`] calls.
+    pub async fn diff_page_under(
+        &self,
+        request: &crate::changes::GraphDiffRequest,
+        lineage: ChangeLineage,
+    ) -> Result<crate::changes::GraphDiffPage> {
+        let prepared = self.prepare_diff(request, None, lineage).await?;
+        self.run_diff_page(prepared, lineage).await
+    }
+
+    /// [`Self::diff_page`] for a caller that may read only some branches.
+    /// `can_read` answers for the branch each two-point side reads: a branch
+    /// itself, or a commit's authored branch (an unpublished proposal's or
+    /// unattached snapshot's recorded target). Each side is authorized as
+    /// soon as it is classified, before the next side is looked at and before
+    /// its snapshot opens, and a side `can_read` refuses is
+    /// [`OmniError::ReadTargetNotFound`] naming it, exactly as a side that
+    /// names nothing: the answer is not an existence oracle. A continuation
+    /// classifies and authorizes its sides again, then reopens only the
+    /// token's commits its sides reach: what a side resolves to now, or a
+    /// commit `can_read` allows as a side of its own; any other is
+    /// [`OmniError::ChangeCursorRejected`]. The branch form names its branches
+    /// outright, so its caller authorizes them before the call, and
+    /// `can_read` decides only a continuation's commits.
+    pub async fn diff_page_readable(
+        &self,
+        request: &crate::changes::GraphDiffRequest,
+        can_read: &mut ReadCheck<'_>,
+    ) -> Result<crate::changes::GraphDiffPage> {
+        self.diff_page_readable_under(request, can_read, crate::changes::default_change_lineage())
+            .await
+    }
+
+    /// [`Self::diff_page_readable`] under one session's `change_lineage`.
+    pub async fn diff_page_readable_under(
+        &self,
+        request: &crate::changes::GraphDiffRequest,
+        can_read: &mut ReadCheck<'_>,
+        lineage: ChangeLineage,
+    ) -> Result<crate::changes::GraphDiffPage> {
+        let prepared = self.prepare_diff(request, Some(can_read), lineage).await?;
+        self.run_diff_page(prepared, lineage).await
+    }
+
+    /// Resolve a graph diff page request, reading lineage only: its endpoints
+    /// and its continuation position. `ChangeLineage::Off` never pairs rows,
+    /// so it skips the ancestry answer and its lineage reads.
+    async fn prepare_diff(
+        &self,
+        request: &crate::changes::GraphDiffRequest,
+        can_read: Option<&mut ReadCheck<'_>>,
+        lineage: ChangeLineage,
+    ) -> Result<PreparedDiffPage> {
+        use crate::changes::token;
+
+        let max_changes = request
+            .max_changes
+            .unwrap_or(crate::changes::COMMIT_CHANGES_DEFAULT_CHANGES);
+        let max_bytes = request
+            .max_bytes
+            .unwrap_or(crate::changes::COMMIT_CHANGES_DEFAULT_BYTES);
+        crate::changes::enumerate::validate_change_page_limits(max_changes, max_bytes)?;
+
+        let graph_identity = self.schema_view.load().schema_identity_domain.clone();
+        let filter_digest = token::filter_digest(&request.scope);
+        let sides_digest = token::sides_digest(&request.sides);
+        let (endpoints, resume) = match request.page_token.as_deref() {
+            None => (
+                self.resolve_diff_endpoints(&request.sides, can_read, lineage)
+                    .await?,
+                None,
+            ),
+            Some(encoded) => {
+                let decoded = token::decode_diff_page_token(encoded)?;
+                if decoded.graph_identity != token::hashed_identity(&graph_identity)
+                    || decoded.sides != sides_digest
+                {
+                    return Err(token::cursor_rejected(
+                        "diff page token does not match this graph and these sides",
+                    ));
+                }
+                if decoded.filter_digest != filter_digest {
+                    return Err(token::cursor_rejected(
+                        "diff page token was minted for a different filter scope",
+                    ));
+                }
+                // A caller with no read check reads every branch: its token
+                // is held to the same sides, under an allow-all decision.
+                let mut read_all = |_: &str| true;
+                let can_read: &mut ReadCheck<'_> = match can_read {
+                    Some(can_read) => can_read,
+                    None => &mut read_all,
+                };
+                let endpoints = self
+                    .reopen_diff_continuation(&request.sides, &decoded, can_read, lineage)
+                    .await?;
+                let resume = crate::changes::enumerate::ContinuationKey {
+                    type_id: decoded.type_id,
+                    position: decoded.position,
+                    operation_rank: decoded.operation_rank,
+                    change_index: decoded.change_index,
+                };
+                (endpoints, Some(resume))
+            }
+        };
+        Ok(PreparedDiffPage {
+            scope: request.scope.clone(),
+            max_changes,
+            max_bytes,
+            graph_identity,
+            filter_digest,
+            sides_digest,
+            endpoints,
+            resume,
+        })
+    }
+
+    /// Read one prepared graph diff page.
+    async fn run_diff_page(
+        &self,
+        prepared: PreparedDiffPage,
+        lineage: ChangeLineage,
+    ) -> Result<crate::changes::GraphDiffPage> {
+        use crate::changes::token;
+
+        let PreparedDiffPage {
+            scope,
+            max_changes,
+            max_bytes,
+            graph_identity,
+            filter_digest,
+            sides_digest,
+            endpoints,
+            resume,
+        } = prepared;
+        // Reclaimed history under either endpoint is a typed gap naming the
+        // diff's `to` commit; a diff has no feed cursor to resume.
+        let to_commit_id = endpoints.to_commit_id.clone();
+        let map_gap = |error| match error {
+            OmniError::HistoricalVersionReclaimed { .. } => OmniError::ChangeFeedGap {
+                cursor: None,
+                first_unreadable_commit_id: to_commit_id.clone(),
+            },
+            error => error,
+        };
+        let mut budget = crate::changes::enumerate::PageBudget::new(max_changes, max_bytes);
+        let mut changes = Vec::new();
+        let outcome = crate::changes::enumerate::enumerate_commit_changes(
+            &self.table_store,
+            &endpoints.from_snapshot,
+            &endpoints.to_snapshot,
+            &graph_identity,
+            &endpoints.to_commit_id,
+            crate::changes::enumerate::ChangeDiscovery {
+                lineage,
+                linear_descent: endpoints.linear_descent,
+            },
+            &scope,
+            resume.as_ref(),
+            &mut budget,
+            &mut changes,
+        )
+        .await
+        .map_err(map_gap)?;
+
+        let next_page_token = match outcome {
+            crate::changes::enumerate::CommitEnumeration::Complete => None,
+            crate::changes::enumerate::CommitEnumeration::Truncated(key) => {
+                Some(token::encode_token(&token::DiffPageTokenV1 {
+                    version: token::TOKEN_VERSION,
+                    kind: token::KIND_DIFF_PAGE.to_string(),
+                    graph_identity: token::hashed_identity(&graph_identity),
+                    sides: sides_digest,
+                    from_commit_id: endpoints.from_commit_id.clone(),
+                    to_commit_id: endpoints.to_commit_id.clone(),
+                    base_commit_id: endpoints.base_commit_id.clone(),
+                    filter_digest,
+                    type_id: key.type_id,
+                    position: key.position,
+                    operation_rank: key.operation_rank,
+                    change_index: key.change_index,
+                })?)
+            }
+            crate::changes::enumerate::CommitEnumeration::Exhausted { required_bytes } => {
+                return Err(OmniError::resource_limit(
+                    "commit_changes_page_bytes",
+                    max_bytes,
+                    required_bytes,
+                ));
+            }
+        };
+
+        Ok(crate::changes::GraphDiffPage {
+            from_commit_id: endpoints.from_commit_id,
+            to_commit_id: endpoints.to_commit_id,
+            base_commit_id: endpoints.base_commit_id,
+            changes,
+            next_page_token,
+        })
+    }
+
+    /// The merge base of `source` and `target` (RFC 0030 §8.4): the commit a
+    /// merge of `source` into `target` would classify against, by the rule
+    /// branch merge uses, with the two heads it was computed from. Reads
+    /// lineage only.
+    pub async fn merge_base(
+        &self,
+        source: &str,
+        target: &str,
+    ) -> Result<crate::changes::MergeBase> {
+        let captured = self.capture_merge_base(source, target).await?;
+        Ok(crate::changes::MergeBase {
+            source_commit_id: captured.source_head,
+            target_commit_id: captured.target_head,
+            merge_base: captured.merge_base,
+        })
+    }
+
+    /// Capture both branches from one view each and resolve their merge base.
+    async fn capture_merge_base(&self, source: &str, target: &str) -> Result<CapturedMergeBase> {
+        let source_branch = normalize_branch_name(source)?;
+        let target_branch = normalize_branch_name(target)?;
+        let (source_txn, target_txn, source_commits, target_commits) = self
+            .open_merge_write_txns(source_branch.as_deref(), target_branch.as_deref())
+            .await?;
+        let source_head = source_txn
+            .effective_graph_head
+            .clone()
+            .ok_or_else(|| OmniError::manifest("source branch has no head commit".to_string()))?;
+        let target_head = target_txn
+            .effective_graph_head
+            .clone()
+            .ok_or_else(|| OmniError::manifest("target branch has no head commit".to_string()))?;
+        let merge_base = Self::resolve_merge_base(
+            &source_commits.graph,
+            &target_commits.graph,
+            &source_head,
+            &target_head,
+        )
+        .await?;
+        Ok(CapturedMergeBase {
+            source_head,
+            target_head,
+            merge_base,
+            source_snapshot: source_txn.base,
+            target_snapshot: target_txn.base,
+            source_graph: source_commits.graph,
+        })
+    }
+
+    /// Resolve a graph diff's sides to exact commits and their snapshots, each
+    /// two-point side authorized by `can_read` before the next is looked at,
+    /// and whether `to` descends linearly from `from` unless `lineage` is `Off`.
+    async fn resolve_diff_endpoints(
+        &self,
+        sides: &crate::changes::GraphDiffSides,
+        mut can_read: Option<&mut ReadCheck<'_>>,
+        lineage: ChangeLineage,
+    ) -> Result<DiffEndpoints> {
+        match sides {
+            crate::changes::GraphDiffSides::Between { from, to } => {
+                let from_side = self
+                    .authorized_diff_side(from, can_read.as_deref_mut())
+                    .await?;
+                let from_commit = match &from_side {
+                    DiffReadTarget::Commit(commit) => Some(commit.clone()),
+                    DiffReadTarget::Branch(_) => None,
+                };
+                let (from_commit_id, from_snapshot) = self.open_diff_side(from, from_side).await?;
+                let to_side = self.authorized_diff_side(to, can_read).await?;
+                let linear_descent = match to_side.commit_id() {
+                    Some(to_commit_id) if lineage != ChangeLineage::Off => {
+                        self.diff_descends_linearly(
+                            &from_commit_id,
+                            from_commit.as_ref(),
+                            to_commit_id,
+                            &to_side,
+                        )
+                        .await?
+                    }
+                    _ => false,
+                };
+                let (to_commit_id, to_snapshot) = self.open_diff_side(to, to_side).await?;
+                Ok(DiffEndpoints {
+                    from_commit_id,
+                    to_commit_id,
+                    base_commit_id: None,
+                    linear_descent,
+                    from_snapshot,
+                    to_snapshot,
+                })
+            }
+            crate::changes::GraphDiffSides::Branch { source, target } => {
+                let captured = self.capture_merge_base(source, target).await?;
+                let linear_descent = lineage != ChangeLineage::Off
+                    && captured
+                        .source_descends_linearly(
+                            &captured.merge_base.graph_commit_id,
+                            &captured.source_head,
+                        )
+                        .await?;
+                let CapturedMergeBase {
+                    source_head,
+                    target_head,
+                    merge_base,
+                    source_snapshot,
+                    target_snapshot,
+                    ..
+                } = captured;
+                let base_commit_id = merge_base.graph_commit_id.clone();
+                // The base is usually an ancestor neither head is at; when it
+                // is one of the captured heads, its captured snapshot is the
+                // base snapshot.
+                let base_snapshot = if base_commit_id == source_head {
+                    source_snapshot.clone()
+                } else if base_commit_id == target_head {
+                    target_snapshot
+                } else {
+                    self.diff_endpoint_snapshot(&base_commit_id, &base_commit_id)
+                        .await?
+                };
+                Ok(DiffEndpoints {
+                    from_commit_id: base_commit_id.clone(),
+                    to_commit_id: source_head,
+                    base_commit_id: Some(base_commit_id),
+                    linear_descent,
+                    from_snapshot: base_snapshot,
+                    to_snapshot: source_snapshot,
+                })
+            }
+        }
+    }
+
+    /// Whether a two-point diff page may pair rows by identity across the
+    /// commits it opens: `to` descends from `from` through first parents with
+    /// no merge commit after it, walked from `to` in the lineage of the branch
+    /// the side `to_side` names. Every page asks for its own two commits: the
+    /// first page for what its sides resolve to, a later one for what its
+    /// token names, never the branch's head now. A side spelled as a commit,
+    /// or a `from` of unknown generation, answers `false`.
+    async fn diff_descends_linearly(
+        &self,
+        from: &str,
+        from_commit: Option<&GraphCommit>,
+        to: &str,
+        to_side: &DiffReadTarget,
+    ) -> Result<bool> {
+        let DiffReadTarget::Branch(resolved) = to_side else {
+            return Ok(false);
+        };
+        if to == from {
+            return Ok(true);
+        }
+        let branch = resolved.branch.as_deref();
+        {
+            let coord = self.coordinator.load_full();
+            if branch == coord.current_branch() {
+                return Self::descends_linearly_from(&coord, from, from_commit, to).await;
+            }
+        }
+        let cache = self.validated_cached_coordinator(branch).await?;
+        let (_, coord) = cache
+            .as_ref()
+            .expect("validated authority cache entry is present");
+        Self::descends_linearly_from(coord, from, from_commit, to).await
+    }
+
+    /// [`GraphCoordinator::descends_linearly_from`] for `from`, whose
+    /// generation comes from its classified commit or from what the
+    /// coordinator already holds.
+    async fn descends_linearly_from(
+        coord: &GraphCoordinator,
+        from: &str,
+        from_commit: Option<&GraphCommit>,
+        to: &str,
+    ) -> Result<bool> {
+        let generation = match from_commit {
+            Some(commit) => commit.generation,
+            None => match coord.captured_commit(from)? {
+                Some(commit) => commit.generation,
+                None => return Ok(false),
+            },
+        };
+        coord.descends_linearly_from(to, from, generation).await
+    }
+
+    /// Reopen the commits a diff page token names, once its sides reach them.
+    /// The sides are classified and authorized as the first page did, then
+    /// each commit is checked. A token is checksummed, not signed, so its
+    /// commits are the caller's claim. A commit is reached when its side
+    /// resolves to it now, or, for a side that moves (a branch head, a merge
+    /// base), when it was an earlier head of the side's branch or the caller
+    /// could name it as a side itself. A side spelled as a commit reaches only
+    /// that commit. A commit the sides do not reach, unknown or unreadable
+    /// alike, refuses the page before any snapshot opens. Each commit opens
+    /// through what reached it, so a continuation reads what its first page
+    /// read and never asks another branch for a commit its side holds.
+    async fn reopen_diff_continuation(
+        &self,
+        sides: &crate::changes::GraphDiffSides,
+        decoded: &crate::changes::token::DiffPageTokenV1,
+        can_read: &mut ReadCheck<'_>,
+        lineage: ChangeLineage,
+    ) -> Result<DiffEndpoints> {
+        use crate::changes::GraphDiffSides;
+        let from = &decoded.from_commit_id;
+        let to = &decoded.to_commit_id;
+        let linear_descent;
+        let (from_reach, to_reach) = match sides {
+            GraphDiffSides::Between {
+                from: from_side,
+                to: to_side,
+            } => {
+                if decoded.base_commit_id.is_some() {
+                    return Err(diff_token_unreached());
+                }
+                let from_now = self
+                    .authorized_diff_side(from_side, Some(&mut *can_read))
+                    .await?;
+                let to_now = self
+                    .authorized_diff_side(to_side, Some(&mut *can_read))
+                    .await?;
+                let from_commit = match &from_now {
+                    DiffReadTarget::Commit(commit) if commit.graph_commit_id == *from => {
+                        Some(commit.clone())
+                    }
+                    _ => None,
+                };
+                linear_descent = lineage != ChangeLineage::Off
+                    && self
+                        .diff_descends_linearly(from, from_commit.as_ref(), to, &to_now)
+                        .await?;
+                (
+                    self.reach_side(from, from_side, from_now, can_read).await?,
+                    self.reach_side(to, to_side, to_now, can_read).await?,
+                )
+            }
+            GraphDiffSides::Branch { source, target } => {
+                if decoded.base_commit_id.as_ref() != Some(from) {
+                    return Err(diff_token_unreached());
+                }
+                let source_branch = normalize_branch_name(source)?;
+                let target_branch = normalize_branch_name(target)?;
+                let captured = self.capture_merge_base(source, target).await?;
+                linear_descent = lineage != ChangeLineage::Off
+                    && captured.source_descends_linearly(from, to).await?;
+                let CapturedMergeBase {
+                    source_head,
+                    target_head,
+                    merge_base: base,
+                    source_snapshot,
+                    target_snapshot,
+                    ..
+                } = captured;
+                let from_reach = if *from == base.graph_commit_id {
+                    if *from == source_head {
+                        DiffReach::Resolved(Box::new(source_snapshot.clone()))
+                    } else if *from == target_head {
+                        DiffReach::Resolved(Box::new(target_snapshot))
+                    } else {
+                        DiffReach::ById(from.clone())
+                    }
+                } else {
+                    self.reach_moved(from, &[source_branch.clone(), target_branch], can_read)
+                        .await?
+                };
+                let to_reach = if *to == source_head {
+                    DiffReach::Resolved(Box::new(source_snapshot))
+                } else {
+                    self.reach_moved(to, &[source_branch], can_read).await?
+                };
+                (from_reach, to_reach)
+            }
+        };
+        Ok(DiffEndpoints {
+            from_commit_id: from.clone(),
+            to_commit_id: to.clone(),
+            base_commit_id: decoded.base_commit_id.clone(),
+            linear_descent,
+            from_snapshot: self.open_reached(from, from_reach).await?,
+            to_snapshot: self.open_reached(to, to_reach).await?,
+        })
+    }
+
+    /// How the commit `named` is reached from the two-point side `spelling`,
+    /// classified now as `side`.
+    async fn reach_side(
+        &self,
+        named: &str,
+        spelling: &str,
+        side: DiffReadTarget,
+        can_read: &mut ReadCheck<'_>,
+    ) -> Result<DiffReach> {
+        match side {
+            DiffReadTarget::Branch(resolved)
+                if resolved.graph_commit_id.as_deref() == Some(named) =>
+            {
+                Ok(DiffReach::Resolved(Box::new(resolved.snapshot)))
+            }
+            DiffReadTarget::Branch(resolved) => {
+                self.reach_moved(named, &[resolved.branch], can_read).await
+            }
+            DiffReadTarget::Commit(commit) if commit.graph_commit_id == named => {
+                Ok(DiffReach::ById(spelling.to_string()))
+            }
+            DiffReadTarget::Commit(_) => Err(diff_token_unreached()),
+        }
+    }
+
+    /// How the commit `named` is reached from a side that moved since the
+    /// first page and follows `branches`: as an earlier head of one of them,
+    /// else as a commit the caller could name as a side itself.
+    async fn reach_moved(
+        &self,
+        named: &str,
+        branches: &[Option<String>],
+        can_read: &mut ReadCheck<'_>,
+    ) -> Result<DiffReach> {
+        for branch in branches {
+            if let Some(coordinator) = self.headed_by(branch.as_deref(), named).await? {
+                return Ok(DiffReach::Head(Box::new(coordinator)));
+            }
+        }
+        match self.authorized_diff_side(named, Some(can_read)).await {
+            Ok(DiffReadTarget::Commit(commit)) if commit.graph_commit_id == named => {
+                Ok(DiffReach::ById(named.to_string()))
+            }
+            Ok(_)
+            | Err(OmniError::ReadTargetNotFound { .. })
+            | Err(OmniError::AmbiguousReadTarget { .. }) => Err(diff_token_unreached()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The coordinator of `branch` when `commit_id` was a head of it: walking
+    /// first parents from the branch's head now, it is reached before any
+    /// commit another branch published, within
+    /// [`DIFF_CONTINUATION_WALK_COMMITS`] commits. A head another branch
+    /// published, such as a fork's first head, is reached this way, though the
+    /// caller may not read the branch that published it; a commit below it is
+    /// not. The walk reads the commits the branch published since, which its
+    /// `__manifest` usually still buffers.
+    async fn headed_by(
+        &self,
+        branch: Option<&str>,
+        commit_id: &str,
+    ) -> Result<Option<GraphCoordinator>> {
+        let coordinator = self.open_coordinator_for_branch(branch).await?;
+        let branch = branch.unwrap_or("main");
+        let mut next = coordinator
+            .head_commit_id()
+            .await?
+            .map(|id| id.as_str().to_string());
+        for _ in 0..DIFF_CONTINUATION_WALK_COMMITS {
+            let Some(id) = next else {
+                return Ok(None);
+            };
+            if id == commit_id {
+                return Ok(Some(coordinator));
+            }
+            let commit = coordinator.resolve_commit(&SnapshotId::new(&id)).await?;
+            if commit.graph_branch.as_deref().unwrap_or("main") != branch {
+                return Ok(None);
+            }
+            next = commit.parent_commit_id;
+        }
+        Ok(None)
+    }
+
+    /// The graph as of `commit_id`, opened through what reached it.
+    async fn open_reached(&self, commit_id: &str, reach: DiffReach) -> Result<Snapshot> {
+        match reach {
+            DiffReach::Resolved(snapshot) => Ok(*snapshot),
+            DiffReach::ById(spelling) => self.diff_endpoint_snapshot(commit_id, &spelling).await,
+            DiffReach::Head(coordinator) => coordinator
+                .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(commit_id)))
+                .await
+                .map(|resolved| resolved.snapshot)
+                .map_err(|error| match error {
+                    OmniError::BranchNotFound { .. } => OmniError::ReadTargetNotFound {
+                        target: commit_id.to_string(),
+                    },
+                    error => error,
+                }),
+        }
+    }
+
+    /// The graph as of one commit, published or not.
+    async fn commit_snapshot(&self, commit_id: &str) -> Result<Snapshot> {
+        Ok(self
+            .coordinator
+            .load_full()
+            .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(commit_id)))
+            .await?
+            .snapshot)
+    }
+
+    /// The graph as of one diff endpoint commit. A commit whose writing
+    /// branch is gone, or that a raced branch deletion hides mid-lookup, is
+    /// no longer readable: it is the not-found of the spelling that named it,
+    /// never the branch its record names, which the caller may not be allowed
+    /// to learn.
+    async fn diff_endpoint_snapshot(&self, commit_id: &str, spelling: &str) -> Result<Snapshot> {
+        self.commit_snapshot(commit_id)
+            .await
+            .map_err(|error| match error {
+                OmniError::BranchNotFound { .. } => OmniError::ReadTargetNotFound {
+                    target: spelling.to_string(),
+                },
+                error => error,
+            })
+    }
+
+    /// Open one classified and authorized diff endpoint: its commit and the
+    /// graph as of it.
+    async fn open_diff_side(
+        &self,
+        side: &str,
+        classified: DiffReadTarget,
+    ) -> Result<(String, Snapshot)> {
+        match classified {
+            DiffReadTarget::Branch(resolved) => {
+                let commit_id = resolved.graph_commit_id.ok_or_else(|| {
+                    OmniError::manifest(format!("branch '{side}' has no head commit"))
+                })?;
+                Ok((commit_id, resolved.snapshot))
+            }
+            DiffReadTarget::Commit(commit) => {
+                let snapshot = self
+                    .diff_endpoint_snapshot(&commit.graph_commit_id, side)
+                    .await?;
+                Ok((commit.graph_commit_id, snapshot))
+            }
+        }
+    }
+
+    /// Classify one diff side, then, when the caller may read only some
+    /// branches, authorize the branch it reads before anything else is
+    /// resolved: a refused side is the not-found of a side that names
+    /// nothing.
+    async fn authorized_diff_side(
+        &self,
+        side: &str,
+        can_read: Option<&mut ReadCheck<'_>>,
+    ) -> Result<DiffReadTarget> {
+        let classified = self.classify_diff_read_target(side).await?;
+        if let Some(can_read) = can_read
+            && !can_read(&classified.read_branch())
+        {
+            return Err(OmniError::ReadTargetNotFound {
+                target: side.to_string(),
+            });
+        }
+        Ok(classified)
+    }
+
+    /// Classify one diff endpoint: a live branch (its head now) or a graph
+    /// commit. A string naming both is refused, never resolved by precedence;
+    /// one naming neither is a typed not-found carrying only the caller's
+    /// spelling.
+    async fn classify_diff_read_target(&self, target: &str) -> Result<DiffReadTarget> {
+        if target.is_empty() {
+            return Err(OmniError::manifest("a diff endpoint cannot be empty"));
+        }
+        // A branch name and a commit id are both taken as written, so a
+        // spelling neither could be is refused rather than trimmed.
+        ensure_canonical_branch_name(target)?;
+        // A string the branch-name rules refuse cannot name a branch; that is
+        // not an error here, since it may still name a commit.
+        let as_branch = match normalize_branch_name(target) {
+            Err(_) => None,
+            Ok(_) => match self.resolved_target(ReadTarget::branch(target)).await {
+                Ok(resolved) => Some(resolved),
+                Err(OmniError::BranchNotFound { .. }) => None,
+                Err(error) => return Err(error),
+            },
+        };
+        // Every graph commit id is minted canonical, a ULID or an `hb1`
+        // address, so any other spelling names no commit and needs no lookup.
+        // The lookup is not free: on a miss it checks out every live branch's
+        // `__manifest`, which a branch name like `main` would otherwise pay.
+        let as_commit = if !omnigraph_core::graph_commit_id::is_valid_graph_commit_id(target) {
+            None
+        } else {
+            match self
+                .coordinator
+                .load_full()
+                .resolve_commit(&SnapshotId::new(target))
+                .await
+            {
+                Ok(commit) => Some(commit),
+                Err(OmniError::Manifest(error)) if error.kind == ManifestErrorKind::NotFound => {
+                    None
+                }
+                Err(OmniError::BranchNotFound { .. }) => None,
+                Err(error) => return Err(error),
+            }
+        };
+        match (as_branch, as_commit) {
+            (Some(_), Some(_)) => Err(OmniError::AmbiguousReadTarget {
+                target: target.to_string(),
+            }),
+            (Some(resolved), None) => Ok(DiffReadTarget::Branch(Box::new(resolved))),
+            (None, Some(commit)) => Ok(DiffReadTarget::Commit(commit)),
+            (None, None) => Err(OmniError::ReadTargetNotFound {
+                target: target.to_string(),
+            }),
+        }
     }
 
     pub async fn entity_at_target(
@@ -2620,8 +3636,7 @@ impl Omnigraph {
     ) -> Result<Snapshot> {
         self.ensure_schema_state_valid().await?;
         self.coordinator
-            .read()
-            .await
+            .load_full()
             .snapshot_at_graph_manifest_version(graph_manifest_version)
             .await
     }
@@ -2691,31 +3706,43 @@ impl Omnigraph {
         table_ops::graph_index_for_resolved(self, resolved, edge_types, system_columns).await
     }
 
-    /// Ensure every declared BTREE, full-text, and vector index exists.
-    /// Idempotent — Lance skips indexes that already exist.
-    ///
-    /// Plans from one graph-manifest/schema token, then revalidates under the final
-    /// schema → branch → sorted dataset gates. Existing target refs must still have live
-    /// Lance HEAD equal to their published dataset version; uncovered drift is refused with
-    /// explicit `omnigraph repair` guidance instead of being silently folded.
-    /// The verified handle is reused for index effects and the resulting
-    /// versions are published through the graph manifest.
-    ///
-    /// On named branches, indexing preserves lazy branching:
-    /// unbranched datasets keep inheriting `main`, while datasets inherited
-    /// from an ancestor branch remain inherited when no index work is needed.
-    /// When real index work exists they are forked into the active branch only
-    /// under the final gates.
-    /// Returns the declared indexes that could not be materialized on this
-    /// pass (today: vector properties with no trainable vectors yet). They are
-    /// deferred, not errors; a later `ensure_indices`/`optimize` builds them
-    /// once the property is trainable. Reads stay correct (brute-force) meanwhile.
+    /// [`Self::ensure_indices_on`] on this handle's current branch.
     pub async fn ensure_indices(&self) -> Result<Vec<PendingIndex>> {
-        table_ops::ensure_indices(self).await
+        Ok(table_ops::ensure_indices(self).await?.pending)
     }
 
+    /// [`Self::ensure_indices_on_as`] with no actor, returning only what it
+    /// left pending. With a policy installed, use the actor-aware counterpart.
     pub async fn ensure_indices_on(&self, branch: &str) -> Result<Vec<PendingIndex>> {
-        table_ops::ensure_indices_on(self, branch).await
+        Ok(self.ensure_indices_on_as(branch, None).await?.pending)
+    }
+
+    /// Bring the selected branch's declared indexes up to its rows: build
+    /// every declared BTREE, full-text and vector index a table lacks, and
+    /// rebuild whole every BTREE or vector index that leaves a current
+    /// fragment uncovered. Each table's work stages as one detached
+    /// `CreateIndex` on its pinned version, and every table publishes in one
+    /// graph commit on the branch; other branches and historical snapshots
+    /// keep their indexes. Idempotent: a branch with nothing to do publishes
+    /// nothing.
+    ///
+    /// Requires `Change` on the selected branch before any effect and
+    /// records the actor in the publication. Plans from one graph-manifest
+    /// and schema token and builds the artifacts before taking the schema →
+    /// branch → sorted table gates, then revalidates that authority under
+    /// them; a lost race publishes nothing.
+    ///
+    /// Pending, not errors, and reads stay correct meanwhile: a vector
+    /// property with no trainable vectors yet, and full-text coverage, which
+    /// only the explicit full rebuild ([`Self::rebuild_full_text_indices_on_as`])
+    /// refreshes; the rows it does not cover are matched with the index's
+    /// analyzer.
+    pub async fn ensure_indices_on_as(
+        &self,
+        branch: &str,
+        actor: Option<&str>,
+    ) -> Result<IndexBuildResult> {
+        table_ops::ensure_indices_on_as(self, branch, actor).await
     }
 
     /// Fully rebuild all declared or existing supported full-text indexes from
@@ -2819,8 +3846,7 @@ impl Omnigraph {
 
     pub(crate) async fn active_branch(&self) -> Option<String> {
         self.coordinator
-            .read()
-            .await
+            .load_full()
             .current_branch()
             .map(str::to_string)
     }
@@ -2855,8 +3881,7 @@ impl Omnigraph {
     ) -> Result<()> {
         let active = self
             .coordinator
-            .read()
-            .await
+            .load_full()
             .current_branch()
             .map(str::to_string);
         if active.as_deref() == Some(branch) {
@@ -2935,7 +3960,7 @@ impl Omnigraph {
             .acquire_branches(&[source.clone(), Some(target.clone())])
             .await;
         let branches = [source.clone(), Some(target.clone())];
-        let warm_snapshot = self.coordinator.read().await.snapshot();
+        let warm_snapshot = self.coordinator.load_full().snapshot();
         let (control_catalog, identity) = self
             .accepted_catalog_for_snapshot(&warm_snapshot)
             .await
@@ -2965,51 +3990,97 @@ impl Omnigraph {
         Ok(())
     }
 
-    pub async fn branch_create_from(&self, from: impl Into<ReadTarget>, name: &str) -> Result<()> {
+    pub async fn branch_create_from(
+        &self,
+        from: impl Into<ReadTarget>,
+        name: &str,
+    ) -> Result<BranchCreated> {
         self.branch_create_from_as(from, name, None).await
     }
 
-    /// Create a branch from a specific source branch with an explicit
-    /// actor for engine-layer policy enforcement (MR-722 fan-out).
+    /// Create `name` from `from` with an explicit actor for engine-layer
+    /// policy enforcement (MR-722 fan-out): a branch, whose head the new
+    /// branch starts at, or a published graph commit
+    /// ([`ReadTarget::Snapshot`]), which the new branch starts at with that
+    /// commit's data and history. Returns the branch forked and the commit
+    /// the new branch starts at.
     ///
     /// Scope is `BranchTransition { source, target }` — matches the
     /// HTTP-layer convention at `server_branch_create`
     /// (branch=Some(from), target_branch=Some(name)), so engine and
-    /// HTTP fire the same Cedar decision. Pinned-snapshot sources
-    /// (which aren't a branch ref) materialize as the sentinel
-    /// `<snapshot>` for the policy check; Cedar rules using
-    /// `branch_scope: any` still match, rules pinning a specific
-    /// source branch correctly do not.
+    /// HTTP fire the same Cedar decision. A commit start's source is the
+    /// branch a control on the commit addresses
+    /// ([`Self::commit_target_branch`]); a denial answers the not-found an
+    /// unknown id answers, so the id discloses neither existence nor
+    /// publication state. An unpublished commit and an unattached snapshot
+    /// are refused: neither is any branch's history.
     pub async fn branch_create_from_as(
         &self,
         from: impl Into<ReadTarget>,
         name: &str,
         actor: Option<&str>,
-    ) -> Result<()> {
-        let target = from.into();
-        let source_branch = match &target {
-            ReadTarget::Branch(b) => b.clone(),
-            _ => "<snapshot>".to_string(),
+    ) -> Result<BranchCreated> {
+        let start = match from.into() {
+            ReadTarget::Branch(branch) => {
+                self.enforce(
+                    omnigraph_policy::PolicyAction::BranchCreate,
+                    &omnigraph_policy::ResourceScope::BranchTransition {
+                        source: branch.clone(),
+                        target: name.to_string(),
+                    },
+                    actor,
+                )?;
+                CreateStart::Head(branch)
+            }
+            ReadTarget::Snapshot(id) => {
+                let addressed = self.addressed_commit(id.as_str()).await?;
+                let scope = omnigraph_policy::ResourceScope::BranchTransition {
+                    source: addressed.target_branch().unwrap_or("main").to_string(),
+                    target: name.to_string(),
+                };
+                match self.enforce(omnigraph_policy::PolicyAction::BranchCreate, &scope, actor) {
+                    Err(OmniError::Policy(_)) if actor.is_some() => {
+                        return Err(commit_not_found(&id));
+                    }
+                    decision => decision?,
+                }
+                match addressed {
+                    AddressedCommit::Published(commit) => CreateStart::Commit(commit),
+                    AddressedCommit::Proposal(_) => {
+                        return Err(OmniError::branch_start_refused(
+                            id.as_str(),
+                            BranchStartRefusal::UnpublishedCommit,
+                        )
+                        .before_effect());
+                    }
+                    AddressedCommit::Unattached(_) => {
+                        return Err(OmniError::branch_start_refused(
+                            id.as_str(),
+                            BranchStartRefusal::UnattachedSnapshot,
+                        )
+                        .before_effect());
+                    }
+                }
+            }
         };
-        self.enforce(
-            omnigraph_policy::PolicyAction::BranchCreate,
-            &omnigraph_policy::ResourceScope::BranchTransition {
-                source: source_branch,
-                target: name.to_string(),
-            },
-            actor,
-        )?;
-        self.branch_create_from_impl(target, name).await
+        // Keep the capture and the start proof out of every caller's frame.
+        Box::pin(self.branch_create_from_impl(start, name)).await
     }
 
-    async fn branch_create_from_impl(&self, from: impl Into<ReadTarget>, name: &str) -> Result<()> {
-        let target = from.into();
-        let ReadTarget::Branch(branch_name) = target else {
-            return Err(OmniError::manifest(
-                "branch creation from pinned snapshots is not supported yet".to_string(),
-            ));
+    async fn branch_create_from_impl(
+        &self,
+        start: CreateStart,
+        name: &str,
+    ) -> Result<BranchCreated> {
+        // The source a commit start clones is the branch incarnation that
+        // wrote the commit, where the version that published it lives.
+        let branch = match &start {
+            CreateStart::Head(branch) => normalize_branch_name(branch)?,
+            CreateStart::Commit(commit) => match commit.graph_branch.as_deref() {
+                Some(branch) => normalize_branch_name(branch)?,
+                None => None,
+            },
         };
-        let branch = normalize_branch_name(&branch_name)?;
         let target_branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
         let _export_exclusion = self.reserve_export_destructive_control()?;
@@ -3023,7 +4094,7 @@ impl Omnigraph {
             .acquire_branches(&[branch.clone(), Some(target_branch.clone())])
             .await;
         let branches = [branch.clone(), Some(target_branch.clone())];
-        let warm_snapshot = self.coordinator.read().await.snapshot();
+        let warm_snapshot = self.coordinator.load_full().snapshot();
         let (control_catalog, identity) = self
             .accepted_catalog_for_snapshot(&warm_snapshot)
             .await
@@ -3033,10 +4104,21 @@ impl Omnigraph {
         self.ensure_schema_state_valid()
             .await
             .map_err(OmniError::before_effect)?;
-        let mut source_coord = self
-            .capture_branch_control_source(branch.as_deref())
-            .await
-            .map_err(OmniError::before_effect)?;
+        let (mut source_coord, start_record) = match &start {
+            CreateStart::Head(_) => (
+                self.capture_branch_control_source(branch.as_deref())
+                    .await
+                    .map_err(OmniError::before_effect)?,
+                None,
+            ),
+            CreateStart::Commit(commit) => {
+                let (source, record) =
+                    Box::pin(self.capture_commit_start_source(branch.as_deref(), commit))
+                        .await
+                        .map_err(OmniError::before_effect)?;
+                (source, Some(record))
+            }
+        };
         let (_control_catalog, _table_guards) = self
             .join_control_catalog_to_capture(
                 control_catalog,
@@ -3051,14 +4133,192 @@ impl Omnigraph {
         // A locally owned source coordinator cannot be swapped by a concurrent
         // `branch_create_from`; the ref write is durable whichever handle
         // issued it.
-        source_coord.branch_create(&target_branch).await?;
+        let created = match (start, start_record) {
+            (CreateStart::Head(from), _) => BranchCreated {
+                from_commit_id: source_coord.branch_create(&target_branch).await?,
+                from,
+            },
+            (CreateStart::Commit(commit), Some(record)) => {
+                self.prove_commit_start(&source_coord, &record)
+                    .await
+                    .map_err(OmniError::before_effect)?;
+                source_coord
+                    .branch_create_at(&target_branch, &record)
+                    .await?;
+                BranchCreated {
+                    from: commit.graph_branch.unwrap_or_else(|| "main".to_string()),
+                    from_commit_id: commit.graph_commit_id,
+                }
+            }
+            (CreateStart::Commit(_), None) => {
+                unreachable!("a commit start captures the commit's record with its source")
+            }
+        };
         self.invalidate_read_caches().await;
-        Ok(())
+        Ok(created)
+    }
+
+    /// The source a branch starting at the published `commit` clones, and
+    /// the commit's record read from it, captured under the control gates.
+    /// The branch incarnation that wrote the commit must still be the live
+    /// one under its name. A deleted name and a name created again since
+    /// are the same fact, so both answer `BranchDeleted`, before any effect
+    /// and on every door.
+    async fn capture_commit_start_source(
+        &self,
+        branch: Option<&str>,
+        commit: &GraphCommit,
+    ) -> Result<(GraphCoordinator, super::manifest::HistoryRecord)> {
+        let commit_id = commit.graph_commit_id.as_str();
+        let deleted = || {
+            OmniError::branch_start_refused(
+                commit_id,
+                BranchStartRefusal::BranchDeleted {
+                    branch: commit
+                        .graph_branch
+                        .clone()
+                        .unwrap_or_else(|| "main".to_string()),
+                },
+            )
+        };
+        let source = match self.capture_branch_control_source(branch).await {
+            Err(OmniError::BranchNotFound { .. }) => return Err(deleted()),
+            captured => captured?,
+        };
+        match source.published_record(commit_id).await? {
+            Some(record) if record.commit.native_branch.as_deref() == source.native_branch() => {
+                Ok((source, record))
+            }
+            Some(_) => Err(deleted()),
+            // Addressed as published, its record is held by no live
+            // incarnation of its branch now: that branch was deleted.
+            None if commit.graph_branch.is_some() => Err(deleted()),
+            None => Err(commit_not_found(&SnapshotId::new(commit_id))),
+        }
+    }
+
+    /// Prove under the control gates that a branch can start at `record`,
+    /// which the captured `source` wrote: the commit is at or below the
+    /// captured head; its schema is the accepted one; and every table
+    /// version its snapshot pins still opens with every object it
+    /// references, so the new branch's first manifest names a complete
+    /// snapshot that its base keeps from cleanup from then on.
+    async fn prove_commit_start(
+        &self,
+        source: &GraphCoordinator,
+        record: &super::manifest::HistoryRecord,
+    ) -> Result<()> {
+        let commit_id = record.commit.graph_commit_id.as_str();
+        if record.commit.graph_manifest_version > source.version() {
+            return Err(OmniError::manifest_internal(format!(
+                "commit '{commit_id}' names `__manifest` version {} above the captured head \
+                 version {} of the branch that wrote it",
+                record.commit.graph_manifest_version,
+                source.version()
+            )));
+        }
+        let snapshot = Snapshot::wrap(record.snapshot(self.root_uri(), &self.control_session())?);
+        // Every record carries the contract its commit was written under:
+        // the storage upgrade gives each converted commit one too. A commit
+        // from before the upgrade is refused where its `__manifest` version
+        // is cloned, which only the legacy history reads.
+        let Some(contract) = snapshot.schema_contract() else {
+            return Err(OmniError::manifest_internal(format!(
+                "the record of commit '{commit_id}' carries no schema contract"
+            )));
+        };
+        if Some(contract) != source.snapshot().schema_contract() {
+            return Err(OmniError::branch_start_refused(
+                commit_id,
+                BranchStartRefusal::SchemaChanged,
+            ));
+        }
+        // A pin the captured head also holds is a root of every collection,
+        // and the collector never deletes a root's files. Any other pin may
+        // be a version an interrupted cleanup already emptied: its sweep
+        // deletes a version's files before its manifest, so the manifest
+        // opening proves nothing about them, and each object it references
+        // is probed. These requests run under the exclusive schema permit,
+        // which every write in the process waits on, so the pins open and
+        // their objects are probed with bounded concurrency, stopping at the
+        // first missing object.
+        use futures::StreamExt;
+        let head = source.snapshot();
+        let entries: std::collections::BTreeMap<_, _> = snapshot
+            .datasets()
+            .filter(|entry| {
+                !head
+                    .datasets()
+                    .any(|held| held.same_physical_version(entry))
+            })
+            .map(|entry| (entry.type_key.clone(), entry.clone()))
+            .collect();
+        let mut opens = futures::stream::iter(entries.values().cloned())
+            .map(|entry| async move {
+                let dataset = match self.table_store.open_at_entry(&entry).await {
+                    Ok(dataset) => dataset,
+                    Err(OmniError::HistoricalVersionReclaimed { .. }) => {
+                        return Err(branch_start_not_retained(commit_id, &entry));
+                    }
+                    Err(error) => return Err(error),
+                };
+                let mut objects = collector::CollectorPathSnapshot::default();
+                collector::capture_dataset_paths(&mut objects, &dataset, &entry.type_key).await?;
+                Ok(objects)
+            })
+            .buffer_unordered(BRANCH_START_RETENTION_PROBES);
+        let mut objects = collector::CollectorPathSnapshot::default();
+        while let Some(opened) = opens.next().await {
+            objects.absorb(opened?);
+        }
+        match objects
+            .first_missing_location(BRANCH_START_RETENTION_PROBES)
+            .await?
+        {
+            None => Ok(()),
+            Some(type_key) => Err(branch_start_not_retained(
+                commit_id,
+                entries.get(&type_key).ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "a branch start probe reported '{type_key}', which no probed pin names"
+                    ))
+                })?,
+            )),
+        }
     }
 
     pub async fn branch_list(&self) -> Result<Vec<String>> {
         self.ensure_schema_state_valid().await?;
-        self.coordinator.read().await.branch_list().await
+        self.coordinator.load_full().branch_list().await
+    }
+
+    /// [`Self::branch_list`] with the details of each branch `can_read`
+    /// admits: its head, the branch and commit its current lifetime started
+    /// from, and when that lifetime was created. One listing of the branch
+    /// refs; `can_read` is asked once per branch, before any read of that
+    /// branch. Each admitted branch costs a read of its
+    /// latest `__manifest` version and, when it has written a commit, of the
+    /// version it was created from; never a read of its lineage. A branch
+    /// deleted after the listing keeps its name and has no details.
+    pub async fn branch_list_detailed(
+        &self,
+        can_read: &mut ReadCheck<'_>,
+    ) -> Result<BranchListing> {
+        self.ensure_schema_state_valid().await?;
+        let listing = crate::db::manifest::list_graph_branches_detailed(
+            self.uri(),
+            &self.control_session(),
+            can_read,
+        )
+        .await?;
+        Ok(BranchListing {
+            branches: listing.branches,
+            details: listing
+                .details
+                .into_iter()
+                .map(BranchDetail::from_catalog)
+                .collect(),
+        })
     }
 
     pub async fn branch_delete(&self, name: &str) -> Result<()> {
@@ -3101,7 +4361,7 @@ impl Omnigraph {
         };
         drop(cache);
         let branches = [Some(branch.clone())];
-        let warm_snapshot = self.coordinator.read().await.snapshot();
+        let warm_snapshot = self.coordinator.load_full().snapshot();
         let (control_catalog, identity) = self
             .accepted_catalog_for_snapshot(&warm_snapshot)
             .await
@@ -3150,26 +4410,24 @@ impl Omnigraph {
     pub async fn get_commit(&self, commit_id: &str) -> Result<GraphCommit> {
         self.ensure_schema_state_valid().await?;
         self.coordinator
-            .read()
-            .await
+            .load_full()
             .resolve_commit(&SnapshotId::new(commit_id))
             .await
     }
 
-    /// The branch a control write on `commit_id` addresses: a proposal's
-    /// recorded target while its tag stands, whatever its lifetime, else the
-    /// branch of the published commit; an unknown id is not found.
+    /// The branch a control write on `commit_id` addresses: a proposal's or
+    /// an unattached snapshot's recorded target while its tag stands,
+    /// whatever its lifetime, else the branch of the published commit; an
+    /// unknown id is not found.
     pub async fn commit_target_branch(&self, commit_id: &str) -> Result<String> {
-        let branch = match self.addressed_commit(commit_id).await? {
-            AddressedCommit::Proposal(candidate) => candidate.property.graph_branch,
-            AddressedCommit::Published(published) => published.graph_branch,
-        };
-        Ok(branch.unwrap_or_else(|| "main".to_string()))
+        let addressed = self.addressed_commit(commit_id).await?;
+        Ok(addressed.target_branch().unwrap_or("main").to_string())
     }
 
     /// List the branch's reachable graph lineage, **most recent first** (by
-    /// [`GraphCommit::lineage_key`] — the same total order head selection and
-    /// any future keyset pagination cursor derive from).
+    /// [`GraphCommit::lineage_key`], the order head selection derives from,
+    /// which along one first-parent chain is falling generation: the order
+    /// [`Self::list_commits_page`] walks).
     ///
     /// `branch: None` (or `"main"`) lists main's lineage projection. A named
     /// branch lists the history reachable from that branch's head: the main
@@ -3190,6 +4448,168 @@ impl Omnigraph {
         let mut commits = coordinator.list_commits().await?;
         commits.reverse();
         Ok(commits)
+    }
+
+    /// One page of [`Self::list_commits`]: up to `limit` commits
+    /// ([`COMMIT_LIST_DEFAULT_PAGE_COMMITS`] when `None`), newest first, and
+    /// a token that continues the list below them.
+    ///
+    /// The first page resolves the branch's head and names it; a continuation
+    /// (`page_token`) answers for that head's first-parent chain, whatever
+    /// the branch did since. The token carries a digest of the branch, never
+    /// its name. A page reads the branch's `__manifest` and the `__history`
+    /// extents its own commits occupy, so its cost follows the page, not the
+    /// history below it.
+    ///
+    /// The token is checksummed, not signed. A continuation is refused for
+    /// another graph or branch digest, but the commit it continues from, and
+    /// the head it names, are the caller's claim: the walk starts at any
+    /// commit this handle can find, on any branch. That is no authority for a
+    /// caller who may read every commit by id; a caller who may read only some
+    /// branches uses [`Self::list_commits_page_readable`].
+    pub async fn list_commits_page(
+        &self,
+        branch: Option<&str>,
+        page_token: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<CommitListPage> {
+        self.commit_list_page(branch, page_token, limit, None).await
+    }
+
+    /// [`Self::list_commits_page`] for a caller who may read only some
+    /// branches; `can_read` answers for a branch by name, as for
+    /// [`Self::diff_page_readable`]. A continuation lists from its commit only
+    /// when that commit is on `branch`'s history: held by the branch's
+    /// `__manifest` (its head or a buffered commit), published on a branch
+    /// `can_read` allows, or else the first commit below the token's
+    /// generation on the branch's first-parent chain from its head, a walk
+    /// that costs what [`Self::list_commits`] costs. Any other commit, unknown
+    /// or unreadable alike, is [`OmniError::ChangeCursorRejected`].
+    pub async fn list_commits_page_readable(
+        &self,
+        branch: Option<&str>,
+        page_token: Option<&str>,
+        limit: Option<usize>,
+        can_read: &mut ReadCheck<'_>,
+    ) -> Result<CommitListPage> {
+        self.commit_list_page(branch, page_token, limit, Some(can_read))
+            .await
+    }
+
+    /// One commit list page; with `can_read`, a continuation's commit is held
+    /// to the branch's history.
+    async fn commit_list_page(
+        &self,
+        branch: Option<&str>,
+        page_token: Option<&str>,
+        limit: Option<usize>,
+        can_read: Option<&mut ReadCheck<'_>>,
+    ) -> Result<CommitListPage> {
+        use crate::changes::token;
+
+        self.ensure_schema_state_valid().await?;
+        let limit = limit.unwrap_or(COMMIT_LIST_DEFAULT_PAGE_COMMITS);
+        if limit == 0 {
+            return Err(OmniError::manifest(
+                "commit list page limit must be greater than zero",
+            ));
+        }
+        if limit > COMMIT_LIST_MAX_PAGE_COMMITS {
+            return Err(OmniError::resource_limit(
+                "commit_list_page_commits",
+                COMMIT_LIST_MAX_PAGE_COMMITS as u64,
+                limit as u64,
+            ));
+        }
+        let branch = match branch {
+            Some(branch) => normalize_branch_name(branch)?,
+            None => None,
+        };
+        let graph_identity =
+            token::hashed_identity(&self.schema_view.load().schema_identity_domain);
+        let scope = token::BranchScopeV1::for_branch(branch.as_deref());
+        let resume = page_token
+            .map(token::decode_commit_list_page_token)
+            .transpose()?;
+        if let Some(resume) = &resume
+            && (resume.graph_identity != graph_identity || resume.branch != scope)
+        {
+            return Err(token::cursor_rejected(
+                "commit list page token does not match this graph and branch",
+            ));
+        }
+        let coordinator = self.open_coordinator_for_branch(branch.as_deref()).await?;
+        let start = resume.as_ref().map(|resume| resume.next_commit_id.as_str());
+        let (head, page) = coordinator.first_parent_page(start, limit).await?;
+        // A commit the branch's history does not reach is refused as an
+        // unknown one is, so the refusal tells a caller nothing it may not read.
+        let unreached = || {
+            token::cursor_rejected(
+                "commit list page token names a commit off this branch's history",
+            )
+        };
+        let Some(page) = page else {
+            return Err(match (&resume, &can_read) {
+                (Some(_), Some(_)) => unreached(),
+                (Some(_), None) => token::cursor_rejected(
+                    "commit list page token names a commit this graph does not hold",
+                ),
+                (None, _) => OmniError::manifest_internal(format!(
+                    "the head '{}' of the branch is not held",
+                    head.graph_commit_id
+                )),
+            });
+        };
+        if let (Some(resume), Some(can_read)) = (&resume, can_read) {
+            // The cheap proofs first: a commit the branch's `__manifest` holds
+            // is on its first-parent run to the head, and one published on a
+            // branch the caller may read lists that branch's history. Only a
+            // commit neither covers, such as one an unreadable branch the
+            // branch forked from published, is looked for down the chain.
+            let first = &page.commits[0];
+            let reached = coordinator.holds_commit(&first.graph_commit_id)
+                || can_read(first.graph_branch.as_deref().unwrap_or("main"))
+                || coordinator
+                    .first_parent_below(resume.below_generation)
+                    .await?
+                    .is_some_and(|commit| commit.graph_commit_id == resume.next_commit_id);
+            if !reached {
+                return Err(unreached());
+            }
+        }
+        if let Some(resume) = &resume
+            && page
+                .commits
+                .first()
+                .is_some_and(|first| first.generation >= resume.below_generation)
+        {
+            return Err(token::cursor_rejected(
+                "commit list page token names a commit that is not below the page before it",
+            ));
+        }
+        let head_commit_id = match resume {
+            Some(resume) => resume.head_commit_id,
+            None => head.graph_commit_id,
+        };
+        let next_page_token = match (page.next, page.commits.last()) {
+            (Some(next_commit_id), Some(last)) => {
+                Some(token::encode_token(&token::CommitListPageTokenV1 {
+                    version: token::TOKEN_VERSION,
+                    kind: token::KIND_COMMIT_LIST_PAGE.to_string(),
+                    graph_identity,
+                    branch: scope,
+                    head_commit_id: head_commit_id.clone(),
+                    next_commit_id,
+                    below_generation: last.generation,
+                })?)
+            }
+            _ => None,
+        };
+        Ok(CommitListPage {
+            head_commit_id,
+            commits: page.commits,
+            next_page_token,
+        })
     }
 
     /// The unpublished commits whose target is `branch` (`None` = main) and
@@ -3213,6 +4633,28 @@ impl Omnigraph {
             .collect())
     }
 
+    /// The live unattached snapshots whose recorded target is `branch`
+    /// (`None` = main), newest first (RFC "Unattached graph branches"). One
+    /// tag listing, one read per candidate tag and one target scan per
+    /// distinct chain.
+    pub async fn list_unattached_commits(&self, branch: Option<&str>) -> Result<Vec<GraphCommit>> {
+        self.ensure_schema_state_valid().await?;
+        let branch = match branch {
+            Some(branch) => normalize_branch_name(branch)?,
+            None => None,
+        };
+        let snapshots = crate::db::manifest::ManifestCoordinator::list_unattached(
+            self.uri(),
+            &self.control_session(),
+            branch.as_deref(),
+        )
+        .await?;
+        Ok(snapshots
+            .iter()
+            .map(crate::db::manifest::UnattachedCommit::graph_commit)
+            .collect())
+    }
+
     /// The unpublished commit `commit_id` names, judged against its target.
     async fn unpublished_commit(
         &self,
@@ -3226,25 +4668,38 @@ impl Omnigraph {
         .await
     }
 
+    /// The unattached snapshot `commit_id` names, judged against its target.
+    async fn unattached_commit(
+        &self,
+        commit_id: &str,
+    ) -> Result<Option<crate::db::manifest::UnattachedCommit>> {
+        crate::db::manifest::ManifestCoordinator::unattached_commit(
+            self.uri(),
+            &self.control_session(),
+            commit_id,
+        )
+        .await
+    }
+
     /// What `commit_id` addresses: the proposal its tag names while that is
-    /// not published, else the published commit; an unknown id is not found.
-    async fn addressed_commit(&self, commit_id: &str) -> Result<AddressedCommit> {
+    /// not published, else the unattached snapshot a candidate tag names,
+    /// else the published commit; an unknown id is not found. The candidate
+    /// tag listing costs nothing for an id that is not a canonical ULID.
+    pub(crate) async fn addressed_commit(&self, commit_id: &str) -> Result<AddressedCommit> {
         use crate::db::manifest::{UnpublishedExpiry, UnpublishedLifetime};
-        match self.unpublished_commit(commit_id).await? {
-            Some(candidate)
-                if candidate.lifetime
-                    != UnpublishedLifetime::Expired(UnpublishedExpiry::Published) =>
-            {
-                Ok(AddressedCommit::Proposal(Box::new(candidate)))
-            }
-            _ => self
-                .coordinator
-                .read()
-                .await
-                .resolve_commit(&SnapshotId::new(commit_id))
-                .await
-                .map(AddressedCommit::Published),
+        if let Some(candidate) = self.unpublished_commit(commit_id).await?
+            && candidate.lifetime != UnpublishedLifetime::Expired(UnpublishedExpiry::Published)
+        {
+            return Ok(AddressedCommit::Proposal(Box::new(candidate)));
         }
+        if let Some(candidate) = self.unattached_commit(commit_id).await? {
+            return Ok(AddressedCommit::Unattached(Box::new(candidate)));
+        }
+        self.coordinator
+            .load_full()
+            .resolve_commit(&SnapshotId::new(commit_id))
+            .await
+            .map(AddressedCommit::Published)
     }
 
     /// `enforce` for an id-addressed control write on `target_branch`: a
@@ -3282,6 +4737,15 @@ impl Omnigraph {
         self.ensure_schema_state_valid().await?;
         let candidate = match self.addressed_commit(commit_id).await? {
             AddressedCommit::Proposal(candidate) => *candidate,
+            AddressedCommit::Unattached(candidate) => {
+                self.enforce_commit_control(
+                    omnigraph_policy::PolicyAction::CommitPublish,
+                    candidate.property.graph_branch.as_deref(),
+                    commit_id,
+                    actor,
+                )?;
+                return Err(OmniError::unattached_cannot_publish(commit_id));
+            }
             AddressedCommit::Published(published) => {
                 self.enforce_commit_control(
                     omnigraph_policy::PolicyAction::CommitPublish,
@@ -3305,16 +4769,18 @@ impl Omnigraph {
         let _branch_guard = self.write_queue().acquire_branch(target.as_deref()).await;
         let candidate = match self.addressed_commit(commit_id).await? {
             AddressedCommit::Proposal(candidate) => *candidate,
+            AddressedCommit::Unattached(_) => return Err(changed_kind_under_gate(commit_id)),
             AddressedCommit::Published(published) => return Ok(published),
         };
         candidate.require_publishable()?;
         self.ensure_schema_state_valid().await?;
-        let mut active = self.coordinator.write().await;
-        let published = if target.as_deref() == active.current_branch() {
-            *active = self.open_coordinator_for_branch(target.as_deref()).await?;
-            active.publish_unpublished(&candidate).await?
+        let installed = self.coordinator.load_full();
+        let published = if target.as_deref() == installed.current_branch() {
+            let mut next = self.open_coordinator_for_branch(target.as_deref()).await?;
+            let outcome = next.publish_unpublished(&candidate).await;
+            self.install_coordinator(next, &installed);
+            outcome?
         } else {
-            drop(active);
             let mut coordinator = self.open_coordinator_for_branch(target.as_deref()).await?;
             let published = coordinator.publish_unpublished(&candidate).await?;
             *self.merge_authority_cache.lock().await = Some((target_name, coordinator));
@@ -3334,13 +4800,18 @@ impl Omnigraph {
     /// Drop the unpublished commit `commit_id`, under `commit_drop` on its
     /// recorded target branch and that branch's write gate, which it shares
     /// with the publication: its tag is removed and its held merge inputs
-    /// released. A published commit is refused.
+    /// released. An unattached snapshot is dropped with every descendant,
+    /// deepest first ([`Self::drop_unattached_as`]). A published commit is
+    /// refused.
     pub async fn drop_commit_as(&self, commit_id: &str, actor: Option<&str>) -> Result<()> {
         self.ensure_schema_state_valid().await?;
         let published_conflict =
             || OmniError::manifest_conflict(format!("commit '{commit_id}' is published"));
         let candidate = match self.addressed_commit(commit_id).await? {
             AddressedCommit::Proposal(candidate) => *candidate,
+            AddressedCommit::Unattached(candidate) => {
+                return self.drop_unattached_as(*candidate, commit_id, actor).await;
+            }
             AddressedCommit::Published(published) => {
                 self.enforce_commit_control(
                     omnigraph_policy::PolicyAction::CommitDrop,
@@ -3363,6 +4834,7 @@ impl Omnigraph {
         let _branch_guard = self.write_queue().acquire_branch(target.as_deref()).await;
         let candidate = match self.addressed_commit(commit_id).await? {
             AddressedCommit::Proposal(candidate) => *candidate,
+            AddressedCommit::Unattached(_) => return Err(changed_kind_under_gate(commit_id)),
             AddressedCommit::Published(_) => return Err(published_conflict()),
         };
         candidate.require_droppable()?;
@@ -3370,6 +4842,48 @@ impl Omnigraph {
             self.uri(),
             &self.control_session(),
             &candidate,
+        )
+        .await
+    }
+
+    /// Drop `candidate` and every snapshot descending from it, deepest first,
+    /// under `commit_drop` on its recorded target and that branch's write
+    /// gate, under which the descendant set is captured.
+    async fn drop_unattached_as(
+        &self,
+        candidate: crate::db::manifest::UnattachedCommit,
+        commit_id: &str,
+        actor: Option<&str>,
+    ) -> Result<()> {
+        let target = candidate.property.graph_branch.clone();
+        self.enforce_commit_control(
+            omnigraph_policy::PolicyAction::CommitDrop,
+            target.as_deref(),
+            commit_id,
+            actor,
+        )?;
+        candidate.require_droppable()?;
+        let _schema_permit = self.write_queue().acquire_schema_shared().await;
+        let _branch_guard = self.write_queue().acquire_branch(target.as_deref()).await;
+        let candidate = match self.addressed_commit(commit_id).await? {
+            AddressedCommit::Unattached(candidate) => *candidate,
+            AddressedCommit::Proposal(_) | AddressedCommit::Published(_) => {
+                return Err(changed_kind_under_gate(commit_id));
+            }
+        };
+        candidate.require_droppable()?;
+        let descendants = crate::db::manifest::ManifestCoordinator::unattached_descendants(
+            self.uri(),
+            &self.control_session(),
+            &candidate.property.root_commit_id,
+            commit_id,
+        )
+        .await?;
+        crate::db::manifest::ManifestCoordinator::drop_unattached(
+            self.uri(),
+            &self.control_session(),
+            &candidate,
+            &descendants,
         )
         .await
     }
@@ -3462,18 +4976,23 @@ impl Omnigraph {
     }
 }
 
+/// A caller's branch name as the engine addresses it: `None` for main, the
+/// name itself otherwise. The name is taken as written, the spelling a policy
+/// decision judged; one that is not canonical is refused, never corrected.
 pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
-    let branch = branch.trim();
-    if branch.is_empty() {
-        return Err(OmniError::manifest(
-            "branch name cannot be empty".to_string(),
-        ));
-    }
+    ensure_canonical_branch_name(branch)?;
     if branch == "main" {
         return Ok(None);
     }
     crate::branch_names::ensure_logical_branch_name(branch)?;
     Ok(Some(branch.to_string()))
+}
+
+/// Refuse a branch name that is not canonical as a bad request
+/// ([`omnigraph_policy::ensure_canonical_branch_name`]).
+pub(crate) fn ensure_canonical_branch_name(branch: &str) -> Result<()> {
+    omnigraph_policy::ensure_canonical_branch_name(branch)
+        .map_err(|error| OmniError::manifest(error.to_string()))
 }
 
 /// Build a `ResolvedTarget` from the warm coordinator without opening the commit
@@ -3684,6 +5203,15 @@ fn physical_table_schema(
         fields,
         schema.metadata.clone(),
     )))
+}
+
+/// A proposal id and an unattached id are distinct spellings, so a commit
+/// that resolves to one kind before a branch gate and another under it is
+/// an integrity failure, never a lifetime outcome.
+fn changed_kind_under_gate(commit_id: &str) -> OmniError {
+    OmniError::manifest_internal(format!(
+        "commit '{commit_id}' resolved to a different kind under the branch gate"
+    ))
 }
 
 fn validate_bound_catalog_against_snapshot(catalog: &Catalog, snapshot: &Snapshot) -> Result<()> {
@@ -3919,6 +5447,177 @@ pub(crate) fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result
     )))
 }
 
+/// A caller's answer to "may it read this branch?", asked once per two-point
+/// graph diff side and, on a continuation, per commit the page token names
+/// that its side no longer resolves to ([`Omnigraph::diff_page_readable`]),
+/// and once per listed branch ([`Omnigraph::branch_list_detailed`]).
+pub type ReadCheck<'a> = dyn FnMut(&str) -> bool + Send + 'a;
+
+/// The live graph branches, as [`Omnigraph::branch_list_detailed`] lists them.
+#[derive(Debug, Clone)]
+pub struct BranchListing {
+    /// Every live branch, `main` first and the rest by name.
+    pub branches: Vec<String>,
+    /// One entry per branch the caller may read, in the order of `branches`.
+    pub details: Vec<BranchDetail>,
+}
+
+/// One live graph branch, as [`Omnigraph::branch_list_detailed`] reports it.
+/// `from` and `from_commit_id` name where the branch started, as its create
+/// receipt ([`BranchCreated`]) did. A branch deleted and created again under
+/// the same name is a new lifetime: its start and creation time are the new
+/// lifetime's.
+#[derive(Debug, Clone)]
+pub struct BranchDetail {
+    pub name: String,
+    /// The commit a read of the branch sees: its newest commit, or the commit
+    /// it started at while it has written none.
+    pub head: GraphCommit,
+    /// The branch this one started from, as that branch was named then; it
+    /// may since have been deleted or recreated. `None` on `main`.
+    pub from: Option<String>,
+    /// The commit the branch started at. Fixed for the branch's lifetime:
+    /// unlike the merge base, a later merge does not move it. `None` on
+    /// `main`.
+    pub from_commit_id: Option<String>,
+    /// When the branch was created, in Unix microseconds recorded to the
+    /// second; `None` on `main`.
+    pub created_at: Option<i64>,
+    /// When the head last moved, in Unix microseconds: the time of the
+    /// branch's newest commit, or `created_at` while it has written none.
+    pub updated_at: i64,
+}
+
+impl BranchDetail {
+    fn from_catalog(detail: crate::db::manifest::GraphBranchDetail) -> Self {
+        let head = crate::db::commit_graph::graph_commit_from_manifest_row(detail.head);
+        let created_at = detail.created_at_seconds.map(|seconds| {
+            i64::try_from(seconds)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1_000_000)
+        });
+        let updated_at = match created_at {
+            Some(created_at) if !detail.head_is_own => created_at,
+            _ => head.created_at,
+        };
+        Self {
+            name: detail.name,
+            head,
+            from: detail.from,
+            from_commit_id: detail.from_commit_id,
+            created_at,
+            updated_at,
+        }
+    }
+}
+
+/// How a diff continuation reached a commit its token names, which is how
+/// it opens the commit.
+enum DiffReach {
+    /// Its side resolves to it now: the side's snapshot, already open.
+    Resolved(Box<Snapshot>),
+    /// Named as a side of its own, opened by id under this spelling.
+    ById(String),
+    /// An earlier head of a moved branch side, opened through that branch.
+    Head(Box<GraphCoordinator>),
+}
+
+/// Commits a diff continuation walks down a moved branch side's first-parent
+/// chain, from its head now, to find the head the first page resolved: the
+/// commits the branch published between the two pages.
+const DIFF_CONTINUATION_WALK_COMMITS: usize = 1024;
+
+/// The one refusal of a diff page token naming a commit its sides do not
+/// reach, whether the commit is unknown or the caller may not read it.
+fn diff_token_unreached() -> OmniError {
+    crate::changes::token::cursor_rejected("diff page token names a commit its sides do not reach")
+}
+
+/// What one graph diff endpoint names.
+enum DiffReadTarget {
+    Branch(Box<crate::db::graph_coordinator::ResolvedTarget>),
+    Commit(GraphCommit),
+}
+
+impl DiffReadTarget {
+    /// The commit this endpoint resolves to: a branch's head when the side was
+    /// classified, or the named commit.
+    fn commit_id(&self) -> Option<&str> {
+        match self {
+            Self::Branch(resolved) => resolved.graph_commit_id.as_deref(),
+            Self::Commit(commit) => Some(&commit.graph_commit_id),
+        }
+    }
+
+    /// The branch a caller authorizes `read` on: the branch itself, or the
+    /// authored branch of the commit (an unpublished proposal's or unattached
+    /// snapshot's recorded target).
+    fn read_branch(&self) -> String {
+        match self {
+            Self::Branch(resolved) => resolved.branch.clone(),
+            Self::Commit(commit) => commit.graph_branch.clone(),
+        }
+        .unwrap_or_else(|| "main".to_string())
+    }
+}
+
+/// A graph diff page request resolved to its endpoints and continuation
+/// position.
+struct PreparedDiffPage {
+    scope: crate::changes::ChangeFeedScope,
+    max_changes: usize,
+    max_bytes: u64,
+    graph_identity: String,
+    filter_digest: String,
+    sides_digest: String,
+    endpoints: DiffEndpoints,
+    resume: Option<crate::changes::enumerate::ContinuationKey>,
+}
+
+/// Both branches of a branch diff or merge base, captured from one view each:
+/// the heads, their merge base and snapshots, and the source's commit graph.
+struct CapturedMergeBase {
+    source_head: String,
+    target_head: String,
+    merge_base: crate::db::commit_graph::GraphCommit,
+    source_snapshot: Snapshot,
+    target_snapshot: Snapshot,
+    source_graph: crate::db::commit_graph::CommitGraph,
+}
+
+impl CapturedMergeBase {
+    /// Whether a branch review page may pair rows by identity across the
+    /// commits it opens: the source's commit `to` descends from `from`
+    /// through first parents with no merge commit above it, walked from `to`
+    /// in the source's lineage. The first page asks for the merge base and
+    /// the source head; a later page asks for the commits its token names,
+    /// which the base and head now may have moved past. A source that merged
+    /// its target holds the base as a merge commit's second parent, where
+    /// sibling first commits stamp their rows alike; a merge above the base
+    /// can take another branch's table pins, whose history never read the
+    /// base's.
+    async fn source_descends_linearly(&self, from: &str, to: &str) -> Result<bool> {
+        let generation =
+            (from == self.merge_base.graph_commit_id).then_some(self.merge_base.generation);
+        descends_linearly_from_in(&self.source_graph, to, from, generation).await
+    }
+}
+
+/// A graph diff's two endpoints, resolved to exact commits and their
+/// snapshots.
+struct DiffEndpoints {
+    from_commit_id: String,
+    to_commit_id: String,
+    base_commit_id: Option<String>,
+    /// `to` descends from `from` through first parents with no merge commit
+    /// after it, decided for these two commits whether a first page resolved
+    /// them or a token named them, and the session pairs rows: never under
+    /// `change_lineage = off`.
+    linear_descent: bool,
+    from_snapshot: Snapshot,
+    to_snapshot: Snapshot,
+}
+
 #[cfg(test)]
 mod tests {
     use arrow_array::{Int32Array, new_null_array};
@@ -3954,6 +5653,10 @@ edge WorksAt: Person -> Company
         exists_checks: Mutex<Vec<String>>,
         renames: Mutex<Vec<(String, String)>>,
         deletes: Mutex<Vec<String>>,
+        /// Answer a create that meets an object as an unscoped S3 or Azure
+        /// adapter does: its client may have sent the request before, so
+        /// equal bytes are read as this call's own copy.
+        reads_back_creates: bool,
     }
 
     impl Default for RecordingStorageAdapter {
@@ -3965,6 +5668,7 @@ edge WorksAt: Person -> Company
                 exists_checks: Mutex::default(),
                 renames: Mutex::default(),
                 deletes: Mutex::default(),
+                reads_back_creates: false,
             }
         }
     }
@@ -4027,7 +5731,11 @@ edge WorksAt: Person -> Company
 
         async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {
             self.writes.lock().unwrap().push(uri.to_string());
-            self.inner.write_text_if_absent(uri, contents).await
+            let created = self.inner.write_text_if_absent(uri, contents).await?;
+            if !created && self.reads_back_creates {
+                return Ok(self.inner.read_text(uri).await? == contents);
+            }
+            Ok(created)
         }
 
         async fn exists(&self, uri: &str) -> Result<bool> {
@@ -4280,6 +5988,60 @@ edge WorksAt: Person -> Company
             !dir.path().join(INIT_CLAIM_FILENAME).exists(),
             "the completed winner must release its transient init claim"
         );
+    }
+
+    /// Two applies of one prepared token never both hold its init claim,
+    /// though the storage adapter reads a create's conflict back by the
+    /// stored bytes: each apply's claim names the apply. Settlement still
+    /// recognizes any apply's claim of the token, and the exact claim an
+    /// earlier release wrote, and no other token's.
+    #[tokio::test]
+    async fn one_prepared_token_has_one_init_claim_owner_issue_1067() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let prepared = Omnigraph::prepare_graph_create(uri, TEST_SCHEMA)
+            .await
+            .unwrap();
+        let other_token = Omnigraph::prepare_graph_create(uri, TEST_SCHEMA)
+            .await
+            .unwrap();
+        let storage = RecordingStorageAdapter {
+            reads_back_creates: true,
+            ..Default::default()
+        };
+
+        let _claim = acquire_init_claim(prepared.root(), &storage, Some(&prepared))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                acquire_init_claim(prepared.root(), &storage, Some(&prepared)).await,
+                Err(OmniError::InitializationClaimed { .. })
+            ),
+            "a second apply of the token is refused the claim the first holds"
+        );
+
+        let held = std::fs::read_to_string(dir.path().join(INIT_CLAIM_FILENAME)).unwrap();
+        assert!(prepared.holds_claim(&held).unwrap());
+        let another_apply = prepared.claim_payload().unwrap();
+        assert_ne!(another_apply, held, "each apply writes its own claim");
+        assert!(prepared.holds_claim(&another_apply).unwrap());
+        assert!(!other_token.holds_claim(&held).unwrap());
+
+        let mut legacy: Value = serde_json::from_str(&held).unwrap();
+        legacy["version"] = 2.into();
+        legacy.as_object_mut().unwrap().remove("attempt_id");
+        assert!(
+            prepared.holds_claim(&legacy.to_string()).unwrap(),
+            "the version-2 claim an earlier release wrote"
+        );
+        let mut mixed = legacy.clone();
+        mixed["attempt_id"] = "01J00000000000000000000000".into();
+        assert!(!prepared.holds_claim(&mixed.to_string()).unwrap());
+        let mut unnamed: Value = serde_json::from_str(&held).unwrap();
+        unnamed.as_object_mut().unwrap().remove("attempt_id");
+        assert!(!prepared.holds_claim(&unnamed.to_string()).unwrap());
+        assert!(!prepared.holds_claim("not a claim").unwrap());
     }
 
     const LEFT_RACE_SCHEMA: &str = "node Left { name: String @key }\n";
@@ -4777,7 +6539,7 @@ edge WorksAt: Person -> Company
         .await
         .unwrap();
 
-        let all_branches = db.coordinator.read().await.all_branches().await.unwrap();
+        let all_branches = db.coordinator.load_full().all_branches().await.unwrap();
         assert!(
             !all_branches.iter().any(|b| b.starts_with("__run__")),
             "no __run__ branch should exist after publish, got: {:?}",
@@ -4790,6 +6552,78 @@ edge WorksAt: Person -> Company
         );
         let result = db.apply_schema(&desired).await.unwrap();
         assert!(result.applied, "schema apply should have applied");
+    }
+
+    /// The coordinator CAS is a gate: a winning install crosses `acquire` once
+    /// per round, here one, then `hold`; a refused install (a clone bound to a
+    /// branch the handle has since left) crosses `acquire`, then `refused`.
+    #[cfg(feature = "failpoints")]
+    #[tokio::test]
+    async fn a_winning_coordinator_install_crosses_acquire_then_hold() {
+        let _scenario = crate::seams::FailScenario::setup();
+        let crossings: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let note = |name: &'static str| {
+            let crossings = Arc::clone(&crossings);
+            move || crossings.lock().unwrap().push(name)
+        };
+        let _acquire = GATE_COORDINATOR_CAS_ACQUIRE.observe(note("acquire"));
+        let _hold = GATE_COORDINATOR_CAS_HOLD.observe(note("hold"));
+        let _refused = GATE_COORDINATOR_CAS_REFUSED.observe(note("refused"));
+        let dir = tempfile::tempdir().unwrap();
+        let db = Omnigraph::init(dir.path().to_str().unwrap(), TEST_SCHEMA)
+            .await
+            .unwrap();
+        crossings.lock().unwrap().clear();
+
+        let (installed, mut next) = db.installed_coordinator_copy();
+        next.refresh().await.unwrap();
+        assert!(db.install_coordinator(next, &installed));
+        assert_eq!(*crossings.lock().unwrap(), ["acquire", "hold"]);
+
+        db.branch_create("feature").await.unwrap();
+        db.sync_branch("feature").await.unwrap();
+        let (feature_pointer, feature_clone) = db.installed_coordinator_copy();
+        db.sync_branch("main").await.unwrap();
+        crossings.lock().unwrap().clear();
+        assert!(!db.install_coordinator(feature_clone, &feature_pointer));
+        assert_eq!(*crossings.lock().unwrap(), ["acquire", "refused"]);
+    }
+
+    /// A clone of an installed pointer that another install has since replaced
+    /// with another branch lifetime is refused: lifetimes have no order, so
+    /// only provenance tells a late refresh of the dead lifetime apart.
+    #[tokio::test]
+    async fn late_install_of_a_dead_branch_lifetime_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        db.branch_create("feature").await.unwrap();
+        db.sync_branch("feature").await.unwrap();
+        let (dead_pointer, dead_clone) = db.installed_coordinator_copy();
+        let dead = dead_clone.manifest_incarnation();
+
+        let other = Omnigraph::open(uri).await.unwrap();
+        other.branch_delete("feature").await.unwrap();
+        other.branch_create("feature").await.unwrap();
+
+        db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
+        let recreated = db.coordinator.load().manifest_incarnation();
+        assert!(
+            !recreated.same_lifetime(&dead),
+            "the probing read installed the recreated lifetime"
+        );
+
+        assert!(
+            !db.install_coordinator(dead_clone, &dead_pointer),
+            "a clone of a replaced pointer carrying another lifetime is refused"
+        );
+        assert!(
+            db.coordinator
+                .load()
+                .manifest_incarnation()
+                .same_lifetime(&recreated),
+            "the handle stays on the recreated lifetime"
+        );
     }
 
     #[tokio::test]

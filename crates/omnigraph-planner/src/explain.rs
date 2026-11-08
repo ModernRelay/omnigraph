@@ -9,6 +9,7 @@ use crate::operation::{Operation, PageBudgetSpec, ScopeSpec};
 use crate::physical::StatisticSource;
 use crate::registry::{Entry, Route};
 use crate::route::RouteOverride;
+use crate::validate::ValidationSummary;
 
 /// Incremented when a field's meaning changes, or when a node kind is added
 /// or removed; additive keys do not bump it. Version 2: the logical `Filter`
@@ -18,7 +19,19 @@ use crate::route::RouteOverride;
 /// Version 4: `Expand` carries typed `edges`, `src_type` and per-member
 /// `versions` instead of one `edge_type`, `direction` and `version`; Sort
 /// and RankFuse declare exact metadata tie-break keys, including edge type.
-pub const EXPLAIN_VERSION: u32 = 4;
+/// Version 5: `pipelines` entries carry identity, pipeline `id` and
+/// `depends_on`, with `source`, `operators` and `sink` as objects whose `id`
+/// joins the `physical_plan` nodes; the additive `logical_plan_initial`
+/// arrived with the same bump.
+/// Version 6: the load node kinds `CsvSource`, `Validate` and
+/// `FragmentWrite` were added, and `operation` carries `mode` for a load.
+/// Version 7: `pipelines` is present on every planned document and is cut at
+/// every node whose operator holds its whole input, not only at a join's
+/// build side; a pipeline's `sink` may name such a breaker node.
+/// Version 8: the write node kind `DeltaSource` was added (a write's staged
+/// delta of one table, the leaf under its `Validate`), and `operation`
+/// carries `write` and `committed` for a write.
+pub const EXPLAIN_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EntrySummary {
@@ -55,6 +68,16 @@ pub struct OperationSummary {
     pub budget: Option<PageBudgetSpec>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume: Option<String>,
+    /// A load's `mode`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<&'static str>,
+    /// A write's statement kind (`load`, `mutation`, `blob_cell`,
+    /// `branch_merge`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write: Option<&'static str>,
+    /// The committed image a write's lookups read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committed: Option<&'static str>,
 }
 
 impl OperationSummary {
@@ -76,12 +99,25 @@ impl OperationSummary {
             } => (Some(*scope), Some(*budget), resume.clone()),
             _ => (None, None, None),
         };
+        let mode = match op {
+            Operation::Load { ir, .. } => Some(ir.mode.as_str()),
+            _ => None,
+        };
+        let (write, committed) = match op {
+            Operation::Write {
+                kind, committed, ..
+            } => (Some(kind.as_str()), Some(committed.as_str())),
+            _ => (None, None),
+        };
         Self {
             kind: op.kind(),
             tables,
             scope,
             budget,
             resume,
+            mode,
+            write,
+            committed,
         }
     }
 
@@ -92,6 +128,9 @@ impl OperationSummary {
             scope: None,
             budget: None,
             resume: None,
+            mode: None,
+            write: None,
+            committed: None,
         }
     }
 }
@@ -107,18 +146,26 @@ pub struct Explain {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry: Option<EntrySummary>,
     pub operation: OperationSummary,
+    /// The logical plan as resolved, before rewrite passes ran;
+    /// `logical_plan` is the rewritten one the physical plan lowers from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logical_plan_initial: Option<Value>,
     pub logical_plan: Option<Value>,
     pub logical_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub physical_plan: Option<Value>,
-    /// The pipelines the push operators build from a diff or merge plan: per
-    /// pipeline its source, its operators and its sink, in run order. Absent
-    /// for a query, which the engine lowers to one DataFusion plan.
+    /// The physical plan cut into pipelines at every node that holds its whole
+    /// input (`PhysicalPlan::pipelines`): per pipeline its source, its
+    /// operators and its sink, in run order, on every planned route. Absent
+    /// only when no physical plan was built.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pipelines: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub statistics: Option<Vec<StatisticSource>>,
     pub passes: Vec<&'static str>,
+    /// What acceptance checked, on a read query's accepted plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation: Option<ValidationSummary>,
 }
 
 impl Explain {
@@ -130,12 +177,14 @@ impl Explain {
             reason: None,
             entry: None,
             operation,
+            logical_plan_initial: None,
             logical_plan: None,
             logical_hash: None,
             physical_plan: None,
             pipelines: None,
             statistics: None,
             passes: Vec::new(),
+            validation: None,
         }
     }
 

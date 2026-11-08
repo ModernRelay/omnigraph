@@ -166,7 +166,10 @@ by GitHub, and the red context stays visible on the pull request either way.
 Requests; `scripts/check-pr-title.py` is the check). Every merge is a squash
 whose subject is the title, so the title is the one line `git log` keeps for
 the change. On the pull request it runs on `pull_request_target`, so the
-checker comes from `main`, and a title edit (`edited`) re-runs it. On the
+checker comes from `main`, and a title edit (`edited`) re-runs it. There it
+also holds a `feat`, `fix` or `perf` pull request to a `changelog.d` note
+([ci.md](ci.md#pull-request-gates)), so a push or a `skip-changelog` label change
+re-runs it too. On the
 merge-group run the group commit's message carries the squash subject the
 queue will land (`merge_group.head_commit.message`, first line, with the
 ` (#N)` suffix GitHub appends), so the same checker runs on that subject.
@@ -198,7 +201,7 @@ cold cache (`Test Workspace`, `Test omnigraph-server --features aws`,
 
 A group merges as one push of `main` carrying one squash commit per entry, so
 the post-merge runs (`Test Workspace`, the fence, the shards, Azurite, the
-vocabulary audit, the edge release) cover the whole group at once, and a
+vocabulary audit) cover the whole group at once, and a
 revert picks the entry's own squash commit out of that push.
 
 Changing one of the five required context names still needs the rule page:

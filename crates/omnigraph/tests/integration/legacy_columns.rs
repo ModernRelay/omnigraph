@@ -4,7 +4,7 @@
 use crate::helpers;
 
 use arrow_array::{StringArray, StructArray};
-use omnigraph::changes::{ChangeFeedScope, ChangeFilter, ChangeOp, ChangeOpKind};
+use omnigraph::changes::{ChangeFeedScope, ChangeOpKind};
 
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::LoadMode;
@@ -403,31 +403,31 @@ async fn legacy_vintage_graph_mutates_diffs_evolves_and_reopens() {
     );
 
     let changed_commit = snapshot_id(&db, "main").await.unwrap();
-    let diff = db
-        .diff_commits(
-            loaded_commit.as_str(),
-            changed_commit.as_str(),
-            &ChangeFilter::default(),
-        )
-        .await
-        .unwrap();
+    let diff = helpers::graph_diff(
+        &db,
+        loaded_commit.as_str(),
+        changed_commit.as_str(),
+        &ChangeFeedScope::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(diff.changes.len(), 3);
     assert!(
         diff.changes
             .iter()
-            .any(|change| change.id == "Alice" && change.op == ChangeOp::Update)
+            .any(|change| change.id == "Alice" && change.op == ChangeOpKind::Update)
     );
     assert!(
         diff.changes
             .iter()
-            .any(|change| change.id == "Bob" && change.op == ChangeOp::Delete)
+            .any(|change| change.id == "Bob" && change.op == ChangeOpKind::Delete)
     );
     let deleted_edge = diff
         .changes
         .iter()
         .find(|change| change.id == "works-bob")
         .unwrap();
-    assert_eq!(deleted_edge.op, ChangeOp::Delete);
+    assert_eq!(deleted_edge.op, ChangeOpKind::Delete);
     let endpoints = deleted_edge.endpoints.as_ref().unwrap();
     assert_eq!(endpoints.src, "Bob");
     assert_eq!(endpoints.dst, "company-1");

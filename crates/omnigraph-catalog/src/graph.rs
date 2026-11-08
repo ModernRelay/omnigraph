@@ -188,7 +188,10 @@ pub(crate) async fn init_manifest_graph(
     let manifest_path = manifest_uri(root);
     let params = WriteParams {
         mode: WriteMode::Create,
-        store_params: Some(crate::storage::lance_store_params_for_uri(&manifest_path)?),
+        store_params: Some(crate::storage::lance_store_params_for_session(
+            &manifest_path,
+            control_session,
+        )?),
         enable_stable_row_ids: true,
         data_storage_version: Some(LanceFileVersion::V2_2),
         auto_cleanup: None,
@@ -347,15 +350,15 @@ pub(crate) async fn snapshot_state_at(
     branch: Option<&str>,
     version: u64,
     history: &ExtentCache,
+    control_session: &Arc<lance::session::Session>,
 ) -> Result<(Dataset, VersionState)> {
-    let control_session = crate::lance_access::control_session();
     let root = root_uri.trim_end_matches('/');
-    let dataset = open_manifest_dataset_with_session(root, branch, &control_session).await?;
+    let dataset = open_manifest_dataset_with_session(root, branch, control_session).await?;
     let dataset = dataset
         .checkout_version(version)
         .await
         .map_err(OmniError::storage)?;
-    let state = match crate::legacy::at_version(root, &control_session, history, &dataset).await? {
+    let state = match crate::legacy::at_version(root, control_session, history, &dataset).await? {
         None => VersionState::Rows(read_manifest_state(&dataset).await?),
         Some(at) => VersionState::Legacy(at),
     };
@@ -488,7 +491,10 @@ async fn create_empty_dataset(
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
     let params = WriteParams {
         mode: WriteMode::Create,
-        store_params: Some(crate::storage::lance_store_params_for_uri(uri)?),
+        store_params: Some(crate::storage::lance_store_params_for_session(
+            uri,
+            control_session,
+        )?),
         enable_stable_row_ids: true,
         data_storage_version: Some(LanceFileVersion::V2_2),
         allow_external_blob_outside_bases: true,

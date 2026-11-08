@@ -1052,6 +1052,7 @@ fn hydration_keeps_every_column_something_besides_the_output_reads() {
             ),
             returned(prop("c", "body"), Some("text"), "text"),
         ],
+        distinct: false,
         order_by: vec![
             IROrdering {
                 expr: prop("c", "rank"),
@@ -1076,4 +1077,310 @@ fn hydration_keeps_every_column_something_besides_the_output_reads() {
             "__id", "slug", "rank", "state", "title", "kind", "edits", "_rowaddr"
         ])
     );
+}
+
+/// `$x.prop = "value"`, a bound equality on one binding.
+fn equals(variable: &str, property: &str, value: &str) -> IRExpr {
+    IRExpr::comparison(
+        prop(variable, property),
+        CompOp::Eq,
+        IRExpr::Literal(
+            Literal::String(value.to_string()),
+            value_type(ScalarType::String, false),
+        ),
+    )
+}
+
+/// `not { $a knows $m  $m knows $k  <inner filters> }` over every `T` as `$a`,
+/// `$k`'s own filters `k_filters`.
+fn negated_two_hops(
+    outer_filters: Vec<IRExpr>,
+    k_filters: Vec<IRExpr>,
+    inner_filters: Vec<IROp>,
+) -> Operation {
+    let mut inner = vec![expand("a", "m", vec![]), expand("m", "k", k_filters)];
+    inner.extend(inner_filters);
+    let outer = IROp::NodeScan {
+        variable: "a".to_string(),
+        type_name: "T".to_string(),
+        filters: outer_filters,
+    };
+    ir(
+        vec![
+            outer,
+            IROp::AntiJoin {
+                outer_var: "a".to_string(),
+                inner,
+                predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),
+            },
+        ],
+        vec![prop("a", "slug")],
+        vec![],
+    )
+}
+
+/// 1,000 `T` rows; `knows` fans out ten per source going out and `in_fanout`
+/// per destination coming in.
+fn anti_join_source(in_fanout: u64) -> MemorySource {
+    MemorySource::default()
+        .with_node_type("T", node_type("T", Some(1_000)))
+        .with_expand_statistics("knows", Direction::Out, knows_statistics(1_000))
+        .with_expand_statistics(
+            "knows",
+            Direction::In,
+            ExpandStatistics {
+                edge_count: 10_000,
+                src_node_count: 10_000 / in_fanout,
+                dst_node_count: 1_000,
+                max_frontier_cap: 1024,
+                max_hops_cap: 6,
+            },
+        )
+}
+
+/// The block's strategy and its inner tree's nodes, in pre-order.
+fn anti_join_of(plan: &PhysicalPlan) -> (omnigraph_planner::AntiJoinStrategy, Vec<&PhysicalNode>) {
+    let (strategy, inner) = plan
+        .live()
+        .find_map(|(_, node)| match node {
+            PhysicalNode::AntiJoin {
+                strategy, inner, ..
+            } => Some((*strategy, *inner)),
+            _ => None,
+        })
+        .expect("the plan holds the block's AntiJoin");
+    let mut nodes = Vec::new();
+    let mut pending = vec![inner];
+    while let Some(id) = pending.pop() {
+        let node = plan.node(id).unwrap();
+        nodes.push(node);
+        pending.extend(node.inputs().into_iter().rev());
+    }
+    (strategy, nodes)
+}
+
+/// A block bounded by a key equality on its own binding runs from it when its
+/// chain produces fewer rows: one `$k`, ten `$m`, a hundred `$a` keys against
+/// the correlated 1,000 outer rows expanded twice. The key-set tree is a
+/// table scan of `$k` under the pushed equality, then both hops reversed,
+/// ending on `$a` with no scan of it and no `OuterReference`.
+#[test]
+fn bounded_block_runs_from_its_key_set_when_its_rows_are_fewer() {
+    use omnigraph_planner::AntiJoinStrategy;
+
+    let source = anti_join_source(10);
+    let op = negated_two_hops(vec![], vec![equals("k", "slug", "k1")], vec![]);
+    let mut plan = resolve(&op, &source).expect("resolve");
+    let fired = rewrite(&mut plan, &source).expect("rewrite");
+    let optimized =
+        omnigraph_planner::physical_plan(&mut plan, &source, &bounds(), fired).expect("lower");
+    assert!(optimized.fired.contains(&"anti_join_strategy"));
+    assert!(
+        optimized.statistics.iter().any(|statistic| {
+            statistic.statistic == "anti_join_rows($a)"
+                && statistic.value == "correlated 4001 estimated, key_set 121 estimated"
+        }),
+        "{:?}",
+        optimized.statistics
+    );
+    let (strategy, inner) = anti_join_of(&optimized.physical);
+    assert_eq!(strategy, AntiJoinStrategy::KeySet);
+    let shape: Vec<String> = inner
+        .iter()
+        .map(|node| match node {
+            PhysicalNode::Scan {
+                source: omnigraph_planner::ScanInput::Table,
+                spec,
+                ..
+            } => format!(
+                "table scan ${} filtered {}",
+                spec.binding.as_deref().unwrap_or_default(),
+                spec.filter.is_some()
+            ),
+            PhysicalNode::Scan { spec, .. } => format!(
+                "dependent scan ${}",
+                spec.binding.as_deref().unwrap_or_default()
+            ),
+            PhysicalNode::Expand {
+                src, dst, edges, ..
+            } => format!(
+                "expand ${src} {:?} ${dst}",
+                edges.named().map(|member| member.direction)
+            ),
+            other => other.name().to_string(),
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            "expand $m Some(In) $a",
+            "dependent scan $m",
+            "expand $k Some(In) $m",
+            "table scan $k filtered true",
+        ]
+    );
+    let json = optimized.physical.to_json();
+    assert_eq!(
+        json["inputs"][0]["inputs"][0]["strategy"], "key_set",
+        "{json}"
+    );
+}
+
+/// The same block over one outer row stays correlated: its 122 rows beat the
+/// 1,201 the key set reaches when each destination has a hundred sources.
+#[test]
+fn bounded_block_stays_correlated_when_the_outer_side_is_smaller() {
+    use omnigraph_planner::AntiJoinStrategy;
+
+    let source = anti_join_source(100);
+    let op = negated_two_hops(
+        vec![equals("a", "slug", "a1")],
+        vec![equals("k", "slug", "k1")],
+        vec![],
+    );
+    let mut plan = resolve(&op, &source).expect("resolve");
+    let fired = rewrite(&mut plan, &source).expect("rewrite");
+    let optimized =
+        omnigraph_planner::physical_plan(&mut plan, &source, &bounds(), fired).expect("lower");
+    assert!(optimized.fired.contains(&"anti_join_strategy"));
+    assert!(
+        optimized.statistics.iter().any(|statistic| {
+            statistic.statistic == "anti_join_rows($a)"
+                && statistic.value == "correlated 122 estimated, key_set 1201 estimated"
+        }),
+        "{:?}",
+        optimized.statistics
+    );
+    let (strategy, inner) = anti_join_of(&optimized.physical);
+    assert_eq!(strategy, AntiJoinStrategy::Correlated);
+    assert!(
+        inner
+            .iter()
+            .any(|node| matches!(node, PhysicalNode::OuterReference { .. }))
+    );
+}
+
+/// No key set without a bounded binding, or when the block reads the outer
+/// rows beyond the correlation binding's identity: the planner does not
+/// price it, and the block keeps its correlated tree.
+#[test]
+fn unbounded_or_outer_reading_blocks_stay_correlated() {
+    use omnigraph_planner::AntiJoinStrategy;
+
+    let reads_outer = IROp::Filter(IRExpr::comparison(
+        prop("m", "state"),
+        CompOp::Eq,
+        prop("a", "state"),
+    ));
+    for (what, op) in [
+        (
+            "a non-key filter bounds nothing",
+            negated_two_hops(vec![], vec![equals("k", "state", "open")], vec![]),
+        ),
+        (
+            "a filter reads the outer row",
+            negated_two_hops(vec![], vec![equals("k", "slug", "k1")], vec![reads_outer]),
+        ),
+    ] {
+        let source = anti_join_source(10);
+        let (plan, fired) = physical(&op, &source);
+        assert!(!fired.contains(&"anti_join_strategy"), "{what}: {fired:?}");
+        let (strategy, inner) = anti_join_of(&plan);
+        assert_eq!(strategy, AntiJoinStrategy::Correlated, "{what}");
+        assert!(
+            inner
+                .iter()
+                .any(|node| matches!(node, PhysicalNode::OuterReference { .. })),
+            "{what}"
+        );
+    }
+}
+
+/// `$x.prop` in a list of `values`, a binding bounded to that many rows.
+fn member_of(variable: &str, property: &str, values: &[&str]) -> IRExpr {
+    IRExpr::comparison(
+        IRExpr::Literal(
+            Literal::List(
+                values
+                    .iter()
+                    .map(|value| Literal::String(value.to_string()))
+                    .collect(),
+            ),
+            ExprType::Value {
+                scalar: ScalarType::String,
+                list: true,
+                nullable: false,
+            },
+        ),
+        CompOp::Contains,
+        prop(variable, property),
+    )
+}
+
+/// The binding of the table scan a key-set tree starts from.
+fn key_set_root(plan: &PhysicalPlan) -> String {
+    let (strategy, inner) = anti_join_of(plan);
+    assert_eq!(strategy, omnigraph_planner::AntiJoinStrategy::KeySet);
+    inner
+        .iter()
+        .find_map(|node| match node {
+            PhysicalNode::Scan {
+                source: omnigraph_planner::ScanInput::Table,
+                spec,
+                ..
+            } => spec.binding.clone(),
+            _ => None,
+        })
+        .expect("a key-set tree starts from a table scan")
+}
+
+/// The key set starts from the binding with the fewest estimated rows: `$k`
+/// under a key equality (one row) over `$m` in a three-value list; between
+/// two equal bounds, from the binding the correlated tree reaches first.
+#[test]
+fn key_set_starts_from_the_most_bounded_binding_and_the_first_on_a_tie() {
+    let block = |m_filters: Vec<IRExpr>, k_filters: Vec<IRExpr>| {
+        ir(
+            vec![
+                scan("a"),
+                IROp::AntiJoin {
+                    outer_var: "a".to_string(),
+                    inner: vec![expand("a", "m", m_filters), expand("m", "k", k_filters)],
+                    predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),
+                },
+            ],
+            vec![prop("a", "slug")],
+            vec![],
+        )
+    };
+    let source = anti_join_source(10);
+    for (what, op, root) in [
+        (
+            "a key equality over a list",
+            block(
+                vec![member_of("m", "slug", &["m1", "m2", "m3"])],
+                vec![equals("k", "slug", "k1")],
+            ),
+            "k",
+        ),
+        (
+            "a list under a key equality",
+            block(
+                vec![equals("m", "slug", "m1")],
+                vec![member_of("k", "slug", &["k1", "k2", "k3"])],
+            ),
+            "m",
+        ),
+        (
+            "two key equalities",
+            block(
+                vec![equals("m", "slug", "m1")],
+                vec![equals("k", "slug", "k1")],
+            ),
+            "m",
+        ),
+    ] {
+        let (plan, _) = physical(&op, &source);
+        assert_eq!(key_set_root(&plan), root, "{what}");
+    }
 }

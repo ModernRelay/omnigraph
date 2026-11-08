@@ -132,7 +132,7 @@ async fn concurrent_branch_ops_morphological_matrix() {
                 .expect("merge 409 must include published dataset version conflict");
             assert_eq!(
                 conflict.entity_kind,
-                omnigraph_server::api::EntityKindOutput::Node
+                omnigraph_server::api::EntityKind::Node
             );
             assert_eq!(conflict.type_name, "Person", "[{cell}] conflict type");
             h.assert_persons("main", cell, &["FrankD-celld"], &["EveD-celld"])
@@ -353,7 +353,7 @@ async fn concurrent_branch_ops_morphological_matrix() {
                 .expect("merge 409 must include published dataset version conflict");
             assert_eq!(
                 conflict.entity_kind,
-                omnigraph_server::api::EntityKindOutput::Node
+                omnigraph_server::api::EntityKind::Node
             );
             assert_eq!(conflict.type_name, "Person", "[{cell}] conflict type");
             h.assert_persons("main", cell, &["Steve-cellk"], &["Rita-cellk"])
@@ -415,6 +415,7 @@ async fn cluster_boot_serves_applied_state() {
         graphs,
         config_path,
         server_policy,
+        ..
     } = settings.mode;
     assert_eq!(graphs.len(), 1);
     assert_eq!(graphs[0].graph_id, "knowledge");
@@ -705,7 +706,8 @@ rules:
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert!(!response.headers().contains_key("retry-after"));
+    // An unavailable graph asks for a retry, and says when.
+    assert_eq!(response.headers()["retry-after"], "60");
     for (id, expected) in [("good", StatusCode::OK), ("unknown", StatusCode::NOT_FOUND)] {
         let (status, body) = json_response(
             &app,
@@ -815,6 +817,7 @@ graphs:
         graphs,
         config_path,
         server_policy,
+        ..
     } = settings.mode;
     let state = omnigraph_server::open_multi_graph_state(
         graphs,

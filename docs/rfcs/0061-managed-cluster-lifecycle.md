@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - Andrew
 created: 2026-09-06
-updated: 2026-10-06
+updated: 2026-10-20
 discussion: null
 supersedes: []
 superseded_by: []
@@ -15,6 +15,15 @@ blocked_on: []
 ---
 
 # RFC 0061: Managed cluster lifecycle and config preparation
+
+> **RFC 0059 disposition:** [RFC 0059](0059-config-cli-coherency.md) replaces
+> lifecycle routing and recovery-record custody. Historical: User behavior's
+> mode/API/folder selectors and create-time folder binding; Design's folder-local
+> pending/last-record placement; and Compatibility's context requirement.
+> Current: exact request/key/principal replay, preservation of uncertain outcomes,
+> service-owned lifecycle authority, readiness/outcome distinctions and bounded
+> source capture. Operator-home custody requires RFC 0059's verified migration;
+> accepting that design does not claim its implementation cutover is complete.
 
 ## Summary
 

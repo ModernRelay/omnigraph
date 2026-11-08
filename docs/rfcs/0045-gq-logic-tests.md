@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - azimafroozeh
 created: 2026-08-29
-updated: 2026-09-28
+updated: 2026-10-13
 discussion: https://github.com/ModernRelay/omnigraph/pull/584
 supersedes: []
 superseded_by: []
@@ -558,6 +558,16 @@ in Seams at an explicit step. A step is one of:
   id lookup or the destination table read once as a hash join's build side;
   it fails when the physical plan holds no such scan, the scan is a table
   scan, or its access path differs.
+  A `scan <Type>[ as $var]: ranked nearest` claim may end in
+  `diagnostics present`, after any fetch, probe-cap or eligibility claims. It
+  requires at least one measured attempt for every selected nearest scan,
+  including each nearest RRF arm. BM25 siblings are excluded. All inspected
+  queries validate present ANN metric names/types, unique scan/rung/attempt
+  identities, physical-scan/probe joins and same-run profile preservation.
+  Optional measurements may be absent; zero is valid. Measurements are neither
+  compared across runs nor included in DST replay observations. Exact native
+  counter oracles and synthetic adapter edge cases remain Rust owners, avoiding
+  a native index-construction language in GQT.
   Projection and filter-read lists are sets. Sort identity keys, RankFuse
   downstream row keys and edge-selection members are exact ordered lists.
   `sort tiebreak [$a.@id, $e.@type, $e.@id]` checks the metadata keys
@@ -655,10 +665,21 @@ counts exist). `branch list` is a rows step: it takes `unordered`,
 `ordered`, or `error: <substring>` over rows `{"name": "…"}`, its rows are
 sorted by `name` in byte order (a total order, so `ordered` is accepted and
 the `order`-clause refusal for declarations does not apply), and it
-carries the mandatory shape section, one line, `name: String`. A statement
-step has no params, so an iterating value never reaches its body; `${` in a
-quoted statement name parses and is refused by the runner's `${` fence, and
-`${` anywhere else in a statement body does not parse.
+carries the mandatory shape section, one line, `name: String`. A
+`--- query` step may also hold a ***branch control read*** of RFC 0030 §8.5
+(`branch diff`, `branch merge-base`, `branch merge … dry run`), refused under
+`--- mutate` as `branch list` is. It is a rows step over the statement's own
+answer: `unordered`, `ordered`, or `error: <substring>`, the rows compared
+as JSON whatever their key order. Its columns are the statement's, so it
+carries no shape section, and one is refused (`` `branch diff` answers its
+own columns; drop the `--- expect shape` section ``). A side spelled as a
+quoted bound name (`branch diff "${c}" to main`) runs with the commit
+`--- bind commit $c` captured, and a bound `${c}` in an expected row stands
+for the same id, as in a params body; an unbound name is refused. A
+statement step has no params, so an iterating value never reaches its body;
+`${` in a quoted statement name parses and is refused by the runner's `${`
+fence unless it is a bound commit, and `${` anywhere else in a statement body
+does not parse.
 
 The read/mutation classification is the compiler's own
 (`query_body = { read_query_body | mutation_body }` in `query.pest`); the
@@ -1209,18 +1230,29 @@ bare and its body names each session once, `<label>: ok` or
 `<label>: error: <needle>`, compared as a mutate or query step's `ok` and
 `error:` are; rows are not compared inside a block.
 
-The paused clock is the block's one hazard: the runtime auto-advances it
-to the next pending timer whenever it is idle, and a session waiting on the
-script is idle, so a parked writer would let the clock reach the engine's
-own far timers and the engine would time itself out. While a session waits
-on the script the block therefore drives the clock itself, one tick per
-scheduler turn up to ten virtual seconds past the last cursor move or
-request, so the other sessions' modeled request costs elapse and nothing
-farther fires; past that budget the clock stands still. The block fails as
-starved when neither an entry nor a request arrives for half the case's
-`timeout_ms` of wall time, at most ten seconds, or when a session finishes
-without a request entry of its own; a session blocked in the engine while
-no session waits on the script ends as the case's timeout. The evidence
+The paused clock is the block's one subtlety: the runtime advances it to
+the earliest pending timer whenever it is idle, and never while a task of
+its blocking pool runs, so while a session waits on the script the other
+sessions' modeled request costs elapse, a commit backoff fires at its
+distance, and a session's work on a foreign thread (the Lance CPU pool)
+takes no virtual time when nothing is pending to advance to; when another
+session's modeled sleep is pending the clock jumps to it while the hop
+runs, and the hop's wake lands before or after that one jump, a one-tick
+window Lance owns (its CPU pool is a second runtime the paused clock does
+not see). Nothing else moves the clock, so a wait at a gate is the modeled
+cost of what the holder did meanwhile and replays exactly up to that
+window. A timer farther than the block's
+work would fire the moment a session parks with nothing nearer pending and
+end the block as a timeout, visibly: Lance's bound on one commit is such a
+timer, pending for as long as a parked commit stays open, so every commit
+the engine makes runs without it under simulation (`lance_commit`, the
+one constructor every commit site uses) and with Lance's default in
+production. The block fails as starved when
+neither an entry nor a request arrives for half the case's `timeout_ms` of
+wall time, at most ten seconds, read off the runtime by a guard thread, or
+when a session finishes without a request entry of its own; a session
+blocked in the engine while no session waits on the script ends as the
+case's timeout. The evidence
 row `concurrent_block` carries each session's outcome, the entry the
 cursor stopped at and the block's failure, replay-compared; the grant
 sequence with its wall times and the count of requests made outside any
@@ -2662,3 +2694,11 @@ historical command and configuration descriptions are not migration aliases.
   `order_key_aggregate_or_node_binds_to_return_item.gqt` (§Evidence and
   tests) and `engine_v1_refuses_compound_predicates.gqt` to
   `compound_and_bare_boolean_filters.gqt`.
+- 2026-10-13, branch control reads: a `--- query` step holds the branch
+  control reads of RFC 0030 §8.5 (`branch diff`, `branch merge-base`,
+  `branch merge … dry run`) as rows steps without a shape section, their
+  columns being the statement's own, with a bound commit name in a quoted
+  side and in the expected rows. This supersedes "a `--- query` step may hold
+  `branch list`" as the only branch statement a query step holds, and "`${`
+  in a quoted statement name parses and is refused by the runner's `${`
+  fence" for a bound commit name in a branch control read.

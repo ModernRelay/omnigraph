@@ -1,6 +1,7 @@
 //! The catalog of query compile diagnostic codes (RFC 0047). A code is
 //! stable once published: its meaning is frozen, its message text may
-//! improve. `Q…` codes are the parser's, `T…` codes the typechecker's; the
+//! improve. `Q…` codes are the parser's, `T…` codes the typechecker's, `P…`
+//! codes the planner's; the
 //! numbering has gaps where earlier stages were withdrawn, and a withdrawn
 //! number is never reused.
 
@@ -40,7 +41,6 @@ codes! {
     T15 = "traversal hop bounds or nearest operands are invalid";
     T16 = "update is not supported for edge types";
     T17 = "nearest ordering requires a limit";
-    T18 = "alias ordering cannot be combined with nearest";
     T19 = "search or fuzzy operands are invalid";
     T20 = "match_text or bm25 operands are invalid";
     T21 = "rrf operands are invalid or its ordering lacks a limit";
@@ -48,6 +48,7 @@ codes! {
     T23 = "a node or edge binding is used in an incompatible role";
     T24 = "a Blob property is not a read value";
     T25 = "two projections produce the same result column";
+    T27 = "a full-text call needs a full-text index on its property";
     T32 = "a retrieval cannot sit under an aggregate";
     T33 = "a projected rank must repeat the executed retrieval";
     T35 = "a search predicate cannot be projected";
@@ -69,6 +70,17 @@ codes! {
     T52 = "nested list literals are not supported";
     T53 = "list literal elements must share one scalar type";
     T54 = "a relevance ranking does not accept the asc modifier";
+    T55 = "an unattached base parameter is undeclared or not a String";
+    T56 = "distinct does not apply to an aggregated return";
+    T57 = "distinct applies only to count";
+    T58 = "a Boolean return item compares aggregates with constants only";
+    T59 = "an rrf() ranks two bindings one traversal connects";
+
+    // Planner. P001 and P005 are withdrawn: a ranking roots its traversal at
+    // the binding it ranks, and `rrf()` arms one traversal connects are T59.
+    P002 = "an edge alternation or wildcard traversal needs a finite traversal work limit";
+    P003 = "the traversal work limit is out of range or recorded twice";
+    P004 = "an edge alternation or wildcard traversal cannot run in CSR traversal mode";
 }
 
 #[cfg(test)]
@@ -82,7 +94,10 @@ mod tests {
         for code in ALL {
             assert!(seen.insert(code.as_str()), "duplicate code {code}");
             let (prefix, number) = code.as_str().split_at(1);
-            assert!(matches!(prefix, "Q" | "T"), "{code}: unknown namespace");
+            assert!(
+                matches!(prefix, "Q" | "T" | "P"),
+                "{code}: unknown namespace"
+            );
             assert!(
                 number.parse::<u32>().is_ok(),
                 "{code}: the number must parse"

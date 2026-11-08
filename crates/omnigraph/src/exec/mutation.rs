@@ -2,7 +2,8 @@ use super::*;
 
 use crate::db::manifest::HistoryReleaseBytes;
 use crate::engine::{
-    evaluate_constant, fill_declared_params, id_in_list_expr, ir_expr_to_df_expr, validate_params,
+    MAX_NULL_SPLIT_COLUMNS, evaluate_constant, exceeds_null_split_columns, fill_declared_params,
+    id_in_list_expr, ir_expr_to_df_expr, validate_params,
 };
 use crate::instrumentation::record_mutation_table_open;
 use crate::loader::append_blob_value;
@@ -11,6 +12,7 @@ use crate::session::Session;
 use crate::storage_layer::{DeletedIdBudget, PendingScanBudget, SnapshotHandle, WriteBudget};
 use datafusion::prelude::Expr;
 use futures::TryStreamExt;
+use lance_select::mask::RowAddrTreeMap;
 
 // ─── Mutation helpers ────────────────────────────────────────────────────────
 
@@ -57,7 +59,12 @@ fn literal_to_typed_array(
             })?;
             Arc::new(Int32Array::from(vec![value; num_rows]))
         }
-        (Literal::Integer(n), DataType::Int64) => Arc::new(Int64Array::from(vec![*n; num_rows])),
+        (Literal::Integer(n), DataType::Int64) => {
+            let value = i64::try_from(*n).map_err(|_| {
+                OmniError::manifest(format!("integer value {n} exceeds Int64 range"))
+            })?;
+            Arc::new(Int64Array::from(vec![value; num_rows]))
+        }
         (Literal::Integer(n), DataType::UInt32) => {
             let value = u32::try_from(*n).map_err(|_| {
                 OmniError::manifest(format!("integer value {n} exceeds UInt32 range"))
@@ -220,7 +227,15 @@ fn typed_list_literal_to_array(
             for _ in 0..num_rows {
                 for item in items {
                     match item {
-                        Literal::Integer(value) => builder.values().append_value(*value),
+                        Literal::Integer(value) => {
+                            let value = i64::try_from(*value).map_err(|_| {
+                                OmniError::manifest(format!(
+                                    "list value {} exceeds Int64 range",
+                                    value
+                                ))
+                            })?;
+                            builder.values().append_value(value);
+                        }
                         _ => builder.values().append_null(),
                     }
                 }
@@ -445,6 +460,13 @@ fn mutation_predicate_expr(predicate: &IRExpr, params: &ParamMap, schema: &Schem
         )));
     }
     ir_expr_to_df_expr(predicate, params, Some(schema)).ok_or_else(|| {
+        if exceeds_null_split_columns(predicate, params) {
+            return OmniError::manifest(format!(
+                "unsupported expression in mutation predicate: {predicate}: a mutation `where` \
+                 may compare at most {MAX_NULL_SPLIT_COLUMNS} properties more than once each \
+                 with `=`, `!=` or `in`"
+            ));
+        }
         OmniError::manifest(format!(
             "unsupported expression in mutation predicate: {predicate}"
         ))
@@ -551,6 +573,81 @@ use super::staging::{MutationStaging, PendingMode};
 pub(super) struct CommittedStagedMutation {
     pub(super) committed: super::staging::CommittedMutation,
     lineage_intent: crate::db::manifest::LineageIntent,
+    /// The planner's document per validated table, for the receipt.
+    pub(super) plans: Vec<omnigraph_planner::Explain>,
+}
+
+/// Where a declaration's write lands, resolved from the parsed declaration
+/// before the policy gate and the write transaction (RFC "Unattached graph
+/// branches": a child's recorded target is known before authorization).
+enum WriteRoute {
+    Publish,
+    AsCommit,
+    /// A root snapshot over the request branch's head.
+    UnattachedRoot,
+    /// A child over the Live snapshot it names, on the recorded target that
+    /// snapshot's chain inherits.
+    UnattachedChild(Box<crate::db::manifest::UnattachedCommit>),
+}
+
+impl WriteRoute {
+    /// Whether lowering, which parses the declaration again, read the mode
+    /// the route was resolved from.
+    fn agrees_with(&self, mode: &omnigraph_compiler::query::ast::MutationWriteMode) -> bool {
+        use omnigraph_compiler::query::ast::MutationWriteMode;
+        matches!(
+            (self, mode),
+            (Self::Publish, MutationWriteMode::Publish)
+                | (Self::AsCommit, MutationWriteMode::AsCommit)
+                | (
+                    Self::UnattachedRoot,
+                    MutationWriteMode::Unattached { base: None }
+                )
+                | (
+                    Self::UnattachedChild(_),
+                    MutationWriteMode::Unattached { base: Some(_) }
+                )
+        )
+    }
+
+    fn publication(&self, txn: &crate::db::WriteTxn) -> Result<crate::db::omnigraph::Publication> {
+        use crate::db::manifest::UnattachedWriteBase;
+        use crate::db::omnigraph::Publication;
+        Ok(match self {
+            Self::Publish => Publication::Publish,
+            Self::AsCommit => Publication::Propose(None),
+            Self::UnattachedRoot => Publication::Unattached(UnattachedWriteBase::Head),
+            Self::UnattachedChild(_) => {
+                let base = txn.unattached_base.as_ref().ok_or_else(|| {
+                    OmniError::manifest_internal(
+                        "a child unattached write carries no base in its transaction",
+                    )
+                })?;
+                Publication::Unattached(base.write_base())
+            }
+        })
+    }
+}
+
+/// The base id an `on` operand names: the literal as written, or the
+/// `String` value of the named parameter.
+fn unattached_base_id(
+    base: &omnigraph_compiler::query::ast::UnattachedBase,
+    params: &ParamMap,
+) -> Result<String> {
+    use omnigraph_compiler::query::ast::UnattachedBase;
+    match base {
+        UnattachedBase::Literal(id) => Ok(id.clone()),
+        UnattachedBase::Param(name) => match params.get(name) {
+            Some(Literal::String(id)) => Ok(id.clone()),
+            Some(_) => Err(OmniError::manifest(format!(
+                "parameter '${name}' names the base of an unattached branch and must be a String"
+            ))),
+            None => Err(OmniError::manifest(format!(
+                "parameter '${name}' names the base of an unattached branch and is missing"
+            ))),
+        },
+    }
 }
 
 /// Open a sub-table dataset for read or staged write within the current
@@ -642,11 +739,19 @@ pub(super) async fn open_table_for_mutation(
 /// cascade, or — if it is the only match — leaves the node undeleted). Only
 /// rows a prior predicate matched as definitely TRUE should be excluded:
 /// `(prior) IS NOT TRUE` keeps both FALSE and UNKNOWN rows.
+///
+/// Each prior predicate gets its own `IS NOT TRUE` (`(p1 OR p2) IS NOT TRUE`
+/// is `p1 IS NOT TRUE AND p2 IS NOT TRUE`). An `OR` of the priors would put
+/// their tests side by side, where Lance's simplifier folds two disjoint
+/// `NOT IN` tests of one nullable column to `true` and so excludes the rows
+/// whose value is null (#1277); `IS NOT TRUE` has no rewrite there.
 fn dedup_delete_filter(base: &Expr, prior: &[Expr]) -> Expr {
-    match prior.iter().cloned().reduce(Expr::or) {
-        None => base.clone(),
-        Some(excluded) => base.clone().and(excluded.is_not_true()),
-    }
+    prior
+        .iter()
+        .cloned()
+        .fold(base.clone(), |filter, excluded| {
+            filter.and(excluded.is_not_true())
+        })
 }
 
 /// D₂ parse-time check: a single mutation query is either insert/update-only
@@ -850,19 +955,37 @@ impl Session {
         actor_id: Option<&str>,
         expected_head: Option<&str>,
     ) -> Result<crate::MutationReceipt> {
-        // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
-        // `Branch(branch)` to match the HTTP-layer convention at
-        // `server_change` (branch=Some(branch), target_branch=None). When no
-        // PolicyChecker is installed this is a no-op; with policy installed
-        // and actor=None this fails hard (forget-the-actor footgun guard).
-        self.enforce(
-            omnigraph_policy::PolicyAction::Change,
-            &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
+        self.mutate_as_with_optional_branch_receipt(
+            Some(branch),
+            query_source,
+            query_name,
+            params,
             actor_id,
-        )?;
+            expected_head,
+        )
+        .await
+    }
+
+    /// Executes a mutation with an optional branch selection. An omitted branch
+    /// inherits an unattached child's recorded target and otherwise selects main.
+    /// A supplied branch, including main, must match a child's recorded target.
+    pub async fn mutate_as_with_optional_branch_receipt(
+        &self,
+        branch: Option<&str>,
+        query_source: &str,
+        query_name: &str,
+        params: &ParamMap,
+        actor_id: Option<&str>,
+        expected_head: Option<&str>,
+    ) -> Result<crate::MutationReceipt> {
+        let decl = omnigraph_compiler::find_named_query(query_source, query_name)
+            .map_err(query_lookup_error)?;
+        let (route, branch) = self
+            .resolve_write_route(&decl.write_mode, branch, params, actor_id)
+            .await?;
         let settings = self.effective(query_source)?;
         self.mutate_with_current_actor(
-            branch,
+            &branch,
             query_source,
             query_name,
             params,
@@ -871,36 +994,181 @@ impl Session {
             settings.stage_write_concurrency(),
             HistoryReleaseBytes(settings.history_release_bytes()),
             WriteBudget::from_settings(&settings),
+            &route,
         )
         .await
+    }
+
+    /// The route of a declaration's write and the branch it addresses, after
+    /// the engine-layer `change` gate on that branch; a child unattached
+    /// write addresses its base's recorded target, a denial masked as not found.
+    async fn resolve_write_route(
+        &self,
+        mode: &omnigraph_compiler::query::ast::MutationWriteMode,
+        branch: Option<&str>,
+        params: &ParamMap,
+        actor_id: Option<&str>,
+    ) -> Result<(WriteRoute, String)> {
+        use omnigraph_compiler::query::ast::MutationWriteMode;
+        let base = match mode {
+            MutationWriteMode::Publish => {
+                let branch = branch.unwrap_or("main");
+                self.enforce_change(branch, actor_id)?;
+                return Ok((WriteRoute::Publish, branch.to_string()));
+            }
+            MutationWriteMode::AsCommit => {
+                let branch = branch.unwrap_or("main");
+                self.enforce_change(branch, actor_id)?;
+                return Ok((WriteRoute::AsCommit, branch.to_string()));
+            }
+            MutationWriteMode::Unattached { base: None } => {
+                let branch = branch.unwrap_or("main");
+                self.enforce_change(branch, actor_id)?;
+                return Ok((WriteRoute::UnattachedRoot, branch.to_string()));
+            }
+            MutationWriteMode::Unattached { base: Some(base) } => base,
+        };
+        let base_id = unattached_base_id(base, params)?;
+        let addressed = self.addressed_commit(&base_id).await?;
+        let target = addressed.target_branch().unwrap_or("main").to_string();
+        match self.enforce_change(&target, actor_id) {
+            Err(OmniError::Policy(_)) if actor_id.is_some() => {
+                return Err(crate::db::graph_coordinator::commit_not_found(
+                    &crate::db::SnapshotId::new(base_id),
+                ));
+            }
+            decision => decision?,
+        }
+        let candidate = match addressed {
+            crate::db::omnigraph::AddressedCommit::Unattached(candidate) => candidate,
+            crate::db::omnigraph::AddressedCommit::Proposal(_)
+            | crate::db::omnigraph::AddressedCommit::Published(_) => {
+                return Err(OmniError::manifest(format!(
+                    "commit '{base_id}' is not an unattached snapshot"
+                )));
+            }
+        };
+        candidate.require_extendable()?;
+        if let Some(branch) = branch {
+            let requested =
+                Omnigraph::normalize_branch_name(branch)?.unwrap_or_else(|| "main".to_string());
+            if requested != target {
+                return Err(OmniError::manifest(format!(
+                    "branch '{requested}' is not the recorded target '{target}' of unattached \
+                     branch '{base_id}'; name that branch or omit the branch"
+                )));
+            }
+        }
+        Ok((WriteRoute::UnattachedChild(candidate), target))
+    }
+
+    fn enforce_change(&self, branch: &str, actor_id: Option<&str>) -> Result<()> {
+        self.enforce(
+            omnigraph_policy::PolicyAction::Change,
+            &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
+            actor_id,
+        )
     }
 }
 
 impl Omnigraph {
-    /// End-of-query validation for a constructive mutation: build the change-set
-    /// from the accumulated staging and run the unified evaluator (value/enum,
-    /// uniqueness incl. cross-version, edge-RI, cardinality) against committed
-    /// state. Read-your-writes is inherent — every same-query insert is already
-    /// in the change-set. Destructive queries (D2) stage no constructive batches,
-    /// so the change-set is empty and this is a no-op (deletes cascade).
+    /// End-of-query validation of a mutation: every staged table planned as an
+    /// upsert and every deleted-from table as a removal, judged against the
+    /// pinned base and, for `@card` (#298), the live branch; documents for the receipt.
     async fn validate_staged_mutation(
         &self,
         staging: &MutationStaging,
         txn: &crate::db::WriteTxn,
-    ) -> Result<()> {
-        // RI/uniqueness read the write's already-validated pinned base (`txn.base`),
-        // NOT a fresh `snapshot_for_branch` — per-table resolution must not add a
-        // schema-contract validation beyond capture + the pre-effect gate.
-        // Cardinality reads a fresh manifest-visible branch snapshot (the #298
-        // stale-handle fix) via `CommittedState::write`; it never follows an
-        // unpublished raw Lance HEAD or a not-yet-created first-touch ref.
-        let committed =
-            crate::validate::CommittedState::write(&txn.base, self, txn.branch.as_deref());
-        // `to_changeset` carries both constructive batches and the ids the delete
-        // ops captured from their own scans (`deleted_ids`), so the evaluator
-        // recounts the srcs a delete empties (`@card`) and sees removed rows for
-        // RI — the faithful change-set the merge path also builds.
-        crate::validate::validate_changeset(&staging.to_changeset(), &committed, &txn.catalog).await
+    ) -> Result<Vec<omnigraph_planner::Explain>> {
+        use crate::validate::load::{JudgedSide, RepeatRule, Report, WriteJudge};
+        use crate::validate::plan::{WriteTable, judgment_rank, plan_write};
+        use omnigraph_compiler::ir::{DeltaClass, WriteKind};
+        use omnigraph_planner::CommittedSide;
+
+        let mut tables: Vec<WriteTable> = staging
+            .pending
+            .iter()
+            .filter(|(_, pending)| !pending.batches.is_empty())
+            .map(|(table, pending)| WriteTable {
+                table: table.clone(),
+                delta: DeltaClass::Upsert,
+                rows: pending.batches.iter().map(|b| b.num_rows() as u64).sum(),
+                deleted_ids: Vec::new(),
+            })
+            .chain(
+                staging
+                    .deleted_ids
+                    .iter()
+                    .filter(|(_, ids)| !ids.is_empty())
+                    .map(|(table, ids)| WriteTable {
+                        table: table.clone(),
+                        delta: DeltaClass::Removal,
+                        rows: 0,
+                        deleted_ids: ids.clone(),
+                    }),
+            )
+            .collect();
+        if tables.is_empty() {
+            return Ok(Vec::new());
+        }
+        tables.sort_by(|a, b| judgment_rank(&a.table).cmp(&judgment_rank(&b.table)));
+        // The base pins exact table versions, which this write's own opens
+        // (`open_pinned_for_write`) already read through the shared session
+        // and the held-handle cache keyed by that pin; validation reads the
+        // same versions through them too, instead of a zero-capacity
+        // statement session, on which each validation's open of a table
+        // rereads its manifest and every index lookup rereads the manifest's
+        // index section.
+        let mut base = txn.base.clone();
+        base.set_read_caches(crate::db::manifest::SnapshotReadCaches {
+            session: self.read_caches().session.clone(),
+            handles: self.read_caches().handles.clone(),
+            table_wrapper: None,
+        });
+        let write_budget = staging.write_budget();
+        let batches: Vec<Vec<RecordBatch>> = tables
+            .iter()
+            .map(|table| staging.pending_batches(&table.table).to_vec())
+            .collect();
+        let (judged, plans): (Vec<_>, Vec<_>) = plan_write(
+            &base,
+            &txn.catalog,
+            WriteKind::Mutation,
+            CommittedSide::Live,
+            tables,
+            write_budget.bytes(),
+        )
+        .await?
+        .into_iter()
+        .unzip();
+        let judge = WriteJudge {
+            tables: judged,
+            committed: JudgedSide::Live {
+                base,
+                branch: txn.branch.clone(),
+            },
+            write_budget,
+            catalog: Arc::clone(&txn.catalog),
+            report: Report::First,
+            repeat: RepeatRule::for_write(WriteKind::Mutation),
+        };
+        let mut deleted = DeletedIdBudget::new(write_budget);
+        let mut admit_removed = |id: &str| deleted.retain(id);
+        let mut admit_retained = |_: &RecordBatch| Ok(());
+        judge
+            .judge_batches(
+                self,
+                batches,
+                &mut crate::validate::load::LoadAdmission {
+                    phase: None,
+                    bytes: None,
+                    reuse: None,
+                    removed: &mut admit_removed,
+                    retained: &mut admit_retained,
+                },
+            )
+            .await?;
+        Ok(plans)
     }
 
     async fn mutate_with_current_actor(
@@ -914,6 +1182,7 @@ impl Omnigraph {
         stage_write_concurrency: usize,
         history_release_bytes: HistoryReleaseBytes,
         write_budget: WriteBudget,
+        route: &WriteRoute,
     ) -> Result<crate::MutationReceipt> {
         const MAX_PRE_EFFECT_REPREPARES: usize = 32;
 
@@ -935,6 +1204,7 @@ impl Omnigraph {
                     attempt == 0,
                     &mut retryable,
                     write_budget,
+                    route,
                 )
                 .await
             {
@@ -970,24 +1240,32 @@ impl Omnigraph {
         first_attempt: bool,
         retryable: &mut bool,
         write_budget: WriteBudget,
+        route: &WriteRoute,
     ) -> Result<crate::MutationReceipt> {
         let requested = Self::normalize_branch_name(branch)?;
+        let addressed = requested.as_deref().unwrap_or("main").to_string();
         // Capture one branch-wide write authority: native branch identity,
         // exact optional graph head, accepted schema identity/catalog, and the
         // base table snapshot. Execution, validation, staging, and publication
         // all use this immutable attempt. `commit_all` revalidates the complete
         // token under the root-shared schema → branch → sorted-table gates
         // before its first detached commit.
-        let mut txn = self
-            .open_write_txn(requested.as_deref())
-            .await
-            .map_err(|error| {
-                if first_attempt {
-                    error.before_effect()
-                } else {
-                    error.without_pre_effect_evidence()
-                }
-            })?;
+        let opened = match route {
+            WriteRoute::UnattachedChild(base) => {
+                self.open_write_txn_on_unattached(requested.as_deref(), base)
+                    .await
+            }
+            WriteRoute::Publish | WriteRoute::AsCommit | WriteRoute::UnattachedRoot => {
+                self.open_write_txn(requested.as_deref()).await
+            }
+        };
+        let mut txn = opened.map_err(|error| {
+            if first_attempt {
+                error.before_effect()
+            } else {
+                error.without_pre_effect_evidence()
+            }
+        })?;
         // Caller CAS gate against the pinned view this attempt executes with —
         // a separate head lookup would reopen the race. Re-checked per
         // reprepare; not `ReadSetChanged`, so the retry loop never replays it.
@@ -1017,6 +1295,11 @@ impl Omnigraph {
         // execution. A lowering/validation error returns exactly as it did
         // when this happened inside execute_named_mutation.
         let ir = self.lower_named_mutation(&txn.catalog, query_source, query_name)?;
+        debug_assert!(
+            route.agrees_with(&ir.write_mode),
+            "the lowered write mode {:?} disagrees with the pre-parsed route",
+            ir.write_mode
+        );
         fill_declared_params(&mut resolved_params, &ir.params)?;
         validate_params(&resolved_params, &ir.params)?;
         // Only an insert-only mutation is safe to replay automatically after a
@@ -1059,10 +1342,12 @@ impl Omnigraph {
                 Ok(crate::MutationReceipt {
                     result: total,
                     commit: None,
+                    branch: addressed,
+                    plans: Vec::new(),
                 })
             }
             Ok(total) => {
-                let committed = self
+                let mut committed = self
                     .commit_staged_mutation(
                         staging,
                         &txn,
@@ -1071,17 +1356,16 @@ impl Omnigraph {
                         history_release_bytes,
                     )
                     .await?;
-                let publication = if ir.as_commit {
-                    crate::db::omnigraph::Publication::Propose(None)
-                } else {
-                    crate::db::omnigraph::Publication::Publish
-                };
+                let plans = std::mem::take(&mut committed.plans);
+                let publication = route.publication(&txn).map_err(OmniError::unpublished)?;
                 let commit = self
                     .publish_committed_mutation(committed, &txn, actor_id, publication)
                     .await?;
                 Ok(crate::MutationReceipt {
                     result: total,
                     commit: Some(commit),
+                    branch: addressed,
+                    plans,
                 })
             }
         }
@@ -1101,18 +1385,28 @@ impl Omnigraph {
         history_release_bytes: HistoryReleaseBytes,
     ) -> Result<CommittedStagedMutation> {
         let requested = txn.branch.as_deref();
-        self.validate_staged_mutation(&staging, txn).await?;
+        let plans = self.validate_staged_mutation(&staging, txn).await?;
+        // From the first staged file to the publisher call, every durable
+        // effect is a fresh file or a detached version no manifest names: a
+        // failure here is definite (`Unpublished`), whatever its cause, and a
+        // server must not treat it as an outcome it cannot establish.
         let staged = staging
             .stage_all_with_concurrency(self, requested, stage_write_concurrency)
-            .await?;
-        fail(&MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
+            .await
+            .map_err(OmniError::unpublished)?;
+        fail(&MUTATION_POST_STAGE_PRE_EFFECT_GATE).map_err(OmniError::unpublished)?;
         let lineage_intent = self
             .new_lineage_intent_for_branch(requested, actor_id, history_release_bytes)
-            .await?;
-        let committed = staged.commit_all(self, requested, txn).await?;
+            .await
+            .map_err(OmniError::unpublished)?;
+        let committed = staged
+            .commit_all(self, requested, txn)
+            .await
+            .map_err(OmniError::unpublished)?;
         Ok(CommittedStagedMutation {
             committed,
             lineage_intent,
+            plans,
         })
     }
 
@@ -1134,6 +1428,7 @@ impl Omnigraph {
                     gates: _held_gates,
                 },
             lineage_intent,
+            plans: _,
         } = committed;
         // `_held_gates` holds the shared schema permit, branch effect gate,
         // and sorted table gates acquired by `commit_all`. They remain held
@@ -1146,10 +1441,11 @@ impl Omnigraph {
         // failure here leaves the graph unchanged and the detached versions as
         // reclaimable garbage. See
         // `tests/failpoints.rs::finalize_publisher_residual_does_not_drift_untouched_tables`.
-        fail(&MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
+        fail(&MUTATION_POST_FINALIZE_PRE_PUBLISHER).map_err(OmniError::unpublished)?;
         // RFC 0067: every effect is a detached commit of its pinned base, so a
         // publish failure leaves the graph unchanged; the error is returned as
-        // is (a moved head is `ReadSetChanged`).
+        // is (a moved head is `ReadSetChanged`). The publisher alone decides
+        // between a definite loss and an outcome it could not read back.
         self.commit_updates_on_branch_with_expected(
             txn.branch.as_deref(),
             &updates,
@@ -1581,9 +1877,9 @@ impl Omnigraph {
 
         // Accumulate the updated batch into the Merge-mode pending stream.
         // The accumulator may now contain entries with the same id as a
-        // prior insert or update on this table; `MutationStaging::finalize`
+        // prior insert or update on this table; `prepare_pending_table`
         // dedupes by id (last-occurrence wins) before issuing the single
-        // `stage_merge_insert` call at end-of-query.
+        // `stage_keyed_write` call at end-of-query.
         let updated_schema = updated.schema();
         staging.append_batch(&table_key, updated_schema, PendingMode::Upsert, updated)?;
 
@@ -1643,9 +1939,20 @@ impl Omnigraph {
         // Delete is a STRICT op, so collapse #1 never skips its open.
         let ds = handle.expect("strict Delete op always opens its dataset");
 
-        let scan_filter =
-            dedup_delete_filter(&pred_expr, staging.recorded_delete_predicates(&table_key));
-        let deleted_ids = scan_deleted_ids(
+        // A `<key> = v` conjunct on a single String key also selects the
+        // derived `id = v`, so with an id BTREE the scan narrows through
+        // the index instead of reading the key column of every fragment.
+        // The recorded predicate stays the written one.
+        let scan_predicate =
+            match delete_key_id_conjunct(self, &ds, type_name, predicate, params, txn).await? {
+                Some(id_conjunct) => pred_expr.clone().and(id_conjunct),
+                None => pred_expr.clone(),
+            };
+        let scan_filter = dedup_delete_filter(
+            &scan_predicate,
+            staging.recorded_delete_predicates(&table_key),
+        );
+        let (deleted_ids, deleted_addrs) = scan_deleted_ids(
             self,
             &ds,
             txn.catalog.system_columns.id,
@@ -1672,6 +1979,7 @@ impl Omnigraph {
         // path/version/op-kind via `ensure_path`.
         fail(&MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE)?;
         staging.record_delete(&table_key, pred_expr.clone());
+        staging.record_deleted_row_addrs(&table_key, ds.version(), deleted_addrs)?;
 
         let mut affected_edges = 0usize;
 
@@ -1730,7 +2038,7 @@ impl Omnigraph {
             // Scan (not count) the cascade-removed edge ids so validation
             // recounts the OTHER endpoint's @card after the cascade; `len()` is
             // the affected count.
-            let matched_ids = scan_deleted_ids(
+            let (matched_ids, matched_addrs) = scan_deleted_ids(
                 self,
                 &edge_ds,
                 txn.catalog.system_columns.id,
@@ -1744,6 +2052,11 @@ impl Omnigraph {
             if matched > 0 {
                 staging.record_deleted_ids(&edge_table_key, matched_ids);
                 staging.record_delete(&edge_table_key, cascade_filter);
+                staging.record_deleted_row_addrs(
+                    &edge_table_key,
+                    edge_ds.version(),
+                    matched_addrs,
+                )?;
             }
         }
 
@@ -1800,7 +2113,7 @@ impl Omnigraph {
         // a delete emptying a src below @card min is rejected; `len()` is the
         // affected count. One scan replaces the former count-here + resolve-at-
         // validation re-scan.
-        let deleted_ids = scan_deleted_ids(
+        let (deleted_ids, deleted_addrs) = scan_deleted_ids(
             self,
             &ds,
             txn.catalog.system_columns.id,
@@ -1813,6 +2126,7 @@ impl Omnigraph {
         if affected > 0 {
             staging.record_deleted_ids(&table_key, deleted_ids);
             staging.record_delete(&table_key, pred_expr.clone());
+            staging.record_deleted_row_addrs(&table_key, ds.version(), deleted_addrs)?;
             self.invalidate_graph_index().await;
         }
 
@@ -1823,33 +2137,121 @@ impl Omnigraph {
     }
 }
 
+/// The derived-id conjunct of a node delete whose predicate has a top-level
+/// `<key> = <String literal or parameter>` conjunct on the type's single
+/// String `@key`: every write derives a keyed node's id from its key
+/// (`loader::canonical_key_id`), so `key = v` implies `id = derive(v)` and
+/// adding the conjunct selects the same rows. The read planner narrows the
+/// same shape (`scan_access::narrow_key`). Only when the pinned table has an
+/// id BTREE: without one the extra column would only add bytes.
+async fn delete_key_id_conjunct(
+    db: &Omnigraph,
+    ds: &SnapshotHandle,
+    type_name: &str,
+    predicate: &IRExpr,
+    params: &ParamMap,
+    txn: &crate::db::WriteTxn,
+) -> Result<Option<Expr>> {
+    let type_key = format!("node:{type_name}");
+    let Some(node) = txn.catalog.node_types.get(type_name) else {
+        return Ok(None);
+    };
+    let Some([key]) = node.key.as_deref() else {
+        return Ok(None);
+    };
+    let mut derived = None;
+    for conjunct in predicate.clone().into_conjuncts() {
+        let Some((left, omnigraph_compiler::query::ast::CompOp::Eq, right)) =
+            conjunct.comparison_parts()
+        else {
+            continue;
+        };
+        for (property, value) in [(left, right), (right, left)] {
+            let IRExpr::PropAccess { property, .. } = property else {
+                continue;
+            };
+            if property != key {
+                continue;
+            }
+            let literal = match value {
+                IRExpr::Literal(literal, _) => Some(literal),
+                IRExpr::Param(name, _) => params.get(name),
+                _ => None,
+            };
+            let Some(literal) = literal else {
+                continue;
+            };
+            if let Some(id) = crate::engine::plan_source::canonical_key_id_of(
+                &txn.catalog,
+                &type_key,
+                literal,
+                value.ty(),
+            )? {
+                derived = Some(id);
+                break;
+            }
+        }
+        if derived.is_some() {
+            break;
+        }
+    }
+    let Some(id) = derived else {
+        return Ok(None);
+    };
+    let id_column = txn.catalog.system_columns.id;
+    if !db.storage().has_btree_index(ds, id_column).await? {
+        return Ok(None);
+    }
+    Ok(Some(
+        datafusion::prelude::col(id_column).eq(datafusion::prelude::lit(id)),
+    ))
+}
+
 /// Walk the exact typed predicate a batch at a time, admitting each id against
-/// `budget` before copying it.
+/// `budget` before copying it, and keep each matched row's address so the
+/// staged delete removes exactly these rows without scanning again.
 async fn scan_deleted_ids(
     db: &Omnigraph,
     snapshot: &SnapshotHandle,
     id_column: &str,
     filter: Expr,
     budget: &mut DeletedIdBudget,
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, RowAddrTreeMap)> {
     let mut stream = db
         .storage()
-        .scan_filtered(snapshot, Some(&[id_column]), filter)
+        .scan_filtered_row_addrs(snapshot, &[id_column], filter)
         .await?;
     let mut removed = Vec::new();
+    let mut addrs = RowAddrTreeMap::new();
     while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
         let ids = batch
             .column(0)
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| OmniError::manifest_internal("delete id scan did not return Utf8"))?;
+        let row_addrs = batch
+            .column_by_name(lance_core::ROW_ADDR)
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| {
+                OmniError::manifest_internal("delete id scan did not return UInt64 row addresses")
+            })?;
+        if row_addrs.len() != ids.len() || row_addrs.null_count() != 0 {
+            return Err(OmniError::manifest_internal(
+                "delete id scan returned an address column that does not match its ids",
+            ));
+        }
         for i in 0..ids.len() {
             let id = ids.value(i);
             budget.retain(id)?;
             removed.push(id.to_owned());
+            if !addrs.insert(row_addrs.value(i)) {
+                return Err(OmniError::manifest_internal(
+                    "delete id scan returned one row address twice",
+                ));
+            }
         }
     }
-    Ok(removed)
+    Ok((removed, addrs))
 }
 
 /// Concat the matched batches from `scan_with_pending` into a single batch.
@@ -1896,21 +2298,19 @@ mod literal_narrowing_tests {
 
     #[test]
     fn scalar_narrowing_accepts_boundaries_and_rejects_wraparound() {
-        assert!(
-            literal_to_typed_array(&Literal::Integer(i32::MAX as i64), &DataType::Int32, 1).is_ok()
-        );
-        assert!(
-            literal_to_typed_array(&Literal::Integer(i32::MAX as i64 + 1), &DataType::Int32, 1,)
-                .is_err()
-        );
-        assert!(
-            literal_to_typed_array(&Literal::Integer(u32::MAX as i64), &DataType::UInt32, 1)
-                .is_ok()
-        );
-        assert!(
-            literal_to_typed_array(&Literal::Integer(u32::MAX as i64 + 1), &DataType::UInt32, 1,)
-                .is_err()
-        );
+        let int = |value: i128| Literal::Integer(value);
+        let int32_max = int(i32::MAX as i128);
+        let int32_over = int(i32::MAX as i128 + 1);
+        let uint32_max = int(u32::MAX as i128);
+        let uint32_over = int(u32::MAX as i128 + 1);
+        let uint64_max = int(u64::MAX as i128);
+        let uint64_over = int(u64::MAX as i128 + 1);
+        assert!(literal_to_typed_array(&int32_max, &DataType::Int32, 1).is_ok());
+        assert!(literal_to_typed_array(&int32_over, &DataType::Int32, 1).is_err());
+        assert!(literal_to_typed_array(&uint32_max, &DataType::UInt32, 1).is_ok());
+        assert!(literal_to_typed_array(&uint32_over, &DataType::UInt32, 1).is_err());
+        assert!(literal_to_typed_array(&uint64_max, &DataType::UInt64, 1).is_ok());
+        assert!(literal_to_typed_array(&uint64_over, &DataType::UInt64, 1).is_err());
         assert!(literal_to_typed_array(&Literal::Integer(-1), &DataType::UInt32, 1).is_err());
         assert!(literal_to_typed_array(&Literal::Integer(-1), &DataType::UInt64, 1).is_err());
     }
@@ -2015,7 +2415,7 @@ edge Shared: Endpoint -> Endpoint { label: String }
             name: "q".into(),
             params: Vec::new(),
             ops: vec![op],
-            as_commit: false,
+            write_mode: omnigraph_compiler::query::ast::MutationWriteMode::Publish,
         };
         for (ir, is_insert) in [
             (
@@ -2094,5 +2494,26 @@ edge Shared: Endpoint -> Endpoint { label: String }
         assert!(staging.is_empty());
         assert!(staging.paths.is_empty());
         assert!(staging.deleted_ids.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod delete_filter_tests {
+    use super::dedup_delete_filter;
+    use crate::engine::lance_filter_support::selected_rows;
+    use datafusion::prelude::{col, lit, not};
+
+    /// A later statement selects `k = "a"`, the row whose `s` is null; the
+    /// earlier statements' disjoint `NOT IN` tests are null there, so they
+    /// did not match it and must not exclude it.
+    #[test]
+    fn earlier_disjoint_not_in_statements_do_not_exclude_a_null_row_issue_1277() {
+        let prior = [
+            not(col("s").in_list(vec![lit("y")], false)),
+            not(col("s").in_list(vec![lit("x")], false)),
+        ];
+        let filter = dedup_delete_filter(&col("k").eq(lit("a")), &prior);
+        assert_eq!(selected_rows(filter.clone(), false), vec![0]);
+        assert_eq!(selected_rows(filter, true), vec![0]);
     }
 }

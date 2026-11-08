@@ -57,9 +57,10 @@ key). Name rules depend on the graph's vintage:
   and may declare ordinary properties named `id`, `src`, or `dst`. Every
   property name beginning `_` is reserved.
 - **Legacy graphs** (spellings kept by `omnigraph upgrade`) retain physical
-  `id`/`src`/`dst` and refuse `id` on any type, `src`/`dst` on edges, and
-  `__id`/`__src`/`__dst`. Other `_` names are still accepted there, but they
-  block `schema upgrade-system-columns`.
+  `id`/`src`/`dst` and refuse `id` and `__id` on any type, `src`/`dst` and
+  `__src`/`__dst` on edges, and Lance's virtual column names (`_rowid`,
+  `_rowaddr`, …). Other `_` names are still accepted there, but they block
+  `schema upgrade-system-columns`.
 - **All vintages:** `from` and `to` are reserved edge property names (insert
   endpoints), and `_distance`/`_score` are refused as property names.
 
@@ -103,9 +104,9 @@ This validates the schema **and** the queries against it. No running repo requir
 ### Plan before apply — always
 
 ```bash
-omnigraph schema plan --schema next.pg s3://bucket/repo --json
+omnigraph schema plan --schema next.pg --target ./graph.omni --json
 # inspect "supported": true|false and the step list
-omnigraph schema apply --schema next.pg s3://bucket/repo
+omnigraph schema apply --schema next.pg --target ./graph.omni
 ```
 
 If `supported: false`, fix the source before applying. Plan is free; run it as often as needed.
@@ -115,12 +116,17 @@ a code is present, match it rather than the free-form message text.
 
 **Drops reclaim nothing at apply.** Dropping a property or type removes it from
 the current schema; older commits still read the dropped data until
-`omnigraph cleanup` stops retaining them, and only then is it gone for good. No
-flag makes a drop destructive at apply: to reclaim the space, run `cleanup`
-with a retention that excludes the commits before the drop. A cluster-only
-server rejects
-`POST /graphs/{id}/schema/apply` with `409`; evolve a served graph through
-`cluster plan` and `cluster apply`.
+`omnigraph cleanup` stops retaining them. A dropped type is then gone, but a
+dropped property's values also stay in the table's current data files until
+`omnigraph optimize` (which works on `main`) rewrites the fragments holding
+them. To erase a dropped property: run `optimize` after the drop, delete every
+branch created from a commit before that optimize and every tag naming such a
+commit (merging a branch releases nothing), then run `cleanup` with a
+retention that excludes the commits before the optimize, for example
+`--keep 1 --confirm`. No flag makes a drop destructive at apply. Re-adding a
+dropped name starts a new property, so historical reads never see the old
+values through it. The HTTP server has no `POST /graphs/{id}/schema/apply`
+route; evolve a served graph through `cluster plan` and `cluster apply`.
 
 ### Apply is main-only
 
@@ -162,13 +168,28 @@ remain rebuild territory. Value *order* never matters (values are normalized).
 
 Changing the key field is effectively a replace — it invalidates every external reference to the node. `schema plan` refuses adding, removing, or changing `@key` on an existing node or edge type; an identity change is an export/rebuild migration, not a casual field rename.
 
-### Constraints: only `@index` is added in place
+### Constraints: `@index` and a node's `@unique` are added in place
 
-Adding a constraint other than `@index` (`@key`, `@unique`, `@range`, `@check`)
-to an existing type, removing any constraint, and changing edge cardinality or
-endpoints are refused as unsupported. In-place migrations are additions of
-nullable properties and types, `@index` additions, enum widening, renames, and
-drops; tightening a constraint means a rebuild.
+Adding `@index` is metadata only. Adding `@unique` to a node type, and making a
+nullable property required (`T?` → `T`, node or edge), first read the stored
+rows under the apply's locks: a live row holding a null (OG-MF-104) or two rows
+sharing a key (OG-MF-108) refuse the apply and change nothing. To add a required
+or unique property to a populated type, add it nullable, load its values, then
+promote it. Promotion may be combined with a `@rename_from` of the same property.
+A `@unique` naming a nullable property added in the same apply needs no row
+check: every stored row holds a null there, and a key with a null part is exempt.
+
+Adding another constraint (`@key`, `@range`, `@check`, an edge `@unique`)
+to an existing type, removing a constraint from a property that stays,
+changing edge cardinality or endpoints, and adding an edge type with a non-zero
+`@card` minimum from an existing node type (OG-MF-107) are refused as
+unsupported. Dropping a
+property drops every constraint that names only dropped properties (its own
+`@index`, `@unique`, `@range` or `@check`); a drop that would remove a `@key`,
+or a constraint that also names a field that stays, is refused. In-place
+migrations are additions of nullable properties and types, `@index` and node
+`@unique` additions, nullable-to-required promotion, enum widening, renames,
+and drops; any other tightening means a rebuild.
 
 ### `schema apply` blocks writes while running
 
@@ -177,7 +198,7 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 ## Supported Types
 
 - **Scalars:** `String`, `Bool`, `I32`, `I64`, `U32`, `U64`, `F32`, `F64`, `Date`, `DateTime`, `Blob`
-- **Collections:** `Vector(N)` (fixed-size float vector), `[ScalarType]` (list of scalar)
+- **Collections:** `Vector(N)` (fixed-size float vector), `[ScalarType]` (list of a non-Blob scalar; `[Blob]` is refused)
 - **Enums:** `enum(value1, value2, ...)` — inline only, values can contain alphanumerics, underscores, hyphens
 - **Optional:** any type + `?` suffix (`String?`, `[I32]?`, `Vector(4)?`)
 
@@ -186,12 +207,12 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 **Property-level shorthand:**
 - `@key` — single-property node key
 - `@unique` — single-property uniqueness constraint
-- `@index` — single-property index intent (currently materialized automatically only for node properties)
+- `@index` — single-property index intent (currently materialized automatically only for node properties). A String property used in `search`, `fuzzy`, `match_text` or `bm25` must declare it, or the call is refused at type check (`T27`); an enum takes no full-text index (compare it with `=`)
 - `@embed("source_prop")` — associates a node Vector property with a String source; does not populate it during writes
 - `@description("...")` — metadata (no migration impact)
 
 **Edge-level:**
-- `@card(min..max)` — edge cardinality (default: unbounded from zero; write an open upper bound as `@card(1..)`)
+- `@card(min..max)` — bounds the edges of the type that start at each source node (default: unbounded from zero; write an open upper bound as `@card(1..)`). A write is refused when it leaves out of bounds a source node it inserts or updates (when `min > 0`) or one whose edges of the type it adds, moves or removes, so a node with a non-zero minimum arrives in the same mutation query or load as its edges, and a `load csv` into its type cannot add one. Schema apply refuses a new edge type with a minimum from an existing node type (OG-MF-107). Nodes older versions wrote without edges are counted only when next written: keep an orphan check for them ([`schema-design.md`](schema-design.md#9-enforce-meaning-and-keep-the-rules-in-the-graph))
 
 **Type-level (nodes/edges):**
 - `@instruction("...")` — semantic hint for LLMs/operators
@@ -204,8 +225,13 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 - `@key(@src, @dst, prop)` — edge identity tuple including both endpoints and optional scalar members
 - `@unique(prop1, prop2)` — composite uniqueness, enforced as a true tuple key at intake and merge (works on edges too: `@unique(@src, @dst)`). Members must reduce to scalar keys. Blob is rejected at schema admission; list/vector declarations may parse but writes fail scalar-key validation.
 - `@index(prop1, prop2)` — composite index intent. Composite and edge intents are accepted but are not currently materialized as property indexes.
-- `@range(prop, min..max)` — node-only numeric bounds; either bound may be omitted
+- `@range(prop, min..max)` — node-only inclusive numeric bounds, compared exactly; a list property bounds each element; either bound may be omitted
 - `@check(prop, "regex")` — node-only String regular-expression constraint
+
+Integer bounds must fit `I64`; `..max` is upper-only and `min..` is lower-only.
+Decimal bounds use `F64`. Existing accepted schemas retain their bounds: before
+restating a historical schema, write an old upper-only bound as `min..` and an
+oversized integer bound as a decimal with its stored value.
 
 ## Interfaces
 
@@ -225,13 +251,11 @@ node Doc implements Searchable {
 
 Most schemas are fine without interfaces. Reach for them only when 3+ node types need to share a property contract.
 
-## Design Principles (brief)
+## Design Principles
 
-- **Identity is explicit** — use `@key` on a semantic slug, not internal row IDs
-- **Narrow types** — `Date` over `String` for dates, `enum` over `String` for lifecycle states
-- **Edge semantics matter** — prefer `AuthoredBy` over `RelatedTo`
-- **Constraints live in the schema** — `@unique`, `@range`, `@card` keep invariants out of application code
-- **Schemas are reviewable** — clear names, explicit enums, obvious keys
+Design guidance (Gruber's criteria, identity, narrow types, edge semantics,
+constraints, provenance, `GraphPolicy` rules, and designing for many agents)
+lives in [`schema-design.md`](schema-design.md).
 
 ## Schema Evolution in Cluster Mode
 
@@ -240,18 +264,18 @@ schema is declared (`graphs.<id>.schema:` in `cluster.yaml`) and converged:
 
 ```bash
 $EDITOR schema.pg
-omnigraph cluster plan  --config . --observe   # migration steps; takes no cluster lock
-omnigraph cluster apply --server <name|url> --config .
+# production is a registered server target
+omnigraph cluster plan --target production --config . --json
+omnigraph cluster apply --target production --config .
 # the running server publishes and activates the new shape; no restart
 ```
 
-Without `--server`, `cluster apply --config . --as <you>` writes the storage
-root itself: stop the server and transfer its cluster lock first (see
+With a direct-root target, `cluster apply --target ./cluster --config . --as <you>` writes storage directly: stop the server and transfer its cluster lock first (see
 [`cluster.md`](cluster.md)), then start the server to serve the new shape.
 
 Differences from direct `schema apply` (on a non-cluster store): out-of-band
 schema changes on the live graph are *drift* — the next `cluster apply`
-refuses with `applied_schema_drift`, and `--schema-correction` accepts a
-reviewed observed schema.
+refuses with `applied_schema_drift`. Apply does not adopt drift; restore
+authoritative state from verified evidence or a backup before proceeding.
 Everything else in this file (`@rename_from`, backfills,
 linting, enum discipline) applies unchanged to the `.pg` you edit.

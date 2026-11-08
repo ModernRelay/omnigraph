@@ -288,3 +288,125 @@ fn prop_antijoin_partitions_persons() {
         })
         .unwrap();
 }
+
+/// Correlated blocks bound by a key on one of their own bindings, as
+/// `(outer pattern, block)`. Each runs as written and again with `FORCE` set
+/// to a conjunct that reads the outer row (`$p.name = $p.name`, always true),
+/// which keeps the twin `correlated`; written, the planner may run the block as
+/// a key set from the bound binding. The last shape repeats each `$p` once per
+/// outer `knows` edge.
+const KEY_SET_SHAPES: &[(&str, &str)] = &[
+    (
+        "$p: Person",
+        "not { $p knows{1,3} $x  $x: Person { name: $name } FORCE }",
+    ),
+    (
+        "$p: Person",
+        "not { $x knows{1,2} $p  $x: Person { name: $name } FORCE }",
+    ),
+    (
+        "$p: Person",
+        "count { $p <knows>{1,2} $x  $x: Person { name: $name } FORCE } = 1",
+    ),
+    (
+        "$p: Person",
+        "not { $p knows{2,2} $x  $x: Person { name: $name } FORCE }",
+    ),
+    (
+        "$p: Person",
+        "count { $p $k:knows $x  $x: Person { name: $name } FORCE } = 1",
+    ),
+    (
+        "$p: Person",
+        "not { $p knows $m  $p worksAt $c  $c: Company { name: $name } FORCE }",
+    ),
+    (
+        "$p: Person  $p knows $q",
+        "not { $p worksAt $c  $c: Company { name: $name } FORCE }",
+    ),
+];
+
+/// The run of `block` over `outer` with `force` in its place: its first
+/// column as a sorted multiset, and the block's strategy.
+async fn block_run(
+    db: &Session,
+    outer: &str,
+    block: &str,
+    force: &str,
+    params: &ParamMap,
+) -> (Vec<String>, omnigraph_planner::AntiJoinStrategy) {
+    let query = format!(
+        "query q($name: String) {{ match {{ {outer} {} }} return {{ $p.name }} }}",
+        block.replace("FORCE", force)
+    );
+    let executed = db
+        .query_inspected(ReadTarget::branch("main"), &query, "q", params)
+        .await
+        .unwrap();
+    let strategy = executed
+        .plan
+        .plan
+        .live()
+        .find_map(|(_, node)| match node {
+            omnigraph_planner::PhysicalNode::AntiJoin { strategy, .. } => Some(*strategy),
+            _ => None,
+        })
+        .expect("the block plans an AntiJoin");
+    let mut names = Vec::new();
+    if executed.result.num_rows() > 0 {
+        let batch = executed.result.concat_batches().unwrap();
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        names = (0..column.len())
+            .map(|row| column.value(row).to_string())
+            .collect();
+        names.sort();
+    }
+    (names, strategy)
+}
+
+// INVARIANT 4: a key-set block keeps the rows its correlated form keeps. The
+// key set runs the pattern from the bound binding, each traversal toward the
+// outer binding reversed, so this holds only while every `Expand` emits the
+// same pairs (or edge rows) in both orientations. Over collision-prone keys,
+// cycles, self-loops and duplicated outer rows, each shape's row multiset as
+// written equals its forced-correlated twin's, for every key.
+#[test]
+fn prop_key_set_block_eq_correlated() {
+    use omnigraph_planner::AntiJoinStrategy;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut runner = TestRunner::new(config());
+    let key_set_runs = std::sync::atomic::AtomicUsize::new(0);
+    runner
+        .run(&arb_graph(), |graph| {
+            let mismatch = rt.block_on(async {
+                let (_dir, db) = load_graph(&graph).await;
+                for (outer, block) in KEY_SET_SHAPES {
+                    for key in KEYS {
+                        let params = one_param(key);
+                        let (written, strategy) = block_run(&db, outer, block, "", &params).await;
+                        let (forced, twin) =
+                            block_run(&db, outer, block, "$p.name = $p.name", &params).await;
+                        assert_eq!(twin, AntiJoinStrategy::Correlated, "{block}");
+                        if strategy == AntiJoinStrategy::KeySet {
+                            key_set_runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if written != forced {
+                            return Some((*block, *key, strategy, written, forced));
+                        }
+                    }
+                }
+                None
+            });
+            prop_assert!(mismatch.is_none(), "key-set divergence: {:?}", mismatch);
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        key_set_runs.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "no written block ran as a key set, so the property compared nothing"
+    );
+}

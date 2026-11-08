@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - OmniGraph maintainers
 created: 2026-06-14
-updated: 2026-10-05
+updated: 2026-10-29
 discussion: null
 supersedes: ["0010"]
 superseded_by: []
@@ -15,6 +15,15 @@ blocked_on: []
 ---
 
 # RFC 0011: CLI addressing and configuration
+
+> **RFC 0059 disposition:** [RFC 0059](0059-config-cli-coherency.md) replaces
+> primitive/profile selection with fixed target bindings. Historical: the profile
+> and scope routing definitions, Design's address selection and config shape,
+> command/addressing tables, and the corresponding migration and Decisions rules.
+> Current: distinct served/direct authority, no automatic fallback or sticky
+> selection state, graph selection within a scope, and operation-specific
+> applicability and authorization. The accepted replacement design does not claim
+> implementation completion; RFC 0059 tracks the cutover.
 
 > **Implementation note:** The `omnigraph.yaml` excision landed in
 > #250/#251/#252; D1–D4, D6, D7, D9, and D10 shipped. D11 (server-side
@@ -781,3 +790,11 @@ duplicated here.
 - 2026-10-05: `schema apply` is direct-only; the unused served schema-apply
   route is removed. Served changes use cluster deployment. Decision 10 and
   the capability taxonomy now reflect that boundary.
+
+- 2026-10-29: Pending amendment. [Remote optimize through the serving
+  owner](2026-10-29-remote-optimize-through-the-serving-owner.md), a draft, executes a served root's
+  `optimize` in the serving owner rather than an out-of-band worker. Once it
+  is accepted, Decision 11's "Runs out-of-band … never inline in serving"
+  gives way for `optimize` only; `cleanup` and `repair` are unchanged, and the
+  worker remains the later offload shape. Decision 11 stands unchanged until
+  acceptance.

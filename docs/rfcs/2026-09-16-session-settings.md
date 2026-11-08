@@ -1123,6 +1123,18 @@ routed) follows step 2.
 
 ## Decision log
 
+- 2026-10-16: `query_memory_bytes` gains its second load-side scope, the
+  aggregate tracked memory of one `load csv` statement (source capture,
+  decoded batches, validation state, staging working set), refusing before any
+  fragment write, per rollout step 2 of the bulk-load RFC (2026-10-15, bulk
+  load as a query plan). `write_max_bytes` bounds each staged-write input of a
+  CSV load; since step 3 it is also the load plan's `max_input_bytes`.
+- 2026-10-15: `query_memory_bytes` gains its first load-side scope: a load
+  statement's retained read-reuse buffers (statement-scoped session caches,
+  held table handles, byte-range memo) are admitted against it, per rollout
+  step 1 of the bulk-load RFC (2026-10-15, bulk load as a query plan). Read
+  queries are unchanged; an allowance that cannot admit the buffers leaves the
+  load's reads uncached.
 - 2026-09-22: `ann_nprobes` moves from `process` to `request` scope. A
   caller may set the probe cap of its own `nearest` scans, because once the
   plan carries `RankedAccess.nprobes` the answer is reproducible from the

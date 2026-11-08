@@ -30,57 +30,18 @@ pub enum PolicyAction {
     /// Drop an unpublished graph commit (`commit drop "<id>"`). Target-branch
     /// scoped: the branch the proposal would have landed on.
     CommitDrop,
-    /// Reserved for **policy-management** surfaces. Per MR-724 Option A,
-    /// this gates operator actions like hot-reloading policy / tokens
-    /// (MR-726), querying the audit log (MR-732), and listing /
-    /// approving pending two-person-rule requests (MR-734). None of
-    /// those endpoints exist yet, so today no engine or HTTP code
-    /// calls `enforce(Admin, ...)`. The variant is kept in the enum so
-    /// the action vocabulary is complete from chassis day one — when
-    /// the first consumer surface ships, it can just call
-    /// `enforce(Admin, ResourceScope::Graph, actor)` without needing
-    /// to add the enum variant + update policy.yaml schemas + redeploy.
-    ///
-    /// Operators can write Cedar rules referencing `admin` today; they
-    /// won't fire (no call site) but they're load-bearing for the
-    /// future shape. Avoid writing such rules until the first consumer
-    /// endpoint ships to prevent confusion.
+    /// Reserved action; no current engine or HTTP operation uses this grant.
     Admin,
-    /// MR-668: management action that operates on the server's graph
-    /// registry, not on a single graph's contents. The Cedar `appliesTo`
-    /// declaration binds it to `resource: Server` instead of the
-    /// per-graph `resource: Graph`. Operators authorize a group with:
-    /// ```yaml
-    /// rules:
-    ///   - id: admins-can-list-graphs
-    ///     allow:
-    ///       actors: { group: admins }
-    ///       actions: [graph_list]
-    /// ```
-    /// `branch_scope` and `target_branch_scope` are NOT supported for
-    /// this action — there's no branch context at the server level.
-    /// Runtime `graph_create` / `graph_delete` are intentionally omitted
-    /// from v0.6.0; operators add and remove graphs by editing
-    /// `omnigraph.yaml` and restarting.
+    /// List the server's graph registry. This is server-scoped, with no branch
+    /// scope. Add or remove graphs through `cluster apply` using `config_manage`.
     GraphList,
-    /// Gates invoking a server-side stored query by name. Per-graph and
-    /// **graph-scoped** (no branch dimension, like `Admin`): the per-branch
-    /// access of the query body is enforced by the inner `Read`/`Change`
-    /// gate, so branch-scoping this outer gate would be redundant (and was
-    /// wrong for snapshot reads). A rule that sets `branch_scope` on
-    /// `invoke_query` is rejected by `validate()`. In this release it is
-    /// **coarse**: an `invoke_query` allow rule permits *any* stored query
-    /// on the graph (no per-query dimension yet); a future, additive
-    /// refinement adds an optional query-name scope.
-    ///
-    /// This gate sits at the HTTP boundary. The engine `_as` writers still
-    /// enforce `Read`/`Change` per the query body, so a stored *mutation*
-    /// is double-gated: `invoke_query` to reach the tool, plus `change` for
-    /// the write itself.
+    /// Invoke a stored query by name. This graph-scoped grant covers every
+    /// stored query on that graph; the query's own read or change permission
+    /// is checked separately. Branch scopes are unsupported for this action.
     InvokeQuery,
     /// Change the cluster's configuration, including policy membership,
     /// graph creation, and the initial schema of a newly created graph.
-    /// Existing graph schema changes additionally require `schema_apply`.
+    /// Existing graph schema changes additionally require `read` and `schema_apply`.
     ConfigManage,
 }
 
@@ -291,6 +252,55 @@ pub struct PolicyRequest {
     pub target_branch: Option<String>,
 }
 
+/// A branch name refused by [`ensure_canonical_branch_name`].
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum BranchNameError {
+    Empty,
+    ControlCharacter(String),
+    SurroundingWhitespace(String),
+}
+
+impl fmt::Display for BranchNameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BranchNameError::Empty => write!(f, "branch name cannot be empty"),
+            BranchNameError::ControlCharacter(name) => {
+                write!(f, "branch name {name:?} contains a control character")
+            }
+            BranchNameError::SurroundingWhitespace(name) => {
+                write!(f, "branch name {name:?} has leading or trailing whitespace")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BranchNameError {}
+
+/// Accept a branch name only in a spelling no layer reads differently.
+///
+/// A policy decision compares the request's branch names with
+/// `protected_branches` as written, and the engine opens the branch it is
+/// given, so the two decide about one branch only while nothing rewrites the
+/// name between them. A name that a reader could take for another spelling
+/// is refused rather than corrected: an empty name, one with leading or
+/// trailing whitespace (the Unicode set `str::trim` removes), or one holding a
+/// control character. Every surface that accepts a branch name applies this
+/// rule before it authorizes or resolves the name. Lance's `check_valid_branch`
+/// refuses whitespace and control characters in a ref name, so no branch
+/// created through it is made unreachable by the rule.
+pub fn ensure_canonical_branch_name(name: &str) -> Result<(), BranchNameError> {
+    if name.chars().any(char::is_control) {
+        return Err(BranchNameError::ControlCharacter(name.to_string()));
+    }
+    if name.trim() != name {
+        return Err(BranchNameError::SurroundingWhitespace(name.to_string()));
+    }
+    if name.is_empty() {
+        return Err(BranchNameError::Empty);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct PolicyDecision {
     pub allowed: bool,
@@ -320,7 +330,7 @@ impl PolicyConfig {
     /// `load` for callers whose policies don't live on the local filesystem
     /// (e.g. a cluster catalog on object storage).
     pub fn from_source(source: &str) -> Result<Self> {
-        let config: Self = serde_yaml::from_str(source)?;
+        let config: Self = yaml_serde::from_str(source)?;
         config.validate()?;
         Ok(config)
     }
@@ -344,10 +354,11 @@ impl PolicyConfig {
             }
         }
 
+        // A request's branch is compared with these names as written, so an
+        // entry no request can spell would protect nothing.
         for branch in &self.protected_branches {
-            if branch.trim().is_empty() {
-                bail!("protected branch names must not be blank");
-            }
+            ensure_canonical_branch_name(branch)
+                .map_err(|err| eyre!("protected_branches: {err}"))?;
         }
 
         let mut seen_rule_ids = HashSet::new();
@@ -443,7 +454,7 @@ impl PolicyConfig {
 
 impl PolicyTestConfig {
     pub fn load(path: &Path) -> Result<Self> {
-        let config: Self = serde_yaml::from_str(&fs::read_to_string(path)?)?;
+        let config: Self = yaml_serde::from_str(&fs::read_to_string(path)?)?;
         if config.version != 1 {
             bail!("policy test version must be 1");
         }
@@ -563,6 +574,15 @@ impl PolicyEngine {
     /// supplying a `PolicyRequest` cannot smuggle identity through the
     /// same struct that carries the requested action.
     pub fn authorize(&self, actor_id: &str, request: &PolicyRequest) -> Result<PolicyDecision> {
+        // The decision compares these names with `protected_branches` as
+        // written; one a caller could have meant as another spelling has no
+        // decision, whoever asks.
+        for branch in [&request.branch, &request.target_branch]
+            .into_iter()
+            .flatten()
+        {
+            ensure_canonical_branch_name(branch)?;
+        }
         if !self.known_actors.contains(actor_id) {
             return Ok(self.deny(
                 None,
@@ -1170,13 +1190,13 @@ rules:
         }
     }
     use super::{
-        PolicyAction, PolicyCompiler, PolicyConfig, PolicyEngine, PolicyExpectation, PolicyRequest,
-        PolicyResourceKind, PolicyTestCase, PolicyTestConfig,
+        BranchNameError, PolicyAction, PolicyCompiler, PolicyConfig, PolicyEngine,
+        PolicyExpectation, PolicyRequest, PolicyResourceKind, PolicyTestCase, PolicyTestConfig,
     };
 
     #[test]
     fn rejects_duplicate_rule_ids() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1202,7 +1222,7 @@ rules:
 
     #[test]
     fn rejects_unknown_group_references() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1223,7 +1243,7 @@ rules:
 
     #[test]
     fn rejects_invalid_scope_action_combinations() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1244,7 +1264,7 @@ rules:
 
     #[test]
     fn compiles_and_authorizes_branch_and_target_rules() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1309,11 +1329,53 @@ rules:
             .unwrap();
         assert!(admin.allowed);
         assert_eq!(admin.matched_rule_id.as_deref(), Some("admins-promote"));
+
+        // A spelling of protected main that is not main as written gets no
+        // decision, on either side of a transition, whoever asks.
+        for (actor, name) in [
+            ("act-bruno", " main"),
+            ("act-bruno", "main "),
+            ("act-bruno", "main\u{3000}"),
+            ("act-bruno", "\tmain"),
+            ("act-bruno", ""),
+            ("act-unknown", " main"),
+        ] {
+            for (branch, target_branch) in [
+                (Some(name.to_string()), None),
+                (Some("feature".to_string()), Some(name.to_string())),
+            ] {
+                let request = PolicyRequest {
+                    action: PolicyAction::BranchMerge,
+                    branch,
+                    target_branch,
+                };
+                let err = engine.authorize(actor, &request).unwrap_err();
+                assert!(err.downcast_ref::<BranchNameError>().is_some(), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn protected_branches_must_be_canonical() {
+        for entry in [r#"" main""#, r#""main ""#, r#""\tmain""#, r#""""#] {
+            let source = format!(
+                "version: 1\ngroups:\n  team: [act-a]\nprotected_branches: [{entry}]\nrules: []\n"
+            );
+            let err = PolicyConfig::from_source(&source).unwrap_err().to_string();
+            assert!(
+                err.starts_with("protected_branches: branch name"),
+                "{entry}: {err}"
+            );
+        }
+        PolicyConfig::from_source(
+            "version: 1\ngroups:\n  team: [act-a]\nprotected_branches: [main, release/1.2]\nrules: []\n",
+        )
+        .unwrap();
     }
 
     #[test]
     fn policy_tests_enforce_expected_outcomes() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1356,7 +1418,7 @@ rules:
 
     #[test]
     fn schema_apply_uses_target_branch_scope() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1400,7 +1462,7 @@ rules:
 
     #[test]
     fn commit_publish_and_drop_use_target_branch_scope() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1443,7 +1505,7 @@ rules:
             assert!(!deny.allowed, "{action:?} onto feature");
         }
 
-        let branch_scoped: PolicyConfig = serde_yaml::from_str(
+        let branch_scoped: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1465,7 +1527,7 @@ rules:
 
     #[test]
     fn graph_list_action_authorizes_against_server_resource() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1515,7 +1577,7 @@ rules:
 
     #[test]
     fn invoke_query_authorizes_per_graph() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1566,7 +1628,7 @@ rules:
         // invoke_query is graph-scoped (like admin) — per-branch access is
         // enforced by the inner read/change gate — so a rule that puts a
         // `branch_scope` qualifier on it is rejected at validate().
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1589,7 +1651,7 @@ rules:
 
     #[test]
     fn server_scoped_rule_cannot_use_branch_scope() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1616,7 +1678,7 @@ rules:
         // A single rule must reference exactly one resource kind.
         // `graph_list` (Server) + `read` (Graph) in one allow block
         // is invalid — operators must split the rule.
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1644,7 +1706,7 @@ rules:
         // as before, even when the compiled-in schema now declares
         // `Server` + `graph_*` actions. This pins the "Cedar refactor
         // is operator-invisible" promise.
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:

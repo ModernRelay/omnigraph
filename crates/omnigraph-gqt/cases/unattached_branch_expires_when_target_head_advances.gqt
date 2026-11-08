@@ -1,0 +1,77 @@
+# issue: none
+# notes: A plain write on the recorded target expires the root: its reads and a new child answer not found
+# notes: naming the expiry, the drop still succeeds, and the target holds only its own rows.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+query root_bob() as unattached branch {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $r
+
+--- mutate
+query add_carol_on_main() {
+    insert Person { name: "carol", age: 52 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query snapshot: $r
+query names_at_expired_root() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect error: not found: it expired
+
+--- mutate
+query child_of_expired() as unattached branch on "${r}" {
+    insert Person { name: "dave", age: 63 }
+}
+
+--- expect error: not found: it expired
+
+--- mutate
+commit drop "${r}"
+
+--- expect ok
+
+--- query snapshot: $r
+query names_at_dropped_root() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect error: not found
+
+--- query
+query names_on_main() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "carol"}
+
+--- expect shape
+p.name: String

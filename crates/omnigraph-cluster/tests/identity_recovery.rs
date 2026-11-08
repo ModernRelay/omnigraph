@@ -2,6 +2,8 @@
 //! recovery effects. Fault injection lives in a separate integration process.
 
 #![cfg(feature = "failpoints")]
+// Match the cluster test harness budget for composed deployment/recovery futures.
+#![recursion_limit = "256"]
 
 use std::collections::BTreeMap;
 use std::fs;

@@ -54,6 +54,7 @@ fn identity_is_local_stable_admission_without_token_permissions() {
     c["permissions"] = json!(["everything"]);
     let actor = trust.verify_at(&sign(&c), NOW).unwrap();
     assert_eq!(actor.actor_id_str(), "principal:stable_1");
+    assert_eq!(actor.client_id(), Some("oauth-client"));
     assert!(actor.is_identity());
     assert!(
         actor.identity_claims().is_none(),
@@ -97,6 +98,33 @@ fn exact_recipient_identity_and_profile_are_required() {
         let mut c = claims();
         c.as_object_mut().unwrap().remove(field);
         assert!(trust.verify_at(&sign(&c), NOW).is_none(), "missing {field}");
+    }
+}
+
+#[test]
+fn the_verified_client_is_kept_beside_one_stable_principal_issue_1173() {
+    let (_dir, trust) = setup(&document());
+    let mut actors = Vec::new();
+    for client in [
+        "https://studio.example/oauth/client",
+        "https://agent.example/oauth/client",
+        "<b>studio</b>",
+    ] {
+        let mut c = claims();
+        c["client_id"] = json!(client);
+        let actor = trust.verify_at(&sign(&c), NOW).unwrap();
+        assert_eq!(actor.client_id(), Some(client));
+        actors.push(actor);
+    }
+    // One person across clients: the actor, its policy principal and its
+    // admission budget key stay the local principal.
+    for actor in &actors {
+        assert_eq!(actor.actor_id_str(), "principal:stable_1");
+    }
+    for client in ["a".repeat(513), "ok\n".to_owned()] {
+        let mut c = claims();
+        c["client_id"] = json!(client);
+        assert!(trust.verify_at(&sign(&c), NOW).is_none(), "{client:?}");
     }
 }
 
@@ -295,4 +323,51 @@ fn public_snapshot_bounds_and_ambiguous_admission_refuse_before_boot() {
     h.kid = Some("key-1".into());
     let bad = encode(&h, &claims(), &EncodingKey::from_secret(b"not an RSA key")).unwrap();
     assert!(trust.verify_at(&bad, NOW).is_none());
+}
+
+#[test]
+fn refusals_say_whether_a_new_token_can_help_issue_1172() {
+    let (_dir, trust) = setup(&document());
+    assert!(trust.check_at(&sign(&claims()), NOW).is_ok());
+    // A token that fails its own checks is invalid: a new one can help.
+    let mut expired = claims();
+    expired["exp"] = json!(NOW);
+    let tampered = tamper_signature(&sign(&claims()));
+    for token in [sign(&expired), tampered, "not-a-jwt".into()] {
+        assert_eq!(
+            trust.check_at(&token, NOW).err(),
+            Some(OidcRefusal::Invalid)
+        );
+    }
+    // A valid token for a subject the snapshot does not name is not admitted.
+    let mut stranger = claims();
+    stranger["sub"] = json!("user_unadmitted");
+    assert_eq!(
+        trust.check_at(&sign(&stranger), NOW).err(),
+        Some(OidcRefusal::NotAdmitted)
+    );
+    // Past the snapshot's expiry a valid token is unverifiable, not invalid;
+    // a token that fails its own checks stays invalid even then.
+    let mut late = claims();
+    late["iat"] = json!(NOW + 250);
+    late["exp"] = json!(NOW + 400);
+    assert_eq!(
+        trust.check_at(&sign(&late), NOW + 300).err(),
+        Some(OidcRefusal::Unavailable)
+    );
+    assert_eq!(
+        trust.check_at("not-a-jwt", NOW + 300).err(),
+        Some(OidcRefusal::Invalid)
+    );
+}
+
+/// The token with one character changed in the middle of its signature. The
+/// last base64url character can carry only padding bits, so changing it may
+/// leave the signature bytes unchanged.
+fn tamper_signature(token: &str) -> String {
+    let (head, signature) = token.rsplit_once('.').unwrap();
+    let mut signature: Vec<char> = signature.chars().collect();
+    let middle = signature.len() / 2;
+    signature[middle] = if signature[middle] == 'A' { 'B' } else { 'A' };
+    format!("{head}.{}", signature.into_iter().collect::<String>())
 }

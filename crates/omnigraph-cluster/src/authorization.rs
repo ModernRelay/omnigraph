@@ -547,15 +547,18 @@ pub(crate) async fn authorize_candidate(
                 // absent graph; it must never be recreated to inspect recovery.
                 continue;
             }
-            Omnigraph::ensure_no_pending_recovery(&backend.graph_root(&graph))
-                .await
-                .map_err(|error| {
-                    refusal(
-                        "policy_recovery_required",
-                        graph_address(&graph),
-                        error.to_string(),
-                    )
-                })?;
+            Omnigraph::ensure_no_pending_recovery_with_storage(
+                &backend.graph_root(&graph),
+                backend.graph_storage(&backend.graph_root(&graph))?,
+            )
+            .await
+            .map_err(|error| {
+                refusal(
+                    "policy_recovery_required",
+                    graph_address(&graph),
+                    error.to_string(),
+                )
+            })?;
         }
         Some(policies)
     };

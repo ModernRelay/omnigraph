@@ -1,7 +1,10 @@
-//! init/config scaffolding, schema plan/apply, graphs listing, version.
+//! init/config scaffolding, schema plan/apply, graphs listing, version,
+//! and the built-in agent skill.
 //! Moved verbatim from tests/cli.rs in the modularization.
 
+use std::collections::BTreeMap;
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use omnigraph::db::{Omnigraph, ReadTarget};
 use serde_json::Value;
@@ -12,35 +15,345 @@ use crate::support;
 use crate::support::*;
 
 #[test]
-fn version_command_prints_current_cli_version() {
+fn version_command_prints_cli_version_http_contract_and_storage_formats_issue_977() {
+    use omnigraph::db::manifest::{
+        INTERNAL_MANIFEST_SCHEMA_VERSION as WRITES, MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION as LOWEST,
+    };
+    use omnigraph_api_types::HTTP_API_CONTRACT;
+
+    // The release workflows stamp both at compile time; the test binary is
+    // built with whatever this build was given, normally neither.
+    let channel = option_env!("OMNIGRAPH_RELEASE_CHANNEL");
+    let commit = option_env!("OMNIGRAPH_SOURCE_VERSION");
+    let version = match (channel, commit) {
+        (Some("edge"), Some(commit)) => {
+            format!("{}-edge+{}", env!("CARGO_PKG_VERSION"), &commit[..7])
+        }
+        _ => env!("CARGO_PKG_VERSION").to_string(),
+    };
+
+    // The first two lines keep their earlier text and position; the contract
+    // line follows them, then the commit of a packaged build.
     let output = output_success(cli().arg("version"));
     let stdout = stdout_string(&output);
+    let mut expected = vec![
+        format!("omnigraph {version}"),
+        format!("internal-schema {WRITES} (serves v{LOWEST} to v{WRITES})"),
+        format!("http-contract {HTTP_API_CONTRACT}"),
+    ];
+    expected.extend(commit.map(|commit| format!("commit {commit}")));
+    assert_eq!(stdout.lines().collect::<Vec<_>>(), expected);
 
+    // `--version` prints the first line alone.
+    let output = output_success(cli().arg("--version"));
+    assert_eq!(
+        stdout_string(&output).trim_end(),
+        format!("omnigraph {version}")
+    );
+
+    // Equality with the whole object pins the field set: a field added or
+    // renamed changes this test.
+    let output = output_success(cli().args(["version", "--json"]));
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "version": version,
+            "channel": channel,
+            "commit": commit,
+            "http_contract": HTTP_API_CONTRACT,
+            "protocols": {"studio": 1, "target": 2, "credential": 2, "access": 2},
+            "internal_schema": { "writes": WRITES, "serves": [LOWEST, WRITES] },
+        }),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn clap_exit_status_survives_closed_output() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+
+    for (args, expected, uses_stderr) in [
+        (vec!["--help"], 0, false),
+        (vec!["--version"], 0, false),
+        (vec!["query", "--help"], 0, false),
+        (vec!["--unknown-option"], 64, true),
+    ] {
+        // Close the reader before spawning, avoiding the race in `| head -n0`.
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        let writer: OwnedFd = writer.into();
+        let mut command = cli_process();
+        command.args(&args).stdin(Stdio::null());
+        if uses_stderr {
+            command.stderr(Stdio::from(writer));
+        } else {
+            command.stdout(Stdio::from(writer));
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(expected), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+    }
+}
+
+/// A failure the CLI cannot deliver keeps the exit its outcome chose: a write
+/// whose receipt meets a closed stdout may have committed, so it exits 2,
+/// never the 1 that says nothing changed; a read still exits 1.
+#[test]
+fn an_undelivered_failure_keeps_its_exit() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    let graph = graph.to_str().unwrap();
+    for (args, expected) in [
+        (
+            vec![
+                "mutate",
+                "--target",
+                graph,
+                "-e",
+                "query add() { insert Person { name: \"Undelivered\", age: 1 } }",
+                "--json",
+            ],
+            2,
+        ),
+        (vec!["snapshot", "--target", graph, "--json"], 1),
+    ] {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        let writer: OwnedFd = writer.into();
+        let output = cli_process()
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(writer))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(expected), "{args:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("could not deliver CLI diagnostic"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+/// `skills/omnigraph`, the one copy of the skill the binary embeds.
+fn source_skill_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/omnigraph")
+}
+
+/// Every file below `root` by `/`-separated path, skipping names that start
+/// with `.` as the embedding does (the export record among them).
+fn skill_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    fn walk(dir: &Path, prefix: &str, files: &mut BTreeMap<String, Vec<u8>>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            if name.starts_with('.') {
+                continue;
+            }
+            let path = format!("{prefix}{name}");
+            if entry.file_type().unwrap().is_dir() {
+                walk(&entry.path(), &format!("{path}/"), files);
+            } else {
+                files.insert(path, fs::read(entry.path()).unwrap());
+            }
+        }
+    }
+    let mut files = BTreeMap::new();
+    walk(root, "", &mut files);
+    files
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[test]
+fn skill_export_writes_the_built_in_skill_byte_for_byte() {
+    let temp = tempdir().unwrap();
+    let dir = temp.path().join("agent/skills/omnigraph");
+    let output = output_success(cli().args(["skill", "export"]).arg(&dir).arg("--json"));
+    let report = parse_stdout_json(&output);
+
+    let source = skill_tree(&source_skill_dir());
+    let exported = skill_tree(&dir);
+    let differing: Vec<&String> = source
+        .keys()
+        .chain(exported.keys())
+        .filter(|path| source.get(*path) != exported.get(*path))
+        .collect();
     assert!(
-        stdout.contains(&format!("omnigraph {}", env!("CARGO_PKG_VERSION"))),
-        "version output must include the CLI version line, got: {stdout}"
+        differing.is_empty(),
+        "exported skill differs from skills/omnigraph at {differing:?}"
+    );
+
+    assert_eq!(report["directory"], dir.display().to_string());
+    assert_eq!(report["skill"], "omnigraph");
+    assert_eq!(report["cli_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        report["http_contract"],
+        omnigraph_api_types::HTTP_API_CONTRACT
+    );
+    let skill_md = String::from_utf8(source["SKILL.md"].clone()).unwrap();
+    let version_line = format!(
+        "  version: \"{}\"",
+        report["skill_version"].as_str().unwrap()
     );
     assert!(
-        stdout.contains(&format!(
-            "internal-schema {}",
-            omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
-        )),
-        "version output must include the internal-schema line, got: {stdout}"
+        skill_md.lines().any(|line| line == version_line),
+        "skill_version {} is not SKILL.md's metadata.version",
+        report["skill_version"]
+    );
+    assert_eq!(
+        report["files"],
+        serde_json::json!(source.keys().collect::<Vec<_>>())
+    );
+    assert_eq!(report["record"], ".omnigraph-skill.json");
+    assert_eq!(report["removed"], serde_json::json!([]));
+    assert_eq!(report["kept"], serde_json::json!([]));
+
+    let record: Value =
+        serde_json::from_slice(&fs::read(dir.join(".omnigraph-skill.json")).unwrap()).unwrap();
+    assert_eq!(record["format"], 1);
+    assert_eq!(record["skill_version"], report["skill_version"]);
+    let recorded = record["files"].as_object().unwrap();
+    assert_eq!(recorded.len(), source.len());
+    for (path, bytes) in &source {
+        assert_eq!(recorded[path], sha256_hex(bytes), "{path}");
+    }
+
+    let shown = output_success(cli().args(["skill", "show"]));
+    assert_eq!(shown.stdout, source["SKILL.md"]);
+    let shown = output_success(cli().args(["skill", "show", "references/commands.md"]));
+    assert_eq!(shown.stdout, source["references/commands.md"]);
+    let missing = output_failure(cli().args(["skill", "show", "references/absent.md"]));
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("the skill has no references/absent.md"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
     );
 }
 
 #[test]
+fn skill_export_refuses_existing_files_and_force_removes_only_unchanged_recorded_files() {
+    let temp = tempdir().unwrap();
+    let dir = temp.path().join("omnigraph");
+    output_success(cli().args(["skill", "export"]).arg(&dir));
+    let skill_md = dir.join("SKILL.md");
+    fs::write(&skill_md, "edited\n").unwrap();
+
+    let refused = output_failure(cli().args(["skill", "export"]).arg(&dir));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("pass --force"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(fs::read_to_string(&skill_md).unwrap(), "edited\n");
+
+    // As if an earlier export had written files this skill no longer has:
+    // one still as written, one edited since, and (on Unix) one replaced by a
+    // symbolic link to a file outside the directory. `notes.md` was never
+    // recorded.
+    let record_path = dir.join(".omnigraph-skill.json");
+    let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    let written = b"retired reference\n";
+    fs::write(dir.join("references/retired.md"), written).unwrap();
+    fs::write(dir.join("references/edited.md"), "my notes\n").unwrap();
+    let outside = temp.path().join("outside.md");
+    fs::write(&outside, written).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, dir.join("references/linked.md")).unwrap();
+    let stale: Vec<&str> = ["references/retired.md", "references/edited.md"]
+        .into_iter()
+        .chain(cfg!(unix).then_some("references/linked.md"))
+        .collect();
+    for path in &stale {
+        record["files"][path] = serde_json::json!(sha256_hex(written));
+    }
+    fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+    fs::write(dir.join("notes.md"), "unrelated\n").unwrap();
+
+    let output = output_success(
+        cli()
+            .args(["skill", "export", "--force", "--json"])
+            .arg(&dir),
+    );
+    let report = parse_stdout_json(&output);
+    assert_eq!(
+        report["removed"],
+        serde_json::json!(["references/retired.md"])
+    );
+    let mut kept = vec![serde_json::json!({"path": "references/edited.md", "reason": "modified"})];
+    if cfg!(unix) {
+        kept.push(serde_json::json!({"path": "references/linked.md", "reason": "not_a_file"}));
+    }
+    assert_eq!(report["kept"], serde_json::json!(kept));
+    assert!(!dir.join("references/retired.md").exists());
+    assert_eq!(
+        fs::read_to_string(dir.join("references/edited.md")).unwrap(),
+        "my notes\n"
+    );
+    assert_eq!(fs::read(&outside).unwrap(), written);
+    assert_eq!(
+        fs::read_to_string(dir.join("notes.md")).unwrap(),
+        "unrelated\n"
+    );
+    assert_eq!(
+        fs::read(&skill_md).unwrap(),
+        fs::read(source_skill_dir().join("SKILL.md")).unwrap()
+    );
+    let rewritten: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    for path in &stale {
+        assert!(rewritten["files"].get(path).is_none(), "{path}");
+    }
+
+    // A record naming a path outside the directory refuses a forced export
+    // before it writes anything.
+    let mut escaping = rewritten.clone();
+    escaping["files"]["../escape.md"] = serde_json::json!(sha256_hex(written));
+    fs::write(&record_path, serde_json::to_vec(&escaping).unwrap()).unwrap();
+    fs::write(&skill_md, "edited again\n").unwrap();
+    let refused = output_failure(cli().args(["skill", "export", "--force"]).arg(&dir));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("leaves the skill directory"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(fs::read_to_string(&skill_md).unwrap(), "edited again\n");
+}
+
+#[test]
 fn help_groups_commands_by_capability() {
-    // RFC-010 Slice 2 / RFC-011 Slice B: `--help` clusters commands (declaration
-    // order in the Command enum) and explains the capability each needs in an
-    // after_help legend. Pinned lightly — the legend phrase + the cluster
-    // ordering — to avoid brittle full-text assertions on clap's help body.
+    // Help keeps the family ordering and explains the one destination selector
+    // and source-only config. Avoid a brittle snapshot of Clap's whole body.
     let output = output_success(cli().arg("--help"));
     let stdout = stdout_string(&output);
+    assert!(output.stderr.is_empty(), "{output:?}");
 
     assert!(
-        stdout.contains("COMMANDS BY CAPABILITY"),
-        "capability legend (after_help) missing from --help:\n{stdout}"
+        stdout.contains("--target <NAME|ADDRESS>")
+            && stdout.contains("defaults.target")
+            && stdout
+                .contains("Select resources with --target and account operations with --profile")
+            && !stdout.contains("--auth")
+            && stdout.contains("--operator-config selects one operator file")
+            && stdout.contains("--config supplies deployment sources")
+            && stdout.contains(
+                "First time using Omnigraph: call the omnigraph skill (`omnigraph skill show`) before a schema or query."
+            ),
+        "target/capability guidance missing from --help:\n{stdout}"
     );
 
     // Match command names in the Commands list, not words in descriptions or
@@ -69,6 +382,15 @@ fn help_groups_commands_by_capability() {
         pos("optimize") < pos("cluster"),
         "direct commands should be listed before the control command"
     );
+
+    // Help must exit before target lookup or deployment input validation.
+    let output =
+        output_success(cli().args(["cluster", "apply", "--target", "unconfigured", "--help"]));
+    assert!(
+        stdout_string(&output).contains("Usage: omnigraph cluster apply"),
+        "{output:?}"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
 }
 
 #[test]
@@ -139,15 +461,21 @@ fn schema_show_preserves_plain_source_and_json_contract() {
     init_graph(&graph);
     let source = fs::read_to_string(fixture("test.pg")).unwrap();
 
-    let plain = output_success(cli().args(["schema", "show"]).arg(&graph));
+    let plain = output_success(cli().args(["schema", "show"]).arg("--target").arg(&graph));
     assert_eq!(stdout_string(&plain).trim_end(), source.trim_end());
-    let json = output_success(cli().args(["schema", "show", "--json"]).arg(&graph));
+    let json = output_success(
+        cli()
+            .args(["schema", "show", "--json"])
+            .arg("--target")
+            .arg(&graph),
+    );
     let payload: Value = serde_json::from_slice(&json.stdout).unwrap();
     assert_eq!(
         payload,
         serde_json::json!({
             "schema_source": source,
-            "system_columns": { "id": "__id", "src": "__src", "dst": "__dst" }
+            "system_columns": { "id": "__id", "src": "__src", "dst": "__dst" },
+            "catalogue_source": omnigraph_compiler::catalogue_declarations()
         })
     );
 }
@@ -172,6 +500,7 @@ fn schema_plan_json_reports_supported_additive_change() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
+            .arg("--target")
             .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -186,30 +515,25 @@ fn schema_plan_json_reports_supported_additive_change() {
 
 #[test]
 fn schema_plan_with_server_flag_errors_wrong_plane() {
+    let temp = tempdir().unwrap();
     let server = support::managed_http::IntentApiFixture::graph(Vec::new());
     for command in ["plan", "apply"] {
-        let output = output_failure(
-            cli()
-                .args(["schema", command, "--schema"])
-                .arg(fixture("test.pg"))
-                .args(["--server", &server.origin]),
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains(&format!(
-                "`schema {command}` is a direct (storage-native) command"
-            )),
-            "schema {command} wrong-capability message not found; got: {stderr}"
-        );
-        if command == "apply" {
-            assert!(stderr.contains("cluster apply --server"), "{stderr}");
-        } else {
-            assert!(stderr.contains("Pass a storage URI."), "{stderr}");
+        for schema in [fixture("test.pg"), temp.path().join("missing.pg")] {
+            let output = output_failure(
+                cli()
+                    .args(["schema", command, "--schema"])
+                    .arg(&schema)
+                    .args(["--target"])
+                    .fixture_target(&server.origin),
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("not available for this target kind and scope"),
+                "{stderr}"
+            );
+            assert!(output.stdout.is_empty());
+            assert!(server.requests().is_empty());
         }
-        assert!(
-            server.requests().is_empty(),
-            "refuse before discovery or dispatch"
-        );
     }
     server.assert_complete();
 }
@@ -233,6 +557,7 @@ fn schema_plan_json_reports_unsupported_type_change() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
+            .arg("--target")
             .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -257,7 +582,7 @@ fn schema_apply_json_applies_supported_migration() {
     let read = |source: &str| {
         parse_stdout_json(&output_success(
             cli()
-                .args(["query", "people", "-e", source, "--json", "--store"])
+                .args(["query", "people", "-e", source, "--json", "--target"])
                 .arg(&graph),
         ))
     };
@@ -279,6 +604,7 @@ fn schema_apply_json_applies_supported_migration() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
+            .arg("--target")
             .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -326,6 +652,7 @@ fn schema_apply_human_reports_noop() {
             .arg("apply")
             .arg("--schema")
             .arg(&schema_path)
+            .arg("--target")
             .arg(&graph),
     );
     let stdout = stdout_string(&output);
@@ -347,6 +674,7 @@ fn schema_apply_human_reports_noop() {
         cli()
             .args(["schema", "apply", "--schema"])
             .arg(&source_only)
+            .arg("--target")
             .arg(&graph),
     ));
     assert!(stdout.contains("applied: yes"), "{stdout}");
@@ -357,6 +685,7 @@ fn schema_apply_human_reports_noop() {
         cli()
             .args(["schema", "plan", "--schema"])
             .arg(&source_only)
+            .arg("--target")
             .arg(&graph),
     ));
     assert!(plan.contains("no table migration steps"), "{plan}");
@@ -386,6 +715,7 @@ fn schema_apply_json_renames_type_and_updates_snapshot() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
+            .arg("--target")
             .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -422,6 +752,7 @@ fn schema_apply_json_renames_property_and_updates_catalog() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
+            .arg("--target")
             .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -464,6 +795,7 @@ fn schema_apply_json_adds_index_for_existing_property() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
+            .arg("--target")
             .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -504,6 +836,7 @@ fn schema_apply_rejects_unsupported_plan() {
             .arg("apply")
             .arg("--schema")
             .arg(&schema_path)
+            .arg("--target")
             .arg(&graph),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -522,7 +855,7 @@ fn schema_apply_rejects_when_non_main_branch_exists() {
             .arg("create")
             .arg("--from")
             .arg("main")
-            .arg("--uri")
+            .arg("--target")
             .arg(&graph)
             .arg("feature"),
     );
@@ -539,6 +872,7 @@ fn schema_apply_rejects_when_non_main_branch_exists() {
             .arg("apply")
             .arg("--schema")
             .arg(&schema_path)
+            .arg("--target")
             .arg(&graph),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -568,6 +902,7 @@ fn schema_apply_drop_step_has_no_mode_and_the_removed_flag_is_refused() {
                 .arg("--schema")
                 .arg(&schema_path)
                 .arg("--allow-data-loss")
+                .arg("--target")
                 .arg(&graph),
         );
         let stderr = String::from_utf8_lossy(&refused.stderr);
@@ -584,6 +919,7 @@ fn schema_apply_drop_step_has_no_mode_and_the_removed_flag_is_refused() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
+            .arg("--target")
             .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -630,6 +966,7 @@ fn schema_plan_parity_cli_and_sdk() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
+            .arg("--target")
             .arg(&graph),
     );
     let cli_payload: Value = serde_json::from_slice(&cli_output.stdout).unwrap();
@@ -695,11 +1032,13 @@ fn explicit_graph_discovery_preserves_jwt_shaped_static_catalog_and_skips_contex
             serde_json::json!({"graphs":[{"graph_id":"alpha","uri":"file:///private/alpha","state":"ready","read_available":true,"write_available":true,"action":"none"},{"graph_id":"beta","uri":"file:///private/beta","state":"blocked","read_available":false,"write_available":false,"failure":"open_failed","action":"apply_correction_or_restart"}]})
         };
         let server = IntentApiFixture::graph(vec![IntentReply::json(200, reply.clone())]);
+        let operator = KeyedServer::new(&server.origin);
         let mut command = cli();
         command
             .current_dir(directory.path())
-            .env("OMNIGRAPH_BEARER_TOKEN", &token)
-            .args(["graphs", "list", "--server", &server.origin]);
+            .envs(operator.env(&token))
+            .args(["graphs", "list", "--target"])
+            .fixture_target(&server.origin);
         if json_output {
             command.arg("--json");
         }
@@ -733,203 +1072,359 @@ fn explicit_graph_discovery_preserves_jwt_shaped_static_catalog_and_skips_contex
 }
 
 #[test]
-fn init_with_store_flag_errors_instead_of_ignoring_it() {
-    // `init` takes its target as a required positional URI and never reads
-    // `--store`; passing both must be a loud guard error, not a silently
-    // ignored second address (PR #377 review follow-up).
+fn init_rejects_two_explicit_destinations() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
-    let schema = fixture("test.pg");
     let output = output_failure(
         cli()
-            .arg("init")
-            .arg("--schema")
-            .arg(&schema)
-            .arg("--store")
-            .arg("file:///elsewhere/graph.omni")
+            .args(["init", "--schema"])
+            .arg(fixture("test.pg"))
+            .args(["--target", "file:///elsewhere/graph.omni"])
             .arg(&graph),
     );
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
-        stderr.contains("`init` is a direct (storage-native) command")
-            && stderr.contains("--store")
-            && stderr.contains("does not apply"),
-        "expected the addressing-guard store rejection on init; got:\n{stderr}"
+        String::from_utf8_lossy(&output.stderr)
+            .contains("init URI and --target are mutually exclusive")
     );
-    assert!(
-        !graph.exists(),
-        "init must not run when the addressing is rejected"
-    );
+    assert!(!graph.exists());
 }
 
 #[test]
-fn init_with_profile_flag_errors_instead_of_ignoring_it() {
-    // `init` never resolves a scope, so an explicit `--profile` (which may
-    // carry a store binding) would be silently discarded — the same
-    // two-address ambiguity as `init --store` (PR #377 review follow-up).
-    // The ambient $OMNIGRAPH_PROFILE default remains ignored, matching the
-    // explicit-flag-vs-config-default rule on the registry path.
+fn init_rejects_managed_profile_selection() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
-    let schema = fixture("test.pg");
     let output = output_failure(
         cli()
-            .arg("init")
-            .arg("--schema")
-            .arg(&schema)
-            .arg("--profile")
-            .arg("localdev")
+            .args(["init", "--schema"])
+            .arg(fixture("test.pg"))
+            .args(["--profile", "localdev"])
             .arg(&graph),
     );
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
     assert!(
-        stderr.contains("`init` is a direct (storage-native) command")
-            && stderr.contains("--profile")
-            && stderr.contains("does not apply"),
-        "expected the addressing-guard profile rejection on init; got:\n{stderr}"
+        String::from_utf8_lossy(&output.stderr).contains("init does not accept --profile"),
+        "{output:?}"
     );
-    assert!(
-        !graph.exists(),
-        "init must not run when the addressing is rejected"
-    );
+    assert!(!graph.exists());
 }
 
 #[test]
-fn graphs_list_rejects_store_scope() {
-    // `graphs list` is a served-registry command: it enumerates a server's
-    // graphs, so a `--store` (local) address can never apply. The addressing
-    // guard rejects it up front instead of failing late in the client with an
-    // engine-limitation message.
-    let output = output_failure(
-        cli()
-            .arg("graphs")
-            .arg("list")
-            .arg("--store")
-            .arg("/tmp/local"),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+fn graphs_list_rejects_direct_storage() {
+    let output = output_failure(cli().args(["graphs", "list", "--target", "/tmp/local"]));
     assert!(
-        stderr.contains("`graphs list` is a served command")
-            && stderr
-                .contains("--store addresses a single graph's storage directly and does not apply")
-            && stderr.contains("Address the server with --server <name|url> or --profile <name>."),
-        "expected the addressing-guard store rejection in stderr; got:\n{stderr}"
+        String::from_utf8_lossy(&output.stderr)
+            .contains("not available for this target kind and scope")
     );
 }
 
 #[test]
 fn graphs_list_rejects_graph_selector() {
-    // `graphs list` IS the enumeration — selecting a graph is meaningless, and
-    // historically `--graph` corrupted the URL to `/graphs/<id>/graphs` (404).
-    // The guard rejects it before any network I/O.
-    let output = output_failure(
-        cli()
-            .arg("graphs")
-            .arg("list")
-            .arg("--server")
-            .arg("http://127.0.0.1:9")
-            .arg("--graph")
-            .arg("atlas"),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let output = output_failure(cli().args([
+        "graphs",
+        "list",
+        "--target",
+        "http://127.0.0.1:9",
+        "--graph",
+        "atlas",
+    ]));
     assert!(
-        stderr.contains("`graphs list` is a served command")
-            && stderr.contains(
-                "--graph selects a graph within a server or cluster scope and does not apply"
-            )
-            && stderr.contains("Address the server with --server <name|url> or --profile <name>."),
-        "expected the addressing-guard graph rejection in stderr; got:\n{stderr}"
+        String::from_utf8_lossy(&output.stderr).contains("graphs list does not accept --graph")
     );
 }
 
-/// Operator home for the graphs-list registry-resolution tests: a store-bound
-/// and a cluster-bound profile, neither of which can carry a served-registry
-/// command.
-fn registry_profile_home() -> tempfile::TempDir {
+#[test]
+fn graphs_list_requires_a_target_and_rejects_legacy_ambient_selection() {
+    for (profile, expected) in [("", "target_required"), ("prod", "target_required")] {
+        let output = output_failure(
+            cli()
+                .env("OMNIGRAPH_PROFILE", profile)
+                .args(["graphs", "list"]),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{output:?}"
+        );
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn graphs_list_rejects_named_direct_targets() {
     let home = tempfile::tempdir().unwrap();
-    std::fs::write(
-        home.path().join("config.yaml"),
-        "servers:\n  prod:\n    url: https://graph.example.com\n\
-         clusters:\n  brain:\n    root: s3://acme/clusters/brain\n\
-         profiles:\n\
-         \x20 localdev:\n    store: file:///data/dev.omni\n\
-         \x20 brain-admin:\n    cluster: brain\n",
-    )
-    .unwrap();
-    home
-}
-
-#[test]
-fn graphs_list_without_scope_needs_server() {
-    // No addressing and no operator defaults: the served-registry resolver
-    // asks for a server scope — not the graph-shaped "no graph addressed"
-    // advice, which points at flags graphs list cannot consume.
-    let output = output_failure(cli().arg("graphs").arg("list"));
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        stderr.contains("`graphs list` needs a server scope")
-            && stderr.contains("--server <name|url> or --profile <name>"),
-        "expected the needs-a-server-scope error in stderr; got:\n{stderr}"
-    );
-}
-
-#[test]
-fn graphs_list_rejects_store_bound_profile() {
-    // A store-bound profile resolves a single graph's storage; the registry
-    // is server-scoped, so resolution fails with scope-shaped advice instead
-    // of the late embedded-arm engine-limitation message.
-    let home = registry_profile_home();
-    let output = output_failure(
-        cli()
-            .env("OMNIGRAPH_HOME", home.path())
-            .arg("graphs")
-            .arg("list")
-            .arg("--profile")
-            .arg("localdev"),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        stderr.contains("requires a server")
-            && stderr.contains("profile 'localdev' resolves a store scope"),
-        "expected the served store-scope rejection in stderr; got:\n{stderr}"
-    );
-}
-
-#[test]
-fn graphs_list_rejects_cluster_bound_profile() {
-    // A cluster-bound profile is control-plane addressing; the rejection
-    // points at `cluster status` for cluster-graph enumeration instead of the
-    // misleading graph-data-command error.
-    let home = registry_profile_home();
-    let output = output_failure(
-        cli()
-            .env("OMNIGRAPH_HOME", home.path())
-            .arg("graphs")
-            .arg("list")
-            .arg("--profile")
-            .arg("brain-admin"),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        stderr.contains("requires a server")
-            && stderr.contains("profile 'brain-admin' resolves a cluster scope")
-            && stderr.contains("cluster status"),
-        "expected the served cluster-scope rejection in stderr; got:\n{stderr}"
-    );
+    fs::write(home.path().join("config.yaml"), "version: 1\ntargets:\n  graph:\n    kind: direct\n    scope: graph\n    uri: file:///data/dev.omni\n  root:\n    kind: direct\n    scope: root\n    uri: file:///data/root\n").unwrap();
+    for target in ["graph", "root"] {
+        let output = output_failure(
+            cli()
+                .env("OMNIGRAPH_HOME", home.path())
+                .args(["graphs", "list", "--target", target]),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("not available for this target kind and scope"),
+            "{output:?}"
+        );
+    }
 }
 
 #[test]
 fn graphs_list_rejects_as_actor() {
-    // The registry read carries no actor; `--as` is for direct-engine and
-    // actor-bound cluster operations. Rejected loudly instead of silently
-    // ignored.
-    let output = output_failure(cli().arg("graphs").arg("list").arg("--as").arg("act-op"));
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        stderr.contains("`graphs list` is a served command")
-            && stderr.contains(
-                "--as sets the actor for a direct-engine or actor-bound cluster operation and does not apply"
-            ),
-        "expected the addressing-guard --as rejection in stderr; got:\n{stderr}"
+    let output = output_failure(cli().args(["graphs", "list", "--as", "act-op"]));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("graphs list does not accept --as"));
+}
+
+#[test]
+fn operator_config_selection_validation_and_inspection_are_offline() {
+    let home = tempfile::tempdir().unwrap();
+    let selected = tempfile::tempdir().unwrap();
+    let trap = crate::support::managed_http::IntentApiFixture::new(vec![]);
+    // Explicit file selection replaces the home file; it does not merge it.
+    fs::write(home.path().join("config.yaml"), "invalid: [").unwrap();
+    let config = selected.path().join("operator.yaml");
+    fs::write(
+        &config,
+        format!(
+            r#"version: 1
+profiles:
+  account:
+    api: {}
+    organization_id: account-one
+    auth:
+      provider: token
+      source: {{env: CLI_TEST_ABSENT_TOKEN}}
+  other:
+    api: https://other.example.test
+    organization_id: account-two
+    auth: {{provider: omnigraph}}
+targets:
+  cluster:
+    kind: managed
+    profile: account
+    cluster_id: cluster-one
+    cluster_incarnation: inc-one
+    default_graph: knowledge
+defaults:
+  profile: other
+  target: cluster
+"#,
+            trap.origin
+        ),
+    )
+    .unwrap();
+    let before = fs::read(&config).unwrap();
+    let invoke = |args: &[&str]| {
+        let mut command = cli();
+        command
+            .env("OMNIGRAPH_HOME", home.path())
+            .env_remove("CLI_TEST_ABSENT_TOKEN")
+            .arg("--operator-config")
+            .arg(&config)
+            .args(args);
+        command
+    };
+    let valid = parse_stdout_json(&output_success(&mut invoke(&[
+        "config", "validate", "--json",
+    ])));
+    assert_eq!(valid, serde_json::json!({"valid": true, "version": 1}));
+    let inspected = parse_stdout_json(&output_success(&mut invoke(&[
+        "target",
+        "inspect",
+        "cluster",
+        "--resolved",
+        "--json",
+    ])));
+    assert_eq!(inspected["target"]["profile"], "account");
+    assert_eq!(inspected["profile"]["organization_id"], "account-one");
+    assert_eq!(inspected["identity"]["status"], "unknown");
+    let credential = parse_stdout_json(&output_success(&mut invoke(&[
+        "credentials",
+        "status",
+        "--profile",
+        "account",
+        "--json",
+    ])));
+    assert_eq!(credential["availability"], "absent");
+    assert_eq!(credential["profile"], "account");
+    assert_eq!(credential["owner"]["kind"], "profile");
+    for args in [
+        vec!["cluster", "list", "--target", "cluster"],
+        vec!["branch", "list", "--profile", "account"],
+        vec![
+            "cluster",
+            "list",
+            "--profile",
+            "account",
+            "--target",
+            "cluster",
+        ],
+        vec!["config", "validate", "--auth", "automation"],
+        vec![
+            "credentials",
+            "status",
+            "--profile",
+            "account",
+            "--auth",
+            "automation",
+        ],
+        vec!["credentials", "status", "--auth", "automation"],
+        vec![
+            "branch",
+            "list",
+            "--target",
+            "cluster",
+            "--profile",
+            "other",
+        ],
+        vec![
+            "branch",
+            "list",
+            "--target",
+            "cluster",
+            "--auth",
+            "automation",
+        ],
+        vec![
+            "cluster",
+            "status",
+            "--target",
+            "cluster",
+            "--profile",
+            "other",
+        ],
+        vec!["login", "--profile", "account", "--auth", "automation"],
+        vec![
+            "config",
+            "rename-auth",
+            "automation",
+            "renamed",
+            "--profile",
+            "account",
+        ],
+    ] {
+        output_failure(&mut invoke(&args));
+    }
+    for selector in ["--profile", "--operator-config", "--target"] {
+        let output = output_failure(
+            cli()
+                .env("OMNIGRAPH_HOME", home.path())
+                .args([selector, "one", "cluster", "status", selector, "two"]),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("cannot be used multiple times"),
+            "{output:?}"
+        );
+    }
+    for args in [
+        vec!["cluster", "list", "--connection", "account"],
+        vec!["query", "--target", "cluster", "--auth", "old", "-e", "q"],
+        vec!["config", "rename-auth", "server", "old", "first", "second"],
+        vec!["config", "rename-connection", "account", "renamed"],
+    ] {
+        let output = output_failure(&mut invoke(&args));
+        assert_eq!(output.status.code(), Some(64), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+    }
+    assert_eq!(fs::read(&config).unwrap(), before);
+    assert!(trap.requests().is_empty());
+    trap.assert_complete();
+}
+
+#[test]
+fn operator_config_clean_slate_refuses_legacy_and_ambiguous_documents() {
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("operator.yaml");
+    for source in [
+        "version: 1\nconnections: {}\n",
+        "version: 1\ndefaults: {connection: old}\n",
+        "version: 1\nprofiles:\n  old: {api: https://example.test, organization_id: org, auth: {human: {provider: omnigraph}}}\n",
+        "version: 1\nprofiles:\n  old: {api: https://example.test, organization_id: org, default_auth: human, auth: {provider: omnigraph}}\n",
+        "version: 1\nprofiles:\n  account: {api: https://example.test, organization_id: org, auth: {provider: omnigraph}}\ntargets:\n  old: {kind: managed, connection: account, cluster_id: cluster, cluster_incarnation: one}\n",
+        "version: 1\nprofiles:\n  account: {api: https://example.test, organization_id: org, auth: {provider: omnigraph}}\ntargets:\n  old: {kind: managed, profile: account, auth: human, cluster_id: cluster, cluster_incarnation: one}\n",
+        "target_config_version: 1\ntargets: {}\n",
+        "version: 2\n",
+        "version: 1\nversion: 1\n",
+        "version: 1\noperator: {actor: act-old}\n",
+        "version: 1\nservers: {}\n",
+        "version: 1\nunknown: value\n",
+        "version: 1\n---\nversion: 1\n",
+        "version: 1\ntargets:\n  old: {kind: server, endpoint: https://example.test, credential: old}\n",
+        "version: 1\ntargets:\n  old: {kind: server, endpoint: https://example.test, auth: anonymous}\n",
+        "version: 1\ntargets:\n  old: {kind: server, endpoint: https://example.test, auth: {named: {provider: anonymous}}}\n",
+        "version: 1\ntargets:\n  old: {kind: server, endpoint: https://example.test, auth: {provider: anonymous}, default_auth: named}\n",
+        "version: 1\nconnections:\n  old: {api: http://127.0.0.1:9, organization_id: org, auth: {token: {provider: token, source: {env: UNUSED}}}}\n",
+        "version: 1\ntargets:\n  old: {kind: server, endpoint: http://127.0.0.1:9, auth: {token: {provider: token, source: {env: UNUSED}}}}\n",
+    ] {
+        fs::write(&config, source).unwrap();
+        let before = fs::read(&config).unwrap();
+        output_failure(
+            cli()
+                .env("OMNIGRAPH_HOME", home.path())
+                .arg("--operator-config")
+                .arg(&config)
+                .args(["config", "validate", "--json"]),
+        );
+        assert_eq!(fs::read(&config).unwrap(), before);
+        assert!(!home.path().join("credentials").exists());
+    }
+    // Selecting a missing explicit file cannot fall back to a valid home file.
+    fs::write(home.path().join("config.yaml"), "version: 1\n").unwrap();
+    output_failure(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .arg("--operator-config")
+            .arg(home.path().join("missing.yaml"))
+            .args(["config", "validate"]),
     );
+}
+
+#[test]
+fn server_target_uses_one_auth_source_without_fallback() {
+    let home = tempfile::tempdir().unwrap();
+    let server = crate::support::managed_http::IntentApiFixture::graph(vec![]);
+    let config = home.path().join("config.yaml");
+    fs::write(
+        &config,
+        format!(
+            r#"version: 1
+targets:
+  server:
+    kind: server
+    endpoint: {}
+    auth:
+      provider: token
+      source: {{env: CLI_TEST_SELECTED_TOKEN}}
+"#,
+            server.origin
+        ),
+    )
+    .unwrap();
+    let before = fs::read(&config).unwrap();
+    // The sole configured source cannot fall back to the retired keyed or
+    // unkeyed token variables when it is absent.
+    output_failure(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .env_remove("CLI_TEST_SELECTED_TOKEN")
+            .env("OMNIGRAPH_TOKEN_SERVER", "must-not-be-used")
+            .env("OMNIGRAPH_BEARER_TOKEN", "must-not-be-used")
+            .args([
+                "--target",
+                "server",
+                "--graph",
+                "knowledge",
+                "branch",
+                "list",
+            ]),
+    );
+    let status = parse_stdout_json(&output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .env("CLI_TEST_SELECTED_TOKEN", "present-but-not-read")
+            .args(["credentials", "status", "--target", "server", "--json"]),
+    ));
+    assert_eq!(status["availability"], "present");
+    assert_eq!(status["server_validity"], "unverified");
+    assert_eq!(fs::read(&config).unwrap(), before);
+    assert!(server.requests().is_empty());
+    server.assert_complete();
 }

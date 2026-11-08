@@ -1,0 +1,210 @@
+# issue: none
+# notes: Every mapping, kind, cell and endpoint refusal names what it refuses and leaves the
+# notes: graph as it was: an undeclared column, a `columns` count that differs from the source,
+# notes: a list or Vector property mapped from CSV, a malformed integer, an empty field for a
+# notes: non-nullable property, an endpoint column on a node file, an edge file without its
+# notes: `to` column, and an edge to a node that does not exist.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    id: I64 @key
+    name: String
+    small: F32?
+    wide: F64?
+    tags: [String]?
+    v: Vector(2)?
+}
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"id":1,"name":"alice"}}
+
+--- csv undeclared.csv
+id,name,nickname
+2,bob,bobby
+
+--- mutate
+load csv "undeclared.csv" into node:Person mode append header
+
+--- expect error: column `nickname` is not a declared property of node:Person
+
+--- csv two_columns.csv
+2,bob
+
+--- csv three_columns.csv
+2,bob,x
+
+--- mutate
+load csv "three_columns.csv" into node:Person mode append columns (id, name)
+
+--- expect error: `columns` names 2 columns, the source holds 3
+
+--- mutate
+load csv "three_columns.csv" into node:Person mode append columns (id, name, tags)
+
+--- expect error: property 'tags' is a list; CSV defines no encoding for it
+
+--- mutate
+load csv "three_columns.csv" into node:Person mode append columns (id, name, v)
+
+--- expect error: property 'v' is a Vector; CSV defines no encoding for it
+
+--- csv not_a_number.csv
+id,name
+x,bob
+
+--- mutate
+load csv "not_a_number.csv" into node:Person mode append header
+
+--- expect error: load csv into node:Person
+
+--- csv empty_name.csv
+id,name
+2,
+
+--- mutate
+load csv "empty_name.csv" into node:Person mode append header
+
+--- expect error: record 1 has an empty field for non-nullable property 'name'
+
+--- mutate
+load csv "two_columns.csv" into node:Person mode append columns (from, name)
+
+--- expect error: column `from` names an endpoint, and node:Person is a node type
+
+--- csv one_column.csv
+1
+
+--- mutate
+load csv "one_column.csv" into edge:Knows mode append columns (from)
+
+--- expect error: an edge file names its `to` endpoint column
+
+--- csv dangling.csv
+1,99
+
+--- mutate
+load csv "dangling.csv" into edge:Knows mode append columns (from, to)
+
+--- expect error: 99
+
+--- csv small_0.csv
+id,name,small
+2,bob,NaN
+
+--- mutate
+load csv "small_0.csv" into node:Person mode overwrite header
+
+--- expect error: expected finite Float32
+
+--- csv small_1.csv
+id,name,small
+2,bob,inf
+
+--- mutate
+load csv "small_1.csv" into node:Person mode overwrite header
+
+--- expect error: expected finite Float32
+
+--- csv small_2.csv
+id,name,small
+2,bob,-inf
+
+--- mutate
+load csv "small_2.csv" into node:Person mode overwrite header
+
+--- expect error: expected finite Float32
+
+--- csv small_3.csv
+id,name,small
+2,bob,1e100
+
+--- mutate
+load csv "small_3.csv" into node:Person mode overwrite header
+
+--- expect error: expected finite Float32
+
+--- csv wide_0.csv
+id,name,wide
+2,bob,NaN
+
+--- mutate
+load csv "wide_0.csv" into node:Person mode overwrite header
+
+--- expect error: expected finite Float64
+
+--- csv wide_1.csv
+id,name,wide
+2,bob,inf
+
+--- mutate
+load csv "wide_1.csv" into node:Person mode overwrite header
+
+--- expect error: expected finite Float64
+
+--- csv wide_2.csv
+id,name,wide
+2,bob,-inf
+
+--- mutate
+load csv "wide_2.csv" into node:Person mode overwrite header
+
+--- expect error: expected finite Float64
+
+--- csv wide_3.csv
+id,name,wide
+2,bob,1e400
+
+--- mutate
+load csv "wide_3.csv" into node:Person mode overwrite header
+
+--- expect error: expected finite Float64
+
+--- query
+query unchanged() {
+    match { $p: Person }
+    return { $p.id, $p.name }
+}
+
+--- expect unordered
+{"p.id": 1, "p.name": "alice"}
+
+--- expect shape
+p.id: I64
+p.name: String
+
+--- csv finite_bounds.csv
+id,name,small,wide
+2,max,3.4028234663852886e38,1.7976931348623157e308
+3,min,-3.4028234663852886e38,-1.7976931348623157e308
+4,nulls,,
+
+--- mutate
+load csv "finite_bounds.csv" into node:Person mode overwrite header
+
+--- expect ok
+
+--- query
+query finite_bounds_and_nulls() {
+    match { $p: Person }
+    return { $p.id, $p.small, $p.wide }
+}
+
+--- expect unordered
+{"p.id": 2, "p.small": 3.4028235e38, "p.wide": 1.7976931348623157e308}
+{"p.id": 3, "p.small": -3.4028235e38, "p.wide": -1.7976931348623157e308}
+{"p.id": 4}
+
+--- expect shape
+p.id: I64
+p.small: F32?
+p.wide: F64?

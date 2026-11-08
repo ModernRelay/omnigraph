@@ -6,8 +6,10 @@
 #![recursion_limit = "512"]
 
 mod aggregation;
+mod anti_join_cost;
 mod branch_control_cost;
 mod branching;
+mod catalogue;
 mod changes;
 mod changes_cost;
 mod checkpoint_retention_cost;

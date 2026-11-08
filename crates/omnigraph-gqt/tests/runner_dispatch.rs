@@ -1,6 +1,39 @@
 use std::path::Path;
 use std::process::Command;
 
+/// A case cannot assert its own file-admission failure.
+#[test]
+fn csv_missing_fixture_is_refused_before_execution() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runner/csv_missing_fixture.gqt");
+    let text = std::fs::read_to_string(fixture).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("csv_missing_fixture.gqt");
+    for extra in ["", "--- csv unrelated.csv\nname\nalice\n"] {
+        std::fs::write(
+            &path,
+            text.replace("--- mutate", &format!("{extra}--- mutate")),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+            .arg(&path)
+            .arg("--artifacts")
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "accepted a missing CSV fixture");
+        let summary = report(&output).1;
+        assert_eq!(summary["code"], "invalid_case", "{summary}");
+        assert!(
+            summary["result"]["Err"]
+                .as_str()
+                .unwrap()
+                .contains("names no `--- csv people.csv` section"),
+            "{summary}"
+        );
+    }
+}
+
 #[test]
 fn refuses_unknown_or_unobserved_faults() {
     let expected = if cfg!(tokio_unstable) {
@@ -581,7 +614,15 @@ fn external_store_admission_refuses_before_workers() {
                 "target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]",
             ),
             Some(uri.as_str()),
-            "--store requires direct engine",
+            "--store root is not a directory",
+        ),
+        (
+            text.replace(
+                "target: omnigraph-engine\n    storage: local-filesystem",
+                "target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]",
+            ),
+            Some("s3://bucket/untouched"),
+            "--store takes a file:// root",
         ),
         (
             text.clone(),
@@ -723,6 +764,37 @@ fn server_target_admission_refuses_before_workers() {
             "{expected}: a worker ran"
         );
     }
+    let csv_case = dir.path().join("served_csv.gqt");
+    let served_text = std::fs::read_to_string(&served).unwrap();
+    for (fixture, expected) in [
+        (
+            "--- csv people.csv\nid\n1\n",
+            "`--- csv` fixtures (engine execution only)",
+        ),
+        ("", "load csv source without an absolute URI"),
+    ] {
+        std::fs::write(
+            &csv_case,
+            format!(
+                "{served_text}\n{fixture}\n--- mutate\nload csv \"people.csv\" into node:Person mode append header\n--- expect ok\n"
+            ),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+            .arg(&csv_case)
+            .args(["--server", "http://127.0.0.1:1", "--graph", "default"])
+            .arg("--artifacts")
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{expected}: {stderr}");
+        assert!(
+            report(&output).1["attempts"].as_array().unwrap().is_empty(),
+            "{expected}: a worker ran"
+        );
+    }
     let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
         .arg(&served)
         .args(["--target", "omnigraph-engine"])
@@ -841,7 +913,7 @@ fn external_store_missing_root_is_not_initialized() {
 }
 
 #[test]
-fn external_store_selects_direct_execution_from_a_mixed_case() {
+fn external_store_runs_every_selected_environment_of_a_mixed_case() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("graph");
     let uri = format!("file://{}", root.display());
@@ -864,20 +936,210 @@ fn external_store_selects_direct_execution_from_a_mixed_case() {
         }
         let output = command.output().unwrap();
         let (_, summary) = report(&output);
-        assert_eq!(
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !selected && !cfg!(tokio_unstable) {
+            assert!(!output.status.success());
+            assert!(
+                stderr.contains("DST runner is unavailable in this build"),
+                "{stderr}"
+            );
+            continue;
+        }
+        assert!(output.status.success(), "{stderr}");
+        let attempts = summary["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), if selected { 1 } else { 3 }, "{summary}");
+        assert_eq!(summary["scope"], if selected { "partial" } else { "full" });
+        assert!(
+            attempts
+                .iter()
+                .all(|attempt| attempt["input"]["store"] == uri),
+            "{summary}"
+        );
+    }
+}
+
+#[cfg(tokio_unstable)]
+#[test]
+fn prepared_store_under_dst_runs_a_concurrent_block_and_leaves_the_root_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("file://{}/graph", dir.path().display());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let db = omnigraph::db::Omnigraph::init(&uri, "node Person { name: String @key }")
+            .await
+            .unwrap();
+        omnigraph::Session::from_defaults(std::sync::Arc::new(db), Default::default())
+            .load_jsonl(
+                "{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}",
+                omnigraph::loader::LoadMode::Overwrite,
+            )
+            .await
+            .unwrap();
+    });
+    let path = dir.path().join("prepared.gqt");
+    std::fs::write(
+        &path,
+        "# issue: none\n--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n\n--- concurrent\nw1: query add_bob() { insert Person { name: \"bob\" } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1 park put __manifest/_versions/, r1 start, w1 put __manifest/_versions/, w1, r1\n--- expect\nw1: ok\nr1: ok\n\n--- query\nquery all() { match { $p: Person } return { $p.name } }\n--- expect unordered\n{\"p.name\":\"alice\"}\n{\"p.name\":\"bob\"}\n--- expect shape\np.name: String\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(&path)
+        .args(["--store", &uri, "--measure"])
+        .arg("--artifacts")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (saved, summary) = report(&output);
+    assert_eq!(summary["attempts"][0]["input"]["store"], uri);
+    let observations = summary["attempts"][0]["outcome"]["Ok"]["observations"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        observations
+            .iter()
+            .filter(|event| {
+                event.as_str().is_some_and(|text| {
+                    text.starts_with("prepared store: ")
+                        && text.ends_with("read through below the ledger")
+                })
+            })
+            .count(),
+        1,
+        "one trace line per attempt: {observations:?}"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("GQT measure:"));
+    let replay = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg("--replay")
+        .arg(saved)
+        .output()
+        .unwrap();
+    assert!(
+        !replay.status.success(),
+        "a prepared root is not frozen by the report"
+    );
+    assert!(
+        String::from_utf8_lossy(&replay.stderr)
+            .contains("external-store invocations cannot replay")
+    );
+    assert!(report(&replay).1["attempts"].as_array().unwrap().is_empty());
+    runtime.block_on(async {
+        let db = omnigraph::db::Omnigraph::open(&uri).await.unwrap();
+        let session =
+            omnigraph::Session::from_defaults(std::sync::Arc::new(db), Default::default());
+        let rows = session
+            .query(
+                omnigraph::db::ReadTarget::branch("main"),
+                "query all() { match { $p: Person } return { $p.name } }",
+                "all",
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.num_rows(), 1, "the prepared root must not change");
+    });
+}
+
+#[cfg(tokio_unstable)]
+#[test]
+fn prepared_store_under_dst_runs_seams_on_the_view_ignores_foreign_files_and_refuses_symlinks() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("graph");
+    let uri = format!("file://{}", root.display());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let db = omnigraph::db::Omnigraph::init(&uri, "node Person { name: String @key }")
+            .await
+            .unwrap();
+        omnigraph::Session::from_defaults(std::sync::Arc::new(db), Default::default())
+            .load_jsonl(
+                "{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}",
+                omnigraph::loader::LoadMode::Overwrite,
+            )
+            .await
+            .unwrap();
+    });
+    let header = "# issue: none\n--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n\n";
+    let retried = format!(
+        "{header}--- seam\nat: publish.load_state\noccurrence: 1\naction: contention\nscope: next_step\n\n--- mutate\nquery add_bob() {{ insert Person {{ name: \"bob\" }} }}\n--- expect affected: nodes=1 edges=0\n\n--- query\nquery all() {{ match {{ $p: Person }} return {{ $p.name }} }}\n--- expect unordered\n{{\"p.name\":\"alice\"}}\n{{\"p.name\":\"bob\"}}\n--- expect shape\np.name: String\n"
+    );
+    let windowed = format!(
+        "{header}--- seam\nat: mutation.post_table_commit\noccurrence: 1\naction: fail\nscope: next_step\n\n--- mutate\nquery add_bob() {{ insert Person {{ name: \"bob\" }} }}\n--- expect error: injected failpoint triggered: mutation.post_table_commit\n\n--- query\nquery all() {{ match {{ $p: Person }} return {{ $p.name }} }}\n--- expect unordered\n{{\"p.name\":\"alice\"}}\n--- expect shape\np.name: String\n"
+    );
+    let run = |name: &str, text: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, text).unwrap();
+        Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+            .arg(&path)
+            .args(["--store", &uri])
+            .arg("--artifacts")
+            .arg(dir.path())
+            .output()
+            .unwrap()
+    };
+    for (name, text) in [
+        ("copy_retried.gqt", &retried),
+        ("copy_windowed.gqt", &windowed),
+    ] {
+        let output = run(name, text);
+        assert!(
             output.status.success(),
-            selected,
-            "{}",
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let (_, summary) = report(&output);
+        let observations = summary["attempts"][0]["outcome"]["Ok"]["observations"].clone();
+        assert!(
+            observations.as_array().unwrap().iter().any(|event| event
+                .as_str()
+                .is_some_and(|t| t.starts_with("prepared store: "))),
+            "{name}: {observations:?}"
+        );
+    }
+    for foreign in [".stray", "notes.txt"] {
+        std::fs::write(root.join(foreign), b"not an engine object").unwrap();
+        let output = run("copy_windowed.gqt", &windowed);
+        assert!(
+            output.status.success(),
+            "{foreign}: a foreign file the engine never reads is the directory's business: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(
-            summary["attempts"].as_array().unwrap().len(),
-            usize::from(selected)
+            std::fs::read(root.join(foreign)).unwrap(),
+            b"not an engine object"
         );
-        if selected {
-            assert_eq!(summary["scope"], "partial");
-        }
+        std::fs::remove_file(root.join(foreign)).unwrap();
     }
+    std::os::unix::fs::symlink(".", root.join("loop")).unwrap();
+    let output = run("copy_windowed.gqt", &windowed);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success());
+    assert!(text.contains("prepared store holds a symlink"), "{text}");
+    std::fs::remove_file(root.join("loop")).unwrap();
+    runtime.block_on(async {
+        let db = omnigraph::db::Omnigraph::open(&uri).await.unwrap();
+        let session =
+            omnigraph::Session::from_defaults(std::sync::Arc::new(db), Default::default());
+        let rows = session
+            .query(
+                omnigraph::db::ReadTarget::branch("main"),
+                "query all() { match { $p: Person } return { $p.name } }",
+                "all",
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.num_rows(), 1, "the prepared root must not change");
+    });
 }
 
 #[test]
@@ -1366,8 +1628,11 @@ fn measure_counts_schema_contract_requests_issue_817() {
     // first write, and Lance's detached commit loads the base's indexes. Behind
     // a strict insert's inline transaction the index section lies outside the
     // tail block the open read, and Lance opens the manifest again without the
-    // size it already learned: that HEAD is the one read a step may repeat.
-    let repeated_manifest_heads = |step: u64| -> u64 {
+    // size it already learned: that HEAD is one read a step may repeat. The
+    // other is the catalog freshness probe's HEAD of the held `__manifest`
+    // version, which a write makes when it captures its branch and again when
+    // it revalidates that capture.
+    let repeated_heads = |step: u64, class: &str| -> u64 {
         let group = measurements
             .iter()
             .find(|group| group["slot"] == "step" && group["step"] == step)
@@ -1377,7 +1642,7 @@ fn measure_counts_schema_contract_requests_issue_817() {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|request| request["class"] == "table_meta" && request["verb"] == "head")
+            .filter(|request| request["class"] == class && request["verb"] == "head")
             .filter(|request| !seen.insert(request["path"].as_str().unwrap().to_string()))
             .count() as u64
     };
@@ -1389,14 +1654,20 @@ fn measure_counts_schema_contract_requests_issue_817() {
         );
         assert_eq!(
             counts["repeat_reads"],
-            repeated_manifest_heads(step),
+            repeated_heads(step, "table_meta") + repeated_heads(step, "manifest_meta"),
             "step {step}: neither the inline contract nor table data repeats a read, \
-             except the reopen of an indexed table's manifest"
+             except the reopen of an indexed table's manifest and the freshness \
+             probe's HEAD of the held `__manifest` version"
         );
     }
     assert_eq!(
-        repeated_manifest_heads(2),
+        repeated_heads(2, "table_meta"),
         1,
         "the second insert reopens the first insert's manifest for its index section"
+    );
+    assert_eq!(
+        repeated_heads(3, "manifest_meta"),
+        0,
+        "a read probes its branch's freshness once"
     );
 }

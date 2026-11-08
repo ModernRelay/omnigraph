@@ -156,6 +156,7 @@ pub fn validate_aggregate_specs(plan: &PhysicalPlan) -> Result<(), PlanError> {
                             func: AggFunc::Count,
                             arg,
                             signature,
+                            ..
                         } => {
                             matches!((arg.as_ref(), &signature.arg),
                                 (IRExpr::Variable(binding, _), ExprType::Node { type_name })

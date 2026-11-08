@@ -4,12 +4,16 @@ use super::{
 
 impl QueryIR {
     /// The read representation accepted by the frozen reference executor.
+    /// Neither `distinct` is carried: the frozen format predates both, and GQT
+    /// refuses `--- expect same as v1` on a `return distinct` or a
+    /// `count(distinct …)` step.
     pub fn erase(&self) -> untyped::QueryIR {
         let Self {
             name,
             params,
             pipeline,
             return_exprs,
+            distinct: _,
             order_by,
             limit,
         } = self;
@@ -196,6 +200,7 @@ impl IRExpr {
             Self::Literal(literal, _) => untyped::IRExpr::Literal(literal.clone()),
             Self::Aggregate {
                 func,
+                distinct: _,
                 arg,
                 signature: _,
             } => untyped::IRExpr::Aggregate {
@@ -408,6 +413,7 @@ mod tests {
             cases.push((
                 IRExpr::Aggregate {
                     func,
+                    distinct: false,
                     arg: Box::new(IRExpr::PropAccess {
                         variable: "document".into(),
                         property: "amount".into(),
@@ -465,7 +471,7 @@ mod tests {
                 PropType::scalar(ScalarType::String, false),
             ),
             (
-                Literal::Integer(i64::MIN),
+                Literal::Integer(i128::from(i64::MIN)),
                 PropType::scalar(ScalarType::I64, false),
             ),
             (
@@ -648,6 +654,7 @@ mod tests {
                         )),
                     },
                 ],
+                distinct: false,
                 order_by: vec![
                     IROrdering {
                         expr: IRExpr::AliasRef(

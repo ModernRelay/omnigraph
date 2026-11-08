@@ -27,6 +27,11 @@
 //!   [`OmniError::MergeConflicts`] error), and
 //! * the affected graph state on `main` after a successful merge.
 //!
+//! Before the merge, every cell runs `branch_merge_dry_run` on the same
+//! inputs (RFC 0030 §8.4): it must report the merge's own outcome or conflict
+//! list while writing nothing to the object store and leaving `main` where it
+//! was.
+//!
 //! `branch_merge(source, target)` is directional: target acts as the merge
 //! base anchor while source's diff is replayed. The matrix already
 //! enumerates both `(L, R)` and `(R, L)` as independent cells (e.g.
@@ -862,19 +867,41 @@ async fn run_direction(
     apply(&db, "feature", left_op).await;
     apply(&db, "main", right_op).await;
 
-    let merge_result = db.branch_merge("feature", "main").await;
-    let outcome = match merge_result.map(|result| result.outcome) {
-        Ok(MergeOutcome::AlreadyUpToDate) => ActualOutcome::AlreadyUpToDate,
-        Ok(MergeOutcome::FastForward) => ActualOutcome::FastForward,
-        Ok(MergeOutcome::Merged) => ActualOutcome::Merged,
-        Err(OmniError::MergeConflicts(conflicts)) => ActualOutcome::Conflicts(
-            conflicts
-                .into_iter()
-                .map(|c| (c.type_key, c.kind, c.entity_id))
-                .collect(),
-        ),
-        Err(other) => panic!("[{label}] unexpected merge error: {other:?}"),
-    };
+    let main_before = helpers::snapshot_id(&db, "main").await.unwrap();
+    let (dry_run, dry_io) =
+        helpers::cost::measure(db.branch_merge_dry_run("feature", "main")).await;
+    if let Ok(result) = &dry_run {
+        assert!(
+            result.commit.is_none(),
+            "[{label}] a dry run returned a commit"
+        );
+    }
+    let dry_outcome = actual_outcome(label, dry_run.map(|result| result.outcome));
+    assert_eq!(
+        (dry_io.manifest_writes, dry_io.data_writes),
+        (0, 0),
+        "[{label}] a dry run wrote to the object store: {dry_io:?}"
+    );
+    assert_eq!(
+        helpers::snapshot_id(&db, "main").await.unwrap(),
+        main_before,
+        "[{label}] a dry run moved main"
+    );
+
+    let (merge_result, merge_io) = helpers::cost::measure(db.branch_merge("feature", "main")).await;
+    let outcome = actual_outcome(label, merge_result.map(|result| result.outcome));
+    assert!(
+        dry_outcome == outcome,
+        "[{label}] the dry run answered {dry_outcome:?}, the merge {outcome:?}"
+    );
+    if matches!(outcome, ActualOutcome::FastForward | ActualOutcome::Merged) {
+        // The counter the dry run is held to zero on sees a real merge's
+        // publication, so a zero above is evidence and not a dead probe.
+        assert!(
+            merge_io.manifest_writes > 0,
+            "[{label}] the merge published without a counted __manifest write: {merge_io:?}"
+        );
+    }
 
     if let Expected::Merged(assert) | Expected::FastForward(assert) = expected
         && matches!(
@@ -899,6 +926,21 @@ async fn run_direction(
     DirectionResult {
         cell: label.to_string(),
         outcome,
+    }
+}
+
+fn actual_outcome(label: &str, result: Result<MergeOutcome, OmniError>) -> ActualOutcome {
+    match result {
+        Ok(MergeOutcome::AlreadyUpToDate) => ActualOutcome::AlreadyUpToDate,
+        Ok(MergeOutcome::FastForward) => ActualOutcome::FastForward,
+        Ok(MergeOutcome::Merged) => ActualOutcome::Merged,
+        Err(OmniError::MergeConflicts(conflicts)) => ActualOutcome::Conflicts(
+            conflicts
+                .into_iter()
+                .map(|c| (c.type_key, c.kind, c.entity_id))
+                .collect(),
+        ),
+        Err(other) => panic!("[{label}] unexpected merge error: {other:?}"),
     }
 }
 

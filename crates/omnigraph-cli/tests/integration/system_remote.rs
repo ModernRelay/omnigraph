@@ -4,7 +4,7 @@ use serde_json::json;
 
 use crate::support::*;
 
-/// Graph id every served test addresses (`--server <url> --graph GRAPH_ID`).
+/// Graph id every served test addresses (`--target <url> --graph GRAPH_ID`).
 /// RFC-011: the server is cluster-only, so a graph selector is always required
 /// — even for a single-graph cluster.
 const GRAPH_ID: &str = "knowledge";
@@ -87,13 +87,17 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(health["status"], "ok");
 
     let local_snapshot = parse_stdout_json(&output_success(
-        cli().arg("snapshot").arg(&served_root).arg("--json"),
+        cli()
+            .arg("snapshot")
+            .arg("--target")
+            .arg(&served_root)
+            .arg("--json"),
     ));
     let snapshot = parse_stdout_json(&output_success(
         cli()
             .arg("snapshot")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--json"),
@@ -104,7 +108,7 @@ query insert_person($name: String, $age: I32) {
     let local_read = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--store")
+            .arg("--target")
             .arg(&served_root)
             .arg("--query")
             .arg(fixture("test.gq"))
@@ -116,8 +120,8 @@ query insert_person($name: String, $age: I32) {
     let read_payload = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -140,8 +144,8 @@ query insert_person($name: String, $age: I32) {
     let change_payload = parse_stdout_json(&output_success(
         cli()
             .arg("mutate")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -179,7 +183,7 @@ query insert_person($name: String, $age: I32) {
     let local_verify = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--store")
+            .arg("--target")
             .arg(&served_root)
             .arg("--query")
             .arg(fixture("test.gq"))
@@ -191,14 +195,14 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(local_verify["row_count"], 1);
     assert_eq!(local_verify["rows"][0]["p.name"], "Mina");
 
-    // CLI inline source over the HTTP transport (--server). Confirms inline
+    // CLI inline source over the HTTP transport (--target). Confirms inline
     // source survives the remote-execution path identically to file-based
     // queries.
     let inline_remote_read = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("-e")
@@ -213,8 +217,8 @@ query insert_person($name: String, $age: I32) {
     let inline_remote_change = parse_stdout_json(&output_success(
         cli()
             .arg("mutate")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query-string")
@@ -264,7 +268,9 @@ fn assert_cluster_schema_apply_refused(server: &TestServer, schema: &std::path::
     let read = |arguments: &[&str]| {
         parse_stdout_json(&output_success(
             cli()
-                .args(["--server", &server.base_url, "--graph", GRAPH_ID])
+                .args(["--target"])
+                .fixture_target(&server.base_url)
+                .args(["--graph", GRAPH_ID])
                 .args(arguments)
                 .arg("--json"),
         ))
@@ -288,23 +294,21 @@ fn assert_cluster_schema_apply_refused(server: &TestServer, schema: &std::path::
     let before = state();
     let output = output_failure(
         cli()
-            .args(["--server", &server.base_url, "--graph", GRAPH_ID])
+            .args(["--target"])
+            .fixture_target(&server.base_url)
             .args(["schema", "apply", "--schema"])
             .arg(schema)
             .arg("--json"),
     );
     let refusal = parse_stdout_json(&output);
-    assert_eq!(
-        refusal["command_outcome"]["execution"], "not_started",
-        "{refusal}"
-    );
-    assert_eq!(refusal["command_outcome"]["effects"], "none", "{refusal}");
+    assert_eq!(refusal["disposition"]["effects"], "none", "{refusal}");
+    assert_eq!(refusal["disposition"]["effects"], "none", "{refusal}");
     assert!(refusal.get("http_status").is_none(), "{refusal}");
     assert!(
         refusal["error"]
             .as_str()
             .unwrap()
-            .contains("`schema apply` is a direct (storage-native) command"),
+            .contains("schema apply is not available for this target kind and scope"),
         "{refusal}"
     );
     assert_eq!(
@@ -359,8 +363,8 @@ fn remote_schema_apply_refuses_branched_cluster_backed_graph() {
         cli()
             .arg("branch")
             .arg("create")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--from")
@@ -404,8 +408,8 @@ query ordered_person($name: String) {
     let json_payload = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -426,8 +430,8 @@ query ordered_person($name: String) {
     let csv = stdout_string(&output_success(
         cli()
             .arg("query")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -463,8 +467,8 @@ query insert_person($name: String, $age: I32) {
         cli()
             .arg("branch")
             .arg("list")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--json"),
@@ -475,8 +479,8 @@ query insert_person($name: String, $age: I32) {
         cli()
             .arg("branch")
             .arg("create")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--from")
@@ -491,8 +495,8 @@ query insert_person($name: String, $age: I32) {
         cli()
             .arg("branch")
             .arg("list")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--json"),
@@ -502,8 +506,8 @@ query insert_person($name: String, $age: I32) {
     let changed = parse_stdout_json(&output_success(
         cli()
             .arg("mutate")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -521,8 +525,8 @@ query insert_person($name: String, $age: I32) {
         cli()
             .arg("branch")
             .arg("merge")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("feature")
@@ -537,8 +541,8 @@ query insert_person($name: String, $age: I32) {
     let verify = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -629,17 +633,11 @@ fn assert_merge_delivery_loss_never_replays_committed_effect(statement: bool) {
             vec!["branch".into(), "merge".into(), source.clone()]
         };
         args.extend(
-            [
-                "--server",
-                proxy.origin.as_str(),
-                "--graph",
-                GRAPH_ID,
-                "--json",
-            ]
-            .map(String::from),
+            ["--target", KEYED_SERVER_NAME, "--graph", GRAPH_ID, "--json"].map(String::from),
         );
         let output = if matches!(fault, MergeDeliveryFault::CallerWait) {
             let mut caller = cli_process()
+                .env("OMNIGRAPH_HOME", tls_gateway::anonymous_home(&proxy.origin))
                 .args(&args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -664,14 +662,20 @@ fn assert_merge_delivery_loss_never_replays_committed_effect(statement: bool) {
             caller.kill().unwrap();
             caller.wait_with_output().unwrap()
         } else {
-            output_failure(cli().args(&args).timeout(Duration::from_secs(15)))
+            output_failure(
+                cli()
+                    .env("OMNIGRAPH_HOME", tls_gateway::anonymous_home(&proxy.origin))
+                    .args(&args)
+                    .timeout(Duration::from_secs(15)),
+            )
         };
         assert!(
             !output.status.success(),
             "{statement}/{fault:?}: lost delivery must not report success"
         );
         if !matches!(fault, MergeDeliveryFault::CallerWait) {
-            assert_eq!(output.status.code(), Some(1), "{statement}/{fault:?}");
+            // A lost delivery leaves effects unknown.
+            assert_eq!(output.status.code(), Some(2), "{statement}/{fault:?}");
         }
         if !output.stdout.is_empty() {
             let error = parse_stdout_json(&output);
@@ -683,9 +687,12 @@ fn assert_merge_delivery_loss_never_replays_committed_effect(statement: bool) {
                 error.get("commit").is_none(),
                 "lost delivery is not success"
             );
-            assert!(
-                error.get("outcome").is_none(),
-                "lost delivery is not success"
+            // A merge's success body names its merge `outcome`; a failure's
+            // `disposition` is the whole command's, and a lost delivery's
+            // effects are unknown.
+            assert_eq!(
+                error["disposition"]["effects"], "unknown",
+                "lost delivery is not success: {error}"
             );
         }
 
@@ -765,6 +772,220 @@ fn assert_merge_delivery_loss_never_replays_committed_effect(statement: bool) {
     }
 }
 
+/// Dedicated commit controls have the same uncertain outcome as a mutation
+/// when delivery fails after the server applies the operation. The real graph
+/// and the proxy's request census establish the effect without retrying it.
+#[test]
+fn remote_commit_delivery_loss_never_replays_committed_effect() {
+    use crate::support::managed_http::{IntentApiFixture, MergeDeliveryFault};
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let cluster = converged_loaded_cluster(GRAPH_ID, None);
+    let server = spawn_server_with_cluster(cluster.path());
+    let client = graph_http_client();
+    let graph_url = format!("{}/graphs/{GRAPH_ID}", server.base_url);
+    let get_json = |path: &str| {
+        client
+            .get(format!("{graph_url}/{path}"))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<serde_json::Value>()
+            .unwrap()
+    };
+
+    for operation in ["publish", "drop"] {
+        for (index, fault) in [
+            MergeDeliveryFault::Disconnect,
+            MergeDeliveryFault::Truncate,
+            MergeDeliveryFault::GatewayTimeout,
+            MergeDeliveryFault::CallerWait,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Drop answers 204, so there is no response body to truncate.
+            if operation == "drop" && matches!(fault, MergeDeliveryFault::Truncate) {
+                continue;
+            }
+            let marker = format!("Commit-{operation}-{index}");
+            let before = get_json("commits?branch=main");
+            let proposal = client
+                .post(format!("{graph_url}/mutate"))
+                .json(&json!({
+                    "query": "query propose($name: String) as commit { insert Person { name: $name, age: 33 } }",
+                    "params": {"name": marker}
+                }))
+                .send()
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json::<serde_json::Value>()
+                .unwrap()["commit"]
+                .clone();
+            assert_eq!(proposal["published"], false);
+            let commit_id = proposal["graph_commit_id"].as_str().unwrap();
+            assert_eq!(get_json("commits?branch=main"), before);
+            assert_eq!(get_json(&format!("commits/{commit_id}")), proposal);
+
+            let proxy = IntentApiFixture::graph_merge_proxy(&server.base_url, fault);
+            let args = [
+                "commit",
+                operation,
+                commit_id,
+                "--target",
+                KEYED_SERVER_NAME,
+                "--graph",
+                GRAPH_ID,
+                "--json",
+                "--yes",
+            ];
+            let output = if matches!(fault, MergeDeliveryFault::CallerWait) {
+                let mut caller = cli_process()
+                    .env("OMNIGRAPH_HOME", tls_gateway::anonymous_home(&proxy.origin))
+                    .args(args)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while proxy.forwarded_responses().is_empty()
+                    && caller.try_wait().unwrap().is_none()
+                    && Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let completed = !proxy.forwarded_responses().is_empty();
+                let waiting = caller.try_wait().unwrap().is_none();
+                // Reap the process before assertions, including a failed barrier.
+                if waiting {
+                    caller.kill().unwrap();
+                }
+                let output = caller.wait_with_output().unwrap();
+                assert!(
+                    completed && waiting,
+                    "{operation}/{fault:?}: abandon only after completion while the proxy withholds the response"
+                );
+                output
+            } else {
+                output_failure(
+                    cli()
+                        .env("OMNIGRAPH_HOME", tls_gateway::anonymous_home(&proxy.origin))
+                        .args(args)
+                        .timeout(Duration::from_secs(15)),
+                )
+            };
+            assert!(!output.status.success(), "{operation}/{fault:?}");
+            if !matches!(fault, MergeDeliveryFault::CallerWait) {
+                // A lost delivery leaves effects unknown.
+                assert_eq!(output.status.code(), Some(2), "{operation}/{fault:?}");
+                let error = parse_stdout_json(&output);
+                assert!(
+                    error.get("error").is_some(),
+                    "{operation}/{fault:?}: {error}"
+                );
+                assert_eq!(
+                    error["disposition"],
+                    json!({"effects":"unknown", "action":"reconcile"}),
+                    "{operation}/{fault:?}"
+                );
+                assert!(
+                    error.get("graph_commit_id").is_none(),
+                    "lost delivery is not success"
+                );
+            }
+
+            let captured = proxy.forwarded_responses();
+            assert_eq!(captured.len(), 1, "{operation}/{fault:?}");
+            let after = get_json("commits?branch=main");
+            if operation == "publish" {
+                assert_eq!(captured[0].status, 200);
+                let receipt: serde_json::Value = serde_json::from_slice(&captured[0].body).unwrap();
+                assert_eq!(receipt["graph_commit_id"], commit_id);
+                assert_eq!(receipt["published"], true);
+                assert_eq!(
+                    receipt["parent_commit_id"],
+                    before["commits"][0]["graph_commit_id"]
+                );
+                assert_eq!(get_json(&format!("commits/{commit_id}")), receipt);
+                assert_eq!(after["commits"][0], receipt);
+                assert_eq!(
+                    after["commits"].as_array().unwrap().len(),
+                    before["commits"].as_array().unwrap().len() + 1
+                );
+            } else {
+                assert_eq!(captured[0].status, 204);
+                assert!(captured[0].body.is_empty());
+                assert_eq!(
+                    after, before,
+                    "dropping a proposal preserves published history"
+                );
+                assert_eq!(
+                    client
+                        .get(format!("{graph_url}/commits/{commit_id}"))
+                        .send()
+                        .unwrap()
+                        .status(),
+                    reqwest::StatusCode::NOT_FOUND
+                );
+            }
+            assert_eq!(
+                get_json("commits?branch=main&listing=unpublished")["commits"],
+                json!([])
+            );
+            let rows = client
+                .post(format!("{graph_url}/query"))
+                .json(&json!({
+                    "query": "query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }",
+                    "params": {"name": marker}
+                }))
+                .send()
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json::<serde_json::Value>()
+                .unwrap();
+            assert_eq!(
+                rows["rows"],
+                if operation == "publish" {
+                    json!([{"p.name": marker, "p.age": 33}])
+                } else {
+                    json!([])
+                }
+            );
+
+            proxy.assert_complete();
+            let requests = proxy.requests();
+            assert_eq!(
+                requests.len(),
+                2,
+                "discovery and exactly one commit control, without replay"
+            );
+            assert_eq!(requests[0].method, "HEAD");
+            assert_eq!(requests[0].path, "/healthz");
+            assert_eq!(
+                requests[1].method,
+                if operation == "publish" {
+                    "POST"
+                } else {
+                    "DELETE"
+                }
+            );
+            assert_eq!(
+                requests[1].path,
+                if operation == "publish" {
+                    format!("/graphs/{GRAPH_ID}/commits/{commit_id}/publish")
+                } else {
+                    format!("/graphs/{GRAPH_ID}/commits/{commit_id}")
+                }
+            );
+            assert!(requests[1].raw_body.is_empty());
+        }
+    }
+}
+
 /// A Blob put or clear whose successful receipt is lost in delivery is
 /// published once and never resent: the CLI reports the failure, the server
 /// holds exactly the receipt the proxy saw, and the proxy saw one submission.
@@ -823,6 +1044,7 @@ fn remote_blob_write_delivery_loss_never_replays_committed_effect() {
             }
             let before = commits();
             let proxy = IntentApiFixture::graph_blob_write_proxy(&server.base_url, fault);
+            let operator = KeyedServer::new(&proxy.origin);
             let mut args: Vec<std::ffi::OsString> = ["blob", if put { "put" } else { "clear" }]
                 .into_iter()
                 .chain(["node", "Document", "readme", "content"])
@@ -833,8 +1055,8 @@ fn remote_blob_write_delivery_loss_never_replays_committed_effect() {
             }
             args.extend(
                 [
-                    "--server",
-                    proxy.origin.as_str(),
+                    "--target",
+                    KEYED_SERVER_NAME,
                     "--graph",
                     PARITY_GRAPH_ID,
                     "--json",
@@ -846,7 +1068,7 @@ fn remote_blob_write_delivery_loss_never_replays_committed_effect() {
             // and is abandoned.
             let output = if matches!(fault, MergeDeliveryFault::CallerWait) {
                 let mut caller = cli_process()
-                    .env("OMNIGRAPH_BEARER_TOKEN", PARITY_TOKEN)
+                    .envs(operator.env(PARITY_TOKEN))
                     .args(&args)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -873,7 +1095,7 @@ fn remote_blob_write_delivery_loss_never_replays_committed_effect() {
             } else {
                 output_failure(
                     cli()
-                        .env("OMNIGRAPH_BEARER_TOKEN", PARITY_TOKEN)
+                        .envs(operator.env(PARITY_TOKEN))
                         .args(&args)
                         .timeout(Duration::from_secs(15)),
                 )
@@ -883,7 +1105,8 @@ fn remote_blob_write_delivery_loss_never_replays_committed_effect() {
                 "{put}/{fault:?}: lost delivery must not report success"
             );
             if !matches!(fault, MergeDeliveryFault::CallerWait) {
-                assert_eq!(output.status.code(), Some(1), "{put}/{fault:?}");
+                // A lost delivery leaves effects unknown.
+                assert_eq!(output.status.code(), Some(2), "{put}/{fault:?}");
             }
             if !output.stdout.is_empty() {
                 let error = parse_stdout_json(&output);
@@ -1010,7 +1233,7 @@ fn remote_deployment_delivery_loss_preserves_owned_completion() {
         // 100 Continue only when admission starts polling this incomplete body;
         // no sleep or production test hook decides when deployment may proceed.
         let held = before_acceptance.then(|| {
-            let url = url::Url::parse(&server.base_url).unwrap();
+            let url = url::Url::parse(&tls_gateway::http_upstream(&server.base_url)).unwrap();
             let mut socket = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap())).unwrap();
             socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
             socket.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
@@ -1025,14 +1248,15 @@ fn remote_deployment_delivery_loss_preserves_owned_completion() {
             socket
         });
         let proxy = IntentApiFixture::graph_deployment_proxy(&server.base_url, fault);
+        let operator = KeyedServer::new(&proxy.origin);
         let mut command = cli();
         command
-            .env("OMNIGRAPH_BEARER_TOKEN", TOKEN)
+            .envs(operator.env(TOKEN))
             .args(["cluster", "apply", "--config"])
             .arg(cluster.path())
+            .args(["--target"])
+            .fixture_target(&proxy.origin)
             .args([
-                "--server",
-                &proxy.origin,
                 "--deployment-id",
                 &id,
                 "--timeout",
@@ -1125,12 +1349,10 @@ fn remote_deployment_delivery_loss_preserves_owned_completion() {
         let receipt = if times_out {
             parse_stdout_json(&output_success(
                 cli()
-                    .env("OMNIGRAPH_BEARER_TOKEN", TOKEN)
+                    .envs(operator.env(TOKEN))
+                    .args(["cluster", "status", "--target"])
+                    .fixture_target(&proxy.origin)
                     .args([
-                        "cluster",
-                        "status",
-                        "--server",
-                        &proxy.origin,
                         "--deployment-id",
                         &id,
                         "--wait",
@@ -1215,8 +1437,8 @@ fn remote_branch_delete_removes_branch() {
         cli()
             .arg("branch")
             .arg("create")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--from")
@@ -1229,8 +1451,8 @@ fn remote_branch_delete_removes_branch() {
         cli()
             .arg("branch")
             .arg("delete")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("feature")
@@ -1244,8 +1466,8 @@ fn remote_branch_delete_removes_branch() {
         cli()
             .arg("branch")
             .arg("list")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--json"),
@@ -1277,8 +1499,8 @@ query add_friend($from: String, $to: String) {
         cli()
             .arg("branch")
             .arg("create")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--from")
@@ -1289,8 +1511,8 @@ query add_friend($from: String, $to: String) {
     output_success(
         cli()
             .arg("mutate")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -1305,8 +1527,8 @@ query add_friend($from: String, $to: String) {
     output_success(
         cli()
             .arg("mutate")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -1322,8 +1544,8 @@ query add_friend($from: String, $to: String) {
     let exported = stdout_string(&output_success(
         cli()
             .arg("export")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--branch")
@@ -1347,11 +1569,16 @@ query add_friend($from: String, $to: String) {
             .arg("overwrite")
             .arg("--data")
             .arg(&export_path)
+            .arg("--target")
             .arg(&imported_graph),
     );
 
     let snapshot = parse_stdout_json(&output_success(
-        cli().arg("snapshot").arg(&imported_graph).arg("--json"),
+        cli()
+            .arg("snapshot")
+            .arg("--target")
+            .arg(&imported_graph)
+            .arg("--json"),
     ));
     assert_eq!(
         snapshot["datasets"]
@@ -1377,7 +1604,7 @@ query add_friend($from: String, $to: String) {
     let eve = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--store")
+            .arg("--target")
             .arg(&imported_graph)
             .arg("--query")
             .arg(fixture("test.gq"))
@@ -1408,8 +1635,8 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
             .arg("load")
             .arg("--mode")
             .arg("merge")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--data")
@@ -1433,8 +1660,8 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
     let feature_snapshot = parse_stdout_json(&output_success(
         cli()
             .arg("snapshot")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--branch")
@@ -1446,8 +1673,8 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
     let zoe = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -1482,8 +1709,8 @@ fn remote_load_round_trips_and_requires_from_for_new_branches() {
     let failure = output_failure(
         cli()
             .arg("load")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--mode")
@@ -1502,8 +1729,8 @@ fn remote_load_round_trips_and_requires_from_for_new_branches() {
     let payload = parse_stdout_json(&output_success(
         cli()
             .arg("load")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--mode")
@@ -1528,8 +1755,8 @@ fn remote_load_round_trips_and_requires_from_for_new_branches() {
     let snapshot = parse_stdout_json(&output_success(
         cli()
             .arg("snapshot")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--branch")
@@ -1548,8 +1775,8 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
         cli()
             .arg("branch")
             .arg("create")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--from")
@@ -1571,8 +1798,8 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
             .arg("load")
             .arg("--mode")
             .arg("merge")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--data")
@@ -1594,8 +1821,8 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
     let bob = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -1613,8 +1840,8 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
     let zoe = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -1656,25 +1883,44 @@ query insert_person($name: String, $age: I32) {
     .unwrap();
 
     // Reads are granted to the team group (bruno).
-    let snapshot = parse_stdout_json(&output_success(
-        cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "team-token")
-            .arg("snapshot")
-            .arg("--server")
-            .arg(&server.base_url)
-            .arg("--graph")
-            .arg(GRAPH_ID)
-            .arg("--json"),
-    ));
+    let main_snapshot = || {
+        parse_stdout_json(&output_success(
+            cli()
+                .envs(server.credential("team-token"))
+                .arg("snapshot")
+                .arg("--target")
+                .fixture_target(&server.base_url)
+                .arg("--graph")
+                .arg(GRAPH_ID)
+                .arg("--json"),
+        ))
+    };
+    let snapshot = main_snapshot();
     assert_eq!(snapshot["graph_branch"], "main");
+
+    // Authentication and policy refuse before admission or staging, so the CLI
+    // reports a write that never started and leaves no reconciliation to do: a
+    // credential to fix, or a policy to read again.
+    let refused_before_effects = |output: &std::process::Output, status: u16| {
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let body = parse_stdout_json(output);
+        assert_eq!(body["http_status"], status, "{body}");
+        let action = if status == 401 { "fix" } else { "refresh" };
+        assert_eq!(
+            body["disposition"],
+            serde_json::json!({"effects":"none","action":action}),
+            "{body}"
+        );
+        body
+    };
 
     // bruno cannot change protected main (team-write-unprotected only).
     let denied_main_change = output_failure(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "team-token")
+            .envs(server.credential("team-token"))
             .arg("mutate")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -1683,7 +1929,7 @@ query insert_person($name: String, $age: I32) {
             .arg(r#"{"name":"PolicyRemote","age":41}"#)
             .arg("--json"),
     );
-    let denied_main = parse_stdout_json(&denied_main_change);
+    let denied_main = refused_before_effects(&denied_main_change, 403);
     assert_eq!(denied_main["code"], "forbidden");
     let denied_main_message = denied_main["error"].as_str().unwrap();
     assert!(
@@ -1693,14 +1939,61 @@ query insert_person($name: String, $age: I32) {
         "expected change-on-main denial, got: {denied_main}"
     );
 
+    // Nor load into it.
+    let batch = temp.path().join("system-remote-policy-load.ndjson");
+    fs::write(
+        &batch,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"PolicyLoad\",\"age\":7}}\n",
+    )
+    .unwrap();
+    let denied_load = output_failure(
+        cli()
+            .envs(server.credential("team-token"))
+            .arg("load")
+            .arg("--target")
+            .fixture_target(&server.base_url)
+            .arg("--graph")
+            .arg(GRAPH_ID)
+            .arg("--data")
+            .arg(&batch)
+            .arg("--mode")
+            .arg("append")
+            .arg("--json"),
+    );
+    assert_eq!(
+        refused_before_effects(&denied_load, 403)["code"],
+        "forbidden"
+    );
+
+    // An unrecognized bearer never reaches graph resolution.
+    let unauthenticated = output_failure(
+        cli()
+            .envs(server.credential("unknown-token"))
+            .arg("mutate")
+            .arg("--target")
+            .fixture_target(&server.base_url)
+            .arg("--graph")
+            .arg(GRAPH_ID)
+            .arg("--query")
+            .arg(&mutation_file)
+            .arg("--params")
+            .arg(r#"{"name":"PolicyRemote","age":41}"#)
+            .arg("--json"),
+    );
+    assert_eq!(
+        refused_before_effects(&unauthenticated, 401)["code"],
+        "unauthorized"
+    );
+    assert_eq!(main_snapshot(), snapshot, "a refused write moved main");
+
     // bruno can create an unprotected branch.
     let created = parse_stdout_json(&output_success(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "team-token")
+            .envs(server.credential("team-token"))
             .arg("branch")
             .arg("create")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--from")
@@ -1713,10 +2006,10 @@ query insert_person($name: String, $age: I32) {
     // bruno can change the unprotected branch; actor resolves from the token.
     let changed = parse_stdout_json(&output_success(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "team-token")
+            .envs(server.credential("team-token"))
             .arg("mutate")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -1731,14 +2024,34 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(changed["affected_nodes"], 1);
     assert_eq!(changed["actor_id"], "act-bruno");
 
+    // No rule grants branch_delete; the admin merge below still finds `feature`.
+    let denied_delete = output_failure(
+        cli()
+            .envs(server.credential("team-token"))
+            .arg("branch")
+            .arg("delete")
+            .arg("--target")
+            .fixture_target(&server.base_url)
+            .arg("--graph")
+            .arg(GRAPH_ID)
+            .arg("feature")
+            .arg("--yes")
+            .arg("--json"),
+    );
+    assert_eq!(
+        refused_before_effects(&denied_delete, 403)["code"],
+        "forbidden"
+    );
+
     // bruno cannot merge into protected main (admins-promote only).
+    let before_merge = main_snapshot();
     let denied_merge = output_failure(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "team-token")
+            .envs(server.credential("team-token"))
             .arg("branch")
             .arg("merge")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("feature")
@@ -1746,23 +2059,24 @@ query insert_person($name: String, $age: I32) {
             .arg("main")
             .arg("--json"),
     );
-    let denied_merge = parse_stdout_json(&denied_merge);
+    let denied_merge = refused_before_effects(&denied_merge, 403);
     assert_eq!(denied_merge["code"], "forbidden");
     let denied_merge_message = denied_merge["error"].as_str().unwrap();
     assert!(
         denied_merge_message.contains("denied") && denied_merge_message.contains("branch_merge"),
         "expected branch_merge denial, got: {denied_merge}"
     );
+    assert_eq!(main_snapshot(), before_merge, "a refused merge moved main");
 
     // ragnor can promote into protected main, but has no branch_delete grant.
     // The compound request still exits 0 and preserves the merge's receipt.
     let merged = parse_stdout_json(&output_success(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "admin-token")
+            .envs(server.credential("admin-token"))
             .arg("branch")
             .arg("merge")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("feature")
@@ -1807,10 +2121,10 @@ query insert_person($name: String, $age: I32) {
 
     let verify = parse_stdout_json(&output_success(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "team-token")
+            .envs(server.credential("team-token"))
             .arg("query")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query")
@@ -1832,9 +2146,9 @@ query insert_person($name: String, $age: I32) {
 /// Steps:
 ///   1. Build a converged cluster serving one graph `alpha` with a
 ///      server-scoped policy granting `act-admin` the `graph_list` action.
-///   2. Spawn the server with `--cluster` + a bearer-token map.
-///   3. `omnigraph graphs list --server <url>` (admin token) — expect `alpha`.
-///   4. Addressing the server via `--server <url>` with NO `--graph` errors and
+///   2. Spawn the server with `--target` + a bearer-token map.
+///   3. `omnigraph graphs list --target <url>` (admin token) — expect `alpha`.
+///   4. Addressing the server via `--target <url>` with NO `--graph` errors and
 ///      lists the candidate graphs (RFC-011 D7).
 ///
 /// Runs real server processes over loopback in the ordinary workspace gate.
@@ -1866,11 +2180,11 @@ fn graphs_list_against_multi_graph_server() {
     // `graphs list` lists `alpha`.
     let payload = parse_stdout_json(&output_success(
         cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "admin-token")
+            .envs(server.credential("admin-token"))
             .arg("graphs")
             .arg("list")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--json"),
     ));
     let ids: Vec<&str> = payload["graphs"]
@@ -1881,14 +2195,13 @@ fn graphs_list_against_multi_graph_server() {
         .collect();
     assert_eq!(ids, vec!["alpha"]);
 
-    // RFC-011 D7: addressing the multi-graph server via `--server <url>` with no
-    // `--graph` errors and lists the candidate graphs (the resolver probes
-    // GET /graphs; the default-env token authorizes it).
+    // Target resolution requires explicit graph selection without discovering
+    // a candidate or changing the destination from the server inventory.
     let no_graph = cli()
-        .env("OMNIGRAPH_BEARER_TOKEN", "admin-token")
+        .envs(server.credential("admin-token"))
         .arg("query")
-        .arg("--server")
-        .arg(&server.base_url)
+        .arg("--target")
+        .fixture_target(&server.base_url)
         .arg("-e")
         .arg("query q { match { $p: Person { name: \"x\" } } return { $p.name } }")
         .output()
@@ -1899,8 +2212,8 @@ fn graphs_list_against_multi_graph_server() {
     );
     let stderr = String::from_utf8_lossy(&no_graph.stderr);
     assert!(
-        stderr.contains("alpha") && stderr.contains("--graph <id>"),
-        "expected a candidate-listing error naming alpha; got: {stderr}"
+        stderr.contains("graph_required") && stderr.contains("--graph ID"),
+        "expected an explicit graph selection error; got: {stderr}"
     );
 
     drop(server);
@@ -1919,8 +2232,8 @@ fn mutate_if_commit_lost_cas_exits_4_issue_365() {
     fn mutate_cmd(base_url: &str, name: &str, if_commit: Option<&str>) -> std::process::Output {
         let mut cmd = cli();
         cmd.arg("mutate")
-            .arg("--server")
-            .arg(base_url)
+            .arg("--target")
+            .fixture_target(base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("-e")
@@ -1942,8 +2255,8 @@ fn mutate_if_commit_lost_cas_exits_4_issue_365() {
     let read = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("-e")
@@ -1978,16 +2291,16 @@ fn mutate_if_commit_lost_cas_exits_4_issue_365() {
     assert_eq!(body["precondition_failure"]["expected"], json!(stale_id));
     assert_eq!(body["http_status"], 412);
     assert_eq!(
-        body["command_outcome"],
-        json!({"execution":"not_started","effects":"none","action":"refresh"})
+        body["disposition"],
+        json!({"effects":"none","action":"refresh"})
     );
 
     // An id from a fresh read passes with exit 0.
     let read = parse_stdout_json(&output_success(
         cli()
             .arg("query")
-            .arg("--server")
-            .arg(&server.base_url)
+            .arg("--target")
+            .fixture_target(&server.base_url)
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("-e")
@@ -2008,4 +2321,117 @@ fn mutate_if_commit_lost_cas_exits_4_issue_365() {
     );
 
     drop(server);
+}
+
+/// Every credential-bearing data path refuses Unix transport before connecting;
+/// the same JSON read, mutation, NDJSON load, export and Blob delivery remain
+/// exercised through the supported TLS gateway.
+#[cfg(unix)]
+#[test]
+fn remote_unix_socket_serves_query_mutate_load_export_and_blob_get_issue_979() {
+    use crate::support::unix_gateway::UnixGateway;
+
+    let temp = tempfile::tempdir().unwrap();
+    let (cluster_dir, _) = blob_parity_config(temp.path(), &temp.path().join("twin.omni"));
+    let server = spawn_server_with_cluster_env(
+        &cluster_dir,
+        &[(
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+            r#"{"act-parity":"parity-tok"}"#,
+        )],
+    );
+    let gateway = UnixGateway::new(&server.base_url);
+    // Keep the space-bearing socket fixture, but use a valid escaped URL so
+    // refusal exercises the transport rule rather than URL lexical validation.
+    let socket = gateway.url().replace(' ', "%20");
+    let socket_operator = KeyedServer::new(&socket);
+    let served = |server_url: &str, args: &[&str]| {
+        let credential = if server_url == socket {
+            socket_operator.env(PARITY_TOKEN)
+        } else {
+            server.credential(PARITY_TOKEN)
+        };
+        let mut command = cli();
+        command.envs(credential).args(args).args([
+            "--target",
+            KEYED_SERVER_NAME,
+            "--graph",
+            PARITY_GRAPH_ID,
+        ]);
+        command
+    };
+    let over_socket = |args: &[&str]| {
+        // Credential-bearing Unix routes are refused by the clean-slate grammar.
+        // Exercise every original body/stream path over the supported TLS route.
+        let refused = output_failure(&mut served(&socket, args));
+        let diagnostic = format!(
+            "{}{}",
+            stdout_string(&refused),
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert!(diagnostic.contains("HTTPS"), "{args:?}: {diagnostic}");
+        assert_eq!(gateway.connections(), 0);
+        output_success(&mut served(&server.base_url, args))
+    };
+
+    let read = [
+        "query",
+        "-e",
+        "query docs() { match { $d: Document } return { $d.title, $d.note } order { $d.title asc } }",
+        "--json",
+    ];
+    assert_eq!(
+        scrubbed_json(&over_socket(&read)),
+        scrubbed_json(&output_success(&mut served(&server.base_url, &read)))
+    );
+
+    let blob = ["blob", "get", "node", "Document", "readme", "content"];
+    assert_eq!(over_socket(&blob).stdout, BLOB_NODE_BYTES);
+
+    let mutation = parse_stdout_json(&over_socket(&[
+        "mutate",
+        "-e",
+        r#"query add($title: String) { insert Document { title: $title, note: "over a socket" } }"#,
+        "--params",
+        r#"{"title":"socket-mutate"}"#,
+        "--json",
+    ]));
+    assert_eq!(mutation["affected_nodes"], 1, "{mutation}");
+
+    let rows = temp.path().join("socket-load.jsonl");
+    fs::write(
+        &rows,
+        r#"{"type":"Document","data":{"title":"socket-load","note":"loaded over a socket"}}"#,
+    )
+    .unwrap();
+    let load = parse_stdout_json(&over_socket(&[
+        "load",
+        "--mode",
+        "merge",
+        "--data",
+        rows.to_str().unwrap(),
+        "--json",
+    ]));
+    assert_eq!(load["total_entities"], 1, "{load}");
+
+    let lines = |output: &std::process::Output| {
+        let mut lines: Vec<String> = String::from_utf8(output.stdout.clone())
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        lines.sort_unstable();
+        lines
+    };
+    let exported = lines(&over_socket(&["export"]));
+    assert_eq!(
+        exported,
+        lines(&output_success(&mut served(&server.base_url, &["export"])))
+    );
+    for title in ["socket-mutate", "socket-load"] {
+        assert!(
+            exported.iter().any(|line| line.contains(title)),
+            "{title} missing from the export"
+        );
+    }
 }

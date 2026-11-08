@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - OmniGraph maintainers
 created: 2026-09-30
-updated: 2026-10-07
+updated: 2026-10-21
 discussion: https://github.com/ModernRelay/omnigraph/pull/824
 supersedes: []
 superseded_by: []
@@ -15,6 +15,17 @@ blocked_on: []
 ---
 
 # RFC: Owned server operations
+
+> **Disposition (2026-10-21):** [Storage outcomes per operation and
+> restartable ownership](2026-10-19-storage-outcomes-and-restartable-ownership.md) narrows the containment rule in Ownership
+> and shutdown. An unknown storage outcome no longer closes admission for
+> every graph: a publication in doubt is fenced by its version key, and an
+> opaque storage or I/O failure leaves only its own mutable keys unsettled in
+> the storage scope. Such a write answers `outcome_unknown` and the server
+> keeps serving. Containment remains for a panic, a lost write owner,
+> `RecoveryRequired`, an opaque DataFusion failure and an uncertain
+> activation. On S3 a contained server's retained lock is now taken over
+> through a lease; elsewhere the exact-ID unlock remains.
 
 ## Decision
 
@@ -234,6 +245,10 @@ deployment and ledger-conversion rules remain with the
 [server runtime decision](2026-09-29-server-runtime-and-online-deployment.md).
 
 ## Decision log
+
+- 2026-10-21: Added a disposition note: [storage outcomes per operation and
+  restartable ownership](2026-10-19-storage-outcomes-and-restartable-ownership.md) scopes an unknown storage outcome to its
+  keys instead of closing admission, and leases a server's S3 lock.
 
 - 2026-10-02: Extended Ownership and shutdown to read handler execution and
   MCP tool execution after caller loss, including retained delivery slots.

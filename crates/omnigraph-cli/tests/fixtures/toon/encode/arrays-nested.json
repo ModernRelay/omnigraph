@@ -1,0 +1,120 @@
+{
+  "version": "4.0",
+  "category": "encode",
+  "description": "Nested and mixed array encoding – arrays of arrays, mixed type arrays, root arrays",
+  "tests": [
+    {
+      "name": "quotes strings containing delimiters in nested arrays",
+      "input": {
+        "pairs": [["a", "b"], ["c,d", "e:f", "true"]]
+      },
+      "expected": "pairs[2]:\n  - [2]: a,b\n  - [3]: \"c,d\",\"e:f\",\"true\"",
+      "specSection": "9.2"
+    },
+    {
+      "name": "encodes empty inner arrays",
+      "input": {
+        "pairs": [[], []]
+      },
+      "expected": "pairs[2]:\n  - [0]:\n  - [0]:",
+      "specSection": "9.2"
+    },
+    {
+      "name": "encodes root-level primitive array",
+      "input": ["x", "y", "true", true, 10],
+      "expected": "[5]: x,y,\"true\",true,10",
+      "specSection": "9.1"
+    },
+    {
+      "name": "encodes root-level array of uniform objects in tabular form",
+      "input": [{ "id": 1 }, { "id": 2 }],
+      "expected": "[2]{id}:\n  1\n  2",
+      "specSection": "9.3"
+    },
+    {
+      "name": "encodes root-level array of non-uniform objects in list form",
+      "input": [{ "id": 1 }, { "id": 2, "name": "Ada" }],
+      "expected": "[2]:\n  - id: 1\n  - id: 2\n    name: Ada",
+      "specSection": "9.4"
+    },
+    {
+      "name": "encodes root-level array mixing primitive, object, and array of objects in list form",
+      "input": ["summary", { "id": 1, "name": "Ada" }, [{ "id": 2 }, { "status": "draft" }]],
+      "expected": "[3]:\n  - summary\n  - id: 1\n    name: Ada\n  - [2]:\n    - id: 2\n    - status: draft",
+      "specSection": "9.4"
+    },
+    {
+      "name": "encodes root-level arrays of arrays",
+      "input": [[1, 2], []],
+      "expected": "[2]:\n  - [2]: 1,2\n  - [0]:",
+      "specSection": "9.2"
+    },
+    {
+      "name": "encodes empty root-level array",
+      "input": [],
+      "expected": "[]",
+      "specSection": "9.1"
+    },
+    {
+      "name": "uses list form for arrays mixing primitives and objects",
+      "input": {
+        "items": [1, { "a": 1 }, "text"]
+      },
+      "expected": "items[3]:\n  - 1\n  - a: 1\n  - text",
+      "specSection": "9.4"
+    },
+    {
+      "name": "uses list form for arrays mixing objects and arrays",
+      "input": {
+        "items": [{ "a": 1 }, [1, 2]]
+      },
+      "expected": "items[2]:\n  - a: 1\n  - [2]: 1,2",
+      "specSection": "9.4"
+    },
+    {
+      "name": "quotes hash-leading string as list item",
+      "input": {
+        "items": ["#x", { "a": 1 }]
+      },
+      "expected": "items[2]:\n  - \"#x\"\n  - a: 1",
+      "specSection": "7.2"
+    },
+    {
+      "name": "uses list form for a tabular-eligible array in list-item position",
+      "input": {
+        "a": [[{ "x": 1 }, { "x": 2 }]]
+      },
+      "expected": "a[1]:\n  - [2]:\n    - x: 1\n    - x: 2",
+      "specSection": "9.4",
+      "note": "A keyless fields-bearing header is valid only at the document root"
+    },
+    {
+      "name": "uses list form for an array of arrays in list-item position",
+      "input": [
+        [
+          [
+            1
+          ]
+        ]
+      ],
+      "expected": "[1]:\n  - [1]:\n    - [1]: 1",
+      "specSection": "9.4"
+    },
+    {
+      "name": "uses list form for an array mixing primitives and objects in list-item position",
+      "input": {
+        "a": [
+          [
+            1,
+            {
+              "x": 1
+            }
+          ],
+          2
+        ]
+      },
+      "expected": "a[2]:\n  - [2]:\n    - 1\n    - x: 1\n  - 2",
+      "specSection": "9.4"
+    }
+  ]
+}

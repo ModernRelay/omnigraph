@@ -3,8 +3,8 @@
 //! For every CLI verb with an `is_remote` fork, run the identical
 //! invocation against (a) the local graph directly and (b) a spawned
 //! server on a twin copy of the same graph. Actor-bearing operations use the
-//! SAME actor on both arms (local `--as act-parity`; remote bearer token
-//! resolving to `act-parity`); read-only Blob commands reject `--as`.
+//! SAME actor on both arms (explicit local `--as act-parity` where supported;
+//! remote bearer token resolving to `act-parity`).
 //! Scrub the declared-volatile allowlist
 //! (`support::scrub_volatile` — ids, wall-clock, transport locations);
 //! everything else must match exactly.
@@ -26,11 +26,12 @@ const KNOWN_DIVERGENCES: &[&str] = &[
 ];
 
 /// One matched setup per row: twin graphs + the parity Cedar bundle on the
-/// served arm. The local (`--store`) arm carries no policy (RFC-011); the
+/// served arm. The local (`--target`) arm carries no policy (RFC-011); the
 /// bundle is permissive for `act-parity`, so the arms still agree.
 struct Parity {
     _temp: TempDir,
     local: std::path::PathBuf,
+    local_operator_home: std::path::PathBuf,
     server: TestServer,
     blob_external_uri: Option<String>,
 }
@@ -49,9 +50,11 @@ fn parity() -> Parity {
             r#"{"act-parity":"parity-tok"}"#,
         )],
     );
+    let local_operator_home = parity_operator_home(temp.path());
     Parity {
         _temp: temp,
         local,
+        local_operator_home,
         server,
         blob_external_uri: None,
     }
@@ -68,9 +71,11 @@ fn blob_parity() -> Parity {
             r#"{"act-parity":"parity-tok"}"#,
         )],
     );
+    let local_operator_home = parity_operator_home(temp.path());
     Parity {
         _temp: temp,
         local,
+        local_operator_home,
         server,
         blob_external_uri: Some(blob_external_uri),
     }
@@ -93,7 +98,7 @@ fn blob_write_parity() -> Parity {
 
 impl Parity {
     fn run(&self, args: &[&str]) -> (std::process::Output, std::process::Output) {
-        run_both(&self.local, &self.server.base_url, args)
+        run_both(&self.local, &self.local_operator_home, &self.server, args)
     }
 }
 
@@ -222,12 +227,24 @@ fn assert_blob_stat_parity(
     local_json
 }
 
-fn normalized_blob_error(output: &std::process::Output) -> &str {
+/// A failure's message: the `error` of its JSON envelope on stdout, or the
+/// first line of its human report, before its status lines.
+fn normalized_blob_error(output: &std::process::Output) -> String {
+    if !output.stdout.is_empty() {
+        let failure = parse_stdout_json(output);
+        return failure["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("Blob failure omitted its error: {failure}"))
+            .to_string();
+    }
     let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    // The resolved destination line differs between the arms by design.
     stderr
         .lines()
-        .find_map(|line| line.trim().strip_prefix("0: "))
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("target "))
         .unwrap_or_else(|| panic!("Blob failure omitted its primary diagnostic: {stderr}"))
+        .to_string()
 }
 
 #[test]
@@ -246,11 +263,80 @@ fn parity_query() {
     assert_parity("query", &l, &r);
 }
 
+/// A ranked read reports its ranking alike on both arms: the remote arm
+/// prints the ranking it decoded from the server.
+#[test]
+fn parity_ranked_query_ranking() {
+    let p = parity();
+    let queries = p._temp.path().join("ranked.gq");
+    std::fs::write(
+        &queries,
+        "query ranked($q: String) {\n    match { $p: Person }\n    return { $p.name, bm25($p.name, $q) as relevance }\n    order { bm25($p.name, $q) }\n    limit 2\n}\n",
+    )
+    .unwrap();
+    let (l, r) = p.run(&[
+        "query",
+        "--query",
+        queries.to_str().unwrap(),
+        "ranked",
+        "--params",
+        r#"{"q":"Alice"}"#,
+        "--json",
+    ]);
+    assert_parity("ranked query", &l, &r);
+    let local: serde_json::Value = serde_json::from_slice(&l.stdout).unwrap();
+    assert_eq!(local["ranking"]["by"], "bm25", "{local}");
+    assert_eq!(
+        local["ranking"]["score_columns"],
+        serde_json::json!(["relevance"]),
+        "{local}"
+    );
+}
+
 #[test]
 fn parity_schema_show() {
+    let ca = tls_gateway::ca_path().display();
     let p = parity();
     let (l, r) = p.run(&["schema", "show", "--json"]);
     assert_parity("schema show", &l, &r);
+
+    let expected = std::fs::read_to_string(fixture("test.pg")).unwrap();
+    let (local, served) = p.run(&["schema", "show"]);
+    for (arm, output) in [("direct", local), ("served", served)] {
+        assert!(output.status.success(), "{arm}: {output:?}");
+        let source = stdout_string(&output);
+        assert_eq!(source.trim_end(), expected.trim_end(), "{arm}");
+        omnigraph_compiler::schema::parser::parse_schema(&source)
+            .unwrap_or_else(|err| panic!("{arm} schema output must re-parse: {err}"));
+    }
+
+    let home = p._temp.path().join("operator");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(
+        home.join("config.yaml"),
+        format!(
+            "version: 1\ntargets:\n  local:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_LOCAL\n    default_graph: og_catalog\n",
+            p.server.base_url
+        ),
+    )
+    .unwrap();
+    for addressing in [
+        vec!["--target", "local", "--graph", "og_catalog"],
+        vec!["--target", "local"],
+    ] {
+        let output = output_success(
+            cli()
+                .env("OMNIGRAPH_HOME", &home)
+                .env("OMNIGRAPH_TOKEN_LOCAL", "parity-tok")
+                .args(&addressing)
+                .args(["schema", "show"]),
+        );
+        let source = stdout_string(&output);
+        assert!(
+            source.contains(&omnigraph_compiler::catalogue_declarations()),
+            "{addressing:?}: {source}"
+        );
+    }
 }
 
 #[test]
@@ -265,6 +351,13 @@ fn parity_branch_list() {
     let p = parity();
     let (l, r) = p.run(&["branch", "list", "--json"]);
     assert_parity("branch list", &l, &r);
+    let (l, r) = p.run(&["branch", "list", "--detailed", "--json"]);
+    assert_parity("branch list --detailed", &l, &r);
+    assert!(
+        parse_stdout_json(&l)["details"][0]["head"]["graph_commit_id"].is_string(),
+        "{}",
+        String::from_utf8_lossy(&l.stdout)
+    );
 }
 
 #[test]
@@ -281,6 +374,77 @@ fn parity_commit_list_branch() {
     let p = parity();
     let (l, r) = p.run(&["commit", "list", "--branch", "main", "--json"]);
     assert_parity("commit list --branch", &l, &r);
+}
+
+#[test]
+fn parity_branch_create_at_a_commit() {
+    // The twins share their history, so one commit id names the same commit
+    // on both arms: the embedded arm starts the branch in the engine, the
+    // remote arm through `from_commit` on `POST /branches`.
+    let p = parity();
+    let (listed, _) = p.run(&["commit", "list", "--branch", "main", "--json"]);
+    let head = parse_stdout_json(&listed)["commits"][0]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (l, r) = p.run(&[
+        "branch",
+        "create",
+        "--from-commit",
+        &head,
+        "at-head",
+        "--json",
+    ]);
+    assert_parity("branch create at a commit", &l, &r);
+    for (arm, output) in [("local", &l), ("remote", &r)] {
+        let payload = parse_stdout_json(output);
+        assert_eq!(payload["from"], "main", "{arm}");
+        assert_eq!(payload["from_commit_id"], head, "{arm}");
+    }
+    let (l, r) = p.run(&[
+        "branch",
+        "create",
+        "--from-commit",
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "nowhere",
+        "--json",
+    ]);
+    assert_parity("branch create at an unknown commit", &l, &r);
+    assert!(!l.status.success(), "{l:?}");
+}
+
+#[test]
+fn parity_commit_list_pages() {
+    // The remote arm sends `?limit=&page_token=` while the embedded arm calls
+    // the engine's paged listing; the twins mint the same token.
+    let p = parity();
+    let (l, r) = p.run(&["commit", "list", "--limit", "1", "--json"]);
+    assert_parity("commit list --limit", &l, &r);
+    let first = parse_stdout_json(&l);
+    assert_eq!(first["commits"].as_array().unwrap().len(), 1, "{first}");
+    assert_eq!(
+        first["head_commit_id"],
+        first["commits"][0]["graph_commit_id"]
+    );
+    let token = first["next_page_token"]
+        .as_str()
+        .expect("the fixture has more than one commit")
+        .to_string();
+    let (l, r) = p.run(&["commit", "list", "--page-token", &token, "--json"]);
+    assert_parity("commit list --page-token", &l, &r);
+    let (whole, _) = p.run(&["commit", "list", "--json"]);
+    let mut paged = first["commits"].as_array().unwrap().clone();
+    paged.extend(
+        parse_stdout_json(&l)["commits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .cloned(),
+    );
+    assert_eq!(
+        serde_json::Value::Array(paged),
+        parse_stdout_json(&whole)["commits"]
+    );
 }
 
 #[test]
@@ -311,6 +475,64 @@ fn parity_mutate() {
             serde_json::Value::Null,
             "{arm} no-op mutation must not invent a commit"
         );
+    }
+
+    let (l, r) = p.run(&["branch", "create", "feature", "--json"]);
+    assert_parity("branch create for unattached writes", &l, &r);
+    let (local_root, remote_root) = p.run(&[
+        "mutate",
+        "--branch",
+        "feature",
+        "-e",
+        "query root() as unattached branch { insert Person { name: \"Root\", age: 8 } }",
+        "--json",
+    ]);
+    for (arm, root) in [("local", local_root), ("remote", remote_root)] {
+        assert!(root.status.success(), "{arm} unattached root: {root:?}");
+        let root = parse_stdout_json(&root);
+        let base = root["commit"]["graph_commit_id"].as_str().unwrap();
+        let source = format!(
+            "query child() as unattached branch on \"{base}\" {{ \
+             insert Person {{ name: \"Child\", age: 9 }} }}"
+        );
+        let run = |args: &[&str]| {
+            let mut command = cli();
+            command.args(args);
+            if arm == "local" {
+                command
+                    .env("OMNIGRAPH_HOME", &p.local_operator_home)
+                    .arg("--target")
+                    .arg(&p.local);
+                if parity_accepts_actor(args) {
+                    command.args(["--as", PARITY_ACTOR]);
+                }
+            } else {
+                command
+                    .envs(p.server.credential(PARITY_TOKEN))
+                    .arg("--target")
+                    .fixture_target(&p.server.base_url)
+                    .arg("--graph")
+                    .arg(PARITY_GRAPH_ID);
+            }
+            command.output().unwrap()
+        };
+        let refused = run(&["mutate", "--branch", "main", "-e", &source]);
+        assert!(
+            !refused.status.success(),
+            "{arm} explicit main: {refused:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("is not the recorded target"),
+            "{arm} explicit main: {refused:?}"
+        );
+        let inherited = run(&["mutate", "-e", &source, "--json"]);
+        assert!(
+            inherited.status.success(),
+            "{arm} omitted branch: {inherited:?}"
+        );
+        let inherited = parse_stdout_json(&inherited);
+        assert_eq!(inherited["branch"], "feature", "{arm} receipt target");
+        assert_eq!(inherited["affected_nodes"], 1, "{arm} child rows");
     }
 }
 
@@ -347,7 +569,33 @@ fn parity_branch_merge() {
         "--json",
     ]);
     assert_write_parity("merge source write", &l, &r);
-    let (l, r) = p.run(&["branch", "merge", " feature ", "--into", " main ", "--json"]);
+    // A name is used as written on both arms: a padded spelling of a branch
+    // is refused, never read as the branch, before any effect.
+    for args in [
+        &["branch", "merge", " feature ", "--into", " main ", "--json"][..],
+        &["branch", "merge", "feature", "--into", "main ", "--json"][..],
+        &[
+            "mutate",
+            "--branch",
+            " main",
+            "-e",
+            "query add() { insert Person { name: \"Padded\", age: 32 } }",
+            "--json",
+        ][..],
+    ] {
+        let (l, r) = p.run(args);
+        assert_parity("padded branch name", &l, &r);
+        for output in [&l, &r] {
+            // `--json` reports the error on stdout.
+            assert!(
+                !output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains("has leading or trailing whitespace"),
+                "{args:?}: {output:?}"
+            );
+        }
+    }
+    let (l, r) = p.run(&["branch", "merge", "feature", "--into", "main", "--json"]);
     assert_write_parity("branch merge own publication", &l, &r);
     for output in [&l, &r] {
         let payload = parse_stdout_json(output);
@@ -370,9 +618,9 @@ fn parity_branch_merge() {
     let (l, r) = p.run(&[
         "branch",
         "merge",
-        " feature2 ",
+        "feature2",
         "--into",
-        " main ",
+        "main",
         "--delete-branch",
         "--json",
     ]);
@@ -434,9 +682,10 @@ fn parity_branch_merge() {
         let (l, r) = p.run(&["branch", "merge", source, "--into", target]);
         for output in [&l, &r] {
             assert_eq!(output.status.code(), Some(1));
+            let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
-                String::from_utf8_lossy(&output.stderr)
-                    .contains("branch merge source and target must not be empty"),
+                stderr.contains("has leading or trailing whitespace")
+                    || stderr.contains("contains a control character"),
                 "{output:?}"
             );
         }
@@ -515,6 +764,7 @@ fn parity_verb_and_statement_agree() {
         assert_eq!(verb["name"], "via-verb", "{arm}: verb name");
         assert_eq!(stmt["outcome"]["name"], "via_stmt", "{arm}: statement name");
         assert_eq!(verb["actor_id"], stmt["actor_id"], "{arm}: create actor");
+        assert_eq!(verb["actor_id"], PARITY_ACTOR, "{arm}: create actor");
     }
 
     let (verb_l, verb_r) = p.run(&["branch", "list", "--json"]);
@@ -552,6 +802,7 @@ fn parity_verb_and_statement_agree() {
             "{arm}: nothing to merge"
         );
         assert_eq!(verb["actor_id"], stmt["actor_id"], "{arm}: merge actor");
+        assert_eq!(verb["actor_id"], PARITY_ACTOR, "{arm}: merge actor");
     }
 
     let (verb_l, verb_r) = p.run(&["branch", "delete", "via-verb", "--yes", "--json"]);
@@ -565,6 +816,7 @@ fn parity_verb_and_statement_agree() {
             "{arm}: statement delete"
         );
         assert_eq!(verb["actor_id"], stmt["actor_id"], "{arm}: delete actor");
+        assert_eq!(verb["actor_id"], PARITY_ACTOR, "{arm}: delete actor");
     }
     let (verb_l, _) = p.run(&["branch", "list", "--json"]);
     assert_eq!(
@@ -592,6 +844,20 @@ fn parity_load() {
         "--json",
     ]);
     assert_write_parity("load", &l, &r);
+    // Both arms print the load route's body: the write's actor, an explicit
+    // null base branch without `--from`, and no field the route lacks.
+    for (arm, output) in [("local", &l), ("remote", &r)] {
+        let payload = parse_stdout_json(output);
+        assert_eq!(payload["actor_id"], PARITY_ACTOR, "{arm}");
+        assert_eq!(
+            payload.get("base_branch"),
+            Some(&serde_json::Value::Null),
+            "{arm}"
+        );
+        let body: omnigraph_api_types::GraphBatchLoadOutput =
+            serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&body).unwrap(), payload, "{arm}");
+    }
 
     // Canonical load is strict graph-batch syntax, but Overwrite uses Lance's
     // replacement transaction rather than RFC-023's keyed Append/Merge adapter.
@@ -643,11 +909,10 @@ fn parity_load() {
         "--json",
     ]);
     for (arm, output) in [("local", &l), ("remote", &r)] {
-        assert_eq!(output.status.code(), Some(1), "{arm}: {output:?}");
+        assert_eq!(output.status.code(), Some(2), "{arm}: {output:?}");
         let output = parse_stdout_json(output);
-        assert_eq!(output["command_outcome"]["execution"], "unknown", "{arm}");
-        assert_eq!(output["command_outcome"]["effects"], "unknown", "{arm}");
-        assert_ne!(output["command_outcome"]["action"], "retry", "{arm}");
+        assert_eq!(output["disposition"]["effects"], "unknown", "{arm}");
+        assert_ne!(output["disposition"]["action"], "retry", "{arm}");
     }
     let (l, r) = p.run(&["branch", "list", "--json"]);
     assert_parity("compound load retained the created branch", &l, &r);
@@ -684,9 +949,11 @@ fn parity_load_embedding_diagnostics() {
             r#"{"act-parity":"parity-tok"}"#,
         )],
     );
+    let local_operator_home = parity_operator_home(temp.path());
     let p = Parity {
         _temp: temp,
         local,
+        local_operator_home,
         server,
         blob_external_uri: None,
     };
@@ -847,13 +1114,14 @@ fn assert_slow_export_and_baseline_complete(p: &Parity) {
         "--json",
     ]);
     assert_write_parity("slow export fixture", &local, &remote);
-    let expected = output_success(cli().args(["export", "--store", p.local.to_str().unwrap()]));
+    let expected = output_success(cli().args(["export", "--target", p.local.to_str().unwrap()]));
     assert!(
         expected.stdout.len() > 8 * 1024 * 1024,
         "fixture must exceed socket buffers"
     );
 
-    let address = p.server.base_url.strip_prefix("http://").unwrap();
+    let upstream = tls_gateway::http_upstream(&p.server.base_url);
+    let address = upstream.strip_prefix("http://").unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()
@@ -1189,8 +1457,12 @@ fn parity_blob_put_and_clear_share_receipts_and_refusals() {
             normalized_blob_receipt(verb, "remote", &remote),
             "{verb}: normalized receipts diverge (left=local, right=remote)"
         );
-        if verb == "blob put" {
-            assert_eq!(parse_stdout_json(&local)["actor_id"], PARITY_ACTOR);
+        for (arm, output) in [("local", &local), ("remote", &remote)] {
+            assert_eq!(
+                parse_stdout_json(output)["actor_id"],
+                PARITY_ACTOR,
+                "{verb}: {arm}"
+            );
         }
         if verb.ends_with("null cell") {
             assert!(parse_stdout_json(&local)["commit"].is_null());
@@ -1198,19 +1470,19 @@ fn parity_blob_put_and_clear_share_receipts_and_refusals() {
     }
 
     // A stale validator: the same Blob precondition detail on both arms. As
-    // for a graph-commit precondition, the served arm's verified 412 exits 4
-    // and the embedded arm, which opened storage for writing, exits 1.
+    // for a graph-commit precondition, both arms exit 4: the served arm's
+    // verified 412 and the embedded engine's own refusal both precede effects.
     let (local, remote) = p.run(&with(
         "put",
         &["--file", payload, "--if-match", "\"stale\""],
     ));
     assert_eq!(
         (local.status.code(), remote.status.code()),
-        (Some(1), Some(4))
+        (Some(4), Some(4))
     );
     let (local, remote) = (parse_stdout_json(&local), parse_stdout_json(&remote));
     for (arm, refused) in [("local", &local), ("remote", &remote)] {
-        assert_eq!(refused["code"], "conflict", "{arm}: {refused}");
+        assert_eq!(refused["code"], "precondition_failed", "{arm}: {refused}");
         assert!(
             refused.get("precondition_failure").is_none(),
             "{arm}: {refused}"
@@ -1220,7 +1492,7 @@ fn parity_blob_put_and_clear_share_receipts_and_refusals() {
             serde_json::json!({}),
             "{arm}: a null cell has no validator"
         );
-        assert_eq!(refused["command_outcome"]["action"], "refresh", "{arm}");
+        assert_eq!(refused["disposition"]["action"], "refresh", "{arm}");
     }
     assert_eq!(local["error"], remote["error"]);
 
@@ -1233,10 +1505,7 @@ fn parity_blob_put_and_clear_share_receipts_and_refusals() {
     let (local, remote) = p.run(&with("put", &["--file", oversized.to_str().unwrap()]));
     assert_eq!(local.status.code(), remote.status.code());
     assert_eq!(parse_stdout_json(&local), parse_stdout_json(&remote));
-    assert_eq!(
-        parse_stdout_json(&local)["command_outcome"]["execution"],
-        "not_started"
-    );
+    assert_eq!(parse_stdout_json(&local)["disposition"]["effects"], "none");
 }
 
 // ---- error parity: exit codes must match for shared failure cases ----
@@ -1348,6 +1617,155 @@ fn parity_commit_changes_filtered() {
         "commit", "changes", &commit_id, "--kind", "node", "--op", "insert", "--json",
     ]);
     assert_parity("commit changes filtered", &l, &r);
+}
+
+#[test]
+fn parity_diff_over_shared_history() {
+    let p = parity();
+    let commit_id = fixture_load_commit(&p);
+    let (l, _r) = p.run(&["commit", "show", &commit_id, "--json"]);
+    let parent = parse_stdout_json(&l)["parent_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // --limit 1 walks page tokens on both arms; the shared history makes the
+    // endpoints, type ids and rows byte-identical.
+    let (l, r) = p.run(&[
+        "diff", "--from", &parent, "--to", "main", "--limit", "1", "--json",
+    ]);
+    assert_parity("diff", &l, &r);
+    let (local, remote) = (parse_stdout_json(&l), parse_stdout_json(&r));
+    assert_eq!(local, remote, "diff JSON diverges unscrubbed");
+    assert_eq!(local["from_commit_id"], parent.as_str());
+    assert!(!local["changes"].as_array().unwrap().is_empty());
+    // The commit form and the two-point form from its parent agree.
+    let (commit, _) = p.run(&["commit", "changes", &commit_id, "--json"]);
+    let (between, _) = p.run(&["diff", "--from", &parent, "--to", &commit_id, "--json"]);
+    assert_eq!(
+        parse_stdout_json(&commit)["changes"],
+        parse_stdout_json(&between)["changes"]
+    );
+    // A side naming nothing is the same refusal on both arms.
+    let (l, r) = p.run(&["diff", "--from", "main", "--to", "nowhere"]);
+    assert_eq!(l.status.code(), r.status.code());
+    for output in [&l, &r] {
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("'nowhere' names no branch and no commit"),
+            "{output:?}"
+        );
+    }
+}
+
+/// Each arm writes its own commits, so commit ids differ between the arms;
+/// only those are normalized before the outputs are compared.
+fn without_commit_ids(output: &std::process::Output) -> serde_json::Value {
+    fn normalize(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map.iter_mut() {
+                    if key.ends_with("commit_id") && value.is_string() {
+                        *value = serde_json::Value::String(format!("<{key}>"));
+                    } else {
+                        normalize(value);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(normalize),
+            _ => {}
+        }
+    }
+    let mut payload = parse_stdout_json(output);
+    normalize(&mut payload);
+    if let Some(base) = payload.get_mut("merge_base") {
+        for key in ["graph_manifest_version", "created_at"] {
+            base[key] = serde_json::Value::Null;
+        }
+    }
+    payload
+}
+
+#[test]
+fn parity_branch_review() {
+    let p = parity();
+    let (l, r) = p.run(&["branch", "create", "--from", "main", "feature", "--json"]);
+    assert_parity("branch create (review setup)", &l, &r);
+    let (l, r) = p.run(&[
+        "mutate",
+        "--branch",
+        "feature",
+        "-e",
+        "query add() { insert Person { name: \"Reviewed\", age: 31 } }",
+        "--json",
+    ]);
+    assert_write_parity("review source write", &l, &r);
+    for args in [
+        &["branch", "merge-base", "feature", "--json"][..],
+        &[
+            "branch", "diff", "feature", "--into", "main", "--limit", "1", "--json",
+        ][..],
+        &["diff", "--from", "main", "--to", "feature", "--json"][..],
+        &["branch", "merge", "feature", "--dry-run", "--json"][..],
+        // The same reads as GQ statements at the query door.
+        &["query", "-e", "branch merge-base feature", "--json"][..],
+        &[
+            "query",
+            "-e",
+            "branch diff feature into main limit 1",
+            "--json",
+        ][..],
+        &["query", "-e", "branch diff main to feature", "--json"][..],
+        &["query", "-e", "branch merge feature dry run", "--json"][..],
+    ] {
+        let (l, r) = p.run(args);
+        assert!(
+            l.status.success() && r.status.success(),
+            "{args:?}: {l:?} {r:?}"
+        );
+        assert_eq!(
+            without_commit_ids(&l),
+            without_commit_ids(&r),
+            "{args:?}: JSON diverges beyond commit ids"
+        );
+    }
+    let (l, _r) = p.run(&["branch", "diff", "feature", "--json"]);
+    let review = parse_stdout_json(&l);
+    assert_eq!(review["changes"][0]["id"], "Reviewed");
+    assert_eq!(review["changes"][0]["op"], "insert");
+    assert_eq!(review["base_commit_id"], review["from_commit_id"]);
+    let (l, _r) = p.run(&["branch", "merge", "feature", "--dry-run", "--json"]);
+    let dry = parse_stdout_json(&l);
+    assert_eq!(dry["outcome"], "fast_forward");
+    assert_eq!(dry["dry_run"], true);
+    assert!(dry["commit"].is_null());
+    let (l, _r) = p.run(&["query", "-e", "branch diff feature", "--json"]);
+    let rows = parse_stdout_json(&l);
+    assert_eq!(rows["query_name"], "branch diff");
+    assert_eq!(rows["rows"][0]["id"], "Reviewed");
+    assert_eq!(rows["rows"][0]["type"], "Person");
+    assert_eq!(rows["page"]["base_commit_id"], review["base_commit_id"]);
+    let (l, r) = p.run(&["query", "-e", "branch merge feature dry run", "--json"]);
+    for output in [&l, &r] {
+        assert_eq!(
+            parse_stdout_json(output)["rows"][0]["outcome"],
+            "fast_forward"
+        );
+    }
+    // A branch read sent through `mutate` is refused as a read on both arms.
+    let (l, r) = p.run(&["mutate", "-e", "branch diff feature"]);
+    for output in [&l, &r] {
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("statement 'branch diff' is a read; use POST /query"),
+            "{output:?}"
+        );
+    }
+    // The dry run wrote nothing: the real merge still has work to do.
+    let (l, r) = p.run(&["branch", "merge", "feature", "--json"]);
+    assert_write_parity("merge after the dry run", &l, &r);
+    assert_eq!(parse_stdout_json(&l)["outcome"], "fast_forward");
 }
 
 #[test]

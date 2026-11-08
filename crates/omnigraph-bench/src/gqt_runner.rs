@@ -46,6 +46,7 @@ pub enum GqtOperationKind {
     CommitDrop,
     Settings,
     Show,
+    BranchRead,
     Restart,
     Concurrent,
 }
@@ -63,6 +64,7 @@ impl From<StepKind> for GqtOperationKind {
             StepKind::CommitDrop => Self::CommitDrop,
             StepKind::Settings => Self::Settings,
             StepKind::Show => Self::Show,
+            StepKind::BranchRead => Self::BranchRead,
             StepKind::Restart => Self::Restart,
             StepKind::Concurrent => Self::Concurrent,
         }
@@ -75,6 +77,11 @@ pub struct GqtStepObservation {
     pub occurrence: u32,
     pub kind: GqtOperationKind,
     pub elapsed_us: u64,
+    /// For a write that produced a graph commit: whether it advanced its
+    /// branch head (`true`) or stayed an unpublished `as commit` proposal
+    /// (`false`). Absent on reads and on writes that produced no commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published: Option<bool>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -197,6 +204,9 @@ struct HostState {
     ready: bool,
     settled: bool,
     merge: Option<GqtMergeEvidence>,
+    /// The `commit` record of the operation in flight, by ordinal: taken
+    /// into the step receipt when the operation finishes.
+    published: BTreeMap<usize, bool>,
 }
 impl HostState {
     fn new(local: Option<LocalInstrumentation>) -> Self {
@@ -209,6 +219,7 @@ impl HostState {
             control: None,
             steps: Vec::new(),
             occurrences: BTreeMap::new(),
+            published: BTreeMap::new(),
             prefix_reads: 0,
             assertions: 0,
             following: 0,
@@ -312,11 +323,13 @@ impl<S: MeasurementSignals + Send> BenchHost<'_, S> {
             *n += 1;
             *n
         };
+        let published = state.published.remove(&ordinal);
         state.steps.push(GqtStepObservation {
             ordinal,
             occurrence,
             kind: self.kinds[&ordinal].into(),
             elapsed_us: elapsed,
+            published,
         });
         if ordinal == self.selected {
             state.elapsed = Some(elapsed);
@@ -397,17 +410,30 @@ impl<S: MeasurementSignals + Send> ExecutionHost for BenchHost<'_, S> {
         self.state.lock().unwrap().current = value()["ordinal"].as_u64().unwrap_or(0) as usize;
     }
     fn record(&self, kind: &str, value: impl FnOnce() -> serde_json::Value) {
-        if kind == "assertion" && value()["status"] == "passed" {
-            let mut s = self.state.lock().unwrap();
-            s.assertions += 1;
-            if s.current == self.selected {
-                s.selected_assertion = true
+        match kind {
+            "assertion" => {
+                if value()["status"] != "passed" {
+                    return;
+                }
+                let mut s = self.state.lock().unwrap();
+                s.assertions += 1;
+                if s.current == self.selected {
+                    s.selected_assertion = true
+                }
+                if s.current > self.selected
+                    && crate::gqt_case::explicit_verification(self.kinds[&s.current])
+                {
+                    s.following += 1
+                }
             }
-            if s.current > self.selected
-                && crate::gqt_case::explicit_verification(self.kinds[&s.current])
-            {
-                s.following += 1
+            "commit" => {
+                if let Some(published) = value()["published"].as_bool() {
+                    let mut s = self.state.lock().unwrap();
+                    let current = s.current;
+                    s.published.insert(current, published);
+                }
             }
+            _ => {}
         }
     }
     fn reopen<'a>(
@@ -765,12 +791,25 @@ pub(crate) fn sample_evidence_matches(
                 && sample.peak_rss_bytes.is_none()
                 && sample.merge.is_none()
                 && rss_matches(sample.client_peak_rss_bytes)
-                && sample.steps.iter().all(|s| {
-                    SERVED_READ_KINDS
-                        .into_iter()
-                        .any(|kind| GqtOperationKind::from(kind) == s.kind)
-                })
+                && sample.steps.iter().all(served_receipt_admitted)
         }
+    }
+}
+
+/// A served receipt is a read, an unpublished write (its commit advanced no
+/// head), or the drop of such a commit: the mirror of
+/// `gqt_case::served_step_refusal` over what actually executed.
+pub(crate) fn served_receipt_admitted(step: &GqtStepObservation) -> bool {
+    if SERVED_READ_KINDS
+        .into_iter()
+        .any(|kind| GqtOperationKind::from(kind) == step.kind)
+    {
+        return true;
+    }
+    match step.kind {
+        GqtOperationKind::Mutate | GqtOperationKind::BranchMerge => step.published == Some(false),
+        GqtOperationKind::CommitDrop => step.published.is_none(),
+        _ => false,
     }
 }
 
@@ -834,6 +873,7 @@ pub(crate) fn sample_byte_upper_bound(plan: &PlannedGqt) -> RunnerResult<usize> 
                     occurrence: u32::MAX,
                     kind: step.operation_kind().into(),
                     elapsed_us: u64::MAX,
+                    published: None,
                 });
             }
         }

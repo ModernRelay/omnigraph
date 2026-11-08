@@ -222,9 +222,27 @@ pub async fn census_within(
     max_cells: u64,
     max_snapshot_bytes: u64,
 ) -> CensusResult<LegacyCensus> {
-    let session = crate::lance_access::control_session();
+    census_within_with_session(
+        root_uri,
+        input,
+        source,
+        max_cells,
+        max_snapshot_bytes,
+        &crate::lance_access::control_session(),
+    )
+    .await
+}
+
+pub async fn census_within_with_session(
+    root_uri: &str,
+    input: &CensusInput,
+    source: &dyn LegacyManifestSource,
+    max_cells: u64,
+    max_snapshot_bytes: u64,
+    session: &Arc<lance::session::Session>,
+) -> CensusResult<LegacyCensus> {
     let main =
-        crate::layout::open_manifest_dataset_native_with_session(root_uri, None, &session).await?;
+        crate::layout::open_manifest_dataset_native_with_session(root_uri, None, session).await?;
     let mut counts = CensusCounts {
         live_refs: input.live.len() as u64,
         retired_refs: input.retired.len() as u64,

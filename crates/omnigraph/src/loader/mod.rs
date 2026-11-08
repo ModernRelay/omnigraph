@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{BufRead, BufReader, Cursor};
@@ -22,15 +23,26 @@ use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::db::Omnigraph;
+use omnigraph_compiler::ir::{DeltaClass, LoadCheck, WriteKind, lower_load};
+use omnigraph_compiler::query::ast::{LoadStmt, LoadStmtMode, LoadTarget};
+use omnigraph_planner::{
+    BoundPlan, CommittedSide, Decision, MemorySource, Operation, RouteOverride, Side, SideId,
+    TableRef, ValueTable, route,
+};
+
 use crate::db::manifest::HistoryReleaseBytes;
+use crate::db::{Omnigraph, Snapshot, WriteTxn};
+use crate::engine::{EngineContext, GraphIndexHandle, LoadFacts, LoadWrite};
 use crate::error::{OmniError, Result, missing_graph_type_at_snapshot};
-use crate::exec::staging::{MutationStaging, PendingMode};
+use crate::exec::staging::{MutationStaging, PendingMode, StagedMutation};
 use crate::seams::{catalog, decide_seam, fail};
 use crate::session::Session;
 use crate::storage_layer::{
     DeletedIdBudget, KEYED_WRITE_MAX_BYTES, WriteBudget, retain_keyed_batch,
 };
+use crate::table_store::CapturedSource;
+use crate::validate::load::{JudgedSide, LoadAdmission, RepeatRule, Report, WriteJudge};
+use crate::validate::plan::{WriteTable, judgment_rank, node_type_spec};
 
 /// Result of a load operation.
 #[derive(Debug, Clone, Default)]
@@ -51,6 +63,90 @@ pub struct LoadResult {
 pub struct LoadReceipt {
     pub result: LoadResult,
     pub commit: crate::db::GraphCommit,
+    /// The planner's document for a `load csv` statement; a JSONL load has none.
+    pub plan: Option<omnigraph_planner::explain::Explain>,
+    pub executed: LoadExecuted,
+    /// A JSONL load's planner document per table it validated, in table
+    /// order; a `load csv` statement's one document is `plan`.
+    pub validated: Vec<omnigraph_planner::explain::Explain>,
+}
+
+impl LoadReceipt {
+    /// The measurement of a plan the engine ran: `Some` for a `load csv`
+    /// overwrite, whose operators recorded their rows; `None` for an append
+    /// or merge, which the keyed adapters run with no plan executed, and for
+    /// a JSONL load.
+    pub fn executed_plan(&self) -> Option<&LoadExecuted> {
+        (self.plan.is_some() && !self.executed.operators.is_empty()).then_some(&self.executed)
+    }
+}
+
+/// What an executed load measured beside its plan.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadExecuted {
+    pub partitions: u32,
+    pub rows: u64,
+    pub source_bytes: u64,
+    /// One entry per node of the executed plan in post-order, the source
+    /// first, read from the node's operator after the plan ran; empty for a
+    /// load the engine did not run (append and merge).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operators: Vec<LoadOperatorExecuted>,
+}
+
+/// What one operator of an executed load plan did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadOperatorExecuted {
+    /// The plan node's `id`, as the explain document numbers it.
+    pub id: u64,
+    /// The plan node's kind: `CsvSource`, `Validate`, `FragmentWrite`.
+    pub node: String,
+    /// The operator the node built.
+    pub operator: String,
+    /// The rows the operator emitted; the sink counts the rows it staged.
+    pub rows: u64,
+    /// Nanoseconds the operator was computing: the polls of its stream and of
+    /// its workers, never the time it waited for its input or for storage.
+    pub elapsed_compute_ns: u64,
+    /// Nanoseconds from the operator's first poll to its end: the phase's
+    /// wall time, waits included; `0` where no end was recorded.
+    pub wall_ns: u64,
+    /// The output partitions the operator ran, each its own stream: a
+    /// `CsvSource`'s parsers, 1 for every other operator.
+    #[serde(default = "one_partition")]
+    pub partitions: u32,
+    /// The slices of the source a `CsvSource` cut and parsed, in slice order;
+    /// empty for every other operator.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slices: Vec<LoadSliceExecuted>,
+}
+
+fn one_partition() -> u32 {
+    1
+}
+
+/// What one slice of a `CsvSource` measured: a byte range of the capture
+/// parsed whole by one partition.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadSliceExecuted {
+    /// The slice's position in the source, from 0; rows of a slice are the
+    /// same on every run.
+    pub slice: u32,
+    /// The partition that claimed the slice; which one varies between runs.
+    pub partition: u32,
+    /// The records the slice held.
+    pub rows: u64,
+    /// Nanoseconds the slice's parse and normalization took.
+    pub elapsed_compute_ns: u64,
+    /// Nanoseconds the slice's partition waited for the source's bytes.
+    #[serde(default)]
+    pub read_ns: u64,
+    /// Nanoseconds after the source's first poll at which the slice was
+    /// claimed.
+    pub start_ns: u64,
+    /// Nanoseconds after the source's first poll at which the slice's last
+    /// batch was sent.
+    pub end_ns: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,11 +176,65 @@ pub enum LoadMode {
     Merge,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LoadInputShape {
+pub mod csv;
+pub(crate) mod read_reuse;
+pub use csv::{CSV_SOURCE_BYTES_RESOURCE, CSV_SOURCE_READ_DEADLINE, CsvLoadRequest};
+
+/// How the load input is read: lenient JSON, strict NDJSON envelopes, or
+/// one CSV object fetched under the external Blob policy. Every shape ends
+/// in the same per-type Arrow batches and the same load transaction.
+#[derive(Clone, Copy)]
+enum LoadInputShape<'a> {
     LoaderCompatible,
     StrictGraphBatch,
+    /// One `load csv` statement, the session's `load_source_max_bytes`, and
+    /// the shared graph handle a load plan's write operator owns across its
+    /// run; the statement enters only through a `Session`, which holds one.
+    Csv(&'a CsvLoadRequest, u64, &'a Arc<Omnigraph>),
 }
+
+/// What one attempt of a load statement interprets: the input shape, with a
+/// CSV source as the probe every attempt of the statement shares.
+#[derive(Clone, Copy)]
+enum LoadAttemptInput<'a> {
+    LoaderCompatible,
+    StrictGraphBatch,
+    Csv(&'a CsvLoadRequest, &'a CsvInput, &'a Arc<Omnigraph>),
+}
+
+/// The CSV source of one statement across its attempts: probed once before
+/// the plan; the plan route reads it by range inside its partitions, the
+/// keyed route reads it whole once and replays that capture on every retry.
+struct CsvInput {
+    bytes: Arc<csv::CsvBytes>,
+    source_max_bytes: u64,
+    source_charge: Arc<crate::engine::LoadCharge>,
+    capture: tokio::sync::OnceCell<CapturedSource>,
+}
+
+impl CsvInput {
+    async fn capture(&self, request: &CsvLoadRequest) -> Result<&CapturedSource> {
+        self.capture
+            .get_or_try_init(|| {
+                csv::capture_csv_source(
+                    &self.bytes,
+                    request,
+                    self.source_max_bytes,
+                    Arc::clone(&self.source_charge),
+                )
+            })
+            .await
+    }
+}
+
+/// The resource each staged-write input of an overwrite is admitted under:
+/// one reader batch of a CSV overwrite over `write_max_bytes` refuses with
+/// this name before anything is staged.
+pub const STAGED_WRITE_INPUT_BYTES_RESOURCE: &str = "staged_write_input_bytes";
+
+/// Validation state per loaded row: one id entry and one key or endpoint
+/// entry, charged before the evaluator builds them.
+pub(crate) const VALIDATION_ENTRIES_PER_ROW: usize = 2;
 
 impl Session {
     /// Convenience: load JSONL data onto the handle's *active branch* (`main`
@@ -251,6 +401,7 @@ impl Session {
             self.settings().stage_write_concurrency(),
             HistoryReleaseBytes(self.settings().history_release_bytes()),
             WriteBudget::from_settings(self.settings()),
+            self.settings().query_memory_bytes(),
         )
         .await
     }
@@ -296,6 +447,34 @@ impl Session {
             self.settings().stage_write_concurrency(),
             HistoryReleaseBytes(self.settings().history_release_bytes()),
             WriteBudget::from_settings(self.settings()),
+            self.settings().query_memory_bytes(),
+        )
+        .await
+    }
+
+    /// Run one `load csv` statement onto `branch`: the source object is
+    /// authorized by the graph's external Blob policy, bounded by the
+    /// session's `load_source_max_bytes` before it is read, parsed typed by the
+    /// target's `.pg` declaration, and staged through the same transaction,
+    /// admission, validation and publication as a strict NDJSON batch. The
+    /// branch must exist; a load statement never forks one.
+    pub async fn load_csv_as_with_receipt(
+        &self,
+        branch: &str,
+        request: &CsvLoadRequest,
+        actor_id: Option<&str>,
+    ) -> Result<LoadReceipt> {
+        self.load_input_as(
+            branch,
+            None,
+            "",
+            request.mode,
+            actor_id,
+            LoadInputShape::Csv(request, self.settings().load_source_max_bytes(), self.db()),
+            self.settings().stage_write_concurrency(),
+            HistoryReleaseBytes(self.settings().history_release_bytes()),
+            WriteBudget::from_settings(self.settings()),
+            self.settings().query_memory_bytes(),
         )
         .await
     }
@@ -322,10 +501,11 @@ impl Omnigraph {
         data: &str,
         mode: LoadMode,
         actor_id: Option<&str>,
-        input_shape: LoadInputShape,
+        input_shape: LoadInputShape<'_>,
         stage_write_concurrency: usize,
         history_release_bytes: HistoryReleaseBytes,
         write_budget: WriteBudget,
+        query_memory_bytes: u64,
     ) -> Result<LoadReceipt> {
         // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
         // `Branch(branch)` to match the HTTP-layer Change convention.
@@ -351,6 +531,7 @@ impl Omnigraph {
             stage_write_concurrency,
             history_release_bytes,
             write_budget,
+            query_memory_bytes,
         ))
         .await
     }
@@ -363,10 +544,11 @@ impl Omnigraph {
         data: &str,
         mode: LoadMode,
         actor_id: Option<&str>,
-        input_shape: LoadInputShape,
+        input_shape: LoadInputShape<'_>,
         stage_write_concurrency: usize,
         history_release_bytes: HistoryReleaseBytes,
         write_budget: WriteBudget,
+        query_memory_bytes: u64,
     ) -> Result<LoadReceipt> {
         // Schema/catalog authority is captured once via the `WriteTxn` (plus its
         // cheap trailing identity-marker fence); the only second full validation
@@ -398,7 +580,8 @@ impl Omnigraph {
                 branch_created = true;
                 // DST window (loader walk D1 → D2): the implicit fork is
                 // durable, the load has not begun.
-                fail(&LOAD_POST_BRANCH_CREATE_PRE_STAGE)?;
+                fail(&LOAD_POST_BRANCH_CREATE_PRE_STAGE)
+                    .map_err(OmniError::after_earlier_publication)?;
             }
         }
         // Direct-to-target writes: no Run state machine, no `__run__` staging
@@ -414,11 +597,14 @@ impl Omnigraph {
                 stage_write_concurrency,
                 history_release_bytes,
                 write_budget,
+                query_memory_bytes,
             )
             .await
             .map_err(|error| {
+                // The fork published on its own, so every failure of the rows
+                // follows it.
                 if branch_created {
-                    error.without_pre_effect_evidence()
+                    error.after_earlier_publication()
                 } else {
                     error
                 }
@@ -471,10 +657,11 @@ impl Omnigraph {
         data: &str,
         mode: LoadMode,
         actor_id: Option<&str>,
-        input_shape: LoadInputShape,
+        input_shape: LoadInputShape<'_>,
         stage_write_concurrency: usize,
         history_release_bytes: HistoryReleaseBytes,
         write_budget: WriteBudget,
+        query_memory_bytes: u64,
     ) -> Result<LoadReceipt> {
         load_jsonl_data(
             self,
@@ -486,6 +673,7 @@ impl Omnigraph {
             stage_write_concurrency,
             history_release_bytes,
             write_budget,
+            query_memory_bytes,
         )
         .await
     }
@@ -541,10 +729,11 @@ async fn load_jsonl_data(
     data: &str,
     mode: LoadMode,
     actor_id: Option<&str>,
-    input_shape: LoadInputShape,
+    input_shape: LoadInputShape<'_>,
     stage_write_concurrency: usize,
     history_release_bytes: HistoryReleaseBytes,
     write_budget: WriteBudget,
+    query_memory_bytes: u64,
 ) -> Result<LoadReceipt> {
     const MAX_PRE_EFFECT_REPREPARES: usize = 32;
 
@@ -553,6 +742,21 @@ async fn load_jsonl_data(
     // pre-effect retry; copying it into a second raw byte buffer would double
     // peak input memory before the parser's per-type materialization.
     let retryable = matches!(mode, LoadMode::Append | LoadMode::Merge);
+    let memory = crate::engine::LoadMemory::new(query_memory_bytes)?;
+    let csv_input;
+    let input = match input_shape {
+        LoadInputShape::LoaderCompatible => LoadAttemptInput::LoaderCompatible,
+        LoadInputShape::StrictGraphBatch => LoadAttemptInput::StrictGraphBatch,
+        LoadInputShape::Csv(request, source_max_bytes, handle) => {
+            csv_input = CsvInput {
+                bytes: Arc::new(csv::probe_csv_source(db, request, source_max_bytes).await?),
+                source_max_bytes,
+                source_charge: Arc::new(memory.charge("load source")?),
+                capture: tokio::sync::OnceCell::new(),
+            };
+            LoadAttemptInput::Csv(request, &csv_input, handle)
+        }
+    };
     for attempt in 0..=MAX_PRE_EFFECT_REPREPARES {
         let replay = BufReader::new(Cursor::new(data.as_bytes()));
         match load_jsonl_reader_once(
@@ -561,11 +765,12 @@ async fn load_jsonl_data(
             replay,
             mode,
             actor_id,
-            input_shape,
+            input,
             stage_write_concurrency,
             history_release_bytes,
             attempt == 0,
             write_budget,
+            &memory,
         )
         .await
         {
@@ -579,6 +784,7 @@ async fn load_jsonl_data(
                     branch = branch.unwrap_or("main"),
                     "prepared load authority changed before effects; repreparing"
                 );
+                crate::instrumentation::record_mutation_reprepare();
                 db.refresh_coordinator_only().await?;
             }
             result => return result,
@@ -587,17 +793,30 @@ async fn load_jsonl_data(
     unreachable!("bounded load retry loop always returns")
 }
 
+/// Retain CSV append/merge input against the shared keyed-write ceiling.
+fn admit_csv_batches(
+    prepared: &csv::PreparedCsvBatch,
+    mut prepared_keyed_bytes: u64,
+    write_budget: WriteBudget,
+) -> Result<u64> {
+    for batch in &prepared.batches {
+        prepared_keyed_bytes = retain_keyed_batch(prepared_keyed_bytes, batch, write_budget)?;
+    }
+    Ok(prepared_keyed_bytes)
+}
+
 async fn load_jsonl_reader_once<R: BufRead>(
     db: &Omnigraph,
     branch: Option<&str>,
     reader: R,
     mode: LoadMode,
     actor_id: Option<&str>,
-    input_shape: LoadInputShape,
+    input: LoadAttemptInput<'_>,
     stage_write_concurrency: usize,
     history_release_bytes: HistoryReleaseBytes,
     first_attempt: bool,
     write_budget: WriteBudget,
+    memory: &crate::engine::LoadMemory,
 ) -> Result<LoadReceipt> {
     // Capture the manifest/schema authority before interpreting any input. The
     // catalog rides the WriteTxn and was built from the exact accepted IR named
@@ -627,7 +846,64 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // contract. Strict normalization still preflights its Arrow allocation.
     let bounded_keyed_input = matches!(mode, LoadMode::Append | LoadMode::Merge);
 
-    if input_shape == LoadInputShape::StrictGraphBatch {
+    let csv_buffers = memory.charge("load CSV input")?;
+    let mut csv_batch = None;
+    let mut load_plan = None;
+    let mut csv_judged = None;
+    let mut executed = LoadExecuted::default();
+    if let LoadAttemptInput::Csv(request, source, handle) = input {
+        executed.partitions = 1;
+        executed.source_bytes = source.bytes.size();
+        let decision = plan_load(
+            &catalog,
+            &snapshot,
+            request,
+            source.bytes.size(),
+            memory.limit(),
+            write_budget.bytes(),
+            stage_write_concurrency,
+        )
+        .await?;
+        if mode == LoadMode::Overwrite {
+            return Box::pin(load_csv_overwrite_plan(
+                handle,
+                txn,
+                &snapshot,
+                branch,
+                request,
+                &source.bytes,
+                decision,
+                actor_id,
+                history_release_bytes,
+                write_budget,
+                stage_write_concurrency,
+                memory,
+                executed,
+            ))
+            .await;
+        }
+        let (judged, explain) = crate::validate::plan::judged_table(
+            decision,
+            request.target.table_key(),
+            if mode == LoadMode::Merge {
+                DeltaClass::Upsert
+            } else {
+                DeltaClass::Insert
+            },
+            Vec::new(),
+        )?;
+        load_plan = Some(explain);
+        csv_judged = Some(judged);
+        let capture = source.capture(request).await?;
+        let decoding = memory.charge("load CSV decoding")?;
+        let prepared = csv::prepare_csv_batches(&catalog, request, capture, &mut |bytes| {
+            decoding.grow(bytes)
+        })?;
+        for batch in &prepared.batches {
+            csv_buffers.hold(batch)?;
+        }
+        csv_batch = Some(prepared);
+    } else if matches!(input, LoadAttemptInput::StrictGraphBatch) {
         strict_rows = parse_strict_graph_rows(
             reader,
             &catalog,
@@ -828,9 +1104,26 @@ async fn load_jsonl_reader_once<R: BufRead>(
         let loaded_count = batch.num_rows();
         prepared_nodes.push((type_name, table_key, vec![batch], loaded_count));
     }
+    if let Some(prepared) = csv_batch.take_if(|prepared| !prepared.is_edge) {
+        let _entry = snapshot.dataset(&prepared.table_key).ok_or_else(|| {
+            OmniError::manifest(missing_graph_type_at_snapshot(&prepared.table_key))
+        })?;
+        prepared_keyed_bytes = admit_csv_batches(&prepared, prepared_keyed_bytes, write_budget)?;
+        prepared_nodes.push((
+            prepared.type_name,
+            prepared.table_key,
+            prepared.batches,
+            prepared.rows,
+        ));
+    }
 
     // Phase 2b: accumulate every node type in memory. Fragment writes are
     // delayed until after all validation succeeds.
+    let retained = load_plan
+        .as_ref()
+        .map(|_| memory.charge("load retained input"))
+        .transpose()?;
+    let mut staged_bytes = 0_u64;
     for (type_name, table_key, batches, loaded_count) in prepared_nodes {
         // The loader only needs the captured expected version (the publisher's
         // CAS fence) for `ensure_path` — it discards the handle. With a
@@ -850,6 +1143,11 @@ async fn load_jsonl_reader_once<R: BufRead>(
             load_op_kind,
         )?;
         for batch in batches {
+            if let Some(retained) = &retained {
+                retained.hold(&batch)?;
+                staged_bytes = staged_bytes
+                    .saturating_add(crate::table_store::write_batch_bytes(&batch)?.rows);
+            }
             let schema = batch.schema();
             staging.append_batch(&table_key, schema, pending_mode, batch)?;
         }
@@ -896,6 +1194,18 @@ async fn load_jsonl_reader_once<R: BufRead>(
         let loaded_count = batch.num_rows();
         prepared_edges.push((edge_name, table_key, vec![batch], loaded_count));
     }
+    if let Some(prepared) = csv_batch.take_if(|prepared| prepared.is_edge) {
+        let _entry = snapshot.dataset(&prepared.table_key).ok_or_else(|| {
+            OmniError::manifest(missing_graph_type_at_snapshot(&prepared.table_key))
+        })?;
+        admit_csv_batches(&prepared, prepared_keyed_bytes, write_budget)?;
+        prepared_edges.push((
+            prepared.type_name,
+            prepared.table_key,
+            prepared.batches,
+            prepared.rows,
+        ));
+    }
 
     // Phase 2e: accumulate every edge type. Same dispatch as Phase 2b.
     for (edge_name, table_key, batches, loaded_count) in prepared_edges {
@@ -915,89 +1225,399 @@ async fn load_jsonl_reader_once<R: BufRead>(
             load_op_kind,
         )?;
         for batch in batches {
+            if let Some(retained) = &retained {
+                retained.hold(&batch)?;
+                staged_bytes = staged_bytes
+                    .saturating_add(crate::table_store::write_batch_bytes(&batch)?.rows);
+            }
             let schema = batch.schema();
             staging.append_batch(&table_key, schema, pending_mode, batch)?;
         }
         result.edges_loaded.insert(edge_name, loaded_count);
     }
 
-    // Phase 3: end-of-load validation — one unified evaluator pass over the
-    // accumulated staging (value/enum, uniqueness incl. cross-version, edge-RI,
-    // cardinality) against the pinned pre-load base. `Overwrite` validates each
-    // touched table as its whole new image (that table's committed view empty),
-    // but is PER-TABLE — a table absent from the batch keeps `base`, so an
-    // edges-only overwrite still resolves RI against committed nodes;
-    // `Append`/`Merge` keep `base` everywhere. This shares the evaluator with the
-    // mutation + merge paths, so the surfaces cannot drift.
-    let mut changeset = staging.to_changeset();
-    // Overwrite replaces each touched table; a committed row absent from the new
-    // batch is REMOVED but is not in `to_changeset` (which only records the new
-    // batch). Express those removals as `deleted_ids` so edge-RI (path-b) and
-    // cardinality recompute against them — e.g. overwriting `node:Person` to drop
-    // Bob while a retained `edge:Knows(Alice->Bob)` would otherwise publish an
-    // orphan. (Per-table, like the rest of Overwrite handling.)
-    if mode == LoadMode::Overwrite {
+    let mut tables: Vec<WriteTable> = staging
+        .pending
+        .iter()
+        .filter(|(_, pending)| !pending.batches.is_empty())
+        .map(|(table, pending)| WriteTable {
+            table: table.clone(),
+            delta: match pending_mode {
+                PendingMode::StrictInsert => DeltaClass::Insert,
+                PendingMode::Upsert => DeltaClass::Upsert,
+                PendingMode::Overwrite => DeltaClass::Replace,
+            },
+            rows: pending.batches.iter().map(|b| b.num_rows() as u64).sum(),
+            deleted_ids: Vec::new(),
+        })
+        .collect();
+    tables.sort_by(|a, b| judgment_rank(&a.table).cmp(&judgment_rank(&b.table)));
+    let batches: Vec<Vec<RecordBatch>> = tables
+        .iter()
+        .map(|table| staging.pending_batches(&table.table).to_vec())
+        .collect();
+    let (judged, validated): (Vec<_>, Vec<_>) = match csv_judged {
+        Some(judged) => {
+            if tables.len() != 1 || tables[0].table != judged.table {
+                return Err(OmniError::manifest_internal(format!(
+                    "load csv into {}: the load staged {} tables",
+                    judged.table,
+                    tables.len()
+                )));
+            }
+            (vec![judged], Vec::new())
+        }
+        None if tables.is_empty() => (Vec::new(), Vec::new()),
+        None => {
+            let mut planning = snapshot.clone();
+            planning.set_read_caches(crate::db::manifest::SnapshotReadCaches {
+                session: db.read_caches().session.clone(),
+                handles: db.read_caches().handles.clone(),
+                table_wrapper: None,
+            });
+            crate::validate::plan::plan_write(
+                &planning,
+                &catalog,
+                WriteKind::Load,
+                CommittedSide::Base,
+                tables,
+                write_budget.bytes(),
+            )
+            .await?
+            .into_iter()
+            .unzip()
+        }
+    };
+    let loaded_rows: usize = result
+        .nodes_loaded
+        .values()
+        .chain(result.edges_loaded.values())
+        .sum();
+    let validation = retained
+        .as_ref()
+        .map(|_| memory.charge("load validation"))
+        .transpose()?;
+    if let Some(validation) = &validation {
+        validation.entries::<String>(loaded_rows.saturating_mul(VALIDATION_ENTRIES_PER_ROW))?;
+    }
+    if !judged.is_empty() {
+        let judge = WriteJudge {
+            tables: judged,
+            committed: JudgedSide::Base(snapshot.clone()),
+            write_budget,
+            catalog: Arc::clone(&catalog),
+            report: Report::First,
+            repeat: RepeatRule::for_write(WriteKind::Load),
+        };
+        let mut admit_reuse = || {
+            memory
+                .admit_read_reuse()
+                .and_then(|admitted| read_reuse::LoadReadReuse::new(db, &snapshot, admitted))
+        };
         let mut removed_id_budget = DeletedIdBudget::new(write_budget);
-        let keys: Vec<String> = changeset.keys().cloned().collect();
-        for table_key in keys {
-            let removed = crate::validate::overwrite_removed_ids(
-                &snapshot,
-                &table_key,
-                changeset.get(&table_key).expect("key from this changeset"),
-                catalog.system_columns,
-                |id| removed_id_budget.retain(id),
+        let mut admit_removed = |id: &str| removed_id_budget.retain(id);
+        let retained_edges = retained
+            .as_ref()
+            .map(|_| memory.charge("load retained edges"))
+            .transpose()?;
+        let mut admit_retained = |batch: &RecordBatch| match &retained_edges {
+            Some(charge) => charge.hold(batch),
+            None => Ok(()),
+        };
+        judge
+            .judge_batches(
+                db,
+                batches,
+                &mut LoadAdmission {
+                    phase: None,
+                    bytes: None,
+                    reuse: Some(&mut admit_reuse),
+                    removed: &mut admit_removed,
+                    retained: &mut admit_retained,
+                },
             )
             .await?;
-            if !removed.is_empty() {
-                changeset
-                    .get_mut(&table_key)
-                    .expect("key from this changeset")
-                    .deleted_ids = removed;
-            }
-        }
     }
-    let committed = crate::validate::CommittedState::load(&snapshot, mode, &changeset);
-    crate::validate::validate_changeset(&changeset, &committed, &catalog).await?;
+    drop(validation);
+    executed.rows = loaded_rows as u64;
 
-    // Phase 4: Atomic manifest commit with publisher-level OCC.
+    let staging_charge = retained
+        .as_ref()
+        .map(|_| memory.charge("load staging"))
+        .transpose()?;
+    if let Some(staging_charge) = &staging_charge {
+        staging_charge.grow(staged_bytes)?;
+    }
+    // From the first staged file to the publisher call nothing is
+    // graph-visible: a failure is definite (`Unpublished`) whatever its cause.
     let staged = staging
         .stage_all_with_concurrency(db, branch, stage_write_concurrency)
-        .await?;
-    fail(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
+        .await
+        .map_err(OmniError::unpublished)?;
+    let commit =
+        publish_staged_load(db, staged, &txn, branch, actor_id, history_release_bytes).await?;
+
+    Ok(LoadReceipt {
+        result,
+        commit,
+        plan: load_plan,
+        executed,
+        validated,
+    })
+}
+
+/// A CSV overwrite as a plan: the operators read, parse, judge and stage, the
+/// attempt commits detached and publishes once; a partitioned run that
+/// refused reruns as one partition, whose source-numbered refusal is reported.
+#[allow(clippy::too_many_arguments)]
+async fn load_csv_overwrite_plan(
+    db: &Arc<Omnigraph>,
+    txn: WriteTxn,
+    snapshot: &Snapshot,
+    branch: Option<&str>,
+    request: &CsvLoadRequest,
+    bytes: &Arc<csv::CsvBytes>,
+    decision: Decision,
+    actor_id: Option<&str>,
+    history_release_bytes: HistoryReleaseBytes,
+    write_budget: WriteBudget,
+    stage_write_concurrency: usize,
+    memory: &crate::engine::LoadMemory,
+    mut executed: LoadExecuted,
+) -> Result<LoadReceipt> {
+    let catalog = Arc::clone(&txn.catalog);
+    let table_key = request.target.table_key();
+    snapshot
+        .dataset(&table_key)
+        .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
+    let (plan, explain) = match decision {
+        Decision::Engine { plan, explain, .. } => (plan, explain),
+        other => {
+            let route = other.explain().map_or_else(
+                || "none".to_string(),
+                |explain| explain.to_value()["route"].to_string(),
+            );
+            return Err(OmniError::manifest_internal(format!(
+                "load csv overwrite into {table_key} routed to {route}, not the engine"
+            )));
+        }
+    };
+    let bound = BoundPlan {
+        plan,
+        values: ValueTable::default(),
+    };
+    let mut single_partition = false;
+    let (run, staged) = loop {
+        let staged = Arc::new(std::sync::Mutex::new(None));
+        let source_refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let facts = LoadFacts {
+            request: request.clone(),
+            bytes: Arc::clone(bytes),
+            write: Some(LoadWrite {
+                db: Arc::clone(db),
+                txn: Arc::new(txn.clone()),
+                write_budget,
+                writers: stage_write_concurrency,
+                staged: Arc::clone(&staged),
+            }),
+            slice_bytes: crate::engine::csv_slice_bytes(),
+            single_partition,
+            source_refused: Arc::clone(&source_refused),
+        };
+        let context = EngineContext {
+            snapshot: Some(snapshot),
+            catalog: &catalog,
+            graph_index: Arc::new(GraphIndexHandle::none()),
+            load: Some(&facts),
+        };
+        match crate::engine::execute_load(&bound, &context, memory).await {
+            Ok(run) => break (run, staged),
+            Err(error)
+                if !single_partition
+                    && source_refused.load(std::sync::atomic::Ordering::Acquire) =>
+            {
+                tracing::debug!(
+                    source = %request.source,
+                    %error,
+                    "load csv: a partitioned read refused; rerunning as one partition"
+                );
+                memory.reopen();
+                single_partition = true;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let rows = run.rows;
+    executed.operators = run.operators;
+    executed.partitions = executed
+        .operators
+        .iter()
+        .map(|operator| operator.partitions)
+        .max()
+        .unwrap_or(1);
+    let staged = staged
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "load csv overwrite into {table_key}: the plan ran without staging a write"
+            ))
+        })?;
+    let commit =
+        publish_staged_load(db, staged, &txn, branch, actor_id, history_release_bytes).await?;
+    executed.rows = rows;
+    let loaded = usize::try_from(rows)
+        .map_err(|_| OmniError::manifest("load csv: row count exceeds usize".to_string()))?;
+    let mut result = LoadResult::default();
+    match &request.target {
+        LoadTarget::Node(name) => {
+            result.nodes_loaded.insert(name.clone(), loaded);
+        }
+        LoadTarget::Edge(name) => {
+            result.edges_loaded.insert(name.clone(), loaded);
+        }
+    }
+    Ok(LoadReceipt {
+        result,
+        commit,
+        plan: Some(explain),
+        executed,
+        validated: Vec::new(),
+    })
+}
+
+async fn publish_staged_load(
+    db: &Omnigraph,
+    staged: StagedMutation,
+    txn: &WriteTxn,
+    branch: Option<&str>,
+    actor_id: Option<&str>,
+    history_release_bytes: HistoryReleaseBytes,
+) -> Result<crate::db::GraphCommit> {
+    fail(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE).map_err(OmniError::unpublished)?;
     let lineage_intent = db
         .new_lineage_intent_for_branch(branch, actor_id, history_release_bytes)
-        .await?;
-    // `held_gates` holds the root-shared schema permit → branch →
-    // sorted-table gates across manifest publication. This closes
-    // same-process interleaving across the effect lifetime. The exact
-    // publisher token remains the persistent correctness authority; these
-    // local gates do not expand the documented single-writer-process
-    // boundary.
+        .await
+        .map_err(OmniError::unpublished)?;
     let crate::exec::staging::CommittedMutation {
         updates,
         expected_versions,
         detached: _,
         gates: _held_gates,
-    } = staged.commit_all(db, branch, &txn).await?;
-    // Same detached-effects → publisher boundary as mutations: every table
-    // effect is committed detached, but the graph manifest has not published
-    // the result. Reuse the mutation failpoint name so one failpoint pins the
-    // shared boundary.
-    fail(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
-    let publish_result = db
-        .commit_updates_on_branch_with_expected(
-            branch,
-            &updates,
-            &expected_versions,
-            actor_id,
-            &txn,
-            lineage_intent,
-            crate::db::omnigraph::Publication::Publish,
-        )
-        .await;
-    let commit = publish_result?;
+    } = staged
+        .commit_all(db, branch, txn)
+        .await
+        .map_err(OmniError::unpublished)?;
+    fail(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER).map_err(OmniError::unpublished)?;
+    // The publisher alone decides between a definite loss and an outcome it
+    // could not read back.
+    db.commit_updates_on_branch_with_expected(
+        branch,
+        &updates,
+        &expected_versions,
+        actor_id,
+        txn,
+        lineage_intent,
+        crate::db::omnigraph::Publication::Publish,
+    )
+    .await
+}
 
-    Ok(LoadReceipt { result, commit })
+/// The planner's decision for one `load csv` statement under `catalog` at
+/// `snapshot`: the statement, the pinned tables and the source's size are
+/// all it reads, so an explain and an attempt plan alike.
+pub(crate) async fn plan_load(
+    catalog: &Catalog,
+    snapshot: &Snapshot,
+    request: &CsvLoadRequest,
+    source_bytes: u64,
+    memory_limit: u64,
+    write_max_bytes: u64,
+    load_workers_max: usize,
+) -> Result<Decision> {
+    let stmt = LoadStmt {
+        source: request.source.clone(),
+        target: request.target.clone(),
+        mode: match request.mode {
+            LoadMode::Overwrite => LoadStmtMode::Overwrite,
+            LoadMode::Append => LoadStmtMode::Append,
+            LoadMode::Merge => LoadStmtMode::Merge,
+        },
+        delimiter: request.delimiter,
+        header: request.header,
+        columns: request.columns.clone(),
+    };
+    let ir = lower_load(catalog, &stmt);
+    let table_key = request.target.table_key();
+    let tables = load_sides(snapshot, catalog.system_columns, &table_key, &ir.checks);
+    let mut source = MemorySource::default().with_schema(
+        SideId::Child,
+        csv::target_arrow_schema(catalog, &request.target)?,
+    );
+    for side in &tables {
+        let key = &side.table.type_key;
+        let endpoint = ir.checks.iter().any(|check| {
+            matches!(
+                check.check,
+                omnigraph_compiler::ir::ValidateCheck::EdgeRi { .. }
+            ) && check.consults.as_ref() == Some(key)
+        });
+        if !endpoint && *key != table_key {
+            continue;
+        }
+        let Some(name) = key.strip_prefix("node:") else {
+            continue;
+        };
+        let Some(node) = catalog.node_types.get(name) else {
+            continue;
+        };
+        let Some(entry) = snapshot.dataset(key) else {
+            continue;
+        };
+        source = source
+            .with_node_type(
+                name,
+                node_type_spec(side, node, catalog, Some(entry.entity_count)),
+            )
+            .with_index_facts(
+                key,
+                crate::engine::plan_source::load_index_facts(snapshot, key).await?,
+            );
+    }
+    let operation = Operation::Load {
+        ir: Box::new(ir),
+        tables,
+        source_bytes,
+    };
+    let bounds = crate::engine::engine_bounds(memory_limit, write_max_bytes, load_workers_max);
+    Ok(route(&operation, &source, RouteOverride::Registry, &bounds))
+}
+
+/// The target and every consulted table the base pins, each once in check
+/// order; a table the base predates has no side.
+pub(crate) fn load_sides(
+    snapshot: &Snapshot,
+    columns: SystemColumns,
+    table_key: &str,
+    checks: &[LoadCheck],
+) -> Vec<Side> {
+    let mut keys: Vec<&str> = vec![table_key];
+    for table in checks.iter().filter_map(|check| check.consults.as_deref()) {
+        if !keys.contains(&table) {
+            keys.push(table);
+        }
+    }
+    keys.into_iter()
+        .filter_map(|key| {
+            let pin = crate::engine::dataset_pin(snapshot.dataset(key)?);
+            Some(Side {
+                table: TableRef::dataset(key, pin.dataset_path, pin.native_branch),
+                version: pin.version,
+                columns,
+            })
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -2319,14 +2939,8 @@ fn preflight_strict_rows_arrow_bytes(
     for object in objects {
         for field in schema.fields() {
             let value = object.get(field.name()).unwrap_or(&JsonValue::Null);
-            let field_bytes = if blob_properties.contains(field.name()) {
-                16_u64.saturating_add(match value.as_str() {
-                    Some(value) if value.starts_with("base64:") => 0,
-                    _ => estimate_json_arrow_bytes(value)?,
-                })
-            } else {
-                projected_strict_column_bytes(field.data_type(), value)?
-            };
+            let field_bytes =
+                projected_strict_field_bytes(field, value, blob_properties.contains(field.name()))?;
             projected = projected.saturating_add(field_bytes);
             if projected > limit {
                 return Err(OmniError::resource_limit(
@@ -2338,6 +2952,21 @@ fn preflight_strict_rows_arrow_bytes(
         }
     }
     Ok(())
+}
+
+fn projected_strict_field_bytes(
+    field: &arrow_schema::Field,
+    value: &JsonValue,
+    blob_property: bool,
+) -> Result<u64> {
+    if blob_property {
+        Ok(16_u64.saturating_add(match value.as_str() {
+            Some(value) if value.starts_with("base64:") => 0,
+            _ => estimate_json_arrow_bytes(value)?,
+        }))
+    } else {
+        projected_strict_column_bytes(field.data_type(), value)
+    }
 }
 
 fn projected_strict_column_bytes(data_type: &DataType, value: &JsonValue) -> Result<u64> {
@@ -2531,17 +3160,11 @@ fn build_column_from_json(
     write_budget: WriteBudget,
 ) -> Result<ArrayRef> {
     let array: ArrayRef = match data_type {
-        DataType::Utf8 => {
-            let values: Vec<Option<String>> = rows
-                .iter()
-                .map(|row| {
-                    row.get(name)
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                })
-                .collect();
-            Arc::new(StringArray::from(values))
-        }
+        DataType::Utf8 => Arc::new(
+            rows.iter()
+                .map(|row| row.get(name).and_then(|v| v.as_str()))
+                .collect::<StringArray>(),
+        ),
         DataType::Int32 => {
             let mut values = Vec::with_capacity(rows.len());
             for row in rows {
@@ -3180,151 +3803,216 @@ pub(crate) fn parse_date64_literal(value: &str) -> Result<i64> {
 
 // ─── Value constraint validation ─────────────────────────────────────────────
 
-pub(crate) fn validate_value_constraints(
+/// Every `@range` and `@check` constraint of `node_type` that `batch`
+/// violates: one entry per constraint in declaration order (the range
+/// constraints, then the check constraints), the constraint's index, its
+/// first violating row and the refusal; a constraint the batch cannot be
+/// checked against (an unchecked type, an invalid pattern, a NaN bound)
+/// refuses at row 0.
+pub(crate) fn value_constraint_failures(
     batch: &RecordBatch,
     node_type: &omnigraph_compiler::catalog::NodeType,
-) -> Result<()> {
-    use arrow_array::Array;
-
-    // Range constraints
-    for rc in &node_type.range_constraints {
-        let Some(col) = batch.column_by_name(&rc.property) else {
-            continue;
-        };
-        for row in 0..batch.num_rows() {
-            if col.is_null(row) {
-                continue;
-            }
-            let value = extract_numeric_value(col, row);
-            if let Some(val) = value {
-                if val.is_nan() {
-                    return Err(OmniError::manifest(format!(
-                        "@range violation on {}.{}: value is NaN",
-                        node_type.name, rc.property
-                    )));
-                }
-                if let Some(ref min) = rc.min {
-                    let min_f = literal_value_to_f64(min);
-                    if val < min_f {
-                        return Err(OmniError::manifest(format!(
-                            "@range violation on {}.{}: value {} < min {}",
-                            node_type.name, rc.property, val, min_f
-                        )));
-                    }
-                }
-                if let Some(ref max) = rc.max {
-                    let max_f = literal_value_to_f64(max);
-                    if val > max_f {
-                        return Err(OmniError::manifest(format!(
-                            "@range violation on {}.{}: value {} > max {}",
-                            node_type.name, rc.property, val, max_f
-                        )));
-                    }
-                }
-            }
-        }
-    }
-
-    // Check constraints (regex)
-    for cc in &node_type.check_constraints {
-        let re = regex::Regex::new(&cc.pattern).map_err(|e| {
-            OmniError::manifest(format!(
-                "@check on {}.{} has invalid regex '{}': {}",
-                node_type.name, cc.property, cc.pattern, e
-            ))
-        })?;
-        let Some(col) = batch.column_by_name(&cc.property) else {
-            continue;
-        };
-        let str_col = col.as_any().downcast_ref::<StringArray>();
-        if let Some(str_col) = str_col {
-            for row in 0..str_col.len() {
-                if str_col.is_null(row) {
-                    continue;
-                }
-                let val = str_col.value(row);
-                if !re.is_match(val) {
-                    return Err(OmniError::manifest(format!(
-                        "@check violation on {}.{}: value '{}' does not match pattern '{}'",
-                        node_type.name, cc.property, val, cc.pattern
-                    )));
-                }
-            }
-        }
-    }
-
-    Ok(())
+) -> Vec<(usize, usize, OmniError)> {
+    let ranges = node_type
+        .range_constraints
+        .iter()
+        .map(|rc| range_constraint_failure(batch, node_type, rc));
+    let checks = node_type
+        .check_constraints
+        .iter()
+        .map(|cc| check_constraint_failure(batch, node_type, cc));
+    ranges
+        .chain(checks)
+        .enumerate()
+        .filter_map(|(index, failure)| failure.map(|(row, error)| (index, row, error)))
+        .collect()
 }
 
-/// Validate that every enum-typed property in `properties` only contains values
-/// from its declared enum value set. Operates on a single `RecordBatch` so it
-/// can be called from any write path that already holds a batch.
-///
-/// Scalar string enums are checked directly. List-of-enum properties are
-/// checked element-by-element across the underlying string values.
-pub(crate) fn validate_enum_constraints(
+/// The first row of `batch` outside `rc`'s bounds; a list property bounds
+/// each element, and nulls are never bounded, so an all-null column passes
+/// whatever its physical type.
+fn range_constraint_failure(
+    batch: &RecordBatch,
+    node_type: &omnigraph_compiler::catalog::NodeType,
+    rc: &omnigraph_compiler::catalog::RangeConstraint,
+) -> Option<(usize, OmniError)> {
+    use arrow_array::Array;
+    use arrow_array::cast::AsArray;
+
+    let col = batch.column_by_name(&rc.property)?;
+    if col.logical_null_count() == col.len() {
+        return None;
+    }
+    let bounds = [
+        (rc.min.as_ref(), Ordering::Less, "<", "min"),
+        (rc.max.as_ref(), Ordering::Greater, ">", "max"),
+    ]
+    .map(|(bound, refused, relation, name)| {
+        (bound.map(RangeOperand::bound), refused, relation, name)
+    });
+    let check = |value: RangeOperand| -> Result<()> {
+        if value.is_nan() {
+            return Err(OmniError::manifest(format!(
+                "@range violation on {}.{}: value is NaN",
+                node_type.name, rc.property
+            )));
+        }
+        for (bound, refused, relation, name) in bounds {
+            let Some(bound) = bound else {
+                continue;
+            };
+            let order = value.compare(bound).ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "@range on {}.{} has a NaN {name} bound",
+                    node_type.name, rc.property
+                ))
+            })?;
+            if order == refused {
+                return Err(OmniError::manifest(format!(
+                    "@range violation on {}.{}: value {value} {relation} {name} {bound}",
+                    node_type.name, rc.property
+                )));
+            }
+        }
+        Ok(())
+    };
+    let unchecked = |data_type: &DataType| {
+        OmniError::manifest(format!(
+            "@range on {}.{} cannot check values of type {data_type}",
+            node_type.name, rc.property
+        ))
+    };
+    if let DataType::List(_) = col.data_type() {
+        let list = col.as_list::<i32>();
+        let elements = list.values();
+        let Some(values) = RangeColumn::new(elements) else {
+            return Some((0, unchecked(elements.data_type())));
+        };
+        for (row, span) in list.value_offsets().windows(2).enumerate() {
+            if list.is_null(row) {
+                continue;
+            }
+            for index in span[0] as usize..span[1] as usize {
+                if !elements.is_null(index) {
+                    if let Err(error) = check(values.value(index)) {
+                        return Some((row, error));
+                    }
+                }
+            }
+        }
+    } else {
+        let Some(values) = RangeColumn::new(col) else {
+            return Some((0, unchecked(col.data_type())));
+        };
+        for row in 0..col.len() {
+            if !col.is_null(row) {
+                if let Err(error) = check(values.value(row)) {
+                    return Some((row, error));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The first row of `batch` whose text leaves `cc`'s pattern.
+fn check_constraint_failure(
+    batch: &RecordBatch,
+    node_type: &omnigraph_compiler::catalog::NodeType,
+    cc: &omnigraph_compiler::catalog::CheckConstraint,
+) -> Option<(usize, OmniError)> {
+    use arrow_array::Array;
+
+    let re = match regex::Regex::new(&cc.pattern) {
+        Ok(re) => re,
+        Err(e) => {
+            return Some((
+                0,
+                OmniError::manifest(format!(
+                    "@check on {}.{} has invalid regex '{}': {}",
+                    node_type.name, cc.property, cc.pattern, e
+                )),
+            ));
+        }
+    };
+    let col = batch.column_by_name(&cc.property)?;
+    let str_col = col.as_any().downcast_ref::<StringArray>()?;
+    (0..str_col.len())
+        .filter(|&row| !str_col.is_null(row))
+        .find(|&row| !re.is_match(str_col.value(row)))
+        .map(|row| {
+            (
+                row,
+                OmniError::manifest(format!(
+                    "@check violation on {}.{}: value '{}' does not match pattern '{}'",
+                    node_type.name,
+                    cc.property,
+                    str_col.value(row),
+                    cc.pattern
+                )),
+            )
+        })
+}
+
+/// Every enum-typed property of `properties` with a value of `batch` outside
+/// its declared set: one entry per property, the properties ordered by name,
+/// the property's index in that order, its first offending row and the
+/// refusal. Scalar string enums are checked directly; a list-of-enum property
+/// is checked element by element, the row being the list's.
+pub(crate) fn enum_constraint_failures(
     batch: &RecordBatch,
     properties: &HashMap<String, omnigraph_compiler::types::PropType>,
     type_name: &str,
-) -> Result<()> {
+) -> Vec<(usize, usize, OmniError)> {
     use arrow_array::{Array, ListArray};
 
-    let mut __dst_pp: Vec<_> = properties.iter().collect();
+    let mut __dst_pp: Vec<_> = properties
+        .iter()
+        .filter_map(|(name, prop_type)| {
+            prop_type
+                .enum_values
+                .as_ref()
+                .map(|allowed| (name, prop_type.list, allowed))
+        })
+        .collect();
     __dst_pp.sort_by(|a, b| a.0.cmp(b.0));
-    for (prop_name, prop_type) in __dst_pp {
-        let Some(allowed) = prop_type.enum_values.as_ref() else {
-            continue;
-        };
-        let Some(col) = batch.column_by_name(prop_name) else {
-            continue;
-        };
-        if prop_type.list {
-            let Some(list_col) = col.as_any().downcast_ref::<ListArray>() else {
-                continue;
+    __dst_pp
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, (prop_name, list, allowed))| {
+            let col = batch.column_by_name(prop_name)?;
+            let invalid = |val: &str| {
+                OmniError::manifest(format!(
+                    "invalid enum value '{}' for {}.{} (expected: {})",
+                    val,
+                    type_name,
+                    prop_name,
+                    allowed.join(", ")
+                ))
             };
-            for row in 0..list_col.len() {
-                if list_col.is_null(row) {
-                    continue;
-                }
-                let item_arr = list_col.value(row);
-                let Some(str_arr) = item_arr.as_any().downcast_ref::<StringArray>() else {
-                    continue;
-                };
-                for i in 0..str_arr.len() {
-                    if str_arr.is_null(i) {
-                        continue;
-                    }
-                    let val = str_arr.value(i);
-                    if !allowed.iter().any(|a| a.as_str() == val) {
-                        return Err(OmniError::manifest(format!(
-                            "invalid enum value '{}' for {}.{} (expected: {})",
-                            val,
-                            type_name,
-                            prop_name,
-                            allowed.join(", ")
-                        )));
-                    }
-                }
-            }
-        } else if let Some(str_col) = col.as_any().downcast_ref::<StringArray>() {
-            for row in 0..str_col.len() {
-                if str_col.is_null(row) {
-                    continue;
-                }
-                let val = str_col.value(row);
-                if !allowed.iter().any(|a| a.as_str() == val) {
-                    return Err(OmniError::manifest(format!(
-                        "invalid enum value '{}' for {}.{} (expected: {})",
-                        val,
-                        type_name,
-                        prop_name,
-                        allowed.join(", ")
-                    )));
-                }
-            }
-        }
-    }
-    Ok(())
+            let found = if list {
+                let list_col = col.as_any().downcast_ref::<ListArray>()?;
+                (0..list_col.len())
+                    .filter(|&row| !list_col.is_null(row))
+                    .find_map(|row| {
+                        let item_arr = list_col.value(row);
+                        let str_arr = item_arr.as_any().downcast_ref::<StringArray>()?;
+                        str_arr
+                            .iter()
+                            .flatten()
+                            .find(|val| !allowed.iter().any(|a| a == val))
+                            .map(|val| (row, invalid(val)))
+                    })
+            } else {
+                let str_col = col.as_any().downcast_ref::<StringArray>()?;
+                (0..str_col.len())
+                    .filter(|&row| !str_col.is_null(row))
+                    .find(|&row| !allowed.iter().any(|a| a == str_col.value(row)))
+                    .map(|row| (row, invalid(str_col.value(row))))
+            };
+            found.map(|(row, error)| (index, row, error))
+        })
+        .collect()
 }
 
 /// Build the composite uniqueness key for `row` over a constraint group's
@@ -3568,37 +4256,113 @@ fn explicit_id_matches_node_key(
     Ok(false)
 }
 
-fn extract_numeric_value(col: &ArrayRef, row: usize) -> Option<f64> {
-    use arrow_array::{
-        Array, Float32Array, Float64Array, Int32Array, Int64Array, UInt32Array, UInt64Array,
-    };
-    if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
-        return Some(a.value(row) as f64);
-    }
-    if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
-        return Some(a.value(row) as f64);
-    }
-    if let Some(a) = col.as_any().downcast_ref::<UInt32Array>() {
-        return Some(a.value(row) as f64);
-    }
-    if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
-        return Some(a.value(row) as f64);
-    }
-    if let Some(a) = col.as_any().downcast_ref::<Float32Array>() {
-        return Some(a.value(row) as f64);
-    }
-    if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
-        return Some(a.value(row));
-    }
-    None
+/// The values of a `@range` column in their declared type.
+enum RangeColumn<'a> {
+    Int32(&'a Int32Array),
+    Int64(&'a Int64Array),
+    UInt32(&'a UInt32Array),
+    UInt64(&'a UInt64Array),
+    Float32(&'a Float32Array),
+    Float64(&'a Float64Array),
 }
 
-fn literal_value_to_f64(v: &omnigraph_compiler::catalog::LiteralValue) -> f64 {
-    use omnigraph_compiler::catalog::LiteralValue;
-    match v {
-        LiteralValue::Integer(n) => *n as f64,
-        LiteralValue::Float(f) => *f,
+impl<'a> RangeColumn<'a> {
+    /// `None` for a type `@range` cannot check, which the caller refuses
+    /// rather than skips.
+    fn new(col: &'a ArrayRef) -> Option<Self> {
+        let any = col.as_any();
+        Some(match col.data_type() {
+            DataType::Int32 => Self::Int32(any.downcast_ref()?),
+            DataType::Int64 => Self::Int64(any.downcast_ref()?),
+            DataType::UInt32 => Self::UInt32(any.downcast_ref()?),
+            DataType::UInt64 => Self::UInt64(any.downcast_ref()?),
+            DataType::Float32 => Self::Float32(any.downcast_ref()?),
+            DataType::Float64 => Self::Float64(any.downcast_ref()?),
+            _ => return None,
+        })
     }
+
+    fn value(&self, row: usize) -> RangeOperand {
+        match self {
+            Self::Int32(values) => RangeOperand::Integer(values.value(row).into()),
+            Self::Int64(values) => RangeOperand::Integer(values.value(row).into()),
+            Self::UInt32(values) => RangeOperand::Integer(values.value(row).into()),
+            Self::UInt64(values) => RangeOperand::Integer(values.value(row).into()),
+            Self::Float32(values) => RangeOperand::Float(values.value(row).into()),
+            Self::Float64(values) => RangeOperand::Float(values.value(row)),
+        }
+    }
+}
+
+/// A `@range` value or bound, compared without rounding. Integers widen to
+/// i128, which holds every I32, I64, U32 and U64 value and every Integer
+/// bound; F32 widens to F64 exactly. An integer and a double compare against
+/// the double's exact value, so a Float bound on an integer property, or an
+/// Integer bound on a float property, rounds neither side.
+#[derive(Clone, Copy)]
+enum RangeOperand {
+    Integer(i128),
+    Float(f64),
+}
+
+impl RangeOperand {
+    fn bound(literal: &omnigraph_compiler::catalog::LiteralValue) -> Self {
+        use omnigraph_compiler::catalog::LiteralValue;
+        match literal {
+            LiteralValue::Integer(value) => Self::Integer((*value).into()),
+            LiteralValue::Float(value) => Self::Float(*value),
+        }
+    }
+
+    fn is_nan(self) -> bool {
+        matches!(self, Self::Float(value) if value.is_nan())
+    }
+
+    /// `None` when either side is NaN.
+    fn compare(self, other: Self) -> Option<Ordering> {
+        match (self, other) {
+            (Self::Integer(left), Self::Integer(right)) => Some(left.cmp(&right)),
+            (Self::Float(left), Self::Float(right)) => left.partial_cmp(&right),
+            (Self::Integer(left), Self::Float(right)) => integer_cmp_float(left, right),
+            (Self::Float(left), Self::Integer(right)) => {
+                integer_cmp_float(right, left).map(Ordering::reverse)
+            }
+        }
+    }
+}
+
+impl fmt::Display for RangeOperand {
+    /// The exact value compared: an integral double prints as its integer,
+    /// since f64's shortest form pads with zeros past 17 digits (2^63 would
+    /// read 9223372036854776000).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Integer(value) => write!(f, "{value}"),
+            Self::Float(value) if value.fract() == 0.0 && value.abs() < i128::MAX as f64 => {
+                write!(f, "{}", value as i128)
+            }
+            Self::Float(value) => write!(f, "{value}"),
+        }
+    }
+}
+
+/// Orders an integer against a double's exact value: the double's integral
+/// part is itself an integer, exact in i128 within i128's range, and when the
+/// two integral parts are equal the double's fraction decides. `None` for NaN.
+fn integer_cmp_float(integer: i128, float: f64) -> Option<Ordering> {
+    if float.is_nan() {
+        return None;
+    }
+    let whole = float.trunc();
+    // `i128::MAX as f64` rounds up to 2^127, above every i128;
+    // `i128::MIN as f64` is -2^127 exactly. Infinities land here too.
+    if whole >= i128::MAX as f64 {
+        return Some(Ordering::Less);
+    }
+    if whole < i128::MIN as f64 {
+        return Some(Ordering::Greater);
+    }
+    Some(integer.cmp(&(whole as i128)).then(whole.total_cmp(&float)))
 }
 
 #[cfg(test)]
@@ -4820,10 +5584,59 @@ node Doc {
             arrow_schema: schema,
         };
 
-        let result = validate_value_constraints(&batch, &node_type);
-        assert!(result.is_err(), "expected NaN to be rejected");
-        let err = result.unwrap_err().to_string();
+        let failures = value_constraint_failures(&batch, &node_type);
+        let (_, _, err) = failures.first().expect("expected NaN to be rejected");
+        let err = err.to_string();
         assert!(err.contains("NaN"), "error should mention NaN: {}", err);
+    }
+
+    /// The schema grammar cannot spell an infinite, NaN or negative-zero
+    /// bound, nor reach i128's edges, so the comparator's corners and the
+    /// spelling of a large integral bound are pinned here; the `.gqt` case
+    /// `range_constraint_compares_integers_exactly` owns the observable
+    /// refusals.
+    #[test]
+    fn range_operands_compare_exactly() {
+        use RangeOperand::{Float, Integer};
+        use std::cmp::Ordering::{Equal, Greater, Less};
+
+        let two_53 = 9_007_199_254_740_992_i128;
+        let two_63 = 9_223_372_036_854_775_808_i128;
+        for (value, bound, expected) in [
+            (Integer(two_53 + 1), Integer(two_53), Some(Greater)),
+            (Integer(two_53 + 1), Float(two_53 as f64), Some(Greater)),
+            (Integer(two_63), Integer(two_63 - 1), Some(Greater)),
+            (
+                Integer(u64::MAX.into()),
+                Float(18_446_744_073_709_551_616.0),
+                Some(Less),
+            ),
+            (Integer(2), Float(2.5), Some(Less)),
+            (Integer(3), Float(2.5), Some(Greater)),
+            (Integer(-2), Float(-2.5), Some(Greater)),
+            (Integer(-3), Float(-2.5), Some(Less)),
+            (Integer(0), Float(-0.0), Some(Equal)),
+            (Integer(0), Float(-0.5), Some(Greater)),
+            (Integer(-1), Float(-0.5), Some(Less)),
+            (Integer(i128::MAX), Float(f64::INFINITY), Some(Less)),
+            (Integer(i128::MIN), Float(f64::NEG_INFINITY), Some(Greater)),
+            (Integer(i128::MIN), Float(i128::MIN as f64), Some(Equal)),
+            (Integer(i128::MAX), Float(i128::MAX as f64), Some(Less)),
+            (Integer(0), Float(f64::NAN), None),
+            (Float(two_53 as f64), Integer(two_53 + 1), Some(Less)),
+            (Float(0.5), Float(0.5), Some(Equal)),
+            (Float(f64::NAN), Float(0.0), None),
+        ] {
+            assert_eq!(value.compare(bound), expected, "{value} against {bound}");
+        }
+        for (operand, shown) in [
+            (Float(9_223_372_036_854_775_808.0), "9223372036854775808"),
+            (Float(-2.5), "-2.5"),
+            (Float(f64::INFINITY), "inf"),
+            (Integer(u64::MAX.into()), "18446744073709551615"),
+        ] {
+            assert_eq!(operand.to_string(), shown);
+        }
     }
 
     #[test]

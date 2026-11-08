@@ -27,10 +27,8 @@ use std::time::Duration;
 
 use futures::stream::StreamExt;
 use lance::dataset::optimize::{CompactionMetrics, CompactionOptions};
-use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 
 use super::*;
-use crate::dataset_index::is_full_text_index;
 use crate::seams::{decide_seam, fail};
 
 /// How many datasets to optimize/cleanup concurrently. Each has separate
@@ -468,8 +466,14 @@ async fn prepare_optimize_table(
         let mut stat =
             DatasetOptimizeStats::compacted(task.table_key, &CompactionMetrics::default(), false);
         stat.pending_indexes = index_work.pending;
-        append_deferred_full_text_indexes(&snapshot, &stat.type_key, &mut stat.pending_indexes)
-            .await?;
+        super::table_ops::append_deferred_full_text_indexes(
+            &snapshot,
+            &stat.type_key,
+            "main",
+            &[],
+            &mut stat.pending_indexes,
+        )
+        .await?;
         return Ok(OptimizePreparation::Stat(stat));
     }
 
@@ -482,52 +486,6 @@ async fn prepare_optimize_table(
         witness: task.witness,
         last_linear_version: task.entry.version_metadata.last_linear_version(),
     }))
-}
-
-/// Deferred full-text coverage is observable status, never a promise that
-/// ordinary optimize will advance this table. Recheck after physical work too:
-/// stable-ID compaction can change coverage while preserving index artifacts.
-async fn append_deferred_full_text_indexes(
-    snapshot: &crate::storage_layer::SnapshotHandle,
-    table_key: &str,
-    pending: &mut Vec<super::PendingIndex>,
-) -> Result<()> {
-    let ds = snapshot.dataset();
-    let indices = ds.load_indices().await.map_err(OmniError::storage)?;
-    let full_text: std::collections::BTreeMap<_, _> = indices
-        .iter()
-        .filter(|index| is_full_text_index(index))
-        .map(|index| (index.name.as_str(), index))
-        .collect();
-    for (name, index) in full_text {
-        let coverage_unknown = indices
-            .iter()
-            .any(|segment| segment.name == name && segment.fragment_bitmap.is_none());
-        if !coverage_unknown
-            && ds
-                .unindexed_fragments(name)
-                .await
-                .map_err(OmniError::storage)?
-                .is_empty()
-        {
-            continue;
-        }
-        for field in index
-            .keyed_fields()
-            .iter()
-            .filter_map(|id| ds.schema().field_by_id(*id))
-        {
-            pending.push(super::PendingIndex {
-                type_key: table_key.to_string(),
-                property: field.name.clone(),
-                reason: format!(
-                    "full-text index '{name}' has incomplete or unknown coverage; \
-                     run omnigraph rebuild-full-text-indexes <URI> --branch main"
-                ),
-            });
-        }
-    }
-    Ok(())
 }
 
 decide_seam! {
@@ -627,12 +585,26 @@ async fn apply_optimize_table_effects(
     let Some(identity) = tip_identity else {
         let mut stat = DatasetOptimizeStats::compacted(table_key, &metrics, false);
         stat.pending_indexes = index_work.pending;
-        append_deferred_full_text_indexes(&tip, &stat.type_key, &mut stat.pending_indexes).await?;
+        super::table_ops::append_deferred_full_text_indexes(
+            &tip,
+            &stat.type_key,
+            "main",
+            &[],
+            &mut stat.pending_indexes,
+        )
+        .await?;
         return Ok(OptimizeEffectOutcome { stat, effect: None });
     };
     let mut stat = DatasetOptimizeStats::compacted(table_key.clone(), &metrics, true);
     stat.pending_indexes = index_work.pending;
-    append_deferred_full_text_indexes(&tip, &stat.type_key, &mut stat.pending_indexes).await?;
+    super::table_ops::append_deferred_full_text_indexes(
+        &tip,
+        &stat.type_key,
+        "main",
+        &[],
+        &mut stat.pending_indexes,
+    )
+    .await?;
     let state = db.storage().table_state(&full_path, &tip).await?;
     let published_dataset_version = work.expected_version + 1 + chain.len() as u64;
     let version_metadata = state
@@ -697,7 +669,7 @@ async fn clear_manifest_auto_cleanup(db: &Omnigraph) -> Result<DatasetOptimizeSt
         match clear_stale_auto_cleanup_config(&mut ds).await {
             Ok(cleared) => {
                 if cleared {
-                    db.coordinator.write().await.refresh().await?;
+                    db.refresh_coordinator_only().await?;
                 }
                 return Ok(DatasetOptimizeStats::compacted(
                     "__manifest".to_string(),
@@ -721,6 +693,13 @@ async fn clear_manifest_auto_cleanup(db: &Omnigraph) -> Result<DatasetOptimizeSt
 
 decide_seam! {
     pub static CLEANUP_TABLE_GC = ("cleanup.table_gc", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    /// After one expired unattached tag's release is confirmed and before
+    /// the next one's: the released descendant is gone, its ancestors stay
+    /// addressable, and a retried cleanup finishes upward.
+    pub static CLEANUP_POST_UNATTACHED_RELEASE = ("cleanup.post_unattached_release", Unreachable, [Fail]);
 }
 
 decide_seam! {
@@ -855,7 +834,14 @@ async fn cleanup_detached_only(
         .buffer_unordered(concurrency)
         .collect()
         .await;
-    if !plan.expired_merge_input_tags.is_empty() || !plan.expired_unpublished_tags.is_empty() {
+    let unattached_release = super::collector::unattached_release_order(
+        &plan.expired_unattached_tags,
+        &plan.retained_unattached_tags,
+    );
+    if !plan.expired_merge_input_tags.is_empty()
+        || !plan.expired_unpublished_tags.is_empty()
+        || !unattached_release.is_empty()
+    {
         let manifest =
             crate::db::manifest::ManifestCoordinator::collector_branch_under_control_gates(
                 db.root_uri(),
@@ -872,6 +858,24 @@ async fn cleanup_detached_only(
             crate::db::manifest::unpublished::release_unpublished_tag(manifest.dataset(), name)
                 .await?;
         }
+        let mut unattached_tags_released: u64 = 0;
+        for record in &unattached_release {
+            crate::db::manifest::unattached::release_unattached_tag_confirmed(
+                manifest.dataset(),
+                &record.name,
+                &record.graph_commit_id,
+            )
+            .await?;
+            unattached_tags_released += 1;
+            fail(&CLEANUP_POST_UNATTACHED_RELEASE)?;
+        }
+        tracing::info!(
+            target: "omnigraph::cleanup",
+            unattached_tags_released,
+            unattached_tags_retained = plan.retained_unattached_tags.len(),
+            unattached_tags_blocked = plan.expired_unattached_tags.len() - unattached_release.len(),
+            "cleanup released the expired unattached branch tags"
+        );
     }
     let reconciled = reconcile_frozen_native_forks(db, native_plan, plan).await?;
     if !reconciled.reclaimed.is_empty() {
@@ -916,8 +920,7 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
 pub(crate) async fn cleanup_graph_branches(db: &Omnigraph) -> Result<Vec<Option<String>>> {
     let mut branches = db
         .coordinator
-        .read()
-        .await
+        .load_full()
         .all_branches()
         .await?
         .into_iter()

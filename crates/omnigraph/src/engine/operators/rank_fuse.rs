@@ -17,7 +17,8 @@ use datafusion::physical_plan::{
 };
 
 use super::memory::WorkMemory;
-use super::{breaker_properties, breaker_stream, conform_positional, drain_one, external, polled};
+use super::shape::{Breaker, work};
+use super::{conform_positional, drain_one, external};
 use crate::engine::graph::{fuse_arms, fused_schema};
 use crate::engine::search::RrfMode;
 use crate::error::OmniError;
@@ -39,7 +40,7 @@ pub(crate) struct RankFuseExec {
     fused_score: String,
     orders: [ArmOrder; 2],
     row_tiebreak: Vec<String>,
-    properties: Arc<PlanProperties>,
+    shape: Breaker,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -62,7 +63,7 @@ impl RankFuseExec {
             fused_score,
             orders,
             row_tiebreak,
-            properties: breaker_properties(schema),
+            shape: Breaker::new(schema),
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -155,7 +156,7 @@ impl ExecutionPlan for RankFuseExec {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
+        self.shape.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -201,12 +202,10 @@ impl ExecutionPlan for RankFuseExec {
         let orders = self.orders.clone();
         let row_tiebreak = self.row_tiebreak.clone();
         let declared = Arc::clone(&schema);
-        let stream = breaker_stream(
-            "RankFuseExec",
-            schema,
-            &ctx,
-            &self.metrics,
-            move |reservation| async move {
+        let memory = work(ctx, "RankFuseExec", &self.metrics)?;
+        Ok(self
+            .shape
+            .stream(memory, &self.metrics, move |reservation| async move {
                 let primary = drain_one(primary, &primary_schema, &reservation).await?;
                 let secondary = drain_one(secondary, &secondary_schema, &reservation).await?;
                 reservation
@@ -237,9 +236,7 @@ impl ExecutionPlan for RankFuseExec {
                         conform_positional(fused, &declared).map_err(external)
                     })
                     .await
-            },
-        );
-        Ok(polled(&self.metrics, stream))
+            }))
     }
 }
 

@@ -60,6 +60,32 @@ pub(crate) struct EmbedOutput {
     pub model: String,
 }
 
+pub(crate) fn write_human(output: &EmbedOutput, stdout: &mut dyn Write) -> Result<()> {
+    let vectors = output
+        .vectors
+        .iter()
+        .map(|vector| {
+            format!(
+                "{}.{} {}d",
+                vector.type_name, vector.property, vector.dimension
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(
+        stdout,
+        "embedded {} records (selected {}, cleaned {}) from {} -> {} [{}: {}]",
+        output.embedded_records,
+        output.selected_records,
+        output.cleaned_records,
+        output.input,
+        output.output,
+        output.mode,
+        vectors
+    )?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct EmbedJob {
     input: PathBuf,
@@ -461,7 +487,7 @@ fn load_seed_manifest(path: &Path) -> Result<ResolvedSeedManifest> {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or(std::env::current_dir()?);
-    let manifest: SeedManifest = serde_yaml::from_str(&fs::read_to_string(path)?)
+    let manifest: SeedManifest = yaml_serde::from_str(&fs::read_to_string(path)?)
         .map_err(|err| eyre!("seed manifest {}: {err}", path.display()))?;
     let schema = manifest.schema.ok_or_else(|| {
         eyre!(

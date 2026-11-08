@@ -41,11 +41,12 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use lance::Dataset;
 use lance::dataset::transaction::{Operation, TransactionBuilder};
-use lance::dataset::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
+use lance::dataset::{InsertBuilder, WriteMode, WriteParams};
 use lance_file::version::LanceFileVersion;
 use lance_table::format::Fragment;
 
 use crate::error::{OmniError, Result};
+use crate::manifest_request::ManifestRequestProbe;
 use crate::migrations::{
     INTERNAL_MANIFEST_SCHEMA_VERSION, guard_row_layout, read_stamp, stamp_entry,
 };
@@ -77,8 +78,8 @@ const DETACHED_VERSION_RETRIES: u32 = 20;
 /// Write `rows` as the hot row set of `dataset`'s version + 1, and `cold` as
 /// a cold fragment of that version. The schema metadata carries over from
 /// `dataset`, a served stamp, and the new version is stamped with the format
-/// this binary writes: a v14 branch becomes v15 in the CAS that writes its
-/// first registry rows. Returns the hot batch beside the new version.
+/// this binary writes: a branch below it takes the current stamp in the CAS
+/// that writes its first rows. Returns the hot batch beside the new version.
 pub(crate) async fn overwrite(
     dataset: Dataset,
     rows: &ManifestRows,
@@ -104,6 +105,29 @@ async fn overwrite_placed(
     rows: &ManifestRows,
     cold: Option<&LineageRegistry>,
     placement: Placement,
+) -> Result<(Dataset, RecordBatch)> {
+    let probe = ManifestRequestProbe::new();
+    overwrite_probed(dataset, rows, cold, placement, probe.clone())
+        .await
+        .map_err(|error| {
+            // Every failure before the conditional manifest create, and one
+            // the store refused outright, publishes nothing: no request for
+            // the version can land. A request that may have applied stays
+            // opaque for the publisher's read-back.
+            if probe.outcome().may_have_landed() {
+                error
+            } else {
+                error.unpublished()
+            }
+        })
+}
+
+async fn overwrite_probed(
+    dataset: Dataset,
+    rows: &ManifestRows,
+    cold: Option<&LineageRegistry>,
+    placement: Placement,
+    probe: ManifestRequestProbe,
 ) -> Result<(Dataset, RecordBatch)> {
     guard_row_layout(&dataset)?;
     let mut metadata = dataset.schema().metadata.clone();
@@ -149,16 +173,20 @@ async fn overwrite_placed(
         initial_bases: None,
     };
     let mut transaction = TransactionBuilder::new(dataset.version().version, operation).build();
+    let handler = crate::lance_clone::probed_commit_handler(&dataset, probe)
+        .await
+        .map_err(OmniError::storage)?;
     let builder = match placement {
-        Placement::Linear => CommitBuilder::new(dataset).with_max_retries(0),
+        Placement::Linear => crate::lance_commit::commit_builder(dataset).with_max_retries(0),
         Placement::Detached { properties } => {
             transaction.transaction_properties = Some(Arc::new(properties));
-            CommitBuilder::new(dataset)
+            crate::lance_commit::commit_builder(dataset)
                 .with_detached(true)
                 .with_max_retries(DETACHED_VERSION_RETRIES)
         }
     };
     let committed = builder
+        .with_commit_handler(handler)
         .with_skip_auto_cleanup(true)
         .execute(transaction)
         .await
@@ -264,7 +292,7 @@ pub(crate) async fn commit_overwrite(
         .execute_uncommitted(batches)
         .await
         .map_err(map_lance_publish_error)?;
-    CommitBuilder::new(dataset)
+    crate::lance_commit::commit_builder(dataset)
         .with_max_retries(0)
         .with_skip_auto_cleanup(true)
         .execute(transaction)

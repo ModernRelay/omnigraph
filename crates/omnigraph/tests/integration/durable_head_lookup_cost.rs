@@ -18,7 +18,7 @@
 //! stable summary fields on the pinned Lance surface.  The
 //! `fragments_scanned`, `ranges_scanned`, and `rows_scanned` entries in
 //! `all_counts` are explicitly documented upstream as debug/subject-to-change;
-//! this dedicated substrate fixture intentionally requires the pinned RC.1 names
+//! this dedicated substrate fixture intentionally requires the pinned Lance names
 //! so a Lance upgrade fails visibly and triggers a fresh alignment audit.
 
 use std::collections::{BTreeMap, HashMap};
@@ -684,7 +684,7 @@ async fn record_state(
             cost,
         };
         eprintln!(
-            "RFC024 backend={:?} depth={} actual={} layout={:?} index={:?} access={:?} fragments={}/{} object_io={}/{} scan_io={}/{} pages={} scanned=f{}/r{}/rows{} output={}",
+            "RFC024 backend={:?} depth={} actual={} layout={:?} index={:?} access={:?} fragments={}/{} object_io={}/{} scan_io={}/{}/{} pages={} scanned=f{}/r{}/rows{} output={}",
             backend,
             point.base_depth,
             point.journal_depth,
@@ -696,6 +696,7 @@ async fn record_state(
             point.cost.object_store_reads,
             point.cost.object_store_read_bytes,
             point.cost.scan_iops,
+            point.cost.scan_requests,
             point.cost.scan_read_bytes,
             point.cost.index_pages_loaded,
             point.cost.fragments_scanned,
@@ -922,16 +923,30 @@ fn assert_reconciled_slopes(curve: &[CurvePoint], depths: &[u64], backend: Stora
                     AccessMode::WarmRepeat => 0,
                 }
             );
-            // RC.1 crosses at most one additional range-read boundary between
-            // the 10- and 1,000-commit endpoints. The candidate already fails
-            // Gate A on physical byte curves; keep this second no-go visible
-            // and bounded instead of describing the read cost as flat.
-            assert_bounded_growth(
-                "BLOCKER: reconciled scan I/O operations",
-                shallow.cost.scan_iops,
-                deep.cost.scan_iops,
-                1,
-            );
+            if layout == HistoryLayout::Compacted && backend == StorageBackend::Local {
+                // Lance 13 decoder::RequestBatch groups page/column reads before
+                // FileScheduler coalesces nearby ranges. iops counts those
+                // physical ranges, not the exact logical ranges checked above.
+                // At 20/80 publishes cold iops are 4/6 and warm iops 1/2.
+                // Bound both samples independently so different file geometry
+                // cannot hide a history-dependent increase behind a larger base.
+                assert_bounded_pair(
+                    "local compacted scan I/O operations",
+                    shallow.cost.scan_iops,
+                    deep.cost.scan_iops,
+                    match access {
+                        AccessMode::ColdOpen => 6,
+                        AccessMode::WarmRepeat => 2,
+                    },
+                );
+            } else {
+                assert_bounded_growth(
+                    "BLOCKER: reconciled scan I/O operations",
+                    shallow.cost.scan_iops,
+                    deep.cost.scan_iops,
+                    1,
+                );
+            }
             assert_bounded_growth(
                 "BLOCKER: reconciled scan requests",
                 shallow.cost.scan_requests,
@@ -939,23 +954,43 @@ fn assert_reconciled_slopes(curve: &[CurvePoint], depths: &[u64], backend: Stora
                 1,
             );
 
-            match (layout, access) {
-                (HistoryLayout::Uncompacted, _) => assert_bounded_growth(
+            match (layout, access, backend) {
+                (HistoryLayout::Uncompacted, _, _) => assert_bounded_growth(
                     "BLOCKER: reconciled uncompacted scan bytes",
                     shallow.cost.scan_read_bytes,
                     deep.cost.scan_read_bytes,
                     128,
                 ),
-                (HistoryLayout::Compacted, AccessMode::ColdOpen) => assert_grows(
-                    "BLOCKER: compacted cold scan bytes",
-                    shallow.cost.scan_read_bytes,
-                    deep.cost.scan_read_bytes,
-                ),
-                (HistoryLayout::Compacted, AccessMode::WarmRepeat) => assert_non_growing(
-                    "compacted warm scan bytes",
-                    shallow.cost.scan_read_bytes,
-                    deep.cost.scan_read_bytes,
-                ),
+                (HistoryLayout::Compacted, _, StorageBackend::Local) => {
+                    // The same V2_2 logical projection reads 35,272/22,983
+                    // bytes cold and 20,728/13,344 warm on Lance 13. Requiring
+                    // growth would reject an improved encoding. Keep fixed
+                    // byte ceilings, rounded to local 4 KiB read blocks, rather
+                    // than treating fewer rows or ranges as the physical proof.
+                    assert_bounded_pair(
+                        "local compacted scan bytes",
+                        shallow.cost.scan_read_bytes,
+                        deep.cost.scan_read_bytes,
+                        match access {
+                            AccessMode::ColdOpen => 36 * 1024,
+                            AccessMode::WarmRepeat => 24 * 1024,
+                        },
+                    );
+                }
+                (HistoryLayout::Compacted, AccessMode::ColdOpen, StorageBackend::S3) => {
+                    assert_grows(
+                        "BLOCKER: compacted cold scan bytes",
+                        shallow.cost.scan_read_bytes,
+                        deep.cost.scan_read_bytes,
+                    )
+                }
+                (HistoryLayout::Compacted, AccessMode::WarmRepeat, StorageBackend::S3) => {
+                    assert_non_growing(
+                        "compacted warm scan bytes",
+                        shallow.cost.scan_read_bytes,
+                        deep.cost.scan_read_bytes,
+                    )
+                }
             }
 
             match (layout, access, backend) {
@@ -1010,7 +1045,7 @@ fn assert_reconciled_slopes(curve: &[CurvePoint], depths: &[u64], backend: Stora
                     );
                     // Local manifest/object bookkeeping is non-monotonic as
                     // compacted files cross encoding boundaries. It is a
-                    // bounded control; scan bytes above carry the no-go slope.
+                    // bounded control, independent of the fixed local scan budgets.
                     assert_bounded_pair(
                         "local compacted cold object bytes",
                         shallow.cost.object_store_read_bytes,

@@ -397,7 +397,7 @@ mod tests {
     use super::*;
 
     fn case() -> CaseV1 {
-        serde_yaml::from_str(
+        yaml_serde::from_str(
             r#"
 version: 1
 id: worker-protocol-test

@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use arrow_schema::{Schema, SchemaRef};
+use datafusion::datasource::sink::DataSinkExec;
 use datafusion::functions_aggregate::average::avg_udaf;
 use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::functions_aggregate::min_max::{max_udaf, min_udaf};
@@ -20,26 +21,33 @@ use datafusion::physical_expr::aggregate::AggregateExprBuilder;
 use datafusion::physical_expr::expressions::{CastExpr, Column};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
-use omnigraph_compiler::ir::SubqueryPredicate;
+use datafusion::physical_plan::execution_plan::EmissionType;
+use omnigraph_compiler::ir::{DeltaClass, SubqueryPredicate};
+use omnigraph_compiler::query::ast::LoadStmtMode;
 use omnigraph_compiler::traversal::EDGE_TYPE_COLUMN;
 use omnigraph_planner::logical::{EDGE_TYPE_MEMBER, IDENTITY_MEMBER};
 use omnigraph_planner::{
-    Accumulator, AggregateFields, BoundPlan, ColumnRef, ContainsJoinFields, ExpandFields,
-    HashJoinFields, HydratedBinding, Lower, NodeId, PhysicalNode, PhysicalPlan, PlanError,
-    Predicate, ROW_ADDRESS_PREFIX, RankArm, RankFuseFields, RankKind, RankedAccess,
-    RuntimeFilterKind, RuntimeFilterSpec, ScanInput, ScanSpec, SideId, SortMergeJoinFields,
+    Accumulator, AggregateFields, AntiJoinStrategy, BoundPlan, ColumnRef, ContainsJoinFields,
+    CsvSourceFields, DeltaSourceFields, ExpandFields, FragmentWriteFields, HashJoinFields,
+    HydratedBinding, Lower, NodeId, PhysicalNode, PhysicalPlan, PlanError, Predicate,
+    ROW_ADDRESS_PREFIX, RankArm, RankFuseFields, RankKind, RankedAccess, RuntimeFilterKind,
+    RuntimeFilterSpec, ScanInput, ScanSpec, SideId, SortMergeJoinFields, ValidateFields,
     ValueTable,
 };
 
 use super::adapters::{GqProjectionExpr, LoweringId, Projected};
 use super::exact_aggregate::{EXACT_CARRIER, ExactIntegerUdaf};
 use super::operators::{
-    AntiJoinMaskExec, ArmOrder, ContainsJoinExec, CrossJoinExec, ExpandExec, ExpandExecution,
-    ExpandStep, FilterExec, GraphEnv, HashJoinExec, HydrateExec, LimitExec, LookupSpec,
-    MetadataCountExec, OuterReferenceExec, OuterSlot, ProjectionExec, RankFuseExec,
-    RuntimeFilterSlot, ScanExec, ScanSource, SortExec, SortKey, fresh_tag_column, tagged_schema,
+    AntiJoinMaskExec, ArmOrder, CatalogueExec, ContainsJoinExec, CrossJoinExec, CsvSourceExec,
+    ExpandExec, ExpandExecution, ExpandStep, FilterExec, GraphEnv, HashJoinExec, HydrateExec,
+    LanceFragmentSink, LimitExec, LookupSpec, MetadataCountExec, OuterReferenceExec, OuterSlot,
+    ProjectionExec, RankFuseExec, RuntimeFilterSlot, ScanExec, ScanSource, SortExec, SortKey,
+    ValidateExec, fresh_tag_column, tagged_schema,
 };
 use super::*;
+use crate::loader::LoadMode;
+use crate::loader::csv::target_arrow_schema;
+use crate::validate::load::{JudgedSide, JudgedTable, RepeatRule, Report, WriteJudge};
 
 type Plan = Arc<dyn ExecutionPlan>;
 
@@ -51,17 +59,21 @@ pub(super) const HIDDEN: &str = "~";
 pub(super) struct Lowering<'a> {
     pub(super) plan: &'a PhysicalPlan,
     pub(super) values: &'a ValueTable,
-    pub(super) snapshot: &'a Snapshot,
+    /// The graph storage the stored-type scans, counts, hydrations and
+    /// traversals read; `None` under the catalogue-only scope.
+    pub(super) snapshot: Option<&'a Snapshot>,
     pub(super) graph_index: &'a Arc<GraphIndexHandle>,
     pub(super) catalog: &'a Arc<Catalog>,
+    pub(super) load: Option<&'a LoadFacts>,
 }
 
 pub(super) struct Lowered {
     pub(super) root: Plan,
     /// The one operator of every live node, the tree `root` heads.
     pub(super) operators: HashMap<NodeId, Plan>,
-    /// What the ranked scan reported in this pass, for the overfetch ladder.
-    pub(super) report: Arc<Mutex<ScanReport>>,
+    /// What each nearest scan reported in this pass, by plan node: the
+    /// overfetch ladder's input and the run's probe decisions.
+    pub(super) report: Arc<Mutex<ScanReports>>,
     /// The in-memory filter applications of the tree, one per conjunct.
     in_memory_filters: usize,
 }
@@ -75,11 +87,21 @@ impl Lowered {
     }
 }
 
-/// What every operator of one lowering shares.
+/// What every operator of one lowering shares; the graph environment only
+/// when the lowering has storage.
 struct Scope {
     id: LoweringId,
-    env: Arc<GraphEnv>,
+    env: Option<Arc<GraphEnv>>,
     ctx: Arc<ProjectionContext>,
+}
+
+impl Scope {
+    fn env(&self, what: &str) -> Lowers<Arc<GraphEnv>> {
+        self.env
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| super::no_graph_storage(what).into())
+    }
 }
 
 impl<'a> Lowering<'a> {
@@ -91,6 +113,7 @@ impl<'a> Lowering<'a> {
             snapshot: context.snapshot,
             graph_index: &context.graph_index,
             catalog: context.catalog,
+            load: context.load,
         }
     }
 
@@ -98,6 +121,12 @@ impl<'a> Lowering<'a> {
         self.plan.node(id).ok_or_else(|| {
             OmniError::manifest_internal(format!("physical node {id} is a tombstone"))
         })
+    }
+
+    /// The snapshot a storage-reading node needs, or the catalogue-only
+    /// refusal naming `what`.
+    fn snapshot(&self, what: &str) -> Result<&'a Snapshot> {
+        self.snapshot.ok_or_else(|| super::no_graph_storage(what))
     }
 
     fn params(&self) -> &'a Arc<ParamMap> {
@@ -161,6 +190,7 @@ impl<'a> Lowering<'a> {
                     None => ranked.nprobes,
                 };
                 mode.nearest_exact = rung.is_some_and(|rung| rung.exact);
+                mode.nearest_policy = ranked.policy;
             }
             RankKind::Bm25 => {
                 let text = resolve_to_string(&ranked.query, self.params())?;
@@ -168,14 +198,16 @@ impl<'a> Lowering<'a> {
                     property: ranked.property.clone(),
                     text,
                 });
+                mode.eligibility_after_scoring =
+                    ranked.eligibility == omnigraph_planner::Eligibility::AfterScoring;
             }
         }
         Ok(mode)
     }
 
-    /// What a scan of `spec` reads: the destination type, the binding, the
-    /// pushed filters and the projection, on either side of a hash join too.
-    fn lookup(&self, spec: &ScanSpec) -> Result<LookupSpec> {
+    /// The type, binding and projection a scan of `spec` reads, the part of
+    /// a lookup that needs no storage.
+    fn lookup_columns(&self, spec: &ScanSpec) -> Result<ScanColumnsSpec> {
         let binding = spec.binding.as_deref().ok_or_else(|| {
             OmniError::manifest_internal(
                 "a read plan's scan is bound to a match variable".to_string(),
@@ -186,20 +218,37 @@ impl<'a> Lowering<'a> {
             .type_key
             .strip_prefix("node:")
             .unwrap_or(&spec.table.type_key);
-        Ok(LookupSpec {
+        Ok(ScanColumnsSpec {
             type_name: type_name.to_string(),
             binding: binding.to_string(),
+            projection: spec
+                .projection
+                .as_ref()
+                .map(|columns| NeededColumns(columns.iter().cloned().collect())),
+        })
+    }
+
+    /// What a scan of `spec` reads: the destination type, the binding, the
+    /// pushed filters and the projection, on either side of a hash join too.
+    fn lookup(&self, spec: &ScanSpec) -> Result<LookupSpec> {
+        let ScanColumnsSpec {
+            type_name,
+            binding,
+            projection,
+        } = self.lookup_columns(spec)?;
+        Ok(LookupSpec {
+            type_name,
+            binding,
             filters: spec
                 .filter
                 .as_ref()
                 .map(Predicate::gq_filters)
                 .unwrap_or_default(),
-            projection: spec
-                .projection
-                .as_ref()
-                .map(|columns| NeededColumns(columns.iter().cloned().collect())),
+            projection,
             params: Arc::clone(self.params()),
-            snapshot: self.snapshot.clone(),
+            snapshot: self
+                .snapshot(&format!("the scan of `{}`", spec.table.type_key))?
+                .clone(),
             catalog: Arc::clone(self.catalog),
         })
     }
@@ -357,12 +406,19 @@ struct OuterScope {
     tag_column: String,
 }
 
+/// The storage-free part of a scan's lookup.
+struct ScanColumnsSpec {
+    type_name: String,
+    binding: String,
+    projection: Option<NeededColumns>,
+}
+
 /// The state of one `PhysicalPlan::lower` call over a read plan.
 struct Walk<'l, 'a> {
     lowering: &'l Lowering<'a>,
     pass: &'l Pass,
     scope: Scope,
-    report: Arc<Mutex<ScanReport>>,
+    report: Arc<Mutex<ScanReports>>,
     outers: Vec<OuterScope>,
     operators: HashMap<NodeId, Plan>,
     in_memory_filters: usize,
@@ -381,14 +437,16 @@ impl<'l, 'a> Walk<'l, 'a> {
             pass,
             scope: Scope {
                 id: LoweringId::next(),
-                env: Arc::new(GraphEnv {
-                    graph_index: Arc::clone(lowering.graph_index),
-                    snapshot: lowering.snapshot.clone(),
-                    catalog: Arc::clone(lowering.catalog),
+                env: lowering.snapshot.map(|snapshot| {
+                    Arc::new(GraphEnv {
+                        graph_index: Arc::clone(lowering.graph_index),
+                        snapshot: snapshot.clone(),
+                        catalog: Arc::clone(lowering.catalog),
+                    })
                 }),
                 ctx: Arc::new(ProjectionContext::for_plan(lowering.catalog, lowering.plan)),
             },
-            report: Arc::new(Mutex::new(ScanReport::default())),
+            report: Arc::new(Mutex::new(ScanReports::new())),
             outers: Vec::new(),
             operators: HashMap::new(),
             in_memory_filters: 0,
@@ -420,10 +478,37 @@ impl<'l, 'a> Walk<'l, 'a> {
             .into()
     }
 
-    /// The one operator of node `id`.
+    /// The one operator of node `id`; `AggregateExec` (not built through a
+    /// shape; `Final` while its input order mode is linear) and `ValidateExec`
+    /// (its shape chosen by the plan's checks) have their emission checked.
     fn built(&mut self, id: NodeId, operator: impl ExecutionPlan) -> Lowers<Plan> {
         let plan: Plan = Arc::new(operator);
         let node = self.lowering.node(id)?;
+        if matches!(node, PhysicalNode::Aggregate { .. })
+            && plan.properties().emission_type != EmissionType::Final
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "node {id} `Aggregate` is a pipeline breaker in the plan but `{}` emits {:?}",
+                plan.name(),
+                plan.properties().emission_type,
+            ))
+            .into());
+        }
+        if matches!(node, PhysicalNode::Validate { .. }) {
+            let declared = match node.shape() {
+                omnigraph_planner::PipelineShape::Breaker => EmissionType::Final,
+                omnigraph_planner::PipelineShape::Streaming => EmissionType::Incremental,
+            };
+            if plan.properties().emission_type != declared {
+                return Err(OmniError::manifest_internal(format!(
+                    "node {id} `Validate` is {:?} in the plan's cut but `{}` emits {:?}",
+                    node.shape(),
+                    plan.name(),
+                    plan.properties().emission_type,
+                ))
+                .into());
+            }
+        }
         if matches!(
             node,
             PhysicalNode::Projection { .. }
@@ -481,7 +566,9 @@ impl Lower for Walk<'_, '_> {
         })?;
         let count = MetadataCountExec::new(
             spec.table.type_key.clone(),
-            self.lowering.snapshot.clone(),
+            self.lowering
+                .snapshot(&format!("the metadata count of `{}`", spec.table.type_key))?
+                .clone(),
             Arc::clone(&properties.schema),
         );
         self.built(id, count)
@@ -503,6 +590,27 @@ impl Lower for Walk<'_, '_> {
             ))
             .into());
         }
+        if spec.table.is_catalogue() {
+            if ranked.is_some()
+                || spec.runtime_filter.is_some()
+                || !matches!(source, ScanInput::Table)
+                || input.is_some()
+            {
+                return Err(OmniError::manifest_internal(format!(
+                    "scan {id} of `{}` asks the catalogue for a ranked, runtime-filtered or dependent read",
+                    spec.table.type_key
+                ))
+                .into());
+            }
+            let lookup = self.lowering.lookup_columns(spec)?;
+            let scan = CatalogueExec::try_new(
+                &lookup.type_name,
+                &lookup.binding,
+                lookup.projection.as_ref(),
+                self.lowering.catalog,
+            )?;
+            return self.built(id, scan);
+        }
         let runtime = match (source, ranked, &spec.runtime_filter) {
             (ScanInput::Table, None, Some(filter)) => {
                 Some(Arc::new(Self::runtime_scan_filter(id, spec, filter)?))
@@ -520,6 +628,7 @@ impl Lower for Walk<'_, '_> {
                 ScanSource::Table {
                     mode: Box::new(mode),
                     report: Arc::clone(&self.report),
+                    node: id,
                 }
             }
             _ => {
@@ -588,7 +697,9 @@ impl Lower for Walk<'_, '_> {
         let hydrate = HydrateExec::try_new(
             input,
             bindings.to_vec(),
-            self.lowering.snapshot.clone(),
+            self.lowering
+                .snapshot("the hydration of return columns")?
+                .clone(),
             self.lowering.catalog,
             declared.schema.as_ref(),
         )?;
@@ -697,7 +808,8 @@ impl Lower for Walk<'_, '_> {
             edge_binding: fields.edge_binding.map(str::to_string),
             frontier_estimate: fields.frontier_estimate,
         };
-        let expand = ExpandExec::try_new(input, step, Arc::clone(&self.scope.env))?;
+        let env = self.scope.env("a traversal")?;
+        let expand = ExpandExec::try_new(input, step, env)?;
         self.built(id, expand)
     }
 
@@ -720,6 +832,7 @@ impl Lower for Walk<'_, '_> {
             inner: inner_id,
             predicate,
             aggregate,
+            strategy,
             ..
         } = self.lowering.node(id)?
         else {
@@ -734,9 +847,12 @@ impl Lower for Walk<'_, '_> {
             )
             .into());
         }
-        let bulk = self
-            .lowering
-            .bulk_row_count(*inner_id, outer_var, predicate)?;
+        let bulk = match strategy {
+            AntiJoinStrategy::Correlated => self
+                .lowering
+                .bulk_row_count(*inner_id, outer_var, predicate)?,
+            AntiJoinStrategy::KeySet => None,
+        };
         let mask = AntiJoinMaskExec::new(
             outer,
             inner,
@@ -746,8 +862,10 @@ impl Lower for Walk<'_, '_> {
             Arc::clone(self.lowering.params()),
             scope.tag_column,
             scope.slot,
+            *strategy,
             bulk,
-            Arc::clone(&self.scope.env),
+            Arc::clone(self.lowering.catalog),
+            Arc::clone(self.lowering.graph_index),
         );
         self.built(id, mask)
     }
@@ -896,6 +1014,7 @@ impl Lower for Walk<'_, '_> {
                 (
                     IRExpr::Aggregate {
                         func,
+                        distinct,
                         arg,
                         signature,
                     },
@@ -959,6 +1078,7 @@ impl Lower for Walk<'_, '_> {
                     let aggregate = AggregateExprBuilder::new(udaf, vec![argument])
                         .schema(Arc::clone(&input_schema))
                         .alias(name)
+                        .with_distinct(*distinct)
                         .build()
                         .map(Arc::new)
                         .map_err(OmniError::datafusion)?;
@@ -1123,6 +1243,140 @@ impl Lower for Walk<'_, '_> {
         self.built(id, sort)
     }
 
+    fn delta_source(&mut self, _id: NodeId, fields: DeltaSourceFields<'_>) -> Lowers<Plan> {
+        Err(OmniError::manifest_internal(format!(
+            "`DeltaSource` of {} is the executor's staged delta; a write plan's `Validate` \
+             runs on the executor's judge, never through the engine",
+            fields.spec.table
+        ))
+        .into())
+    }
+
+    fn csv_source(&mut self, id: NodeId, fields: CsvSourceFields<'_>) -> Lowers<Plan> {
+        let load = self.lowering.load.ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "CsvSource {id}: the lowering carries no load statement"
+            ))
+        })?;
+        let table = load.request.target.table_key();
+        if table != fields.spec.table {
+            return Err(OmniError::manifest_internal(format!(
+                "CsvSource {id}: the plan loads {} and the statement {table}",
+                fields.spec.table
+            ))
+            .into());
+        }
+        let schema = target_arrow_schema(self.lowering.catalog, &load.request.target)?;
+        let declared = self.lowering.plan.properties(id).ok_or_else(|| {
+            OmniError::manifest_internal(format!("CsvSource {id} has no declared schema"))
+        })?;
+        if declared.schema.fields() != schema.fields() {
+            return Err(OmniError::manifest_internal(format!(
+                "CsvSource {id}: the plan's schema is not the typed delta of {table}"
+            ))
+            .into());
+        }
+        self.built(
+            id,
+            CsvSourceExec::new(
+                load.request.clone(),
+                Arc::clone(&load.bytes),
+                Arc::clone(self.lowering.catalog),
+                schema,
+                if load.single_partition {
+                    1
+                } else {
+                    usize::try_from(fields.max_partitions).unwrap_or(1)
+                },
+                load.slice_bytes,
+                Arc::clone(&load.source_refused),
+            ),
+        )
+    }
+
+    fn validate(&mut self, id: NodeId, fields: ValidateFields<'_>, input: Plan) -> Lowers<Plan> {
+        let load = self.lowering.load.ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "Validate {id}: the lowering carries no load statement"
+            ))
+        })?;
+        let table = load.request.target.table_key();
+        if table != fields.table {
+            return Err(OmniError::manifest_internal(format!(
+                "Validate {id}: the plan judges {} and the statement loads {table}",
+                fields.table
+            ))
+            .into());
+        }
+        let write = load.write.as_ref().ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "Validate {id}: the lowering carries no write transaction"
+            ))
+        })?;
+        if load.request.mode != LoadMode::Overwrite {
+            return Err(OmniError::manifest_internal(format!(
+                "Validate {id}: a {} load runs its plan's node on the executor's judge",
+                load.request.mode.as_str()
+            ))
+            .into());
+        }
+        let judge = WriteJudge {
+            tables: vec![JudgedTable {
+                table,
+                checks: fields.checks.to_vec(),
+                removal: fields.removal,
+                delta: DeltaClass::Replace,
+                deleted_ids: Vec::new(),
+            }],
+            committed: JudgedSide::Base(self.lowering.snapshot("load validation")?.clone()),
+            write_budget: write.write_budget,
+            catalog: Arc::clone(self.lowering.catalog),
+            report: Report::First,
+            repeat: RepeatRule::AcrossInput,
+        };
+        let streams = omnigraph_planner::validate_streams(fields.checks, fields.removal);
+        self.built(
+            id,
+            ValidateExec::new(input, judge, Arc::clone(&write.db), streams),
+        )
+    }
+
+    fn fragment_write(
+        &mut self,
+        id: NodeId,
+        fields: FragmentWriteFields<'_>,
+        input: Plan,
+    ) -> Lowers<Plan> {
+        let load = self.lowering.load.ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "FragmentWrite {id}: the lowering carries no load statement"
+            ))
+        })?;
+        let write = load.write.as_ref().ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "FragmentWrite {id}: the lowering carries no write transaction"
+            ))
+        })?;
+        if fields.spec.mode != LoadStmtMode::Overwrite {
+            return Err(OmniError::manifest_internal(format!(
+                "FragmentWrite {id}: {} routes to the executor's keyed adapters",
+                fields.spec.mode.as_str()
+            ))
+            .into());
+        }
+        let table = load.request.target.table_key();
+        if table != fields.spec.table {
+            return Err(OmniError::manifest_internal(format!(
+                "FragmentWrite {id}: the plan writes {} and the statement loads {table}",
+                fields.spec.table
+            ))
+            .into());
+        }
+        let sink =
+            LanceFragmentSink::new(table, input.schema(), write.clone(), fields.max_input_bytes);
+        self.built(id, DataSinkExec::new(input, Arc::new(sink), None))
+    }
+
     fn finish(&mut self, _root: NodeId, op: Plan) -> Lowers<Plan> {
         Ok(op)
     }
@@ -1260,11 +1514,20 @@ pub(super) fn in_order(batch: RecordBatch, names: &[String]) -> Result<RecordBat
     batch.project(&indices).map_err(OmniError::arrow_internal)
 }
 
-/// The return's column names in return order, for the root of `plan`.
+/// The return's column names in return order when the result node under the
+/// root's sort and limit is an `Aggregate`; a `Projection` root, including one
+/// above an aggregate, already emits its columns in order.
 pub(super) fn return_order(plan: &PhysicalPlan) -> Option<Vec<String>> {
-    let returns = plan.live().find_map(|(_, node)| match node {
-        PhysicalNode::Aggregate { return_exprs, .. } => Some(return_exprs),
-        _ => None,
-    })?;
-    Some(returns.iter().map(return_name).collect())
+    let mut id = plan.root();
+    loop {
+        match plan.node(id)? {
+            PhysicalNode::Sort { input, .. }
+            | PhysicalNode::Limit { input, .. }
+            | PhysicalNode::Page { input, .. } => id = *input,
+            PhysicalNode::Aggregate { return_exprs, .. } => {
+                return Some(return_exprs.iter().map(return_name).collect());
+            }
+            _ => return None,
+        }
+    }
 }

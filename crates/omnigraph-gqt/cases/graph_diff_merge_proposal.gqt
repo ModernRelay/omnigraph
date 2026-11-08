@@ -1,0 +1,90 @@
+# issue: none
+# notes: A merge proposal under review (RFC 0030 §8): the diff from its parent is the branch's changes, a
+# notes: diff from main to the proposal names it by commit id, and once published the branch has nothing left to
+# notes: merge and nothing left to review.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Person","data":{"name":"bob","age":40}}
+
+--- mutate
+branch create feature
+
+--- expect ok
+
+--- mutate branch: feature
+query age_alice() {
+    update Person set { age: 31 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: feature
+query insert_carol() {
+    insert Person { name: "carol", age: 22 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query insert_dave() {
+    insert Person { name: "dave", age: 50 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $dave
+
+--- mutate
+branch merge feature into main as commit
+
+--- expect outcome: merged
+
+--- bind commit $proposal
+
+--- query
+branch diff "${dave}" to "${proposal}"
+
+--- expect ordered
+{"kind":"node","type":"Person","id":"alice","op":"update","before":{"properties":{"name":"alice","age":30}},"after":{"properties":{"name":"alice","age":31}}}
+{"kind":"node","type":"Person","id":"carol","op":"insert","after":{"properties":{"name":"carol","age":22}}}
+
+--- query
+branch diff main to "${proposal}"
+
+--- expect ordered
+{"kind":"node","type":"Person","id":"alice","op":"update","before":{"properties":{"name":"alice","age":30}},"after":{"properties":{"name":"alice","age":31}}}
+{"kind":"node","type":"Person","id":"carol","op":"insert","after":{"properties":{"name":"carol","age":22}}}
+
+--- mutate
+commit publish "${proposal}"
+
+--- expect ok
+
+--- query
+branch merge feature dry run
+
+--- expect ordered
+{"source": "feature", "target": "main", "outcome": "already_up_to_date"}
+
+--- query
+branch diff feature
+
+--- expect ordered

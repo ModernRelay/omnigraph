@@ -159,8 +159,8 @@ impl Capture {
         Ok(())
     }
 
-    fn references(&mut self, yaml: &serde_yaml::Value) -> Result<()> {
-        use serde_yaml::Value as Yaml;
+    fn references(&mut self, yaml: &yaml_serde::Value) -> Result<()> {
+        use yaml_serde::Value as Yaml;
         if let Some(graphs) = yaml.get("graphs").and_then(Yaml::as_mapping) {
             for graph in graphs.values() {
                 if let Some(path) = graph.get("schema").and_then(Yaml::as_str) {
@@ -216,7 +216,7 @@ pub(super) fn request(config: &Path, revision: &str, message: &str) -> Result<Va
         total: 0,
     };
     capture.file("cluster.yaml")?;
-    let yaml = serde_yaml::from_str(&capture.files["cluster.yaml"])
+    let yaml = yaml_serde::from_str(&capture.files["cluster.yaml"])
         .map_err(|_| invalid("cluster.yaml is not valid YAML"))?;
     capture.references(&yaml)?;
     let request = json!({"expected_revision":revision,"message":message,"files":capture.files});

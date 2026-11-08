@@ -1,7 +1,10 @@
 //! Stored-query commands and alias resolution.
 //! Moved verbatim from tests/cli.rs in the modularization.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use serde_json::Value;
 use tempfile::{TempDir, tempdir};
@@ -10,7 +13,32 @@ use crate::support::*;
 
 const STATEMENT_GRAPH_ID: &str = "knowledge";
 
-/// A loaded graph for the embedded (`--store`) arm.
+#[test]
+fn managed_query_catalog_uses_issued_identity_without_local_source() {
+    use crate::support::managed_http::{IntentApiFixture, IntentReply};
+    let catalog = serde_json::json!({"queries":[]});
+    let data = IntentApiFixture::graph(vec![IntentReply::json(200, catalog.clone())]);
+    let (api, tokens) = IntentApiFixture::identity_issuer(&data.origin, 1);
+    let config = tempdir().unwrap();
+    write_managed_data_target(config.path(), &api.origin, &data.origin);
+    let output = output_success(
+        managed_command(config.path(), &api.origin, "managed-test")
+            .args(["queries", "list", "--json"]),
+    );
+    assert_eq!(parse_stdout_json(&output), catalog);
+    let requests = data.workflow_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/graphs/knowledge/queries");
+    assert_eq!(
+        requests[0].headers.get("authorization"),
+        Some(&format!("Bearer {}", tokens[0]))
+    );
+    assert!(!stdout_string(&output).contains(&tokens[0]));
+    api.assert_complete();
+    data.assert_complete();
+}
+
+/// A loaded graph for the embedded (`--target`) arm.
 fn loaded_graph() -> (TempDir, PathBuf) {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
@@ -19,7 +47,7 @@ fn loaded_graph() -> (TempDir, PathBuf) {
     (temp, graph)
 }
 
-/// A loaded graph served unauthenticated for the remote (`--server`) arm.
+/// A loaded graph served unauthenticated for the remote (`--target`) arm.
 fn served_graph() -> (ClusterFixture, TestServer) {
     let cluster = converged_loaded_cluster(STATEMENT_GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
@@ -28,7 +56,7 @@ fn served_graph() -> (ClusterFixture, TestServer) {
 
 fn embedded(verb: &str, graph: &Path) -> assert_cmd::Command {
     let mut command = cli();
-    command.arg(verb).arg("--store").arg(graph);
+    command.arg(verb).arg("--target").arg(graph);
     command
 }
 
@@ -36,8 +64,8 @@ fn served(verb: &str, server: &TestServer) -> assert_cmd::Command {
     let mut command = cli();
     command
         .arg(verb)
-        .arg("--server")
-        .arg(&server.base_url)
+        .arg("--target")
+        .fixture_target(&server.base_url)
         .arg("--graph")
         .arg(STATEMENT_GRAPH_ID);
     command
@@ -64,7 +92,16 @@ fn branch_statements_embedded_print_the_verb_lines() {
     let (_temp, graph) = loaded_graph();
 
     let created = output_success(embedded("mutate", &graph).arg("-e").arg("branch create b0"));
-    assert_eq!(stdout_string(&created), "created branch b0 from main\n");
+    let start = parse_stdout_json(&output_success(
+        embedded("commit", &graph).args(["list", "--branch", "b0", "--json"]),
+    ))["commits"][0]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        stdout_string(&created),
+        format!("created branch b0 from main at {start}\n")
+    );
 
     let listed = output_success(
         embedded("query", &graph)
@@ -233,7 +270,16 @@ fn branch_statements_remote_round_trip_and_delete_needs_consent() {
     let (_cluster, server) = served_graph();
 
     let created = output_success(served("mutate", &server).arg("-e").arg("branch create b0"));
-    assert_eq!(stdout_string(&created), "created branch b0 from main\n");
+    let start = parse_stdout_json(&output_success(
+        served("commit", &server).args(["list", "--branch", "b0", "--json"]),
+    ))["commits"][0]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        stdout_string(&created),
+        format!("created branch b0 from main at {start}\n")
+    );
 
     let table = stdout_string(&output_success(
         served("query", &server)
@@ -289,13 +335,13 @@ fn branch_statements_remote_round_trip_and_delete_needs_consent() {
         "--json fails closed too: {refusal}"
     );
     assert_eq!(
-        refusal["command_outcome"],
+        refusal["disposition"],
         serde_json::json!({
-            "execution":"not_started", "effects":"none", "action":"refresh"
+            "effects":"none", "action":"refresh"
         })
     );
     assert!(refusal.get("http_status").is_none());
-    assert!(refused_json.stderr.is_empty());
+    assert!(only_target_report(&refused_json));
     let listed = output_success(
         served("query", &server)
             .arg("-e")
@@ -353,7 +399,7 @@ fn branch_statements_remote_round_trip_and_delete_needs_consent() {
 
 #[test]
 fn branch_statement_local_refusals_happen_before_any_round_trip() {
-    let unreachable = "http://127.0.0.1:9";
+    let unreachable = crate::support::managed_http::IntentApiFixture::graph(vec![]);
     let temp = tempdir().unwrap();
     let params_file = temp.path().join("params.json");
     std::fs::write(&params_file, "{}").unwrap();
@@ -363,8 +409,8 @@ fn branch_statement_local_refusals_happen_before_any_round_trip() {
         let mut command = cli();
         command
             .args(args)
-            .arg("--server")
-            .arg(unreachable)
+            .arg("--target")
+            .fixture_target(&unreachable.origin)
             .arg("--graph")
             .arg("g");
         stderr_string(&output_failure(&mut command))
@@ -511,8 +557,8 @@ fn branch_statement_local_refusals_happen_before_any_round_trip() {
         );
         assert!(
             !stderr.contains("error sending request") && !stderr.contains("Connection refused"),
-            "{args:?}: the refusal must not follow a round trip (nothing listens on \
-             {unreachable}); got: {stderr}"
+            "{args:?}: the refusal must not follow a round trip to {}; got: {stderr}",
+            unreachable.origin
         );
     });
 
@@ -561,30 +607,34 @@ fn a_source_this_cli_cannot_parse_is_sent_to_the_server_verbatim() {
                 .arg(verb)
                 .arg("-e")
                 .arg(SOURCE)
-                .arg("--server")
-                .arg(&server.origin)
+                .arg("--target")
+                .fixture_target(&server.origin)
                 .arg("--graph")
                 .arg("g")
                 .arg("--json"),
         );
         let mut actual = parse_stdout_json(&output);
-        if verb == "mutate" {
-            assert_eq!(actual["http_status"], 400);
-            assert_eq!(
-                actual["command_outcome"],
+        // A read changes nothing; an untyped refusal of a write leaves its
+        // effects unknown.
+        assert_eq!(actual["http_status"], 400);
+        assert_eq!(
+            actual["disposition"],
+            if verb == "mutate" {
                 serde_json::json!({
-                    "execution":"unknown", "effects":"unknown", "action":"reconcile"
+                    "effects":"unknown", "action":"reconcile"
                 })
-            );
-            let fields = actual.as_object_mut().unwrap();
-            fields.remove("http_status");
-            fields.remove("command_outcome");
-        }
+            } else {
+                serde_json::json!({"effects":"none", "action":"fix"})
+            }
+        );
+        let fields = actual.as_object_mut().unwrap();
+        fields.remove("http_status");
+        fields.remove("disposition");
         assert_eq!(
             actual, refusal,
             "{verb} must preserve every original server field"
         );
-        assert!(output.stderr.is_empty(), "{verb}: {output:?}");
+        assert!(only_target_report(&output), "{verb}: {output:?}");
         let requests = server.requests();
         assert_eq!(requests.len(), 2, "one discovery and one data request");
         assert_eq!(requests[0].method, "HEAD");
@@ -761,13 +811,13 @@ fn set_flag_refusals_happen_before_any_open_or_round_trip() {
             "--set {flag}: expected {expected:?}; got: {stderr}"
         );
     }
-    let unreachable = "http://127.0.0.1:9";
+    let unreachable = crate::support::managed_http::IntentApiFixture::graph(vec![]);
     let refusal = |args: &[&str]| -> String {
         let mut command = cli();
         command
             .args(args)
-            .arg("--server")
-            .arg(unreachable)
+            .arg("--target")
+            .fixture_target(&unreachable.origin)
             .arg("--graph")
             .arg("g");
         stderr_string(&output_failure(&mut command))
@@ -836,8 +886,8 @@ fn set_flag_refusals_happen_before_any_open_or_round_trip() {
         );
         assert!(
             !stderr.contains("error sending request") && !stderr.contains("Connection refused"),
-            "{args:?}: the refusal must not follow a round trip (nothing listens on \
-             {unreachable}); got: {stderr}"
+            "{args:?}: the refusal must not follow a round trip to {}; got: {stderr}",
+            unreachable.origin
         );
     }
 }
@@ -864,7 +914,7 @@ fn alias_unknown_name_errors_listing_defined() {
     let home = tempdir().unwrap();
     std::fs::write(
         home.path().join("config.yaml"),
-        "servers:\n  dev:\n    url: https://x\naliases:\n  who:\n    server: dev\n    query: find_person\n",
+        "version: 1\ntargets:\n  dev:\n    kind: server\n    endpoint: https://x\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_DEV\ndefaults:\n  output: json\naliases:\n  who:\n    target: dev\n    graph: knowledge\n    query: find_person\n",
     )
     .unwrap();
     let output = output_failure(
@@ -878,96 +928,412 @@ fn alias_unknown_name_errors_listing_defined() {
         stderr.contains("unknown alias 'nope'") && stderr.contains("who"),
         "expected an unknown-alias error listing defined aliases; got: {stderr}"
     );
+    assert!(
+        output.stdout.is_empty(),
+        "an error before alias capture cannot inherit its output defaults: {output:?}"
+    );
 }
 
 #[test]
-fn alias_rejects_global_scope_flags_that_the_binding_owns() {
-    for (flag, value) in [
-        ("--server", "dev"),
-        ("--graph", "local"),
-        ("--store", "file:///tmp/graph.omni"),
-        ("--cluster", "."),
-        ("--profile", "prod"),
-        ("--as", "act-op"),
-    ] {
-        let output = output_failure(cli().arg(flag).arg(value).arg("alias").arg("who"));
-        let stderr = String::from_utf8_lossy(&output.stderr);
+#[cfg(unix)]
+fn alias_setup_keeps_one_operator_config_across_params_file() {
+    let ca = tls_gateway::ca_path().display();
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::time::{Duration, Instant};
+
+    use crate::support::managed_http::{IntentApiFixture, IntentReply};
+    use serde_json::json;
+
+    let cases = [
+        ("csv", "json", &["--json"][..], false, "json"),
+        ("csv", "json", &[][..], false, "csv"),
+        ("json", "csv", &[][..], true, "json"),
+        ("jsonl", "csv", &[][..], true, "jsonl"),
+        ("json", "jsonl", &["--format", "table"][..], true, "human"),
+    ];
+    for (default_format, _old_default_format, flags, refused, expected_format) in cases {
+        let home = tempdir().unwrap();
+        let config = home.path().join("config.yaml");
+        let replacement = home.path().join("replacement.yaml");
+        let params_file = home.path().join("params.json");
+        let trap = IntentApiFixture::graph(vec![]);
+        let refusal = json!({"error": "captured alias denied", "code": "forbidden"});
+        let response = if refused {
+            IntentReply::json(403, refusal.clone())
+        } else {
+            IntentReply::json(
+                200,
+                json!({
+                    "query_name": "find_person",
+                    "target": {"branch": "main"},
+                    "row_count": 1,
+                    "rows": [{"p.name": "original-server"}]
+                }),
+            )
+        };
+        let server = IntentApiFixture::graph(vec![response]);
+        let captured_config = format!(
+            "version: 1\ntargets:\n  prod:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_PROD\n  graph-owner:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/unrelated'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_GRAPH_OWNER\ndefaults:\n  output: {default_format}\naliases:\n  who:\n    target: prod\n    graph: knowledge\n    query: find_person\n    params: {{name: fixed, limit: 2, source: original-alias}}\n",
+            server.origin, server.origin
+        );
+        fs::write(&config, captured_config).unwrap();
+        let replacement_config = format!(
+            "version: 1\ntargets:\n  prod:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_PROD\n  replacement:\n    kind: server\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{ca}'}}\n    endpoint: '{}/graphs/knowledge'\n    auth:\n      provider: token\n      source:\n        env: OMNIGRAPH_TOKEN_REPLACEMENT\naliases:\n  who:\n    target: prod\n    graph: replacement\n    query: replacement_query\n    params: {{source: replacement-alias}}\n",
+            trap.origin, server.origin
+        );
+        fs::write(&replacement, &replacement_config).unwrap();
         assert!(
-            stderr.contains("`alias` uses the server, graph, and stored query")
-                && stderr.contains(flag),
-            "expected {flag} to be rejected by the alias binding guard; got: {stderr}"
+            std::process::Command::new("mkfifo")
+                .arg(&params_file)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let mut command = assert_cmd::Command::from(cli_process());
+        command
+            .current_dir(home.path())
+            .env("OMNIGRAPH_HOME", home.path())
+            .env("OMNIGRAPH_TOKEN_PROD", "captured-root-token")
+            .env("OMNIGRAPH_TOKEN_GRAPH_OWNER", "captured-graph-token")
+            .env("OMNIGRAPH_TOKEN_REPLACEMENT", "replacement-token")
+            .env_remove("OMNIGRAPH_BEARER_TOKEN")
+            .env_remove("OMNIGRAPH_PROFILE")
+            .args(["alias", "who", "--params-file"])
+            .arg(&params_file)
+            .args(flags)
+            .timeout(Duration::from_secs(15));
+        let output = std::thread::scope(|scope| {
+            // assert_cmd kills and reaps the child on timeout, including if the
+            // barrier fails before a writer can release its parameter-file read.
+            let child = scope.spawn(move || command.output().unwrap());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut params = loop {
+                match OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&params_file)
+                {
+                    Ok(params) => break params,
+                    Err(error)
+                        if error.raw_os_error() == Some(libc::ENXIO)
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("CLI did not open its parameter file: {error}"),
+                }
+            };
+            // Opening the FIFO writer succeeds only once the CLI has opened its
+            // reader, after loading the alias. Readiness, not the polling delay,
+            // orders replacement before execute_operator_alias can start.
+            fs::rename(&replacement, &config).unwrap();
+            params
+                .write_all(br#"{"name":"explicit-name","extra":"file"}"#)
+                .unwrap();
+            drop(params);
+            child.join().unwrap()
+        });
+
+        assert_eq!(fs::read_to_string(&config).unwrap(), replacement_config);
+        assert!(
+            trap.requests().is_empty(),
+            "alias setup changed destination"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(if refused { 1 } else { 0 }),
+            "{expected_format}: {output:?}"
+        );
+        let stdout = stdout_string(&output);
+        if refused {
+            if expected_format == "human" {
+                assert!(output.stdout.is_empty(), "{output:?}");
+                assert!(
+                    stderr_string(&output).contains("captured alias denied"),
+                    "{output:?}"
+                );
+            } else {
+                // An alias is a read: its refusal reports the disposition a
+                // `query` does, with no effects.
+                let mut reported = parse_stdout_json(&output);
+                assert_eq!(
+                    reported["disposition"],
+                    serde_json::json!({"effects":"none","action":"refresh"}),
+                    "{output:?}"
+                );
+                assert_eq!(reported["http_status"], 403, "{output:?}");
+                let reported = reported.as_object_mut().unwrap();
+                reported.remove("disposition");
+                reported.remove("http_status");
+                assert_eq!(
+                    serde_json::Value::Object(reported.clone()),
+                    refusal,
+                    "{output:?}"
+                );
+                assert!(
+                    !stderr_string(&output).contains("captured alias denied"),
+                    "{output:?}"
+                );
+                if expected_format == "jsonl" {
+                    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+                }
+            }
+        } else if expected_format == "csv" {
+            assert_eq!(stdout, "p.name\noriginal-server\n");
+        } else {
+            assert_eq!(
+                parse_stdout_json(&output)["rows"][0]["p.name"],
+                "original-server"
+            );
+        }
+        trap.assert_complete();
+        server.assert_complete();
+        let requests = server.workflow_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/graphs/knowledge/queries/find_person");
+        assert_eq!(
+            requests[0].headers["authorization"],
+            "Bearer captured-root-token"
+        );
+        assert_eq!(
+            requests[0].body,
+            json!({
+                "expect_mutation": false,
+                "branch": null,
+                "snapshot": null,
+                "params": {
+                    "name": "explicit-name", "limit": 2,
+                    "source": "original-alias", "extra": "file"
+                }
+            })
+        );
+        let stderr = stderr_string(&output);
+        assert_eq!(
+            stderr.matches("unknown key `captured_only`").count(),
+            0,
+            "{stderr}"
+        );
+        // Success and failure presentation use the same config as alias dispatch.
+        assert_eq!(
+            stderr.matches("unknown key `replacement_only`").count(),
+            0,
+            "{stderr}"
         );
     }
 }
 
 #[test]
-fn queries_list_with_store_flag_errors() {
-    // `queries list` reads a cluster's applied state; a single-graph `--store`
-    // address can never apply. Rejected loudly at the addressing guard (was:
-    // silently ignored, then failed later asking for a cluster).
+fn alias_rejects_non_object_parameters_and_positional_arguments_without_requests() {
+    let server = crate::support::managed_http::IntentApiFixture::graph(Vec::new());
+    let home = tempdir().unwrap();
+    fs::write(
+        home.path().join("config.yaml"),
+        format!(
+            "version: 1\ntargets:\n  srv:\n    kind: server\n    endpoint: '{}'\n    auth: {{provider: anonymous}}\naliases:\n  lookup:\n    target: srv\n    graph: knowledge\n    query: lookup\n    params: {{name: default}}\n",
+            server.origin
+        ),
+    ).unwrap();
+    let params_file = home.path().join("params.json");
+    for params in ["[1]", "\"name\"", "7", "true", "null"] {
+        fs::write(&params_file, params).unwrap();
+        for file in [false, true] {
+            let mut command = cli();
+            command
+                .env("OMNIGRAPH_HOME", home.path())
+                .args(["alias", "lookup", "--json"]);
+            if file {
+                command.arg("--params-file").arg(&params_file);
+            } else {
+                command.args(["--params", params]);
+            }
+            let output = output_failure(&mut command);
+            assert_eq!(output.status.code(), Some(1));
+            assert!(
+                parse_stdout_json(&output)["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("must contain a JSON object")
+            );
+            assert!(server.requests().is_empty());
+        }
+    }
+    let output = output_failure(cli().env("OMNIGRAPH_HOME", home.path()).args([
+        "alias",
+        "lookup",
+        "positional",
+    ]));
+    assert_eq!(output.status.code(), Some(64));
+    assert!(stderr_string(&output).contains("unexpected argument"));
+    assert!(server.requests().is_empty());
+    server.assert_complete();
+}
+
+#[test]
+fn alias_rejects_global_scope_flags_that_the_binding_owns() {
+    for (flag, value) in [
+        ("--target", "dev"),
+        ("--graph", "local"),
+        ("--as", "act-op"),
+    ] {
+        let output = output_failure(cli().args(["alias", "who", flag, value]));
+        let stderr = stderr_string(&output);
+        assert!(
+            stderr.contains("does not accept") && stderr.contains(flag),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn queries_list_rejects_direct_graph_target() {
+    let home = tempdir().unwrap();
+    fs::write(home.path().join("config.yaml"), "version: 1\ntargets:\n  graph:\n    kind: direct\n    scope: graph\n    uri: file:///data/graph.omni\n").unwrap();
     let output = output_failure(
         cli()
-            .arg("--store")
-            .arg("file:///tmp/graph.omni")
-            .arg("queries")
-            .arg("list"),
+            .env("OMNIGRAPH_HOME", home.path())
+            .args(["queries", "list", "--target", "graph"]),
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("`queries list` is a cluster control command")
-            && stderr
-                .contains("--store addresses a single graph's storage directly and does not apply"),
-        "expected the addressing-guard store rejection; got: {stderr}"
-    );
+    assert!(stderr_string(&output).contains("not available for this target kind and scope"));
 }
 
 #[test]
 fn queries_list_with_as_flag_errors() {
-    // Read-only control verbs (`queries`, `policy`, `cluster status`, …) never
-    // read the actor; only actor-bound `cluster apply` does. `--as` on a
-    // non-attributing control verb must be a loud guard error, not a silently
-    // dropped identity (PR #377 review follow-up).
-    let output = output_failure(
-        cli()
-            .arg("--as")
-            .arg("act-alice")
-            .arg("queries")
-            .arg("list"),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("`queries list` is a cluster control command")
-            && stderr.contains("--as")
-            && stderr.contains("does not apply"),
-        "expected the addressing-guard --as rejection; got: {stderr}"
-    );
+    let output = output_failure(cli().args(["queries", "list", "--as", "act-alice"]));
+    assert!(stderr_string(&output).contains("queries list does not accept --as"));
 }
 
 #[test]
-fn queries_and_policy_wrong_server_scope_points_at_cluster_scope() {
-    let output = output_failure(cli().arg("--server").arg("prod").arg("queries").arg("list"));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("pass --cluster <dir|uri>") && !stderr.contains("pass --config <dir>"),
-        "queries should point at --cluster, not --config; got: {stderr}"
-    );
-
+fn queries_and_policy_refuse_server_targets_before_network() {
+    let server = crate::support::managed_http::IntentApiFixture::graph(Vec::new());
+    for args in [
+        vec!["queries", "validate"],
+        vec!["policy", "validate"],
+        vec!["policy", "test", "--tests", "missing-tests.yaml"],
+        vec!["policy", "explain", "--actor", "actor", "--action", "read"],
+    ] {
+        let output = output_failure(
+            cli()
+                .args(["--target"])
+                .fixture_target(&server.origin)
+                .args(&args),
+        );
+        let stderr = stderr_string(&output);
+        assert!(
+            stderr.contains("not available for this target kind and scope"),
+            "{args:?}: {stderr}"
+        );
+        assert!(output.stdout.is_empty());
+        assert!(server.requests().is_empty());
+    }
+    // A server lists one graph's queries, so `queries list` without `--graph`
+    // or a `default_graph` refuses before any request.
     let output = output_failure(
         cli()
-            .arg("--server")
-            .arg("prod")
-            .arg("policy")
-            .arg("validate"),
+            .args(["--target"])
+            .fixture_target(&server.origin)
+            .args(["queries", "list"]),
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("pass --cluster <dir|uri>") && !stderr.contains("pass --config <dir>"),
-        "policy should point at --cluster, not --config; got: {stderr}"
+    let stderr = stderr_string(&output);
+    assert!(stderr.contains("graph_required"), "{stderr}");
+    assert!(output.stdout.is_empty());
+    assert!(server.requests().is_empty());
+    server.assert_complete();
+}
+
+/// On a server target `queries list` reads `GET /graphs/{id}/queries`, and
+/// `--json` prints that body exactly. The direct root form keeps its own
+/// shape (`mcp_expose`, GQ type names, the whole cluster without `--graph`),
+/// so the two agree on the declarations they share, not byte for byte.
+#[test]
+fn queries_list_on_a_server_target_prints_the_route_body() {
+    let cluster = converged_cluster_with_query(
+        "stored.gq",
+        &format!(
+            "query described($name: String) \
+                @description(\"Find a person by exact name.\") \
+                @instruction(\"Use for exact lookups.\") \
+                {{ match {{ $p: Person {{ name: $name }} }} return {{ $p.age }} }}\n{SET_AGE}\n"
+        ),
+        "      - ./stored.gq\n",
     );
+    let server = spawn_server_with_cluster(cluster.path());
+    let route: Value = graph_http_client()
+        .get(format!("{}/graphs/knowledge/queries", server.base_url))
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(route["queries"].as_array().unwrap().len(), 2, "{route}");
+
+    let served = output_success(
+        cli()
+            .args(["queries", "list", "--target"])
+            .fixture_target(&server.base_url)
+            .args(["--graph", "knowledge", "--json"]),
+    );
+    assert_eq!(parse_stdout_json(&served), route);
+
+    // A named server target supplies its `default_graph`.
+    let home = tempdir().unwrap();
+    fs::write(
+        home.path().join("config.yaml"),
+        format!(
+            "version: 1\ntargets:\n  srv:\n    kind: server\n    endpoint: '{}'\n    auth:\n      provider: anonymous\n    transport:\n      tls:\n        ca: {{mode: replace, file: '{}'}}\n    default_graph: knowledge\n",
+            server.base_url, tls_gateway::ca_path().display()
+        ),
+    )
+    .unwrap();
+    let human = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .args(["queries", "list", "--target", "srv"]),
+    );
+    assert!(stderr_string(&human).contains("graph=knowledge"));
+    assert_eq!(
+        stdout_string(&human),
+        concat!(
+            "read  described($name: string)\n",
+            "    description: Find a person by exact name.\n",
+            "    instruction: Use for exact lookups.\n",
+            "mutation  set_age($name: string, $age: int)\n",
+        )
+    );
+
+    let direct = parse_stdout_json(&output_success(
+        cli()
+            .args(["queries", "list", "--target"])
+            .arg(cluster.path())
+            .args(["--graph", "knowledge", "--json"]),
+    ));
+    let shared = |body: &Value| -> Vec<Value> {
+        body["queries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|q| {
+                serde_json::json!({
+                    "name": q["name"],
+                    "mutation": q["mutation"],
+                    "description": q.get("description"),
+                    "instruction": q.get("instruction"),
+                    "params": q["params"].as_array().unwrap().iter()
+                        .map(|p| serde_json::json!([p["name"], p["nullable"]]))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect()
+    };
+    assert_eq!(shared(&direct), shared(&route));
 }
 
 // RFC-011: `queries validate`/`list` source the registry + schemas from a
-// converged cluster's applied state (`--cluster <dir>`), not omnigraph.yaml.
+// converged cluster's applied state (`--target <dir>`), not omnigraph.yaml.
 
 /// Build a converged single-graph cluster (id `knowledge`) with one stored
 /// query. `query_block` is the YAML under the graph's `queries:` key.
@@ -1003,7 +1369,7 @@ fn queries_validate_exits_zero_on_clean_registry() {
         cli()
             .arg("queries")
             .arg("validate")
-            .arg("--cluster")
+            .arg("--target")
             .arg(cluster.path()),
     );
     let stdout = stdout_string(&output);
@@ -1045,7 +1411,15 @@ fn cluster_apply_rejects_a_broken_query_naming_it_and_where() {
             ),
         )
         .unwrap();
-        let output = output_failure(cli().arg("cluster").arg("apply").arg("--config").arg(dir));
+        let output = output_failure(
+            cli()
+                .arg("cluster")
+                .arg("apply")
+                .arg("--target")
+                .arg(dir)
+                .arg("--config")
+                .arg(dir),
+        );
         let combined = format!(
             "{}{}",
             stdout_string(&output),
@@ -1071,7 +1445,7 @@ fn queries_list_prints_registered_query() {
         cli()
             .arg("queries")
             .arg("list")
-            .arg("--cluster")
+            .arg("--target")
             .arg(cluster.path()),
     );
     let stdout = stdout_string(&output);
@@ -1102,7 +1476,7 @@ fn queries_list_surfaces_description_and_instruction() {
         cli()
             .arg("queries")
             .arg("list")
-            .arg("--cluster")
+            .arg("--target")
             .arg(cluster.path()),
     );
     let stdout = stdout_string(&output);
@@ -1120,7 +1494,7 @@ fn queries_list_surfaces_description_and_instruction() {
         cli()
             .arg("queries")
             .arg("list")
-            .arg("--cluster")
+            .arg("--target")
             .arg(cluster.path())
             .arg("--json"),
     );
@@ -1154,7 +1528,7 @@ fn queries_list_indents_multiline_annotation_continuation() {
         cli()
             .arg("queries")
             .arg("list")
-            .arg("--cluster")
+            .arg("--target")
             .arg(cluster.path()),
     );
     let stdout = stdout_string(&output);
@@ -1181,7 +1555,7 @@ fn queries_list_omits_annotations_when_absent() {
         cli()
             .arg("queries")
             .arg("list")
-            .arg("--cluster")
+            .arg("--target")
             .arg(cluster.path()),
     );
     let stdout = stdout_string(&output);
@@ -1196,7 +1570,7 @@ fn queries_list_omits_annotations_when_absent() {
         cli()
             .arg("queries")
             .arg("list")
-            .arg("--cluster")
+            .arg("--target")
             .arg(cluster.path())
             .arg("--json"),
     );
@@ -1215,12 +1589,11 @@ fn queries_list_omits_annotations_when_absent() {
 
 #[test]
 fn queries_validate_requires_a_cluster() {
-    // RFC-011: with no --cluster (and no cluster profile), the command errors
-    // loudly rather than reading any omnigraph.yaml.
+    // With no --target or defaults.target, no source file can route the command.
     let output = output_failure(cli().arg("queries").arg("validate"));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("needs a cluster") || stderr.contains("--cluster"),
+        stderr.contains("target_required") && stderr.contains("--target"),
         "queries validate must require a cluster; stderr:\n{stderr}"
     );
 }
@@ -1233,16 +1606,39 @@ fn queries_validate_graph_filter_selects_one_graph() {
     let dir = temp.path();
     write_multi_graph_cluster_fixture(dir);
     apply_cluster_fixture(dir);
+    let state_path = dir.join("__cluster/state.json");
+    let before = fs::read(&state_path).unwrap();
     let output = output_success(
         cli()
             .arg("queries")
             .arg("validate")
-            .arg("--cluster")
+            .arg("--target")
             .arg(dir)
             .arg("--graph")
             .arg("knowledge"),
     );
     assert!(stdout_string(&output).contains("OK"));
+
+    let listed = parse_stdout_json(&output_success(
+        cli().args(["queries", "list", "--target"]).arg(dir).args([
+            "--graph",
+            "knowledge",
+            "--json",
+        ]),
+    ));
+    assert_eq!(listed["queries"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["queries"][0]["name"], "find_person");
+
+    let missing = output_failure(
+        cli()
+            .args(["queries", "validate", "--target"])
+            .arg(dir)
+            .args(["--graph", "missing", "--json"]),
+    );
+    assert!(missing.stdout.is_empty());
+    assert!(stderr_string(&missing).contains("graph `missing` is not applied"));
+    assert_eq!(fs::read(&state_path).unwrap(), before);
+    assert!(!dir.join("__cluster/lock.json").exists());
 }
 
 /// RFC 0047's diagnostics contract at the CLI: a refused query reports its
@@ -1295,6 +1691,21 @@ fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
     assert_eq!(line["diagnostic"]["code"], "Q002");
     assert_eq!(line["diagnostic"]["suggestion"], suggestion);
 
+    let toon_output = output_failure(
+        embedded("query", &graph)
+            .arg("-e")
+            .arg(refused)
+            .args(["--format", "toon"]),
+    );
+    let toon = stdout_string(&toon_output);
+    assert!(toon.starts_with("error:"), "{toon}");
+    assert!(toon.contains("code: Q002"), "{toon}");
+    assert!(toon.contains("fix: query name()"), "{toon}");
+    assert!(
+        !stderr_string(&toon_output).contains("error[Q002]:"),
+        "the TOON lane does not also print the human diagnostic"
+    );
+
     let human = output_failure(embedded("query", &graph).arg("-e").arg(refused));
     let stderr = stderr_string(&human);
     assert!(
@@ -1313,6 +1724,46 @@ fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
         "the human lane writes nothing to stdout"
     );
 
+    let operator_home = tempdir().unwrap();
+    let cases: &[(&str, &[&str], &str)] = &[
+        ("json", &[], "json"),
+        ("jsonl", &[], "jsonl"),
+        ("json", &["--format", "table"], "human"),
+        ("jsonl", &["--format", "csv"], "human"),
+        ("csv", &["--json"], "json"),
+        ("csv", &["--format", "jsonl"], "jsonl"),
+    ];
+    for &(default_format, flags, expected_format) in cases {
+        std::fs::write(
+            operator_home.path().join("config.yaml"),
+            format!("version: 1\ndefaults:\n  output: {default_format}\n"),
+        )
+        .unwrap();
+        let output = output_failure(
+            embedded("query", &graph)
+                .env("OMNIGRAPH_HOME", operator_home.path())
+                .args(["-e", refused])
+                .args(flags),
+        );
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        if expected_format == "human" {
+            assert!(output.stdout.is_empty(), "{output:?}");
+            let stderr = stderr_string(&output);
+            assert!(stderr.contains("error[Q002]:"), "{stderr}");
+            assert!(stderr.contains("fix: query name()"), "{stderr}");
+        } else {
+            assert_eq!(
+                parse_stdout_json(&output),
+                json,
+                "{default_format} {flags:?}"
+            );
+            assert!(only_target_report(&output), "{output:?}");
+            if expected_format == "jsonl" {
+                assert_eq!(stdout_string(&output).lines().count(), 1, "{output:?}");
+            }
+        }
+    }
+
     let (_cluster, server) = served_graph();
     let json = parse_stdout_json(&output_failure(
         served("query", &server)
@@ -1324,6 +1775,15 @@ fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
     assert_eq!(json["diagnostic"]["code"], "Q002");
     assert_eq!(json["diagnostic"]["suggestion"], suggestion);
     assert_eq!(json["diagnostic"]["fix"], "query name()");
+    let served_toon_output = output_failure(
+        served("query", &server)
+            .arg("-e")
+            .arg(refused)
+            .args(["--format", "toon"]),
+    );
+    let served_toon = stdout_string(&served_toon_output);
+    assert!(served_toon.contains("code: Q002"), "{served_toon}");
+    assert!(served_toon.contains("fix: query name()"), "{served_toon}");
     let served_human = output_failure(served("query", &server).arg("-e").arg(refused));
     let stderr = stderr_string(&served_human);
     assert!(stderr.contains("error[Q002]:"), "{stderr}");

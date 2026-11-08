@@ -1,0 +1,1 @@
+- A delete reads each table it removes rows from once, uses the id index for a delete by `@key`, and validates against cached tables.

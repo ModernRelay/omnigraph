@@ -14,11 +14,11 @@ use datafusion::execution::TaskContext;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use futures::StreamExt;
 
+use super::ScanExec;
 use super::runtime_filter::{RuntimeFilter, count_unsieved, lance_batch_rows, scan_counters};
-use super::{ScanExec, ScanSource};
 use crate::engine::operators::memory::WorkMemory;
-use crate::engine::operators::producer::{BatchSender, producer_stream};
-use crate::engine::operators::{conform, external, polled};
+use crate::engine::operators::shape::{BatchSender, Source, work};
+use crate::engine::operators::{conform, external};
 use crate::engine::scan::{NodeRead, add_null_blob_columns, prefix_batch};
 use crate::engine::search::SearchMode;
 
@@ -33,13 +33,6 @@ pub(super) fn streams(mode: &SearchMode) -> bool {
 }
 
 impl ScanExec {
-    /// Whether the scan sends each Lance batch as it is read: every table read
-    /// under no search mode. A ranked scan stays a breaker: its overfetch
-    /// ladder reruns it whole.
-    pub(super) fn pipelines(&self) -> bool {
-        matches!(&self.source, ScanSource::Table { mode, .. } if streams(mode))
-    }
-
     /// The table read as a pipeline over `stream_batches`, under the filter a
     /// marking parent left in the slot (`None` when it left none or the scan
     /// is unmarked); only a marked scan counts what its filter read.
@@ -48,9 +41,9 @@ impl ScanExec {
         mode: SearchMode,
         filter: Option<RuntimeFilter>,
         ctx: Arc<TaskContext>,
+        shape: &Source,
     ) -> DfResult<SendableRecordBatchStream> {
-        let schema: SchemaRef = self.schema();
-        let declared = Arc::clone(&schema);
+        let declared: SchemaRef = self.schema();
         let type_name = self.type_name.clone();
         let binding = self.binding.clone();
         let filters = self.filters.clone();
@@ -58,19 +51,15 @@ impl ScanExec {
         let params = Arc::clone(&self.params);
         let snapshot = self.snapshot.clone();
         let catalog = Arc::clone(&self.catalog);
-        let mut work = WorkMemory::new(ctx, "ScanExec")?;
-        work.set_metrics(self.metrics.clone());
-        work.metric("input_rows", 0);
+        let memory = work(ctx, "ScanExec", &self.metrics)?;
+        memory.metric("input_rows", 0);
         let marked = self.runtime_filter.is_some();
         let gather_rows = self.gather_rows;
         if marked {
-            scan_counters(&work, filter.is_some());
+            scan_counters(&memory, filter.is_some());
         }
-        let stream = producer_stream(
-            schema,
-            Arc::new(work),
-            Some(&self.metrics),
-            move |memory, sender| async move {
+        Ok(
+            shape.stream(memory, &self.metrics, move |memory, sender| async move {
                 let read = NodeRead::resolve(
                     &type_name,
                     &filters,
@@ -94,9 +83,8 @@ impl ScanExec {
                     &sender,
                 )
                 .await
-            },
-        );
-        Ok(polled(&self.metrics, stream))
+            }),
+        )
     }
 }
 

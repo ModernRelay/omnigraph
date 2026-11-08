@@ -42,7 +42,7 @@ async fn manifest_version(uri: &str) -> u64 {
 
 const RERUN: (&str, &str) = (
     "this omnigraph executable",
-    "then rerun `omnigraph upgrade <graph> --to-format 15` without `--check`",
+    "then rerun `omnigraph upgrade <graph> --to-format 16` without `--check`",
 );
 const PRESERVE_AND_CHECK: (&str, &str) = (
     "the omnigraph executable that started the conversion",
@@ -58,11 +58,11 @@ const FENCING_EXECUTABLE: (&str, &str) = (
 
 /// The route names a report carries, spelled out: a change of `handler` is a
 /// change of what operators and their tooling read.
-const UNROUTED: &str = "history-lance-files-to-v15";
-const FROM_8: &str = "history-lance-files-v8-to-v15";
-const FROM_9: &str = "history-lance-files-v9-to-v15";
-const FROM_13: &str = "history-lance-files-v13-to-v15";
-const STAMP: &str = "stamp-v14-to-v15";
+const UNROUTED: &str = "history-lance-files-to-v16";
+const FROM_8: &str = "history-lance-files-v8-to-v16";
+const FROM_9: &str = "history-lance-files-v9-to-v16";
+const FROM_13: &str = "history-lance-files-v13-to-v16";
+const STAMP: &str = "stamp-v14-to-v16";
 
 fn route_name(stamp: u32) -> &'static str {
     match stamp {
@@ -494,7 +494,7 @@ async fn served(root: &str, native: Option<&str>) -> (Vec<String>, Vec<(String, 
     (keys, heads)
 }
 
-/// Every live ref of `source` is converted: served under stamp 15 with its
+/// Every live ref of `source` is converted: served under stamp 16 with its
 /// own head alone, and main is activated three versions above its source.
 async fn assert_converted(source: &Source) {
     let root = source.root.as_str();
@@ -521,6 +521,38 @@ async fn assert_converted(source: &Source) {
         let dataset = open(root, Some(branch)).await.unwrap();
         assert_eq!(dataset.version().version, version, "{branch}");
     }
+    // A detailed listing serves each converted branch's start from the legacy
+    // history: `feature` wrote its own head, so its start is read at the
+    // pre-upgrade version it was created from; `child` was forked from the
+    // retired `gone`.
+    let listing = crate::db::manifest::list_graph_branches_detailed(
+        root,
+        &crate::lance_access::control_session(),
+        &mut |_| true,
+    )
+    .await
+    .unwrap();
+    let details: Vec<_> = listing
+        .details
+        .iter()
+        .map(|detail| {
+            (
+                detail.name.as_str(),
+                detail.from.as_deref(),
+                detail.from_commit_id.clone(),
+                detail.head.graph_commit_id.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        details,
+        [
+            ("main", None, None, id(4)),
+            ("child", Some("gone"), Some(id(3)), id(3)),
+            ("feature", Some("main"), Some(id(2)), id(6)),
+            ("fresh", Some("feature"), Some(id(5)), id(5)),
+        ]
+    );
     assert_eq!(
         root_objects(source.dir.path()),
         root_objects_of(source),
@@ -619,8 +651,8 @@ async fn a_target_other_than_the_served_format_is_unsupported() {
         assert_eq!(codes(&report), ["unsupported_target"]);
         assert_eq!(
             report.findings[0].message,
-            "this binary converts storage formats v8, v9 and v13 to v15, stamps v14 to v15 and \
-             serves both; `--to-format` accepts 15 only"
+            "this binary converts storage formats v8, v9 and v13 to v16, stamps v14 to v16 and \
+             serves both; `--to-format` accepts 16 only"
         );
         assert_eq!(report.target_format, target);
         assert!(!report.target_defaulted);
@@ -693,7 +725,7 @@ async fn a_pending_conversion_with_a_valid_intent_is_reported_by_check_as_pendin
         let guidance = pending_report(&json, true, "pending_upgrade", handler).await;
         assert!(
             guidance.contains(&format!(
-                "the pending storage conversion of attempt {attempt} to format v15"
+                "the pending storage conversion of attempt {attempt} to format v16"
             )) && guidance.contains(
                 "rerun `omnigraph upgrade <graph>` without `--check` with this executable"
             ),
@@ -805,7 +837,7 @@ async fn converted_once(stamp: u32) {
     );
     for again in [check(&source.root).await, execute(&source.root).await] {
         assert_eq!(again.outcome, UpgradeOutcome::AlreadyCurrent, "{again:?}");
-        assert_eq!(again.observed_format, Some(15));
+        assert_eq!(again.observed_format, Some(16));
     }
     assert_eq!(stored_files(source.dir.path()), files, "v{stamp}");
 }
@@ -837,12 +869,23 @@ async fn version_of(uri: &str, native: Option<&str>) -> u64 {
 /// main first, under the stamp route; `--check` writes nothing, a rerun is
 /// current, and the graph opens.
 #[tokio::test]
-async fn a_v14_graph_is_stamped_v15_per_live_ref() {
+async fn a_v14_graph_is_stamped_current_per_live_ref() {
+    stamped_current_per_live_ref(14).await;
+}
+
+/// A v15 graph takes the same stamp route: the stamp fences a v15 binary off
+/// the reserved `unattached_` tags, nothing in its rows changes.
+#[tokio::test]
+async fn a_v15_graph_is_stamped_current_per_live_ref() {
+    stamped_current_per_live_ref(15).await;
+}
+
+async fn stamped_current_per_live_ref(stamp: u32) {
     let (dir, uri) = fresh_graph().await;
     let feature = forked_branch(&uri, "feature").await;
     for native in [None, Some(feature.as_str())] {
         let mut manifest = open(&uri, native).await.unwrap();
-        set_stamp_for_test(&mut manifest, 14).await.unwrap();
+        set_stamp_for_test(&mut manifest, stamp).await.unwrap();
     }
     let versions = (
         version_of(&uri, None).await,
@@ -851,7 +894,7 @@ async fn a_v14_graph_is_stamped_v15_per_live_ref() {
     let before = stored_files(dir.path());
     let checked = check(&uri).await;
     assert_eq!(checked.outcome, UpgradeOutcome::CheckPassed, "{checked:?}");
-    assert_eq!(checked.observed_format, Some(14));
+    assert_eq!(checked.observed_format, Some(stamp));
     assert_eq!(checked.route, [STAMP]);
     assert!(checked.completed_handlers.is_empty());
     assert_eq!(checked.work.live_refs, 2);
@@ -867,8 +910,8 @@ async fn a_v14_graph_is_stamped_v15_per_live_ref() {
         Some(format!("stamped:ref '{feature}'").as_str())
     );
     assert_eq!(report.work.live_refs, 2);
-    assert_eq!(stamp_of(&uri, None).await, Some(15));
-    assert_eq!(stamp_of(&uri, Some(&feature)).await, Some(15));
+    assert_eq!(stamp_of(&uri, None).await, Some(16));
+    assert_eq!(stamp_of(&uri, Some(&feature)).await, Some(16));
     assert_eq!(version_of(&uri, None).await, versions.0 + 1);
     assert_eq!(version_of(&uri, Some(&feature)).await, versions.1 + 1);
 
@@ -894,11 +937,45 @@ async fn a_live_ref_left_at_v14_is_stamped_alone() {
 
     let report = execute(&uri).await;
     assert_eq!(report.outcome, UpgradeOutcome::Completed, "{report:?}");
-    assert_eq!(report.observed_format, Some(15));
+    assert_eq!(report.observed_format, Some(16));
     assert_eq!(report.completed_handlers, [STAMP]);
-    assert_eq!(stamp_of(&uri, Some(&feature)).await, Some(15));
+    assert_eq!(stamp_of(&uri, Some(&feature)).await, Some(16));
     assert_eq!(version_of(&uri, None).await, main_version);
     assert_eq!(version_of(&uri, Some(&feature)).await, feature_version + 1);
+    assert_eq!(execute(&uri).await.outcome, UpgradeOutcome::AlreadyCurrent);
+}
+
+/// A v15 graph is served as it is: reads and ordinary publishes need no
+/// upgrade, the first publish on a ref stamps that ref 16 and leaves the
+/// other at 15, and the stamp-only route finishes the rest.
+#[tokio::test]
+async fn a_v15_graph_is_served_and_stamped_by_its_first_publish() {
+    let (_dir, uri) = fresh_graph().await;
+    let feature = forked_branch(&uri, "feature").await;
+    for native in [None, Some(feature.as_str())] {
+        let mut manifest = open(&uri, native).await.unwrap();
+        set_stamp_for_test(&mut manifest, 15).await.unwrap();
+    }
+    let graph = Arc::new(Omnigraph::open(&uri).await.unwrap());
+    for branch in ["main", "feature"] {
+        graph
+            .snapshot_of(crate::db::ReadTarget::branch(branch))
+            .await
+            .unwrap();
+    }
+    insert(&graph, "main", "served").await;
+    assert_eq!(stamp_of(&uri, None).await, Some(16));
+    assert_eq!(stamp_of(&uri, Some(&feature)).await, Some(15));
+    drop(graph);
+
+    let report = execute(&uri).await;
+    assert_eq!(report.outcome, UpgradeOutcome::Completed, "{report:?}");
+    assert_eq!(report.completed_handlers, [STAMP]);
+    assert_eq!(
+        report.last_durable_completed_boundary.as_deref(),
+        Some(format!("stamped:ref '{feature}'").as_str())
+    );
+    assert_eq!(stamp_of(&uri, Some(&feature)).await, Some(16));
     assert_eq!(execute(&uri).await.outcome, UpgradeOutcome::AlreadyCurrent);
 }
 
@@ -1451,6 +1528,148 @@ async fn a_staged_schema_object_at_the_root_refuses_before_the_contract_is_read(
         assert_eq!(stored_files(source.dir.path()), before);
         assert_eq!(manifest_version(&source.root).await, 4);
         std::fs::remove_file(source.dir.path().join(&staging)).unwrap();
+    }
+}
+
+/// Accepted bounds keep their recorded representation and endpoint meaning.
+/// Ordinary open and the old-root upgrade validate through the same matcher.
+#[tokio::test]
+async fn accepted_range_contracts_keep_their_complete_historical_shape() {
+    use crate::db::schema_state::{render_schema_contract, validate_schema_contract_row};
+    use ConstraintBound::{Float, Integer};
+    use omnigraph_compiler::schema::ast::{Constraint, ConstraintBound, SchemaDecl};
+    use omnigraph_compiler::schema::parser::parse_schema;
+    use omnigraph_compiler::{SchemaIdentityDomain, compile_schema_shape, initialize_schema_ir};
+
+    let source = |value: &str, other: &str| {
+        format!(
+            "node Counter {{ value: U64? other: I64? \
+             @range(value, {value}) @range(other, {other}) }}"
+        )
+    };
+    // Build the accepted bounds as typed values, independently of either
+    // parser interpretation. The stored Float is exactly what overflow kept.
+    let lower = |value| (Some(value), None);
+    let upper = |value| (None, Some(value));
+    for (label, text, bounds, valid) in [
+        (
+            "historical upper-only and overflowing integer",
+            source("..9223372036854775808", "..10"),
+            [
+                lower(Float(9_223_372_036_854_775_808.0)),
+                lower(Integer(10)),
+            ],
+            true,
+        ),
+        (
+            "historical negative overflow",
+            source("-9223372036854775809..", "..10"),
+            [
+                lower(Float(-9_223_372_036_854_775_808.0)),
+                lower(Integer(10)),
+            ],
+            true,
+        ),
+        (
+            "current upper-only",
+            source("..9223372036854775807", "..10"),
+            [upper(Integer(i64::MAX)), upper(Integer(10))],
+            true,
+        ),
+        (
+            "hybrid endpoint interpretation",
+            source("..9223372036854775808", "..10"),
+            [
+                upper(Float(9_223_372_036_854_775_808.0)),
+                lower(Integer(10)),
+            ],
+            false,
+        ),
+        (
+            "unrelated bound drift",
+            source("..9223372036854775808", "..10"),
+            [
+                lower(Float(9_223_372_036_854_775_808.0)),
+                lower(Integer(11)),
+            ],
+            false,
+        ),
+        (
+            "unrelated property drift",
+            source("..9223372036854775808", "..10").replace("value: U64", "value: U32"),
+            [
+                lower(Float(9_223_372_036_854_775_808.0)),
+                lower(Integer(10)),
+            ],
+            false,
+        ),
+        (
+            "malformed range",
+            source("..", "..10"),
+            [
+                lower(Float(9_223_372_036_854_775_808.0)),
+                lower(Integer(10)),
+            ],
+            false,
+        ),
+    ] {
+        let mut schema = parse_schema("node Counter { value: U64? other: I64? }").unwrap();
+        let SchemaDecl::Node(node) = &mut schema.declarations[0] else {
+            unreachable!();
+        };
+        node.constraints = ["value", "other"]
+            .into_iter()
+            .zip(bounds)
+            .map(|(property, (min, max))| Constraint::Range {
+                property: property.into(),
+                min,
+                max,
+            })
+            .collect();
+        node.source_constraints = node.constraints.clone();
+        let shape = compile_schema_shape(&schema).unwrap();
+        let domain = SchemaIdentityDomain::from_ulid(ulid::Ulid::from(77u128));
+        let ir = initialize_schema_ir(domain, &shape).unwrap().schema_ir;
+        let contract = render_schema_contract(&ir, &text).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = ObjectStorageAdapter::local();
+        let root = dir.path().to_str().unwrap();
+        for damage in ["none", "hash", "domain"] {
+            let mut row = contract.clone();
+            match damage {
+                "hash" => row.head.schema_ir_hash = format!("sha256:{}", "a".repeat(64)),
+                "domain" => {
+                    row.head.schema_identity_domain =
+                        SchemaIdentityDomain::from_ulid(ulid::Ulid::from(78u128))
+                            .as_str()
+                            .to_string();
+                }
+                _ => {}
+            }
+            write_root_schema(dir.path(), &row);
+            let before = root_objects(dir.path());
+            let opened = validate_schema_contract_row(&row);
+            let upgraded = root_schema::load_validated_schema_contract(
+                root,
+                &storage,
+                Bounds::SERVED.root_object_bytes,
+            )
+            .await;
+            let accepted = valid && damage == "none";
+            assert_eq!(opened.is_ok(), accepted, "{label}, {damage}: {opened:?}");
+            assert_eq!(
+                upgraded.is_ok(),
+                accepted,
+                "{label}, {damage}: {upgraded:?}"
+            );
+            if accepted {
+                assert_eq!(opened.unwrap().0, ir, "{label}");
+                let loaded = upgraded.unwrap();
+                assert_eq!(loaded.ir, ir, "{label}");
+                assert_eq!(loaded.row, contract, "{label}");
+            }
+            assert_eq!(root_objects(dir.path()), before, "{label}, {damage}");
+        }
     }
 }
 
@@ -2760,6 +2979,46 @@ async fn commit_list_and_change_feed_cross_the_upgrade() {
     insert(&graph, "main", "d").await;
     let commits = graph.list_commits(None).await.unwrap();
     assert_eq!(commit_ids(&commits[1..]), [id(4), id(2), id(1)]);
+    // Pages walk from the new head into the commits the upgrade converted,
+    // which are read by their pre-upgrade ids, through both doors.
+    for branch in [None, Some("feature")] {
+        let listed = graph.list_commits(branch).await.unwrap();
+        for limit in [1, 2] {
+            for on_branch in [false, true] {
+                let mut paged = Vec::new();
+                let mut token: Option<String> = None;
+                loop {
+                    let page = match on_branch {
+                        true => {
+                            graph
+                                .list_commits_page_readable(
+                                    branch,
+                                    token.as_deref(),
+                                    Some(limit),
+                                    &mut |_| false,
+                                )
+                                .await
+                        }
+                        false => {
+                            graph
+                                .list_commits_page(branch, token.as_deref(), Some(limit))
+                                .await
+                        }
+                    }
+                    .unwrap();
+                    paged.extend(page.commits);
+                    match page.next_page_token {
+                        Some(next) => token = Some(next),
+                        None => break,
+                    }
+                }
+                assert_eq!(
+                    paged, listed,
+                    "{branch:?} by {limit}, on branch {on_branch}"
+                );
+            }
+        }
+    }
     let newest = commits[0].graph_commit_id.clone();
     let second = graph.get_commit(&id(2)).await.unwrap();
     assert_eq!(
@@ -2847,6 +3106,64 @@ async fn commit_list_and_change_feed_cross_the_upgrade() {
     }
 }
 
+/// A commit written before the storage upgrade starts no branch: its
+/// `__manifest` version is in the earlier format, which only the legacy
+/// history reads, so the start is refused before any effect. A commit
+/// written after the upgrade starts one.
+#[tokio::test]
+async fn branch_start_refuses_a_commit_written_before_the_upgrade() {
+    use crate::db::{ReadTarget, SnapshotId};
+    use crate::error::{BranchStartRefusal, CompletionEvidence};
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
+    let source = engine_source().await;
+    assert_eq!(
+        execute(&source.root).await.outcome,
+        UpgradeOutcome::Completed
+    );
+    let graph = Arc::new(Omnigraph::open(&source.root).await.unwrap());
+    insert(&graph, "main", "d").await;
+    let branches = graph.branch_list().await.unwrap();
+    let main_version = version_of(&source.root, None).await;
+    for commit in [id(1), id(2), id(3), id(4)] {
+        let refused = graph
+            .branch_create_from(ReadTarget::snapshot(SnapshotId::new(commit.clone())), "old")
+            .await
+            .expect_err("a pre-upgrade commit starts no branch");
+        assert_eq!(
+            refused.completion_evidence(),
+            Some(CompletionEvidence::BeforeEffect),
+            "{refused}"
+        );
+        let refused = refused.into_completion_evidence().0;
+        assert!(
+            matches!(
+                &refused,
+                OmniError::BranchStartRefused {
+                    reason: BranchStartRefusal::EarlierStorageFormat,
+                    graph_commit_id,
+                } if *graph_commit_id == commit
+            ),
+            "{commit}: {refused:?}"
+        );
+    }
+    assert_eq!(graph.branch_list().await.unwrap(), branches);
+    assert_eq!(version_of(&source.root, None).await, main_version);
+
+    let newest = graph.list_commits(None).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    let created = graph
+        .branch_create_from(ReadTarget::snapshot(SnapshotId::new(newest.clone())), "new")
+        .await
+        .unwrap();
+    assert_eq!(
+        (created.from.as_str(), created.from_commit_id.as_str()),
+        ("main", newest.as_str())
+    );
+    assert_eq!(names(&graph, "new").await, ["a", "c", "d"]);
+}
+
 /// Publish a lineage-only commit on `branch` of `root` under the release
 /// budget `release_bytes` and return the commit the head then holds.
 async fn publish(
@@ -2910,7 +3227,7 @@ async fn numeric_snapshot_below(source: Source, archived_source: &str) {
     ManifestCoordinator::open(root)
         .await
         .unwrap()
-        .create_branch("late")
+        .create_branch("late", None)
         .await
         .unwrap();
     let on_main = publish(root, None, 10, HISTORY_RELEASE_BYTES).await;
@@ -3455,7 +3772,7 @@ mod interrupted {
             assert!(resumed.recovery.is_none(), "{context}: {resumed:?}");
             if !activated {
                 assert_eq!(resumed.outcome, UpgradeOutcome::Completed, "{context}");
-                assert_eq!(resumed.observed_format, Some(15), "{context}");
+                assert_eq!(resumed.observed_format, Some(16), "{context}");
                 assert_eq!(resumed.route, [route_name(stamp)], "{context}");
                 assert_eq!(
                     resumed.work.census_reads > 0,

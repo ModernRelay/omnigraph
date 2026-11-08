@@ -86,6 +86,9 @@ struct Snapshot {
 #[derive(Debug, Clone)]
 pub(crate) struct VerifiedIdentity {
     pub principal_id: String,
+    /// The OAuth client the token was issued to: opaque, signed text of at
+    /// most 512 bytes without control characters.
+    pub client_id: String,
 }
 
 /// Public trust validated against the same canonical root as the serving
@@ -305,71 +308,121 @@ impl OidcIdentityTrust {
         });
     }
 
+    #[cfg(test)]
     pub(crate) fn verify_at(&self, token: &str, now: i64) -> Option<AuthenticatedActor> {
-        if token.is_empty() || token.len() > MAX_TOKEN_BYTES {
-            return None;
-        }
+        self.check_at(token, now).ok()
+    }
+
+    /// Admit a bearer token, or say why not. The token's own checks come
+    /// first, against the snapshot's published keys and binding; only a token
+    /// that passes them learns whether the snapshot is current and whether its
+    /// subject is admitted. A stale snapshot's keys classify a refusal and
+    /// never admit.
+    pub(crate) fn check_at(
+        &self,
+        token: &str,
+        now: i64,
+    ) -> Result<AuthenticatedActor, OidcRefusal> {
         let snapshot = self.current.load();
+        let accepted = accepted_claims(&snapshot, token, now).ok_or(OidcRefusal::Invalid)?;
         if now < 0
             || snapshot.expires_at <= now
             || snapshot.generated_at > now.saturating_add(CLOCK_SKEW_SECONDS)
         {
-            return None;
+            return Err(OidcRefusal::Unavailable);
         }
-        let header = decode_header(token).ok()?;
-        if header.alg != Algorithm::RS256
-            || header.crit.is_some()
-            || header.enc.is_some()
-            || header.zip.is_some()
-            || header
-                .typ
-                .as_deref()
-                .is_some_and(|t| !matches!(t, "JWT" | "at+jwt"))
-        {
-            return None;
-        }
-        let key = snapshot.keys.get(header.kid.as_deref()?)?;
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.leeway = 0;
-        // Explicit clock makes expiry tests deterministic and shares one instant
-        // with the snapshot check; signature/issuer/audience still use the library.
-        validation.validate_exp = false;
-        validation.validate_nbf = false;
-        validation.set_required_spec_claims(&["iss", "sub", "aud", "iat", "exp"]);
-        validation.set_issuer(&[&snapshot.binding.issuer]);
-        validation.set_audience(&[&snapshot.binding.audience]);
-        let claims = decode::<Value>(token, key, &validation).ok()?.claims;
-        if claims.get("iss")?.as_str()? != snapshot.binding.issuer
-            || claims.get("aud")?.as_str()? != snapshot.binding.audience
-            || claims.get("org_id")?.as_str()? != snapshot.binding.organization_id
-            || !bounded(claims.get("client_id")?.as_str()?, 512)
-            || claims.get("act").is_some_and(|v| !v.is_null())
-            || claims.get("impersonator").is_some_and(|v| !v.is_null())
-            || claims
-                .get("sub_profile")
-                .is_some_and(|v| v.as_str() != Some("user"))
-        {
-            return None;
-        }
-        let iat = claims.get("iat")?.as_i64()?;
-        let exp = claims.get("exp")?.as_i64()?;
-        if iat < 0
-            || iat > now.saturating_add(CLOCK_SKEW_SECONDS)
-            || exp <= now
-            || exp <= iat
-            || exp.checked_sub(iat)? > MAX_LIFETIME_SECONDS
-            || claims
-                .get("nbf")
-                .is_some_and(|v| v.as_i64().is_none_or(|n| n > now))
-        {
-            return None;
-        }
-        let subject = claims.get("sub")?.as_str()?;
-        let principal_id = snapshot.principals.get(subject)?.clone();
-        Some(AuthenticatedActor::oidc_identity(VerifiedIdentity {
+        let principal_id = snapshot
+            .principals
+            .get(&accepted.subject)
+            .ok_or(OidcRefusal::NotAdmitted)?
+            .clone();
+        Ok(AuthenticatedActor::oidc_identity(VerifiedIdentity {
             principal_id,
+            client_id: accepted.client_id,
         }))
     }
+}
+
+/// Why an OIDC bearer token admits no actor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OidcRefusal {
+    /// The token fails its own checks: signature, issuer, audience,
+    /// organization, client, delegation or lifetime. A new token can help
+    /// (RFC 6750 `invalid_token`).
+    Invalid,
+    /// The token passes, but the admission snapshot names no principal for
+    /// its subject. A new token for the same subject cannot help.
+    NotAdmitted,
+    /// The token passes, but the admission snapshot has expired or the
+    /// server's clock lies outside it. Access returns with the next
+    /// publication; a new token cannot help.
+    Unavailable,
+}
+
+/// The subject of a token that passes every check of its own against the
+/// snapshot's keys and binding, whatever the snapshot's lifetime.
+/// The claims an accepted token contributes to its identity.
+struct AcceptedClaims {
+    subject: String,
+    client_id: String,
+}
+
+fn accepted_claims(snapshot: &Snapshot, token: &str, now: i64) -> Option<AcceptedClaims> {
+    if token.is_empty() || token.len() > MAX_TOKEN_BYTES {
+        return None;
+    }
+    let header = decode_header(token).ok()?;
+    if header.alg != Algorithm::RS256
+        || header.crit.is_some()
+        || header.enc.is_some()
+        || header.zip.is_some()
+        || header
+            .typ
+            .as_deref()
+            .is_some_and(|t| !matches!(t, "JWT" | "at+jwt"))
+    {
+        return None;
+    }
+    let key = snapshot.keys.get(header.kid.as_deref()?)?;
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.leeway = 0;
+    // Explicit clock makes expiry tests deterministic and shares one instant
+    // with the snapshot check; signature/issuer/audience still use the library.
+    validation.validate_exp = false;
+    validation.validate_nbf = false;
+    validation.set_required_spec_claims(&["iss", "sub", "aud", "iat", "exp"]);
+    validation.set_issuer(&[&snapshot.binding.issuer]);
+    validation.set_audience(&[&snapshot.binding.audience]);
+    let claims = decode::<Value>(token, key, &validation).ok()?.claims;
+    if claims.get("iss")?.as_str()? != snapshot.binding.issuer
+        || claims.get("aud")?.as_str()? != snapshot.binding.audience
+        || claims.get("org_id")?.as_str()? != snapshot.binding.organization_id
+        || !bounded(claims.get("client_id")?.as_str()?, 512)
+        || claims.get("act").is_some_and(|v| !v.is_null())
+        || claims.get("impersonator").is_some_and(|v| !v.is_null())
+        || claims
+            .get("sub_profile")
+            .is_some_and(|v| v.as_str() != Some("user"))
+    {
+        return None;
+    }
+    let iat = claims.get("iat")?.as_i64()?;
+    let exp = claims.get("exp")?.as_i64()?;
+    if iat < 0
+        || iat > now.saturating_add(CLOCK_SKEW_SECONDS)
+        || exp <= now
+        || exp <= iat
+        || exp.checked_sub(iat)? > MAX_LIFETIME_SECONDS
+        || claims
+            .get("nbf")
+            .is_some_and(|v| v.as_i64().is_none_or(|n| n > now))
+    {
+        return None;
+    }
+    Some(AcceptedClaims {
+        subject: claims.get("sub")?.as_str()?.to_owned(),
+        client_id: claims.get("client_id")?.as_str()?.to_owned(),
+    })
 }
 
 #[cfg(test)]

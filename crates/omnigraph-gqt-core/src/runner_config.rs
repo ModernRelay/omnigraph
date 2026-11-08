@@ -49,12 +49,26 @@ impl Environment {
         let Some(uri) = store else {
             return self.admit(needs_dst);
         };
-        let Execution::Engine { storage } = self.execution else {
-            return Err("unsupported_environment: --store requires direct engine execution without DST or server targets".into());
+        let storage = match self.execution {
+            Execution::Engine { storage } => storage,
+            Execution::Dst { .. } => {
+                let root = uri.strip_prefix("file://").ok_or(
+                    "invalid_case: under omnigraph-engine-dst --store takes a file:// root, read through below the in-memory environment",
+                )?;
+                if !std::path::Path::new(root).is_dir() {
+                    return Err(format!(
+                        "invalid_case: --store root is not a directory: {root}"
+                    ));
+                }
+                return self.admit(needs_dst);
+            }
+            Execution::Server { .. } | Execution::ServerDst { .. } => {
+                return Err("unsupported_environment: --store requires direct engine or DST execution, not a server target".into());
+            }
         };
         if needs_dst {
             return Err(
-                "unsupported_environment: --store cannot execute seams or concurrent blocks".into(),
+                "unsupported_environment: --store cannot execute seams or concurrent blocks on the direct engine; select or declare omnigraph-engine-dst (--target omnigraph-engine-dst)".into(),
             );
         }
         if !["file://", "s3://", "az://"]
@@ -289,6 +303,8 @@ mod tests {
             "name: it's Alice & Bob",
             "name: <<",
             "\"<<\": value",
+            "'<<': value",
+            "\u{feff}name: café\r\n",
             "name: '&literal *literal !literal <<'",
             "name: \"escaped \\\" &literal\"",
             "name: 'it''s &literal'",
@@ -299,7 +315,7 @@ mod tests {
             "a: [true, 1, null, {b: ~}]",
         ] {
             assert!(
-                yaml::<serde_yaml::Value>(text, "test body").is_ok(),
+                yaml::<yaml_serde::Value>(text, "test body").is_ok(),
                 "{text}"
             );
         }
@@ -323,20 +339,42 @@ mod tests {
             "a: !<tag:example.org,2026:v> value",
             "%TAG !e! tag:example.org,2026:\n---\na: value",
             "a: {<<: {b: 1}}",
+            "? <<\n: {b: 1}",
+            "&root {a: 1}",
+            "!custom [1, 2]",
+            "a: *missing",
+            "? [a, b]\n: value",
+            "a: 1\n---\nb: 2",
+            "a: 1\n...\n---\nb: 2",
+            "name: \"unterminated",
+            "name: \0",
         ] {
             assert!(
-                yaml::<serde_yaml::Value>(text, "test body").is_err(),
+                yaml::<yaml_serde::Value>(text, "test body").is_err(),
                 "{text}"
             );
         }
         assert_eq!(
-            yaml::<serde_yaml::Value>("true: 1", "test body").unwrap_err(),
+            yaml::<yaml_serde::Value>("true: 1", "test body").unwrap_err(),
             "invalid_case: YAML mapping keys must be strings; `true` reads as a boolean, quote it"
         );
         assert!(
-            yaml::<serde_yaml::Value>("a: 1\na: 2", "generated recipe")
+            yaml::<yaml_serde::Value>("a: 1\na: 2", "generated recipe")
                 .unwrap_err()
                 .starts_with("invalid_case: invalid generated recipe: ")
+        );
+        let scalars = yaml::<serde_json::Value>(
+            "on: on\noff: off\nyes: yes\nno: no\nleading: 001\nquoted: '001'\nexponent: 1e3\nmax: 18446744073709551615\nempty: null\nflag: true\n",
+            "test body",
+        )
+        .unwrap();
+        assert_eq!(
+            scalars,
+            serde_json::json!({
+                "on": "on", "off": "off", "yes": "yes", "no": "no",
+                "leading": "001", "quoted": "001", "exponent": 1000.0,
+                "max": u64::MAX, "empty": null, "flag": true,
+            })
         );
     }
     #[test]
@@ -370,10 +408,6 @@ mod tests {
             }
         }
         for execution in [
-            Execution::Dst {
-                storage: Storage::InMemoryObjectStore,
-                seeds: vec![0],
-            },
             Execution::ServerDst {
                 storage: Storage::InMemoryObjectStore,
                 seeds: vec![0],
@@ -386,9 +420,34 @@ mod tests {
                 Environment { execution }
                     .admit_store(false, Some("file:///tmp/graph"))
                     .unwrap_err()
-                    .contains("--store requires direct engine")
+                    .contains("not a server target")
             );
         }
+        let dst = Environment {
+            execution: Execution::Dst {
+                storage: Storage::InMemoryObjectStore,
+                seeds: vec![0],
+            },
+        };
+        let existing = format!("file://{}", std::env::temp_dir().display());
+        for needs_dst in [false, true] {
+            let admitted = dst.admit_store(needs_dst, Some(&existing));
+            if cfg!(tokio_unstable) {
+                assert!(admitted.is_ok(), "{admitted:?}");
+            } else {
+                assert!(admitted.unwrap_err().contains("unavailable in this build"));
+            }
+        }
+        assert!(
+            dst.admit_store(false, Some("file:///nonexistent/prepared/root"))
+                .unwrap_err()
+                .contains("--store root is not a directory")
+        );
+        assert!(
+            dst.admit_store(false, Some("s3://bucket/graph"))
+                .unwrap_err()
+                .contains("takes a file:// root")
+        );
     }
 
     const ENGINE: &str = "timeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n";

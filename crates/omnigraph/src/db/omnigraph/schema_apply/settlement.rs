@@ -244,7 +244,7 @@ async fn retained_outcome(
 /// branch/table gates and repeat this check after their waits.
 async fn live_base(db: &Omnigraph, original: &PreparedSchemaApply) -> Result<Option<Snapshot>> {
     db.refresh_coordinator_only().await?;
-    let coordinator = db.coordinator.read().await;
+    let coordinator = db.coordinator.load_full();
     let snapshot = coordinator.snapshot();
     if snapshot.graph_branch().is_some()
         || snapshot.graph_manifest_version() != original.base_manifest_version
@@ -327,7 +327,7 @@ pub(in crate::db::omnigraph) async fn settle_prepared_schema(
         return retained_outcome(db, original, settlement).await;
     }
     {
-        let coordinator = db.coordinator.read().await;
+        let coordinator = db.coordinator.load_full();
         let mut captured = false;
         for id in original
             .graph_commit_id()
@@ -350,10 +350,8 @@ pub(in crate::db::omnigraph) async fn settle_prepared_schema(
         authority: original.authority.clone(),
         version: original.base_manifest_version,
     };
-    let published = db
-        .coordinator
-        .write()
-        .await
+    let (installed, mut next) = db.installed_coordinator_copy();
+    let published = next
         .commit_changes_with_intent_and_expected(
             &[],
             &crate::db::manifest::ExpectedTableVersions::new(),
@@ -361,6 +359,7 @@ pub(in crate::db::omnigraph) async fn settle_prepared_schema(
             &precondition,
         )
         .await;
+    db.install_coordinator(next, &installed);
     match published {
         Ok(published) => Ok(SchemaApplySettlement::NotPublished {
             proof: SchemaNonPublicationProof::Fence {

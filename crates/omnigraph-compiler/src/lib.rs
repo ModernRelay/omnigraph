@@ -11,6 +11,10 @@ pub mod settings;
 pub mod traversal;
 pub mod types;
 
+pub use catalog::catalogue::{
+    CATALOGUE_SCOPE, CATALOGUE_TYPES, CatalogueProp, CatalogueType, SYSTEM_GRAPH_ID_PREFIX,
+    catalogue_declarations, catalogue_type, is_catalogue_type_name,
+};
 pub use catalog::schema_ir::{
     ConstraintIR, EdgeIR, EmbedSourceIR, FEATURE_EDGE_KEYS, FEATURE_SYSTEM_COLUMNS, FieldRefIR,
     InterfaceIR, NodeIR, PropertyIR, PropertyRefIR, SCHEMA_IR_VERSION, SCHEMA_IR_VERSION_EDGE_KEYS,
@@ -39,11 +43,13 @@ pub use ir::ParamMap;
 /// `(2, 0)` introduced the shared expression model;
 /// `(2, 1)` adds typed edge selections (`docs/rfcs/2026-09-30-typed-edge-alternation.md`);
 /// `(2, 2)` adds the `as commit` clause and the `commit publish` / `commit drop`
-/// statements (`docs/rfcs/2026-10-10-unpublished-graph-commits.md`).
-pub const GQ_LANGUAGE_VERSION: (u16, u16) = (2, 2);
+/// statements (`docs/rfcs/2026-10-10-unpublished-graph-commits.md`);
+/// `(2, 3)` adds `branch create <name> from commit "<id>"`.
+pub const GQ_LANGUAGE_VERSION: (u16, u16) = (2, 3);
 pub use ir::lower::{lower_mutation_query, lower_query};
 pub use lint::{DiagnosticCode, Family, SafetyTier, Severity};
 pub use query::ast::Literal;
+pub use query::checked::CheckedRead;
 pub use query::descriptor::{
     QueryGraphFact, QueryGraphFactKind, QueryOperationDescriptor, QueryResultFieldDescriptor,
     QueryValueKind, describe_query_operation,

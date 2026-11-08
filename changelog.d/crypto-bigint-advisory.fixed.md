@@ -1,0 +1,1 @@
+- Remove `crypto-bigint` 0.5 (RUSTSEC-2026-0387): data tokens are verified with `p256` 0.14 and OIDC tokens through `aws-lc-rs`; the tokens the server accepts are unchanged.

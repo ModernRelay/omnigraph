@@ -1,0 +1,103 @@
+# issue: none
+# notes: Under `removal none` an overwrite charges nothing to the removed-id allowance of `write_max_bytes`:
+# notes: 90 edge ids (4,500 bytes) and 65 unreferenced Note ids (4,160 bytes) overwrite under 4,096; the charge under `scan` stays in `write_max_bytes_removed_id_charge.gqt`.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Doc {
+    slug: String @key
+}
+edge Cites: Doc -> Doc
+node Note {
+    slug: String @key
+}
+
+--- seed generate: v1 seed: 0
+tables:
+  - kind: node
+    name: Doc
+    rows: 2
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: d, width: 1}
+  - kind: edge
+    name: Cites
+    rows: 90
+    commits: 1
+    from: {kind: literal, value: d0}
+    to: {kind: literal, value: d1}
+    columns: {}
+  - kind: node
+    name: Note
+    rows: 65
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: n, width: 39}
+
+--- csv cites.csv
+from,to
+d0,d1
+
+--- mutate
+set write_max_bytes = 4096;
+load csv "cites.csv" into edge:Cites mode overwrite header
+
+--- expect ok
+
+--- expect plan
+load route: plan
+load validate removal edge:Cites: none
+load write: overwrite fragments
+load executed: partitions 1 rows 1
+
+--- query
+query cites() {
+    match {
+        $a: Doc
+        $b: Doc
+        $a cites $b
+    }
+    return { $a.slug, $b.slug }
+}
+
+--- expect unordered
+{"a.slug": "d0", "b.slug": "d1"}
+
+--- expect shape
+a.slug: String
+b.slug: String
+
+--- csv notes.csv
+slug
+n99
+
+--- mutate
+load csv "notes.csv" into node:Note mode overwrite header
+
+--- expect ok
+
+--- expect plan
+load route: plan
+load validate removal node:Note: none
+load write: overwrite fragments
+load executed: partitions 1 rows 1
+
+--- query
+query notes() {
+    match { $n: Note }
+    return { $n.slug }
+}
+
+--- expect unordered
+{"n.slug": "n99"}
+
+--- expect shape
+n.slug: String

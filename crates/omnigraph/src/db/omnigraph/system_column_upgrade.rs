@@ -170,13 +170,17 @@ pub(super) async fn upgrade_system_columns(
         )
     };
     db.refresh_coordinator_only().await?;
-    let stamp = crate::db::manifest::internal_schema_stamp_at(db.uri(), None)
-        .await?
-        .ok_or_else(|| OmniError::manifest_internal("opened graph has no internal-schema stamp"))?;
+    let stamp = crate::db::manifest::internal_schema_stamp_at_with_session(
+        db.uri(),
+        None,
+        &db.control_session(),
+    )
+    .await?
+    .ok_or_else(|| OmniError::manifest_internal("opened graph has no internal-schema stamp"))?;
     report.stamp_before = stamp;
     report.stamp_after = stamp;
     let (accepted, accepted_identity) = {
-        let snapshot = db.coordinator.read().await.snapshot();
+        let snapshot = db.coordinator.load_full().snapshot();
         (
             db.read_schema_contract_row_for(&snapshot).await?,
             snapshot_contract_identity(&snapshot)?,
@@ -207,9 +211,13 @@ pub(super) async fn upgrade_system_columns(
     )
     .await?;
     report.outcome = SystemColumnUpgradeOutcome::Completed;
-    report.stamp_after = crate::db::manifest::internal_schema_stamp_at(db.uri(), None)
-        .await?
-        .unwrap_or(stamp);
+    report.stamp_after = crate::db::manifest::internal_schema_stamp_at_with_session(
+        db.uri(),
+        None,
+        &db.control_session(),
+    )
+    .await?
+    .unwrap_or(stamp);
     report.graph_manifest_version = Some(graph_manifest_version);
     Ok(report)
 }
@@ -221,7 +229,7 @@ async fn preflight(
     stamp: u32,
     report: &mut SystemColumnUpgradeReport,
 ) -> Result<()> {
-    let coordinator = db.coordinator.read().await;
+    let coordinator = db.coordinator.load_full();
     let blocking_branches = coordinator
         .all_branches()
         .await?
@@ -282,7 +290,7 @@ async fn execute_with_lock(
     fixup_physical_schemas(&mut desired_catalog)?;
 
     let (snapshot, base_branch_identifier, base_graph_head, lineage_intent) = {
-        let coordinator = db.coordinator.read().await;
+        let coordinator = db.coordinator.load_full();
         (
             coordinator.snapshot(),
             coordinator.branch_identifier().await?,
@@ -300,7 +308,7 @@ async fn execute_with_lock(
 
     db.refresh_coordinator_only().await?;
     let (current_branch_identifier, current_graph_head) = {
-        let coordinator = db.coordinator.read().await;
+        let coordinator = db.coordinator.load_full();
         (
             coordinator.branch_identifier().await?,
             coordinator.exact_graph_head(),
@@ -332,7 +340,7 @@ async fn execute_with_lock(
             current_graph_head,
         ));
     }
-    let current_snapshot = db.coordinator.read().await.snapshot();
+    let current_snapshot = db.coordinator.load_full().snapshot();
     let (current_catalog, current_identity) =
         db.accepted_catalog_for_snapshot(&current_snapshot).await?;
     validate_bound_catalog_against_snapshot(&current_catalog, &current_snapshot)?;
@@ -432,17 +440,19 @@ async fn execute_with_lock(
             graph_manifest_version,
             commit,
             ..
-        } = db
-            .coordinator
-            .write()
-            .await
-            .commit_changes_with_intent_and_expected(
-                &manifest_changes,
-                &expected_versions,
-                lineage_intent,
-                &precondition,
-            )
-            .await?;
+        } = {
+            let (installed, mut next) = db.installed_coordinator_copy();
+            let outcome = next
+                .commit_changes_with_intent_and_expected(
+                    &manifest_changes,
+                    &expected_versions,
+                    lineage_intent,
+                    &precondition,
+                )
+                .await;
+            db.install_coordinator(next, &installed);
+            outcome?
+        };
         published_commit = Some(commit.graph_commit_id);
 
         db.store_schema_view(desired_catalog, desired_source, &desired_ir)?;

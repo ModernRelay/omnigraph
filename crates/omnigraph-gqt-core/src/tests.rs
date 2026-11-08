@@ -568,6 +568,55 @@ fn refuses_mutation_declaration_under_query() {
     assert!(refusal("x", &text).contains("use `--- mutate`"));
 }
 
+/// A branch control read is a `--- query` rows step whose shape is its own:
+/// it carries no shape section, takes `${name}` for a bound commit in its
+/// sides and its expected rows, and is refused under `--- mutate`, with an
+/// unbound name, or with a shape section.
+#[test]
+fn branch_read_steps_parse_and_refuse() {
+    const BIND: &str = "--- mutate\nquery ins() {\n    insert Person { name: \"bob\" }\n}\n--- expect ok\n--- bind commit $c\n";
+    let accepted = format!(
+        "{HDR}{SCHEMA}{SEED}{BIND}\
+         --- query\nbranch diff \"${{c}}\" to main\n--- expect ordered\n\
+         --- query\nbranch merge-base main\n--- expect ordered\n\
+         {{\"source\": \"main\", \"target\": \"main\", \"source_commit_id\": \"${{c}}\", \"target_commit_id\": \"${{c}}\", \"merge_base_commit_id\": \"${{c}}\"}}\n\
+         --- query\nbranch merge main dry run\n--- expect error: nothing\n"
+    );
+    let case = parse_case("x", &accepted).unwrap();
+    let reads = case
+        .items
+        .iter()
+        .filter(|item| matches!(item, Item::Step(Step::BranchRead(_))))
+        .count();
+    assert_eq!(reads, 3);
+
+    for (step, want) in [
+        (
+            "--- mutate\nbranch diff feature\n--- expect ok\n".to_string(),
+            "`branch diff` under `--- mutate` is refused; use `--- query`",
+        ),
+        (
+            "--- query\nbranch diff \"${x}\" to main\n--- expect ordered\n".to_string(),
+            "`${x}` is not bound; `--- bind commit $x` must precede this step",
+        ),
+        (
+            "--- query\nbranch merge-base feature\n--- expect ok\n".to_string(),
+            "`branch merge-base` takes `unordered`, `ordered`, or `error:`",
+        ),
+    ] {
+        let text = format!("{HDR}{SCHEMA}{SEED}{step}");
+        assert_eq!(refusal("x", &text), want, "{step}");
+    }
+    let shaped = format!(
+        "{HDR}{SCHEMA}{SEED}--- query\nbranch merge feature dry run\n--- expect ordered\n--- expect shape\noutcome: String\n"
+    );
+    assert!(
+        refusal("x", &shaped)
+            .contains("answers its own columns; drop the `--- expect shape` section"),
+        "{shaped}"
+    );
+}
+
 const CREATE: &str = "--- mutate\nbranch create b0\n--- expect ok\n";
 const LIST: &str = "--- query\nbranch list\n--- expect unordered\n{\"name\": \"b0\"}\n{\"name\": \"main\"}\n--- expect shape\nname: String\n";
 
@@ -685,6 +734,7 @@ fn outcome_takes_the_three_merge_words() {
             into,
             as_commit: _,
             expect: MergeExpect::Outcome(got),
+            plan: _,
         } = &step.write
         else {
             panic!(
@@ -833,6 +883,37 @@ fn bind_commit_names_a_write_and_its_consumers_resolve_it() {
     );
 }
 
+/// A step says whether its write stays unpublished and whether a drop names
+/// a commit the case bound; the benchmark's served admission reads both.
+#[test]
+fn as_commit_and_bound_drop_are_visible_per_step() {
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{PROPOSE}{BIND}--- mutate\ncommit drop \"${{c}}\"\n{EXPECT_OK}--- mutate\nquery publish_bob() {{\n    insert Person {{ name: \"carol\" }}\n}}\n{EXPECT_OK}--- mutate\nbranch merge b0 as commit\n--- expect outcome: merged\n--- mutate\nbranch merge b0\n--- expect outcome: merged\n--- mutate\ncommit drop \"hb1-literal\"\n{EXPECT_OK}{QUERY}{EXPECT}"
+    );
+    let case = parse_case("x", &text).unwrap();
+    let want = [
+        ("the `as commit` mutation", true, false),
+        ("drop of the bound commit", false, true),
+        ("a published mutation", false, false),
+        ("the `as commit` merge", true, false),
+        ("a published merge", false, false),
+        ("drop of a literal id", false, false),
+        ("a read", false, false),
+    ];
+    assert_eq!(case.items.len(), want.len());
+    for (item, (label, as_commit, drops_bound)) in case.items.iter().zip(want) {
+        let Item::Step(step) = item else {
+            panic!("{label}: no loop in this case");
+        };
+        assert_eq!(step.as_commit(), as_commit, "{label}: as_commit");
+        assert_eq!(
+            step.drops_bound_commit(),
+            drops_bound,
+            "{label}: drops_bound_commit"
+        );
+    }
+}
+
 /// Every misplacement of a binding is refused with the rule it broke.
 #[test]
 fn bind_commit_refusals() {
@@ -928,6 +1009,71 @@ fn bind_fence_admits_only_a_whole_quoted_commit_operand() {
     assert_eq!(
         refusal("x", &text),
         "line 21: `${` may appear only inside a params or expect body"
+    );
+}
+
+const ROOT: &str = "--- mutate\nquery root() as unattached branch {\n    insert Person { name: \"bob\" }\n}\n--- expect ok\n--- bind commit $r\n";
+const CHILD: &str = "--- mutate\nquery child() as unattached branch on \"${r}\" {\n    insert Person { name: \"carol\" }\n}\n--- expect ok\n";
+
+/// A whole quoted `on "${name}"` base operand needs its binding first, is the
+/// id in the compiled source, and admits no other `${` in the body; a params
+/// body spells a bound name; a header records whether it spelled `branch:`.
+#[test]
+fn unattached_base_operand_resolves_its_binding() {
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{ROOT}{CHILD}--- mutate branch: feature\nquery by_param($base: String) as unattached branch on $base {{\n    insert Person {{ name: \"dave\" }}\n}}\n--- params\n{{\"base\": \"${{r}}\"}}\n{EXPECT_OK}"
+    );
+    let case = parse_case("x", &text).unwrap();
+    let [
+        Item::Step(Step::Mutate(root)),
+        Item::Step(Step::Mutate(child)),
+        Item::Step(Step::Mutate(by_param)),
+    ] = case.items.as_slice()
+    else {
+        panic!("expected three mutate steps, got {:?}", case.items);
+    };
+    assert_eq!(root.base_binding, None);
+    assert!(!root.branch_spelled);
+    assert_eq!(child.base_binding.as_deref(), Some("r"));
+    assert!(!child.branch_spelled);
+    assert_eq!(by_param.base_binding, None);
+    assert!(by_param.branch_spelled);
+    assert_eq!(by_param.branch, "feature");
+    let mut bindings = Bindings::new();
+    assert_eq!(
+        bound_source(child, &bindings).unwrap_err(),
+        "`${r}` is not bound at this step"
+    );
+    bindings.insert("r".into(), "hb1-r".into());
+    let source = bound_source(child, &bindings).unwrap();
+    assert!(
+        source.contains("as unattached branch on \"hb1-r\" {"),
+        "{source}"
+    );
+    assert!(!source.contains("${"));
+    assert_eq!(bound_source(root, &bindings).unwrap(), root.source.as_str());
+    let params = build_params(
+        by_param.params_raw.as_ref(),
+        &by_param.ast_params,
+        None,
+        &bindings,
+    )
+    .unwrap();
+    assert_eq!(params.get("base"), Some(&Literal::String("hb1-r".into())));
+    assert_eq!(
+        refusal("x", &format!("{HDR}{SCHEMA}{SEED}{CHILD}")),
+        "`${r}` is not bound; `--- bind commit $r` must precede this step"
+    );
+    let elsewhere = CHILD.replace("name: \"carol\"", "name: \"${r}\"");
+    assert_eq!(
+        refusal("x", &format!("{HDR}{SCHEMA}{SEED}{ROOT}{elsewhere}")),
+        "line 21: `${` may appear only inside a params or expect body"
+    );
+    let unbound_param =
+        format!("{HDR}{SCHEMA}{SEED}{MUTATE}--- params\n{{\"n\": \"${{r}}\"}}\n{EXPECT_OK}");
+    assert_eq!(
+        refusal("x", &unbound_param),
+        "`${` in a params or expect body is refused outside a loop"
     );
 }
 
@@ -1744,6 +1890,7 @@ mod result_contract {
             },
             IRExpr::Aggregate {
                 func: AggFunc::Count,
+                distinct: false,
                 arg: Box::new(node()),
                 signature: AggSignature {
                     arg: ExprType::Node {
@@ -1838,6 +1985,7 @@ mod result_contract {
                     op: CompOp::Gt,
                     right,
                 },
+                strategy: omnigraph_planner::AntiJoinStrategy::Correlated,
             });
             bound.plan.set_root(id);
             assert_eq!(check_bound_plan_round_trip(&bound), Ok(()));
@@ -2516,7 +2664,13 @@ async fn pinned_step_runs_only_its_pinned_path() {
         let Some(Item::Step(Step::Query(step))) = case.items.first() else {
             panic!("first item is the query step");
         };
-        let params = build_params(step.params_raw.as_ref(), &step.decl.params, None).unwrap();
+        let params = build_params(
+            step.params_raw.as_ref(),
+            &step.decl.params,
+            None,
+            &Bindings::new(),
+        )
+        .unwrap();
         let (outcome, counts) = under_traversal(
             Some(mode),
             session.query(
@@ -2603,7 +2757,13 @@ async fn traversal_pin_survives_settings_steps_and_rebind() {
 /// own pin plumbing expands on the csr path only.
 async fn assert_csr_pin_runs(session: &Session, step: &QueryStep, stage: &str) {
     assert_eq!(session.settings().traversal(), Traversal::Csr, "{stage}");
-    let params = build_params(step.params_raw.as_ref(), &step.decl.params, None).unwrap();
+    let params = build_params(
+        step.params_raw.as_ref(),
+        &step.decl.params,
+        None,
+        &Bindings::new(),
+    )
+    .unwrap();
     let (outcome, counts) = under_traversal(
         pinned_mode(session),
         session.query(
@@ -2627,14 +2787,6 @@ async fn assert_csr_pin_runs(session: &Session, step: &QueryStep, stage: &str) {
 }
 
 #[test]
-fn admits_ordered_expect_on_an_rrf_led_order() {
-    let query = "--- query\nquery q($v: Vector(4), $t: String) {\n    match { $p: Person }\n    \
-                 return { $p.name }\n    order { rrf(nearest($p.vec, $v), bm25($p.name, $t)) }\n    limit 3\n}\n";
-    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n{SHAPE}");
-    parse_case("x", &text).unwrap();
-}
-
-#[test]
 fn refuses_ordered_expect_with_an_aggregate_in_return() {
     let query = "--- query\nquery q($t: String) {\n    match { $p: Person\n        search($p.name, $t) }\n    \
                  return { count($p) as total }\n    order { bm25($p.name, $t) }\n}\n";
@@ -2649,6 +2801,33 @@ fn refuses_ordered_expect_with_an_aggregate_in_return() {
         "{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n--- expect shape\np.name: String\ntotal: I64?\n"
     );
     parse_case("x", &text).unwrap();
+}
+
+#[test]
+fn refuses_ordered_expect_with_rank_only_distinct_issue_953() {
+    for ranking in [
+        "nearest($p.vec, $v)",
+        "bm25($p.name, $t)",
+        "rrf(nearest($p.vec, $v), bm25($p.name, $t))",
+    ] {
+        let query = format!(
+            "--- query\nquery q($v: Vector(4), $t: String) {{\n\
+             match {{ $p: Person }}\nreturn distinct {{ $p.name }}\n\
+             order {{ {ranking} }}\nlimit 3\n}}\n"
+        );
+        let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n{SHAPE}");
+        assert!(refusal("x", &text).contains("rank-only `return distinct`"));
+        let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n{SHAPE}");
+        parse_case("x", &text).unwrap();
+        for accepted in [
+            query.replace("return distinct", "return"),
+            query.replace(ranking, &format!("{ranking}, $p.name")),
+            query.replace(ranking, "$p.name"),
+        ] {
+            let text = format!("{HDR}{SCHEMA}{SEED}{accepted}--- expect ordered\n{SHAPE}");
+            parse_case("x", &text).unwrap();
+        }
+    }
 }
 
 const SET_MERGE_OFF: &str = "--- mutate\nset merge_lineage = off;\n--- expect ok\n";
@@ -3190,4 +3369,40 @@ async fn traversal_pin_preserves_the_hosts_query_io_probes() {
     })
     .await;
     assert_eq!(inherited.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
+fn a_plan_section_follows_a_load_or_mutate_steps_expect_only() {
+    const CSV: &str = "--- csv people.csv\nname\ncarol\n";
+    const LOAD: &str =
+        "--- mutate\nload csv \"people.csv\" into node:Person mode overwrite header\n";
+    const PLAN: &str = "--- expect plan\nload route: plan\nload write: overwrite fragments\n";
+    let text = format!("{HDR}{SCHEMA}{SEED}{CSV}{LOAD}{EXPECT_OK}{PLAN}");
+    let case = parse_case("load_plan", &text).unwrap();
+    let [
+        Item::Step(Step::Control(ControlStep {
+            write: ControlWrite::Load {
+                plan: Some(plan), ..
+            },
+            ..
+        })),
+    ] = case.items.as_slice()
+    else {
+        panic!("expected one load step carrying a plan expect");
+    };
+    assert_eq!(plan.lines.len(), 2);
+    let after_error = text.replace("--- expect ok\n", "--- expect error: anything\n");
+    assert!(parse_case("load_plan", &after_error).is_err());
+    let after_a_query = format!("{HDR}{SCHEMA}{SEED}{CSV}{LOAD}{EXPECT_OK}{QUERY}{EXPECT}{PLAN}");
+    assert!(parse_case("load_plan", &after_a_query).is_err());
+    let malformed = text.replace("load route: plan", "load route: express");
+    assert!(parse_case("load_plan", &malformed).is_err());
+    let on_a_mutation = format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{EXPECT_OK}{PLAN}");
+    let case = parse_case("load_plan", &on_a_mutation).unwrap();
+    let [Item::Step(Step::Mutate(step))] = case.items.as_slice() else {
+        panic!("expected one mutate step carrying a plan expect");
+    };
+    assert_eq!(step.plan.as_ref().map(|plan| plan.lines.len()), Some(2));
+    let before_the_expect = format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{PLAN}{EXPECT_OK}");
+    assert!(parse_case("load_plan", &before_the_expect).is_err());
 }

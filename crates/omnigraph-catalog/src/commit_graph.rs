@@ -11,6 +11,24 @@ use crate::error::{OmniError, Result};
 use crate::history;
 use crate::state::{BlockRun, LineageRegistry, MergeEdge};
 
+/// What a graph commit is on the wire: a commit of a branch's lineage, a
+/// publishable proposal (RFC "Unpublished graph commits"), or an unattached
+/// snapshot that is never published (RFC "Unattached graph branches").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GraphCommitKind {
+    #[default]
+    Published,
+    Unpublished,
+    Unattached,
+}
+
+impl GraphCommitKind {
+    pub fn is_published(self) -> bool {
+        self == Self::Published
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GraphCommit {
     pub graph_commit_id: String,
@@ -23,20 +41,32 @@ pub struct GraphCommit {
     pub merged_parent_commit_id: Option<String>,
     pub actor_id: Option<String>,
     pub created_at: i64,
-    /// `false` for an unpublished commit: a proposal readable by its id and
-    /// invisible to every branch read until it is published.
+    /// `false` for an unpublished commit or an unattached snapshot: readable
+    /// by its id and invisible to every branch read; always `kind.is_published()`.
     #[serde(default = "published_by_default")]
     pub published: bool,
+    /// Serialized only for the two unpublished kinds: a published commit's
+    /// encoding is unchanged by its arrival.
+    #[serde(default, skip_serializing_if = "kind_is_published")]
+    pub kind: GraphCommitKind,
+    /// The root of an unattached snapshot's chain, `None` for the other kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_commit_id: Option<String>,
 }
 
 fn published_by_default() -> bool {
     true
 }
 
+fn kind_is_published(kind: &GraphCommitKind) -> bool {
+    kind.is_published()
+}
+
 impl GraphCommit {
-    /// The one total order for deterministic lineage listing, head selection,
-    /// and any future commit-list keyset cursor. Ancestry and CDC traversal use
-    /// persisted first-parent links instead; this key never defines feed order.
+    /// The one total order for deterministic lineage listing and head
+    /// selection. A commit-list page, ancestry and CDC traversal follow
+    /// persisted first-parent links instead, along which this key and the
+    /// generation both rise; this key never defines feed order.
     pub fn lineage_key(&self) -> (u64, i64, &str) {
         (
             self.graph_manifest_version,
@@ -481,15 +511,20 @@ impl CommitGraph {
         Ok(registry)
     }
 
+    /// Test-only: production reads pass the reading handle's control session.
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn open(root_uri: &str) -> Result<Self> {
         Self::open_branch(root_uri, None).await
     }
 
     /// Fails with the typed branch miss when `branch` is not a live branch.
+    /// Test-only: production reads pass the reading handle's control session.
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn open_at_branch(root_uri: &str, branch: &str) -> Result<Self> {
         Self::open_branch(root_uri, Some(branch)).await
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     async fn open_branch(root_uri: &str, branch: Option<&str>) -> Result<Self> {
         let session = crate::lance_access::control_session();
         let (rows, dataset) =
@@ -700,6 +735,170 @@ impl CommitGraph {
         commits.sort_by(|a, b| a.lineage_key().cmp(&b.lineage_key()));
         Ok(commits)
     }
+
+    /// Up to `limit` commits of the first-parent chain that starts at
+    /// `start`, newest first; `None` when no commit `start` names is held or
+    /// in `__history`. Generation falls strictly along the chain, so a page
+    /// is the keyset `generation < g` of the chain below the commit before it.
+    ///
+    /// The head, the buffer and the commits the cache holds cost nothing; a
+    /// commit outside them is read by its id with the rest of its `__history`
+    /// extent, which usually holds the commits after it on the chain. A page
+    /// costs one read per extent its commits occupy, never a read of the
+    /// history below it, and never fills the cache's parent-closed set.
+    pub async fn first_parent_page(
+        &self,
+        start: &str,
+        limit: usize,
+    ) -> Result<Option<FirstParentPage>> {
+        let (commits, end) = self.read_first_parents(start, limit).await?;
+        match end {
+            ChainEnd::Missing(_) if commits.is_empty() => Ok(None),
+            ChainEnd::Missing(id) => Err(missing_parent(&id)),
+            ChainEnd::Root => Ok(Some(FirstParentPage {
+                commits,
+                next: None,
+            })),
+            ChainEnd::Next(next) => Ok(Some(FirstParentPage {
+                commits,
+                next: Some(next),
+            })),
+        }
+    }
+
+    /// Whether `descendant` descends from `commit_id` through first parents
+    /// with no merge commit after it: `commit_id` is on the first-parent chain
+    /// from `descendant`, read as [`Self::first_parent_page`] reads it, `limit`
+    /// commits at a time, and no commit above it on that chain names a merged
+    /// parent. The walk stops at the commit, at the first merge commit above
+    /// it, or at the first commit below the commit's own generation, so the
+    /// reads follow the distance between the two. `generation` is that
+    /// generation when the caller knows it; otherwise the commit is read
+    /// first. A commit neither the held commits nor `__history` hold, either
+    /// end or one the chain names, ends the walk with `false`: the caller's
+    /// fallback needs no lineage.
+    pub async fn descends_linearly_from(
+        &self,
+        descendant: &str,
+        commit_id: &str,
+        generation: Option<u64>,
+        limit: usize,
+    ) -> Result<bool> {
+        if descendant == commit_id {
+            return Ok(true);
+        }
+        let generation = match generation {
+            Some(generation) => generation,
+            None => match self.read_first_parents(commit_id, 1).await?.0.first() {
+                Some(commit) => commit.generation,
+                None => return Ok(false),
+            },
+        };
+        let mut start = descendant.to_string();
+        loop {
+            let (commits, end) = self.read_first_parents(&start, limit).await?;
+            for commit in &commits {
+                if commit.graph_commit_id == commit_id {
+                    return Ok(true);
+                }
+                if commit.merged_parent_commit_id.is_some() || commit.generation < generation {
+                    return Ok(false);
+                }
+            }
+            match end {
+                ChainEnd::Next(next) => start = next,
+                ChainEnd::Root | ChainEnd::Missing(_) => return Ok(false),
+            }
+        }
+    }
+
+    /// Up to `limit` commits of the first-parent chain from `start`, newest
+    /// first, and how the run ended.
+    async fn read_first_parents(
+        &self,
+        start: &str,
+        limit: usize,
+    ) -> Result<(Vec<GraphCommit>, ChainEnd)> {
+        let settled = self.history.held();
+        let mut read: HashMap<String, GraphCommit> = HashMap::new();
+        let mut commits: Vec<GraphCommit> = Vec::with_capacity(limit.min(PAGE_PREALLOCATED));
+        let mut next = Some(start.to_string());
+        while commits.len() < limit {
+            let Some(id) = next.take() else {
+                return Ok((commits, ChainEnd::Root));
+            };
+            let held = self
+                .held
+                .get(&id)
+                .or_else(|| settled.as_ref().and_then(|commits| commits.get(&id)))
+                .or_else(|| read.get(&id))
+                .cloned();
+            let commit = match held {
+                Some(commit) => commit,
+                None => {
+                    let found = history::read_lineage_of_bounded_in(
+                        &self.root_uri,
+                        &self.session,
+                        self.history.objects(),
+                        &[id.as_str()],
+                        PAGE_READ_BYTES,
+                    )
+                    .await?;
+                    read.extend(
+                        found
+                            .into_iter()
+                            .map(|(id, row)| (id, graph_commit_from_manifest_row(row))),
+                    );
+                    match read.get(&id) {
+                        Some(commit) => commit.clone(),
+                        None => return Ok((commits, ChainEnd::Missing(id))),
+                    }
+                }
+            };
+            if let Some(child) = commits.last()
+                && commit.generation >= child.generation
+            {
+                return Err(OmniError::manifest_internal(format!(
+                    "graph commit '{}' has generation {} and its first parent '{}' generation {}",
+                    child.graph_commit_id,
+                    child.generation,
+                    commit.graph_commit_id,
+                    commit.generation
+                )));
+            }
+            next = commit.parent_commit_id.clone();
+            commits.push(commit);
+        }
+        Ok((
+            commits,
+            match next {
+                Some(next) => ChainEnd::Next(next),
+                None => ChainEnd::Root,
+            },
+        ))
+    }
+}
+
+/// How a run of first parents ended: at the root, at the commit the next run
+/// starts from, or at a commit neither the held commits nor `__history` hold.
+enum ChainEnd {
+    Root,
+    Next(String),
+    Missing(String),
+}
+
+/// Commits a page reserves room for before it learns how long its chain is.
+const PAGE_PREALLOCATED: usize = 1024;
+
+/// Bytes one `__history` read of a commit page may fetch and decode.
+const PAGE_READ_BYTES: usize = 32 * 1024 * 1024;
+
+/// One page of a first-parent chain: its commits, newest first, and the id of
+/// the commit the next page starts at, `None` once the page ends at the root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirstParentPage {
+    pub commits: Vec<GraphCommit>,
+    pub next: Option<String>,
 }
 
 pub fn graph_commit_from_manifest_row(row: crate::GraphLineageRow) -> GraphCommit {
@@ -713,6 +912,8 @@ pub fn graph_commit_from_manifest_row(row: crate::GraphLineageRow) -> GraphCommi
         actor_id: row.actor_id,
         created_at: row.created_at,
         published: true,
+        kind: GraphCommitKind::Published,
+        root_commit_id: None,
     }
 }
 
@@ -1568,6 +1769,8 @@ mod tests {
             actor_id: None,
             created_at: 0,
             published: true,
+            kind: GraphCommitKind::Published,
+            root_commit_id: None,
         }
     }
 

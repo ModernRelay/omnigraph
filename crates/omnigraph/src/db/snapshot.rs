@@ -20,6 +20,9 @@ use crate::error::Result;
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     inner: omnigraph_catalog::Snapshot,
+    /// Opened through a branch incarnation that was already retired, by its
+    /// exact commit, while a live branch retained the commit.
+    retired_incarnation: bool,
 }
 
 /// Read-only view of one backing dataset pinned by a [`Snapshot`].
@@ -207,12 +210,31 @@ impl SnapshotDataset {
 }
 
 impl Snapshot {
+    pub(crate) fn clone_allocation_bytes(&self) -> usize {
+        self.inner.clone_allocation_bytes()
+    }
+
     pub(crate) fn same_manifest_image(&self, other: &Self) -> bool {
         self.inner.same_manifest_image(&other.inner)
     }
 
     pub(crate) fn wrap(inner: omnigraph_catalog::Snapshot) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            retired_incarnation: false,
+        }
+    }
+
+    /// Mark this view as opened through an already retired incarnation. Its
+    /// native ref has a unique name no recreated branch can reuse, so there is
+    /// no live name to reprove after its tables open.
+    pub(crate) fn retired_incarnation(mut self) -> Self {
+        self.retired_incarnation = true;
+        self
+    }
+
+    pub(crate) fn is_retired_incarnation(&self) -> bool {
+        self.retired_incarnation
     }
 
     #[cfg(feature = "test-util")]
@@ -274,8 +296,18 @@ impl Snapshot {
             .map(SchemaContractIdentity::from)
     }
 
-    pub(crate) fn bind_catalog_aliases(&mut self, catalog: &Catalog) -> Result<()> {
-        self.inner.bind_catalog_aliases(catalog)
+    pub(crate) fn bind_catalog_aliases(
+        &mut self,
+        catalog: &Catalog,
+        live: &Snapshot,
+    ) -> Result<()> {
+        self.inner.bind_catalog_aliases(catalog, &live.inner)
+    }
+
+    /// Whether the accepted contract was published with the version this view
+    /// pins for `type_key` (see `omnigraph_catalog::Snapshot::contract_covers`).
+    pub(crate) fn contract_covers(&self, type_key: &str) -> bool {
+        self.inner.contract_covers(type_key)
     }
 
     /// Open a backing dataset at its pinned version by qualified graph type key. With read caches present

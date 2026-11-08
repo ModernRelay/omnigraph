@@ -25,16 +25,26 @@ struct FreshNames {
     temp: usize,
 }
 
+const ANON_PREFIX: &str = "__anon_";
+const TEMP_PREFIX: &str = "__temp_";
+
 impl FreshNames {
     fn anon(&mut self) -> String {
         self.anon += 1;
-        format!("__anon_{}", self.anon)
+        format!("{ANON_PREFIX}{}", self.anon)
     }
 
     fn temp(&mut self, dst: &str) -> String {
         self.temp += 1;
-        format!("__temp_{}_{}", dst, self.temp)
+        format!("{TEMP_PREFIX}{}_{}", dst, self.temp)
     }
+}
+
+/// Whether `variable` is a name the lowering made up: an anonymous `_`
+/// endpoint or a cycle-closing or renamed temp. The query declares no such
+/// binding, so its identity orders nothing a reader can see.
+pub fn is_fresh_variable(variable: &str) -> bool {
+    variable.starts_with(ANON_PREFIX) || variable.starts_with(TEMP_PREFIX)
 }
 
 /// What every expression site shares: the physical column spellings and
@@ -109,14 +119,36 @@ impl LowerCtx<'_> {
 /// let catalog: omnigraph_compiler::catalog::Catalog = unimplemented!();
 /// let _ = omnigraph_compiler::lower_query(&catalog, &checked);
 /// ```
+fn typed_contains_aggregate(expr: &TypedExpr) -> bool {
+    match expr {
+        TypedExpr::Aggregate { .. } => true,
+        TypedExpr::Binary { left, right, .. }
+        | TypedExpr::In {
+            needle: left,
+            list: right,
+            ..
+        } => typed_contains_aggregate(left) || typed_contains_aggregate(right),
+        TypedExpr::Not { inner, .. } | TypedExpr::IsNull { inner, .. } => {
+            typed_contains_aggregate(inner)
+        }
+        _ => false,
+    }
+}
+
 pub fn lower_query(catalog: &Catalog, query: &CheckedReadQuery) -> Result<QueryIR> {
     let mut pipeline = Vec::new();
     let mut bound_vars = HashSet::new();
     let mut fresh = FreshNames::default();
+    let ranked = query
+        .orders
+        .first()
+        .map(|order| order.expr.ranked_variables())
+        .unwrap_or_default();
 
     lower_clauses(
         catalog,
         &query.scope,
+        &ranked,
         &mut pipeline,
         &mut bound_vars,
         &HashSet::new(),
@@ -146,7 +178,7 @@ pub fn lower_query(catalog: &Catalog, query: &CheckedReadQuery) -> Result<QueryI
     let has_aggregates = query
         .returns
         .iter()
-        .any(|item| matches!(&item.expr, TypedExpr::Aggregate { .. }));
+        .any(|item| typed_contains_aggregate(&item.expr));
     let aggregate_meta_columns: HashSet<String> = query
         .returns
         .iter()
@@ -157,7 +189,8 @@ pub fn lower_query(catalog: &Catalog, query: &CheckedReadQuery) -> Result<QueryI
     let order_by: Vec<IROrdering> = query
         .orders
         .iter()
-        .map(|order| {
+        .enumerate()
+        .map(|(index, order)| {
             let expr = order
                 .expr
                 .meta_field_result_key()
@@ -172,7 +205,23 @@ pub fn lower_query(catalog: &Catalog, query: &CheckedReadQuery) -> Result<QueryI
                         .clone();
                     IRExpr::AliasRef(name, ty)
                 })
-                .map_or_else(|| lower_expr(&order.expr, &ctx), Ok)?;
+                .map_or_else(
+                    || {
+                        if index == 0
+                            && matches!(
+                                &order.expr,
+                                TypedExpr::Nearest { .. }
+                                    | TypedExpr::Bm25 { .. }
+                                    | TypedExpr::Rrf { .. }
+                            )
+                        {
+                            lower_expr(&order.expr, &ctx)
+                        } else {
+                            lower_projection(&order.expr, &ctx)
+                        }
+                    },
+                    Ok,
+                )?;
             Ok(IROrdering {
                 expr,
                 descending: order.descending,
@@ -185,6 +234,7 @@ pub fn lower_query(catalog: &Catalog, query: &CheckedReadQuery) -> Result<QueryI
         params: lower_params(&query.params),
         pipeline,
         return_exprs,
+        distinct: query.distinct,
         order_by,
         limit: query.limit,
     };
@@ -217,7 +267,7 @@ pub fn lower_mutation_query(catalog: &Catalog, query: &CheckedMutationQuery) -> 
         name: query.name.clone(),
         params: lower_params(&query.params),
         ops,
-        as_commit: query.as_commit,
+        write_mode: query.write_mode.clone(),
     })
 }
 
@@ -285,9 +335,12 @@ fn lower_single_mutation(catalog: &Catalog, op: &CheckedMutationOp) -> Result<Mu
     }
 }
 
+/// `ranked` names the bindings the query's leading order key ranks; a
+/// correlated block has no order and passes none.
 fn lower_clauses(
     catalog: &Catalog,
     scope: &CheckedScope,
+    ranked: &[&str],
     pipeline: &mut Vec<IROp>,
     bound_vars: &mut HashSet<String>,
     outer_physical_names: &HashSet<String>,
@@ -324,6 +377,11 @@ fn lower_clauses(
     // order.  The first binding in each component becomes the root (gets
     // a NodeScan); all other bindings in the same component are deferred
     // — their inline filters become post-Expand Filter ops.
+    //
+    // A component holding a binding the leading order key ranks roots there
+    // instead, whatever the declaration order: the ranking starts the
+    // traversal. A ranked binding only a traversal introduces gets a NodeScan
+    // of its checked type, so declaring it does not change the plan.
 
     let binding_set: HashSet<&str> = bindings.iter().map(|b| b.variable.as_str()).collect();
 
@@ -347,14 +405,29 @@ fn lower_clauses(
         .iter()
         .filter_map(|f| f.text_search_subject())
         .collect();
+    // A ranked node binding no declaration introduces, keyed by the
+    // component binding whose place in declaration order its NodeScan takes
+    // (`None`: a component with no declared binding, scanned after the rest).
+    let mut ranked_scans: Vec<(Option<&str>, &str, &str)> = Vec::new();
+    let ranked_nodes: Vec<(&str, &str)> = ranked
+        .iter()
+        .filter_map(|var| match scope.bindings.get(*var) {
+            Some(BoundVariable::Node { type_name }) => Some((*var, type_name.as_str())),
+            Some(BoundVariable::Edge { .. }) | None => None,
+        })
+        .collect();
 
-    for binding in &bindings {
-        if component_visited.contains(binding.variable.as_str()) {
+    let starts = bindings
+        .iter()
+        .map(|binding| binding.variable.as_str())
+        .chain(ranked_nodes.iter().map(|(var, _)| *var));
+    for start in starts {
+        if component_visited.contains(start) {
             continue;
         }
-        // BFS from this binding through the traversal graph
+        // BFS from this variable through the traversal graph
         let mut queue = VecDeque::new();
-        queue.push_back(binding.variable.as_str());
+        queue.push_back(start);
         let mut component_bindings: Vec<&str> = Vec::new();
         let mut component_vars: Vec<&str> = Vec::new();
 
@@ -381,7 +454,27 @@ fn lower_clauses(
             .copied()
             .filter(|var| !bound_vars.contains(*var))
             .collect();
-        let root = scan_root(&inner_bindings, reaches_outer, &searched);
+        let ranked_here: Vec<(&str, &str)> = ranked_nodes
+            .iter()
+            .copied()
+            .filter(|(var, _)| component_vars.contains(var) && !bound_vars.contains(*var))
+            .collect();
+        let root = match ranked_here[..] {
+            [] => scan_root(&inner_bindings, reaches_outer, &searched),
+            [(var, type_name)] => {
+                let declared = inner_bindings.iter().position(|binding| *binding == var);
+                if declared.is_none() {
+                    ranked_scans.push((component_bindings.first().copied(), var, type_name));
+                }
+                declared
+            }
+            _ => {
+                return Err(CompilerError::Plan(format!(
+                    "the leading order key ranks {} bindings one traversal connects; the type checker refuses that rrf()",
+                    ranked_here.len()
+                )));
+            }
+        };
         for (index, var) in inner_bindings.into_iter().enumerate() {
             if Some(index) != root {
                 deferred_set.insert(var.to_string());
@@ -400,6 +493,14 @@ fn lower_clauses(
 
     // Lower bindings into NodeScan ops (skip deferred ones)
     for binding in &bindings {
+        ranked_scans.retain(|&(anchor, variable, type_name)| {
+            if anchor != Some(binding.variable.as_str()) {
+                return true;
+            }
+            pipeline.push(ranked_root_scan(variable, type_name));
+            bound_vars.insert(variable.to_string());
+            false
+        });
         let binding_filters = build_binding_filters(binding, &ctx)?;
 
         // A variable the outer pattern already bound (a negation's inner
@@ -430,6 +531,11 @@ fn lower_clauses(
             filters: binding_filters,
         });
         bound_vars.insert(binding.variable.clone());
+    }
+    // The ranked roots of components no declared binding belongs to.
+    for (_, variable, type_name) in ranked_scans {
+        pipeline.push(ranked_root_scan(variable, type_name));
+        bound_vars.insert(variable.to_string());
     }
 
     // Lower traversals into Expand ops.
@@ -618,6 +724,7 @@ fn lower_clauses(
         lower_clauses(
             catalog,
             &block.inner,
+            &[],
             &mut inner_pipeline,
             &mut inner_bound,
             &physical_names,
@@ -765,6 +872,7 @@ fn rename_inner_bindings<'a>(
             }
             IRExpr::Aggregate {
                 func: _,
+                distinct: _,
                 arg,
                 signature: _,
             }
@@ -807,6 +915,16 @@ fn build_binding_filters(binding: &CheckedBinding, ctx: &LowerCtx<'_>) -> Result
         )?);
     }
     Ok(filters)
+}
+
+/// The `NodeScan` of a ranked binding only a traversal introduces: every row
+/// of its checked type, filtered later like any other root.
+fn ranked_root_scan(variable: &str, type_name: &str) -> IROp {
+    IROp::NodeScan {
+        variable: variable.to_string(),
+        type_name: type_name.to_string(),
+        filters: Vec::new(),
+    }
 }
 
 /// The index of the component binding that keeps its `NodeScan`: the first one, or,
@@ -869,8 +987,8 @@ fn outer_var_in_expr(expr: &TypedExpr, outer_bound: &HashSet<String>) -> Option<
     }
 }
 
-/// A projected rank expression, at the root or inside the Boolean structure
-/// (`bm25($p.name, "x") > 0.0 as hit`), lowers to the score column the
+/// A rank expression in a projection or secondary order key, at the root or
+/// inside Boolean structure (`bm25($p.name, "x") > 0.0 as hit`), lowers to the score column the
 /// retrieval appends (`TypedExpr::score_column`); T33 required `order` to execute it.
 fn lower_projection(expr: &TypedExpr, ctx: &LowerCtx<'_>) -> Result<IRExpr> {
     let mut lowered = match expr {
@@ -997,10 +1115,12 @@ fn lower_expr(expr: &TypedExpr, ctx: &LowerCtx<'_>) -> Result<IRExpr> {
         TypedExpr::Literal { literal, .. } => IRExpr::Literal(literal.clone(), expr.expr_type()),
         TypedExpr::Aggregate {
             func,
+            distinct,
             arg,
             signature,
         } => IRExpr::Aggregate {
             func: *func,
+            distinct: *distinct,
             arg: Box::new(lower(arg)?),
             signature: signature.clone(),
         },

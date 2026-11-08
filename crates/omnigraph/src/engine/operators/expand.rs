@@ -15,7 +15,8 @@ use omnigraph_compiler::traversal::{EdgeMember, EdgeSelection};
 use omnigraph_compiler::types::Direction;
 use omnigraph_planner::{ExpandMode, ExpandPolicy};
 
-use super::{breaker_properties, external, joined_schema, polled, streaming_properties};
+use super::shape::{Breaker, Streaming};
+use super::{external, joined_schema};
 use crate::db::Snapshot;
 use crate::engine::graph::{GraphIndexHandle, ModeOrigin, bound_edge_pair_schema};
 use crate::error::{OmniError, Result};
@@ -235,11 +236,28 @@ impl fmt::Display for ExpandExecution {
     }
 }
 
+/// The shape a traversal holds, the same fact the planner's `PipelineShape`
+/// reads off the node: one hop streams its pairs and a budgeted traversal
+/// streams its frontier; a costed multi-hop traversal holds its paths.
+pub(super) enum ExpandShape {
+    Streaming(Streaming),
+    Breaker(Breaker),
+}
+
+impl ExpandShape {
+    pub(super) fn properties(&self) -> &Arc<PlanProperties> {
+        match self {
+            Self::Streaming(shape) => shape.properties(),
+            Self::Breaker(shape) => shape.properties(),
+        }
+    }
+}
+
 pub(crate) struct ExpandExec {
     input: Arc<dyn ExecutionPlan>,
     step: ExpandStep,
     env: Arc<GraphEnv>,
-    properties: Arc<PlanProperties>,
+    shape: ExpandShape,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -251,16 +269,16 @@ impl ExpandExec {
     ) -> Result<Self> {
         step.validate(&env.catalog)?;
         let schema = expand_output_schema(&input.schema(), &env.catalog, &step)?;
-        let properties = if step.single_hop() || step.budgeted() {
-            streaming_properties(schema)
+        let shape = if step.single_hop() || step.budgeted() {
+            ExpandShape::Streaming(Streaming::new(schema))
         } else {
-            breaker_properties(schema)
+            ExpandShape::Breaker(Breaker::new(schema))
         };
         Ok(Self {
             input,
             step,
             env,
-            properties,
+            shape,
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
@@ -342,7 +360,7 @@ impl ExecutionPlan for ExpandExec {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
+        self.shape.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -369,13 +387,14 @@ impl ExecutionPlan for ExpandExec {
         if partition != 0 {
             return internal_err!("ExpandExec has one partition, asked for {}", partition);
         }
-        let schema: SchemaRef = self.schema();
-        let input_schema = self.input.schema();
-        let input = self.input.execute(0, Arc::clone(&ctx))?;
-        let step = self.step.clone();
-        let env = Arc::clone(&self.env);
-        super::expand_stream::execute(input, input_schema, schema, step, env, ctx, &self.metrics)
-            .map(|stream| polled(&self.metrics, stream))
+        super::expand_stream::execute(
+            &self.shape,
+            Arc::clone(&self.input),
+            self.step.clone(),
+            Arc::clone(&self.env),
+            ctx,
+            &self.metrics,
+        )
     }
 }
 

@@ -10,7 +10,7 @@ use super::needle_rows::{ContainsColumns, NeedleRows};
 use crate::engine::operators::Needles;
 use crate::engine::operators::memory::WorkMemory;
 use crate::engine::operators::pair_buffer::PairBuffer;
-use crate::engine::operators::producer::BatchSender;
+use crate::engine::operators::shape::BatchSender;
 
 /// The pairs the needle rows found for the non-empty needles, before the
 /// join's filters; counted only beside a `MATCHER_METRIC` of 1.

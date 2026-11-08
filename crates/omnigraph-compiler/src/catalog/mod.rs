@@ -1,3 +1,4 @@
+pub mod catalogue;
 pub mod schema_ir;
 pub mod schema_plan;
 pub mod schema_shape;
@@ -26,6 +27,21 @@ pub struct Catalog {
     /// direct projection of one validated accepted SchemaIR and retain that
     /// authority so no consumer can reconstruct IDs from mutable names.
     pub identity: CatalogIdentity,
+    /// The engine catalogue's built-in `@` types as a query reads them,
+    /// spelled with this graph's identity column; never part of
+    /// `node_types`, so schema apply, validation and stored identity never
+    /// see them.
+    pub catalogue: HashMap<String, NodeType>,
+}
+
+impl Catalog {
+    /// The node type a `match` binding may read: a declared type by name,
+    /// or a catalogue type by its `@` name.
+    pub fn query_node_type(&self, name: &str) -> Option<&NodeType> {
+        self.node_types
+            .get(name)
+            .or_else(|| self.catalogue.get(name))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +90,18 @@ pub struct NodeType {
 }
 
 impl NodeType {
+    /// Whether `property` carries a declared full-text index: a one-column
+    /// `@index` or `@key` on a free-text String property
+    /// ([`PropType::index_kind`]). A composite declaration builds no
+    /// property index.
+    pub fn has_full_text_index(&self, property: &str) -> bool {
+        self.indices
+            .iter()
+            .any(|columns| matches!(columns.as_slice(), [column] if column == property))
+            && self.properties.get(property).and_then(PropType::index_kind)
+                == Some(crate::types::PropIndexKind::FullText)
+    }
+
     /// Backward-compatible accessor: returns the first (and typically only) key property name.
     pub fn key_property(&self) -> Option<&str> {
         self.key
@@ -551,6 +579,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
         interfaces,
         system_columns,
         identity: CatalogIdentity::SourceUnbound,
+        catalogue: catalogue::catalogue_node_types(system_columns),
     })
 }
 
@@ -830,6 +859,7 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
         interfaces,
         system_columns,
         identity: CatalogIdentity::Bound(Arc::new(ir.clone())),
+        catalogue: catalogue::catalogue_node_types(system_columns),
     })
 }
 

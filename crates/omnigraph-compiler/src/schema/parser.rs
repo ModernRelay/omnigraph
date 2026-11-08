@@ -39,10 +39,12 @@ pub fn parse_schema_for_vintage(
 
 /// Parse source that is already bound to a persisted accepted schema contract.
 ///
-/// This compatibility seam permits exactly one historical admission bug:
-/// body-level `@unique(...)` could contain a Blob property before v0.10. New
-/// schema admission must always use [`parse_schema`], which rejects that shape.
-/// Property-level Blob annotations remain rejected in both modes.
+/// This compatibility seam preserves historical body-level `@unique(Blob)`
+/// and integer range bounds that overflowed I64 and were stored as Float. New
+/// schema admission must always use [`parse_schema`], which rejects those shapes.
+/// Property-level Blob annotations remain rejected in both modes. Historical
+/// upper-only range endpoint interpretation is accepted only by the caller's
+/// complete source-shape comparison with the already accepted schema IR.
 #[doc(hidden)]
 pub fn parse_persisted_schema_contract(input: &str) -> Result<SchemaFile> {
     parse_schema_diagnostic_with_mode(input, ConstraintValidationMode::PersistedContract)
@@ -97,8 +99,10 @@ fn parse_schema_diagnostic_with_modes(
         if pair.as_rule() == Rule::schema_file {
             for inner in pair.into_inner() {
                 if let Rule::schema_decl = inner.as_rule() {
-                    declarations
-                        .push(parse_schema_decl(inner).map_err(compiler_error_to_diagnostic)?);
+                    declarations.push(
+                        parse_schema_decl(inner, constraint_mode)
+                            .map_err(compiler_error_to_diagnostic)?,
+                    );
                 }
             }
         }
@@ -226,12 +230,15 @@ fn compiler_error_to_diagnostic(err: CompilerError) -> ParseDiagnostic {
     ParseDiagnostic::new(err.to_string(), None)
 }
 
-fn parse_schema_decl(pair: pest::iterators::Pair<Rule>) -> Result<SchemaDecl> {
+fn parse_schema_decl(
+    pair: pest::iterators::Pair<Rule>,
+    mode: ConstraintValidationMode,
+) -> Result<SchemaDecl> {
     let inner = pair.into_inner().next().unwrap();
     match inner.as_rule() {
         Rule::interface_decl => Ok(SchemaDecl::Interface(parse_interface_decl(inner)?)),
-        Rule::node_decl => Ok(SchemaDecl::Node(parse_node_decl(inner)?)),
-        Rule::edge_decl => Ok(SchemaDecl::Edge(parse_edge_decl(inner)?)),
+        Rule::node_decl => Ok(SchemaDecl::Node(parse_node_decl(inner, mode)?)),
+        Rule::edge_decl => Ok(SchemaDecl::Edge(parse_edge_decl(inner, mode)?)),
         _ => Err(CompilerError::Parse(format!(
             "unexpected rule: {:?}",
             inner.as_rule()
@@ -253,7 +260,10 @@ fn parse_interface_decl(pair: pest::iterators::Pair<Rule>) -> Result<InterfaceDe
     Ok(InterfaceDecl { name, properties })
 }
 
-fn parse_node_decl(pair: pest::iterators::Pair<Rule>) -> Result<NodeDecl> {
+fn parse_node_decl(
+    pair: pest::iterators::Pair<Rule>,
+    mode: ConstraintValidationMode,
+) -> Result<NodeDecl> {
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str().to_string();
 
@@ -278,7 +288,7 @@ fn parse_node_decl(pair: pest::iterators::Pair<Rule>) -> Result<NodeDecl> {
                 properties.push(parse_prop_decl(item)?);
             }
             Rule::body_constraint => {
-                constraints.push(parse_body_constraint(item)?);
+                constraints.push(parse_body_constraint(item, mode)?);
             }
             _ => {}
         }
@@ -312,7 +322,10 @@ fn parse_node_decl(pair: pest::iterators::Pair<Rule>) -> Result<NodeDecl> {
     })
 }
 
-fn parse_edge_decl(pair: pest::iterators::Pair<Rule>) -> Result<EdgeDecl> {
+fn parse_edge_decl(
+    pair: pest::iterators::Pair<Rule>,
+    mode: ConstraintValidationMode,
+) -> Result<EdgeDecl> {
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str().to_string();
     let from_type = inner.next().unwrap().as_str().to_string();
@@ -330,7 +343,7 @@ fn parse_edge_decl(pair: pest::iterators::Pair<Rule>) -> Result<EdgeDecl> {
             }
             Rule::annotation => annotations.push(parse_annotation(item)?),
             Rule::prop_decl => properties.push(parse_prop_decl(item)?),
-            Rule::body_constraint => constraints.push(parse_body_constraint(item)?),
+            Rule::body_constraint => constraints.push(parse_body_constraint(item, mode)?),
             _ => {}
         }
     }
@@ -377,7 +390,10 @@ fn parse_cardinality(pair: pest::iterators::Pair<Rule>) -> Result<Cardinality> {
     Ok(Cardinality { min, max })
 }
 
-fn parse_body_constraint(pair: pest::iterators::Pair<Rule>) -> Result<Constraint> {
+fn parse_body_constraint(
+    pair: pest::iterators::Pair<Rule>,
+    mode: ConstraintValidationMode,
+) -> Result<Constraint> {
     let mut inner = pair.into_inner();
     let name_pair = inner.next().unwrap();
     let constraint_name = name_pair.as_str();
@@ -425,7 +441,7 @@ fn parse_body_constraint(pair: pest::iterators::Pair<Rule>) -> Result<Constraint
             }
             let property = extract_ident_from_constraint_arg(args[0].clone())?;
             // The second arg should be a range_bound
-            let (min, max) = extract_range_bounds(&args[1])?;
+            let (min, max) = extract_range_bounds(&args[1], mode)?;
             Ok(Constraint::Range { property, min, max })
         }
         "check" => {
@@ -491,6 +507,7 @@ fn extract_string_from_constraint_arg(pair: &pest::iterators::Pair<Rule>) -> Res
 
 fn extract_range_bounds(
     pair: &pest::iterators::Pair<Rule>,
+    mode: ConstraintValidationMode,
 ) -> Result<(Option<ConstraintBound>, Option<ConstraintBound>)> {
     // Find the range_bound node inside the constraint_arg
     let range_pair = if pair.as_rule() == Rule::range_bound {
@@ -512,55 +529,45 @@ fn extract_range_bounds(
 
     let mut min = None;
     let mut max = None;
-    let mut seen_bound = false;
-
-    for child in range_pair.into_inner() {
-        if child.as_rule() == Rule::literal
-            || child.as_rule() == Rule::integer
-            || child.as_rule() == Rule::float_lit
-            || child.as_rule() == Rule::signed_integer
-            || child.as_rule() == Rule::signed_float
-        {
-            let bound = parse_constraint_bound(&child)?;
-            if !seen_bound {
-                min = Some(bound);
-                seen_bound = true;
-            } else {
-                max = Some(bound);
-            }
+    for endpoint in range_pair.into_inner() {
+        let role = endpoint.as_rule();
+        let value = endpoint
+            .into_inner()
+            .next()
+            .ok_or_else(|| CompilerError::Parse("missing value in range bound".to_string()))?;
+        let bound = parse_constraint_bound(&value, mode)?;
+        match role {
+            Rule::range_min => min = Some(bound),
+            Rule::range_max => max = Some(bound),
+            _ => unreachable!("range endpoints are named by the grammar"),
         }
     }
-
     Ok((min, max))
 }
 
-fn parse_constraint_bound(pair: &pest::iterators::Pair<Rule>) -> Result<ConstraintBound> {
+fn parse_constraint_bound(
+    pair: &pest::iterators::Pair<Rule>,
+    mode: ConstraintValidationMode,
+) -> Result<ConstraintBound> {
     let text = pair.as_str();
-
-    // Try as integer first
-    if let Ok(n) = text.parse::<i64>() {
-        return Ok(ConstraintBound::Integer(n));
-    }
-    // Try as float
-    if let Ok(f) = text.parse::<f64>() {
-        return Ok(ConstraintBound::Float(f));
-    }
-
-    // Navigate into literal -> integer/float_lit
-    for inner in pair.clone().into_inner() {
-        let s = inner.as_str();
-        if let Ok(n) = s.parse::<i64>() {
-            return Ok(ConstraintBound::Integer(n));
-        }
-        if let Ok(f) = s.parse::<f64>() {
-            return Ok(ConstraintBound::Float(f));
+    if pair.as_rule() == Rule::signed_integer {
+        match text.parse::<i64>() {
+            Ok(value) => return Ok(ConstraintBound::Integer(value)),
+            Err(_) if mode == ConstraintValidationMode::Admission => {
+                return Err(CompilerError::Parse(format!(
+                    "integer range bound {text} is outside I64 ({}..{})",
+                    i64::MIN,
+                    i64::MAX,
+                )));
+            }
+            // Accepted contracts may already contain an overflowed integer as
+            // a Float. Keep that value when checking their persisted source.
+            Err(_) => {}
         }
     }
-
-    Err(CompilerError::Parse(format!(
-        "invalid constraint bound: {}",
-        text
-    )))
+    text.parse::<f64>()
+        .map(ConstraintBound::Float)
+        .map_err(|_| CompilerError::Parse(format!("invalid constraint bound: {text}")))
 }
 
 /// Desugar property-level @key/@unique/@index annotations into body-level constraints.

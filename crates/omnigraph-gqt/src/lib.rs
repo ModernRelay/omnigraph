@@ -138,9 +138,21 @@ async fn open_case_store(
     let db = Omnigraph::init(&uri, &fixture.schema)
         .await
         .map_err(|e| format!("init failed: {e}"))?;
+    let db = with_case_external_blob_policy(db, case)?;
     let session = case_session(db, case, engine)?;
     seed_case(&session, &fixture.seed, case.needs_indices).await?;
     Ok((session, uri, dir))
+}
+
+/// The case's materialized `--- csv` base, installed on a fresh handle so a
+/// `load csv` step reads its fixture under the same policy any source meets.
+fn with_case_external_blob_policy(db: Omnigraph, case: &Case) -> Result<Omnigraph, String> {
+    match &case.external_blob_policy {
+        Some(policy) => db
+            .with_external_blob_policy(policy.clone())
+            .map_err(|e| format!("csv fixture policy: {e}")),
+        None => Ok(db),
+    }
 }
 
 fn execute_case<'a>(
@@ -195,6 +207,7 @@ async fn execute_case_inner(
         let db = Omnigraph::open(uri)
             .await
             .map_err(|e| format!("open failed: {e}"))?;
+        let db = with_case_external_blob_policy(db, case)?;
         let session = case_session(db, case, engine)?;
         return omnigraph_gqt_core::execute_steps(case, path, bless, session, uri, None, &GqtHost)
             .await
@@ -213,17 +226,27 @@ async fn execute_case_with_storage(
     uri: &str,
     storage: Arc<dyn StorageAdapter>,
     engine: Engine,
+    prepared: Option<&str>,
 ) -> Result<(), String> {
-    let fixture = case
-        .fixture
-        .as_ref()
-        .ok_or("invalid_case: DST requires schema and seed")?;
-    let db =
-        Omnigraph::init_with_storage(uri, &fixture.schema, storage.clone(), Default::default())
-            .await
-            .map_err(|e| format!("init failed: {e}"))?;
+    let db = match (prepared, case.fixture.as_ref()) {
+        (Some(mounted), _) => {
+            GqtHost.observe(|| mounted.to_string());
+            Omnigraph::open_with_storage(uri, storage.clone())
+                .await
+                .map_err(|e| format!("open failed: {e}"))?
+        }
+        (None, Some(fixture)) => {
+            Omnigraph::init_with_storage(uri, &fixture.schema, storage.clone(), Default::default())
+                .await
+                .map_err(|e| format!("init failed: {e}"))?
+        }
+        (None, None) => return Err("invalid_case: DST requires schema and seed, or --store".into()),
+    };
+    let db = with_case_external_blob_policy(db, case)?;
     let session = case_session(db, case, engine)?;
-    seed_case(&session, &fixture.seed, case.needs_indices).await?;
+    if let (None, Some(fixture)) = (prepared, case.fixture.as_ref()) {
+        seed_case(&session, &fixture.seed, case.needs_indices).await?;
+    }
     omnigraph_gqt_core::execute_steps(case, path, false, session, uri, Some(storage), &GqtHost)
         .await
         .map(|_| ())
@@ -243,6 +266,7 @@ async fn run_concurrent_step(
     }
     let line = case.source_lines.get(&step.ordinal).map(|l| *l as u64);
     let run = concurrent::Run::begin(step, concurrent::starve_budget(case.runner.timeout_ms));
+    let _stop = run.stop_guard();
     let sessions = step.sessions.iter().enumerate().map(|(index, op)| {
         let ctx = measure::SessionCtx::new(
             index,
@@ -259,11 +283,7 @@ async fn run_concurrent_step(
             (outcome, script)
         })
     });
-    let results = tokio::select! {
-        biased;
-        results = futures::future::join_all(sessions) => results,
-        () = run.drive_clock() => unreachable!("the clock driver never returns"),
-    };
+    let results = futures::future::join_all(sessions).await;
     let block = run.end();
     let sessions_evidence: Vec<Value> = step
         .sessions
@@ -310,7 +330,7 @@ fn record_concurrent_outcome(ordinal: usize, sessions: &[Value], block: &concurr
 pub async fn run_case(path: PathBuf, bless: bool) -> Result<(), String> {
     let stem = stem_of(&path);
     let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read case file: {e}"))?;
-    let case = parse_case(&stem, &text).map_err(|e| format!("refused: {e}"))?;
+    let mut case = parse_case(&stem, &text).map_err(|e| format!("refused: {e}"))?;
     case.admit_store(None)?;
     if case.runner.environments.len() != 1
         || !matches!(
@@ -321,6 +341,9 @@ pub async fn run_case(path: PathBuf, bless: bool) -> Result<(), String> {
         return Err("DST cases require the file dispatcher; the async normal runner cannot execute mode: dst".into());
     }
     case.runner.environments[0].admit(case.needs_dst())?;
+    let csv_dir = tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?;
+    case.materialize_csv_fixtures(csv_dir.path())
+        .map_err(|e| format!("refused: {e}"))?;
     execute_case(&case, &path, bless).await
 }
 

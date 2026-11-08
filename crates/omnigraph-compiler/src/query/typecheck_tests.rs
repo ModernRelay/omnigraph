@@ -114,7 +114,7 @@ fn setup() -> Catalog {
     let schema = parse_schema(
         r#"
 node Person {
-name: String
+name: String @index
 age: I32?
 }
 node Company {
@@ -154,7 +154,7 @@ fn setup_vector() -> Catalog {
     let schema = parse_schema(
         r#"
 node Doc {
-id_str: String
+id_str: String @index
 embedding: Vector(3)
 }
 "#,
@@ -715,6 +715,31 @@ limit 3
     assert!(err.to_string().contains("T15"));
 }
 
+/// The literal-vector shortcut in `nearest` must type its elements: an
+/// overflowing element is T3 at declaration time, the check the stored-query
+/// boot path and cluster config validation run (issue 920).
+#[test]
+fn test_nearest_literal_vector_overflowing_element_is_t3() {
+    let catalog = setup_vector();
+    let qf = parse_query(&format!(
+        r#"
+query q() {{
+match {{ $d: Doc }}
+return {{ $d.id_str }}
+order {{ nearest($d.embedding, [{}.0, 0.0, 0.0]) }}
+limit 3
+}}
+"#,
+        "9".repeat(400)
+    ))
+    .unwrap();
+    let err = typecheck_query_decl(&catalog, qf.single_decl()).unwrap_err();
+    assert!(
+        err.to_string().contains("T3") && err.to_string().contains("outside the F64 range"),
+        "{err}"
+    );
+}
+
 #[test]
 fn test_nearest_vector_param_ok() {
     let catalog = setup_vector();
@@ -749,6 +774,106 @@ limit 3
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert!(ctx.scope.bindings.contains_key("d"));
+}
+
+/// T27: a full-text call needs a one-column full-text index on its node
+/// property, read from the schema alone. `@key` declares one, a composite
+/// `@index` does not, an enum takes none, and a field that is not a String
+/// keeps its operand error.
+#[test]
+fn full_text_calls_need_a_declared_full_text_index() {
+    let catalog = build_catalog(
+        &parse_schema(
+            r#"
+node Doc {
+slug: String @key
+title: String @index
+body: String?
+summary: String
+kind: enum(note, essay)
+pages: I32?
+@index(summary, body)
+}
+"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let check = |call: &str| {
+        let source = format!(
+            "query q($q: String) {{ match {{ $d: Doc }} return {{ $d.slug }} {call} limit 3 }}"
+        );
+        typecheck_query(&catalog, parse_query(&source).unwrap().single_decl())
+    };
+    for accepted in [
+        "order { bm25($d.title, $q) }",
+        "order { bm25($d.slug, $q) }",
+    ] {
+        check(accepted).unwrap_or_else(|error| panic!("{accepted}: {error}"));
+    }
+    let accepted = typecheck_query(
+        &catalog,
+        parse_query(
+            "query q($q: String) { match { $d: Doc search($d.title, $q) } return { $d.slug } }",
+        )
+        .unwrap()
+        .single_decl(),
+    );
+    accepted.unwrap();
+    for (call, property) in [
+        ("search($d.body, $q)", "body"),
+        ("fuzzy($d.body, $q)", "body"),
+        ("match_text($d.summary, $q)", "summary"),
+    ] {
+        let source =
+            format!("query q($q: String) {{ match {{ $d: Doc {call} }} return {{ $d.slug }} }}");
+        let error =
+            typecheck_query(&catalog, parse_query(&source).unwrap().single_decl()).unwrap_err();
+        let diagnostic = error.diagnostic().expect("T27 carries a diagnostic");
+        assert_eq!(diagnostic.code.as_str(), "T27", "{call}: {error}");
+        assert_eq!(
+            diagnostic
+                .stage
+                .as_ref()
+                .and_then(|stage| stage.expression.as_deref()),
+            Some(format!("$d.{property}").as_str())
+        );
+        assert!(
+            diagnostic
+                .fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains(&format!("{property}: String @index"))),
+            "{call}: {diagnostic:?}"
+        );
+    }
+    let error = check("order { bm25($d.body, $q) }").unwrap_err();
+    assert_eq!(error.diagnostic().unwrap().code.as_str(), "T27", "{error}");
+    let error = typecheck_query(
+        &catalog,
+        parse_query("query q() { match { $d: Doc search($d.kind, \"note\") } return { $d.slug } }")
+            .unwrap()
+            .single_decl(),
+    )
+    .unwrap_err();
+    let diagnostic = error.diagnostic().unwrap();
+    assert_eq!(diagnostic.code.as_str(), "T27", "{error}");
+    assert!(
+        diagnostic
+            .fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("$d.kind = ")),
+        "{diagnostic:?}"
+    );
+    let error = typecheck_query(
+        &catalog,
+        parse_query(
+            "query q($q: String) { match { $d: Doc search($d.pages, $q) } return { $d.slug } }",
+        )
+        .unwrap()
+        .single_decl(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("T19"), "{error}");
 }
 
 #[test]
@@ -915,29 +1040,6 @@ limit 5
 }
 
 #[test]
-fn test_standalone_nearest_with_alias_ordering_still_rejected() {
-    let catalog = setup_vector();
-    let qf = parse_query(
-        r#"
-query q($vq: Vector(3)) {
-match { $d: Doc }
-return {
-    $d.id_str as score
-}
-order {
-    nearest($d.embedding, $vq),
-    score desc
-}
-limit 5
-}
-"#,
-    )
-    .unwrap();
-    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
-    assert!(err.to_string().contains("T18"));
-}
-
-#[test]
 fn test_rrf_rejects_non_rank_expression_argument() {
     let parse = parse_query(
         r#"
@@ -950,6 +1052,64 @@ limit 5
 "#,
     );
     assert!(parse.is_err());
+}
+
+/// T59: the ranked binding roots its component's scan, so `rrf()` arms that
+/// rank two bindings one traversal connects, directly or over several hops,
+/// are refused; arms on one binding, or on bindings no top-level traversal
+/// joins (an anonymous endpoint and a negation join nothing), are admitted.
+#[test]
+fn rrf_arms_on_two_bindings_one_traversal_connects_issue_789() {
+    let catalog = build_catalog(
+        &parse_schema(
+            "node Doc { text: String @index  embedding: Vector(2) @index }\nedge Cites: Doc -> Doc",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let check = |pattern: &str, first: &str, second: &str| {
+        let parsed = parse_query(&format!(
+            "query q($q: String, $v: Vector(2)) {{ match {{ {pattern} }} return {{ ${first}.text }} order {{ rrf(nearest(${first}.embedding, $v), bm25(${second}.text, $q)) }} limit 5 }}"
+        ))
+        .unwrap();
+        typecheck_query(&catalog, parsed.single_decl())
+    };
+    for pattern in [
+        "$a: Doc  $a cites $b",
+        "$b: Doc  $a cites $b",
+        "$a: Doc  $a cites $x  $x cites $b",
+        "$a: Doc  $b cites{1,3} $a",
+    ] {
+        let err = check(pattern, "a", "b").unwrap_err();
+        let diagnostic = err.diagnostic().expect("a typecheck diagnostic");
+        assert_eq!(diagnostic.code.as_str(), "T59", "{pattern}: {err}");
+        assert!(
+            diagnostic
+                .message
+                .contains("`rrf()` ranks `$a` and `$b`, which one traversal connects"),
+            "{pattern}: {err}"
+        );
+        assert_eq!(
+            diagnostic
+                .stage
+                .as_ref()
+                .and_then(|stage| stage.expression.as_deref()),
+            Some("rrf(nearest($a.embedding, $v), bm25($b.text, $q))"),
+            "{pattern}"
+        );
+        assert_eq!(
+            diagnostic.fix, None,
+            "{pattern}: no pattern serves both arms"
+        );
+    }
+    for (pattern, first, second) in [
+        ("$a: Doc  $a cites $b", "b", "b"),
+        ("$a: Doc  $b: Doc", "a", "b"),
+        ("$a: Doc  $b: Doc  $a cites $_  $_ cites $b", "a", "b"),
+        ("$a: Doc  $b: Doc  not { $a cites $b }", "a", "b"),
+    ] {
+        check(pattern, first, second).unwrap_or_else(|err| panic!("{pattern}: {err}"));
+    }
 }
 
 #[test]
@@ -1317,6 +1477,68 @@ insert Person {
             }
         ),
         _ => panic!("expected mutation typecheck result"),
+    }
+}
+
+#[test]
+fn unattached_base_parameter_must_be_a_declared_non_nullable_string() {
+    let catalog = setup();
+    let declared = parse_query(
+        "query add($name: String, $base: String) as unattached branch on $base {\n    insert Person { name: $name }\n}\n",
+    )
+    .unwrap();
+    let CheckedQuery::Mutation(checked) =
+        typecheck_query_decl(&catalog, declared.single_decl()).unwrap()
+    else {
+        panic!("expected mutation typecheck result");
+    };
+    assert_eq!(
+        checked.write_mode,
+        MutationWriteMode::Unattached {
+            base: Some(UnattachedBase::Param("base".to_string())),
+        }
+    );
+    let literal = parse_query(
+        "query add($name: String) as unattached branch on \"01ARZ3NDEKTSV4RRFFQ69G5FAV\" {\n    insert Person { name: $name }\n}\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        typecheck_query_decl(&catalog, literal.single_decl()),
+        Ok(CheckedQuery::Mutation(_))
+    ));
+
+    for (params, expected) in [
+        (
+            "$name: String",
+            "T55: `on $base` needs a declared `String` parameter; `$base` is not declared",
+        ),
+        (
+            "$name: String, $base: I32",
+            "T55: `on $base` needs a declared `String` parameter; `$base` is `I32`",
+        ),
+        (
+            "$name: String, $base: String?",
+            "T55: `on $base` needs a declared `String` parameter; `$base` is `String?`",
+        ),
+        (
+            "$name: String, $base: [String]",
+            "T55: `on $base` needs a declared `String` parameter; `$base` is `[String]`",
+        ),
+        (
+            "$name: String, $base: [String]?",
+            "T55: `on $base` needs a declared `String` parameter; `$base` is `[String]?`",
+        ),
+    ] {
+        let source = format!(
+            "query add({params}) as unattached branch on $base {{\n    insert Person {{ name: $name }}\n}}\n"
+        );
+        let qf = parse_query(&source).unwrap();
+        let err = typecheck_query_decl(&catalog, qf.single_decl()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("type error: {expected}"),
+            "{source}"
+        );
     }
 }
 
@@ -1954,10 +2176,11 @@ return { $d.name }
             expr: Expr::Literal(Literal::String("unreachable".to_string())),
             alias: None,
         }],
+        distinct: false,
         order_clause: Vec::new(),
         limit: None,
         mutations: Vec::new(),
-        as_commit: false,
+        write_mode: MutationWriteMode::Publish,
     };
     let error = typecheck_query(&catalog, &direct_ast).unwrap_err();
     assert_eq!(
@@ -2129,8 +2352,8 @@ fn setup_expressions() -> Catalog {
     let schema = parse_schema(
         r#"
 node Person {
-name: String
-email: String?
+name: String @index
+email: String? @index
 age: I32?
 active: Bool
 tags: [String]?
@@ -2918,7 +3141,7 @@ fn expected_visits_of(expr: &Expr, out: &mut Vec<Visit>) {
 fn checked_tree_retains_every_source_field() {
     let catalog = build_catalog(
         &parse_schema(
-            "node Doc { text: String  score: I32?  embedding: Vector(2) }\nedge Cites: Doc -> Doc",
+            "node Doc { text: String @index  score: I32?  embedding: Vector(2) }\nedge Cites: Doc -> Doc",
         )
         .unwrap(),
     )

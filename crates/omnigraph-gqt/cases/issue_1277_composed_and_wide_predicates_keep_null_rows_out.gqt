@@ -1,0 +1,102 @@
+# issue: 1277
+# red_on: f5a0dac9; the later delete excludes null rows that no earlier statement matched, and the wide read selects the all-null row.
+# notes: The shapes beside the written pair of disjoint IN tests. A later delete statement of one mutation
+# notes: excludes the rows earlier statements matched; when two earlier statements test one nullable
+# notes: property with disjoint NOT IN lists, the exclusion must not treat a null row as matched.
+# notes: A predicate that tests four properties twice each is pushed split on all four; one that tests
+# notes: five is not pushed: a read evaluates it in memory and a mutation refuses it.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Item {
+    slug: String @key
+    s: String?
+    t: String?
+}
+node Wide {
+    slug: String @key
+    p1: String?
+    p2: String?
+    p3: String?
+    p4: String?
+    p5: String?
+    tag: String?
+}
+
+--- seed
+{"type":"Item","data":{"slug":"a","t":"k"}}
+{"type":"Item","data":{"slug":"b","s":"x"}}
+{"type":"Item","data":{"slug":"d","s":"z"}}
+{"type":"Item","data":{"slug":"e","s":"y"}}
+{"type":"Wide","data":{"slug":"w0"}}
+{"type":"Wide","data":{"slug":"w1","p1":"a"}}
+
+--- query
+query four_properties_tested_twice() {
+    match {
+        $w: Wide
+        not (($w.p1 in ["a"]) and ($w.p1 in ["b"])) or not (($w.p2 in ["a"]) and ($w.p2 in ["b"])) or not (($w.p3 in ["a"]) and ($w.p3 in ["b"])) or not (($w.p4 in ["a"]) and ($w.p4 in ["b"]))
+    }
+    return { $w.slug }
+}
+
+--- expect unordered
+{"w.slug": "w1"}
+
+--- expect shape
+w.slug: String
+
+--- query
+query five_properties_tested_twice() {
+    match {
+        $w: Wide
+        not (($w.p1 in ["a"]) and ($w.p1 in ["b"])) or not (($w.p2 in ["a"]) and ($w.p2 in ["b"])) or not (($w.p3 in ["a"]) and ($w.p3 in ["b"])) or not (($w.p4 in ["a"]) and ($w.p4 in ["b"])) or not (($w.p5 in ["a"]) and ($w.p5 in ["b"]))
+    }
+    return { $w.slug }
+}
+
+--- expect unordered
+{"w.slug": "w1"}
+
+--- expect shape
+w.slug: String
+
+--- mutate
+query update_five_properties_tested_twice() {
+    update Wide set { tag: "hit" } where not ((p1 in ["a"]) and (p1 in ["b"])) or not ((p2 in ["a"]) and (p2 in ["b"])) or not ((p3 in ["a"]) and (p3 in ["b"])) or not ((p4 in ["a"]) and (p4 in ["b"])) or not ((p5 in ["a"]) and (p5 in ["b"]))
+}
+
+--- expect error: may compare at most 4 properties more than once each
+
+--- mutate
+query update_four_properties_tested_twice() {
+    update Wide set { tag: "hit" } where not ((p1 in ["a"]) and (p1 in ["b"])) or not ((p2 in ["a"]) and (p2 in ["b"])) or not ((p3 in ["a"]) and (p3 in ["b"])) or not ((p4 in ["a"]) and (p4 in ["b"]))
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query delete_after_disjoint_negated_statements() {
+    delete Item where not (s in ["y"])
+    delete Item where not (s in ["x"])
+    delete Item where t = "k"
+}
+
+--- expect affected: nodes=4 edges=0
+
+--- query
+query survivors() {
+    match { $i: Item }
+    return { count($i) as n }
+}
+
+--- expect unordered
+{"n": 0}
+
+--- expect shape
+n: I64

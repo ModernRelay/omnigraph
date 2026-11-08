@@ -3,16 +3,18 @@
 //! and one engine-result -> DTO mapping per verb. Plain serde/utoipa
 //! types; no transport, no server internals.
 
-use omnigraph::db::{GraphCommit, MergeOutcome, ReadTarget, SchemaApplyResult, Snapshot};
-use omnigraph::error::{MergeConflict, MergeConflictKind};
-use omnigraph::loader::{LoadMode, LoadReceipt, LoadResult};
+use omnigraph::db::{
+    GraphCommit, GraphCommitKind, MergeOutcome, ReadTarget, SchemaApplyResult, Snapshot,
+};
+use omnigraph::error::{MergeConflict, MergeConflictKind as EngineMergeConflictKind};
+use omnigraph::loader::{LoadExecuted, LoadMode, LoadOperatorExecuted, LoadReceipt, LoadResult};
 use omnigraph_compiler::SchemaMigrationStep;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::query::ast::Param;
-use omnigraph_compiler::result::QueryResult;
+use omnigraph_compiler::result::{QueryResult, Ranking, SearchFunction as ResultSearchFunction};
 use omnigraph_compiler::settings::{
-    Engine, MergeLineage, SettingId, SettingKind, SettingRow, SettingValue,
+    ChangeLineage, Engine, MergeLineage, SettingId, SettingKind, SettingRow, SettingValue,
 };
 use omnigraph_compiler::types::{PropType, ScalarType};
 use serde::{Deserialize, Serialize};
@@ -25,11 +27,87 @@ use utoipa::{IntoParams, ToSchema};
 /// re-exported so a wire consumer needs no second dependency for it.
 pub use omnigraph_compiler::settings;
 
-/// The single request/response discriminator for the v0.13 HTTP contract.
+pub mod operations;
+
+/// The single request/response discriminator for the v0.14 HTTP contract.
 /// This is independent of the package version and graph-storage stamp.
 pub const HTTP_API_CONTRACT_HEADER: &str = "omnigraph-http-api";
 /// Exact header value; consumers must reject missing or repeated values.
-pub const HTTP_API_CONTRACT: &str = "0.13";
+pub const HTTP_API_CONTRACT: &str = "0.14";
+/// An optional request header naming the actor the caller expects its
+/// credential to resolve to. The server refuses a mismatch with
+/// [`ErrorCode::ActorMismatch`] before graph lookup or effects; a matching
+/// value changes nothing, so the header can only narrow a request. Contract
+/// 0.14 introduced it, so a server that speaks [`HTTP_API_CONTRACT`] enforces
+/// it and an older one refuses the request before reading the header.
+pub const IF_ACTOR_HEADER: &str = "omnigraph-if-actor";
+
+/// How a binary identifies its build: the one derivation the CLI's
+/// `omnigraph version`, the server's `/healthz` and its MCP server info all
+/// report. The release workflows (`.github/workflows/build-release-archives.yml`
+/// and `publish-image.yml`) stamp both values at compile time; a local or
+/// source build carries neither, and a malformed stamp fails the build.
+pub mod build {
+    /// `stable` or `edge` for a release build; none for any other build.
+    pub const RELEASE_CHANNEL: Option<&str> = option_env!("OMNIGRAPH_RELEASE_CHANNEL");
+    /// The full commit a packaged build was compiled from.
+    pub const SOURCE_COMMIT: Option<&str> = option_env!("OMNIGRAPH_SOURCE_VERSION");
+
+    pub(crate) const fn is_full_commit(value: &str) -> bool {
+        let bytes = value.as_bytes();
+        if bytes.len() != 40 {
+            return false;
+        }
+        let mut index = 0;
+        while index < bytes.len() {
+            if !matches!(bytes[index], b'0'..=b'9' | b'a'..=b'f') {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+
+    pub(crate) const fn is_release_channel(value: &[u8]) -> bool {
+        matches!(value, b"stable" | b"edge")
+    }
+
+    // A malformed stamp fails the build instead of reporting a version no
+    // release has.
+    const _: () = {
+        if let Some(commit) = SOURCE_COMMIT {
+            assert!(
+                is_full_commit(commit),
+                "OMNIGRAPH_SOURCE_VERSION must be a full lowercase commit id"
+            );
+        }
+        if let Some(channel) = RELEASE_CHANNEL {
+            assert!(
+                is_release_channel(channel.as_bytes()),
+                "OMNIGRAPH_RELEASE_CHANNEL must be stable or edge"
+            );
+            assert!(
+                SOURCE_COMMIT.is_some(),
+                "OMNIGRAPH_RELEASE_CHANNEL requires OMNIGRAPH_SOURCE_VERSION"
+            );
+        }
+    };
+
+    /// The version a binary of `package` reports. An edge build is a SemVer
+    /// pre-release of the package version, `0.14.0-edge+9c2b367`, naming its
+    /// commit; the edge publisher refuses a build whose package version is not
+    /// above the latest stable release, so it also sorts after that release.
+    pub fn reported_version(package: &str) -> String {
+        versioned(package, RELEASE_CHANNEL, SOURCE_COMMIT)
+    }
+
+    pub(crate) fn versioned(package: &str, channel: Option<&str>, commit: Option<&str>) -> String {
+        match (channel, commit) {
+            (Some("edge"), Some(commit)) => format!("{package}-edge+{}", &commit[..7]),
+            _ => package.to_string(),
+        }
+    }
+}
 
 /// Lowercase wire name for the raw graph-head conditional-write token.
 /// Documentation presents the canonical spelling
@@ -98,6 +176,10 @@ pub struct SettingsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = merge_lineage_schema)]
     pub merge_lineage: Option<MergeLineage>,
+    /// `change_lineage`: `off`, `on` or `verify`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(schema_with = change_lineage_schema)]
+    pub change_lineage: Option<ChangeLineage>,
     /// `ann_nprobes`: the partition cap per index delta of a `nearest` scan, `0`
     /// is no cap. An `i64`, the settings model's integer: a value above its
     /// range fails to decode, a negative one is refused by the settings
@@ -109,10 +191,23 @@ pub struct SettingsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = traversal_work_limit_schema)]
     pub traversal_work_limit: Option<i64>,
-    /// `write_max_bytes`: independent row-data and Blob-payload allowances, `1..=33554432`.
+    /// `write_max_bytes`: independent row-data and Blob-payload allowances, at
+    /// least `1`; a value raised above the default is held in memory as one
+    /// typed batch at commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = write_max_bytes_schema)]
     pub write_max_bytes: Option<i64>,
+    /// `load_source_max_bytes`: the largest object a `load csv` statement
+    /// reads, at least `1`; an `i64` like `traversal_work_limit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(schema_with = load_source_max_bytes_schema)]
+    pub load_source_max_bytes: Option<i64>,
+    /// `query_memory_bytes`: the memory pool one read query runs under, and
+    /// the allowance a load statement's read-reuse buffers are admitted
+    /// against, at least `1`; an `i64` like `traversal_work_limit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(schema_with = query_memory_bytes_schema)]
+    pub query_memory_bytes: Option<i64>,
     /// `history_release_bytes`: the byte budget of a branch's buffer of
     /// unreleased commits for this request's mutate or merge publishes, `1024..=262144`; an
     /// `i64` like `traversal_work_limit`.
@@ -138,6 +233,12 @@ impl SettingsRequest {
                 SettingValue::Ident(merge_lineage.as_str().to_string()),
             ));
         }
+        if let Some(change_lineage) = self.change_lineage {
+            assignments.push((
+                SettingId::ChangeLineage,
+                SettingValue::Ident(change_lineage.as_str().to_string()),
+            ));
+        }
         if let Some(ann_nprobes) = self.ann_nprobes {
             assignments.push((SettingId::AnnNprobes, SettingValue::Integer(ann_nprobes)));
         }
@@ -146,6 +247,12 @@ impl SettingsRequest {
         }
         if let Some(bytes) = self.write_max_bytes {
             assignments.push((SettingId::WriteMaxBytes, SettingValue::Integer(bytes)));
+        }
+        if let Some(bytes) = self.load_source_max_bytes {
+            assignments.push((SettingId::LoadSourceMaxBytes, SettingValue::Integer(bytes)));
+        }
+        if let Some(bytes) = self.query_memory_bytes {
+            assignments.push((SettingId::QueryMemoryBytes, SettingValue::Integer(bytes)));
         }
         if let Some(bytes) = self.history_release_bytes {
             assignments.push((SettingId::HistoryReleaseBytes, SettingValue::Integer(bytes)));
@@ -169,6 +276,7 @@ fn setting_schema(id: SettingId) -> utoipa::openapi::schema::Object {
             .minimum(Some(min))
             .maximum(max)
             .build(),
+        SettingKind::Text => builder.schema_type(Type::String).build(),
     }
 }
 
@@ -178,6 +286,10 @@ fn engine_schema() -> utoipa::openapi::schema::Object {
 
 fn merge_lineage_schema() -> utoipa::openapi::schema::Object {
     setting_schema(SettingId::MergeLineage)
+}
+
+fn change_lineage_schema() -> utoipa::openapi::schema::Object {
+    setting_schema(SettingId::ChangeLineage)
 }
 
 fn ann_nprobes_schema() -> utoipa::openapi::schema::Object {
@@ -190,6 +302,14 @@ fn traversal_work_limit_schema() -> utoipa::openapi::schema::Object {
 
 fn write_max_bytes_schema() -> utoipa::openapi::schema::Object {
     setting_schema(SettingId::WriteMaxBytes)
+}
+
+fn load_source_max_bytes_schema() -> utoipa::openapi::schema::Object {
+    setting_schema(SettingId::LoadSourceMaxBytes)
+}
+
+fn query_memory_bytes_schema() -> utoipa::openapi::schema::Object {
+    setting_schema(SettingId::QueryMemoryBytes)
 }
 
 fn history_release_bytes_schema() -> utoipa::openapi::schema::Object {
@@ -215,12 +335,12 @@ enum LoadModeSchema {
 /// Logical graph entity namespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum EntityKindOutput {
+pub enum EntityKind {
     Node,
     Edge,
 }
 
-impl EntityKindOutput {
+impl EntityKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Node => "node",
@@ -252,16 +372,14 @@ impl std::error::Error for EntityTypeMappingError {}
 
 /// Project an engine-internal type selector into its logical kind and accepted
 /// schema name. The internal spelling is deliberately not returned.
-pub fn entity_type_parts(
-    selector: &str,
-) -> Result<(EntityKindOutput, &str), EntityTypeMappingError> {
+pub fn entity_type_parts(selector: &str) -> Result<(EntityKind, &str), EntityTypeMappingError> {
     if let Some(type_name) = selector.strip_prefix("node:") {
         (!type_name.is_empty())
-            .then_some((EntityKindOutput::Node, type_name))
+            .then_some((EntityKind::Node, type_name))
             .ok_or(EntityTypeMappingError)
     } else if let Some(type_name) = selector.strip_prefix("edge:") {
         (!type_name.is_empty())
-            .then_some((EntityKindOutput::Edge, type_name))
+            .then_some((EntityKind::Edge, type_name))
             .ok_or(EntityTypeMappingError)
     } else {
         Err(EntityTypeMappingError)
@@ -270,7 +388,7 @@ pub fn entity_type_parts(
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SnapshotDatasetOutput {
-    pub entity_kind: EntityKindOutput,
+    pub entity_kind: EntityKind,
     pub type_name: String,
     pub dataset_path: String,
     pub published_dataset_version: u64,
@@ -283,16 +401,23 @@ pub struct SnapshotOutput {
     pub graph_branch: String,
     pub graph_manifest_version: u64,
     /// The on-disk internal-schema (storage-format) version this graph's branch
-    /// is stamped at. This binary serves only its own storage-format version; a
-    /// graph at any other version is refused until it is upgraded offline or rebuilt.
+    /// is stamped at. It may be below the version the binary writes (the
+    /// `internal_schema_version` of `GET /healthz`): normal open serves a range
+    /// of versions, and a branch in that range takes the current one at its
+    /// first publish.
     pub internal_schema_version: u32,
     pub datasets: Vec<SnapshotDatasetOutput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchCreateRequest {
-    /// Parent branch to fork from. Defaults to `main`.
+    /// Parent branch to fork from; the new branch starts at its head.
+    /// Mutually exclusive with `from_commit`. Defaults to `main`.
     pub from: Option<String>,
+    /// A published graph commit id to start the new branch at, with that
+    /// commit's data and history. Mutually exclusive with `from`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_commit: Option<String>,
     /// Name of the new branch. Must not already exist.
     pub name: String,
 }
@@ -303,11 +428,64 @@ pub struct BranchCreateOutput {
     pub from: String,
     pub name: String,
     pub actor_id: Option<String>,
+    /// The graph commit the new branch starts at: `from`'s head when the
+    /// branch was created, or the commit `from_commit` named. For a commit
+    /// start, `from` is the branch that wrote the commit.
+    pub from_commit_id: String,
+}
+
+/// Query parameters for listing branches.
+#[derive(Debug, Clone, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct BranchListQuery {
+    /// `true` adds `details`: each branch's head, the branch and commit it
+    /// started from, when it was created, and when it last moved. Defaults
+    /// to `false`. Reads each listed branch's latest version, and the version
+    /// it was created from once it has written a commit, never its commit
+    /// history; the names alone read neither.
+    #[serde(default)]
+    pub detailed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchListOutput {
+    /// Every live branch, sorted by name in byte order.
     pub branches: Vec<String>,
+    /// Present only with `detailed=true`: one entry per branch the caller
+    /// may `read`, in the order of `branches`. A branch the caller may not
+    /// read is listed in `branches` alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Vec<BranchDetailOutput>>,
+}
+
+/// One live branch as `GET /branches?detailed=true` reports it. `from` and
+/// `from_commit_id` say where the branch started, as its `POST /branches`
+/// receipt did. A branch deleted and created again under the same name is a
+/// new lifetime: its start and creation time are the later creation's. The
+/// optional fields are absent on `main`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BranchDetailOutput {
+    pub name: String,
+    /// The commit a read of the branch sees: its newest commit, or the commit
+    /// it started at while it has written none.
+    pub head: CommitOutput,
+    /// The branch this one started from, as that branch was named then; it
+    /// may since have been deleted or recreated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// The commit the branch started at. A later merge does not move it;
+    /// `GET /branches/merge-base` answers where two branches last met.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_commit_id: Option<String>,
+    /// When the branch was created, as Unix epoch microseconds recorded to
+    /// the second.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = 1714000000000000i64)]
+    pub created_at: Option<i64>,
+    /// When the head last moved, as Unix epoch microseconds: the time of the
+    /// branch's newest commit, or `created_at` while it has written none.
+    #[schema(example = 1714000000000000i64)]
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -334,6 +512,13 @@ pub struct BranchMergeRequest {
     /// with `delete_branch`, whose source the proposal still holds.
     #[serde(default)]
     pub as_commit: bool,
+    /// Run the merge through classification and validation and stop: the
+    /// response reports the outcome the merge would have now, a conflict
+    /// fails with the same `409` a merge returns, and nothing is written.
+    /// A read of both branches; refused together with `as_commit` and
+    /// `delete_branch`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
     /// Session settings for this request (the Session settings RFC); see [`SettingsRequest`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<SettingsRequest>,
@@ -388,11 +573,15 @@ pub struct BranchMergeOutput {
     /// `branch_deleted` is `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_delete_error_details: Option<ErrorOutput>,
+    /// `true` for a dry run: `outcome` is what the merge would do now, and
+    /// `commit` is `null` because nothing was written.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum MergeConflictKindOutput {
+pub enum MergeConflictKind {
     DivergentInsert,
     DivergentUpdate,
     DeleteVsUpdate,
@@ -402,7 +591,7 @@ pub enum MergeConflictKindOutput {
     ValueConstraintViolation,
 }
 
-impl MergeConflictKindOutput {
+impl MergeConflictKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::DivergentInsert => "divergent_insert",
@@ -416,26 +605,26 @@ impl MergeConflictKindOutput {
     }
 }
 
-impl From<MergeConflictKind> for MergeConflictKindOutput {
-    fn from(value: MergeConflictKind) -> Self {
+impl From<EngineMergeConflictKind> for MergeConflictKind {
+    fn from(value: EngineMergeConflictKind) -> Self {
         match value {
-            MergeConflictKind::DivergentInsert => Self::DivergentInsert,
-            MergeConflictKind::DivergentUpdate => Self::DivergentUpdate,
-            MergeConflictKind::DeleteVsUpdate => Self::DeleteVsUpdate,
-            MergeConflictKind::OrphanEdge => Self::OrphanEdge,
-            MergeConflictKind::UniqueViolation => Self::UniqueViolation,
-            MergeConflictKind::CardinalityViolation => Self::CardinalityViolation,
-            MergeConflictKind::ValueConstraintViolation => Self::ValueConstraintViolation,
+            EngineMergeConflictKind::DivergentInsert => Self::DivergentInsert,
+            EngineMergeConflictKind::DivergentUpdate => Self::DivergentUpdate,
+            EngineMergeConflictKind::DeleteVsUpdate => Self::DeleteVsUpdate,
+            EngineMergeConflictKind::OrphanEdge => Self::OrphanEdge,
+            EngineMergeConflictKind::UniqueViolation => Self::UniqueViolation,
+            EngineMergeConflictKind::CardinalityViolation => Self::CardinalityViolation,
+            EngineMergeConflictKind::ValueConstraintViolation => Self::ValueConstraintViolation,
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MergeConflictOutput {
-    pub entity_kind: EntityKindOutput,
+    pub entity_kind: EntityKind,
     pub type_name: String,
     pub entity_id: Option<String>,
-    pub kind: MergeConflictKindOutput,
+    pub kind: MergeConflictKind,
     pub message: String,
 }
 
@@ -474,6 +663,71 @@ pub struct ReadOutput {
     /// come from one pinned version, so no separate id fetch is needed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_commit_id: Option<String>,
+    /// Page state of a paged control read (`branch diff`); absent for every
+    /// other answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<ReadPageOutput>,
+    /// How the read ordered its rows when its order is a search: the
+    /// search function, the direction its score ranks, whether the run's
+    /// search was exhaustive, and the returned columns holding the score.
+    /// Absent when the order is no search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranking: Option<RankingOutput>,
+}
+
+/// The ranking a read ordered its rows by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RankingOutput {
+    /// The search function the leading `order` key names.
+    pub by: SearchFunction,
+    /// `ascending` for a `nearest` distance (smaller is nearer),
+    /// `descending` for a `bm25` or `rrf` score (larger is more relevant).
+    pub order: RankOrder,
+    /// Whether no row the search admitted and did not return outranks a
+    /// returned one. `bm25` scores every match, so it is always exhaustive.
+    /// `nearest` is exhaustive when the run searched every partition of the
+    /// vector index, scored every row flat or returned every row it
+    /// admitted, and `false` when a probe cap left partitions unsearched, so
+    /// a nearer row may exist. `rrf` is exhaustive when its `nearest` arms
+    /// are.
+    pub exhaustive: bool,
+    /// The returned columns that hold the ranking's own score, in return
+    /// order; empty when the read returns none. A column computed from the
+    /// score is not one.
+    pub score_columns: Vec<String>,
+}
+
+/// The search function a ranked read orders by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchFunction {
+    Nearest,
+    Bm25,
+    Rrf,
+}
+
+/// The direction a ranking's score orders rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RankOrder {
+    Ascending,
+    Descending,
+}
+
+/// The page state a `branch diff` answer carries: the exact commits it
+/// compares, and the token `after page "<token>"` continues it with, absent
+/// on its last page.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ReadPageOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_commit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_commit_id: Option<String>,
+    /// The merge base, for a branch's diff since it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
 }
 
 /// The effect of a branch statement sent to `POST /mutate`, tagged by `kind`.
@@ -482,8 +736,14 @@ pub struct ReadOutput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BranchOutcomeOutput {
-    /// `name` was forked off `from`.
-    Created { from: String, name: String },
+    /// `name` was forked off `from` at the commit `from_commit_id`: the
+    /// head of `from`, or the commit a `from commit "<id>"` start named,
+    /// which `from` wrote.
+    Created {
+        from: String,
+        name: String,
+        from_commit_id: String,
+    },
     /// `name` was removed.
     Deleted { name: String },
     /// `source` was merged into `target`; `merge` is the three-way result,
@@ -501,9 +761,10 @@ pub enum BranchOutcomeOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeOutput {
-    /// The branch that received the effect. For a branch statement: the
-    /// created branch, the deleted branch (gone by the time this is read),
-    /// or the merge target.
+    /// The branch that received the effect, or the recorded target of an
+    /// unattached write (a child inherits its base's target whatever the
+    /// request named). For a branch statement: the created branch, the
+    /// deleted branch (gone by the time this is read), or the merge target.
     pub branch: String,
     /// The declared mutation's name, or a branch statement's two keywords
     /// (`branch create`, `branch delete`, `branch merge`).
@@ -523,6 +784,10 @@ pub struct ChangeOutput {
     /// Present only when the request was a branch statement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<BranchOutcomeOutput>,
+    /// Present only when the request was a `load csv` statement whose plan
+    /// the engine ran (`mode overwrite`): what the plan measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executed: Option<LoadExecutedOutput>,
 }
 
 /// Load capability for a batch touching a node type with declared `@embed`.
@@ -581,6 +846,78 @@ pub struct IngestOutput {
     pub commit: Option<CommitOutput>,
 }
 
+/// What a `load csv` statement's plan measured as it ran, beside the
+/// statement's [`ChangeOutput`]: the source partitions and bytes it read, the
+/// count its sink staged, and what each operator did. Absent for an append
+/// or merge load, which the keyed adapters run, and for every other change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct LoadExecutedOutput {
+    /// Source partitions the plan read.
+    pub partitions: u32,
+    /// Entities the sink staged.
+    pub rows: u64,
+    /// Bytes of the captured source.
+    pub source_bytes: u64,
+    /// One entry per node of the executed plan in post-order, the source
+    /// first.
+    pub operators: Vec<LoadOperatorExecutedOutput>,
+}
+
+/// What one operator of an executed load plan did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct LoadOperatorExecutedOutput {
+    /// The plan node's `id`, as the explain document numbers it.
+    pub id: u64,
+    /// The plan node's kind: `CsvSource`, `Validate`, `FragmentWrite`.
+    pub node: String,
+    /// The operator the node built.
+    pub operator: String,
+    /// What the operator emitted; the sink counts what it staged.
+    pub rows: u64,
+    /// Nanoseconds the operator was computing: the polls of its stream and of
+    /// its workers, never the time it waited for its input or for storage.
+    pub elapsed_compute_ns: u64,
+    /// Nanoseconds from the operator's first poll to its end, waits included;
+    /// `0` where no end was recorded.
+    pub wall_ns: u64,
+    /// The output partitions the operator ran, each its own stream: a
+    /// `CsvSource`'s parsers, 1 for every other operator.
+    #[serde(default = "one_partition")]
+    pub partitions: u32,
+    /// The slices of the source a `CsvSource` cut and parsed, in slice order;
+    /// absent for every other operator.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slices: Vec<LoadSliceExecutedOutput>,
+}
+
+fn one_partition() -> u32 {
+    1
+}
+
+/// What one slice of a `CsvSource` measured: a byte range of the capture
+/// parsed whole by one partition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct LoadSliceExecutedOutput {
+    /// The slice's position in the source, from 0; a slice's rows are the
+    /// same on every run.
+    pub slice: u32,
+    /// The partition that claimed the slice; which one varies between runs.
+    pub partition: u32,
+    /// The records the slice held.
+    pub rows: u64,
+    /// Nanoseconds the slice's parse and normalization took.
+    pub elapsed_compute_ns: u64,
+    /// Nanoseconds the slice's partition waited for the source's bytes.
+    #[serde(default)]
+    pub read_ns: u64,
+    /// Nanoseconds after the source's first poll at which the slice was
+    /// claimed.
+    pub start_ns: u64,
+    /// Nanoseconds after the source's first poll at which the slice's last
+    /// batch was sent.
+    pub end_ns: u64,
+}
+
 /// One logical declaration touched by a graph-batch load.
 ///
 /// This deliberately carries the accepted-schema name, not a backing dataset
@@ -615,7 +952,7 @@ pub struct GraphBatchLoadOutput {
     pub commit: Option<CommitOutput>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CommitOutput {
     pub graph_commit_id: String,
     pub graph_branch: Option<String>,
@@ -626,33 +963,126 @@ pub struct CommitOutput {
     /// Commit creation time as Unix epoch microseconds.
     #[schema(example = 1714000000000000i64)]
     pub created_at: i64,
-    /// `false` for an unpublished commit (a write `as commit`): readable by
-    /// its id, invisible to every branch read, until `commit publish`.
+    /// `false` for an unpublished commit (a write `as commit`) or an
+    /// unattached snapshot (a write `as unattached branch`): readable by its
+    /// id, invisible to every branch read; only the former publishes.
     /// `graph_manifest_version` is then the detached version holding it.
+    /// Always `kind == published`.
     #[serde(default = "published_by_default")]
     pub published: bool,
+    /// Which kind of commit this is. Required on the wire; a legacy receipt
+    /// without it derives `published` or `unpublished` from `published`.
+    #[serde(default)]
+    #[schema(required = true)]
+    pub kind: CommitKind,
+    /// The root of an unattached snapshot's chain, the snapshot's own id on
+    /// a root; `null` for the other kinds.
+    #[serde(default)]
+    pub root_commit_id: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for CommitOutput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Receipt {
+            graph_commit_id: String,
+            graph_branch: Option<String>,
+            graph_manifest_version: u64,
+            parent_commit_id: Option<String>,
+            merged_parent_commit_id: Option<String>,
+            actor_id: Option<String>,
+            created_at: i64,
+            #[serde(default = "published_by_default")]
+            published: bool,
+            #[serde(default, deserialize_with = "deserialize_commit_kind")]
+            kind: Option<CommitKind>,
+            #[serde(default)]
+            root_commit_id: Option<String>,
+        }
+
+        let receipt = Receipt::deserialize(deserializer)?;
+        let kind = receipt.kind.unwrap_or(if receipt.published {
+            CommitKind::Published
+        } else {
+            CommitKind::Unpublished
+        });
+        Ok(Self {
+            graph_commit_id: receipt.graph_commit_id,
+            graph_branch: receipt.graph_branch,
+            graph_manifest_version: receipt.graph_manifest_version,
+            parent_commit_id: receipt.parent_commit_id,
+            merged_parent_commit_id: receipt.merged_parent_commit_id,
+            actor_id: receipt.actor_id,
+            created_at: receipt.created_at,
+            published: receipt.published,
+            kind,
+            root_commit_id: receipt.root_commit_id,
+        })
+    }
+}
+
+fn deserialize_commit_kind<'de, D>(deserializer: D) -> Result<Option<CommitKind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    CommitKind::deserialize(deserializer).map(Some)
 }
 
 fn published_by_default() -> bool {
     true
 }
 
+/// `published`: a commit of a branch's lineage. `unpublished`: a proposal
+/// (`as commit`) awaiting `commit publish`. `unattached`: an unattached
+/// snapshot (`as unattached branch`), which never publishes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitKind {
+    #[default]
+    Published,
+    Unpublished,
+    Unattached,
+}
+
+impl From<GraphCommitKind> for CommitKind {
+    fn from(kind: GraphCommitKind) -> Self {
+        match kind {
+            GraphCommitKind::Published => Self::Published,
+            GraphCommitKind::Unpublished => Self::Unpublished,
+            GraphCommitKind::Unattached => Self::Unattached,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CommitListOutput {
     pub commits: Vec<CommitOutput>,
+    /// The head a paged listing's first page resolved; every later page
+    /// answers for its first-parent chain and repeats it as its page token
+    /// carries it, unchecked. Present only when the request set `limit` or
+    /// `page_token`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_commit_id: Option<String>,
+    /// Continue THIS listing below the last commit of the page. Absent on the
+    /// last page and on an unpaged listing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
 }
 
 /// Logical operation of one change. Ordering rank is frozen:
 /// insert before update before delete within one entity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum ChangeOpOutput {
+pub enum ChangeOp {
     Insert,
     Update,
     Delete,
 }
 
-impl ChangeOpOutput {
+impl ChangeOp {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Insert => "insert",
@@ -703,10 +1133,10 @@ pub struct ChangeImageOutput {
 /// delete only `before`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct EntityChangeOutput {
-    pub kind: EntityKindOutput,
+    pub kind: EntityKind,
     pub r#type: ChangeTypeOutput,
     pub id: String,
-    pub op: ChangeOpOutput,
+    pub op: ChangeOp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before: Option<ChangeImageOutput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -774,24 +1204,119 @@ pub struct ChangeFeedOutput {
 pub struct CommitChangesQuery {
     /// Opaque continuation from the preceding page of this response.
     pub page_token: Option<String>,
-    /// Maximum changes per page. Server default applies when absent; above
-    /// the public ceiling the request fails with 413.
+    /// Maximum changes per page, 1 to 8192; defaults to 1000. Above 8192
+    /// the request fails with 413; zero is refused with 400.
+    #[param(minimum = 1, maximum = 8192, default = 1000)]
     pub limit: Option<usize>,
     /// Repeatable filter: node | edge.
     #[serde(default)]
-    pub kind: Vec<EntityKindOutput>,
+    pub kind: Vec<EntityKind>,
     /// Repeatable filter: accepted-schema type name.
     #[serde(default)]
     pub r#type: Vec<String>,
     /// Repeatable filter: insert | update | delete.
     #[serde(default)]
-    pub op: Vec<ChangeOpOutput>,
+    pub op: Vec<ChangeOp>,
     /// Repeatable session setting, `name=value` in GQ spelling
     /// (`set=merge_lineage=off`); only `request`-scope settings are accepted.
     /// Values are validated as session settings; `engine` does not change
     /// change-feed execution.
     #[serde(default)]
     pub set: Vec<String>,
+}
+
+/// One bounded page of a graph diff: the net entity changes between two
+/// resolved commits, in the commit diff's entity shape and order. There is no
+/// cause: a range has no single author.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DiffOutput {
+    /// The commit the `from` side resolved to; for a branch diff, the merge
+    /// base.
+    pub from_commit_id: String,
+    /// The commit the `to` side resolved to; for a branch diff, the source
+    /// head.
+    pub to_commit_id: String,
+    /// The merge base, present only for a branch diff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit_id: Option<String>,
+    pub changes: Vec<EntityChangeOutput>,
+    /// Continue THIS bounded response; later pages answer for the same two
+    /// commits. Absent on the final page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
+}
+
+/// Query parameters for a two-point graph diff.
+#[derive(Debug, Clone, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct DiffQuery {
+    /// Read target the diff starts from: a branch name (its head now) or a
+    /// graph commit id. A string naming both is refused.
+    pub from: String,
+    /// Read target the diff ends at, spelled as `from`.
+    pub to: String,
+    /// Opaque continuation from the preceding page of this response.
+    pub page_token: Option<String>,
+    /// Maximum changes per page, 1 to 8192; defaults to 1000. Above 8192
+    /// the request fails with 413; zero is refused with 400.
+    #[param(minimum = 1, maximum = 8192, default = 1000)]
+    pub limit: Option<usize>,
+    /// Repeatable filter: node | edge.
+    #[serde(default)]
+    pub kind: Vec<EntityKind>,
+    /// Repeatable filter: accepted-schema type name.
+    #[serde(default)]
+    pub r#type: Vec<String>,
+    /// Repeatable filter: insert | update | delete.
+    #[serde(default)]
+    pub op: Vec<ChangeOp>,
+}
+
+/// Query parameters for a branch diff: what `source` changed since its merge
+/// base with `target`.
+#[derive(Debug, Clone, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct BranchDiffQuery {
+    /// Branch whose changes are reported.
+    pub source: String,
+    /// Branch the source is compared against. Defaults to `main`.
+    pub target: Option<String>,
+    /// Opaque continuation from the preceding page of this response.
+    pub page_token: Option<String>,
+    /// Maximum changes per page, 1 to 8192; defaults to 1000. Above 8192
+    /// the request fails with 413; zero is refused with 400.
+    #[param(minimum = 1, maximum = 8192, default = 1000)]
+    pub limit: Option<usize>,
+    /// Repeatable filter: node | edge.
+    #[serde(default)]
+    pub kind: Vec<EntityKind>,
+    /// Repeatable filter: accepted-schema type name.
+    #[serde(default)]
+    pub r#type: Vec<String>,
+    /// Repeatable filter: insert | update | delete.
+    #[serde(default)]
+    pub op: Vec<ChangeOp>,
+}
+
+/// Query parameters for the merge base of two branches.
+#[derive(Debug, Clone, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct MergeBaseQuery {
+    /// Branch that would be merged.
+    pub source: String,
+    /// Branch that would receive the merge. Defaults to `main`.
+    pub target: Option<String>,
+}
+
+/// The commit a merge of `source` into `target` would classify against, and
+/// the two heads it was computed from.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MergeBaseOutput {
+    pub source: String,
+    pub target: String,
+    pub source_commit_id: String,
+    pub target_commit_id: String,
+    pub merge_base: CommitOutput,
 }
 
 /// Query parameters for the change feed poll.
@@ -809,13 +1334,19 @@ pub struct ChangeFeedQuery {
     /// Continuation of one bounded poll (keeps its captured cut). Mutually
     /// exclusive with `cursor` and `start`.
     pub page_token: Option<String>,
+    /// Maximum changes per page, 1 to 8192; defaults to 1000. Above 8192
+    /// the request fails with 413; zero is refused with 400.
+    #[param(minimum = 1, maximum = 8192, default = 1000)]
     pub limit: Option<usize>,
+    /// Repeatable filter: node | edge.
     #[serde(default)]
-    pub kind: Vec<EntityKindOutput>,
+    pub kind: Vec<EntityKind>,
+    /// Repeatable filter: accepted-schema type name.
     #[serde(default)]
     pub r#type: Vec<String>,
+    /// Repeatable filter: insert | update | delete.
     #[serde(default)]
-    pub op: Vec<ChangeOpOutput>,
+    pub op: Vec<ChangeOp>,
     /// Repeatable session setting, `name=value` in GQ spelling
     /// (`set=merge_lineage=off`); only `request`-scope settings are accepted.
     /// Values are validated as session settings; `engine` does not change
@@ -833,11 +1364,11 @@ pub struct ChangeBaselineRequest {
     /// Feed scope the resume cursor is bound to. The snapshot honors `kind`
     /// and `type`; `op` constrains only subsequent polls.
     #[serde(default)]
-    pub kind: Vec<EntityKindOutput>,
+    pub kind: Vec<EntityKind>,
     #[serde(default)]
     pub r#type: Vec<String>,
     #[serde(default)]
-    pub op: Vec<ChangeOpOutput>,
+    pub op: Vec<ChangeOp>,
 }
 
 /// Terminal payload of a baseline stream: the captured snapshot commit and
@@ -868,8 +1399,14 @@ pub struct ChangeBaselineRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeErrorOutput {
     pub error: String,
+    /// The failure's registry code, as on [`ErrorOutput`].
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = ErrorCode, required = true)]
     pub code: Option<ErrorCode>,
+    /// What the request did and what to do next, as on [`ErrorOutput`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = DispositionOutput, required = true)]
+    pub disposition: Option<DispositionOutput>,
     /// Set when a requested limit exceeds a public ceiling, or a single change
     /// exceeds the poll's own byte ceiling.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -899,13 +1436,18 @@ pub struct QueryRequest {
     /// GQ read-query source. May declare one or more named queries; pick one
     /// with `name` when more than one is declared. Mutations
     /// (`insert`/`update`/`delete`) get 400 — use `POST /mutate` instead. May be the branch
-    /// statement `branch list`, sent with no `name`, `params`, `branch`, or
-    /// `snapshot`; or one `explain` statement (`explain query …`), which
+    /// statement `branch list` or a branch control read (`branch diff …`,
+    /// `branch merge-base …`, `branch merge … dry run`), sent with no `name`,
+    /// `params`, `branch`, or `snapshot`; or one `explain` statement (`explain query …`), which
     /// answers the v2 plan instead of
     /// running it, as one result per plan node (fields `tree`, `depth`, `node`,
     /// `detail`: the logical, physical and available DataFusion trees, then `plan` entries for
     /// the passes and the document's other fields), under the same `params`,
-    /// `branch`, or `snapshot` as the query itself.
+    /// `branch`, or `snapshot` as the query itself. `explain load csv …` answers the accepted
+    /// load plan as the same results (`logical_initial`, `logical`, `physical`, then `plan`
+    /// entries), under `branch` alone: `snapshot`, `name` and `params` are refused.
+    /// It requires the load's `change` permission before probing source metadata,
+    /// reads no payload byte, and publishes nothing.
     #[schema(
         example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
     )]
@@ -924,22 +1466,12 @@ pub struct QueryRequest {
     pub settings: Option<SettingsRequest>,
 }
 
-/// Logical graph entity selected by the Blob delivery surface.
-///
-/// This is intentionally graph vocabulary: callers select a node or edge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum BlobEntityKind {
-    Node,
-    Edge,
-}
-
 /// Query parameters shared by `GET` and `HEAD /graphs/{graph_id}/blob`.
 #[derive(Debug, Clone, Serialize, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct BlobReadQuery {
     /// Select a logical node or edge cell.
-    pub entity: BlobEntityKind,
+    pub entity: EntityKind,
     /// Accepted-schema node or edge type name.
     pub r#type: String,
     /// Logical entity id within the selected type.
@@ -955,7 +1487,7 @@ pub struct BlobReadQuery {
 /// One logical graph Blob cell.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct BlobSelectorOutput {
-    pub entity: BlobEntityKind,
+    pub entity: EntityKind,
     pub r#type: String,
     pub id: String,
     pub property: String,
@@ -1065,7 +1597,7 @@ impl BlobStatOutput {
 #[serde(deny_unknown_fields)]
 pub struct BlobWriteQuery {
     /// Select a logical node or edge cell.
-    pub entity: BlobEntityKind,
+    pub entity: EntityKind,
     /// Accepted-schema node or edge type name.
     pub r#type: String,
     /// Logical id of an existing entity within the selected type.
@@ -1092,7 +1624,7 @@ impl From<&BlobWriteQuery> for BlobSelectorOutput {
 /// describes one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum BlobWriteStateOutput {
+pub enum BlobWriteState {
     Managed,
     Null,
 }
@@ -1106,7 +1638,7 @@ pub struct BlobWriteOutput {
     pub selector: BlobSelectorOutput,
     /// The branch the write published to.
     pub branch: String,
-    pub kind: BlobWriteStateOutput,
+    pub kind: BlobWriteState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1136,7 +1668,7 @@ pub fn blob_write_output(
         } => BlobWriteOutput {
             selector,
             branch,
-            kind: BlobWriteStateOutput::Managed,
+            kind: BlobWriteState::Managed,
             size: Some(*length),
             etag: Some(etag.as_str().to_string()),
             actor_id,
@@ -1145,7 +1677,7 @@ pub fn blob_write_output(
         omnigraph::BlobWriteOutcome::Null { commit } => BlobWriteOutput {
             selector,
             branch,
-            kind: BlobWriteStateOutput::Null,
+            kind: BlobWriteState::Null,
             size: None,
             etag: None,
             actor_id,
@@ -1292,7 +1824,7 @@ pub struct InvokeStoredQueryRequest {
 /// wrapper field.
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(untagged)]
-pub enum InvokeStoredQueryResponse {
+pub enum InvokeStoredQueryOutput {
     Read(ReadOutput),
     Change(ChangeOutput),
 }
@@ -1432,6 +1964,12 @@ pub struct SchemaOutput {
     /// compatibility with servers predating the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_columns: Option<SystemColumnsOutput>,
+    /// The engine catalogue's built-in `@` types as `.pg`-style
+    /// declarations, listed beside the graph's own schema: read-only rows
+    /// the binary derives from its registries, never part of the schema
+    /// source above. Optional for compatibility with servers predating it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalogue_source: Option<String>,
 }
 
 /// A graph's system column spellings (see `SchemaOutput::system_columns`).
@@ -1474,6 +2012,7 @@ pub struct IngestRequest {
 
 /// Query parameters for `POST /load/ndjson`.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct GraphBatchLoadQuery {
     /// Target branch. Defaults to `main`. Without `from`, it must exist.
     pub branch: Option<String>,
@@ -1495,27 +2034,292 @@ pub struct ExportRequest {
 }
 
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct SnapshotQuery {
+    /// Branch whose snapshot to read. Defaults to `main`.
     pub branch: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, IntoParams)]
-pub struct CommitListQuery {
+/// Query parameters for `GET /graphs/{graph_id}/access`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
+pub struct AccessQuery {
+    /// A branch whose actions to report, by name; it need not exist.
     pub branch: Option<String>,
-    /// `true` lists the unpublished commits whose recorded target is `branch`
-    /// (writes `as commit` awaiting `commit publish`), newest first, instead
-    /// of the branch's history.
-    #[serde(default)]
-    pub unpublished: bool,
+    /// With `branch`, the branch `branch_create` would create and
+    /// `branch_merge` would merge into, by name.
+    pub target_branch: Option<String>,
+}
+
+/// A graph action a policy decides, as the access route reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessAction {
+    Read,
+    Export,
+    Change,
+    SchemaApply,
+    BranchCreate,
+    BranchDelete,
+    BranchMerge,
+    CommitPublish,
+    CommitDrop,
+    InvokeQuery,
+}
+
+impl AccessAction {
+    /// Every action the access report names, in report order.
+    pub const ALL: [AccessAction; 10] = [
+        AccessAction::Read,
+        AccessAction::Export,
+        AccessAction::Change,
+        AccessAction::SchemaApply,
+        AccessAction::BranchCreate,
+        AccessAction::BranchDelete,
+        AccessAction::BranchMerge,
+        AccessAction::CommitPublish,
+        AccessAction::CommitDrop,
+        AccessAction::InvokeQuery,
+    ];
+
+    /// Whether the report decides this action from `branch` into
+    /// `target_branch` (`branch_create`, `branch_merge`), rather than on
+    /// `branch` alone.
+    pub fn is_transition(self) -> bool {
+        access_slot(self.into()) == Some(AccessSlot::Transition)
+    }
+}
+
+/// Where the access report puts a named branch for an action: the slot of
+/// the policy request the route that performs it builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessSlot {
+    /// Decided only graph-wide: the action names no branch.
+    GraphWide,
+    /// The named branch is the source (`read`, `export`, `change`).
+    Source,
+    /// The named branch is the target (`schema_apply`, `branch_delete`,
+    /// `commit_publish`, `commit_drop`).
+    Target,
+    /// From the named branch into `target_branch` (`branch_create`,
+    /// `branch_merge`).
+    Transition,
+}
+
+/// Each policy action's slot in the access report, or `None` for one no
+/// graph's report names. The match is exhaustive, so a new policy action is
+/// classified here before it compiles, for the route and the CLI at once.
+fn access_slot(action: omnigraph_policy::PolicyAction) -> Option<AccessSlot> {
+    use omnigraph_policy::PolicyAction as P;
+    match action {
+        P::Read | P::Export | P::Change => Some(AccessSlot::Source),
+        P::SchemaApply | P::BranchDelete | P::CommitPublish | P::CommitDrop => {
+            Some(AccessSlot::Target)
+        }
+        P::BranchCreate | P::BranchMerge => Some(AccessSlot::Transition),
+        P::InvokeQuery => Some(AccessSlot::GraphWide),
+        // Server- or operator-scoped: no graph's access report names them.
+        P::Admin | P::GraphList | P::ConfigManage => None,
+    }
+}
+
+impl From<AccessAction> for omnigraph_policy::PolicyAction {
+    fn from(access: AccessAction) -> Self {
+        use omnigraph_policy::PolicyAction as P;
+        match access {
+            AccessAction::Read => P::Read,
+            AccessAction::Export => P::Export,
+            AccessAction::Change => P::Change,
+            AccessAction::SchemaApply => P::SchemaApply,
+            AccessAction::BranchCreate => P::BranchCreate,
+            AccessAction::BranchDelete => P::BranchDelete,
+            AccessAction::BranchMerge => P::BranchMerge,
+            AccessAction::CommitPublish => P::CommitPublish,
+            AccessAction::CommitDrop => P::CommitDrop,
+            AccessAction::InvokeQuery => P::InvokeQuery,
+        }
+    }
+}
+
+/// What the caller's own credential may do on one graph, by the graph's
+/// installed policy. It names actions, never the rules that allow them, and
+/// says nothing about any other actor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AccessOutput {
+    /// The actor the credential resolves to. Absent only on a server that runs
+    /// without authentication.
+    pub actor_id: Option<String>,
+    /// The OAuth client the credential was issued to, when it is a verified
+    /// OIDC access token. The actor stays the person's principal across
+    /// clients. Opaque text the client chose: render it escaped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    pub graph_id: String,
+    /// Actions allowed with no branch named: the graph-scoped ones, and the
+    /// branch-scoped ones a single rule allows on every branch (a rule with no
+    /// branch scope, `branch_scope: any` or `target_branch_scope: any`).
+    /// Rules that cover every branch only together, one for protected
+    /// branches and one for the rest, allow each named branch but leave the
+    /// action out of this list; read `actions` for a branch.
+    pub graph_wide: Vec<AccessAction>,
+    /// The branch asked about, when one was.
+    pub branch: Option<String>,
+    /// The target branch asked about, when one was.
+    pub target_branch: Option<String>,
+    /// With `branch`, the actions allowed on it, including `branch_delete`,
+    /// `commit_publish`, `commit_drop` and `schema_apply` with it as their
+    /// target. With `target_branch` as well, also `branch_create` and
+    /// `branch_merge` from `branch` into it. Empty without `branch`.
+    pub actions: Vec<AccessAction>,
+}
+
+impl AccessOutput {
+    /// Decide every action in the shape a policy decides it: graph-wide; on
+    /// `branch` (`read`, `export` and `change` as the request's branch, the
+    /// branch-targeted actions as its target); and from `branch` to
+    /// `target_branch` for `branch_create` and `branch_merge`. `allowed`
+    /// is the decision for one action with its branch and target branch.
+    pub fn evaluate<E>(
+        actor: Option<String>,
+        graph_id: String,
+        branch: Option<String>,
+        target_branch: Option<String>,
+        mut allowed: impl FnMut(AccessAction, Option<&str>, Option<&str>) -> Result<bool, E>,
+    ) -> Result<Self, E> {
+        let mut graph_wide = Vec::new();
+        for access in AccessAction::ALL {
+            if allowed(access, None, None)? {
+                graph_wide.push(access);
+            }
+        }
+        let mut actions = Vec::new();
+        if let Some(branch) = branch.as_deref() {
+            for slot in [
+                AccessSlot::Source,
+                AccessSlot::Target,
+                AccessSlot::Transition,
+            ] {
+                for access in AccessAction::ALL {
+                    if access_slot(access.into()) != Some(slot) {
+                        continue;
+                    }
+                    let (source, target) = match slot {
+                        AccessSlot::Source => (Some(branch), None),
+                        AccessSlot::Target => (None, Some(branch)),
+                        AccessSlot::Transition => match target_branch.as_deref() {
+                            Some(target) => (Some(branch), Some(target)),
+                            None => continue,
+                        },
+                        AccessSlot::GraphWide => continue,
+                    };
+                    if allowed(access, source, target)? {
+                        actions.push(access);
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            actor_id: actor,
+            client_id: None,
+            graph_id,
+            graph_wide,
+            branch,
+            target_branch,
+            actions,
+        })
+    }
+}
+
+/// Which commit collection to list. Only branch history supports pagination.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitListing {
+    #[default]
+    History,
+    Unpublished,
+    Unattached,
+}
+
+#[derive(Debug, Clone, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct CommitListQuery {
+    /// Branch whose commits to list. Defaults to `main`.
+    pub branch: Option<String>,
+    /// Collection to list: `history` (default), `unpublished` proposals, or
+    /// `unattached` snapshots whose recorded target is `branch`, newest first.
+    #[param(default = "history", required = false)]
+    pub listing: CommitListing,
+    /// Commits per page of the branch's history, 1 to 1000; defaults to 100
+    /// when `page_token` is supplied. The page names the head it resolved
+    /// and a `next_page_token`. Without `limit` and
+    /// `page_token` the whole history is listed. Refused with a `listing` other
+    /// than `history`; above 1000 the request fails with 413.
+    #[param(minimum = 1, maximum = 1000)]
+    pub limit: Option<usize>,
+    /// Opaque continuation from the preceding page of this listing, sent with
+    /// the same `branch`; 100 commits per page unless `limit` is set. Later
+    /// pages answer for the head the first page resolved.
+    pub page_token: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for CommitListQuery {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Retired selectors are recognized only to refuse them. Keeping this
+        // helper private excludes them from IntoParams and the public query
+        // type, while unrelated unknown parameters retain their old behavior.
+        #[derive(Deserialize)]
+        struct Raw {
+            branch: Option<String>,
+            #[serde(default)]
+            listing: CommitListing,
+            limit: Option<usize>,
+            page_token: Option<String>,
+            #[serde(
+                default,
+                rename = "unpublished",
+                deserialize_with = "retired_commit_listing"
+            )]
+            _unpublished: (),
+            #[serde(
+                default,
+                rename = "unattached",
+                deserialize_with = "retired_commit_listing"
+            )]
+            _unattached: (),
+        }
+
+        let query = Raw::deserialize(deserializer)?;
+        Ok(Self {
+            branch: query.branch,
+            listing: query.listing,
+            limit: query.limit,
+            page_token: query.page_token,
+        })
+    }
+}
+
+fn retired_commit_listing<'de, D>(_: D) -> Result<(), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Err(serde::de::Error::custom(
+        "`unpublished` and `unattached` query parameters were replaced by `listing`; use `listing=unpublished` or `listing=unattached`",
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HealthOutput {
     pub status: String,
     pub version: String,
-    /// The internal-schema (storage-format) version this binary writes and
-    /// the only one it serves; a graph at any other version is refused until
-    /// it is upgraded offline or rebuilt.
+    /// The internal-schema (storage-format) version this binary writes, the
+    /// highest it serves. Normal open serves every version from the binary's
+    /// lowest supported one up to this one; a graph below that range is
+    /// refused until it is upgraded offline or rebuilt, and a graph above it
+    /// needs a newer binary.
     pub internal_schema_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_version: Option<String>,
@@ -1552,30 +2356,215 @@ pub struct ReadinessOutput {
     pub shutdown_grace_seconds: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ErrorCode {
-    Unauthorized,
-    Forbidden,
-    BadRequest,
-    /// 400: the request lacks the exact supported HTTP contract header.
-    /// Authentication and contract admission precede graph access and effects.
-    ApiContractMismatch,
-    NotFound,
-    /// 405 Method Not Allowed — the route exists but the active server
-    /// mode doesn't serve this method (e.g. `GET /graphs` in single-graph
-    /// mode). Distinct from 404 so clients can tell "wrong context" from
-    /// "no such resource."
-    MethodNotAllowed,
-    Conflict,
-    /// 429 Too Many Requests — per-actor admission cap exceeded.
-    /// Clients should respect the `Retry-After` header.
-    TooManyRequests,
-    /// 503: operation admission is closed; reconcile any earlier write.
-    ServiceUnavailable,
-    /// 503: a known graph is unavailable. Does not authorize replay.
-    GraphUnavailable,
-    Internal,
+/// Declares [`ErrorCode`] from one list: each code's wire name, the HTTP
+/// status a server sends it under, and its documentation. The published
+/// description and every server's status come from this list, so a code
+/// cannot be sent under a status its documentation does not name.
+macro_rules! error_codes {
+    ($( $(#[doc = $doc:literal])+ $code:ident = $name:literal, [$($status:literal),*]; )+) => {
+        /// The registry of error codes. A server sends each code under the
+        /// HTTP statuses the list names; a code with none never appears in an
+        /// HTTP response.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        pub enum ErrorCode {
+            $( $(#[doc = $doc])+ #[serde(rename = $name)] $code, )+
+        }
+
+        impl ErrorCode {
+            /// Every code, in registry order.
+            pub const ALL: &'static [ErrorCode] = &[$(ErrorCode::$code),+];
+
+            /// The code's wire spelling.
+            pub const fn as_str(self) -> &'static str {
+                match self { $(ErrorCode::$code => $name,)+ }
+            }
+
+            /// The HTTP statuses a server answers this code with, the usual
+            /// one first; empty for a code no HTTP response carries. Only a
+            /// code's details choose among several, as
+            /// [`ErrorOutput::http_status`] says.
+            pub const fn http_statuses(self) -> &'static [u16] {
+                match self { $(ErrorCode::$code => &[$($status),*],)+ }
+            }
+
+            /// What the code means, as its registry entry documents it.
+            pub fn description(self) -> String {
+                let doc: &'static [&'static str] = match self { $(ErrorCode::$code => &[$($doc),+],)+ };
+                doc.iter().map(|line| line.trim()).collect::<Vec<_>>().join(" ")
+            }
+        }
+    };
+}
+
+error_codes! {
+    /// The request carries no credential the server accepts: a bearer token
+    /// is missing, unknown or expired. Supply one the server is configured
+    /// to verify.
+    Unauthorized = "unauthorized", [401];
+    /// The credential's actor may not do this: policy denies the action, or
+    /// the action needs a policy permit the server has not been given.
+    Forbidden = "forbidden", [403];
+    /// The OIDC access token is valid, but the server admits no principal for
+    /// its subject. Signing in again issues a token for the same subject and
+    /// cannot help; the server's operator must admit the identity.
+    NotAdmitted = "not_admitted", [403];
+    /// The request is malformed or invalid: a body, query string, path
+    /// parameter or header that does not decode, a query the compiler
+    /// refuses (see `diagnostic`), or a value refused before any effect.
+    BadRequest = "bad_request", [400];
+    /// The request lacks exactly one `Omnigraph-Http-Api` header naming the
+    /// contract this server speaks. Authentication and this check precede
+    /// graph access and effects.
+    ApiContractMismatch = "api_contract_mismatch", [400];
+    /// The request's `Omnigraph-If-Actor` header names another actor
+    /// than its credential resolves to. Nothing ran.
+    ActorMismatch = "actor_mismatch", [412];
+    /// A write whose completion the server could not settle: it may or may
+    /// not have published. Read the target before writing again; never
+    /// replay the write blindly. An MCP write call that was cancelled or
+    /// passed its deadline answers it too.
+    OutcomeUnknown = "outcome_unknown", [500];
+    /// A request precondition no longer holds: the branch head moved past
+    /// `Omnigraph-If-Graph-Commit` (see `precondition_failure`), or a Blob's
+    /// `If-Match` names a value the cell no longer holds (a write's
+    /// `blob_precondition_failure` names the current one). Nothing was
+    /// written.
+    PreconditionFailed = "precondition_failed", [412];
+    /// An overlapping durable recovery intent must be resolved first; see
+    /// `recovery_required`.
+    RecoveryRequired = "recovery_required", [503];
+    /// An admitted external Blob source could not be probed or read; see
+    /// `external_blob_source`.
+    ExternalBlobSource = "external_blob_source", [424];
+    /// Retained history can no longer reconstruct a change continuation; see
+    /// `change_feed_gap`. Resume from a new baseline.
+    ChangeFeedGap = "change_feed_gap", [410];
+    /// The graph, branch, commit, query, entity or route the request names
+    /// does not exist, or the caller may not learn that it does.
+    NotFound = "not_found", [404];
+    /// The request path is served, but not with the request's method.
+    MethodNotAllowed = "method_not_allowed", [405];
+    /// The request body did not arrive before its deadline; nothing was
+    /// admitted.
+    RequestTimeout = "request_timeout", [408];
+    /// The request conflicts with the graph's current state: a concurrent
+    /// change, an existing id, a merge conflict, an index that must be built
+    /// first, or a commit that cannot be diffed. The details say which.
+    Conflict = "conflict", [409];
+    /// `branch create` could not start the branch at the commit
+    /// `from_commit` named, and nothing was created; see
+    /// `branch_start_refusal`, whose `not_retained` reason answers 410.
+    BranchStartRefusal = "branch_start_refusal", [409, 410];
+    /// The commit is an unattached snapshot, a kind that never publishes.
+    /// Distinct from `conflict`, the authority-moved refusal of a publishable
+    /// proposal.
+    UnattachedCannotPublish = "unattached_cannot_publish", [409];
+    /// The request body, or the work it asks for, exceeds a bounded limit;
+    /// `resource_limit` names the limit when it is the operation's. Split or
+    /// reduce the request.
+    PayloadTooLarge = "payload_too_large", [413];
+    /// The request body's content type is not one the route accepts.
+    UnsupportedMediaType = "unsupported_media_type", [415];
+    /// The requested Blob byte range lies outside the value; see
+    /// `blob_range`.
+    RangeNotSatisfiable = "range_not_satisfiable", [416];
+    /// Admission capacity is exhausted: an actor's, the server's, or the MCP
+    /// endpoint's concurrent tool calls. Nothing started; retry after
+    /// `Retry-After`.
+    TooManyRequests = "too_many_requests", [429];
+    /// Operation admission is closed, or a deployment observation raced an
+    /// owner change. Nothing started; retry after `Retry-After`, reconciling
+    /// any earlier write first.
+    ServiceUnavailable = "service_unavailable", [503];
+    /// A known graph is not being served. The request did not start, so it
+    /// may be retried once the graph is served again.
+    GraphUnavailable = "graph_unavailable", [503];
+    /// The server failed. An error before any write took no effect; see the
+    /// server log.
+    Internal = "internal", [500];
+    /// MCP only: the client cancelled a read tool call. A cancelled write
+    /// answers `outcome_unknown`.
+    Cancelled = "cancelled", [];
+    /// MCP only: a read tool call passed its deadline. A write that does
+    /// answers `outcome_unknown`.
+    DeadlineExceeded = "deadline_exceeded", [];
+    /// MCP only: a tool result exceeds the result limit. Narrow the read.
+    ResultTooLarge = "result_too_large", [];
+}
+
+impl utoipa::PartialSchema for ErrorCode {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        let mut description = String::from(
+            "The registry of error codes. A server sends each code under the HTTP statuses \
+             named with it; a code without one never appears in an HTTP response.\n",
+        );
+        for code in Self::ALL {
+            let status = statuses_label(code.http_statuses());
+            description.push_str(&format!(
+                "\n- `{}` ({status}): {}",
+                code.as_str(),
+                code.description()
+            ));
+        }
+        ObjectBuilder::new()
+            .schema_type(Type::String)
+            .description(Some(description))
+            .enum_values(Some(Self::ALL.iter().map(|code| code.as_str())))
+            .into()
+    }
+}
+
+impl ToSchema for ErrorCode {}
+
+/// The statuses a code is sent under, as the published registry lists them.
+fn statuses_label(statuses: &[u16]) -> String {
+    if statuses.is_empty() {
+        return "no HTTP status".to_string();
+    }
+    statuses
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+impl ErrorCode {
+    /// What a refusal with this code asks of its caller. A server's
+    /// disposition takes it unless the error names something to recover, or
+    /// the request's effects are unknown and must be reconciled first.
+    pub const fn action(self) -> DispositionAction {
+        match self {
+            Self::TooManyRequests | Self::ServiceUnavailable | Self::GraphUnavailable => {
+                DispositionAction::Retry
+            }
+            Self::RecoveryRequired => DispositionAction::Recover,
+            Self::OutcomeUnknown => DispositionAction::Reconcile,
+            Self::RequestTimeout | Self::Cancelled | Self::DeadlineExceeded => {
+                DispositionAction::Retry
+            }
+            // The request itself is wrong; no state it could read changes that.
+            Self::Unauthorized
+            | Self::NotAdmitted
+            | Self::BadRequest
+            | Self::ApiContractMismatch
+            | Self::ActorMismatch
+            | Self::NotFound
+            | Self::MethodNotAllowed
+            | Self::UnattachedCannotPublish
+            | Self::BranchStartRefusal
+            | Self::PayloadTooLarge
+            | Self::UnsupportedMediaType
+            | Self::RangeNotSatisfiable
+            | Self::ResultTooLarge => DispositionAction::Fix,
+            // The state the request met refused it, or the server failed.
+            Self::Forbidden
+            | Self::PreconditionFailed
+            | Self::Conflict
+            | Self::ExternalBlobSource
+            | Self::ChangeFeedGap
+            | Self::Internal => DispositionAction::Refresh,
+        }
+    }
 }
 
 /// Structured details for a publisher-level OCC failure. Surfaces alongside
@@ -1584,7 +2573,7 @@ pub enum ErrorCode {
 /// head. The expected/actual fields tell the client which dataset to refresh.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PublishedDatasetVersionConflictOutput {
-    pub entity_kind: EntityKindOutput,
+    pub entity_kind: EntityKind,
     pub type_name: String,
     pub expected_published_dataset_version: u64,
     pub actual_published_dataset_version: u64,
@@ -1601,11 +2590,13 @@ pub struct ReadSetConflictOutput {
 }
 
 /// A strict insert rejected because `entity_id` already names an entity in the
-/// selected node or edge type. The operation is effect-free when this output is returned;
-/// partial or ambiguous attempts surface `recovery_required` instead.
+/// selected node or edge type. The refused write changed nothing; an earlier
+/// step of the same request, such as the branch a load forks, may already have
+/// published, which the error's `disposition` states. Partial or ambiguous
+/// attempts surface `recovery_required` instead.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct KeyConflictOutput {
-    pub entity_kind: EntityKindOutput,
+    pub entity_kind: EntityKind,
     pub type_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entity_id: Option<String>,
@@ -1632,8 +2623,7 @@ pub struct BlobRangeOutput {
 }
 
 /// Structured details for an allowed external Blob source that could not be
-/// probed or read. The top-level `code` remains optional so this additive
-/// detail can roll out without extending the closed [`ErrorCode`] enum.
+/// probed or read, sent with [`ErrorCode::ExternalBlobSource`].
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ExternalBlobSourceOutput {
     /// Normalized, credential-free URI spelling (or a redacted placeholder).
@@ -1671,9 +2661,8 @@ pub struct PreconditionFailureOutput {
 }
 
 /// A change continuation can no longer be reconstructed from retained history
-/// (HTTP 410). Recovery is the baseline handshake; retrying the same cursor
-/// cannot succeed. `code` stays unset: this structured detail is the
-/// machine-readable discriminator, as with `external_blob_source`.
+/// (HTTP 410), sent with [`ErrorCode::ChangeFeedGap`]. Recovery is the
+/// baseline handshake; retrying the same cursor cannot succeed.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeFeedGapOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1704,6 +2693,52 @@ pub struct ChangeDiffRefusalOutput {
     pub type_name: Option<String>,
 }
 
+/// Why a branch could not start at the graph commit `from_commit` named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchStartRefusalReason {
+    /// HTTP 410: cleanup reclaimed data the commit's snapshot names.
+    NotRetained,
+    /// HTTP 409: the commit was written under an earlier schema.
+    SchemaChanged,
+    /// HTTP 409: the commit was written before the storage upgrade.
+    EarlierStorageFormat,
+    /// HTTP 409: the branch that wrote the commit was deleted, and may have
+    /// been created again under the same name since.
+    BranchDeleted,
+    /// HTTP 409: the commit is unpublished; publish it first.
+    UnpublishedCommit,
+    /// HTTP 409: the commit is an unattached snapshot, never branch history.
+    UnattachedSnapshot,
+    /// A reason added by a newer server; the branch was not created.
+    #[serde(other)]
+    Unknown,
+}
+
+impl BranchStartRefusalReason {
+    /// The HTTP status a server answers a refusal for this reason with.
+    pub const fn http_status(self) -> u16 {
+        match self {
+            Self::NotRetained => 410,
+            _ => 409,
+        }
+    }
+}
+
+/// A branch create refused at the graph commit `from_commit` named; nothing
+/// was created.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BranchStartRefusalOutput {
+    pub reason: BranchStartRefusalReason,
+    pub graph_commit_id: String,
+    /// For `not_retained`, the graph type whose stored version cleanup reclaimed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_name: Option<String>,
+    /// For `branch_deleted`, the branch that wrote the commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
 /// A selected full-text index cannot safely serve the current analyzer (HTTP 409).
 /// This is not a retryable write conflict: an operator must rebuild the live
 /// branch's indexes. Historical snapshots stay unchanged; branch old content
@@ -1714,6 +2749,17 @@ pub struct FullTextIndexRebuildRequiredOutput {
     /// Human-readable diagnosis; branch on the enclosing detail's presence,
     /// not this text, to distinguish the operator-action-required condition.
     pub reason: String,
+}
+
+/// A full-text call read a declared full-text index that has no segment at
+/// the query's snapshot (HTTP 409), so no segment carries its analyzer. This
+/// is not a retryable conflict: an operator builds the branch's index
+/// (`omnigraph index build --branch <branch>`). Historical snapshots stay
+/// unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FullTextIndexRequiredOutput {
+    /// The index's property as `Type.property`.
+    pub index: String,
 }
 
 /// A source position: 1-based line and column (in characters) and the byte
@@ -1728,7 +2774,7 @@ pub struct PositionOutput {
 /// Whether a suggested source edit can be applied mechanically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum ApplicabilityOutput {
+pub enum Applicability {
     MachineApplicable,
     NeedsReview,
 }
@@ -1744,7 +2790,7 @@ pub struct TextEditOutput {
 /// Non-overlapping edits against the original request source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SuggestionOutput {
-    pub applicability: ApplicabilityOutput,
+    pub applicability: Applicability,
     pub edits: Vec<TextEditOutput>,
 }
 
@@ -1795,10 +2841,10 @@ impl From<&omnigraph_compiler::QueryDiagnostic> for DiagnosticOutput {
                 .map(|suggestion| SuggestionOutput {
                     applicability: match suggestion.applicability {
                         omnigraph_compiler::Applicability::MachineApplicable => {
-                            ApplicabilityOutput::MachineApplicable
+                            Applicability::MachineApplicable
                         }
                         omnigraph_compiler::Applicability::NeedsReview => {
-                            ApplicabilityOutput::NeedsReview
+                            Applicability::NeedsReview
                         }
                     },
                     edits: suggestion
@@ -1815,11 +2861,60 @@ impl From<&omnigraph_compiler::QueryDiagnostic> for DiagnosticOutput {
     }
 }
 
+/// What a refused or failed request did and what its caller should do next.
+/// A server states it on every error response, computed where that knowledge
+/// is; a client that lost the response knows less, and says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DispositionOutput {
+    pub effects: DispositionEffects,
+    pub action: DispositionAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DispositionEffects {
+    /// The operation took no effect: it was refused, or lost to another before
+    /// anything it staged became reachable.
+    None,
+    /// An earlier step of the same operation published, as the branch a load
+    /// forks before its data does, and the failing step was refused before it
+    /// wrote anything. Read the target to see what the earlier step left.
+    Partial,
+    /// The operation may have taken effect; the server cannot say.
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DispositionAction {
+    /// Correct the request first: its credential, input, path or client.
+    /// Sent again unchanged, it fails the same way.
+    Fix,
+    /// Read the current state, then decide whether and how to send the
+    /// request again; the state it met refused it.
+    Refresh,
+    /// Repeat the same request later, honoring `Retry-After` when present.
+    Retry,
+    /// Resolve what the error names first: a durable recovery intent, or a
+    /// full-text index to build.
+    Recover,
+    /// Find out whether the operation took effect before writing again.
+    Reconcile,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ErrorOutput {
     pub error: String,
+    /// The failure's registry code. Servers set it on every error response; it
+    /// is absent only from a body built outside a server.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = ErrorCode, required = true)]
     pub code: Option<ErrorCode>,
+    /// What the request did and what to do next. Servers set it on every error
+    /// response; it is absent only from a body built outside a server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = DispositionOutput, required = true)]
+    pub disposition: Option<DispositionOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merge_conflicts: Vec<MergeConflictOutput>,
     /// Set when the conflict is a publisher CAS rejection. The caller's
@@ -1843,18 +2938,16 @@ pub struct ErrorOutput {
     /// `start..end` is half-open and `length` is the selected Blob length.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blob_range: Option<BlobRangeOutput>,
-    /// Set with HTTP 424 when an external Blob URI passed admission policy but
-    /// its source could not be probed or read. This optional detail is the
-    /// machine-readable discriminator; `code` is omitted.
+    /// Set with HTTP 424 and `external_blob_source` when an external Blob URI
+    /// passed admission policy but its source could not be probed or read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_blob_source: Option<ExternalBlobSourceOutput>,
     /// Set when an overlapping durable recovery intent must be resolved before
     /// retry. Its dataset effects may or may not have started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_required: Option<RecoveryRequiredOutput>,
-    /// Set when a mutation's graph-commit precondition failed
-    /// (HTTP 412). Like `recovery_required`, this structured field carries
-    /// the machine-readable meaning and `code` is omitted.
+    /// Set with HTTP 412 and `precondition_failed` when a mutation's
+    /// graph-commit precondition failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub precondition_failure: Option<PreconditionFailureOutput>,
     /// Set with HTTP 412 when a Blob write's `If-Match` did not hold for the
@@ -1869,12 +2962,21 @@ pub struct ErrorOutput {
     /// commit or an unprovable schema boundary).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change_diff_refusal: Option<ChangeDiffRefusalOutput>,
+    /// Set with HTTP 409, or 410 for `not_retained`, when `branch create`
+    /// cannot start a branch at the commit `from_commit` named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_start_refusal: Option<BranchStartRefusalOutput>,
     /// Set with HTTP 409 when a selected full-text index requires an explicit
     /// rebuild before search can succeed. Unlike a write-authority conflict,
     /// this condition is not cleared by retrying. This additive discriminator
     /// preserves the closed [`ErrorCode`] contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_text_index_rebuild_required: Option<FullTextIndexRebuildRequiredOutput>,
+    /// Set with HTTP 409 when a full-text call reads a declared index that
+    /// has no segment at the query's snapshot. Building the index clears it;
+    /// retrying does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_text_index_required: Option<FullTextIndexRequiredOutput>,
     /// Set for a refused query: the diagnostics contract's code, position or
     /// stage, expectation and fix. `error` keeps the one-line rendering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1882,12 +2984,26 @@ pub struct ErrorOutput {
 }
 
 impl ErrorOutput {
+    /// The HTTP status a server answers this body with: its code's usual one,
+    /// or the one its details select for a code sent under several. `None`
+    /// for a body without a code, or one whose code no HTTP response carries.
+    pub fn http_status(&self) -> Option<u16> {
+        let code = self.code?;
+        if code == ErrorCode::BranchStartRefusal
+            && let Some(refusal) = &self.branch_start_refusal
+        {
+            return Some(refusal.reason.http_status());
+        }
+        code.http_statuses().first().copied()
+    }
+
     /// An error body carrying `error` and nothing else; every typed detail is
     /// absent.
     pub fn message(error: impl Into<String>) -> Self {
         Self {
             error: error.into(),
             code: None,
+            disposition: None,
             merge_conflicts: Vec::new(),
             published_dataset_version_conflict: None,
             read_set_conflict: None,
@@ -1900,7 +3016,9 @@ impl ErrorOutput {
             blob_precondition_failure: None,
             change_feed_gap: None,
             change_diff_refusal: None,
+            branch_start_refusal: None,
             full_text_index_rebuild_required: None,
+            full_text_index_required: None,
             diagnostic: None,
         }
     }
@@ -1956,10 +3074,49 @@ pub fn commit_output(commit: &GraphCommit) -> CommitOutput {
         actor_id: commit.actor_id.clone(),
         created_at: commit.created_at,
         published: commit.published,
+        kind: commit.kind.into(),
+        root_commit_id: commit.root_commit_id.clone(),
     }
 }
 
-impl From<omnigraph::changes::ChangeEntityKind> for EntityKindOutput {
+/// The receipt's measurement on the wire, for a load whose plan ran.
+pub fn load_executed_output(executed: &LoadExecuted) -> LoadExecutedOutput {
+    LoadExecutedOutput {
+        partitions: executed.partitions,
+        rows: executed.rows,
+        source_bytes: executed.source_bytes,
+        operators: executed
+            .operators
+            .iter()
+            .map(
+                |operator: &LoadOperatorExecuted| LoadOperatorExecutedOutput {
+                    id: operator.id,
+                    node: operator.node.clone(),
+                    operator: operator.operator.clone(),
+                    rows: operator.rows,
+                    elapsed_compute_ns: operator.elapsed_compute_ns,
+                    wall_ns: operator.wall_ns,
+                    partitions: operator.partitions,
+                    slices: operator
+                        .slices
+                        .iter()
+                        .map(|slice| LoadSliceExecutedOutput {
+                            slice: slice.slice,
+                            partition: slice.partition,
+                            rows: slice.rows,
+                            elapsed_compute_ns: slice.elapsed_compute_ns,
+                            read_ns: slice.read_ns,
+                            start_ns: slice.start_ns,
+                            end_ns: slice.end_ns,
+                        })
+                        .collect(),
+                },
+            )
+            .collect(),
+    }
+}
+
+impl From<omnigraph::changes::ChangeEntityKind> for EntityKind {
     fn from(kind: omnigraph::changes::ChangeEntityKind) -> Self {
         match kind {
             omnigraph::changes::ChangeEntityKind::Node => Self::Node,
@@ -1968,16 +3125,16 @@ impl From<omnigraph::changes::ChangeEntityKind> for EntityKindOutput {
     }
 }
 
-impl From<EntityKindOutput> for omnigraph::changes::ChangeEntityKind {
-    fn from(kind: EntityKindOutput) -> Self {
+impl From<EntityKind> for omnigraph::changes::ChangeEntityKind {
+    fn from(kind: EntityKind) -> Self {
         match kind {
-            EntityKindOutput::Node => Self::Node,
-            EntityKindOutput::Edge => Self::Edge,
+            EntityKind::Node => Self::Node,
+            EntityKind::Edge => Self::Edge,
         }
     }
 }
 
-impl From<omnigraph::changes::ChangeOpKind> for ChangeOpOutput {
+impl From<omnigraph::changes::ChangeOpKind> for ChangeOp {
     fn from(op: omnigraph::changes::ChangeOpKind) -> Self {
         match op {
             omnigraph::changes::ChangeOpKind::Insert => Self::Insert,
@@ -1987,12 +3144,12 @@ impl From<omnigraph::changes::ChangeOpKind> for ChangeOpOutput {
     }
 }
 
-impl From<ChangeOpOutput> for omnigraph::changes::ChangeOpKind {
-    fn from(op: ChangeOpOutput) -> Self {
+impl From<ChangeOp> for omnigraph::changes::ChangeOpKind {
+    fn from(op: ChangeOp) -> Self {
         match op {
-            ChangeOpOutput::Insert => Self::Insert,
-            ChangeOpOutput::Update => Self::Update,
-            ChangeOpOutput::Delete => Self::Delete,
+            ChangeOp::Insert => Self::Insert,
+            ChangeOp::Update => Self::Update,
+            ChangeOp::Delete => Self::Delete,
         }
     }
 }
@@ -2000,9 +3157,9 @@ impl From<ChangeOpOutput> for omnigraph::changes::ChangeOpKind {
 /// Wire filter vocabulary → the engine's feed scope. Shared by the server
 /// handlers and the CLI's embedded arm so both translate identically.
 pub fn change_scope(
-    kinds: &[EntityKindOutput],
+    kinds: &[EntityKind],
     type_names: &[String],
-    ops: &[ChangeOpOutput],
+    ops: &[ChangeOp],
 ) -> omnigraph::changes::ChangeFeedScope {
     omnigraph::changes::ChangeFeedScope {
         kinds: (!kinds.is_empty()).then(|| kinds.iter().map(|kind| (*kind).into()).collect()),
@@ -2072,6 +3229,54 @@ pub fn commit_changes_output(page: &omnigraph::changes::CommitChangesPage) -> Co
     }
 }
 
+pub fn diff_output(page: &omnigraph::changes::GraphDiffPage) -> DiffOutput {
+    DiffOutput {
+        from_commit_id: page.from_commit_id.clone(),
+        to_commit_id: page.to_commit_id.clone(),
+        base_commit_id: page.base_commit_id.clone(),
+        changes: page.changes.iter().map(entity_change_output).collect(),
+        next_page_token: page.next_page_token.clone(),
+    }
+}
+
+/// A detailed branch listing (`detailed=true`): names and details, each in
+/// byte order.
+pub fn branch_list_output(listing: &omnigraph::db::BranchListing) -> BranchListOutput {
+    let mut branches = listing.branches.clone();
+    branches.sort();
+    let mut details: Vec<_> = listing.details.iter().map(branch_detail_output).collect();
+    details.sort_by(|left, right| left.name.cmp(&right.name));
+    BranchListOutput {
+        branches,
+        details: Some(details),
+    }
+}
+
+pub fn branch_detail_output(detail: &omnigraph::db::BranchDetail) -> BranchDetailOutput {
+    BranchDetailOutput {
+        name: detail.name.clone(),
+        head: commit_output(&detail.head),
+        from: detail.from.clone(),
+        from_commit_id: detail.from_commit_id.clone(),
+        created_at: detail.created_at,
+        updated_at: detail.updated_at,
+    }
+}
+
+pub fn merge_base_output(
+    source: &str,
+    target: &str,
+    base: &omnigraph::changes::MergeBase,
+) -> MergeBaseOutput {
+    MergeBaseOutput {
+        source: source.to_string(),
+        target: target.to_string(),
+        source_commit_id: base.source_commit_id.clone(),
+        target_commit_id: base.target_commit_id.clone(),
+        merge_base: commit_output(&base.merge_base),
+    }
+}
+
 pub fn change_feed_output(page: &omnigraph::changes::ChangeFeedPage) -> ChangeFeedOutput {
     let (next_page_token, cursor, caught_up) = match &page.continuation {
         omnigraph::changes::ChangeFeedContinuation::MidBlock { page_token } => {
@@ -2116,6 +3321,7 @@ pub fn read_output(
     let rows = RawValue::from_string(rows).map_err(|err| {
         CompilerError::Execution(format!("query result rendered invalid JSON: {err}"))
     })?;
+    let ranking = result.ranking().map(ranking_output);
     Ok(ReadOutput {
         query_name,
         target: read_target_output(target),
@@ -2123,7 +3329,26 @@ pub fn read_output(
         columns,
         rows,
         graph_commit_id,
+        page: None,
+        ranking,
     })
+}
+
+fn ranking_output(ranking: &Ranking) -> RankingOutput {
+    RankingOutput {
+        by: match ranking.by {
+            ResultSearchFunction::Nearest => SearchFunction::Nearest,
+            ResultSearchFunction::Bm25 => SearchFunction::Bm25,
+            ResultSearchFunction::Rrf => SearchFunction::Rrf,
+        },
+        order: if ranking.by.descending() {
+            RankOrder::Descending
+        } else {
+            RankOrder::Ascending
+        },
+        exhaustive: ranking.exhaustive,
+        score_columns: ranking.score_columns.clone(),
+    }
 }
 
 /// The `branch list` answer: one `{"name": ..}` row per branch in the order
@@ -2145,7 +3370,128 @@ pub fn branch_list_read_output(branches: &[String]) -> Result<ReadOutput, serde_
         columns: vec!["name".to_string()],
         rows: serde_json::value::to_raw_value(&rows)?,
         graph_commit_id: None,
+        page: None,
+        ranking: None,
     })
+}
+
+/// The answer of a branch control read: rows in the order given, no target
+/// (the statement names its own branches) and no graph commit.
+fn branch_read_rows_output(
+    query_name: &str,
+    columns: &[&str],
+    rows: Vec<serde_json::Value>,
+    page: Option<ReadPageOutput>,
+) -> Result<ReadOutput, serde_json::Error> {
+    Ok(ReadOutput {
+        query_name: query_name.to_string(),
+        target: ReadTargetOutput {
+            branch: None,
+            snapshot: None,
+        },
+        row_count: rows.len(),
+        columns: columns.iter().map(|column| column.to_string()).collect(),
+        rows: serde_json::value::to_raw_value(&rows)?,
+        graph_commit_id: None,
+        page,
+        ranking: None,
+    })
+}
+
+/// The answer of any branch control read, rendered by its family.
+pub fn branch_read_output(
+    answer: &omnigraph::changes::BranchReadAnswer,
+) -> Result<ReadOutput, serde_json::Error> {
+    use omnigraph::changes::BranchReadAnswer;
+    match answer {
+        BranchReadAnswer::Diff(page) => branch_diff_read_output(page),
+        BranchReadAnswer::MergeBase {
+            source,
+            target,
+            base,
+        } => branch_merge_base_read_output(source, target, base),
+        BranchReadAnswer::MergeDryRun {
+            source,
+            target,
+            outcome,
+        } => branch_merge_dry_run_read_output(source, target, (*outcome).into()),
+    }
+}
+
+/// The `branch diff` answer: one row per entity change in the diff's order,
+/// columns `kind`, `type`, `id`, `op`, `before`, `after`, the HTTP change
+/// shape with the type named by its name (`GET /diff` also carries its
+/// per-graph opaque id); the compared commits and the continuation token
+/// travel in `page`.
+pub fn branch_diff_read_output(
+    page: &omnigraph::changes::GraphDiffPage,
+) -> Result<ReadOutput, serde_json::Error> {
+    let rows = page
+        .changes
+        .iter()
+        .map(|change| {
+            let mut row = serde_json::to_value(entity_change_output(change))?;
+            row["type"] = serde_json::Value::String(change.entity_type.name.clone());
+            Ok(row)
+        })
+        .collect::<Result<Vec<_>, serde_json::Error>>()?;
+    branch_read_rows_output(
+        "branch diff",
+        &["kind", "type", "id", "op", "before", "after"],
+        rows,
+        Some(ReadPageOutput {
+            from_commit_id: Some(page.from_commit_id.clone()),
+            to_commit_id: Some(page.to_commit_id.clone()),
+            base_commit_id: page.base_commit_id.clone(),
+            next_page_token: page.next_page_token.clone(),
+        }),
+    )
+}
+
+/// The `branch merge-base` answer: one row naming the two branches, their
+/// heads and the merge base commit.
+pub fn branch_merge_base_read_output(
+    source: &str,
+    target: &str,
+    base: &omnigraph::changes::MergeBase,
+) -> Result<ReadOutput, serde_json::Error> {
+    branch_read_rows_output(
+        "branch merge-base",
+        &[
+            "source",
+            "target",
+            "source_commit_id",
+            "target_commit_id",
+            "merge_base_commit_id",
+        ],
+        vec![serde_json::json!({
+            "source": source,
+            "target": target,
+            "source_commit_id": base.source_commit_id,
+            "target_commit_id": base.target_commit_id,
+            "merge_base_commit_id": base.merge_base.graph_commit_id,
+        })],
+        None,
+    )
+}
+
+/// The `branch merge … dry run` answer: one row naming the two branches and
+/// the outcome the merge would have.
+pub fn branch_merge_dry_run_read_output(
+    source: &str,
+    target: &str,
+    outcome: BranchMergeOutcome,
+) -> Result<ReadOutput, serde_json::Error> {
+    branch_read_rows_output(
+        "branch merge dry run",
+        &["source", "target", "outcome"],
+        vec![serde_json::json!({
+            "source": source,
+            "target": target,
+            "outcome": outcome,
+        })],
+        None,
+    )
 }
 
 /// The `show` answer: one row per setting in the order given, the five
@@ -2183,6 +3529,8 @@ pub fn show_read_output(rows: &[SettingRow]) -> Result<ReadOutput, serde_json::E
             .collect(),
         rows: serde_json::value::to_raw_value(&rendered)?,
         graph_commit_id: None,
+        page: None,
+        ranking: None,
     })
 }
 
@@ -2367,7 +3715,7 @@ pub enum GraphAvailabilityAction {
 /// server in alphabetical order by `graph_id` (sorted server-side so
 /// clients get deterministic output across requests).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct GraphListResponse {
+pub struct GraphListOutput {
     pub graphs: Vec<GraphInfo>,
 }
 
@@ -2383,12 +3731,136 @@ pub struct GraphDiscoveryEntry {
 /// Authenticated minimal inventory from `GET /graphs/discovery`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct GraphDiscoveryResponse {
+pub struct GraphDiscoveryOutput {
     pub graphs: Vec<GraphDiscoveryEntry>,
 }
 
 #[cfg(test)]
 mod tests {
+    /// Every code says what it means and whether a server sends it, under
+    /// which status; one that no HTTP response carries names the surface that
+    /// sends it. The published enum lists every code once, in its wire
+    /// spelling, beside its status.
+    #[test]
+    fn every_reported_access_action_has_a_slot() {
+        use super::{AccessAction, access_slot};
+        for access in AccessAction::ALL {
+            assert!(
+                access_slot(access.into()).is_some(),
+                "{access:?} is reported but has no slot"
+            );
+        }
+        let transitions: Vec<AccessAction> = AccessAction::ALL
+            .into_iter()
+            .filter(|access| access.is_transition())
+            .collect();
+        assert_eq!(
+            transitions,
+            [AccessAction::BranchCreate, AccessAction::BranchMerge]
+        );
+    }
+
+    #[test]
+    fn every_error_code_documents_its_status() {
+        use super::ErrorCode;
+        use utoipa::openapi::RefOr;
+        use utoipa::openapi::schema::Schema;
+
+        let mut names = std::collections::BTreeSet::new();
+        for code in ErrorCode::ALL {
+            assert!(names.insert(code.as_str()), "{code:?} listed twice");
+            assert_eq!(
+                serde_json::to_value(code).unwrap(),
+                serde_json::json!(code.as_str())
+            );
+            let description = code.description();
+            assert!(description.len() > 20, "{code:?}: {description}");
+            let statuses = code.http_statuses();
+            assert!(
+                statuses.iter().all(|status| (400..600).contains(status)),
+                "{code:?}: {statuses:?}"
+            );
+            if statuses.is_empty() {
+                assert!(
+                    description.starts_with("MCP only:") || description.starts_with("CLI only"),
+                    "{code:?} has no HTTP status, so it names the surface that sends it: \
+                     {description}"
+                );
+            }
+            // A body answers under one of its code's statuses.
+            let mut body = super::ErrorOutput::message("refused");
+            body.code = Some(*code);
+            assert_eq!(body.http_status(), statuses.first().copied(), "{code:?}");
+        }
+        // The one code sent under two statuses: its details choose.
+        let mut body = super::ErrorOutput::message("refused");
+        body.code = Some(ErrorCode::BranchStartRefusal);
+        for (reason, status) in [
+            (super::BranchStartRefusalReason::NotRetained, 410),
+            (super::BranchStartRefusalReason::SchemaChanged, 409),
+            (super::BranchStartRefusalReason::UnattachedSnapshot, 409),
+        ] {
+            body.branch_start_refusal = Some(super::BranchStartRefusalOutput {
+                reason,
+                graph_commit_id: "01JTEST".into(),
+                type_name: None,
+                branch: None,
+            });
+            assert_eq!(body.http_status(), Some(status), "{reason:?}");
+            assert!(
+                ErrorCode::BranchStartRefusal
+                    .http_statuses()
+                    .contains(&status)
+            );
+        }
+        let RefOr::T(Schema::Object(schema)) = <ErrorCode as utoipa::PartialSchema>::schema()
+        else {
+            panic!("ErrorCode is a string enum");
+        };
+        assert_eq!(schema.enum_values.unwrap().len(), ErrorCode::ALL.len());
+        let description = schema.description.unwrap();
+        for code in ErrorCode::ALL {
+            let status = super::statuses_label(code.http_statuses());
+            assert!(
+                description.contains(&format!("- `{}` ({status}): ", code.as_str())),
+                "{description}"
+            );
+        }
+        assert!(description.contains("- `branch_start_refusal` (409, 410): "));
+    }
+
+    #[test]
+    fn edge_builds_report_a_prerelease_naming_their_commit() {
+        use super::build::versioned;
+        let commit = "9c2b3679e8f66062252e7ed6270a9478b4b77413";
+        assert_eq!(
+            versioned("0.14.0", Some("edge"), Some(commit)),
+            "0.14.0-edge+9c2b367"
+        );
+        assert_eq!(versioned("0.14.0", Some("stable"), Some(commit)), "0.14.0");
+        assert_eq!(versioned("0.14.0", None, Some(commit)), "0.14.0");
+        assert_eq!(versioned("0.14.0", None, None), "0.14.0");
+    }
+
+    #[test]
+    fn build_stamps_accept_only_full_commits_and_known_channels() {
+        use super::build::{is_full_commit, is_release_channel};
+        assert!(is_full_commit("9c2b3679e8f66062252e7ed6270a9478b4b77413"));
+        for commit in [
+            "9c2b367",
+            "9C2B3679E8F66062252E7ED6270A9478B4B77413",
+            "9c2b3679e8f66062252e7ed6270a9478b4b7741g",
+            "",
+        ] {
+            assert!(!is_full_commit(commit), "{commit:?}");
+        }
+        assert!(is_release_channel(b"stable"));
+        assert!(is_release_channel(b"edge"));
+        for channel in ["nightly", "Edge", ""] {
+            assert!(!is_release_channel(channel.as_bytes()), "{channel:?}");
+        }
+    }
+
     use super::*;
     use omnigraph_compiler::settings::SettingScope;
     use serde_json::json;
@@ -2438,7 +3910,7 @@ mod tests {
     #[test]
     fn blob_write_output_reports_a_managed_put_and_a_no_op_clear() {
         let selector = BlobSelectorOutput {
-            entity: BlobEntityKind::Node,
+            entity: EntityKind::Node,
             r#type: "Document".to_string(),
             id: "readme".to_string(),
             property: "content".to_string(),
@@ -2482,13 +3954,72 @@ mod tests {
             output
         );
         let mut reviewed = output;
-        reviewed.suggestion.as_mut().unwrap().applicability = ApplicabilityOutput::NeedsReview;
+        reviewed.suggestion.as_mut().unwrap().applicability = Applicability::NeedsReview;
         let json = serde_json::to_value(&reviewed).unwrap();
         assert_eq!(json["suggestion"]["applicability"], "needs_review");
         assert_eq!(
             serde_json::from_value::<DiagnosticOutput>(json).unwrap(),
             reviewed
         );
+    }
+
+    /// A read's ranking renders in the RFC 0047 wire shape, its order read
+    /// off the search function; the envelope reads back unchanged (the
+    /// remote CLI prints what it decoded), and an envelope without one stays
+    /// without one.
+    #[test]
+    fn read_ranking_renders_and_round_trips() {
+        use omnigraph_compiler::result::{Ranking, SearchFunction};
+        let result =
+            || QueryResult::new(std::sync::Arc::new(arrow_schema::Schema::empty()), vec![]);
+        let rendered = |ranking| {
+            let output = read_output(
+                "q".to_string(),
+                &ReadTarget::branch("main"),
+                result().with_ranking(Some(ranking)),
+                None,
+            )
+            .unwrap();
+            let json = serde_json::to_value(&output).unwrap();
+            let decoded: ReadOutput = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&decoded).unwrap(), json);
+            json["ranking"].clone()
+        };
+        assert_eq!(
+            rendered(Ranking {
+                by: SearchFunction::Nearest,
+                exhaustive: false,
+                score_columns: vec!["d._distance".to_string(), "again".to_string()],
+            }),
+            json!({
+                "by": "nearest", "order": "ascending", "exhaustive": false,
+                "score_columns": ["d._distance", "again"]
+            })
+        );
+        assert_eq!(
+            rendered(Ranking {
+                by: SearchFunction::Bm25,
+                exhaustive: true,
+                score_columns: Vec::new(),
+            }),
+            json!({"by": "bm25", "order": "descending", "exhaustive": true, "score_columns": []})
+        );
+        assert_eq!(
+            rendered(Ranking {
+                by: SearchFunction::Rrf,
+                exhaustive: true,
+                score_columns: vec!["score".to_string()],
+            }),
+            json!({"by": "rrf", "order": "descending", "exhaustive": true, "score_columns": ["score"]})
+        );
+
+        let unranked = serde_json::to_value(
+            read_output("q".to_string(), &ReadTarget::branch("main"), result(), None).unwrap(),
+        )
+        .unwrap();
+        assert!(unranked.get("ranking").is_none());
+        let decoded: ReadOutput = serde_json::from_value(unranked).unwrap();
+        assert!(decoded.ranking.is_none());
     }
 
     /// `SettingsRequest` has one field per `request` row of the definition,
@@ -2504,21 +4035,27 @@ mod tests {
         let populated = SettingsRequest {
             engine: Some(Engine::V2),
             merge_lineage: Some(MergeLineage::Off),
+            change_lineage: Some(ChangeLineage::Off),
             ann_nprobes: Some(7),
             traversal_work_limit: Some(123),
             write_max_bytes: Some(4093),
+            load_source_max_bytes: Some(8186),
+            query_memory_bytes: Some(524288),
             history_release_bytes: Some(2048),
         };
         let expected = format!(
-            "{{\"{}\":\"v2\",\"{}\":\"off\",\"{}\":7,\"{}\":123,\"{}\":4093,\"{}\":2048}}",
+            "{{\"{}\":\"v2\",\"{}\":\"off\",\"{}\":\"off\",\"{}\":7,\"{}\":123,\"{}\":4093,\"{}\":8186,\"{}\":524288,\"{}\":2048}}",
             request_rows[0],
             request_rows[1],
             request_rows[2],
             request_rows[3],
             request_rows[4],
-            request_rows[5]
+            request_rows[5],
+            request_rows[6],
+            request_rows[7],
+            request_rows[8]
         );
-        assert_eq!(request_rows.len(), 6);
+        assert_eq!(request_rows.len(), 9);
         assert_eq!(serde_json::to_string(&populated).unwrap(), expected);
         assert_eq!(
             populated
@@ -2580,22 +4117,16 @@ mod tests {
 
     #[test]
     fn entity_type_parts_projects_only_logical_node_and_edge_selectors() {
-        assert_eq!(
-            EntityKindOutput::parse("node"),
-            Some(EntityKindOutput::Node)
-        );
-        assert_eq!(
-            EntityKindOutput::parse("edge"),
-            Some(EntityKindOutput::Edge)
-        );
-        assert_eq!(EntityKindOutput::parse("table"), None);
+        assert_eq!(EntityKind::parse("node"), Some(EntityKind::Node));
+        assert_eq!(EntityKind::parse("edge"), Some(EntityKind::Edge));
+        assert_eq!(EntityKind::parse("table"), None);
         assert_eq!(
             entity_type_parts("node:Person"),
-            Ok((EntityKindOutput::Node, "Person"))
+            Ok((EntityKind::Node, "Person"))
         );
         assert_eq!(
             entity_type_parts("edge:Knows"),
-            Ok((EntityKindOutput::Edge, "Knows"))
+            Ok((EntityKind::Edge, "Knows"))
         );
         for invalid in ["Person", "node:", "edge:", "table:Person"] {
             assert_eq!(entity_type_parts(invalid), Err(EntityTypeMappingError));
@@ -2635,6 +4166,124 @@ mod tests {
         );
     }
 
+    /// A `load csv` change carries the plan's measurement as `executed`,
+    /// absent from the wire for every other change.
+    #[test]
+    fn change_receipts_carry_the_executed_load_plan_only_when_it_ran() {
+        let executed = load_executed_output(&LoadExecuted {
+            partitions: 1,
+            rows: 2,
+            source_bytes: 19,
+            operators: vec![LoadOperatorExecuted {
+                id: 0,
+                node: "CsvSource".to_string(),
+                operator: "CsvSourceExec".to_string(),
+                rows: 2,
+                elapsed_compute_ns: 12,
+                wall_ns: 34,
+                partitions: 1,
+                slices: vec![omnigraph::loader::LoadSliceExecuted {
+                    slice: 0,
+                    partition: 0,
+                    rows: 2,
+                    elapsed_compute_ns: 10,
+                    read_ns: 0,
+                    start_ns: 1,
+                    end_ns: 30,
+                }],
+            }],
+        });
+        let change = json!({
+            "branch": "main", "query_name": "load csv",
+            "affected_nodes": 2, "affected_edges": 0, "actor_id": null, "commit": null,
+            "executed": {
+                "partitions": 1, "rows": 2, "source_bytes": 19,
+                "operators": [{"id": 0, "node": "CsvSource", "operator": "CsvSourceExec",
+                               "rows": 2, "elapsed_compute_ns": 12, "wall_ns": 34,
+                               "partitions": 1,
+                               "slices": [{"slice": 0, "partition": 0, "rows": 2,
+                                           "elapsed_compute_ns": 10, "read_ns": 0,
+                                           "start_ns": 1, "end_ns": 30}]}]
+            }
+        });
+        let decoded: ChangeOutput = serde_json::from_value(change.clone()).unwrap();
+        assert_eq!(decoded.executed.as_ref(), Some(&executed));
+        assert_eq!(serde_json::to_value(decoded).unwrap(), change);
+        let plain = json!({
+            "branch": "main", "query_name": "insert_person",
+            "affected_nodes": 1, "affected_edges": 0, "actor_id": null, "commit": null
+        });
+        let decoded: ChangeOutput = serde_json::from_value(plain.clone()).unwrap();
+        assert!(decoded.executed.is_none());
+        assert_eq!(serde_json::to_value(decoded).unwrap(), plain);
+    }
+
+    #[test]
+    fn commit_receipts_infer_legacy_kind_and_preserve_explicit_kind() {
+        let receipt = || {
+            json!({
+                "graph_commit_id": "commit",
+                "graph_branch": "feature",
+                "graph_manifest_version": 9_223_372_036_854_775_809u64,
+                "parent_commit_id": "parent",
+                "merged_parent_commit_id": "merged_parent",
+                "actor_id": "actor",
+                "created_at": 1714000000000000i64
+            })
+        };
+        for (published, kind, expected) in [
+            (None, None, CommitKind::Published),
+            (Some(true), None, CommitKind::Published),
+            (Some(false), None, CommitKind::Unpublished),
+            (
+                Some(false),
+                Some(CommitKind::Published),
+                CommitKind::Published,
+            ),
+            (
+                Some(true),
+                Some(CommitKind::Unpublished),
+                CommitKind::Unpublished,
+            ),
+            (
+                Some(false),
+                Some(CommitKind::Unattached),
+                CommitKind::Unattached,
+            ),
+        ] {
+            let mut wire = receipt();
+            if let Some(published) = published {
+                wire["published"] = json!(published);
+            }
+            if let Some(kind) = kind {
+                wire["kind"] = json!(kind);
+                if kind == CommitKind::Unattached {
+                    wire["root_commit_id"] = json!("root");
+                }
+            }
+            let decoded: CommitOutput = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(decoded.kind, expected, "{wire}");
+            wire["published"] = json!(published.unwrap_or(true));
+            wire["kind"] = json!(expected);
+            wire.as_object_mut()
+                .unwrap()
+                .entry("root_commit_id")
+                .or_insert(json!(null));
+            assert_eq!(serde_json::to_value(decoded).unwrap(), wire);
+        }
+
+        let mut wire = receipt();
+        wire["future_field"] = json!("ignored");
+        let decoded = CommitOutput::deserialize(wire).unwrap();
+        assert_eq!(decoded.kind, CommitKind::Published);
+
+        for kind in [json!(null), json!("unknown")] {
+            let mut wire = receipt();
+            wire["kind"] = kind;
+            assert!(serde_json::from_value::<CommitOutput>(wire).is_err());
+        }
+    }
+
     #[test]
     fn export_request_rejects_removed_table_key_selector() {
         let error = serde_json::from_value::<ExportRequest>(json!({
@@ -2649,7 +4298,7 @@ mod tests {
     #[test]
     fn blob_stat_output_has_one_shared_shape_and_omits_inapplicable_fields() {
         let managed_query = BlobReadQuery {
-            entity: BlobEntityKind::Node,
+            entity: EntityKind::Node,
             r#type: "Document".to_string(),
             id: "doc-1".to_string(),
             property: "payload".to_string(),
@@ -2682,7 +4331,7 @@ mod tests {
         );
 
         let external_query = BlobReadQuery {
-            entity: BlobEntityKind::Edge,
+            entity: EntityKind::Edge,
             r#type: "Attachment".to_string(),
             id: "edge-1".to_string(),
             property: "payload".to_string(),

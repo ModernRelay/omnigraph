@@ -287,6 +287,70 @@ async fn prepared_graph_create_reconciles_only_its_own_exact_genesis() {
 }
 
 #[tokio::test]
+async fn prepared_graph_and_reopened_lance_writes_keep_the_storage_lifetime() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let prepared = Omnigraph::prepare_graph_create(uri, TEST_SCHEMA)
+        .await
+        .unwrap();
+    let scope = omnigraph::storage::StorageIoScope::new();
+    let db = session(
+        Omnigraph::apply_prepared_graph_create_with_io_scope(&prepared, Some(scope.clone()))
+            .await
+            .unwrap(),
+    );
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Scoped")], &[("$age", 1)]),
+    )
+    .await
+    .unwrap();
+    db.branch_create("first").await.unwrap();
+    scope.wait_idle().await;
+    assert!(!scope.is_uncertain());
+    scope.close();
+    assert!(db.branch_create("closed").await.is_err());
+    assert!(
+        !db.branch_list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|name| name == "closed")
+    );
+    drop(db);
+
+    let reopened_scope = omnigraph::storage::StorageIoScope::new();
+    let reopened = session(
+        Omnigraph::open_with_io_scope(uri, reopened_scope.clone())
+            .await
+            .unwrap(),
+    );
+    mutate_main(
+        &reopened,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Scoped")], &[("$age", 2)]),
+    )
+    .await
+    .unwrap();
+    reopened.branch_create("second").await.unwrap();
+    reopened_scope.wait_idle().await;
+    assert!(!reopened_scope.is_uncertain());
+    reopened_scope.close();
+    assert!(reopened.branch_create("also-closed").await.is_err());
+    assert!(
+        !reopened
+            .branch_list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|name| name == "also-closed")
+    );
+}
+
+#[tokio::test]
 async fn prepared_graph_create_rejects_mutated_serialized_input_before_effects() {
     let dir = tempfile::tempdir().unwrap();
     let prepared = Omnigraph::prepare_graph_create(dir.path().to_str().unwrap(), TEST_SCHEMA)
@@ -384,12 +448,12 @@ async fn init_creates_graph() {
         db.internal_schema_version_of(ReadTarget::branch("main"))
             .await
             .unwrap(),
-        15,
-        "fresh graphs are stamped v15: current state in `__manifest`, settled commits in `__history`"
+        16,
+        "fresh graphs are stamped v16: current state in `__manifest`, settled commits in `__history`"
     );
     assert_eq!(
         omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
-        15,
+        16,
         "the writer's stamp constant is the released format number"
     );
     assert_eq!(contract_row.source, TEST_SCHEMA);
@@ -840,10 +904,64 @@ async fn refresh_detects_identity_aba_when_source_bytes_are_unchanged() {
     );
 }
 
+/// An open of a root without a graph fails, and so does the open of a graph
+/// whose live manifest names a missing object, with the same storage kind.
+/// `exists` tells them apart: only a root without a `__manifest` dataset is
+/// absent, so a damaged graph never reads as a missing one. The bound form
+/// answers as the unbound one does.
 #[tokio::test]
-async fn open_nonexistent_fails() {
-    let result = Omnigraph::open("/tmp/nonexistent_omnigraph_test_xyz").await;
-    assert!(result.is_err());
+async fn open_nonexistent_fails_and_exists_reports_only_dataset_absence() {
+    use omnigraph::error::StorageFailureKind;
+    use omnigraph::storage::{CapturedStorageBinding, StorageDestination, storage_for_binding};
+    let not_found = |error: omnigraph::error::OmniError| {
+        assert_eq!(
+            error.storage_failure().map(|failure| failure.kind),
+            Some(StorageFailureKind::NotFound),
+            "{error}"
+        );
+    };
+    let bound = |uri: &str| {
+        storage_for_binding(
+            &CapturedStorageBinding::capture(uri, &StorageDestination::Local).unwrap(),
+        )
+        .unwrap()
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let absent = dir.path().join("absent");
+    let absent = absent.to_str().unwrap();
+    assert!(!Omnigraph::exists(absent).await.unwrap());
+    assert!(
+        !Omnigraph::exists_with_storage(absent, bound(absent))
+            .await
+            .unwrap()
+    );
+    not_found(Omnigraph::open(absent).await.err().unwrap());
+    not_found(Omnigraph::open_read_only(absent).await.err().unwrap());
+
+    let root = dir.path().join("graph");
+    let uri = root.to_str().unwrap();
+    drop(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    assert!(Omnigraph::exists(uri).await.unwrap());
+    assert!(
+        Omnigraph::exists_with_storage(uri, bound(uri))
+            .await
+            .unwrap()
+    );
+
+    fs::remove_dir_all(root.join("__manifest").join("data")).unwrap();
+    assert!(Omnigraph::exists(uri).await.unwrap());
+    assert!(
+        Omnigraph::exists_with_storage(uri, bound(uri))
+            .await
+            .unwrap()
+    );
+    not_found(
+        Omnigraph::open_read_only_with_storage(uri, bound(uri))
+            .await
+            .err()
+            .unwrap(),
+    );
 }
 
 #[tokio::test]

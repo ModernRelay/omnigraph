@@ -59,6 +59,15 @@ An optimization miss is not a merge failure. Missing transaction history,
 unknown certificate fields, or an unfamiliar Lance shape
 falls back to the general route.
 
+A dry run (`Session::branch_merge_dry_run`, RFC 0030 §8.4) takes the same
+path through base resolution, classification and constraint validation, then
+returns before the queue guards and the first detached commit. It is a read:
+it takes neither the schema permit nor the branch gates, pins no merge-input
+tag (a reclaimed input surfaces as a typed gap), and stages only to the
+process-local scratch directory. The merge truth table runs it before every
+cell's merge and holds it to the merge's outcome and to zero object-store
+writes.
+
 On the adopt route, every target, main included, selects the source's exact
 table ref, version and pin: the target's registration takes the source's
 `staged_version` in the same dataset, with no fenced insert, keyed update or
@@ -74,8 +83,10 @@ target write stages detached on that same dataset from the adopted pin; no
 table fork is created. Pointer adoption still computes any required
 validation delta and runs the shared constraint evaluator, except for a
 `FastForward` whose candidates are all proven pure inserts into node types
-with no `@unique`, `@range`, `@check` or enum property
-(`proven_fast_forward_needs_no_validation`). For that delta the evaluator reads
+with no `@unique`, `@range`, `@check` or enum property and no edge type with a
+non-zero `@card` minimum from them (`proven_fast_forward_needs_no_validation`):
+a source node inserted alone is below such a minimum, which only a branch
+written before inserted nodes were counted can hold. For that delta the evaluator reads
 nothing from the target; it would only check that no two new rows share a key,
 which the source's certified exact-`id` inserts already rule out. The skip
 follows the outcome, so it also bypasses the 32 MiB validation budget: such a
@@ -116,10 +127,27 @@ read by the merge from its session) derives candidate IDs from
 compatible pinned fragment and deletion metadata. Deletion differences remain
 compressed until bounded offset chunks are needed; known positions use direct
 reads against the pinned before-image. The 32 MiB candidate budget is checked
-before keys are copied. Candidate row filters may still scan data when a
-usable ID index is absent. A proof or budget miss falls back to the ordered
-walk. `off` uses that walk directly; `verify` executes both classifiers and
+before keys are copied. Candidate rows are read by an `id IN (...)` filter
+scoped to the fragments that can hold them (`LineageMergePlan::three_way_fragments`):
+the base over both sides' base scopes, each side over its own changed
+fragments plus the base fragments the other side changed, since a candidate
+only one side changed is live on the other at its base position. Within those
+fragments the filter may still scan data when a usable ID index is absent. A
+proof or budget miss falls back to the ordered walk. `off` uses that walk directly; `verify` executes both classifiers and
 compares their results.
+
+The same setting selects how an adopt (a table the target left at the base
+while the source changed it, so a fast forward too) computes the validation
+delta a proven pure-insert history does not discharge. At `on` the plan's
+base-to-source candidates are read from the base and the source by the same
+`id IN (...)` filter, each end scanned only over its scope
+(`LineageSideScope`): the fragments that end lacks, rewrote or deleted rows
+from relative to the other. A row outside the scope is live at the same
+position on both ends, and the exact-id primary key makes a live id unique
+within a version, so every candidate's live rows lie inside the scope. The
+delta then costs the changed fragments, not the table. `off` and a gate miss
+walk both ends in full; `verify` runs both and fails the merge on any
+difference in the ids it deletes, inserts or updates.
 
 The fallback is an ordered three-way cursor merge. Each cursor streams one
 snapshot's rows in `id` order in two phases so no payload column ever reaches
@@ -159,11 +187,15 @@ versions, and `C` the bounded publish chunks.
 |---|---|---|
 | Pointer adoption | Metadata-only when no validation delta is needed; otherwise the delta may require base/source ordered scans | Manifest-pointer change; no table fork or row copy |
 | Proven insertion replay | Walk `K <= 1,024` transaction records and scan only the certified source interval | `C <= 1,024` join-free fenced inserts; no target ID preflight or MergeInsert join |
-| Adopt with delta | At least two full ordered scans, base and source | New rows use preflighted fenced inserts; changed rows use update-only `KnownPresentUpdate`; deletes are chunked |
+| Adopt with delta | Lineage candidate discovery and reads scoped to the changed fragments when proven; otherwise at least two full ordered scans, base and source | New rows use preflighted fenced inserts; changed rows use update-only `KnownPresentUpdate`; deletes are chunked |
 | General three-way | Lineage candidate discovery and filtered reads when proven; otherwise at least three full ordered scans | New rows use preflighted fenced inserts; existing rows use `KnownPresentUpdate`; deletes are chunked |
 
-Strict insertion keeps Lance's index-disabled, filter-bearing path so the
-transaction carries the exact-`id` conflict proof. `KnownPresentUpdate` can use an `id` index
+Strict insertion probes the pinned target for its ids, then stages a
+join-free, insert-only `Update` carrying the exact-`id` key filter. That
+filter backs Omnigraph's own insertion-absence certificate
+(`omnigraph.insert_absence`), not a Lance conflict check: a detached commit
+runs no Lance conflict pass, and the `__manifest` publish CAS orders
+concurrent writers. `KnownPresentUpdate` can use an `id` index
 when its coverage is safe, falls back to the full join otherwise, and never
 inserts.
 
@@ -247,7 +279,7 @@ below correspond to
 | Route | Ordered cursors | Fenced inserts | Known-present updates | MergeInsert upserts | Strict-insert preflights |
 |---|---:|---:|---:|---:|---:|
 | Proven insertion replay | `0` | `C` | `0` | `0` | `0` |
-| Adopt with delta | at least `2` | insert chunks | changed-row chunks | `0` | insert chunks |
+| Adopt with delta | `0` for lineage candidates; at least `2` for ordered fallback | insert chunks | changed-row chunks | `0` | insert chunks |
 | General three-way | `0` for lineage candidates; at least `3` for ordered fallback | insert chunks | updated-row chunks | `0` | insert chunks |
 
 Blob descriptor selection can add cursor passes, so the fallback counts are

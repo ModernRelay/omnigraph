@@ -96,7 +96,7 @@ struct VersionHeader {
 
 /// Read only the common version header before dispatching to a strict format.
 ///
-/// `serde_yaml` reports a duplicate `version` field here. Unknown fields are
+/// `yaml_serde` reports a duplicate `version` field here. Unknown fields are
 /// intentionally rejected only by the selected full-format DTO.
 pub(crate) fn declared_version(source: &str, noun: &str) -> Result<u32, Diagnostic> {
     if source.len() > MAX_YAML_BYTES {
@@ -109,7 +109,7 @@ pub(crate) fn declared_version(source: &str, noun: &str) -> Result<u32, Diagnost
     // A value projection avoids accepting a future document through a V1 DTO,
     // while the one-field wrapper keeps duplicate/missing version failures
     // typed. Deserialize into Value first because VersionHeader is strict.
-    let value: serde_yaml::Value = serde_yaml::from_str(source).map_err(|error| {
+    let value: yaml_serde::Value = yaml_serde::from_str(source).map_err(|error| {
         Diagnostic::error(
             format!("invalid_{noun}_yaml"),
             "$",
@@ -123,11 +123,11 @@ pub(crate) fn declared_version(source: &str, noun: &str) -> Result<u32, Diagnost
             "required field `version` is missing",
         ));
     };
-    let header_value = serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([(
-        serde_yaml::Value::String("version".to_string()),
+    let header_value = yaml_serde::Value::Mapping(yaml_serde::Mapping::from_iter([(
+        yaml_serde::Value::String("version".to_string()),
         version_value.clone(),
     )]));
-    let header: VersionHeader = serde_yaml::from_value(header_value).map_err(|error| {
+    let header: VersionHeader = yaml_serde::from_value(header_value).map_err(|error| {
         Diagnostic::error(
             format!("invalid_{noun}_yaml"),
             "version",
@@ -141,7 +141,7 @@ pub(crate) fn strict_yaml<T>(source: &str, noun: &str) -> Result<T, Diagnostic>
 where
     T: for<'de> Deserialize<'de>,
 {
-    serde_yaml::from_str(source).map_err(|error| {
+    yaml_serde::from_str(source).map_err(|error| {
         Diagnostic::error(
             format!("invalid_{noun}_yaml"),
             "$",

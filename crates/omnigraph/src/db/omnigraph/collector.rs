@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use futures::StreamExt;
 use lance::index::DatasetIndexExt;
+use lance_table::io::commit::ManifestNamingScheme;
 
 use crate::db::commit_graph::{CommitGraph, GraphCommit, Lineage, MergeBaseResolver};
 use crate::db::manifest::retention::{ManifestTagInventory, incarnation_digest, merge_input_owner};
@@ -24,8 +25,9 @@ use super::promotion::{open_at, table_location};
 
 decide_seam! {
     /// Inside the collector's read of one live branch's `__manifest`, after
-    /// its version history and before its registration rows; both come from
-    /// one open, so a publication landing here is invisible to both.
+    /// its version listing and before the commit times and registration rows
+    /// it reads; all come from one open, so a publication landing here is
+    /// invisible to every one of them.
     pub static CLEANUP_COLLECTOR_MID_BRANCH_READ = ("cleanup.collector_mid_branch_read", Unreachable, [Fail]);
 }
 
@@ -58,12 +60,23 @@ decide_seam! {
     pub static CLEANUP_SWEEP_PRE_FILE_DELETE = ("cleanup.sweep_pre_file_delete", Unreachable, [Fail]);
 }
 
+decide_seam! {
+    /// After the files only a table's dead stagings reference are deleted and
+    /// before the first of their manifests is.
+    pub static CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE = ("cleanup.sweep_pre_dead_manifest_delete", Unreachable, [Fail]);
+}
+
 /// Requests the run made, for the two ceilings in `maintenance.rs`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CollectorCost {
     /// `__manifest` reads: one per live branch at HEAD plus one per retained
     /// version below HEAD.
     pub manifest_snapshots: u64,
+    /// `__manifest` versions read for their commit time: under a cutoff,
+    /// each live branch's versions the newest-N / HEAD / base rule does not
+    /// already retain; none without one. The version numbers come from the
+    /// `_versions/` listing, which reads no manifest.
+    pub manifest_time_reads: u64,
     /// HEAD reads that prove the captured branch snapshots coexisted.
     pub manifest_rechecks: u64,
     /// Listings: per table location its `_versions/` once, then its objects
@@ -154,7 +167,9 @@ pub struct TableCollectionPlan {
     /// Physical object-store prefixes borrowed by retained native snapshots.
     pub(crate) borrowed_origins: BTreeSet<String>,
     pub(crate) object_base: String,
-    orphan_sizes: BTreeMap<String, u64>,
+    /// The sizes the location's listing gave for the paths the run deletes,
+    /// an orphan `_indices/<uuid>` directory as the sum of its files.
+    listed_sizes: BTreeMap<String, u64>,
     /// Linear versions above the last linear version (above the newest pin
     /// any registration names while none is recorded).
     pub foreign_versions: Vec<u64>,
@@ -171,6 +186,18 @@ pub struct CollectorRowSummary {
     pub foreign_versions: Vec<u64>,
 }
 
+/// One unattached snapshot's candidate tag with its place in its chain (RFC
+/// "Unattached graph branches"): the parent link orders a chain's release
+/// descendants first, and a retained record's link names the ancestors it
+/// keeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnattachedTagRecord {
+    pub name: String,
+    pub graph_commit_id: String,
+    pub parent_commit_id: String,
+    pub root_commit_id: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CollectorReport {
     pub branches: Vec<RetainedManifestVersions>,
@@ -183,6 +210,12 @@ pub struct CollectorReport {
     /// (RFC "Unpublished graph commits"), released beside the merge-input
     /// tags by destructive cleanup.
     pub(crate) expired_unpublished_tags: Vec<String>,
+    /// Candidate tags of expired unattached snapshots, released by
+    /// destructive cleanup in the order [`unattached_release_order`] gives.
+    pub expired_unattached_tags: Vec<UnattachedTagRecord>,
+    /// Candidate tags of live or undecidable snapshots and the ancestors
+    /// they retain: their complete result pins are roots.
+    pub retained_unattached_tags: Vec<UnattachedTagRecord>,
     /// Owners visible in the same graph cut as every physical root.
     pub(crate) live_branch_incarnations: HashSet<String>,
     /// Retired graph trees still supplying an exact root or imported lineage.
@@ -287,7 +320,8 @@ pub(crate) async fn sweep_table(
     let naming = dataset.manifest_location().naming_scheme;
     let base = location_base(dataset);
     fail(&CLEANUP_SWEEP_PRE_FILE_DELETE)?;
-    stats.bytes_removed += delete_paths(&store, &base, &plan.sweep_paths).await?;
+    stats.bytes_removed +=
+        delete_paths(&store, &base, &plan.sweep_paths, &plan.listed_sizes).await?;
     fail(&CLEANUP_SWEEP_PRE_MANIFEST_DELETE)?;
     for (index, version) in plan.would_remove().iter().enumerate() {
         if index > 0 {
@@ -300,7 +334,9 @@ pub(crate) async fn sweep_table(
     }
     let dead = plan.dead_stagings();
     if !dead.is_empty() {
-        stats.bytes_removed += delete_paths(&store, &base, &plan.dead_paths).await?;
+        stats.bytes_removed +=
+            delete_paths(&store, &base, &plan.dead_paths, &plan.listed_sizes).await?;
+        fail(&CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE)?;
     }
     for version in dead {
         let manifest = naming.manifest_path(&base, version);
@@ -309,7 +345,8 @@ pub(crate) async fn sweep_table(
         stats.manifests_removed += 1;
         stats.unpublished_removed += 1;
     }
-    stats.bytes_removed += delete_paths(&store, &base, &plan.orphan_paths).await?;
+    stats.bytes_removed +=
+        delete_paths(&store, &base, &plan.orphan_paths, &plan.listed_sizes).await?;
     Ok(())
 }
 
@@ -322,12 +359,17 @@ fn location_base(dataset: &lance::Dataset) -> object_store::path::Path {
 }
 
 /// Delete the location-relative `paths` (never an inherited `base:` file),
-/// an `_indices/<uuid>` entry as a directory; returns the bytes freed,
-/// with a file an earlier pass already removed counting nothing.
+/// an `_indices/<uuid>` entry as a directory; returns the bytes freed, a
+/// file at the size the plan's listing gave (`sizes`), with a file an
+/// earlier pass already removed counting nothing. A pass
+/// that stops between these files and their manifest plans the manifest
+/// again, so an absent index directory is already deleted, not an error
+/// (the local store reports one as `NotFound`; object stores list it empty).
 async fn delete_paths(
     store: &lance::io::ObjectStore,
     base: &object_store::path::Path,
     paths: &BTreeSet<String>,
+    sizes: &BTreeMap<String, u64>,
 ) -> Result<u64> {
     let mut bytes = 0;
     for path in paths {
@@ -339,13 +381,13 @@ async fn delete_paths(
             .chain(object_store::path::Path::from(path.as_str()).parts())
             .collect();
         if path.starts_with("_indices/") {
-            store
-                .remove_dir_all(full)
-                .await
-                .map_err(OmniError::storage)?;
+            match store.remove_dir_all(full).await {
+                Ok(()) | Err(lance::Error::NotFound { .. }) => {}
+                Err(error) => return Err(OmniError::storage(error)),
+            }
             continue;
         }
-        bytes += delete_object(store, &full, None).await?;
+        bytes += delete_object(store, &full, sizes.get(path).copied()).await?;
     }
     Ok(bytes)
 }
@@ -403,6 +445,42 @@ impl CollectorPathSnapshot {
             }
         }
         Ok(missing.into_iter().collect())
+    }
+
+    /// The location of a captured object that no longer exists, or `None`
+    /// when every one does. Probes at most `concurrency` objects at once and
+    /// stops at the first missing one, so a complete inventory costs one
+    /// request per object and an incomplete one usually far fewer.
+    pub(crate) async fn first_missing_location(
+        &self,
+        concurrency: usize,
+    ) -> Result<Option<String>> {
+        use futures::StreamExt;
+        if let Some((location, _)) = self.missing_at_capture.first() {
+            return Ok(Some(location.clone()));
+        }
+        let mut probes = futures::stream::iter(self.objects.iter().cloned())
+            .map(|object| async move {
+                let present = object
+                    .store
+                    .exists(&object.path)
+                    .await
+                    .map_err(OmniError::storage)?;
+                Ok::<_, OmniError>((!present).then_some(object.location))
+            })
+            .buffer_unordered(concurrency.max(1));
+        while let Some(probed) = probes.next().await {
+            if let Some(location) = probed? {
+                return Ok(Some(location));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Move `other`'s captured objects into this inventory.
+    pub(crate) fn absorb(&mut self, other: CollectorPathSnapshot) {
+        self.objects.extend(other.objects);
+        self.missing_at_capture.extend(other.missing_at_capture);
     }
 
     fn insert(
@@ -495,7 +573,7 @@ async fn capture_index_paths(
     Ok(())
 }
 
-async fn capture_dataset_paths(
+pub(crate) async fn capture_dataset_paths(
     snapshot: &mut CollectorPathSnapshot,
     dataset: &lance::Dataset,
     location: &str,
@@ -647,41 +725,66 @@ fn incarnation_key(identifier: &lance::dataset::refs::BranchIdentifier) -> Resul
     })
 }
 
-/// The `__manifest` versions `keep` and `cutoff` retain: the newest-N /
-/// newer-than rule of Lance's `cleanup_old_versions`, applied to graph commits
-/// (`__manifest` versions) per branch rather than to a table's Lance versions.
-/// HEAD is always among them and, with
-/// `keep_base` (a graph branch, deleting), its oldest: the fork-point merge base.
-fn retained_versions(
-    versions: &[lance::dataset::Version],
+/// The `__manifest` versions of one live branch that `keep` and `cutoff`
+/// retain, and the ones they prune, both ascending: the newest-N /
+/// newer-than rule of Lance's `cleanup_old_versions`, applied to graph
+/// commits (`__manifest` versions) per branch rather than to a table's Lance
+/// versions. HEAD is always among them and, with `keep_base` (a graph branch,
+/// deleting), its oldest: the fork-point merge base.
+///
+/// Every policy takes the version numbers from the `_versions/` listing,
+/// which reads no manifest (Lance's `retain_n_versions` does the same,
+/// lance#9019). A commit time is read only where it decides: for the
+/// versions the newest-N / HEAD / base rule leaves undecided, and only under
+/// a cutoff. Manifest times are not monotonic in the version (each writer
+/// stamps its own clock), so every undecided version is read, as many at
+/// once as the store's I/O parallelism allows.
+async fn retained_versions(
+    opened: &CollectorBranch,
     keep: Option<u32>,
     cutoff: Option<chrono::DateTime<chrono::Utc>>,
     keep_base: bool,
-) -> (Vec<u64>, Vec<u64>) {
-    let mut sorted: Vec<&lance::dataset::Version> = versions.iter().collect();
-    sorted.sort_by_key(|version| version.version);
-    let Some(head) = sorted.last().map(|version| version.version) else {
-        return (Vec::new(), Vec::new());
+    cost: &mut CollectorCost,
+) -> Result<(Vec<u64>, Vec<u64>)> {
+    let versions = opened.version_numbers().await?;
+    fail(&CLEANUP_COLLECTOR_MID_BRANCH_READ)?;
+    let (mut retained, undecided) = retained_by_position(&versions, keep, keep_base);
+    let Some(cutoff) = cutoff else {
+        return Ok((retained, undecided));
     };
-    let base = sorted.first().map(|version| version.version);
-    let floor = keep.map(|keep| {
-        let retain = (keep as usize).max(1);
-        sorted[sorted.len().saturating_sub(retain)].version
-    });
-    let mut retained = Vec::new();
+    cost.manifest_time_reads += undecided.len() as u64;
     let mut would_prune = Vec::new();
-    for version in sorted {
-        let kept = version.version == head
-            || (keep_base && Some(version.version) == base)
-            || floor.is_some_and(|floor| version.version >= floor)
-            || cutoff.is_some_and(|cutoff| version.timestamp >= cutoff);
-        if kept {
-            retained.push(version.version);
+    let read = opened.read_versions(&undecided).await?;
+    for (listed, manifest) in undecided.into_iter().zip(read) {
+        if manifest.timestamp >= cutoff {
+            retained.push(listed);
         } else {
-            would_prune.push(version.version);
+            would_prune.push(listed);
         }
     }
-    (retained, would_prune)
+    retained.sort_unstable();
+    Ok((retained, would_prune))
+}
+
+/// The part of the retention rule that version numbers decide: HEAD, the
+/// newest `keep` and, with `keep_base`, the oldest are retained; the rest,
+/// ascending, are left to the cutoff, and pruned without one.
+fn retained_by_position(
+    versions: &[u64],
+    keep: Option<u32>,
+    keep_base: bool,
+) -> (Vec<u64>, Vec<u64>) {
+    let mut sorted = versions.to_vec();
+    sorted.sort_unstable();
+    let (Some(&base), Some(&head)) = (sorted.first(), sorted.last()) else {
+        return (Vec::new(), Vec::new());
+    };
+    let floor = keep.map(|keep| sorted[sorted.len().saturating_sub((keep as usize).max(1))]);
+    sorted.into_iter().partition(|&version| {
+        version == head
+            || (keep_base && version == base)
+            || floor.is_some_and(|floor| version >= floor)
+    })
 }
 
 /// Per table location, the staged pins as `(staged version, linear twin)`
@@ -721,6 +824,71 @@ fn record_roots(
     }
 }
 
+/// The ids of the recorded chain ancestors of `id`, nearest first: the walk
+/// follows `parents` and stops at a published parent (one no record names)
+/// or after as many hops as there are records, so a cycle cannot loop.
+fn chain_ancestors<'a>(id: &'a str, parents: &HashMap<&'a str, &'a str>) -> Vec<&'a str> {
+    let mut ancestors = Vec::new();
+    let mut cursor = id;
+    while ancestors.len() < parents.len()
+        && let Some(parent) = parents.get(cursor)
+    {
+        ancestors.push(cursor);
+        cursor = *parent;
+    }
+    ancestors
+}
+
+/// The expired unattached tags a deleting run releases, in release order:
+/// grouped by root, descendants before ancestors (depth descending, then
+/// name). An expired record with a retained descendant, live or
+/// undecidable, is left out with every ancestor of it: a retained
+/// snapshot's bases stay addressable until it is gone.
+pub fn unattached_release_order<'a>(
+    expired: &'a [UnattachedTagRecord],
+    retained: &[UnattachedTagRecord],
+) -> Vec<&'a UnattachedTagRecord> {
+    let parents: HashMap<&str, &str> = expired
+        .iter()
+        .chain(retained)
+        .map(|record| {
+            (
+                record.graph_commit_id.as_str(),
+                record.parent_commit_id.as_str(),
+            )
+        })
+        .collect();
+    let mut blocked = HashSet::new();
+    let mut incomplete_roots = HashSet::new();
+    for record in retained {
+        let ancestors = chain_ancestors(&record.parent_commit_id, &parents);
+        if record.graph_commit_id != record.root_commit_id
+            && !ancestors.contains(&record.root_commit_id.as_str())
+        {
+            incomplete_roots.insert(record.root_commit_id.as_str());
+        }
+        blocked.extend(ancestors);
+    }
+    let mut order: Vec<(&'a UnattachedTagRecord, usize)> = expired
+        .iter()
+        .filter(|record| {
+            !blocked.contains(record.graph_commit_id.as_str())
+                && !incomplete_roots.contains(record.root_commit_id.as_str())
+        })
+        .map(|record| {
+            let depth = chain_ancestors(&record.parent_commit_id, &parents).len();
+            (record, depth)
+        })
+        .collect();
+    order.sort_by(|(a, depth_a), (b, depth_b)| {
+        a.root_commit_id
+            .cmp(&b.root_commit_id)
+            .then(depth_b.cmp(depth_a))
+            .then(a.name.cmp(&b.name))
+    });
+    order.into_iter().map(|(record, _)| record).collect()
+}
+
 /// The merge bases of every pair of captured heads, over the lineages of those
 /// heads. Retired histories supply records no lineage carries.
 async fn retained_merge_bases(
@@ -758,8 +926,12 @@ async fn retained_merge_bases(
             if resolver.search().needs_import() {
                 if retired.is_none() {
                     retired = Some(
-                        ManifestCoordinator::retired_commit_graphs(db.root_uri(), &db.history)
-                            .await?,
+                        ManifestCoordinator::retired_commit_graphs_with_session(
+                            db.root_uri(),
+                            &db.history,
+                            &db.control_session(),
+                        )
+                        .await?,
                     );
                 }
                 for (native, graph) in retired.as_ref().expect("retired histories were loaded") {
@@ -862,6 +1034,8 @@ pub(crate) async fn plan_collection(
     let mut table_tags = HashMap::new();
     let main = open_inventory_branch(db, None).await?;
     let tags = ManifestTagInventory::capture(main.dataset()).await?;
+    let mut unattached_reader =
+        crate::db::manifest::UnattachedInventoryReader::new(&tags, db.root_uri());
     let registry = main.clone();
     let mut main = Some(main);
     for branch in branches {
@@ -883,10 +1057,14 @@ pub(crate) async fn plan_collection(
                 .insert(incarnation.to_string());
         }
         let head_version = opened.head_version();
-        let versions = opened.versions().await?;
-        fail(&CLEANUP_COLLECTOR_MID_BRANCH_READ)?;
-        let (retained, would_prune) =
-            retained_versions(&versions, options.keep_versions, cutoff, branch.is_some());
+        let (retained, would_prune) = retained_versions(
+            &opened,
+            options.keep_versions,
+            cutoff,
+            branch.is_some(),
+            &mut report.cost,
+        )
+        .await?;
         for entry in opened.rows().await? {
             let full_path = format!("{}/{}", db.root_uri(), entry.dataset_path);
             let location = table_location(&full_path, entry.native_dataset_branch.as_deref());
@@ -947,8 +1125,33 @@ pub(crate) async fn plan_collection(
                     report
                         .protected_manifest_branches
                         .extend(tag.branch.iter().cloned());
-                    let snapshot = candidate.snapshot(db.root_uri())?;
+                    let snapshot = candidate.snapshot(db.root_uri(), &db.control_session())?;
                     record_roots(db, &snapshot, &mut roots, &mut tables);
+                }
+            }
+            continue;
+        }
+        if crate::db::manifest::is_unattached_tag(name) {
+            let candidate = unattached_reader.read(name).await?;
+            report.cost.manifest_snapshots += 1;
+            let record = UnattachedTagRecord {
+                name: name.clone(),
+                graph_commit_id: candidate.property.graph_commit_id.clone(),
+                parent_commit_id: candidate.property.parent_commit_id.clone(),
+                root_commit_id: candidate.property.root_commit_id.clone(),
+            };
+            match candidate.lifetime {
+                crate::db::manifest::UnattachedLifetime::Expired(_) => {
+                    report.expired_unattached_tags.push(record);
+                }
+                crate::db::manifest::UnattachedLifetime::Live
+                | crate::db::manifest::UnattachedLifetime::Undecidable(_) => {
+                    report
+                        .protected_manifest_branches
+                        .extend(tag.branch.iter().cloned());
+                    let snapshot = candidate.snapshot(db.root_uri(), &db.control_session())?;
+                    record_roots(db, &snapshot, &mut roots, &mut tables);
+                    report.retained_unattached_tags.push(record);
                 }
             }
             continue;
@@ -995,10 +1198,41 @@ pub(crate) async fn plan_collection(
             captured_lineages.push((branch, graph, head));
         }
     }
+    let releasable: HashSet<String> = unattached_release_order(
+        &report.expired_unattached_tags,
+        &report.retained_unattached_tags,
+    )
+    .into_iter()
+    .map(|record| record.name.clone())
+    .collect();
+    let expired = std::mem::take(&mut report.expired_unattached_tags);
+    for record in expired {
+        if releasable.contains(&record.name) {
+            report.expired_unattached_tags.push(record);
+        } else {
+            let candidate = unattached_reader.read(&record.name).await?;
+            report.cost.manifest_snapshots += 1;
+            report
+                .protected_manifest_branches
+                .extend(candidate.property.native_branch.iter().cloned());
+            record_roots(
+                db,
+                &candidate.snapshot(db.root_uri(), &db.control_session())?,
+                &mut roots,
+                &mut tables,
+            );
+            report.retained_unattached_tags.push(record);
+        }
+    }
     let (bases, imported_owners) = retained_merge_bases(db, &captured_lineages, live_count).await?;
     report.protected_manifest_branches.extend(imported_owners);
     for base in bases {
-        let pinned = ManifestCoordinator::pinned_graph_commit(db.root_uri(), &base).await?;
+        let pinned = ManifestCoordinator::pinned_graph_commit_with_session(
+            db.root_uri(),
+            &base,
+            &db.control_session(),
+        )
+        .await?;
         report
             .protected_manifest_branches
             .extend(pinned.dataset.manifest().branch.iter().cloned());
@@ -1066,11 +1300,15 @@ pub(crate) async fn plan_collection(
     Ok(report)
 }
 
+/// The version a detached manifest's file name carries. Lance's parser reads
+/// the number before the first dot and ignores the extension, so a staging
+/// name (`d{version}.manifest-{uuid}`) would parse too; only a `.manifest`
+/// name is a version.
 fn parse_detached_name(name: &str) -> Option<u64> {
-    name.strip_prefix('d')?
-        .strip_suffix(".manifest")?
-        .parse::<u64>()
-        .ok()
+    if !name.ends_with(".manifest") {
+        return None;
+    }
+    ManifestNamingScheme::parse_detached_version(name)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1206,6 +1444,9 @@ async fn plan_orphans(
                 plan.dead_paths.insert(relative.clone());
             }
         }
+        if plan.sweep_paths.contains(&relative) || plan.dead_paths.contains(&relative) {
+            plan.listed_sizes.insert(relative.clone(), file.size);
+        }
         if plan.referenced_paths.contains(&key) {
             continue;
         }
@@ -1215,14 +1456,14 @@ async fn plan_orphans(
             slot.0 &= old;
             slot.1 += file.size;
         } else if old {
-            plan.orphan_sizes.insert(relative.clone(), file.size);
+            plan.listed_sizes.insert(relative.clone(), file.size);
             plan.orphan_paths.insert(relative);
             plan.orphan_bytes += file.size;
         }
     }
     for (dir, (all_old, bytes)) in index_dirs {
         if all_old {
-            plan.orphan_sizes.insert(dir.clone(), bytes);
+            plan.listed_sizes.insert(dir.clone(), bytes);
             plan.orphan_paths.insert(dir);
             plan.orphan_bytes += bytes;
         }
@@ -1633,7 +1874,7 @@ fn protect_borrowed_files(report: &mut CollectorReport) {
         plan.orphan_bytes = plan
             .orphan_paths
             .iter()
-            .filter_map(|path| plan.orphan_sizes.get(path))
+            .filter_map(|path| plan.listed_sizes.get(path))
             .sum();
     }
 }
@@ -2021,6 +2262,24 @@ mod path_probe_tests {
         }
         assert!(captured.missing_paths().await.unwrap().is_empty());
     }
+
+    /// A detached manifest name parses back to the version Lance wrote it
+    /// for; a linear name, a staging name and the version hint do not.
+    #[test]
+    fn detached_manifest_names_parse_through_lance() {
+        let version = lance_table::format::DETACHED_VERSION_MASK | 7;
+        let base = object_store::path::Path::from("table.lance");
+        for naming in [ManifestNamingScheme::V1, ManifestNamingScheme::V2] {
+            let path = naming.manifest_path(&base, version);
+            let name = path.filename().unwrap();
+            assert_eq!(parse_detached_name(name), Some(version), "{name}");
+            let linear = naming.manifest_path(&base, 7);
+            assert_eq!(parse_detached_name(linear.filename().unwrap()), None);
+            let staging = format!("{name}-9c100374-3298-4537-afc6-f5ee7913666d");
+            assert_eq!(parse_detached_name(&staging), None);
+        }
+        assert_eq!(parse_detached_name("latest_version_hint.json"), None);
+    }
 }
 
 #[cfg(test)]
@@ -2118,6 +2377,7 @@ mod borrowed_origin_tests {
             &mut source,
             "legacy-table",
             restored_version,
+            None,
         )
         .await
         .unwrap();
@@ -2276,19 +2536,28 @@ mod borrowed_origin_tests {
         let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
         let mut source = snapshot.open_lance_dataset("node:Person").await.unwrap();
         let version = source.version().version;
-        let fork =
-            crate::storage_layer::lance_clone::create_branch(&mut source, "native-only", version)
-                .await
-                .unwrap();
+        let fork = crate::storage_layer::lance_clone::create_branch(
+            &mut source,
+            "native-only",
+            version,
+            None,
+        )
+        .await
+        .unwrap();
         let native_version = fork.version().version;
         source
             .tags()
             .create("native-reader", ("native-only", native_version))
             .await
             .unwrap();
-        crate::storage_layer::lance_clone::create_branch(&mut source, "unrelated-native", version)
-            .await
-            .unwrap();
+        crate::storage_layer::lance_clone::create_branch(
+            &mut source,
+            "unrelated-native",
+            version,
+            None,
+        )
+        .await
+        .unwrap();
         let table_uri = source.uri().to_string();
         drop((source, fork, snapshot));
         load_person(&db, "current", 99).await;
@@ -2496,6 +2765,71 @@ mod overlay_retention_tests {
             .iter()
             .find(|plan| plan.location == table_uri)
             .unwrap();
+        if !cfg!(debug_assertions) {
+            // Native overlays are experimental in release builds. Qualify refusal
+            // and retention without enabling the process-wide upstream opt-in.
+            assert!(!lance_table::feature_flags::can_read_dataset(
+                lance_table::feature_flags::FLAG_UNSTABLE_DATA_OVERLAY_FILES
+            ));
+            assert_ne!(
+                overlay.manifest().reader_feature_flags
+                    & lance_table::feature_flags::FLAG_UNSTABLE_DATA_OVERLAY_FILES,
+                0
+            );
+            // forbidden-api-allow: test-only cold read verifies native release refusal
+            let error = lance::dataset::builder::DatasetBuilder::from_uri(&table_uri)
+                .with_session(Arc::new(lance::session::Session::default()))
+                .with_version(version)
+                .load()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, lance::Error::NotSupported { .. }),
+                "{error:?}"
+            );
+            assert!(
+                plan.errors
+                    .iter()
+                    .any(|error| error.contains("Not supported")),
+                "{:?}",
+                plan.errors
+            );
+            assert!(report.tables.iter().all(|plan| {
+                plan.sweep_paths.is_empty()
+                    && plan.dead_paths.is_empty()
+                    && plan.orphan_paths.is_empty()
+            }));
+            let mut expected = CollectorPathSnapshot::default();
+            capture_dataset_paths(&mut expected, &source, &table_uri)
+                .await
+                .unwrap();
+            capture_dataset_paths(&mut expected, &overlay, &table_uri)
+                .await
+                .unwrap();
+            assert!(
+                expected
+                    .objects
+                    .iter()
+                    .any(|object| object.path == overlay_path)
+            );
+            assert!(expected.missing_paths().await.unwrap().is_empty());
+            let rows = db.cleanup(options).await.unwrap();
+            let row = rows
+                .iter()
+                .find(|row| row.type_key == entry.type_key)
+                .unwrap();
+            assert!(
+                row.error
+                    .as_ref()
+                    .is_some_and(|error| error.contains("trace did not finish")),
+                "{row:?}"
+            );
+            assert_eq!(row.bytes_removed, 0);
+            assert_eq!(row.old_versions_removed, 0);
+            assert_eq!(row.manifests_removed, 0);
+            assert!(expected.missing_paths().await.unwrap().is_empty());
+            return;
+        }
         assert!(plan.errors.is_empty(), "{:?}", plan.errors);
         assert!(if foreign {
             plan.foreign_versions.contains(&version)
@@ -2687,6 +3021,7 @@ mod native_table_tag_tests {
                 &mut source,
                 "registered-native",
                 source_version,
+                None,
             )
             .await
             .unwrap();
@@ -2874,5 +3209,109 @@ mod native_table_tag_tests {
             .await
             .unwrap();
         assert!(inventory.validate().await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod unattached_release_order_tests {
+    use super::*;
+
+    fn record(name: &str, id: &str, parent: &str, root: &str) -> UnattachedTagRecord {
+        UnattachedTagRecord {
+            name: name.to_string(),
+            graph_commit_id: id.to_string(),
+            parent_commit_id: parent.to_string(),
+            root_commit_id: root.to_string(),
+        }
+    }
+
+    fn names(order: Vec<&UnattachedTagRecord>) -> Vec<&str> {
+        order
+            .into_iter()
+            .map(|record| record.name.as_str())
+            .collect()
+    }
+
+    /// Descendants before ancestors within a root, roots apart; a retained
+    /// descendant keeps every ancestor of it while its expired siblings go;
+    /// a cyclic ancestry neither loops nor releases what a retained one reaches.
+    #[test]
+    fn release_order_is_descendants_first_and_a_retained_descendant_keeps_its_ancestors() {
+        let expired = vec![
+            record("b_root", "b", "published", "b"),
+            record("a_root", "a", "published", "a"),
+            record("a_child", "a1", "a", "a"),
+            record("a_grandchild", "a11", "a1", "a"),
+            record("a_sibling", "a2", "a", "a"),
+            record("b_child", "b1", "b", "b"),
+        ];
+        assert_eq!(
+            names(unattached_release_order(&expired, &[])),
+            [
+                "a_grandchild",
+                "a_child",
+                "a_sibling",
+                "a_root",
+                "b_child",
+                "b_root"
+            ]
+        );
+        let retained = vec![record("a_kept", "a111", "a11", "a")];
+        assert_eq!(
+            names(unattached_release_order(&expired, &retained)),
+            ["a_sibling", "b_child", "b_root"],
+            "the retained leaf keeps a11, a1 and a; the sibling path and root b go"
+        );
+        let missing = vec![record("a_kept", "orphan", "missing", "a")];
+        assert_eq!(
+            names(unattached_release_order(&expired, &missing)),
+            ["b_child", "b_root"],
+            "missing ancestry retains every possible ancestor under the recorded root"
+        );
+        let cyclic = vec![record("c_x", "x", "y", "c"), record("c_y", "y", "x", "c")];
+        assert_eq!(unattached_release_order(&cyclic, &[]).len(), 2);
+        assert!(unattached_release_order(&cyclic, &[record("c_kept", "z", "x", "c")]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::retained_by_position;
+
+    /// HEAD always; the newest `keep` (at least one); the oldest only for a
+    /// graph branch; everything else is left to the cutoff, ascending, and
+    /// the listing's order does not matter.
+    #[test]
+    fn version_numbers_decide_head_newest_and_base() {
+        let listed = [4, 1, 5, 2, 3];
+        assert_eq!(
+            retained_by_position(&[], Some(2), true),
+            (Vec::new(), Vec::new())
+        );
+        assert_eq!(
+            retained_by_position(&listed, None, false),
+            (vec![5], vec![1, 2, 3, 4])
+        );
+        assert_eq!(
+            retained_by_position(&listed, Some(2), false),
+            (vec![4, 5], vec![1, 2, 3])
+        );
+        assert_eq!(
+            retained_by_position(&listed, Some(0), false),
+            (vec![5], vec![1, 2, 3, 4]),
+            "a zero keep still keeps HEAD"
+        );
+        assert_eq!(
+            retained_by_position(&listed, Some(9), false),
+            (vec![1, 2, 3, 4, 5], Vec::new())
+        );
+        assert_eq!(
+            retained_by_position(&listed, Some(2), true),
+            (vec![1, 4, 5], vec![2, 3])
+        );
+        assert_eq!(
+            retained_by_position(&[7], None, true),
+            (vec![7], Vec::new())
+        );
     }
 }

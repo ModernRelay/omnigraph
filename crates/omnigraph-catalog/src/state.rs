@@ -56,6 +56,18 @@ impl DatasetEntry {
             && self.version_metadata == other.version_metadata
             && self.manifest_version == other.manifest_version
     }
+
+    /// The same table lifetime pinned at the same physical Lance version,
+    /// whatever alias or publication registered it.
+    pub fn same_physical_version(&self, other: &DatasetEntry) -> bool {
+        self.identity == other.identity
+            && self.dataset_path == other.dataset_path
+            && self.published_dataset_version == other.published_dataset_version
+            && self.native_dataset_branch == other.native_dataset_branch
+            && self
+                .version_metadata
+                .same_read_witness(&other.version_metadata)
+    }
 }
 
 #[derive(Debug, Clone)]

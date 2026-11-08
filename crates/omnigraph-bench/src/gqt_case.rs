@@ -588,10 +588,10 @@ pub(crate) fn admit_target_queries(
             Item::Loop { steps, .. } => steps.as_slice(),
         }) {
             let ordinal = step.ordinal();
-            if !SERVED_READ_KINDS.contains(&step.operation_kind()) {
+            if let Some(refusal) = served_step_refusal(step) {
                 return Err(format!(
-                    "step {ordinal} ({}) is not read-only; reset:none requires every served workload step, including loops and verification, to be read-only",
-                    step_kind(step)
+                    "step {ordinal} ({}) {refusal}",
+                    served_step_label(step)
                 ));
             }
             if let Step::Query(query) = step {
@@ -649,7 +649,7 @@ pub(crate) fn admit_target_queries(
                 continue;
             }
             match s.operation_kind() {
-                StepKind::Query | StepKind::BranchList => {
+                StepKind::Query | StepKind::BranchList | StepKind::BranchRead => {
                     if reopened {
                         return Err(
                             "reads after preparation restart are not post-reopen treatment".into(),
@@ -741,9 +741,52 @@ pub fn override_sources(
     Ok(plan)
 }
 
-/// The only step kinds a served workload may contain anywhere in its program.
-pub const SERVED_READ_KINDS: [StepKind; 3] =
-    [StepKind::Query, StepKind::BranchList, StepKind::Show];
+/// The read step kinds a served workload may contain anywhere in its program
+/// without further condition; `served_step_refusal` admits the writes.
+pub const SERVED_READ_KINDS: [StepKind; 4] = [
+    StepKind::Query,
+    StepKind::BranchList,
+    StepKind::BranchRead,
+    StepKind::Show,
+];
+
+/// The step's name in a served refusal: the control statement's own two
+/// words, since `step_kind` says only `control` for all five of them.
+fn served_step_label(step: &Step) -> &'static str {
+    match step.operation_kind() {
+        StepKind::BranchCreate => "branch create",
+        StepKind::BranchDelete => "branch delete",
+        StepKind::BranchMerge => "branch merge",
+        StepKind::CommitPublish => "commit publish",
+        StepKind::CommitDrop => "commit drop",
+        _ => step_kind(step),
+    }
+}
+
+/// Why a step is refused served, or `None` when it is admitted. A served
+/// graph is provisioned once and shared by every repetition, so a step may
+/// read, write an unpublished commit (`as commit`, which advances no head),
+/// or drop a commit this workload bound; anything that moves a head, loads,
+/// or publishes would change the graph for the next repetition.
+pub(crate) fn served_step_refusal(step: &Step) -> Option<String> {
+    let kind = step.operation_kind();
+    if SERVED_READ_KINDS.contains(&kind) {
+        return None;
+    }
+    match kind {
+        StepKind::Mutate | StepKind::BranchMerge if step.as_commit() => None,
+        StepKind::Mutate | StepKind::BranchMerge => Some(
+            "advances a branch head; reset:none admits a served write only as an unpublished commit (`as commit`), verified at its snapshot and dropped".into(),
+        ),
+        StepKind::CommitDrop if step.drops_bound_commit() => None,
+        StepKind::CommitDrop => Some(
+            "drops a commit this workload did not bind; a served drop names a `--- bind commit $name` of this workload".into(),
+        ),
+        _ => Some(
+            "is not admissible served; reset:none requires every served workload step, including loops and verification, to be a read, an `as commit` write, or the drop of a bound commit".into(),
+        ),
+    }
+}
 
 /// Engine preparation implied by the executed prefix reads, a restart, and the process lifecycle.
 pub(crate) fn engine_preparation(

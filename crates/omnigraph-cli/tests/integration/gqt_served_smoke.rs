@@ -56,6 +56,8 @@ rules:
         &server_binary,
         &[("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", &tokens)],
     );
+    let endpoint = support::tls_gateway::http_upstream(&server.base_url);
+    assert!(endpoint.starts_with("http://127.0.0.1:"));
     let artifacts = tempfile::tempdir().unwrap();
     let mut command = assert_cmd::Command::new(&gqt);
     command
@@ -64,7 +66,7 @@ rules:
         .arg(&case)
         .args([
             "--server",
-            &server.base_url,
+            &endpoint,
             "--graph",
             "smoke",
             "--token",
@@ -88,7 +90,7 @@ rules:
     ] {
         assert!(
             !text.contains(token),
-            "bearer token retained in command output"
+            "bearer token retained in command output or invocation report"
         );
     }
     let report: Value = serde_json::from_str(&report_text).unwrap();

@@ -24,11 +24,14 @@ Load and mutation input use one String representation:
 ```
 
 New external references are denied by default. A cluster-served graph must list
-allowed URI bases in its graph configuration. Direct `--store` CLI access has no
+allowed URI bases in its graph configuration. Direct `--target` CLI access has no
 external-source allowlist, so it accepts managed `base64:` input but rejects new
 external references. Credentials must not appear in stored URIs. An allowed
 base must lie outside the cluster's storage root and every graph root; see
-[External Blob references](clusters/config.md#external-blob-references).
+[External Blob references](clusters/config.md#external-blob-references). The
+same bases admit the source of a `load csv` statement
+([CSV loading](mutations/index.md#csv-loading)), which reads the object once
+and stores no reference to it.
 
 Write mode determines ownership:
 
@@ -69,7 +72,7 @@ cell:
 
 ```http
 PUT /graphs/knowledge/blob?entity=node&type=Document&id=manual&property=content&branch=main
-Omnigraph-Http-Api: 0.13
+Omnigraph-Http-Api: 0.14
 Content-Type: application/octet-stream
 If-Match: "<current ETag>"
 
@@ -94,7 +97,7 @@ HTTP an `If-Match` field, embedded a `BlobPrecondition`. A list of entity tags
 (`BlobPrecondition::Tags`) holds when the current ETag is one of them; weak tags
 never match. `*` (`BlobPrecondition::AnyExisting`) holds when the cell is not
 null. When it fails, the write changes nothing and returns
-`BlobWritePreconditionFailed`, over HTTP a `412` whose
+`BlobWritePreconditionFailed`, over HTTP a `412` `precondition_failed` whose
 `blob_precondition_failure.current_etag` and `ETag` header carry the cell's
 current ETag when it holds a managed value. A malformed `If-Match` is a `400`. A commit that
 lands while the write is in flight makes it start again from the new head and
@@ -111,8 +114,8 @@ before retrying with a precondition.
 Over HTTP:
 
 - `PUT` takes a `Content-Type: application/octet-stream` body of at most the
-  server's `write_max_bytes` (32 MiB by default), inclusive; a request cannot
-  change it. Another media type is a `415`. A larger body is a `413`, refused
+  server's Blob put limit (the process `write_max_bytes`, at most 32 MiB),
+  inclusive; a request cannot change it. Another media type is a `415`. A larger body is a `413`, refused
   before any of it is read when `Content-Length` declares it, and a body that
   does not arrive before the server's body deadline is a `408`;
 - both verbs take `branch` (default `main`) and refuse `snapshot` or any other
@@ -132,16 +135,16 @@ receipt the server returns:
 
 ```bash
 omnigraph blob put node Document manual content --file manual.pdf \
-  --if-match '"<current ETag>"' --store graph.omni
-omnigraph blob clear node Document manual content --server prod --graph knowledge
+  --if-match '"<current ETag>"' --target ./graph.omni
+omnigraph blob clear node Document manual content --target prod --graph knowledge
 ```
 
 The CLI refuses input over 32 MiB and a malformed `--if-match` before it
 addresses the graph. The value must also fit `write_max_bytes`: the process's
-`OMNIGRAPH_WRITE_MAX_BYTES` for a `--store` write, the server's for a served
-one. `--as` names the actor of a `--store` write; a served
-write takes its actor from the bearer token. A served Blob `412` exits 4, as a
-graph-commit precondition does; an embedded one exits 1. Each write is sent
+`OMNIGRAPH_WRITE_MAX_BYTES` for a `--target` write, the server's for a served
+one. `--as` names the actor of a `--target` write; a served
+write takes its actor from the bearer token, and `--as` there only asserts it. A Blob precondition failure exits 4,
+embedded or served, as a graph-commit precondition does. Each write is sent
 once: after an unknown outcome, read the cell before writing again.
 
 ## Query behavior
@@ -158,17 +161,16 @@ commit.
 ## CLI reads
 
 The selector is `ENTITY TYPE ID PROPERTY`, where `ENTITY` is `node` or `edge`.
-Blob commands address the graph with `--store`, `--server`, or a matching
-profile; they do not take a positional graph URI.
+Blob commands address the graph with `--target NAME|ADDRESS`; they do not take a positional graph URI.
 
 ```bash
 # Stream managed bytes to a file.
 omnigraph blob get node Document manual content \
-  --out manual.bin --store graph.omni
+  --out manual.bin --target ./graph.omni
 
 # Inspect the value without reading payload bytes.
 omnigraph blob stat node Document manual content \
-  --json --store graph.omni
+  --json --target ./graph.omni
 ```
 
 Reads default to `main`. `--branch <name>` and `--snapshot <commit-id>` are
@@ -180,9 +182,11 @@ streams the complete value. `--offset N` reads from `N` to the end;
 zero is rejected. An end beyond the value is clamped to EOF, while a start at or
 beyond the end of a non-empty value is unsatisfiable.
 
-If transfer fails after output begins, stdout or `--out` may contain the prefix
-already written. For atomic file replacement, write to a temporary path, check
-the exit status, then rename it.
+A failure before transfer begins leaves an existing `--out` file untouched. A
+successful empty value creates or truncates the file. If transfer fails after
+output begins, stdout or `--out` may contain the prefix already written. For
+atomic file replacement, write to a temporary path, check the exit status, then
+rename it.
 
 `blob stat --json` reports the selector, value kind, and exact resolved snapshot.
 A managed value also reports `size` and `etag`; a whole-object external value
@@ -200,7 +204,7 @@ Servers expose the same logical selector with GET and HEAD:
 
 ```http
 GET /graphs/knowledge/blob?entity=node&type=Document&id=manual&property=content&branch=main
-Omnigraph-Http-Api: 0.13
+Omnigraph-Http-Api: 0.14
 ```
 
 Both methods follow the [HTTP contract](operations/server.md#http-contract),
@@ -252,8 +256,9 @@ An update of a row inserted earlier in the same mutation is such a version:
 it carries the pending row's Blob, so that payload counts twice, the carried
 copy as `materialized blob payload bytes`.
 
-[`write_max_bytes`](queries/settings.md) defaults to 32 MiB and accepts
-`1..=33554432`. Payload and row allowances are independent: a payload exactly
+[`write_max_bytes`](queries/settings.md) defaults to 32 MiB and accepts any
+integer of at least `1`; a Blob put stays bounded at 32 MiB by the put limit
+whatever the setting. Payload and row allowances are independent: a payload exactly
 at the limit fits when its row and descriptors also fit. Repeated external
 references each count their payload length even when one fetch serves them.
 External-only admission can also report `materialized external blob payload bytes`.

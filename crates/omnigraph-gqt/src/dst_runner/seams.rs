@@ -184,7 +184,14 @@ fn crosses(op: omnigraph::seams::Op, step: Option<&crate::Step>) -> bool {
         (op, step),
         (
             Op::Mutation | Op::AnyWrite,
-            Some(crate::Step::Mutate(_) | crate::Step::Load(_))
+            Some(
+                crate::Step::Mutate(_)
+                    | crate::Step::Load(_)
+                    | crate::Step::Control(crate::ControlStep {
+                        write: crate::ControlWrite::Load { .. },
+                        ..
+                    })
+            )
         ) | (
             Op::BranchMerge | Op::AnyWrite,
             Some(crate::Step::Control(crate::ControlStep {

@@ -1,0 +1,30 @@
+# issue: none
+# notes: Inserting an edge whose source key is absent from an unindexed text-keyed Person table
+# notes: is refused with the missing source named, so the scan path still enforces referential integrity.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    id: String @key
+}
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 8
+    commits: 4
+    columns:
+      id: {kind: key, prefix: p, width: 6}
+
+--- mutate
+query ins() { insert Knows { from: "p000099", to: "p000003" } }
+
+--- expect error: __src 'p000099' not found in Person
+

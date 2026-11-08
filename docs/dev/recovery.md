@@ -79,7 +79,7 @@ do not introduce historical schema-language semantics. See
 
 ## Pending storage conversion
 
-The offline upgrade to stamp 15, from stamp 8, 9 or 13, sets `UPGRADE_PENDING_KEY`
+The offline upgrade to stamp 16, from stamp 8, 9 or 13, sets `UPGRADE_PENDING_KEY`
 (`omnigraph:storage_upgrade_pending`) on main's `__manifest` from its fence
 commit to its activation commit; the value is the `UpgradeIntent`, whose
 `source_format` names the route. Ordinary
@@ -196,7 +196,13 @@ attempt-local genesis before deciding the outcome:
   and preserves initialization artifacts and the claim.
 
 Cluster deployment persists an engine-issued `PreparedGraphCreate` before
-invocation. Its claim binds the exact root, genesis and source/IR contract.
+invocation. Its claim binds the exact root, genesis and source/IR contract by
+the token's digest, and names the apply that wrote it with a fresh attempt id:
+the storage adapter reads a create's lost answer back by the stored bytes, so
+two applies of one token must not write the same claim. Settlement recognizes
+the token's claim by digest, graph commit id and root, whichever apply wrote
+it, and still accepts the exact version-2 claim, without an attempt id, that
+earlier releases wrote.
 Read-only reconciliation recognizes that birth or returns `Absent`/`Unknown`;
 matching schema text is insufficient. After explicit prior-owner quiescence,
 `settle_prepared_graph_create_after_quiescence` may remove only that token's

@@ -79,6 +79,7 @@ impl PinnedGraphManifest {
             let mut snapshot = ManifestCoordinator::snapshot_from_state(
                 root_uri,
                 super::read_manifest_state(&dataset).await?,
+                dataset.session(),
             );
             snapshot.graph_branch = native
                 .as_deref()
@@ -101,6 +102,7 @@ impl PinnedGraphManifest {
             root_uri,
             dataset.version().version,
             dataset.manifest().branch.as_deref(),
+            &dataset.session(),
         )?;
         Ok(Self {
             dataset,
@@ -196,6 +198,51 @@ pub async fn release_merge_input_tags(dataset: &Dataset, names: &[String]) -> Re
     Ok(())
 }
 
+/// The names of main's `__manifest` native tags from one directory listing,
+/// no tag opened. Lance's `tags().list()` reads every tag's contents before
+/// returning, so a reader that needs a few tags selects names here and reads
+/// only those with [`read_native_tag`].
+pub async fn list_native_tag_names(dataset: &Dataset) -> Result<Vec<String>> {
+    let root = dataset
+        .branch_location()
+        .find_main()
+        .map_err(OmniError::storage)?;
+    let store = dataset
+        .object_store(None)
+        .await
+        .map_err(OmniError::storage)?;
+    let files = store
+        .read_dir(lance::dataset::refs::base_tags_path(&root.path))
+        .await
+        .map_err(OmniError::storage)?;
+    let mut names: Vec<String> = files
+        .iter()
+        .filter_map(|file| file.strip_suffix(".json"))
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// One native tag's contents by name, one object read; `None` when the tag
+/// is gone, since a listing races a release.
+pub async fn read_native_tag(dataset: &Dataset, name: &str) -> Result<Option<TagContents>> {
+    let root = dataset
+        .branch_location()
+        .find_main()
+        .map_err(OmniError::storage)?;
+    let store = dataset
+        .object_store(None)
+        .await
+        .map_err(OmniError::storage)?;
+    match TagContents::from_path(&lance::dataset::refs::tag_path(&root.path, name), &store).await {
+        Ok(tag) => Ok(Some(tag)),
+        Err(lance::Error::RefNotFound { .. }) => Ok(None),
+        Err(error) if error.is_not_found() => Ok(None),
+        Err(error) => Err(OmniError::storage(error)),
+    }
+}
+
 /// One immutable inventory boundary around all graph snapshots a collector
 /// combines. User tags may be updated, so both names and contents must match.
 pub struct ManifestTagInventory {
@@ -209,6 +256,7 @@ impl ManifestTagInventory {
         for name in tags.keys() {
             merge_input_owner(name)?;
             crate::branch_names::unpublished_tag_commit_id(name)?;
+            crate::branch_names::unattached_tag_parts(name)?;
         }
         Ok(Self {
             dataset: dataset.clone(),
@@ -269,16 +317,27 @@ impl ManifestCoordinator {
     /// Resolve a logical graph commit by immutable physical coordinates. A
     /// recreated logical name may reuse its version number, but never its
     /// graph commit id; retired histories remain eligible lookup candidates.
+    /// Test-only: production reads pass the reading handle's control session.
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn pinned_graph_commit(
         root_uri: &str,
         commit: &GraphCommit,
     ) -> Result<PinnedGraphManifest> {
-        let main = super::open_manifest_dataset_native_with_session(
+        Self::pinned_graph_commit_with_session(
             root_uri,
-            None,
+            commit,
             &crate::lance_access::control_session(),
         )
-        .await?;
+        .await
+    }
+
+    pub async fn pinned_graph_commit_with_session(
+        root_uri: &str,
+        commit: &GraphCommit,
+        session: &Arc<lance::session::Session>,
+    ) -> Result<PinnedGraphManifest> {
+        let main =
+            super::open_manifest_dataset_native_with_session(root_uri, None, session).await?;
         let legacy = ExtentCache::default();
         let mut candidates = Vec::new();
         match commit.graph_branch.as_deref() {
@@ -330,23 +389,34 @@ impl ManifestCoordinator {
             };
         }
         Err(OmniError::manifest_not_found(format!(
-            "merge base '{}' has no matching retained native manifest at version {}",
+            "commit '{}' has no matching retained native manifest at version {}",
             commit.graph_commit_id, commit.graph_manifest_version,
         )))
     }
 
     /// The commit graph of every retired branch incarnation by native ref,
-    /// over the settled commits `history` has read.
+    /// over the settled commits `history` has read. Test-only: production
+    /// reads pass the reading handle's control session.
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn retired_commit_graphs(
         root_uri: &str,
         history: &HistoryCache,
     ) -> Result<Vec<(String, CommitGraph)>> {
-        let main = super::open_manifest_dataset_native_with_session(
+        Self::retired_commit_graphs_with_session(
             root_uri,
-            None,
+            history,
             &crate::lance_access::control_session(),
         )
-        .await?;
+        .await
+    }
+
+    pub async fn retired_commit_graphs_with_session(
+        root_uri: &str,
+        history: &HistoryCache,
+        session: &Arc<lance::session::Session>,
+    ) -> Result<Vec<(String, CommitGraph)>> {
+        let main =
+            super::open_manifest_dataset_native_with_session(root_uri, None, session).await?;
         let mut names = retired_manifest_branches(&main)
             .await?
             .into_keys()

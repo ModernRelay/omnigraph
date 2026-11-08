@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod checked;
 pub mod codes;
 pub mod descriptor;
 pub mod diagnostic;
